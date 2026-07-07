@@ -20,6 +20,7 @@ use codex_tools::ToolSearchEntry;
 use codex_tools::ToolSearchInfo;
 use codex_tools::ToolSpec;
 use codex_tools::coalesce_loadable_tool_specs;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::Weak;
@@ -232,14 +233,48 @@ impl ToolSearchHandler {
         query: &str,
         limit: usize,
     ) -> Result<Vec<LoadableToolSpec>, FunctionCallError> {
-        let results = self
-            .search_engine
-            .search(query, limit)
+        let mut result_ids = self.exact_name_match_ids(query);
+        let mut seen_ids = result_ids.iter().copied().collect::<HashSet<_>>();
+
+        let remaining = limit.saturating_sub(result_ids.len());
+        if remaining > 0 {
+            result_ids.extend(
+                self.search_engine
+                    .search(query, self.search_infos.len())
+                    .into_iter()
+                    .map(|result| result.document.id)
+                    .filter(|id| seen_ids.insert(*id))
+                    .take(remaining),
+            );
+        }
+
+        result_ids.truncate(limit);
+        let results = result_ids
             .into_iter()
-            .map(|result| result.document.id)
             .filter_map(|id| self.search_infos.get(id))
             .map(|search_info| &search_info.entry);
         self.search_output_tools(results)
+    }
+
+    fn exact_name_match_ids(&self, query: &str) -> Vec<usize> {
+        let query_tokens = exact_match_query_tokens(query);
+        if query_tokens.is_empty() {
+            return Vec::new();
+        }
+
+        self.search_infos
+            .iter()
+            .enumerate()
+            .filter_map(|(id, search_info)| {
+                loadable_tool_spec_names(&search_info.entry.output)
+                    .any(|name| {
+                        query_tokens
+                            .iter()
+                            .any(|token| tool_name_matches_token(&name, token))
+                    })
+                    .then_some(id)
+            })
+            .collect()
     }
 
     fn search_output_tools<'a>(
@@ -250,6 +285,36 @@ impl ToolSearchHandler {
             results.into_iter().map(|entry| entry.output.clone()),
         ))
     }
+}
+
+fn exact_match_query_tokens(query: &str) -> Vec<String> {
+    query
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+fn tool_name_matches_token(name: &str, token: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name == token || name.ends_with(&format!("_{token}"))
+}
+
+fn loadable_tool_spec_names(spec: &LoadableToolSpec) -> impl Iterator<Item = String> + '_ {
+    let mut names = Vec::new();
+    match spec {
+        LoadableToolSpec::Function(tool) => names.push(tool.name.clone()),
+        LoadableToolSpec::Namespace(namespace) => {
+            names.push(namespace.name.clone());
+            for tool in &namespace.tools {
+                let codex_tools::ResponsesApiNamespaceTool::Function(tool) = tool;
+                names.push(tool.name.clone());
+                names.push(format!("{}{}", namespace.name, tool.name));
+            }
+        }
+    }
+    names.into_iter()
 }
 
 #[cfg(test)]
@@ -455,6 +520,61 @@ mod tests {
                     })],
                 }),
             ],
+        );
+    }
+
+    #[test]
+    fn search_promotes_exact_tool_name_matches_before_bm25_results() {
+        let mcp_tools = [
+            tool_info(
+                "ironclaw_workflow",
+                "workflow_run_dispatch_round",
+                "Coordinate the next workflow round",
+            ),
+            tool_info(
+                "ironclaw_workflow",
+                "workflow_run_complete",
+                "dispatch_round dispatch_round dispatch_round complete workflow",
+            ),
+            tool_info(
+                "ironclaw_workflow",
+                "workflow_run_spawn",
+                "dispatch_round dispatch_round dispatch_round spawn workflow",
+            ),
+        ];
+        let search_infos = mcp_tools
+            .iter()
+            .map(|tool| {
+                McpHandler::new(tool.clone())
+                    .expect("MCP tool should convert")
+                    .search_info()
+                    .expect("MCP handler should return search info")
+            })
+            .collect::<Vec<_>>();
+        let handler = ToolSearchHandler::new(search_infos);
+
+        let tools = handler
+            .search("dispatch_round", /*limit*/ 1)
+            .expect("search should succeed");
+
+        assert_eq!(
+            tools,
+            vec![LoadableToolSpec::Namespace(ResponsesApiNamespace {
+                name: "mcp__ironclaw_workflow".to_string(),
+                description: "Tools in the mcp__ironclaw_workflow namespace.".to_string(),
+                tools: vec![ResponsesApiNamespaceTool::Function(ResponsesApiTool {
+                    name: "workflow_run_dispatch_round".to_string(),
+                    description: "Coordinate the next workflow round desktop tool".to_string(),
+                    strict: false,
+                    defer_loading: Some(true),
+                    parameters: codex_tools::JsonSchema::object(
+                        Default::default(),
+                        /*required*/ None,
+                        Some(false.into()),
+                    ),
+                    output_schema: None,
+                })],
+            })]
         );
     }
 

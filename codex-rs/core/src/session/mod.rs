@@ -131,6 +131,8 @@ use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::HasLegacyEvent;
 use codex_protocol::protocol::HistoryPosition;
+use codex_protocol::protocol::HookCompletedEvent;
+use codex_protocol::protocol::HookRunSummary;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ItemStartedEvent;
@@ -4899,11 +4901,18 @@ impl Session {
 
     pub(crate) async fn queue_eager_session_start_hook_outcome(
         &self,
+        preview_runs: Vec<HookRunSummary>,
+        hook_events: Vec<HookCompletedEvent>,
         should_stop: bool,
         additional_contexts: Vec<String>,
     ) {
         let mut state = self.state.lock().await;
-        state.queue_eager_session_start_outcome(should_stop, additional_contexts);
+        state.queue_eager_session_start_outcome(
+            preview_runs,
+            hook_events,
+            should_stop,
+            additional_contexts,
+        );
     }
 
     pub(crate) async fn take_eager_session_start_hook_outcome(

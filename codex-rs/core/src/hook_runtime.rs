@@ -128,6 +128,18 @@ pub(crate) async fn run_pending_session_start_hooks(
     turn_context: &Arc<TurnContext>,
 ) -> bool {
     while let Some(outcome) = sess.take_eager_session_start_hook_outcome().await {
+        emit_hook_started_events(sess, turn_context, outcome.preview_runs).await;
+        let hook_events = outcome
+            .hook_events
+            .into_iter()
+            .map(|mut event| {
+                event
+                    .turn_id
+                    .get_or_insert_with(|| turn_context.sub_id.clone());
+                event
+            })
+            .collect();
+        emit_hook_completed_events(sess, turn_context, hook_events).await;
         record_additional_contexts(sess, turn_context, outcome.additional_contexts).await;
         if outcome.should_stop {
             return true;
@@ -214,13 +226,19 @@ pub(crate) async fn run_pending_session_start_hooks_eager(sess: &Arc<Session>) {
         },
     };
     let hooks = sess.hooks();
-    if hooks.preview_session_start(&request).is_empty() {
+    let preview_runs = hooks.preview_session_start(&request);
+    if preview_runs.is_empty() {
         return;
     }
     request.transcript_path = sess.hook_transcript_path().await;
     let outcome = hooks.run_session_start(request, None).await;
-    sess.queue_eager_session_start_hook_outcome(outcome.should_stop, outcome.additional_contexts)
-        .await;
+    sess.queue_eager_session_start_hook_outcome(
+        preview_runs,
+        outcome.hook_events,
+        outcome.should_stop,
+        outcome.additional_contexts,
+    )
+    .await;
 }
 
 /// Runs matching `PreToolUse` hooks before a tool executes.

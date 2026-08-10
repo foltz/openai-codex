@@ -25,6 +25,7 @@ use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::ThreadSource;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::ThreadStartSource;
 use codex_app_server_protocol::ThreadStartedNotification;
 use codex_app_server_protocol::ThreadStatus;
 use codex_app_server_protocol::ThreadStatusChangedNotification;
@@ -431,6 +432,67 @@ async fn thread_start_creates_thread_and_emits_started() -> Result<()> {
         serde_json::from_value(notif.params.expect("params must be present"))?;
     assert_eq!(started.thread, thread);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_started_notification_carries_the_explicit_clear_predecessor() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml_without_approval_policy(codex_home.path(), &server.uri())?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+    let predecessor = "019fe0ce-0000-4000-8000-000000000000".to_string();
+
+    let ThreadStartResponse { thread, .. } = mcp
+        .start_thread(ThreadStartParams {
+            session_start_source: Some(ThreadStartSource::Clear),
+            clear_predecessor_thread_id: Some(predecessor.clone()),
+            ..Default::default()
+        })
+        .await?;
+
+    let notification = mcp
+        .read_stream_until_notification_message("thread/started")
+        .await?;
+    let started: ThreadStartedNotification =
+        serde_json::from_value(notification.params.expect("thread/started params"))?;
+    assert_eq!(started.thread.id, thread.id);
+    assert_eq!(started.session_start_source, Some(ThreadStartSource::Clear));
+    assert_eq!(started.clear_predecessor_thread_id, Some(predecessor));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_start_rejects_clear_predecessor_without_clear_source() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml_without_approval_policy(codex_home.path(), &server.uri())?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+
+    let request_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            clear_predecessor_thread_id: Some("019fe0ce-0000-4000-8000-000000000000".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let error: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+
+    assert_eq!(error.error.code, INVALID_REQUEST_ERROR_CODE);
+    assert_eq!(
+        error.error.message,
+        "clearPredecessorThreadId requires sessionStartSource=clear"
+    );
     Ok(())
 }
 

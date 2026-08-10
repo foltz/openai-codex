@@ -1265,6 +1265,7 @@ async fn skills_changed_notification_is_emitted_after_skill_change() -> Result<(
             ephemeral: None,
             history_mode: None,
             session_start_source: None,
+            clear_predecessor_thread_id: None,
             thread_source: None,
             dynamic_tools: None,
             environments: None,

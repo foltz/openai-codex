@@ -400,6 +400,7 @@ impl App {
                             app_server
                                 .start_thread_with_session_start_source(
                                     &config, /*session_start_source*/ None,
+                                    /*clear_predecessor_thread_id*/ None,
                                 )
                                 .await
                         }

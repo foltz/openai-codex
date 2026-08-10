@@ -663,6 +663,10 @@ impl App {
             &self.cli_kv_overrides,
             &self.harness_overrides,
         );
+        let clear_predecessor_thread_id =
+            matches!(session_start_source, Some(ThreadStartSource::Clear))
+                .then(|| self.current_displayed_thread_id())
+                .flatten();
         let summary = session_summary(
             self.chat_widget.token_usage(),
             self.chat_widget.thread_id(),
@@ -679,7 +683,11 @@ impl App {
         }
         self.config = config.clone();
         match app_server
-            .start_thread_with_session_start_source(&config, session_start_source)
+            .start_thread_with_session_start_source(
+                &config,
+                session_start_source,
+                clear_predecessor_thread_id,
+            )
             .await
         {
             Ok(mut started) => {

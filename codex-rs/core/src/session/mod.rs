@@ -4163,6 +4163,22 @@ impl Session {
         state.take_pending_session_start_source()
     }
 
+    pub(crate) async fn queue_eager_session_start_hook_outcome(
+        &self,
+        should_stop: bool,
+        additional_contexts: Vec<String>,
+    ) {
+        let mut state = self.state.lock().await;
+        state.queue_eager_session_start_outcome(should_stop, additional_contexts);
+    }
+
+    pub(crate) async fn take_eager_session_start_hook_outcome(
+        &self,
+    ) -> Option<crate::state::EagerSessionStartOutcome> {
+        let mut state = self.state.lock().await;
+        state.take_eager_session_start_outcome()
+    }
+
     fn show_raw_agent_reasoning(&self) -> bool {
         self.services.show_raw_agent_reasoning
     }

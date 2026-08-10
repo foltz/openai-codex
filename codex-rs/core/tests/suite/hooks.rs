@@ -1394,6 +1394,18 @@ async fn session_start_hook_sees_materialized_transcript_path() -> Result<()> {
         .with_config(trust_discovered_hooks);
     let test = builder.build(&server).await?;
 
+    let hook_inputs_before_first_turn = read_session_start_hook_inputs(test.codex_home_path())?;
+    assert_eq!(
+        hook_inputs_before_first_turn
+            .iter()
+            .map(|input| input["hook_event_name"]
+                .as_str()
+                .expect("hook input event name"))
+            .collect::<Vec<_>>(),
+        vec!["SessionStart"],
+        "an empty interactive session must dispatch SessionStart before its first prompt"
+    );
+
     test.submit_turn("hello").await?;
 
     let hook_inputs = read_session_start_hook_inputs(test.codex_home_path())?;

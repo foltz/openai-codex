@@ -44,6 +44,11 @@ pub(crate) struct SessionState {
     pub(crate) current_time_reminder: CurrentTimeReminderState,
     pub(crate) active_connector_selection: HashSet<String>,
     pub(crate) pending_session_start_sources: VecDeque<codex_hooks::SessionStartSource>,
+    /// Synchronous output from a `SessionStart` hook that ran while the
+    /// session became addressable, before any model turn exists. The output is
+    /// recorded ahead of the first user prompt so eager dispatch preserves the
+    /// existing context-injection contract.
+    pending_eager_session_start_outcomes: VecDeque<EagerSessionStartOutcome>,
     granted_permissions_by_environment_id: HashMap<String, AdditionalPermissionProfile>,
     next_turn_is_first: bool,
 }
@@ -77,6 +82,7 @@ impl SessionState {
             current_time_reminder: CurrentTimeReminderState::default(),
             active_connector_selection: HashSet::new(),
             pending_session_start_sources: VecDeque::new(),
+            pending_eager_session_start_outcomes: VecDeque::new(),
             granted_permissions_by_environment_id: HashMap::new(),
             next_turn_is_first: true,
         }
@@ -293,6 +299,22 @@ impl SessionState {
         self.pending_session_start_sources.pop_front()
     }
 
+    pub(crate) fn queue_eager_session_start_outcome(
+        &mut self,
+        should_stop: bool,
+        additional_contexts: Vec<String>,
+    ) {
+        self.pending_eager_session_start_outcomes
+            .push_back(EagerSessionStartOutcome {
+                should_stop,
+                additional_contexts,
+            });
+    }
+
+    pub(crate) fn take_eager_session_start_outcome(&mut self) -> Option<EagerSessionStartOutcome> {
+        self.pending_eager_session_start_outcomes.pop_front()
+    }
+
     pub(crate) fn record_granted_permissions(
         &mut self,
         environment_id: &str,
@@ -317,6 +339,11 @@ impl SessionState {
             .get(environment_id)
             .cloned()
     }
+}
+
+pub(crate) struct EagerSessionStartOutcome {
+    pub(crate) should_stop: bool,
+    pub(crate) additional_contexts: Vec<String>,
 }
 
 // Sometimes new snapshots don't include credits or plan information.

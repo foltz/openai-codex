@@ -17,6 +17,8 @@ use crate::session::PreviousTurnSettings;
 use crate::session::session::SessionConfiguration;
 use crate::session::time_reminder::CurrentTimeReminderState;
 use crate::session_startup_prewarm::SessionStartupPrewarmHandle;
+use codex_protocol::protocol::HookCompletedEvent;
+use codex_protocol::protocol::HookRunSummary;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
@@ -44,10 +46,11 @@ pub(crate) struct SessionState {
     pub(crate) current_time_reminder: CurrentTimeReminderState,
     pub(crate) active_connector_selection: HashSet<String>,
     pub(crate) pending_session_start_sources: VecDeque<codex_hooks::SessionStartSource>,
-    /// Synchronous output from a `SessionStart` hook that ran while the
-    /// session became addressable, before any model turn exists. The output is
-    /// recorded ahead of the first user prompt so eager dispatch preserves the
-    /// existing context-injection contract.
+    /// Synchronous output and lifecycle records from a `SessionStart` hook that
+    /// ran while the session became addressable, before any model turn exists.
+    /// The first turn replays the lifecycle records and applies the output
+    /// ahead of its prompt so eager dispatch preserves existing observability,
+    /// context-injection, and stop contracts.
     pending_eager_session_start_outcomes: VecDeque<EagerSessionStartOutcome>,
     granted_permissions_by_environment_id: HashMap<String, AdditionalPermissionProfile>,
     next_turn_is_first: bool,
@@ -301,11 +304,15 @@ impl SessionState {
 
     pub(crate) fn queue_eager_session_start_outcome(
         &mut self,
+        preview_runs: Vec<HookRunSummary>,
+        hook_events: Vec<HookCompletedEvent>,
         should_stop: bool,
         additional_contexts: Vec<String>,
     ) {
         self.pending_eager_session_start_outcomes
             .push_back(EagerSessionStartOutcome {
+                preview_runs,
+                hook_events,
                 should_stop,
                 additional_contexts,
             });
@@ -342,6 +349,8 @@ impl SessionState {
 }
 
 pub(crate) struct EagerSessionStartOutcome {
+    pub(crate) preview_runs: Vec<HookRunSummary>,
+    pub(crate) hook_events: Vec<HookCompletedEvent>,
     pub(crate) should_stop: bool,
     pub(crate) additional_contexts: Vec<String>,
 }

@@ -19,6 +19,7 @@ use codex_app_server_protocol::ThreadRealtimeStartTransport;
 use codex_app_server_protocol::ThreadSettingsUpdateParams;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::ThreadStartSource;
 use codex_protocol::protocol::RealtimeOutputModality;
 use pretty_assertions::assert_eq;
 use std::time::Duration;
@@ -299,6 +300,49 @@ async fn thread_start_mock_field_requires_experimental_api_capability() -> Resul
     )
     .await??;
     assert_experimental_capability_error(error, "thread/start.mockExperimentalField");
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_start_clear_predecessor_requires_experimental_api_capability() -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    let init = mcp
+        .initialize_with_capabilities(
+            default_client_info(),
+            Some(InitializeCapabilities {
+                experimental_api: false,
+                request_attestation: false,
+                opt_out_notification_methods: None,
+                mcp_server_openai_form_elicitation: false,
+                extensions: None,
+            }),
+        )
+        .await?;
+    let JSONRPCMessage::Response(_) = init else {
+        anyhow::bail!("expected initialize response, got {init:?}");
+    };
+
+    let request_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            session_start_source: Some(ThreadStartSource::Clear),
+            clear_predecessor_thread_id: Some("019fe0ce-0000-4000-8000-000000000000".to_string()),
+            ..Default::default()
+        })
+        .await?;
+
+    let error = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    assert_experimental_capability_error(error, "thread/start.clearPredecessor");
     Ok(())
 }
 

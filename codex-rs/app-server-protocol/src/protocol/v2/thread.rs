@@ -1665,12 +1665,12 @@ pub struct ThreadStartedNotification {
     /// The client-declared source for this start, when the source was supplied
     /// on the corresponding `thread/start` request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional = nullable)]
+    #[ts(optional)]
     pub session_start_source: Option<ThreadStartSource>,
-    /// The explicit predecessor of a `Clear` start. This is absent for normal
-    /// new sessions, resumes, and forks.
+    /// The explicit predecessor of a `Clear` start. This is omitted for normal
+    /// new sessions and forks; resumes do not emit `thread/started`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional = nullable)]
+    #[ts(optional)]
     pub clear_predecessor_thread_id: Option<String>,
 }
 

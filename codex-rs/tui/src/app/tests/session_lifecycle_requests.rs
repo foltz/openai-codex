@@ -1369,6 +1369,76 @@ fn fresh_session_applies_requested_name() -> Result<()> {
 }
 
 #[test]
+fn clear_session_sends_the_displayed_predecessor() -> Result<()> {
+    const TEST_STACK_SIZE_BYTES: usize = 8 * 1024 * 1024;
+
+    std::thread::Builder::new()
+        .name("tui-clear-displayed-predecessor".to_string())
+        .stack_size(TEST_STACK_SIZE_BYTES)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(async {
+                let mut app = make_test_app().await;
+                let codex_home = tempdir()?;
+                app.config.codex_home = codex_home.path().to_path_buf().abs();
+                app.config.sqlite = SqliteConfig::new_for_testing(codex_home.path().abs());
+                let (mut app_server, requests, proxy) = start_recording_app_server(
+                    &app.config,
+                    /*blocked_thread_list*/ None,
+                    /*failed_thread_name*/ None,
+                )
+                .await?;
+                let mut tui = crate::tui::test_support::make_test_tui()?;
+
+                app.start_fresh_session_with_summary_hint(
+                    &mut tui,
+                    &mut app_server,
+                    /*session_start_source*/ None,
+                    /*initial_user_message*/ None,
+                    /*new_thread_name*/ None,
+                )
+                .await;
+                let predecessor = app
+                    .current_displayed_thread_id()
+                    .expect("first fresh session should be displayed");
+
+                app.start_fresh_session_with_summary_hint(
+                    &mut tui,
+                    &mut app_server,
+                    Some(ThreadStartSource::Clear),
+                    /*initial_user_message*/ None,
+                    /*new_thread_name*/ None,
+                )
+                .await;
+
+                let starts = recorded_params(&requests, "thread/start");
+                assert_eq!(starts.len(), 2);
+                assert_eq!(
+                    starts[0].get("sessionStartSource"),
+                    Some(&serde_json::Value::Null)
+                );
+                assert_eq!(
+                    starts[0].get("clearPredecessorThreadId"),
+                    Some(&serde_json::Value::Null)
+                );
+                assert_eq!(starts[1]["sessionStartSource"], "clear");
+                assert_eq!(
+                    starts[1]["clearPredecessorThreadId"],
+                    predecessor.to_string()
+                );
+
+                app_server.shutdown().await?;
+                proxy.await??;
+                Ok(())
+            })
+        })?
+        .join()
+        .expect("clear displayed predecessor test thread")
+}
+
+#[test]
 fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
     const TEST_STACK_SIZE_BYTES: usize = 8 * 1024 * 1024;
 

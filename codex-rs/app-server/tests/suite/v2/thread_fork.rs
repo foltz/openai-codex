@@ -252,6 +252,16 @@ async fn thread_fork_creates_new_thread_and_emits_started() -> Result<()> {
         }
     };
     let started_params = notif.params.clone().expect("params must be present");
+    assert_eq!(
+        started_params.get("sessionStartSource"),
+        None,
+        "thread/fork must not attach sessionStartSource metadata"
+    );
+    assert_eq!(
+        started_params.get("clearPredecessorThreadId"),
+        None,
+        "thread/fork must not attach clearPredecessorThreadId metadata"
+    );
     let started_thread_json = started_params
         .get("thread")
         .and_then(Value::as_object)
@@ -278,6 +288,8 @@ async fn thread_fork_creates_new_thread_and_emits_started() -> Result<()> {
     let mut expected_started_thread = thread;
     expected_started_thread.turns.clear();
     assert_eq!(started.thread, expected_started_thread);
+    assert_eq!(started.session_start_source, None);
+    assert_eq!(started.clear_predecessor_thread_id, None);
 
     Ok(())
 }

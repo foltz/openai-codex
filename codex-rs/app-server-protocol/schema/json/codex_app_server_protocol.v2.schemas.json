@@ -19231,6 +19231,24 @@
     "ThreadStartedNotification": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
+        "clearPredecessorThreadId": {
+          "description": "The explicit predecessor of a `Clear` start. This is omitted for normal new sessions and forks; resumes do not emit `thread/started`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sessionStartSource": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ThreadStartSource"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The client-declared source for this start, when the source was supplied on the corresponding `thread/start` request."
+        },
         "thread": {
           "$ref": "#/definitions/Thread"
         }

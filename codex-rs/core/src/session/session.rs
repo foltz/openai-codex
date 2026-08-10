@@ -1891,6 +1891,7 @@ impl Session {
         match session_result {
             Ok(sess) => {
                 live_thread_init.commit();
+                crate::hook_runtime::run_pending_session_start_hooks_eager(&sess).await;
                 Ok(sess)
             }
             Err(err) => {

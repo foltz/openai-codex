@@ -10,6 +10,7 @@ pub(crate) use additional_context::AdditionalContextStore;
 pub(crate) use auto_compact_window::AutoCompactWindowIds;
 pub(crate) use auto_compact_window::AutoCompactWindowSnapshot;
 pub(crate) use service::SessionServices;
+pub(crate) use session::EagerSessionStartOutcome;
 pub(crate) use session::ReasoningEffortPin;
 pub(crate) use session::SessionState;
 pub(crate) use turn::AcceptedUserInputResponse;

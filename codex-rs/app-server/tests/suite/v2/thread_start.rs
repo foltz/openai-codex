@@ -454,6 +454,16 @@ async fn thread_start_creates_thread_and_emits_started() -> Result<()> {
         }
     };
     let started_params = notif.params.clone().expect("params must be present");
+    assert_eq!(
+        started_params.get("sessionStartSource"),
+        None,
+        "normal thread/start must not attach sessionStartSource metadata"
+    );
+    assert_eq!(
+        started_params.get("clearPredecessorThreadId"),
+        None,
+        "normal thread/start must not attach clearPredecessorThreadId metadata"
+    );
     let started_thread_json = started_params
         .get("thread")
         .and_then(Value::as_object)
@@ -480,6 +490,8 @@ async fn thread_start_creates_thread_and_emits_started() -> Result<()> {
     let started: ThreadStartedNotification =
         serde_json::from_value(notif.params.expect("params must be present"))?;
     assert_eq!(started.thread, thread);
+    assert_eq!(started.session_start_source, None);
+    assert_eq!(started.clear_predecessor_thread_id, None);
 
     Ok(())
 }

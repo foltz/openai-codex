@@ -581,6 +581,166 @@ mod tests {
         );
     }
 
+    #[test]
+    fn search_matches_a_full_tool_name_case_insensitively() {
+        let handler = ToolSearchHandler::new(vec![
+            McpHandler::new(tool_info(
+                "ironclaw_workflow",
+                "workflow_run_dispatch_round",
+                "Coordinate the next workflow round",
+            ))
+            .expect("MCP tool should convert")
+            .search_info()
+            .expect("MCP handler should return search info"),
+        ]);
+
+        let tools = handler
+            .search("WORKFLOW_RUN_DISPATCH_ROUND", /*limit*/ 1)
+            .expect("search should succeed");
+
+        assert_eq!(loadable_tool_names(&tools), ["workflow_run_dispatch_round"]);
+    }
+
+    #[test]
+    fn exact_name_matching_finds_a_tool_identifier_embedded_in_prose() {
+        let handler = ToolSearchHandler::new(vec![
+            McpHandler::new(tool_info(
+                "ironclaw_workflow",
+                "workflow_run_dispatch_round",
+                "Coordinate the next workflow round",
+            ))
+            .expect("MCP tool should convert")
+            .search_info()
+            .expect("MCP handler should return search info"),
+        ]);
+
+        assert_eq!(
+            handler.exact_name_match_ids("Please call `WORKFLOW_RUN_DISPATCH_ROUND` next."),
+            [0]
+        );
+    }
+
+    #[test]
+    fn search_matches_the_runtime_flattened_namespaced_tool_name() {
+        let handler = ToolSearchHandler::new(vec![
+            McpHandler::new(tool_info(
+                "ironclaw_workflow",
+                "workflow_run_dispatch_round",
+                "Coordinate the next workflow round",
+            ))
+            .expect("MCP tool should convert")
+            .search_info()
+            .expect("MCP handler should return search info"),
+        ]);
+
+        let tools = handler
+            .search(
+                "mcp__ironclaw_workflowworkflow_run_dispatch_round",
+                /*limit*/ 1,
+            )
+            .expect("search should succeed");
+
+        assert_eq!(loadable_tool_names(&tools), ["workflow_run_dispatch_round"]);
+    }
+
+    #[test]
+    fn search_prioritizes_all_exact_leaf_matches_before_bm25_and_respects_limit() {
+        let mcp_tools = [
+            tool_info("workflow", "first_dispatch_round", "first exact match"),
+            tool_info("workflow", "second_dispatch_round", "second exact match"),
+            tool_info(
+                "workflow",
+                "unrelated_tool",
+                "dispatch_round dispatch_round dispatch_round",
+            ),
+        ];
+        let handler = ToolSearchHandler::new(
+            mcp_tools
+                .iter()
+                .map(|tool| {
+                    McpHandler::new(tool.clone())
+                        .expect("MCP tool should convert")
+                        .search_info()
+                        .expect("MCP handler should return search info")
+                })
+                .collect(),
+        );
+
+        let tools = handler
+            .search("dispatch_round", /*limit*/ 2)
+            .expect("search should succeed");
+
+        assert_eq!(
+            loadable_tool_names(&tools),
+            ["first_dispatch_round", "second_dispatch_round"]
+        );
+    }
+
+    #[test]
+    fn search_backfills_exact_results_with_distinct_bm25_results() {
+        let mcp_tools = [
+            tool_info("workflow", "workflow_run_dispatch_round", "exact match"),
+            tool_info(
+                "workflow",
+                "workflow_run_complete",
+                "dispatch_round dispatch_round dispatch_round",
+            ),
+        ];
+        let handler = ToolSearchHandler::new(
+            mcp_tools
+                .iter()
+                .map(|tool| {
+                    McpHandler::new(tool.clone())
+                        .expect("MCP tool should convert")
+                        .search_info()
+                        .expect("MCP handler should return search info")
+                })
+                .collect(),
+        );
+
+        let tools = handler
+            .search("dispatch_round", /*limit*/ 2)
+            .expect("search should succeed");
+
+        assert_eq!(
+            loadable_tool_names(&tools),
+            ["workflow_run_dispatch_round", "workflow_run_complete"]
+        );
+    }
+
+    #[test]
+    fn exact_name_matching_does_not_promote_partial_tokens() {
+        assert!(tool_name_matches_token(
+            "workflow_run_dispatch_round",
+            "dispatch_round"
+        ));
+        assert!(!tool_name_matches_token(
+            "workflow_run_dispatch_round",
+            "dispatch"
+        ));
+        assert!(!tool_name_matches_token(
+            "workflow_run_dispatch_round",
+            "rounds"
+        ));
+    }
+
+    fn loadable_tool_names(specs: &[LoadableToolSpec]) -> Vec<&str> {
+        specs
+            .iter()
+            .flat_map(|spec| match spec {
+                LoadableToolSpec::Function(tool) => vec![tool.name.as_str()],
+                LoadableToolSpec::Namespace(namespace) => namespace
+                    .tools
+                    .iter()
+                    .map(|tool| {
+                        let ResponsesApiNamespaceTool::Function(tool) = tool;
+                        tool.name.as_str()
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
     fn tool_info(server_name: &str, tool_name: &str, description_prefix: &str) -> ToolInfo {
         ToolInfo {
             server_name: server_name.to_string(),

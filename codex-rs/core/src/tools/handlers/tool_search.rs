@@ -311,9 +311,12 @@ fn loadable_tool_spec_names(spec: &LoadableToolSpec) -> impl Iterator<Item = Str
         LoadableToolSpec::Namespace(namespace) => {
             names.push(namespace.name.clone());
             for tool in &namespace.tools {
-                let codex_tools::ResponsesApiNamespaceTool::Function(tool) = tool;
-                names.push(tool.name.clone());
-                names.push(format!("{}{}", namespace.name, tool.name));
+                let tool_name = match tool {
+                    codex_tools::ResponsesApiNamespaceTool::Function(tool) => &tool.name,
+                    codex_tools::ResponsesApiNamespaceTool::Custom(tool) => &tool.name,
+                };
+                names.push(tool_name.clone());
+                names.push(format!("{}{}", namespace.name, tool_name));
             }
         }
     }
@@ -554,7 +557,7 @@ mod tests {
                     .expect("MCP handler should return search info")
             })
             .collect::<Vec<_>>();
-        let handler = ToolSearchHandler::new(search_infos);
+        let handler = tool_search_handler(search_infos);
 
         let tools = handler
             .search("dispatch_round", /*limit*/ 1)
@@ -583,7 +586,7 @@ mod tests {
 
     #[test]
     fn search_matches_a_full_tool_name_case_insensitively() {
-        let handler = ToolSearchHandler::new(vec![
+        let handler = tool_search_handler(vec![
             McpHandler::new(tool_info(
                 "ironclaw_workflow",
                 "workflow_run_dispatch_round",
@@ -603,7 +606,7 @@ mod tests {
 
     #[test]
     fn exact_name_matching_finds_a_tool_identifier_embedded_in_prose() {
-        let handler = ToolSearchHandler::new(vec![
+        let handler = tool_search_handler(vec![
             McpHandler::new(tool_info(
                 "ironclaw_workflow",
                 "workflow_run_dispatch_round",
@@ -622,7 +625,7 @@ mod tests {
 
     #[test]
     fn search_matches_the_runtime_flattened_namespaced_tool_name() {
-        let handler = ToolSearchHandler::new(vec![
+        let handler = tool_search_handler(vec![
             McpHandler::new(tool_info(
                 "ironclaw_workflow",
                 "workflow_run_dispatch_round",
@@ -654,7 +657,7 @@ mod tests {
                 "dispatch_round dispatch_round dispatch_round",
             ),
         ];
-        let handler = ToolSearchHandler::new(
+        let handler = tool_search_handler(
             mcp_tools
                 .iter()
                 .map(|tool| {
@@ -686,7 +689,7 @@ mod tests {
                 "dispatch_round dispatch_round dispatch_round",
             ),
         ];
-        let handler = ToolSearchHandler::new(
+        let handler = tool_search_handler(
             mcp_tools
                 .iter()
                 .map(|tool| {
@@ -724,6 +727,37 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn search_matches_an_exact_custom_namespace_tool_name() {
+        let custom_tool = codex_tools::FreeformTool {
+            name: "workflow_apply_patch".to_string(),
+            description: "Apply a workflow patch".to_string(),
+            defer_loading: Some(true),
+            format: codex_tools::FreeformToolFormat {
+                r#type: "grammar".to_string(),
+                syntax: "patch".to_string(),
+                definition: "patch grammar".to_string(),
+            },
+        };
+        let search_info = ToolSearchInfo::from_spec(
+            "workflow_apply_patch".to_string(),
+            ToolSpec::Namespace(ResponsesApiNamespace {
+                name: "mcp__workflow__".to_string(),
+                description: "Workflow tools".to_string(),
+                tools: vec![ResponsesApiNamespaceTool::Custom(custom_tool)],
+            }),
+            None,
+        )
+        .expect("custom tool namespace should be searchable");
+        let handler = tool_search_handler(vec![search_info]);
+
+        let tools = handler
+            .search("workflow_apply_patch", /*limit*/ 1)
+            .expect("search should succeed");
+
+        assert_eq!(loadable_tool_names(&tools), ["workflow_apply_patch"]);
+    }
+
     fn loadable_tool_names(specs: &[LoadableToolSpec]) -> Vec<&str> {
         specs
             .iter()
@@ -732,13 +766,17 @@ mod tests {
                 LoadableToolSpec::Namespace(namespace) => namespace
                     .tools
                     .iter()
-                    .map(|tool| {
-                        let ResponsesApiNamespaceTool::Function(tool) = tool;
-                        tool.name.as_str()
+                    .map(|tool| match tool {
+                        ResponsesApiNamespaceTool::Function(tool) => tool.name.as_str(),
+                        ResponsesApiNamespaceTool::Custom(tool) => tool.name.as_str(),
                     })
                     .collect(),
             })
             .collect()
+    }
+
+    fn tool_search_handler(search_infos: Vec<ToolSearchInfo>) -> ToolSearchHandler {
+        ToolSearchHandler::new(search_infos, ToolSearchSourceListing::Include)
     }
 
     fn tool_info(server_name: &str, tool_name: &str, description_prefix: &str) -> ToolInfo {

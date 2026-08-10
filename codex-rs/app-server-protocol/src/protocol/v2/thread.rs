@@ -119,6 +119,15 @@ pub struct ThreadStartParams {
     pub history_mode: Option<ThreadHistoryMode>,
     #[ts(optional = nullable)]
     pub session_start_source: Option<ThreadStartSource>,
+    /// The thread that this client deliberately replaced while clearing its
+    /// visible conversation. This is meaningful only when
+    /// `session_start_source` is `Clear`.
+    ///
+    /// A consumer must treat this as an explicit client lifecycle edge, not as
+    /// permission to infer a global "newest" thread for the workspace.
+    #[experimental("thread/start.clearPredecessor")]
+    #[ts(optional = nullable)]
+    pub clear_predecessor_thread_id: Option<String>,
     /// Optional client-supplied analytics source classification for this thread.
     #[ts(optional = nullable)]
     pub thread_source: Option<ThreadSource>,
@@ -1942,6 +1951,16 @@ impl From<CoreTokenUsage> for TokenUsageBreakdown {
 #[ts(export_to = "v2/")]
 pub struct ThreadStartedNotification {
     pub thread: Thread,
+    /// The client-declared source for this start, when the source was supplied
+    /// on the corresponding `thread/start` request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional = nullable)]
+    pub session_start_source: Option<ThreadStartSource>,
+    /// The explicit predecessor of a `Clear` start. This is absent for normal
+    /// new sessions, resumes, and forks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional = nullable)]
+    pub clear_predecessor_thread_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

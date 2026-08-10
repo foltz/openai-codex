@@ -142,6 +142,7 @@ impl App {
                 &local_settings,
                 &config,
                 /*session_start_source*/ None,
+                /*clear_predecessor_thread_id*/ None,
                 remote_cwd.as_deref(),
                 selected_profile.as_ref(),
             )),

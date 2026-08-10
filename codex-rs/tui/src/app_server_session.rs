@@ -808,6 +808,7 @@ impl AppServerSession {
             &LocalSettings::from(config),
             config,
             /*session_start_source*/ None,
+            /*clear_predecessor_thread_id*/ None,
             /*remote_cwd_override*/ None,
             /*selected_profile*/ None,
         )
@@ -819,6 +820,7 @@ impl AppServerSession {
         local_settings: &LocalSettings,
         config: &Config,
         session_start_source: Option<ThreadStartSource>,
+        clear_predecessor_thread_id: Option<ThreadId>,
         remote_cwd_override: Option<&std::path::Path>,
         selected_profile: Option<&PermissionProfileSelection>,
     ) -> Result<AppServerStartedThread> {
@@ -829,6 +831,7 @@ impl AppServerSession {
             self.thread_params_mode(),
             remote_cwd_override.or(self.remote_cwd_override.as_deref()),
             session_start_source,
+            clear_predecessor_thread_id,
         );
         if let Some(selected_profile) = selected_profile {
             params.runtime_workspace_roots = None;
@@ -1745,6 +1748,7 @@ pub(crate) async fn start_thread_with_request_handle(
         thread_params_mode,
         remote_cwd_override.as_deref(),
         /*session_start_source*/ None,
+        /*clear_predecessor_thread_id*/ None,
     );
     thread_tool_transport.configure(&mut params);
     let (response, _history_support, task_tools_available) =
@@ -2082,6 +2086,7 @@ pub(crate) fn thread_start_params_from_config(
     thread_params_mode: ThreadParamsMode,
     remote_cwd_override: Option<&std::path::Path>,
     session_start_source: Option<ThreadStartSource>,
+    clear_predecessor_thread_id: Option<ThreadId>,
 ) -> ThreadStartParams {
     let permissions = permissions_selection_from_config(config, thread_params_mode);
     let sandbox = permissions
@@ -2110,6 +2115,7 @@ pub(crate) fn thread_start_params_from_config(
         ephemeral: Some(config.ephemeral),
         history_mode: (!config.ephemeral).then_some(ThreadHistoryMode::Paginated),
         session_start_source,
+        clear_predecessor_thread_id: clear_predecessor_thread_id.map(|id| id.to_string()),
         thread_source: Some(ThreadSource::User),
         developer_instructions: with_terminal_visualization_instructions(
             config, /*control_instructions*/ None,
@@ -2848,6 +2854,7 @@ mod tests {
             ThreadParamsMode::Embedded,
             /*remote_cwd_override*/ None,
             /*session_start_source*/ None,
+            /*clear_predecessor_thread_id*/ None,
         );
 
         assert_eq!(params.ephemeral, Some(true));
@@ -2960,6 +2967,7 @@ mod tests {
             ThreadParamsMode::Embedded,
             /*remote_cwd_override*/ None,
             /*session_start_source*/ None,
+            /*clear_predecessor_thread_id*/ None,
         );
 
         assert_eq!(params.cwd, Some(config.cwd.to_string_lossy().to_string()));
@@ -2984,15 +2992,21 @@ mod tests {
     async fn thread_start_params_can_mark_clear_source() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let config = build_config(&temp_dir).await;
+        let predecessor = ThreadId::new();
 
         let params = thread_start_params_from_config(
             &config,
             ThreadParamsMode::Embedded,
             /*remote_cwd_override*/ None,
             Some(ThreadStartSource::Clear),
+            Some(predecessor),
         );
 
         assert_eq!(params.session_start_source, Some(ThreadStartSource::Clear));
+        assert_eq!(
+            params.clear_predecessor_thread_id,
+            Some(predecessor.to_string())
+        );
     }
 
     #[test]
@@ -3207,6 +3221,7 @@ mod tests {
             ThreadParamsMode::Remote,
             /*remote_cwd_override*/ None,
             /*session_start_source*/ None,
+            /*clear_predecessor_thread_id*/ None,
         );
         let resume = thread_resume_params_from_config(
             config.clone(),
@@ -3348,6 +3363,7 @@ mod tests {
             ThreadParamsMode::Remote,
             Some(remote_cwd.as_path()),
             /*session_start_source*/ None,
+            /*clear_predecessor_thread_id*/ None,
         );
         let resume = thread_resume_params_from_config(
             config.clone(),
@@ -3403,6 +3419,7 @@ mod tests {
             ThreadParamsMode::Embedded,
             /*remote_cwd_override*/ None,
             /*session_start_source*/ None,
+            /*clear_predecessor_thread_id*/ None,
         );
         let resume = thread_resume_params_from_config(
             config.clone(),
@@ -3909,6 +3926,7 @@ mod tests {
             ThreadParamsMode::Embedded,
             /*remote_cwd_override*/ None,
             /*session_start_source*/ None,
+            /*clear_predecessor_thread_id*/ None,
         );
         let control_resume = thread_resume_params_from_config(
             config.clone(),
@@ -3939,6 +3957,7 @@ mod tests {
             ThreadParamsMode::Embedded,
             /*remote_cwd_override*/ None,
             /*session_start_source*/ None,
+            /*clear_predecessor_thread_id*/ None,
         );
         let treatment_resume = thread_resume_params_from_config(
             config.clone(),

@@ -1155,6 +1155,7 @@ impl ThreadRequestProcessor {
             ephemeral,
             history_mode,
             session_start_source,
+            clear_predecessor_thread_id,
             thread_source,
             project_id,
             daybreak_enabled,
@@ -1191,6 +1192,16 @@ impl ThreadRequestProcessor {
             if project.is_none() {
                 return Err(invalid_request(format!("project not found: {project_id}")));
             }
+        }
+        if clear_predecessor_thread_id.is_some()
+            && !matches!(
+                session_start_source,
+                Some(codex_app_server_protocol::ThreadStartSource::Clear)
+            )
+        {
+            return Err(invalid_request(
+                "clearPredecessorThreadId requires sessionStartSource=clear",
+            ));
         }
         let runtime_workspace_roots = runtime_workspace_roots.map(resolve_runtime_workspace_roots);
         let environments =
@@ -1242,6 +1253,7 @@ impl ThreadRequestProcessor {
                 selected_capability_roots.unwrap_or_default(),
                 history_mode.map(Into::into),
                 session_start_source,
+                clear_predecessor_thread_id,
                 thread_source.map(Into::into),
                 project_id,
                 daybreak_enabled,
@@ -1324,6 +1336,7 @@ impl ThreadRequestProcessor {
         selected_capability_roots: Vec<SelectedCapabilityRoot>,
         history_mode: Option<ThreadHistoryMode>,
         session_start_source: Option<codex_app_server_protocol::ThreadStartSource>,
+        clear_predecessor_thread_id: Option<String>,
         thread_source: Option<codex_protocol::protocol::ThreadSource>,
         project_id: Option<String>,
         daybreak_enabled: Option<bool>,
@@ -1621,7 +1634,8 @@ impl ThreadRequestProcessor {
             reasoning_effort: config_snapshot.reasoning_effort,
             multi_agent_mode: MultiAgentMode::ExplicitRequestOnly,
         };
-        let notif = thread_started_notification(thread);
+        let notif =
+            thread_started_notification(thread, session_start_source, clear_predecessor_thread_id);
         listener_task_context
             .outgoing
             .send_response_with_thread_originator(request_id, response, thread_originator)
@@ -5328,7 +5342,7 @@ impl ThreadRequestProcessor {
             multi_agent_mode: MultiAgentMode::ExplicitRequestOnly,
         };
 
-        let notif = thread_started_notification(thread);
+        let notif = thread_started_notification(thread, None, None);
         let connection_id = request_id.connection_id;
         self.outgoing
             .send_response_with_thread_originator(request_id, response, thread_originator)

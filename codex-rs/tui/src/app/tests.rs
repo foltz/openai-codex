@@ -4497,6 +4497,8 @@ async fn inactive_thread_started_notification_initializes_replay_session() -> Re
                 name: Some("agent thread".to_string()),
                 turns: Vec::new(),
             },
+            session_start_source: None,
+            clear_predecessor_thread_id: None,
         }),
     )
     .await?;
@@ -4602,6 +4604,8 @@ async fn inactive_thread_started_notification_preserves_primary_model_when_path_
                 name: Some("agent thread".to_string()),
                 turns: Vec::new(),
             },
+            session_start_source: None,
+            clear_predecessor_thread_id: None,
         }),
     )
     .await?;

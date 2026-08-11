@@ -330,6 +330,8 @@ fn write_rollout_with_user_message(
                     forked_from_id: None,
                     forked_from_ordinal_exclusive: None,
                     parent_thread_id: None,
+                    clear_predecessor_thread_id: None,
+                    clear_transition_id: None,
                     timestamp: "2026-06-01T14:26:25Z".to_string(),
                     cwd: home.to_path_buf(),
                     runtime_workspace_roots: None,

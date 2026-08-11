@@ -3126,6 +3126,12 @@ pub struct SessionMeta {
     pub forked_from_ordinal_exclusive: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<ThreadId>,
+    /// Exact predecessor for a server-authorized clear replacement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clear_predecessor_thread_id: Option<ThreadId>,
+    /// Stable clear-transition identity shared with the predecessor end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clear_transition_id: Option<String>,
     pub timestamp: String,
     pub cwd: PathBuf,
     /// Top-level runtime workspace roots at creation for default environments,
@@ -3194,6 +3200,8 @@ impl Default for SessionMeta {
             forked_from_id: None,
             forked_from_ordinal_exclusive: None,
             parent_thread_id: None,
+            clear_predecessor_thread_id: None,
+            clear_transition_id: None,
             timestamp: String::new(),
             cwd: PathBuf::new(),
             runtime_workspace_roots: None,

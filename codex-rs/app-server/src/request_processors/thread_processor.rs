@@ -983,7 +983,7 @@ impl ThreadRequestProcessor {
             })
     }
 
-    async fn set_app_server_client_info(
+    pub(super) async fn set_app_server_client_info(
         thread: &CodexThread,
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
@@ -1092,7 +1092,7 @@ impl ThreadRequestProcessor {
         }
     }
 
-    async fn ensure_conversation_listener(
+    pub(super) async fn ensure_conversation_listener(
         &self,
         conversation_id: ThreadId,
         connection_id: ConnectionId,
@@ -6220,7 +6220,7 @@ fn preview_from_rollout_items(items: &[RolloutItem]) -> String {
         .unwrap_or_default()
 }
 
-fn build_thread_from_snapshot(
+pub(super) fn build_thread_from_snapshot(
     thread_id: ThreadId,
     session_id: String,
     multi_agent_version: Option<codex_protocol::protocol::MultiAgentVersion>,

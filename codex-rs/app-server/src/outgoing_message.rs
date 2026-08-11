@@ -805,6 +805,7 @@ impl OutgoingMessageSender {
             .await
         {
             warn!("failed to send server notification to client: {err:?}");
+            return false;
         }
         write_complete_rx.await.is_ok()
     }

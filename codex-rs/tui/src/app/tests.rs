@@ -2488,6 +2488,8 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
                 session_id: root_thread_id.into(),
                 id: child_thread_id,
                 parent_thread_id: Some(root_thread_id),
+                clear_predecessor_thread_id: None,
+                clear_transition_id: None,
                 timestamp: timestamp.clone(),
                 cwd: app.config.cwd.to_path_buf(),
                 originator: "codex-tui-test".to_string(),

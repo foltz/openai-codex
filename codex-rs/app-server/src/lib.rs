@@ -988,6 +988,7 @@ pub async fn run_main_with_transport_options(
         let mut remote_control_status = remote_control_status_rx.borrow().clone();
         let transport_shutdown_token = transport_shutdown_token.clone();
         async move {
+            processor.reconcile_incomplete_clear_transitions().await;
             let recovery_task = if managed_daemon {
                 match daemon_thread_recovery::start_recovery(
                     recovery_file.clone(),

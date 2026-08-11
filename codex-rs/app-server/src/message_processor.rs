@@ -794,6 +794,12 @@ impl MessageProcessor {
         }
     }
 
+    pub(crate) async fn reconcile_incomplete_clear_transitions(&self) {
+        self.thread_processor
+            .reconcile_incomplete_clear_transitions()
+            .await;
+    }
+
     pub(crate) async fn send_initialize_notifications_to_connection(
         &self,
         connection_id: ConnectionId,
@@ -1288,9 +1294,11 @@ impl MessageProcessor {
                 }
                 Ok(response)
             }
-            ClientRequest::ThreadClear { params: _, .. } => Err(invalid_request(
-                "thread/clear orchestration is not available in this build",
-            )),
+            ClientRequest::ThreadClear { params, .. } => {
+                self.thread_processor
+                    .thread_clear(request_id.clone(), params)
+                    .await
+            }
             ClientRequest::ThreadResume { params, .. } => {
                 self.thread_processor
                     .thread_resume(

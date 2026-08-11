@@ -284,6 +284,94 @@ mod tests {
         assert_eq!(results, vec![true, false, true, false]);
     }
 
+    #[tokio::test]
+    async fn clear_authority_reservation_distinguishes_rejection_causes() {
+        let manager = ThreadStateManager::new();
+        let unknown_thread_id = ThreadId::new();
+        let thread_id = ThreadId::new();
+        let subscribed_connection = ConnectionId(1);
+        let other_connection = ConnectionId(2);
+
+        manager
+            .connection_initialized(subscribed_connection, ConnectionCapabilities::default())
+            .await;
+        manager
+            .connection_initialized(other_connection, ConnectionCapabilities::default())
+            .await;
+
+        assert_eq!(
+            manager
+                .reserve_clear_transition_authority(unknown_thread_id, subscribed_connection)
+                .await,
+            Err(ClearTransitionAuthorityError::UnknownPredecessor)
+        );
+
+        manager
+            .try_ensure_connection_subscribed(
+                thread_id,
+                subscribed_connection,
+                /* experimental_raw_events */ false,
+            )
+            .await
+            .expect("connection should be live");
+
+        assert_eq!(
+            manager
+                .reserve_clear_transition_authority(thread_id, other_connection)
+                .await,
+            Err(ClearTransitionAuthorityError::NotSubscribed)
+        );
+        assert_eq!(
+            manager
+                .reserve_clear_transition_authority(thread_id, subscribed_connection)
+                .await,
+            Ok(())
+        );
+        assert_eq!(
+            manager
+                .reserve_clear_transition_authority(thread_id, subscribed_connection)
+                .await,
+            Err(ClearTransitionAuthorityError::TransitionConflict)
+        );
+    }
+
+    #[tokio::test]
+    async fn releasing_clear_authority_allows_a_new_subscriber_to_reserve() {
+        let manager = ThreadStateManager::new();
+        let thread_id = ThreadId::new();
+        let first_connection = ConnectionId(1);
+        let second_connection = ConnectionId(2);
+
+        for connection_id in [first_connection, second_connection] {
+            manager
+                .connection_initialized(connection_id, ConnectionCapabilities::default())
+                .await;
+            manager
+                .try_ensure_connection_subscribed(
+                    thread_id,
+                    connection_id,
+                    /* experimental_raw_events */ false,
+                )
+                .await
+                .expect("connection should be live");
+        }
+
+        assert_eq!(
+            manager
+                .reserve_clear_transition_authority(thread_id, first_connection)
+                .await,
+            Ok(())
+        );
+        assert!(manager.release_clear_transition_authority(thread_id).await);
+        assert!(!manager.release_clear_transition_authority(thread_id).await);
+        assert_eq!(
+            manager
+                .reserve_clear_transition_authority(thread_id, second_connection)
+                .await,
+            Ok(())
+        );
+    }
+
     fn thread_settings(model: &str) -> ThreadSettings {
         ThreadSettings {
             disabled_plugin_ids: Vec::new(),
@@ -344,6 +432,14 @@ struct ThreadStateManagerInner {
     live_connections: HashMap<ConnectionId, ConnectionCapabilities>,
     threads: HashMap<ThreadId, ThreadEntry>,
     thread_ids_by_connection: HashMap<ConnectionId, HashSet<ThreadId>>,
+    clear_transition_reservations: HashSet<ThreadId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ClearTransitionAuthorityError {
+    UnknownPredecessor,
+    NotSubscribed,
+    TransitionConflict,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -375,6 +471,42 @@ impl ThreadStateManager {
             .await
             .live_connections
             .insert(connection_id, capabilities);
+    }
+
+    /// Validates client authority and reserves the predecessor for one clear transition.
+    ///
+    /// Validation and reservation occur under the same mutex so two subscribed clients
+    /// cannot both acquire clear authority for the same predecessor.
+    pub(crate) async fn reserve_clear_transition_authority(
+        &self,
+        predecessor_thread_id: ThreadId,
+        connection_id: ConnectionId,
+    ) -> Result<(), ClearTransitionAuthorityError> {
+        let mut state = self.state.lock().await;
+        let Some(thread_entry) = state.threads.get(&predecessor_thread_id) else {
+            return Err(ClearTransitionAuthorityError::UnknownPredecessor);
+        };
+        if !thread_entry.connection_ids.contains(&connection_id) {
+            return Err(ClearTransitionAuthorityError::NotSubscribed);
+        }
+        if !state
+            .clear_transition_reservations
+            .insert(predecessor_thread_id)
+        {
+            return Err(ClearTransitionAuthorityError::TransitionConflict);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn release_clear_transition_authority(
+        &self,
+        predecessor_thread_id: ThreadId,
+    ) -> bool {
+        self.state
+            .lock()
+            .await
+            .clear_transition_reservations
+            .remove(&predecessor_thread_id)
     }
 
     pub(crate) async fn first_attestation_capable_connection_for_thread(

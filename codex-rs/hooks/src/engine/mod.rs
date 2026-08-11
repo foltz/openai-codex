@@ -18,6 +18,7 @@ use crate::events::post_tool_use::PostToolUseRequest;
 use crate::events::pre_tool_use::PreToolUseOutcome;
 use crate::events::pre_tool_use::PreToolUseRequest;
 use crate::events::session_end::SessionEndOutcome;
+use crate::events::session_end::SessionEndReason;
 use crate::events::session_end::SessionEndRequest;
 use crate::events::session_start::SessionStartOutcome;
 use crate::events::session_start::SessionStartRequest;
@@ -460,8 +461,8 @@ impl ClaudeHooksEngine {
         crate::events::stop::preview(&self.handlers, request)
     }
 
-    pub(crate) fn preview_session_end(&self) -> Vec<HookRunSummary> {
-        crate::events::session_end::preview(&self.handlers)
+    pub(crate) fn preview_session_end(&self, reason: SessionEndReason) -> Vec<HookRunSummary> {
+        crate::events::session_end::preview(&self.handlers, reason)
     }
 
     pub(crate) async fn run_session_end(&self, request: SessionEndRequest) -> SessionEndOutcome {

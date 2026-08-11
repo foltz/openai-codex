@@ -15,6 +15,7 @@ use crate::events::post_tool_use::PostToolUseRequest;
 use crate::events::pre_tool_use::PreToolUseOutcome;
 use crate::events::pre_tool_use::PreToolUseRequest;
 use crate::events::session_end::SessionEndOutcome;
+use crate::events::session_end::SessionEndReason;
 use crate::events::session_end::SessionEndRequest;
 use crate::events::session_start::SessionStartOutcome;
 use crate::events::session_start::SessionStartRequest;
@@ -284,8 +285,11 @@ impl Hooks {
         self.engine.run_stop(request).await
     }
 
-    pub fn preview_session_end(&self) -> Vec<codex_protocol::protocol::HookRunSummary> {
-        self.engine.preview_session_end()
+    pub fn preview_session_end(
+        &self,
+        reason: SessionEndReason,
+    ) -> Vec<codex_protocol::protocol::HookRunSummary> {
+        self.engine.preview_session_end(reason)
     }
 
     pub async fn run_session_end(&self, request: SessionEndRequest) -> SessionEndOutcome {

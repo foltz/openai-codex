@@ -49,6 +49,13 @@ pub struct SessionStartRequest {
     pub model: String,
     pub permission_mode: String,
     pub target: StartHookTarget,
+    pub clear_context: Option<ClearSessionStartContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClearSessionStartContext {
+    pub predecessor_thread_id: String,
+    pub transition_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +143,7 @@ pub(crate) async fn run(
                 request.model.clone(),
                 request.permission_mode.clone(),
                 source.as_str().to_string(),
+                request.clear_context.clone(),
             )) {
                 Ok(input_json) => input_json,
                 Err(error) => {

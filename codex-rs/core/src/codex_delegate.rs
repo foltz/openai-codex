@@ -134,6 +134,7 @@ pub(crate) async fn run_codex_thread_interactive(
         inherited_multi_agent_version: Some(MultiAgentVersion::Disabled),
         git_enrichment_policy,
         windows_sandbox_proxy_settings_mode,
+        deferred_clear_session_start: None,
     })
     .or_cancel(&cancel_token)
     .await??;

@@ -188,6 +188,14 @@ Bedrock login return an error without changing configuration or saved credential
 exporter configuration before selecting another credential source. `aws.credential_export` and
 `aws.profile` cannot be configured together.
 
+## Clear lifecycle
+
+KCF's `thread/clear` replaces the requester's displayed predecessor with an
+authoritative successor. Its `transitionId` correlates the requester-scoped
+`thread/clear/ended` and `thread/clear/started` notifications; broad
+`thread/started` notifications are not succession authority. Protocol-only
+builds reject clear until the corresponding orchestration is enabled.
+
 ## Stored thread attachments
 
 - `thread/attachment/add` — add a durable resource reference to a stored thread without loading it. Repeated writes with the same attachment type and identity key return the existing attachment.

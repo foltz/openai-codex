@@ -736,6 +736,37 @@ pub struct ThreadUnsubscribeResponse {
     pub status: ThreadUnsubscribeStatus,
 }
 
+/// Parameters for the server-owned clear-and-replace operation.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadClearParams {
+    /// The predecessor currently displayed by the requesting connection.
+    pub thread_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadClearResponse {
+    pub transition_id: String,
+    pub predecessor_thread_id: String,
+    pub successor_thread: Thread,
+}
+
+/// Stable machine-readable causes returned in JSON-RPC error data by `thread/clear`.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub enum ThreadClearErrorCode {
+    UnknownPredecessor,
+    NotSubscribed,
+    TransitionConflict,
+    TransitionCompleted,
+    StateUnavailable,
+    SuccessorCreationFailed,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -1961,6 +1992,35 @@ pub struct ThreadStartedNotification {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub clear_predecessor_thread_id: Option<String>,
+}
+
+/// Requester-scoped authoritative predecessor evidence for `thread/clear`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadClearEndedNotification {
+    pub transition_id: String,
+    pub predecessor_thread_id: String,
+    pub successor_thread_id: String,
+    pub reason: ThreadClearEndReason,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub enum ThreadClearEndReason {
+    Clear,
+}
+
+/// Requester-scoped authoritative successor evidence for `thread/clear`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadClearStartedNotification {
+    pub transition_id: String,
+    pub predecessor_thread_id: String,
+    pub successor_thread: Thread,
+    pub start_source: ThreadStartSource,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

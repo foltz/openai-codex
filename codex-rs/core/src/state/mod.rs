@@ -12,6 +12,7 @@ pub(crate) use auto_compact_window::AutoCompactWindowSnapshot;
 pub(crate) use service::SessionServices;
 pub(crate) use session::EagerSessionStartOutcome;
 pub(crate) use session::ReasoningEffortPin;
+pub(crate) use session::PendingSessionStart;
 pub(crate) use session::SessionState;
 pub(crate) use turn::AcceptedUserInputResponse;
 pub(crate) use turn::ActiveTurn;

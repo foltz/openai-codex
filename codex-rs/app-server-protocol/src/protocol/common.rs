@@ -589,6 +589,11 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::ThreadUnsubscribeResponse,
     },
+    ThreadClear => "thread/clear" {
+        params: v2::ThreadClearParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadClearResponse,
+    },
     #[experimental("thread/increment_elicitation")]
     /// Increment the thread-local out-of-band elicitation counter.
     ///
@@ -1910,6 +1915,8 @@ server_notification_definitions! {
     /// NEW NOTIFICATIONS
     Error => "error" (v2::ErrorNotification),
     ThreadStarted => "thread/started" (v2::ThreadStartedNotification),
+    ThreadClearEnded => "thread/clear/ended" (v2::ThreadClearEndedNotification),
+    ThreadClearStarted => "thread/clear/started" (v2::ThreadClearStartedNotification),
     ThreadStatusChanged => "thread/status/changed" (v2::ThreadStatusChangedNotification),
     ThreadArchived => "thread/archived" (v2::ThreadArchivedNotification),
     ThreadDeleted => "thread/deleted" (v2::ThreadDeletedNotification),

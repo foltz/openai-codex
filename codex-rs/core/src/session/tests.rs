@@ -983,6 +983,7 @@ async fn preview_session_start_hooks(
             target: codex_hooks::StartHookTarget::SessionStart {
                 source: codex_hooks::SessionStartSource::Startup,
             },
+            clear_context: None,
         }),
     )
 }
@@ -1903,6 +1904,7 @@ async fn reload_user_config_layer_refreshes_hooks() -> anyhow::Result<()> {
         target: codex_hooks::StartHookTarget::SessionStart {
             source: codex_hooks::SessionStartSource::Startup,
         },
+        clear_context: None,
     };
     assert!(session.hooks().preview_session_start(&request).is_empty());
 
@@ -2012,6 +2014,7 @@ async fn refresh_runtime_config_refreshes_hooks() -> anyhow::Result<()> {
         target: codex_hooks::StartHookTarget::SessionStart {
             source: codex_hooks::SessionStartSource::Startup,
         },
+        clear_context: None,
     };
     assert!(session.hooks().preview_session_start(&request).is_empty());
 
@@ -5982,6 +5985,7 @@ async fn session_new_fails_when_zsh_fork_enabled_without_packaged_zsh() {
         Some(config.multi_agent_version_from_features()),
         GitEnrichmentPolicy::Fresh,
         codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
+        /*deferred_clear_session_start*/ None,
     )
     .await;
 
@@ -6479,6 +6483,7 @@ async fn make_session_with_config_and_rx(
         Some(config.multi_agent_version_from_features()),
         GitEnrichmentPolicy::Fresh,
         codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
+        /*deferred_clear_session_start*/ None,
     )
     .await?;
 
@@ -6618,6 +6623,7 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         Some(config.multi_agent_version_from_features()),
         GitEnrichmentPolicy::Fresh,
         codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
+        /*deferred_clear_session_start*/ None,
     )
     .await?;
 

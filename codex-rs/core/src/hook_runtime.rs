@@ -145,13 +145,13 @@ pub(crate) async fn run_pending_session_start_hooks(
             return true;
         }
     }
-    while let Some(session_start_source) = sess.take_pending_session_start_source().await {
+    while let Some(pending_start) = sess.take_pending_session_start().await {
         // Spawned subagents can start fresh or fork their parent's history, so both
         // sources dispatch SubagentStart. Internal/system subagents skip start hooks.
         let target = match &turn_context.session_source {
             SessionSource::SubAgent(SubAgentSource::ThreadSpawn { agent_role, .. })
                 if matches!(
-                    session_start_source,
+                    pending_start.source,
                     codex_hooks::SessionStartSource::Startup
                         | codex_hooks::SessionStartSource::Fork
                 ) =>
@@ -165,7 +165,7 @@ pub(crate) async fn run_pending_session_start_hooks(
             }
             SessionSource::SubAgent(_) => return false,
             _ => StartHookTarget::SessionStart {
-                source: session_start_source,
+                source: pending_start.source,
             },
         };
         let request = codex_hooks::SessionStartRequest {
@@ -176,6 +176,7 @@ pub(crate) async fn run_pending_session_start_hooks(
             model: turn_context.model_info().slug.clone(),
             permission_mode: hook_permission_mode(turn_context.approval_policy()),
             target,
+            clear_context: pending_start.clear_context,
         };
         let hooks = sess.hooks();
         let preview_runs = hooks.preview_session_start(&request);
@@ -205,13 +206,13 @@ pub(crate) async fn run_pending_session_start_hooks(
 /// start source can be remapped to `SubagentStart` only once a turn context is
 /// available.
 #[instrument(level = "trace", skip_all)]
-pub(crate) async fn run_pending_session_start_hooks_eager(sess: &Arc<Session>) {
+pub(crate) async fn run_pending_session_start_hooks_eager(sess: &Arc<Session>) -> bool {
     let config_snapshot = sess.thread_config_snapshot().await;
     if matches!(&config_snapshot.session_source, SessionSource::SubAgent(_)) {
-        return;
+        return false;
     }
-    let Some(session_start_source) = sess.take_pending_session_start_source().await else {
-        return;
+    let Some(pending_start) = sess.take_pending_session_start().await else {
+        return false;
     };
     let config = sess.get_config().await;
     let mut request = codex_hooks::SessionStartRequest {
@@ -222,13 +223,14 @@ pub(crate) async fn run_pending_session_start_hooks_eager(sess: &Arc<Session>) {
         model: config_snapshot.model,
         permission_mode: hook_permission_mode(config_snapshot.approval_policy),
         target: StartHookTarget::SessionStart {
-            source: session_start_source,
+            source: pending_start.source,
         },
+        clear_context: pending_start.clear_context,
     };
     let hooks = sess.hooks();
     let preview_runs = hooks.preview_session_start(&request);
     if preview_runs.is_empty() {
-        return;
+        return true;
     }
     request.transcript_path = sess.hook_transcript_path().await;
     let outcome = hooks.run_session_start(request, None).await;
@@ -239,6 +241,7 @@ pub(crate) async fn run_pending_session_start_hooks_eager(sess: &Arc<Session>) {
         outcome.additional_contexts,
     )
     .await;
+    true
 }
 
 /// Runs matching `PreToolUse` hooks before a tool executes.
@@ -525,8 +528,29 @@ pub(crate) async fn run_turn_stop_hooks(
 
 #[instrument(level = "trace", skip_all)]
 pub(crate) async fn run_session_end_hooks(sess: &Arc<Session>) {
+    run_session_end_hooks_for_reason(sess, codex_hooks::SessionEndReason::Other, None).await;
+}
+
+#[instrument(level = "trace", skip_all)]
+pub(crate) async fn run_clear_session_end_hooks(
+    sess: &Arc<Session>,
+    transition_id: codex_state::ClearTransitionId,
+) {
+    run_session_end_hooks_for_reason(
+        sess,
+        codex_hooks::SessionEndReason::Clear,
+        Some(transition_id.to_string()),
+    )
+    .await;
+}
+
+async fn run_session_end_hooks_for_reason(
+    sess: &Arc<Session>,
+    reason: codex_hooks::SessionEndReason,
+    clear_transition_id: Option<String>,
+) {
     let hooks = sess.hooks();
-    let preview_runs = hooks.preview_session_end();
+    let preview_runs = hooks.preview_session_end(reason);
     if preview_runs.is_empty() {
         return;
     }
@@ -545,6 +569,8 @@ pub(crate) async fn run_session_end_hooks(sess: &Arc<Session>) {
         #[allow(deprecated)]
         cwd: turn_context.cwd.clone(),
         transcript_path: sess.hook_transcript_path().await,
+        reason,
+        clear_transition_id,
     };
     if let Err(err) = sess.flush_rollout().await {
         tracing::warn!("failed to flush transcript before SessionEnd hook: {err}");

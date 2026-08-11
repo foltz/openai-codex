@@ -483,6 +483,14 @@ pub(crate) struct SessionSpawnArgs {
     pub(crate) git_enrichment_policy: GitEnrichmentPolicy,
     pub(crate) windows_sandbox_proxy_settings_mode:
         codex_sandboxing::WindowsSandboxProxySettingsMode,
+    pub(crate) deferred_clear_session_start: Option<DeferredClearSessionStart>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DeferredClearSessionStart {
+    pub(crate) predecessor_thread_id: ThreadId,
+    pub(crate) successor_thread_id: ThreadId,
+    pub(crate) transition_id: codex_state::ClearTransitionId,
 }
 
 pub(crate) fn resolve_multi_agent_version(
@@ -585,6 +593,7 @@ impl Session {
             inherited_multi_agent_version,
             git_enrichment_policy,
             windows_sandbox_proxy_settings_mode,
+            deferred_clear_session_start,
         } = args;
         let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
         let (tx_event, rx_event) = async_channel::unbounded();
@@ -918,6 +927,7 @@ impl Session {
             multi_agent_version,
             git_enrichment_policy,
             windows_sandbox_proxy_settings_mode,
+            deferred_clear_session_start,
         ))
         .await
         .map_err(|e| {
@@ -4892,11 +4902,11 @@ impl Session {
         Some(rollout_path)
     }
 
-    pub(crate) async fn take_pending_session_start_source(
+    pub(crate) async fn take_pending_session_start(
         &self,
-    ) -> Option<codex_hooks::SessionStartSource> {
+    ) -> Option<crate::state::PendingSessionStart> {
         let mut state = self.state.lock().await;
-        state.take_pending_session_start_source()
+        state.take_pending_session_start()
     }
 
     pub(crate) async fn queue_eager_session_start_hook_outcome(

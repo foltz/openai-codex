@@ -769,6 +769,7 @@ impl Session {
         multi_agent_version: Option<MultiAgentVersion>,
         git_enrichment_policy: GitEnrichmentPolicy,
         windows_sandbox_proxy_settings_mode: codex_sandboxing::WindowsSandboxProxySettingsMode,
+        deferred_clear_session_start: Option<super::DeferredClearSessionStart>,
     ) -> anyhow::Result<Arc<Self>> {
         debug!(
             "Configuring session: model={}; provider={:?}",
@@ -854,6 +855,19 @@ impl Session {
         let multi_agent_version = multi_agent_version.map(OnceLock::from).unwrap_or_default();
         let initial_multi_agent_version = multi_agent_version.get().copied();
 
+        let reserved_thread_id = match deferred_clear_session_start.as_ref() {
+            Some(deferred) => {
+                if !matches!(initial_history, InitialHistory::Cleared)
+                    || reserved_thread_id.is_some_and(|id| id != deferred.successor_thread_id)
+                {
+                    return Err(anyhow::anyhow!(
+                        "deferred clear start requires matching reserved successor identity"
+                    ));
+                }
+                Some(deferred.successor_thread_id)
+            }
+            None => reserved_thread_id,
+        };
         let thread_id = match (&initial_history, reserved_thread_id) {
             (
                 InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_),
@@ -1883,7 +1897,14 @@ impl Session {
             }
             {
                 let mut state = sess.state.lock().await;
-                state.queue_pending_session_start_source(session_start_source);
+                if let Some(deferred) = deferred_clear_session_start.as_ref() {
+                    state.queue_deferred_clear_session_start(
+                        deferred.predecessor_thread_id.to_string(),
+                        deferred.transition_id.to_string(),
+                    );
+                } else {
+                    state.queue_pending_session_start_source(session_start_source);
+                }
             }
             Ok(sess)
         }
@@ -1891,7 +1912,9 @@ impl Session {
         match session_result {
             Ok(sess) => {
                 live_thread_init.commit();
-                crate::hook_runtime::run_pending_session_start_hooks_eager(&sess).await;
+                if deferred_clear_session_start.is_none() {
+                    crate::hook_runtime::run_pending_session_start_hooks_eager(&sess).await;
+                }
                 Ok(sess)
             }
             Err(err) => {

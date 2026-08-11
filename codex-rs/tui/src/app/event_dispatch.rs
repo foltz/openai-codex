@@ -25,8 +25,7 @@ impl App {
         match event {
             AppEvent::NewSession { name } => {
                 self.start_fresh_session_with_summary_hint(
-                    tui, app_server, /*session_start_source*/ None,
-                    /*initial_user_message*/ None, name,
+                    tui, app_server, /*initial_user_message*/ None, name,
                 )
                 .await;
             }
@@ -76,15 +75,8 @@ impl App {
                 }
             }
             AppEvent::ClearUi { name } => {
-                self.clear_terminal_ui(tui, /*redraw_header*/ false)?;
-                self.reset_app_ui_state_after_clear();
-
-                self.start_fresh_session_with_summary_hint(
-                    tui,
-                    app_server,
-                    Some(ThreadStartSource::Clear),
-                    /*initial_user_message*/ None,
-                    name,
+                self.clear_displayed_session(
+                    tui, app_server, /*initial_user_message*/ None, name,
                 )
                 .await;
             }
@@ -92,13 +84,9 @@ impl App {
                 self.apply_raw_output_mode(tui, enabled, /*notify*/ false);
             }
             AppEvent::ClearUiAndSubmitUserMessage { text } => {
-                self.clear_terminal_ui(tui, /*redraw_header*/ false)?;
-                self.reset_app_ui_state_after_clear();
-
-                self.start_fresh_session_with_summary_hint(
+                self.clear_displayed_session(
                     tui,
                     app_server,
-                    Some(ThreadStartSource::Clear),
                     crate::chatwidget::create_initial_user_message(
                         Some(text),
                         Vec::new(),

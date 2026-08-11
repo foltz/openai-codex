@@ -159,6 +159,27 @@ with Path(r"{hook_log}").open("a", encoding="utf-8") as handle:
         .thread_config_snapshot()
         .await
         .model;
+    let turn_context = successor
+        .thread
+        .session
+        .new_turn_with_sub_id(
+            "premature-clear-turn".to_string(),
+            SessionSettingsUpdate::default(),
+        )
+        .await
+        .expect("build premature turn context");
+    assert!(
+        !crate::hook_runtime::run_pending_session_start_hooks(
+            &successor.thread.session,
+            &turn_context,
+        )
+        .await,
+        "ordinary turn-path drain must not consume the deferred clear start"
+    );
+    assert!(
+        !hook_log.exists(),
+        "ordinary turn-path drain must not dispatch the deferred clear start"
+    );
     predecessor
         .thread
         .dispatch_clear_session_end(transition_id)

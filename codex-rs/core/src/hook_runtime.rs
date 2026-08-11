@@ -158,7 +158,7 @@ pub(crate) async fn run_pending_session_start_hooks(
             model: turn_context.model_info.slug.clone(),
             permission_mode: hook_permission_mode(turn_context),
             target,
-            clear_context: pending_start.clear_context,
+            clear_context: None,
         };
         let hooks = sess.hooks();
         let preview_runs = hooks.preview_session_start(&request);
@@ -196,6 +196,43 @@ pub(crate) async fn run_pending_session_start_hooks_eager(sess: &Arc<Session>) -
     let Some(pending_start) = sess.take_pending_session_start().await else {
         return false;
     };
+    run_session_start_hooks_eager(
+        sess,
+        EagerSessionStart {
+            source: pending_start.source,
+            clear_context: None,
+        },
+    )
+    .await
+}
+
+/// Dispatches the authoritative clear successor start only when the ordered
+/// clear lifecycle orchestrator explicitly releases its one-shot slot.
+#[instrument(level = "trace", skip_all)]
+pub(crate) async fn run_deferred_clear_session_start_hooks_eager(sess: &Arc<Session>) -> bool {
+    let Some(clear_context) = sess.take_deferred_clear_session_start().await else {
+        return false;
+    };
+    run_session_start_hooks_eager(
+        sess,
+        EagerSessionStart {
+            source: codex_hooks::SessionStartSource::Clear,
+            clear_context: Some(clear_context),
+        },
+    )
+    .await
+}
+
+struct EagerSessionStart {
+    source: codex_hooks::SessionStartSource,
+    clear_context: Option<codex_hooks::ClearSessionStartContext>,
+}
+
+async fn run_session_start_hooks_eager(
+    sess: &Arc<Session>,
+    pending_start: EagerSessionStart,
+) -> bool {
+    let config_snapshot = sess.thread_config_snapshot().await;
     let config = sess.get_config().await;
     let mut request = codex_hooks::SessionStartRequest {
         session_id: sess.session_id().into(),

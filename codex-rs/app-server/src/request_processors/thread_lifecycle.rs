@@ -5,6 +5,22 @@ use codex_protocol::config_types::MultiAgentMode;
 
 pub(super) const THREAD_UNLOADING_DELAY: Duration = Duration::from_secs(30 * 60);
 
+#[cfg(debug_assertions)]
+const THREAD_UNLOADING_DELAY_MS_FOR_TESTS_ENV: &str =
+    "CODEX_APP_SERVER_THREAD_UNLOADING_DELAY_MS_FOR_TESTS";
+
+fn thread_unloading_delay() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Some(delay) = std::env::var(THREAD_UNLOADING_DELAY_MS_FOR_TESTS_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return Duration::from_millis(delay);
+    }
+
+    THREAD_UNLOADING_DELAY
+}
+
 #[derive(Clone)]
 pub(super) struct ListenerTaskContext {
     pub(super) thread_manager: Arc<ThreadManager>,
@@ -222,7 +238,7 @@ pub(super) async fn ensure_listener_task_running(
     let Some(mut unloading_state) = UnloadingState::new(
         &listener_task_context,
         conversation_id,
-        THREAD_UNLOADING_DELAY,
+        thread_unloading_delay(),
     )
     .await
     else {

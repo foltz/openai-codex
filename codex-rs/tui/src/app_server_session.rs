@@ -76,6 +76,8 @@ use codex_app_server_protocol::ThreadArchiveParams;
 use codex_app_server_protocol::ThreadArchiveResponse;
 use codex_app_server_protocol::ThreadBackgroundTerminalsCleanParams;
 use codex_app_server_protocol::ThreadBackgroundTerminalsCleanResponse;
+use codex_app_server_protocol::ThreadClearParams;
+use codex_app_server_protocol::ThreadClearResponse;
 use codex_app_server_protocol::ThreadCompactStartParams;
 use codex_app_server_protocol::ThreadCompactStartResponse;
 use codex_app_server_protocol::ThreadDeleteParams;
@@ -1551,6 +1553,22 @@ impl AppServerSession {
             })
             .await
             .wrap_err("thread/goal/clear failed in TUI")
+    }
+
+    pub(crate) async fn thread_clear(
+        &mut self,
+        thread_id: ThreadId,
+    ) -> Result<ThreadClearResponse> {
+        let request_id = self.next_request_id();
+        self.client
+            .request_typed(ClientRequest::ThreadClear {
+                request_id,
+                params: ThreadClearParams {
+                    thread_id: thread_id.to_string(),
+                },
+            })
+            .await
+            .wrap_err("thread/clear failed in TUI")
     }
 
     pub(crate) async fn logout_account(&mut self) -> Result<()> {

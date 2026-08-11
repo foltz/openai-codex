@@ -1,14 +1,15 @@
 CREATE TABLE clear_transitions (
     transition_id TEXT NOT NULL PRIMARY KEY,
-    predecessor_thread_id TEXT NOT NULL UNIQUE,
-    successor_thread_id TEXT NOT NULL UNIQUE,
+    predecessor_thread_id TEXT NOT NULL,
+    successor_thread_id TEXT NOT NULL,
     phase TEXT NOT NULL CHECK (
         phase IN (
             'reserved',
             'successor_created',
             'committed',
             'evidence_claimed',
-            'completed'
+            'completed',
+            'abandoned'
         )
     ),
     end_evidence_state TEXT NOT NULL CHECK (
@@ -23,3 +24,11 @@ CREATE TABLE clear_transitions (
 
 CREATE INDEX idx_clear_transitions_phase
     ON clear_transitions(phase, updated_at);
+
+CREATE UNIQUE INDEX idx_clear_transitions_active_predecessor
+    ON clear_transitions(predecessor_thread_id)
+    WHERE phase != 'abandoned';
+
+CREATE UNIQUE INDEX idx_clear_transitions_active_successor
+    ON clear_transitions(successor_thread_id)
+    WHERE phase != 'abandoned';

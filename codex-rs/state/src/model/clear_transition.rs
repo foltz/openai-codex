@@ -48,6 +48,7 @@ pub enum ClearTransitionPhase {
     Committed,
     EvidenceClaimed,
     Completed,
+    Abandoned,
 }
 
 impl ClearTransitionPhase {
@@ -59,6 +60,14 @@ impl ClearTransitionPhase {
                 | (Self::Committed, Self::EvidenceClaimed)
                 | (Self::EvidenceClaimed, Self::Completed)
         )
+    }
+
+    pub fn can_abandon(self) -> bool {
+        self == Self::Reserved
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Abandoned)
     }
 }
 

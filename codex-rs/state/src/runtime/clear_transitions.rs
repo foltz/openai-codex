@@ -107,6 +107,31 @@ INSERT INTO clear_transitions (
         Ok(result.rows_affected() == 1)
     }
 
+    /// Abandon a reservation only while no successor has been created.
+    ///
+    /// The retained row records the failed attempt, while reservation lookups
+    /// exclude it so the predecessor and reserved successor identities can be
+    /// used by a later authoritative attempt.
+    pub async fn abandon_clear_transition(
+        &self,
+        transition_id: ClearTransitionId,
+        expected: ClearTransitionPhase,
+    ) -> anyhow::Result<bool> {
+        if !expected.can_abandon() {
+            bail!("cannot abandon clear transition from phase: {expected}");
+        }
+        let result = sqlx::query(
+            "UPDATE clear_transitions SET phase = 'abandoned', updated_at = ? \
+             WHERE transition_id = ? AND phase = ?",
+        )
+        .bind(Utc::now().timestamp_millis())
+        .bind(transition_id.to_string())
+        .bind(expected.as_ref())
+        .execute(self.pool.as_ref())
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Advance one ordered evidence state without allowing claim replay or start-before-end.
     pub async fn advance_clear_transition_evidence(
         &self,
@@ -155,7 +180,7 @@ INSERT INTO clear_transitions (
         &self,
     ) -> anyhow::Result<Vec<ClearTransitionRecord>> {
         let rows = sqlx::query(
-            "SELECT * FROM clear_transitions WHERE phase != 'completed' \
+            "SELECT * FROM clear_transitions WHERE phase NOT IN ('completed', 'abandoned') \
              ORDER BY created_at, transition_id",
         )
         .fetch_all(self.pool.as_ref())
@@ -185,7 +210,10 @@ async fn load_by_predecessor<'e, E>(
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
-    let row = sqlx::query("SELECT * FROM clear_transitions WHERE predecessor_thread_id = ?")
+    let row = sqlx::query(
+        "SELECT * FROM clear_transitions \
+         WHERE predecessor_thread_id = ? AND phase != 'abandoned'",
+    )
         .bind(predecessor_thread_id.to_string())
         .fetch_optional(executor)
         .await?;
@@ -199,7 +227,10 @@ async fn load_by_successor<'e, E>(
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
-    let row = sqlx::query("SELECT * FROM clear_transitions WHERE successor_thread_id = ?")
+    let row = sqlx::query(
+        "SELECT * FROM clear_transitions \
+         WHERE successor_thread_id = ? AND phase != 'abandoned'",
+    )
         .bind(successor_thread_id.to_string())
         .fetch_optional(executor)
         .await?;

@@ -150,6 +150,78 @@ async fn phases_only_advance_one_valid_step_from_the_expected_state() {
 }
 
 #[tokio::test]
+async fn abandoned_precreation_reservation_releases_both_identities_for_retry() {
+    let runtime = runtime().await;
+    let transition_id = ClearTransitionId::new();
+    let predecessor = ThreadId::new();
+    let reserved_successor = ThreadId::new();
+    reserved_record(
+        runtime
+            .reserve_clear_transition(transition_id, predecessor, reserved_successor)
+            .await
+            .unwrap(),
+    );
+
+    assert!(
+        runtime
+            .abandon_clear_transition(transition_id, ClearTransitionPhase::Reserved)
+            .await
+            .unwrap()
+    );
+    assert!(
+        runtime
+            .get_clear_transition_by_predecessor(predecessor)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(runtime.list_incomplete_clear_transitions().await.unwrap().is_empty());
+
+    reserved_record(
+        runtime
+            .reserve_clear_transition(
+                ClearTransitionId::new(),
+                predecessor,
+                reserved_successor,
+            )
+            .await
+            .unwrap(),
+    );
+}
+
+#[tokio::test]
+async fn transition_cannot_be_abandoned_after_successor_creation() {
+    let runtime = runtime().await;
+    let transition_id = ClearTransitionId::new();
+    reserved_record(
+        runtime
+            .reserve_clear_transition(transition_id, ThreadId::new(), ThreadId::new())
+            .await
+            .unwrap(),
+    );
+    assert!(
+        runtime
+            .advance_clear_transition_phase(
+                transition_id,
+                ClearTransitionPhase::Reserved,
+                ClearTransitionPhase::SuccessorCreated,
+            )
+            .await
+            .unwrap()
+    );
+
+    assert!(
+        runtime
+            .abandon_clear_transition(
+                transition_id,
+                ClearTransitionPhase::SuccessorCreated,
+            )
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn start_evidence_cannot_be_claimed_before_end_evidence_is_terminal() {
     let runtime = runtime().await;
     let transition_id = ClearTransitionId::new();

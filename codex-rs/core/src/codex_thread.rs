@@ -258,7 +258,7 @@ impl CodexThread {
 
     /// Dispatches a server-authorized clear successor's deferred start hook.
     pub async fn dispatch_deferred_clear_session_start(&self) -> bool {
-        crate::hook_runtime::run_pending_session_start_hooks_eager(&self.session).await
+        crate::hook_runtime::run_deferred_clear_session_start_hooks_eager(&self.session).await
     }
 
     /// Wait until the underlying session loop has terminated.

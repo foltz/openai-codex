@@ -69,7 +69,6 @@ impl ReasoningEffortPin {
 
 pub(crate) struct PendingSessionStart {
     pub(crate) source: codex_hooks::SessionStartSource,
-    pub(crate) clear_context: Option<codex_hooks::ClearSessionStartContext>,
 }
 
 /// Persistent, session-scoped state previously stored directly on `Session`.
@@ -105,6 +104,9 @@ pub(crate) struct SessionState {
     pub(crate) current_time_reminder: CurrentTimeReminderState,
     pub(crate) active_connector_selection: HashSet<String>,
     pub(crate) pending_session_starts: VecDeque<PendingSessionStart>,
+    /// Authoritative clear starts are isolated from the ordinary turn-drained
+    /// queue so only the explicit ordered lifecycle dispatcher can consume one.
+    deferred_clear_session_start: Option<codex_hooks::ClearSessionStartContext>,
     /// Synchronous output and lifecycle records from a `SessionStart` hook that
     /// ran while the session became addressable, before any model turn exists.
     /// The first turn replays the lifecycle records and applies the output
@@ -151,6 +153,7 @@ impl SessionState {
             current_time_reminder: CurrentTimeReminderState::default(),
             active_connector_selection: HashSet::new(),
             pending_session_starts: VecDeque::new(),
+            deferred_clear_session_start: None,
             pending_eager_session_start_outcomes: VecDeque::new(),
             granted_permissions_by_environment_id: HashMap::new(),
             next_turn_is_first: true,
@@ -424,10 +427,8 @@ impl SessionState {
         &mut self,
         value: codex_hooks::SessionStartSource,
     ) {
-        self.pending_session_starts.push_back(PendingSessionStart {
-            source: value,
-            clear_context: None,
-        });
+        self.pending_session_starts
+            .push_back(PendingSessionStart { source: value });
     }
 
     pub(crate) fn queue_deferred_clear_session_start(
@@ -435,17 +436,21 @@ impl SessionState {
         predecessor_thread_id: String,
         transition_id: String,
     ) {
-        self.pending_session_starts.push_back(PendingSessionStart {
-            source: codex_hooks::SessionStartSource::Clear,
-            clear_context: Some(codex_hooks::ClearSessionStartContext {
-                predecessor_thread_id,
-                transition_id,
-            }),
+        debug_assert!(self.deferred_clear_session_start.is_none());
+        self.deferred_clear_session_start = Some(codex_hooks::ClearSessionStartContext {
+            predecessor_thread_id,
+            transition_id,
         });
     }
 
     pub(crate) fn take_pending_session_start(&mut self) -> Option<PendingSessionStart> {
         self.pending_session_starts.pop_front()
+    }
+
+    pub(crate) fn take_deferred_clear_session_start(
+        &mut self,
+    ) -> Option<codex_hooks::ClearSessionStartContext> {
+        self.deferred_clear_session_start.take()
     }
 
     pub(crate) fn queue_eager_session_start_outcome(

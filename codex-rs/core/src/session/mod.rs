@@ -4909,6 +4909,13 @@ impl Session {
         state.take_pending_session_start()
     }
 
+    pub(crate) async fn take_deferred_clear_session_start(
+        &self,
+    ) -> Option<codex_hooks::ClearSessionStartContext> {
+        let mut state = self.state.lock().await;
+        state.take_deferred_clear_session_start()
+    }
+
     pub(crate) async fn queue_eager_session_start_hook_outcome(
         &self,
         preview_runs: Vec<HookRunSummary>,

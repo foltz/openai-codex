@@ -19,8 +19,12 @@ use codex_app_server_protocol::ThreadClearErrorCode;
 use codex_app_server_protocol::ThreadClearParams;
 use codex_app_server_protocol::ThreadClearResponse;
 use codex_app_server_protocol::ThreadClearStartedNotification;
+use codex_app_server_protocol::ThreadReadParams;
+use codex_app_server_protocol::ThreadReadResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::ThreadStartSource;
+use codex_app_server_protocol::ThreadStartedNotification;
 use codex_protocol::ThreadId;
 use codex_state::ClearTransitionEvidenceState;
 use codex_state::ClearTransitionId;
@@ -111,6 +115,70 @@ async fn thread_clear_rejects_unknown_and_current_non_subscriber_without_evidenc
     send_clear(&mut other, 5, &predecessor).await?;
     assert_clear_error(&mut other, 5, ThreadClearErrorCode::NotSubscribed).await?;
     assert_no_clear_evidence(&mut other).await?;
+
+    process.kill().await.context("failed to stop app-server")?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_clear_keeps_bystander_on_usable_predecessor_without_authoritative_evidence()
+-> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri(), "never")?;
+    std::fs::write(
+        codex_home.path().join("hooks.json"),
+        json!({
+            "hooks": {
+                "SessionStart": [{
+                    "matcher": "startup",
+                    "hooks": [{ "type": "command", "command": "true" }]
+                }]
+            }
+        })
+        .to_string(),
+    )?;
+    let (mut process, bind_addr) = spawn_websocket_server(codex_home.path()).await?;
+    let mut requester = connect_websocket(bind_addr).await?;
+    let mut bystander = connect_websocket(bind_addr).await?;
+    initialize(&mut requester, 1, "requester").await?;
+    initialize(&mut bystander, 2, "bystander").await?;
+
+    let predecessor = start_thread_with_config(
+        &mut requester,
+        3,
+        Some(HashMap::from([(
+            "bypass_hook_trust".to_string(),
+            json!(true),
+        )])),
+    )
+    .await?;
+    resume_thread(&mut bystander, 4, &predecessor).await?;
+
+    send_clear(&mut requester, 5, &predecessor).await?;
+    let (response, _) = read_clear_outcome(&mut requester, 5).await?;
+    let successor = response.successor_thread.id;
+
+    let started =
+        read_non_authoritative_clear_broadcast(&mut bystander, &predecessor, &successor).await?;
+    assert_eq!(started.thread.id, successor);
+    assert_eq!(started.session_start_source, Some(ThreadStartSource::Clear));
+    assert_eq!(
+        started.clear_predecessor_thread_id.as_deref(),
+        Some(predecessor.as_str())
+    );
+    assert_no_clear_evidence(&mut bystander).await?;
+
+    // The broadcast is display context only: it does not attach the bystander
+    // to B or detach it from its still-readable subscription to A.
+    assert_unsubscribe_status(&mut bystander, 6, &successor, "notSubscribed").await?;
+    let predecessor_thread = read_thread(&mut bystander, 7, &predecessor).await?;
+    assert_eq!(predecessor_thread.thread.id, predecessor);
+    assert_unsubscribe_status(&mut bystander, 8, &predecessor, "unsubscribed").await?;
+
+    // Only the requester moved from A to B.
+    assert_unsubscribe_status(&mut requester, 9, &predecessor, "notSubscribed").await?;
+    assert_unsubscribe_status(&mut requester, 10, &successor, "unsubscribed").await?;
 
     process.kill().await.context("failed to stop app-server")?;
     Ok(())
@@ -356,6 +424,24 @@ async fn resume_thread(stream: &mut WsClient, id: i64, thread_id: &str) -> Resul
     }
 }
 
+async fn read_thread(
+    stream: &mut WsClient,
+    id: i64,
+    thread_id: &str,
+) -> Result<ThreadReadResponse> {
+    send_request(
+        stream,
+        "thread/read",
+        id,
+        Some(serde_json::to_value(ThreadReadParams {
+            thread_id: thread_id.to_string(),
+            include_turns: false,
+        })?),
+    )
+    .await?;
+    to_response(read_response_for_id(stream, id).await?)
+}
+
 async fn send_clear(stream: &mut WsClient, id: i64, thread_id: &str) -> Result<()> {
     send_request(
         stream,
@@ -460,6 +546,48 @@ async fn assert_no_clear_evidence(stream: &mut WsClient) -> Result<()> {
             _ => {}
         }
     }
+}
+
+async fn read_non_authoritative_clear_broadcast(
+    stream: &mut WsClient,
+    predecessor_thread_id: &str,
+    successor_thread_id: &str,
+) -> Result<ThreadStartedNotification> {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            match read_jsonrpc_message(stream).await? {
+                JSONRPCMessage::Notification(notification)
+                    if matches!(
+                        notification.method.as_str(),
+                        "thread/clear/ended" | "thread/clear/started"
+                    ) =>
+                {
+                    bail!("bystander received requester-scoped clear evidence")
+                }
+                JSONRPCMessage::Notification(notification)
+                    if notification.method == "thread/started" =>
+                {
+                    let params = notification.params.context("thread/started params")?;
+                    let started: ThreadStartedNotification =
+                        serde_json::from_value(params.clone())?;
+                    if started.thread.id == successor_thread_id {
+                        assert_eq!(
+                            started.clear_predecessor_thread_id.as_deref(),
+                            Some(predecessor_thread_id)
+                        );
+                        assert!(
+                            params.get("transitionId").is_none(),
+                            "non-authoritative thread/started must not carry transition identity"
+                        );
+                        return Ok(started);
+                    }
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .context("timed out waiting for non-authoritative clear thread/started broadcast")?
 }
 
 async fn assert_clear_error(

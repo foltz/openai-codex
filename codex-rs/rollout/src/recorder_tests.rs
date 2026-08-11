@@ -184,6 +184,8 @@ async fn state_db_init_backfills_before_returning() -> anyhow::Result<()> {
             id: thread_id,
             forked_from_id: None,
             parent_thread_id: None,
+            clear_predecessor_thread_id: None,
+            clear_transition_id: None,
             timestamp: "2026-01-27T12:34:56Z".to_string(),
             cwd: home.path().to_path_buf(),
             originator: "test".to_string(),

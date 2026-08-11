@@ -153,6 +153,37 @@ with Path(r"{hook_log}").open("a", encoding="utf-8") as handle:
         .expect("start clear successor");
     assert_eq!(successor.thread_id, successor_thread_id);
     assert!(!hook_log.exists(), "clear start must remain deferred");
+    successor.thread.ensure_rollout_materialized().await;
+    successor
+        .thread
+        .flush_rollout()
+        .await
+        .expect("flush clear successor rollout");
+    let successor_history = RolloutRecorder::get_rollout_history(
+        &successor
+            .thread
+            .rollout_path()
+            .expect("clear successor rollout path"),
+    )
+    .await
+    .expect("read clear successor rollout");
+    let successor_meta = successor_history
+        .get_rollout_items()
+        .iter()
+        .find_map(|item| match item {
+            RolloutItem::SessionMeta(line) => Some(&line.meta),
+            _ => None,
+        })
+        .expect("clear successor session metadata");
+    assert_eq!(
+        successor_meta.clear_predecessor_thread_id,
+        Some(predecessor_thread_id)
+    );
+    let expected_transition_id = transition_id.to_string();
+    assert_eq!(
+        successor_meta.clear_transition_id.as_deref(),
+        Some(expected_transition_id.as_str())
+    );
     let expected_model = successor
         .thread
         .session

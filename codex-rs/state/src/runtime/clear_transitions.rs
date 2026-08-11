@@ -214,9 +214,9 @@ where
         "SELECT * FROM clear_transitions \
          WHERE predecessor_thread_id = ? AND phase != 'abandoned'",
     )
-        .bind(predecessor_thread_id.to_string())
-        .fetch_optional(executor)
-        .await?;
+    .bind(predecessor_thread_id.to_string())
+    .fetch_optional(executor)
+    .await?;
     row.as_ref().map(record_from_row).transpose()
 }
 
@@ -231,9 +231,9 @@ where
         "SELECT * FROM clear_transitions \
          WHERE successor_thread_id = ? AND phase != 'abandoned'",
     )
-        .bind(successor_thread_id.to_string())
-        .fetch_optional(executor)
-        .await?;
+    .bind(successor_thread_id.to_string())
+    .fetch_optional(executor)
+    .await?;
     row.as_ref().map(record_from_row).transpose()
 }
 

@@ -634,6 +634,19 @@ impl OutgoingMessageSender {
         connection_id: ConnectionId,
         notification: ServerNotification,
     ) {
+        let _ = self
+            .try_send_server_notification_to_connection_and_wait(connection_id, notification)
+            .await;
+    }
+
+    /// Sends one notification to one connection and reports whether the transport acknowledged
+    /// writing it. A `false` result is authoritative for lifecycle evidence: the notification
+    /// must not be recorded as delivered merely because it was queued locally.
+    pub(crate) async fn try_send_server_notification_to_connection_and_wait(
+        &self,
+        connection_id: ConnectionId,
+        notification: ServerNotification,
+    ) -> bool {
         tracing::trace!("app-server event: {notification}");
         let outgoing_message = timestamped_server_notification(notification);
         let (write_complete_tx, write_complete_rx) = oneshot::channel();
@@ -647,8 +660,9 @@ impl OutgoingMessageSender {
             .await
         {
             warn!("failed to send server notification to client: {err:?}");
+            return false;
         }
-        let _ = write_complete_rx.await;
+        write_complete_rx.await.is_ok()
     }
 
     pub(crate) async fn send_error(

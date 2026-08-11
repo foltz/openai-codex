@@ -39,6 +39,8 @@ fn write_rollout_with_source_and_provider(
                 id: thread_id,
                 forked_from_id: None,
                 parent_thread_id: None,
+                clear_predecessor_thread_id: None,
+                clear_transition_id: None,
                 timestamp,
                 cwd: ".".into(),
                 originator: "test_originator".into(),

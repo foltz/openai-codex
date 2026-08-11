@@ -96,6 +96,8 @@ pub enum RolloutRecorderParams {
         conversation_id: ThreadId,
         forked_from_id: Option<ThreadId>,
         parent_thread_id: Option<ThreadId>,
+        clear_predecessor_thread_id: Option<ThreadId>,
+        clear_transition_id: Option<String>,
         source: Box<SessionSource>,
         thread_source: Option<ThreadSource>,
         originator: String,
@@ -191,6 +193,8 @@ impl RolloutRecorderParams {
             conversation_id,
             forked_from_id,
             parent_thread_id,
+            clear_predecessor_thread_id: None,
+            clear_transition_id: None,
             source: Box::new(source),
             thread_source,
             originator,
@@ -203,6 +207,24 @@ impl RolloutRecorderParams {
             subagent_history_start_ordinal: None,
             initial_window_id: None,
         }
+    }
+
+    pub fn with_clear_lineage(
+        mut self,
+        predecessor_thread_id: ThreadId,
+        transition_id: String,
+    ) -> Self {
+        let Self::Create {
+            clear_predecessor_thread_id,
+            clear_transition_id,
+            ..
+        } = &mut self
+        else {
+            return self;
+        };
+        *clear_predecessor_thread_id = Some(predecessor_thread_id);
+        *clear_transition_id = Some(transition_id);
+        self
     }
 
     pub fn with_session_id(mut self, session_id: SessionId) -> Self {
@@ -802,6 +824,8 @@ impl RolloutRecorder {
                 conversation_id,
                 forked_from_id,
                 parent_thread_id,
+                clear_predecessor_thread_id,
+                clear_transition_id,
                 source,
                 thread_source,
                 originator,
@@ -834,6 +858,8 @@ impl RolloutRecorder {
                     id: thread_id,
                     forked_from_id,
                     parent_thread_id,
+                    clear_predecessor_thread_id,
+                    clear_transition_id,
                     timestamp,
                     cwd: cwd.clone(),
                     originator,

@@ -744,6 +744,12 @@ impl Session {
                             extra_config: config.extra_config.clone(),
                             forked_from_id,
                             parent_thread_id,
+                            clear_lineage: deferred_clear_session_start.as_ref().map(|deferred| {
+                                codex_thread_store::ClearThreadLineage {
+                                    predecessor_thread_id: deferred.predecessor_thread_id,
+                                    transition_id: deferred.transition_id.to_string(),
+                                }
+                            }),
                             source: session_source,
                             thread_source: session_configuration.thread_source.clone(),
                             originator: session_configuration.originator.clone(),

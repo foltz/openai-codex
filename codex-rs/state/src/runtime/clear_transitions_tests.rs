@@ -175,15 +175,17 @@ async fn abandoned_precreation_reservation_releases_both_identities_for_retry() 
             .unwrap()
             .is_none()
     );
-    assert!(runtime.list_incomplete_clear_transitions().await.unwrap().is_empty());
+    assert!(
+        runtime
+            .list_incomplete_clear_transitions()
+            .await
+            .unwrap()
+            .is_empty()
+    );
 
     reserved_record(
         runtime
-            .reserve_clear_transition(
-                ClearTransitionId::new(),
-                predecessor,
-                reserved_successor,
-            )
+            .reserve_clear_transition(ClearTransitionId::new(), predecessor, reserved_successor)
             .await
             .unwrap(),
     );
@@ -212,10 +214,7 @@ async fn transition_cannot_be_abandoned_after_successor_creation() {
 
     assert!(
         runtime
-            .abandon_clear_transition(
-                transition_id,
-                ClearTransitionPhase::SuccessorCreated,
-            )
+            .abandon_clear_transition(transition_id, ClearTransitionPhase::SuccessorCreated,)
             .await
             .is_err()
     );

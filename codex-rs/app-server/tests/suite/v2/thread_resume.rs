@@ -3093,6 +3093,8 @@ async fn thread_resume_prefers_persisted_git_metadata_for_local_threads() -> Res
         id: conversation_id,
         forked_from_id: None,
         parent_thread_id: None,
+        clear_predecessor_thread_id: None,
+        clear_transition_id: None,
         timestamp: "2025-01-05T12:00:00Z".to_string(),
         cwd: repo_path.clone(),
         originator: "codex".to_string(),

@@ -25,28 +25,30 @@ pub(super) async fn create_thread(
         model_provider_id: params.metadata.model_provider.clone(),
         generate_memories: matches!(params.metadata.memory_mode, ThreadMemoryMode::Enabled),
     };
-    RolloutRecorder::new(
-        &config,
-        RolloutRecorderParams::new(
-            params.thread_id,
-            params.forked_from_id,
-            params.parent_thread_id,
-            params.source,
-            params.thread_source,
-            params.originator,
-            params.base_instructions,
-            params.dynamic_tools,
-        )
-        .with_session_id(params.session_id)
-        .with_selected_capability_roots(params.selected_capability_roots)
-        .with_multi_agent_version(params.multi_agent_version)
-        .with_history_mode(params.history_mode)
-        .with_history_base(params.history_base)
-        .with_subagent_history_start_ordinal(params.subagent_history_start_ordinal)
-        .with_initial_window_id(params.initial_window_id),
+    let mut recorder_params = RolloutRecorderParams::new(
+        params.thread_id,
+        params.forked_from_id,
+        params.parent_thread_id,
+        params.source,
+        params.thread_source,
+        params.originator,
+        params.base_instructions,
+        params.dynamic_tools,
     )
-    .await
-    .map_err(|err| ThreadStoreError::Internal {
-        message: format!("failed to initialize local thread recorder: {err}"),
-    })
+    .with_session_id(params.session_id)
+    .with_selected_capability_roots(params.selected_capability_roots)
+    .with_multi_agent_version(params.multi_agent_version)
+    .with_history_mode(params.history_mode)
+    .with_history_base(params.history_base)
+    .with_subagent_history_start_ordinal(params.subagent_history_start_ordinal)
+    .with_initial_window_id(params.initial_window_id);
+    if let Some(lineage) = params.clear_lineage {
+        recorder_params = recorder_params
+            .with_clear_lineage(lineage.predecessor_thread_id, lineage.transition_id);
+    }
+    RolloutRecorder::new(&config, recorder_params)
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!("failed to initialize local thread recorder: {err}"),
+        })
 }

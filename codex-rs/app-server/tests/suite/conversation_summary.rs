@@ -127,6 +127,7 @@ async fn get_conversation_summary_by_thread_id_reads_pathless_store_thread() -> 
             extra_config: None,
             forked_from_id: None,
             parent_thread_id: None,
+            clear_lineage: None,
             source: SessionSource::Cli,
             thread_source: None,
             originator: "test_originator".to_string(),

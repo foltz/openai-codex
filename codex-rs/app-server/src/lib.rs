@@ -916,6 +916,7 @@ pub async fn run_main_with_transport_options(
         let mut remote_control_status = remote_control_status_rx.borrow().clone();
         let transport_shutdown_token = transport_shutdown_token.clone();
         async move {
+            processor.reconcile_incomplete_clear_transitions().await;
             let mut listen_for_threads = true;
             let mut shutdown_state = ShutdownState::default();
             let exit_reason = loop {

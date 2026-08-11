@@ -79,6 +79,9 @@ pub struct CreateThreadParams {
     pub forked_from_id: Option<ThreadId>,
     /// The ID of the parent thread. This will only be set if this thread is a subagent.
     pub parent_thread_id: Option<ThreadId>,
+    /// Immutable predecessor and transition identity for a clear successor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clear_lineage: Option<ClearThreadLineage>,
     /// Runtime source for the thread.
     pub source: SessionSource,
     /// Optional analytics source classification for this thread.
@@ -104,6 +107,12 @@ pub struct CreateThreadParams {
     pub initial_window_id: String,
     /// Metadata captured for the newly created thread.
     pub metadata: ThreadPersistenceMetadata,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClearThreadLineage {
+    pub predecessor_thread_id: ThreadId,
+    pub transition_id: String,
 }
 
 /// Parameters required to reopen persistence for an existing thread.

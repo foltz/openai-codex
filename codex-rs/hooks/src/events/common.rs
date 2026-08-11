@@ -149,6 +149,13 @@ pub(crate) fn matches_matcher(matcher: Option<&str>, input: Option<&str>) -> boo
     }
 }
 
+/// Match one explicit token without accepting omitted, wildcard, or regex matchers.
+pub(crate) fn matches_exact_token(matcher: Option<&str>, input: &str) -> bool {
+    matcher
+        .filter(|matcher| is_exact_matcher(matcher) && !is_match_all_matcher(matcher))
+        .is_some_and(|matcher| matcher.split('|').any(|candidate| candidate == input))
+}
+
 pub(crate) fn matcher_inputs<'a>(
     tool_name: &'a str,
     matcher_aliases: &'a [String],
@@ -176,6 +183,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::matcher_pattern_for_event;
+    use super::matches_exact_token;
     use super::matches_matcher;
     use super::validate_matcher_pattern;
 
@@ -190,6 +198,25 @@ mod tests {
         assert!(matches_matcher(Some("*"), Some("Bash")));
         assert!(matches_matcher(Some("*"), Some("Edit")));
         assert_eq!(validate_matcher_pattern("*"), Ok(()));
+    }
+
+    #[test]
+    fn exact_token_match_excludes_permissive_and_regex_matchers() {
+        assert!(matches_exact_token(Some("clear"), "clear"));
+        assert!(matches_exact_token(Some("other|clear"), "clear"));
+        for matcher in [
+            None,
+            Some(""),
+            Some("*"),
+            Some("^clear$"),
+            Some(".*"),
+            Some("other"),
+        ] {
+            assert!(
+                !matches_exact_token(matcher, "clear"),
+                "matcher: {matcher:?}"
+            );
+        }
     }
 
     #[test]

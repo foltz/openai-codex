@@ -428,6 +428,11 @@ export type { ThreadApproveGuardianDeniedActionResponse } from "./ThreadApproveG
 export type { ThreadArchiveParams } from "./ThreadArchiveParams";
 export type { ThreadArchiveResponse } from "./ThreadArchiveResponse";
 export type { ThreadArchivedNotification } from "./ThreadArchivedNotification";
+export type { ThreadClearEndReason } from "./ThreadClearEndReason";
+export type { ThreadClearEndedNotification } from "./ThreadClearEndedNotification";
+export type { ThreadClearParams } from "./ThreadClearParams";
+export type { ThreadClearResponse } from "./ThreadClearResponse";
+export type { ThreadClearStartedNotification } from "./ThreadClearStartedNotification";
 export type { ThreadClosedNotification } from "./ThreadClosedNotification";
 export type { ThreadCompactStartParams } from "./ThreadCompactStartParams";
 export type { ThreadCompactStartResponse } from "./ThreadCompactStartResponse";

@@ -1064,6 +1064,9 @@ impl MessageProcessor {
                     .thread_unsubscribe(&request_id, params)
                     .await
             }
+            ClientRequest::ThreadClear { params: _, .. } => Err(invalid_request(
+                "thread/clear orchestration is not available in this build",
+            )),
             ClientRequest::ThreadResume { params, .. } => {
                 self.thread_processor
                     .thread_resume(

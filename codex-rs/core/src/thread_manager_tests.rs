@@ -1,5 +1,7 @@
 use super::*;
 use crate::agent::control::SpawnAgentOptions;
+use crate::config::ConfigBuilder;
+use crate::config::ConfigOverrides;
 use crate::config::test_config;
 use crate::init_state_db;
 use crate::installation_id::INSTALLATION_ID_FILENAME;
@@ -11,6 +13,7 @@ use crate::session::tests::make_session_and_context;
 use crate::tasks::InterruptedTurnHistoryMarker;
 use crate::tasks::interrupted_turn_history_marker;
 use codex_extension_api::empty_extension_registry;
+use codex_features::Feature;
 use codex_history::InitialHistory;
 use codex_history::ResumedHistory;
 use codex_models_manager::manager::RefreshStrategy;
@@ -55,6 +58,195 @@ fn thread_id_generator_defaults_to_standard_ids() {
         agent_control.generate_thread_id(),
         agent_control.generate_thread_id()
     );
+}
+
+#[tokio::test]
+async fn clear_successor_defers_authoritative_session_start() {
+    let temp_dir = tempdir().expect("tempdir");
+    let codex_home = temp_dir.path().join("codex-home").abs();
+    std::fs::create_dir_all(&codex_home).expect("create codex home");
+    let hook_log = codex_home.join("clear_start.jsonl");
+    let hook_script = codex_home.join("clear_start.py");
+    std::fs::write(
+        &hook_script,
+        format!(
+            r#"import json
+from pathlib import Path
+import sys
+
+with Path(r"{hook_log}").open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps(json.load(sys.stdin)) + "\n")
+"#,
+            hook_log = hook_log.display(),
+        ),
+    )
+    .expect("write hook script");
+    std::fs::write(
+        codex_home.join("hooks.json"),
+        serde_json::json!({
+            "hooks": {
+                "SessionStart": [{
+                    "matcher": "clear",
+                    "hooks": [{
+                        "type": "command",
+                        "command": format!("python3 {}", hook_script.display()),
+                    }],
+                }],
+                "SessionEnd": [{
+                    "matcher": "clear",
+                    "hooks": [{
+                        "type": "command",
+                        "command": format!("python3 {}", hook_script.display()),
+                    }],
+                }],
+            },
+        })
+        .to_string(),
+    )
+    .expect("write hooks config");
+    let mut config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.to_path_buf())
+        .harness_overrides(ConfigOverrides {
+            cwd: Some(codex_home.to_path_buf()),
+            ..Default::default()
+        })
+        .build()
+        .await
+        .expect("load test config");
+    config.bypass_hook_trust = true;
+    config
+        .features
+        .enable(Feature::CodexHooks)
+        .expect("enable hooks feature");
+    let listed_hooks = codex_hooks::list_hooks(codex_hooks::HooksConfig {
+        feature_enabled: true,
+        bypass_hook_trust: true,
+        config_layer_stack: Some(config.config_layer_stack.clone()),
+        ..codex_hooks::HooksConfig::default()
+    });
+    assert!(!listed_hooks.hooks.is_empty(), "discover clear start hook");
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let successor_thread_id = ThreadId::new();
+    let transition_id = codex_state::ClearTransitionId::new();
+    let predecessor = manager
+        .start_thread(StartThreadOptions::new(config.clone()))
+        .await
+        .expect("start predecessor");
+    let predecessor_thread_id = predecessor.thread_id;
+
+    let successor = manager
+        .start_thread_for_clear(
+            StartThreadOptions {
+                initial_history: InitialHistory::Cleared,
+                ..StartThreadOptions::new(config.clone())
+            },
+            predecessor_thread_id,
+            successor_thread_id,
+            transition_id,
+        )
+        .await
+        .expect("start clear successor");
+    assert_eq!(successor.thread_id, successor_thread_id);
+    assert!(!hook_log.exists(), "clear start must remain deferred");
+    let expected_model = successor
+        .thread
+        .session
+        .thread_config_snapshot()
+        .await
+        .model;
+    predecessor
+        .thread
+        .dispatch_clear_session_end(transition_id)
+        .await;
+    let end_inputs = std::fs::read_to_string(&hook_log)
+        .expect("read clear end hook log")
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("parse hook input"))
+        .collect::<Vec<_>>();
+    assert_eq!(1, end_inputs.len());
+    assert_eq!(
+        Some("SessionEnd"),
+        end_inputs[0]["hook_event_name"].as_str()
+    );
+    assert_eq!(Some("clear"), end_inputs[0]["reason"].as_str());
+    assert_eq!(
+        transition_id.to_string(),
+        end_inputs[0]["clear_transition_id"]
+            .as_str()
+            .expect("clear transition id")
+    );
+    assert_eq!(
+        predecessor_thread_id.to_string(),
+        end_inputs[0]["session_id"]
+            .as_str()
+            .expect("predecessor session id")
+    );
+
+    assert!(
+        successor
+            .thread
+            .dispatch_deferred_clear_session_start()
+            .await,
+        "first dispatch must consume the deferred start"
+    );
+    assert!(
+        !successor
+            .thread
+            .dispatch_deferred_clear_session_start()
+            .await,
+        "second dispatch must be a no-op"
+    );
+    let hook_inputs = std::fs::read_to_string(&hook_log)
+        .expect("read hook log")
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("parse hook input"))
+        .collect::<Vec<_>>();
+    assert_eq!(2, hook_inputs.len());
+    assert_eq!(
+        serde_json::json!({
+            "session_id": successor_thread_id.to_string(),
+            "transcript_path": successor.session_configured.rollout_path.clone(),
+            "cwd": config.codex_home.clone(),
+            "hook_event_name": "SessionStart",
+            "model": expected_model,
+            "permission_mode": "default",
+            "source": "clear",
+            "clear_predecessor_thread_id": predecessor_thread_id.to_string(),
+            "clear_transition_id": transition_id.to_string(),
+        }),
+        hook_inputs[1]
+    );
+    assert!(
+        successor
+            .thread
+            .session
+            .take_pending_session_start()
+            .await
+            .is_none(),
+        "deferred start must not remain queued after dispatch"
+    );
+
+    manager
+        .start_thread(StartThreadOptions {
+            initial_history: InitialHistory::Cleared,
+            ..StartThreadOptions::new(config)
+        })
+        .await
+        .expect("start legacy clear session");
+    let hook_inputs = std::fs::read_to_string(&hook_log)
+        .expect("read hook log after legacy clear")
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("parse hook input"))
+        .collect::<Vec<_>>();
+    assert_eq!(3, hook_inputs.len());
+    assert_eq!(Some("clear"), hook_inputs[2]["source"].as_str());
+    assert_eq!(None, hook_inputs[2].get("clear_predecessor_thread_id"));
+    assert_eq!(None, hook_inputs[2].get("clear_transition_id"));
 }
 
 /// One custom ID factory supplies identifiers for roots, actual child agents, and forks.

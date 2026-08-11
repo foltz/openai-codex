@@ -16,6 +16,7 @@ use super::ConfiguredHandler;
 use super::ConfiguredHandlerKind;
 use super::HandlerRunResult;
 use super::command_runner::run_command;
+use crate::events::common::matches_exact_token;
 use crate::events::common::matches_matcher;
 
 #[derive(Debug)]
@@ -65,6 +66,17 @@ pub(crate) fn select_handlers_for_matcher_inputs(
             }
             HookEventName::UserPromptSubmit | HookEventName::Stop => true,
         })
+        .cloned()
+        .collect()
+}
+
+pub(crate) fn select_clear_session_end_handlers(
+    handlers: &[ConfiguredHandler],
+) -> Vec<ConfiguredHandler> {
+    handlers
+        .iter()
+        .filter(|handler| handler.event_name == HookEventName::SessionEnd)
+        .filter(|handler| matches_exact_token(handler.matcher.as_deref(), "clear"))
         .cloned()
         .collect()
 }

@@ -10,6 +10,7 @@ use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::environment_selection::default_thread_environment_selections;
 use crate::mcp::McpManager;
 use crate::rollout::truncation;
+use crate::session::DeferredClearSessionStart;
 use crate::session::ForkPersistence;
 use crate::session::GitEnrichmentPolicy;
 use crate::session::INITIAL_SUBMIT_ID;
@@ -249,6 +250,7 @@ struct ThreadSpawnRequest {
     inherited_environments: Option<TurnEnvironmentSnapshot>,
     inherited_exec_policy: Option<Arc<crate::exec_policy::ExecPolicyManager>>,
     user_shell_override: Option<crate::shell::Shell>,
+    deferred_clear_session_start: Option<DeferredClearSessionStart>,
 }
 
 impl ThreadSpawnRequest {
@@ -267,6 +269,7 @@ impl ThreadSpawnRequest {
             inherited_environments: None,
             inherited_exec_policy: None,
             user_shell_override: None,
+            deferred_clear_session_start: None,
         }
     }
 }
@@ -847,11 +850,51 @@ impl ThreadManager {
         Box::pin(self.start_thread_inner(options, /*forked_from_thread_id*/ None)).await
     }
 
+    /// Starts the reserved successor for an authoritative clear transition.
+    ///
+    /// Its `SessionStart(clear)` hook remains pending until the caller explicitly
+    /// dispatches it after predecessor end evidence has reached a terminal state.
+    /// The caller must keep abandonment serialized until it advances the durable
+    /// transition to `SuccessorCreated`, and must not publish the returned thread
+    /// or any lifecycle evidence before that advance. This keeps `Reserved`
+    /// equivalent to "no observable successor exists".
+    pub async fn start_thread_for_clear(
+        &self,
+        options: StartThreadOptions,
+        predecessor_thread_id: ThreadId,
+        successor_thread_id: ThreadId,
+        transition_id: codex_state::ClearTransitionId,
+    ) -> CodexResult<NewThread> {
+        if !matches!(options.initial_history, InitialHistory::Cleared) {
+            return Err(CodexErr::InvalidRequest(
+                "deferred clear start requires cleared initial history".to_string(),
+            ));
+        }
+        let mut request = self.thread_spawn_request(options, None).await;
+        request.deferred_clear_session_start = Some(DeferredClearSessionStart {
+            predecessor_thread_id,
+            successor_thread_id,
+            transition_id,
+        });
+        Box::pin(self.state.spawn_thread(request)).await
+    }
+
     async fn start_thread_inner(
+        &self,
+        options: StartThreadOptions,
+        forked_from_thread_id: Option<ThreadId>,
+    ) -> CodexResult<NewThread> {
+        let request = self
+            .thread_spawn_request(options, forked_from_thread_id)
+            .await;
+        Box::pin(self.state.spawn_thread(request)).await
+    }
+
+    async fn thread_spawn_request(
         &self,
         mut options: StartThreadOptions,
         forked_from_thread_id: Option<ThreadId>,
-    ) -> CodexResult<NewThread> {
+    ) -> ThreadSpawnRequest {
         let agent_control = self.agent_control_for_config(&options.config);
         let (resumed_session_source, resumed_thread_source) = options
             .initial_history
@@ -867,7 +910,7 @@ impl ThreadManager {
         let mut request =
             ThreadSpawnRequest::new(options, Arc::clone(&self.state.auth_manager), agent_control);
         request.forked_from_thread_id = forked_from_thread_id;
-        Box::pin(self.state.spawn_thread(request)).await
+        request
     }
 
     // TODO(jif) merge with fork_agent
@@ -1667,6 +1710,7 @@ impl ThreadManagerState {
             inherited_environments,
             inherited_exec_policy,
             user_shell_override,
+            deferred_clear_session_start,
         } = request;
         let StartThreadOptions {
             config,
@@ -1785,6 +1829,7 @@ impl ThreadManagerState {
             git_enrichment_policy: GitEnrichmentPolicy::Fresh,
             windows_sandbox_proxy_settings_mode:
                 codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
+            deferred_clear_session_start,
         }))
         .await?;
         // Enable Full Access form input only after session startup so a required MCP server cannot

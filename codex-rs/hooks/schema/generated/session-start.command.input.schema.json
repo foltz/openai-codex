@@ -10,6 +10,12 @@
     }
   },
   "properties": {
+    "clear_predecessor_thread_id": {
+      "type": "string"
+    },
+    "clear_transition_id": {
+      "type": "string"
+    },
     "cwd": {
       "type": "string"
     },

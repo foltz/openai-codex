@@ -4369,6 +4369,27 @@ fn thread_start_params_preserve_explicit_null_service_tier() {
 }
 
 #[test]
+fn thread_clear_wire_contract_uses_public_string_identities() {
+    let params = ThreadClearParams {
+        thread_id: "predecessor".to_string(),
+    };
+    assert_eq!(
+        json!({ "threadId": "predecessor" }),
+        serde_json::to_value(params).unwrap()
+    );
+
+    let ended: ThreadClearEndedNotification = serde_json::from_value(json!({
+        "transitionId": "transition",
+        "predecessorThreadId": "predecessor",
+        "successorThreadId": "successor",
+        "reason": "clear"
+    }))
+    .unwrap();
+    assert_eq!("transition", ended.transition_id);
+    assert_eq!(ThreadClearEndReason::Clear, ended.reason);
+}
+
+#[test]
 fn thread_lifecycle_responses_default_missing_optional_fields() {
     let response = json!({
         "thread": {

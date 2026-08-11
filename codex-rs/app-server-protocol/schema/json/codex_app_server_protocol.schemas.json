@@ -379,6 +379,30 @@
             },
             "method": {
               "enum": [
+                "thread/clear"
+              ],
+              "title": "Thread/clearRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ThreadClearParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Thread/clearRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
                 "thread/name/set"
               ],
               "title": "Thread/name/setRequestMethod",
@@ -4361,6 +4385,46 @@
             "params"
           ],
           "title": "Thread/startedNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
+                "thread/clear/ended"
+              ],
+              "title": "Thread/clear/endedNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ThreadClearEndedNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Thread/clear/endedNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
+                "thread/clear/started"
+              ],
+              "title": "Thread/clear/startedNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ThreadClearStartedNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Thread/clear/startedNotification",
           "type": "object"
         },
         {
@@ -18801,6 +18865,100 @@
           "threadId"
         ],
         "title": "ThreadArchivedNotification",
+        "type": "object"
+      },
+      "ThreadClearEndReason": {
+        "enum": [
+          "clear"
+        ],
+        "type": "string"
+      },
+      "ThreadClearEndedNotification": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "Requester-scoped authoritative predecessor evidence for `thread/clear`.",
+        "properties": {
+          "predecessorThreadId": {
+            "type": "string"
+          },
+          "reason": {
+            "$ref": "#/definitions/v2/ThreadClearEndReason"
+          },
+          "successorThreadId": {
+            "type": "string"
+          },
+          "transitionId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "predecessorThreadId",
+          "reason",
+          "successorThreadId",
+          "transitionId"
+        ],
+        "title": "ThreadClearEndedNotification",
+        "type": "object"
+      },
+      "ThreadClearParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "Parameters for the server-owned clear-and-replace operation.",
+        "properties": {
+          "threadId": {
+            "description": "The predecessor currently displayed by the requesting connection.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "threadId"
+        ],
+        "title": "ThreadClearParams",
+        "type": "object"
+      },
+      "ThreadClearResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "predecessorThreadId": {
+            "type": "string"
+          },
+          "successorThread": {
+            "$ref": "#/definitions/v2/Thread"
+          },
+          "transitionId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "predecessorThreadId",
+          "successorThread",
+          "transitionId"
+        ],
+        "title": "ThreadClearResponse",
+        "type": "object"
+      },
+      "ThreadClearStartedNotification": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "Requester-scoped authoritative successor evidence for `thread/clear`.",
+        "properties": {
+          "predecessorThreadId": {
+            "type": "string"
+          },
+          "startSource": {
+            "$ref": "#/definitions/v2/ThreadStartSource"
+          },
+          "successorThread": {
+            "$ref": "#/definitions/v2/Thread"
+          },
+          "transitionId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "predecessorThreadId",
+          "startSource",
+          "successorThread",
+          "transitionId"
+        ],
+        "title": "ThreadClearStartedNotification",
         "type": "object"
       },
       "ThreadClosedNotification": {

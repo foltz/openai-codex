@@ -3920,6 +3920,60 @@
       ],
       "type": "object"
     },
+    "ThreadClearEndReason": {
+      "enum": [
+        "clear"
+      ],
+      "type": "string"
+    },
+    "ThreadClearEndedNotification": {
+      "description": "Requester-scoped authoritative predecessor evidence for `thread/clear`.",
+      "properties": {
+        "predecessorThreadId": {
+          "type": "string"
+        },
+        "reason": {
+          "$ref": "#/definitions/ThreadClearEndReason"
+        },
+        "successorThreadId": {
+          "type": "string"
+        },
+        "transitionId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "predecessorThreadId",
+        "reason",
+        "successorThreadId",
+        "transitionId"
+      ],
+      "type": "object"
+    },
+    "ThreadClearStartedNotification": {
+      "description": "Requester-scoped authoritative successor evidence for `thread/clear`.",
+      "properties": {
+        "predecessorThreadId": {
+          "type": "string"
+        },
+        "startSource": {
+          "$ref": "#/definitions/ThreadStartSource"
+        },
+        "successorThread": {
+          "$ref": "#/definitions/Thread"
+        },
+        "transitionId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "predecessorThreadId",
+        "startSource",
+        "successorThread",
+        "transitionId"
+      ],
+      "type": "object"
+    },
     "ThreadClosedNotification": {
       "properties": {
         "threadId": {
@@ -6000,6 +6054,46 @@
         "params"
       ],
       "title": "Thread/startedNotification",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "thread/clear/ended"
+          ],
+          "title": "Thread/clear/endedNotificationMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/ThreadClearEndedNotification"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "title": "Thread/clear/endedNotification",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "thread/clear/started"
+          ],
+          "title": "Thread/clear/startedNotificationMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/ThreadClearStartedNotification"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "title": "Thread/clear/startedNotification",
       "type": "object"
     },
     {

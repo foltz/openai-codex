@@ -21,6 +21,9 @@ pub(crate) const SESSION_END_DEFAULT_TIMEOUT_SEC: u64 = 1;
 /// Keep below app-server's in-process `SHUTDOWN_TIMEOUT`: SessionEnd runs during
 /// teardown and must leave headroom within the existing five-second bound.
 pub(crate) const SESSION_END_MAX_TIMEOUT_SEC: u64 = 3;
+#[cfg(debug_assertions)]
+const SESSION_END_SERIALIZATION_FAILURE_FOR_TESTS_ENV: &str =
+    "CODEX_HOOKS_SESSION_END_SERIALIZATION_FAILURE_FOR_TESTS";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionEndReason {
     Other,
@@ -77,12 +80,31 @@ pub(crate) async fn run(
     engine: &ClaudeHooksEngine,
     request: SessionEndRequest,
 ) -> SessionEndOutcome {
+    #[cfg(debug_assertions)]
+    if std::env::var_os(SESSION_END_SERIALIZATION_FAILURE_FOR_TESTS_ENV).is_some() {
+        return run_with_serializer(engine, request, |_input| {
+            Err("injected session end serialization failure".to_string())
+        })
+        .await;
+    }
+
+    run_with_serializer(engine, request, |input| {
+        serde_json::to_string(input).map_err(|error| error.to_string())
+    })
+    .await
+}
+
+async fn run_with_serializer(
+    engine: &ClaudeHooksEngine,
+    request: SessionEndRequest,
+    serialize: impl FnOnce(&SessionEndCommandInput) -> Result<String, String>,
+) -> SessionEndOutcome {
     let matched = select_handlers(&engine.handlers, request.reason);
     if matched.is_empty() {
         return SessionEndOutcome::default();
     }
 
-    let input_json = match serde_json::to_string(&SessionEndCommandInput {
+    let input_json = match serialize(&SessionEndCommandInput {
         session_id: request.session_id.to_string(),
         transcript_path: NullableString::from_path(request.transcript_path.clone()),
         cwd: request.cwd.display().to_string(),

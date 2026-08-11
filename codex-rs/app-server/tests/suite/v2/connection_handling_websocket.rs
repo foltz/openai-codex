@@ -491,10 +491,26 @@ pub(super) async fn spawn_websocket_server(codex_home: &Path) -> Result<(Child, 
     spawn_websocket_server_with_args(codex_home, "ws://127.0.0.1:0", &[]).await
 }
 
+pub(super) async fn spawn_websocket_server_with_env(
+    codex_home: &Path,
+    env: &[(&str, &str)],
+) -> Result<(Child, SocketAddr)> {
+    spawn_websocket_server_with_args_and_env(codex_home, "ws://127.0.0.1:0", &[], env).await
+}
+
 pub(super) async fn spawn_websocket_server_with_args(
     codex_home: &Path,
     listen_url: &str,
     extra_args: &[String],
+) -> Result<(Child, SocketAddr)> {
+    spawn_websocket_server_with_args_and_env(codex_home, listen_url, extra_args, &[]).await
+}
+
+async fn spawn_websocket_server_with_args_and_env(
+    codex_home: &Path,
+    listen_url: &str,
+    extra_args: &[String],
+    env: &[(&str, &str)],
 ) -> Result<(Child, SocketAddr)> {
     let program = codex_utils_cargo_bin::cargo_bin("codex-app-server")
         .context("should find app-server binary")?;
@@ -507,8 +523,8 @@ pub(super) async fn spawn_websocket_server_with_args(
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .env("CODEX_HOME", codex_home)
-        .env("RUST_LOG", "warn");
-
+        .env("RUST_LOG", "warn")
+        .envs(env.iter().copied());
     let mut process = cmd
         .kill_on_drop(true)
         .spawn()

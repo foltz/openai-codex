@@ -7,10 +7,14 @@ use super::connection_handling_websocket::read_response_for_id;
 use super::connection_handling_websocket::send_initialize_request;
 use super::connection_handling_websocket::send_request;
 use super::connection_handling_websocket::spawn_websocket_server;
+use super::connection_handling_websocket::spawn_websocket_server_with_args;
+use super::connection_handling_websocket::spawn_websocket_server_with_env;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
+use app_test_support::create_fake_rollout;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
+use app_test_support::rollout_path;
 use app_test_support::to_response;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::RequestId;
@@ -26,6 +30,7 @@ use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStartSource;
 use codex_app_server_protocol::ThreadStartedNotification;
 use codex_protocol::ThreadId;
+use codex_state::ClearTransitionEvidenceKind;
 use codex_state::ClearTransitionEvidenceState;
 use codex_state::ClearTransitionId;
 use codex_state::ClearTransitionPhase;
@@ -34,6 +39,9 @@ use codex_state::StateRuntime;
 use core_test_support::PathExt;
 use serde_json::json;
 use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+use std::str::FromStr;
 use tempfile::TempDir;
 use tokio::time::Duration;
 use tokio::time::timeout;
@@ -299,6 +307,164 @@ async fn startup_recovery_terminalizes_undispatched_evidence_without_replay() ->
 }
 
 #[tokio::test]
+async fn startup_recovery_converges_every_persisted_phase_without_replay() -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri(), "never")?;
+    let state = StateRuntime::init(
+        codex_state::SqliteConfig::new_for_testing(codex_home.path().abs()),
+        "test-provider".to_string(),
+    )
+    .await?;
+    let mut cases = Vec::new();
+    for (index, phase) in [
+        ClearTransitionPhase::Reserved,
+        ClearTransitionPhase::SuccessorCreated,
+        ClearTransitionPhase::Committed,
+        ClearTransitionPhase::EvidenceClaimed,
+        ClearTransitionPhase::Completed,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let transition_id = ClearTransitionId::new();
+        let predecessor = ThreadId::new();
+        let successor =
+            create_clear_successor_rollout(codex_home.path(), index, predecessor, transition_id)?;
+        let ClearTransitionReserveOutcome::Reserved(_) = state
+            .reserve_clear_transition(transition_id, predecessor, successor)
+            .await?
+        else {
+            bail!("expected fresh transition reservation");
+        };
+        seed_transition_phase(&state, transition_id, phase).await?;
+        if phase == ClearTransitionPhase::EvidenceClaimed {
+            seed_evidence_state(
+                &state,
+                transition_id,
+                ClearTransitionEvidenceKind::End,
+                ClearTransitionEvidenceState::Delivered,
+            )
+            .await?;
+            seed_evidence_state(
+                &state,
+                transition_id,
+                ClearTransitionEvidenceKind::Start,
+                ClearTransitionEvidenceState::Claimed,
+            )
+            .await?;
+        } else if phase == ClearTransitionPhase::Completed {
+            seed_evidence_state(
+                &state,
+                transition_id,
+                ClearTransitionEvidenceKind::End,
+                ClearTransitionEvidenceState::Delivered,
+            )
+            .await?;
+            seed_evidence_state(
+                &state,
+                transition_id,
+                ClearTransitionEvidenceKind::Start,
+                ClearTransitionEvidenceState::Delivered,
+            )
+            .await?;
+        }
+        cases.push((transition_id, phase, predecessor, successor));
+    }
+    drop(state);
+
+    let (mut process, bind_addr) = spawn_websocket_server(codex_home.path()).await?;
+    let mut client = connect_websocket(bind_addr).await?;
+    initialize(&mut client, 1, "recovery-matrix").await?;
+    assert_no_clear_evidence(&mut client).await?;
+
+    let state = StateRuntime::init(
+        codex_state::SqliteConfig::new_for_testing(codex_home.path().abs()),
+        "test-provider".to_string(),
+    )
+    .await?;
+    for (transition_id, original_phase, predecessor, successor) in cases {
+        let recovered = state
+            .get_clear_transition(transition_id)
+            .await?
+            .context("recovered transition")?;
+        assert_eq!(recovered.phase, ClearTransitionPhase::Completed);
+        assert_eq!(recovered.predecessor_thread_id, predecessor);
+        assert_eq!(recovered.successor_thread_id, successor);
+        if original_phase == ClearTransitionPhase::Completed {
+            assert_eq!(
+                recovered.end_evidence_state,
+                ClearTransitionEvidenceState::Delivered
+            );
+            assert_eq!(
+                recovered.start_evidence_state,
+                ClearTransitionEvidenceState::Delivered
+            );
+        } else if original_phase == ClearTransitionPhase::EvidenceClaimed {
+            assert_eq!(
+                recovered.end_evidence_state,
+                ClearTransitionEvidenceState::Delivered
+            );
+            assert_eq!(
+                recovered.start_evidence_state,
+                ClearTransitionEvidenceState::Failed
+            );
+        } else {
+            assert_eq!(
+                recovered.end_evidence_state,
+                ClearTransitionEvidenceState::Failed
+            );
+            assert_eq!(
+                recovered.start_evidence_state,
+                ClearTransitionEvidenceState::Failed
+            );
+        }
+    }
+
+    process.kill().await.context("failed to stop app-server")?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn reconnect_after_completed_clear_restores_exact_successor_without_replay() -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri(), "never")?;
+    let (mut process, bind_addr) = spawn_websocket_server(codex_home.path()).await?;
+    let mut requester = connect_websocket(bind_addr).await?;
+    initialize(&mut requester, 1, "original-requester").await?;
+    let predecessor = start_thread(&mut requester, 2).await?;
+    send_clear(&mut requester, 3, &predecessor).await?;
+    let (response, _) = read_clear_outcome(&mut requester, 3).await?;
+    let successor = response.successor_thread.id.clone();
+    drop(requester);
+
+    let mut reconnected = connect_websocket(bind_addr).await?;
+    initialize(&mut reconnected, 4, "reconnected-requester").await?;
+    resume_thread(&mut reconnected, 5, &successor).await?;
+    assert_no_clear_evidence(&mut reconnected).await?;
+    let restored = read_thread(&mut reconnected, 6, &successor).await?;
+    assert_eq!(restored.thread.id, successor);
+
+    let state = StateRuntime::init(
+        codex_state::SqliteConfig::new_for_testing(codex_home.path().abs()),
+        "test-provider".to_string(),
+    )
+    .await?;
+    let transition_id = ClearTransitionId::from_str(&response.transition_id)?;
+    let record = state
+        .get_clear_transition(transition_id)
+        .await?
+        .context("completed transition after reconnect")?;
+    assert_eq!(record.predecessor_thread_id.to_string(), predecessor);
+    assert_eq!(record.successor_thread_id.to_string(), restored.thread.id);
+    assert_eq!(record.phase, ClearTransitionPhase::Completed);
+
+    process.kill().await.context("failed to stop app-server")?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn concurrent_thread_clear_has_one_authoritative_winner() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let codex_home = TempDir::new()?;
@@ -371,6 +537,445 @@ async fn concurrent_thread_clear_has_one_authoritative_winner() -> Result<()> {
     }
 
     process.kill().await.context("failed to stop app-server")?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn clear_hook_timeout_is_nonfatal_and_transition_still_completes() -> Result<()> {
+    run_failed_clear_hook_case("import time\ntime.sleep(5)\n", 1).await
+}
+
+#[tokio::test]
+async fn clear_hook_nonzero_exit_is_nonfatal_and_transition_still_completes() -> Result<()> {
+    run_failed_clear_hook_case(
+        "import sys\nsys.stderr.write('clear hook exited seven')\nsys.exit(7)\n",
+        3,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn clear_hook_launch_failure_is_nonfatal_and_transition_still_completes() -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri(), "never")?;
+    enable_codex_hooks(codex_home.path())?;
+    std::fs::write(
+        codex_home.path().join("hooks.json"),
+        json!({
+            "hooks": {
+                "SessionEnd": [{
+                    "matcher": "clear",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "/definitely/missing/codex-clear-hook",
+                        "timeout": 3
+                    }]
+                }]
+            }
+        })
+        .to_string(),
+    )?;
+    let (mut process, bind_addr) = spawn_websocket_server(codex_home.path()).await?;
+    let mut client = connect_websocket(bind_addr).await?;
+    initialize(&mut client, 1, "hook-launch-failure").await?;
+    let predecessor = start_thread_with_config(
+        &mut client,
+        2,
+        Some(HashMap::from([(
+            "bypass_hook_trust".to_string(),
+            json!(true),
+        )])),
+    )
+    .await?;
+
+    send_clear(&mut client, 3, &predecessor).await?;
+    let (response, evidence) = read_clear_outcome(&mut client, 3).await?;
+    assert_eq!(evidence.len(), 2);
+    assert_completed_transition(codex_home.path(), &response.transition_id).await?;
+
+    process.kill().await.context("failed to stop app-server")?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn clear_hook_serialization_failure_is_nonfatal_and_transition_still_completes() -> Result<()>
+{
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri(), "never")?;
+    enable_codex_hooks(codex_home.path())?;
+    let unexpected_marker = codex_home.path().join("serialization-hook-ran");
+    std::fs::write(
+        codex_home.path().join("hooks.json"),
+        json!({
+            "hooks": {
+                "SessionEnd": [{
+                    "matcher": "clear",
+                    "hooks": [{
+                        "type": "command",
+                        "command": format!("touch {}", unexpected_marker.display()),
+                        "timeout": 3
+                    }]
+                }]
+            }
+        })
+        .to_string(),
+    )?;
+    let (mut process, bind_addr) = spawn_websocket_server_with_env(
+        codex_home.path(),
+        &[(
+            "CODEX_HOOKS_SESSION_END_SERIALIZATION_FAILURE_FOR_TESTS",
+            "1",
+        )],
+    )
+    .await?;
+    let mut client = connect_websocket(bind_addr).await?;
+    initialize(&mut client, 1, "hook-serialization-failure").await?;
+    let predecessor = start_thread_with_config(
+        &mut client,
+        2,
+        Some(HashMap::from([(
+            "bypass_hook_trust".to_string(),
+            json!(true),
+        )])),
+    )
+    .await?;
+
+    send_clear(&mut client, 3, &predecessor).await?;
+    let (response, evidence) = read_clear_outcome(&mut client, 3).await?;
+    assert_eq!(evidence.len(), 2);
+    assert!(
+        !unexpected_marker.exists(),
+        "serialization failure must occur before handler launch"
+    );
+    assert_completed_transition(codex_home.path(), &response.transition_id).await?;
+
+    process.kill().await.context("failed to stop app-server")?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cleared_and_control_threads_keep_operational_other_idle_unload() -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri(), "never")?;
+    let hook_log = write_lifecycle_logging_hooks(codex_home.path())?;
+    let (mut process, bind_addr) = spawn_websocket_server_with_args(
+        codex_home.path(),
+        "ws://127.0.0.1:0",
+        &["-c".to_string(), "thread_unload_delay_secs=1".to_string()],
+    )
+    .await?;
+    let mut client = connect_websocket(bind_addr).await?;
+    initialize(&mut client, 1, "idle-unload").await?;
+
+    let config = Some(HashMap::from([(
+        "bypass_hook_trust".to_string(),
+        json!(true),
+    )]));
+    let predecessor = start_thread_with_config(&mut client, 2, config.clone()).await?;
+    send_clear(&mut client, 3, &predecessor).await?;
+    let (response, _) = read_clear_outcome(&mut client, 3).await?;
+    wait_for_thread_closed(&mut client, &predecessor).await?;
+
+    let control = start_thread_with_config(&mut client, 4, config).await?;
+    assert_unsubscribe_status(&mut client, 5, &control, "unsubscribed").await?;
+    wait_for_thread_closed(&mut client, &control).await?;
+
+    let payloads = wait_for_hook_payloads(&hook_log, 3).await?;
+    assert_eq!(
+        payloads
+            .iter()
+            .map(|payload| {
+                (
+                    payload["session_id"].as_str().unwrap_or_default(),
+                    payload["reason"].as_str().unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            (predecessor.as_str(), "clear"),
+            (predecessor.as_str(), "other"),
+            (control.as_str(), "other"),
+        ]
+    );
+    assert_eq!(response.predecessor_thread_id, predecessor);
+
+    process.kill().await.context("failed to stop app-server")?;
+    Ok(())
+}
+
+async fn run_failed_clear_hook_case(script: &str, timeout_sec: u64) -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri(), "never")?;
+    enable_codex_hooks(codex_home.path())?;
+    let started_marker = write_clear_failure_hook(codex_home.path(), script, timeout_sec)?;
+    let (mut process, bind_addr) = spawn_websocket_server(codex_home.path()).await?;
+    let mut client = connect_websocket(bind_addr).await?;
+    initialize(&mut client, 1, "hook-failure").await?;
+    let predecessor = start_thread_with_config(
+        &mut client,
+        2,
+        Some(HashMap::from([(
+            "bypass_hook_trust".to_string(),
+            json!(true),
+        )])),
+    )
+    .await?;
+
+    send_clear(&mut client, 3, &predecessor).await?;
+    let (response, evidence) = read_clear_outcome(&mut client, 3).await?;
+    assert_eq!(evidence.len(), 2);
+    assert!(started_marker.exists(), "failed hook never started");
+
+    assert_completed_transition(codex_home.path(), &response.transition_id).await?;
+
+    // The hook engine unit tests assert the exact diagnostic for this failure
+    // mode. This integration boundary proves that the same real handler was
+    // entered and that its failure cannot cancel or corrupt A/B/T.
+
+    process.kill().await.context("failed to stop app-server")?;
+    Ok(())
+}
+
+async fn assert_completed_transition(codex_home: &Path, transition_id: &str) -> Result<()> {
+    let state = StateRuntime::init(
+        codex_state::SqliteConfig::new_for_testing(codex_home.abs()),
+        "test-provider".to_string(),
+    )
+    .await?;
+    let transition_id = ClearTransitionId::from_str(transition_id)?;
+    let record = state
+        .get_clear_transition(transition_id)
+        .await?
+        .context("completed clear transition")?;
+    assert_eq!(record.phase, ClearTransitionPhase::Completed);
+    Ok(())
+}
+
+fn enable_codex_hooks(codex_home: &Path) -> Result<()> {
+    let config_path = codex_home.join("config.toml");
+    let mut config = std::fs::read_to_string(&config_path)?;
+    config.push_str("\n[features]\ncodex_hooks = true\n");
+    std::fs::write(config_path, config)?;
+    Ok(())
+}
+
+fn write_clear_failure_hook(
+    codex_home: &Path,
+    script: &str,
+    timeout_sec: u64,
+) -> Result<std::path::PathBuf> {
+    let script_path = codex_home.join("clear-failure-hook.py");
+    let started_marker = codex_home.join("clear-failure-hook.started");
+    std::fs::write(
+        &script_path,
+        format!(
+            "from pathlib import Path\nPath(r\"{}\").write_text('started', encoding='utf-8')\n{script}",
+            started_marker.display()
+        ),
+    )?;
+    std::fs::write(
+        codex_home.join("hooks.json"),
+        json!({
+            "hooks": {
+                "SessionEnd": [{
+                    "matcher": "clear",
+                    "hooks": [{
+                        "type": "command",
+                        "command": format!("python3 {}", script_path.display()),
+                        "timeout": timeout_sec
+                    }]
+                }]
+            }
+        })
+        .to_string(),
+    )?;
+    Ok(started_marker)
+}
+
+fn write_lifecycle_logging_hooks(codex_home: &Path) -> Result<std::path::PathBuf> {
+    let log_path = codex_home.join("clear-lifecycle.jsonl");
+    let script_path = codex_home.join("clear-lifecycle-hook.py");
+    std::fs::write(
+        &script_path,
+        format!(
+            r#"import json
+from pathlib import Path
+import sys
+
+payload = json.load(sys.stdin)
+with Path(r"{}").open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps(payload) + "\n")
+"#,
+            log_path.display()
+        ),
+    )?;
+    let command = format!("python3 {}", script_path.display());
+    std::fs::write(
+        codex_home.join("hooks.json"),
+        json!({
+            "hooks": {
+                "SessionEnd": [
+                    {
+                        "matcher": "clear",
+                        "hooks": [{ "type": "command", "command": command, "timeout": 3 }]
+                    },
+                    {
+                        "matcher": "other",
+                        "hooks": [{ "type": "command", "command": command, "timeout": 3 }]
+                    }
+                ]
+            }
+        })
+        .to_string(),
+    )?;
+    Ok(log_path)
+}
+
+async fn wait_for_hook_payloads(
+    log_path: &Path,
+    expected: usize,
+) -> Result<Vec<serde_json::Value>> {
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let payloads = std::fs::read_to_string(log_path)
+                .unwrap_or_default()
+                .lines()
+                .map(serde_json::from_str)
+                .collect::<Result<Vec<_>, _>>()?;
+            if payloads.len() >= expected {
+                return Ok(payloads);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .context("timed out waiting for lifecycle hook payloads")?
+}
+
+async fn wait_for_thread_closed(stream: &mut WsClient, thread_id: &str) -> Result<()> {
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if let JSONRPCMessage::Notification(notification) = read_jsonrpc_message(stream).await?
+                && notification.method == "thread/closed"
+                && notification
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.get("threadId"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(thread_id)
+            {
+                return Ok(());
+            }
+        }
+    })
+    .await
+    .context("timed out waiting for idle thread unload")?
+}
+
+fn create_clear_successor_rollout(
+    codex_home: &Path,
+    index: usize,
+    predecessor: ThreadId,
+    transition_id: ClearTransitionId,
+) -> Result<ThreadId> {
+    let filename_ts = format!("2025-01-01T00-00-{index:02}");
+    let thread_id = create_fake_rollout(
+        codex_home,
+        &filename_ts,
+        "2025-01-01T00:00:00Z",
+        "clear successor",
+        Some("mock-provider"),
+        /*git_info*/ None,
+    )?;
+    let rollout_path = rollout_path(codex_home, &filename_ts, &thread_id);
+    let mut lines = fs::read_to_string(&rollout_path)?
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    lines[0]["payload"]["clear_predecessor_thread_id"] = json!(predecessor.to_string());
+    lines[0]["payload"]["clear_transition_id"] = json!(transition_id.to_string());
+    let contents = lines
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(rollout_path, format!("{contents}\n"))?;
+    ThreadId::from_string(&thread_id).map_err(Into::into)
+}
+
+async fn seed_transition_phase(
+    state: &StateRuntime,
+    transition_id: ClearTransitionId,
+    target: ClearTransitionPhase,
+) -> Result<()> {
+    for (expected, next) in [
+        (
+            ClearTransitionPhase::Reserved,
+            ClearTransitionPhase::SuccessorCreated,
+        ),
+        (
+            ClearTransitionPhase::SuccessorCreated,
+            ClearTransitionPhase::Committed,
+        ),
+        (
+            ClearTransitionPhase::Committed,
+            ClearTransitionPhase::EvidenceClaimed,
+        ),
+        (
+            ClearTransitionPhase::EvidenceClaimed,
+            ClearTransitionPhase::Completed,
+        ),
+    ] {
+        if expected == target {
+            break;
+        }
+        assert!(
+            state
+                .advance_clear_transition_phase(transition_id, expected, next)
+                .await?
+        );
+        if next == target {
+            break;
+        }
+    }
+    Ok(())
+}
+
+async fn seed_evidence_state(
+    state: &StateRuntime,
+    transition_id: ClearTransitionId,
+    kind: ClearTransitionEvidenceKind,
+    target: ClearTransitionEvidenceState,
+) -> Result<()> {
+    if target == ClearTransitionEvidenceState::Pending {
+        return Ok(());
+    }
+    assert!(
+        state
+            .advance_clear_transition_evidence(
+                transition_id,
+                kind,
+                ClearTransitionEvidenceState::Pending,
+                ClearTransitionEvidenceState::Claimed,
+            )
+            .await?
+    );
+    if target != ClearTransitionEvidenceState::Claimed {
+        assert!(
+            state
+                .advance_clear_transition_evidence(
+                    transition_id,
+                    kind,
+                    ClearTransitionEvidenceState::Claimed,
+                    target,
+                )
+                .await?
+        );
+    }
     Ok(())
 }
 

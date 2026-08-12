@@ -757,6 +757,55 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn disclosed_successor_stays_reserved_after_request_scope_releases() {
+        let manager = ThreadStateManager::new();
+        let predecessor_thread_id = ThreadId::new();
+        let successor_thread_id = ThreadId::new();
+        let requester = ConnectionId(1);
+        manager
+            .connection_initialized(requester, ConnectionCapabilities::default())
+            .await;
+        manager
+            .try_ensure_connection_subscribed(predecessor_thread_id, requester, false)
+            .await
+            .expect("requester should be attached to predecessor");
+        assert!(
+            manager
+                .reserve_clear_transition_authority(predecessor_thread_id, requester)
+                .await
+                .is_ok()
+        );
+        assert!(
+            manager
+                .reserve_clear_successor_attachment(predecessor_thread_id, successor_thread_id)
+                .await
+        );
+
+        assert!(
+            manager
+                .release_clear_transition_authority(predecessor_thread_id)
+                .await
+        );
+        assert!(matches!(
+            manager
+                .try_add_connection_to_thread(successor_thread_id, requester)
+                .await,
+            Err(ConnectionSubscriptionError::ClearSuccessorReserved)
+        ));
+        assert!(
+            manager
+                .terminalize_clear_successor_attachment(predecessor_thread_id, successor_thread_id)
+                .await
+        );
+        assert!(
+            manager
+                .try_add_connection_to_thread(successor_thread_id, requester)
+                .await
+                .is_ok()
+        );
+    }
+
     async fn recv_attachment_changed_notification(
         outgoing_rx: &mut mpsc::Receiver<OutgoingEnvelope>,
     ) -> ThreadAttachmentChangedNotification {
@@ -1060,13 +1109,30 @@ impl ThreadStateManager {
         &self,
         predecessor_thread_id: ThreadId,
     ) -> bool {
-        let mut state = self.state.lock().await;
-        state
-            .clear_successor_reservations
-            .retain(|_, predecessor| *predecessor != predecessor_thread_id);
-        state
+        self.state
+            .lock()
+            .await
             .clear_transition_reservations
             .remove(&predecessor_thread_id)
+    }
+
+    /// Releases B only after the durable clear reaches its terminal
+    /// disposition. This is deliberately separate from the request-scoped A
+    /// authority release: an error after B is disclosed must remain
+    /// fail-closed until reconciliation can account for the durable record.
+    pub(crate) async fn terminalize_clear_successor_attachment(
+        &self,
+        predecessor_thread_id: ThreadId,
+        successor_thread_id: ThreadId,
+    ) -> bool {
+        let mut state = self.state.lock().await;
+        matches!(
+            state.clear_successor_reservations.get(&successor_thread_id),
+            Some(predecessor) if *predecessor == predecessor_thread_id
+        ) && state
+            .clear_successor_reservations
+            .remove(&successor_thread_id)
+            .is_some()
     }
 
     /// Prevents an ordinary resume from attaching the disclosed clear
@@ -1435,11 +1501,14 @@ impl ThreadStateManager {
         &self,
         thread_id: ThreadId,
         connection_id: ConnectionId,
-    ) -> bool {
+    ) -> Result<(), ConnectionSubscriptionError> {
         let change = {
             let mut state = self.state.lock().await;
             if !state.live_connections.contains_key(&connection_id) {
-                return false;
+                return Err(ConnectionSubscriptionError::ConnectionClosed);
+            }
+            if state.clear_successor_reservations.contains_key(&thread_id) {
+                return Err(ConnectionSubscriptionError::ClearSuccessorReserved);
             }
             let was_added = state
                 .thread_ids_by_connection
@@ -1462,7 +1531,7 @@ impl ThreadStateManager {
             state.attachment_change(changes)
         };
         self.publish_attachment_change(change).await;
-        true
+        Ok(())
     }
 
     pub(crate) async fn remove_connection(&self, connection_id: ConnectionId) -> Vec<ThreadId> {

@@ -1311,6 +1311,7 @@ mod thread_processor_behavior_tests {
             manager
                 .try_add_connection_to_thread(thread_id, connection_b)
                 .await
+                .is_ok()
         );
         tokio::time::timeout(Duration::from_secs(1), has_connections.changed())
             .await
@@ -1341,7 +1342,7 @@ mod thread_processor_behavior_tests {
         })
         .await?;
 
-        assert!(attached);
+        assert!(attached.is_ok());
         Ok(())
     }
 
@@ -1415,21 +1416,25 @@ mod thread_processor_behavior_tests {
             manager
                 .try_add_connection_to_thread(other_thread_id, unrelated_supported_connection)
                 .await
+                .is_ok()
         );
         assert!(
             manager
                 .try_add_connection_to_thread(thread_id, later_supported_connection)
                 .await
+                .is_ok()
         );
         assert!(
             manager
                 .try_add_connection_to_thread(thread_id, earlier_supported_connection)
                 .await
+                .is_ok()
         );
         assert!(
             manager
                 .try_add_connection_to_thread(thread_id, unsupported_connection)
                 .await
+                .is_ok()
         );
 
         assert_eq!(

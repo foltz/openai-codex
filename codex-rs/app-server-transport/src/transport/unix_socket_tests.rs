@@ -209,6 +209,11 @@ fn unix_socket_peer_helper_connects() {
             ))
             .await
             .expect("helper should send initialized notification");
+        // Keep the peer alive until accept-time credentials are read. This
+        // models the persistent daemon client that entitlement is for; an
+        // immediately-exiting helper can disappear before the accept task is
+        // scheduled and correctly yields ESRCH.
+        tokio::time::sleep(Duration::from_millis(100)).await;
         websocket
             .close(None)
             .await
@@ -255,9 +260,15 @@ async fn control_socket_entitles_only_a_same_image_peer() {
         .await
         .expect("copied helper should be executable");
     run_peer_helper(copied_executable, socket_path.as_path()).await;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     assert_eq!(
         recv_connection_provenance(&mut transport_event_rx).await,
         ConnectionProvenance::Unproven
+    );
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        recv_connection_provenance(&mut transport_event_rx).await,
+        expected_same_image_provenance()
     );
 
     shutdown_token.cancel();
@@ -288,10 +299,14 @@ fn expected_same_image_provenance() -> ConnectionProvenance {
             super::PeerExecutableIdentity::current_process().expect("current executable identity"),
         )
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(target_os = "macos")]
     {
-        // Darwin intentionally cannot turn LOCAL_PEERPID into a trusted
-        // image proof: proc_pidpath is only a mutable pathname.
+        ConnectionProvenance::UnixPeerExecutable(
+            super::PeerExecutableIdentity::current_process().expect("current executable identity"),
+        )
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    {
         ConnectionProvenance::Unproven
     }
 }

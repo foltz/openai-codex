@@ -1,14 +1,18 @@
 use codex_core::config::Config;
 use std::sync::Arc;
 use std::sync::RwLock;
-use tokio::sync::Mutex;
 
 /// One selected user configuration layer that can contribute to the effective
 /// MCP configuration.
 ///
-/// The path is canonicalized while the accepted configuration snapshot is
-/// still held. This makes the wire representation a filesystem identity rather
-/// than a spelling supplied through `CODEX_HOME` or a profile override.
+/// The normalized absolute path spelling selected by the accepted configuration
+/// snapshot.
+///
+/// This is deliberately not a canonical filesystem identity: selected user
+/// layers may be absent (and therefore load as an empty table), and resolving
+/// symlinks after loading could pair a layer's accepted version with a later
+/// filesystem object. The path and version are instead both taken from the
+/// same accepted configuration snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct McpConfigIdentityLayer {
     pub(crate) file_path: String,
@@ -36,8 +40,8 @@ impl McpConfigIdentity {
                 continue;
             };
             let file_path = file
-                .canonicalize()?
-                .into_path_buf()
+                .as_path()
+                .to_path_buf()
                 .into_os_string()
                 .into_string()
                 .map_err(|_| {
@@ -63,20 +67,20 @@ impl McpConfigIdentity {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct AppliedMcpConfigIdentity {
     identity: Arc<RwLock<Option<McpConfigIdentity>>>,
-    apply_lock: Arc<Mutex<()>>,
+    apply_gate: codex_core::RuntimeConfigChangeGate,
 }
 
 impl AppliedMcpConfigIdentity {
     pub(crate) fn from_startup_config(config: &Config) -> Self {
         Self {
             // MessageProcessor construction is intentionally infallible. An
-            // unavailable canonical wire identity is therefore retained as
+            // unavailable UTF-8 wire identity is therefore retained as
             // unavailable and the read/reload request returns an ordinary
-            // error instead of reporting a lossy or non-canonical identity.
+            // error instead of reporting a lossy identity.
             identity: Arc::new(RwLock::new(
                 McpConfigIdentity::from_config(config).ok().flatten(),
             )),
-            apply_lock: Arc::new(Mutex::new(())),
+            apply_gate: codex_core::RuntimeConfigChangeGate::default(),
         }
     }
 
@@ -103,8 +107,22 @@ impl AppliedMcpConfigIdentity {
     /// the corresponding retained applied identity. The asynchronous guard is
     /// intentionally held across configuration and thread work; the separate
     /// synchronous identity lock remains short-lived.
-    pub(crate) async fn lock_apply(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.apply_lock.lock().await
+    pub(crate) async fn lock_apply(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.apply_gate.lock().await
+    }
+
+    pub(crate) fn apply_gate(&self) -> codex_core::RuntimeConfigChangeGate {
+        self.apply_gate.clone()
+    }
+}
+
+impl codex_core::RuntimeConfigChangeListener for AppliedMcpConfigIdentity {
+    fn before_runtime_config_change(&self) {
+        // Legacy core reloads can only report that a selected-user runtime
+        // mutation is about to begin; they cannot construct this app-server
+        // protocol identity. Fail closed until an app-server-owned complete
+        // transition replaces it.
+        self.invalidate();
     }
 }
 
@@ -145,13 +163,10 @@ mod tests {
         )?
         .expect("profile-v2 has selected user layers");
         assert_eq!(startup.layers.len(), 2);
-        assert_eq!(
-            startup.layers[0].file_path,
-            std::fs::canonicalize(&base_path)?.display().to_string()
-        );
+        assert_eq!(startup.layers[0].file_path, base_path.display().to_string());
         assert_eq!(
             startup.layers[1].file_path,
-            std::fs::canonicalize(&profile_path)?.display().to_string()
+            profile_path.display().to_string()
         );
 
         std::fs::write(
@@ -168,11 +183,45 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "the test intentionally proves the shared transition lock blocks a competing async task"
-    )]
+    async fn identity_preserves_the_accepted_selected_symlink_path_spelling() -> anyhow::Result<()>
+    {
+        use std::os::unix::fs::symlink;
+
+        let home = tempdir()?;
+        let real_path = home.path().join("real-config.toml");
+        let selected_path = home.path().join("selected-config.toml");
+        std::fs::write(&real_path, "[mcp_servers.shared]\ncommand = \"real\"\n")?;
+        symlink(&real_path, &selected_path)?;
+
+        let mut overrides =
+            LoaderOverrides::with_managed_config_path_for_tests(home.path().join("managed.toml"));
+        overrides.user_config_path = Some(AbsolutePathBuf::from_absolute_path(&selected_path)?);
+        let manager = ConfigManager::new_for_tests(
+            home.path().to_path_buf(),
+            Vec::new(),
+            overrides,
+            CloudConfigBundleLoader::default(),
+        );
+
+        let identity = McpConfigIdentity::from_config(
+            &manager.load_latest_config(/*fallback_cwd*/ None).await?,
+        )?
+        .expect("selected user config identity");
+        let selected_layer = identity.layers.last().expect("explicit selected layer");
+        assert_eq!(
+            selected_layer.file_path,
+            selected_path.display().to_string()
+        );
+        assert_ne!(
+            selected_layer.file_path,
+            std::fs::canonicalize(real_path)?.display().to_string()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn apply_lock_serializes_runtime_identity_transitions() {
         let identity = AppliedMcpConfigIdentity::default();
         let (first_entered_tx, first_entered_rx) = tokio::sync::oneshot::channel();

@@ -297,16 +297,11 @@ impl ConfigRequestProcessor {
         Ok(ExperimentalFeatureEnablementSetResponse { enablement })
     }
 
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "runtime config refresh and its retained MCP identity must be one serialized transition"
-    )]
     async fn reload_user_config(&self) {
         let _apply_guard = self.applied_mcp_config_identity.lock_apply().await;
         let refreshed_config = match self.load_latest_config(/*fallback_cwd*/ None).await {
             Ok(config) => config,
             Err(err) => {
-                self.applied_mcp_config_identity.invalidate();
                 tracing::warn!(
                     "failed to rebuild user config for runtime refresh: {}",
                     err.message
@@ -317,7 +312,6 @@ impl ConfigRequestProcessor {
         let candidate_identity = match McpConfigIdentity::from_config(&refreshed_config) {
             Ok(identity) => identity,
             Err(err) => {
-                self.applied_mcp_config_identity.invalidate();
                 tracing::warn!(%err, "failed to identify user config for runtime refresh");
                 return;
             }
@@ -327,7 +321,6 @@ impl ConfigRequestProcessor {
             let thread = match self.thread_manager.get_thread(thread_id).await {
                 Ok(thread) => thread,
                 Err(err) => {
-                    self.applied_mcp_config_identity.invalidate();
                     tracing::warn!(%thread_id, %err, "failed to load thread for runtime refresh");
                     return;
                 }
@@ -340,7 +333,6 @@ impl ConfigRequestProcessor {
             {
                 Ok(config) => config,
                 Err(err) => {
-                    self.applied_mcp_config_identity.invalidate();
                     tracing::warn!(%thread_id, %err, "failed to reload thread configuration");
                     return;
                 }
@@ -350,19 +342,17 @@ impl ConfigRequestProcessor {
                     refreshes.push((thread, next_config))
                 }
                 Ok(_) => {
-                    self.applied_mcp_config_identity.invalidate();
                     tracing::warn!(%thread_id, "selected MCP configuration changed while reloading runtime config");
                     return;
                 }
                 Err(err) => {
-                    self.applied_mcp_config_identity.invalidate();
                     tracing::warn!(%thread_id, %err, "failed to identify thread runtime configuration");
                     return;
                 }
             }
         }
         for (thread, config) in refreshes {
-            thread.refresh_runtime_config(config).await;
+            thread.refresh_runtime_config_from_host(config).await;
         }
         self.applied_mcp_config_identity.replace(candidate_identity);
     }
@@ -695,7 +685,7 @@ fn config_write_error(code: ConfigWriteErrorCode, message: impl Into<String>) ->
 
 #[cfg(test)]
 mod tests {
-    use super::map_requirements_toml_to_api;
+    use super::*;
     use codex_app_server_protocol::AutoReviewRequirements;
     use codex_app_server_protocol::FeedbackRequirements;
     use codex_app_server_protocol::WindowsSandboxSetupMode;
@@ -706,11 +696,17 @@ mod tests {
     use codex_config::NewThreadModelDefaultsToml;
     use codex_config::WindowsRequirementsToml;
     use codex_config::types::FeedbackConfigToml;
+    use codex_core::config::ConfigBuilder;
+    use codex_core::test_support::EmptyUserInstructionsProvider;
+    use codex_login::AuthManager;
+    use codex_login::CodexAuth;
     use codex_protocol::openai_models::ReasoningEffort;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use codex_utils_path_uri::PathUri;
     use pretty_assertions::assert_eq;
     use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use tempfile::tempdir;
 
     #[test]
     fn requirements_api_includes_allow_managed_hooks_only() {
@@ -721,6 +717,62 @@ mod tests {
 
         assert_eq!(mapped.allow_managed_hooks_only, Some(true));
         assert_eq!(mapped.hooks, None);
+    }
+
+    #[tokio::test]
+    async fn runtime_reload_planning_failure_retains_applied_mcp_identity() -> anyhow::Result<()> {
+        let home = tempdir()?;
+        let config_path = home.path().join(codex_config::CONFIG_TOML_FILE);
+        std::fs::write(
+            &config_path,
+            "[mcp_servers.initial]\ncommand = \"initial\"\n",
+        )?;
+        let config = ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .build()
+            .await?;
+        let config_manager =
+            ConfigManager::without_managed_config_for_tests(home.path().to_path_buf());
+        let applied = AppliedMcpConfigIdentity::from_startup_config(&config);
+        let before = applied.current().expect("startup identity");
+        let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("test"));
+        let thread_manager = Arc::new(ThreadManager::new(
+            &config,
+            Arc::clone(&auth_manager),
+            codex_core::build_models_manager(&config, auth_manager),
+            codex_core::CodexAppsToolsCache::default(),
+            codex_protocol::protocol::SessionSource::Exec,
+            Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+            codex_extension_api::empty_extension_registry(),
+            Arc::new(EmptyUserInstructionsProvider),
+            /*analytics_events_client*/ None,
+            codex_core::thread_store_from_config(&config, /*state_db*/ None),
+            /*agent_graph_store*/ None,
+            "test-installation".to_string(),
+            /*attestation_provider*/ None,
+            /*external_time_provider*/ None,
+        ));
+        let (outgoing_tx, _outgoing_rx) = tokio::sync::mpsc::channel(1);
+        let processor = ConfigRequestProcessor::new(
+            Arc::new(OutgoingMessageSender::new(
+                outgoing_tx,
+                AnalyticsEventsClient::disabled(),
+            )),
+            config_manager,
+            thread_manager,
+            applied.clone(),
+            AnalyticsEventsClient::disabled(),
+        );
+
+        std::fs::write(&config_path, "[mcp_servers.invalid\n")?;
+        processor.reload_user_config().await;
+
+        assert_eq!(
+            applied.current(),
+            Some(before),
+            "a failed reload before the first thread mutation retains the last complete applied identity"
+        );
+        Ok(())
     }
 
     #[test]

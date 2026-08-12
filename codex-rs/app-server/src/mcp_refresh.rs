@@ -8,10 +8,6 @@ use std::io;
 use std::sync::Arc;
 use tracing::warn;
 
-#[expect(
-    clippy::await_holding_invalid_type,
-    reason = "MCP runtime state and its retained applied identity must advance atomically"
-)]
 pub(crate) async fn reload_mcp_config(
     thread_manager: &Arc<ThreadManager>,
     config_manager: &ConfigManager,
@@ -43,10 +39,6 @@ pub(crate) async fn reload_mcp_config(
     Ok(())
 }
 
-#[expect(
-    clippy::await_holding_invalid_type,
-    reason = "best-effort MCP refresh must invalidate identity before any thread mutation"
-)]
 pub(crate) async fn reload_mcp_config_best_effort(
     thread_manager: &Arc<ThreadManager>,
     config_manager: &ConfigManager,

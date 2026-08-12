@@ -607,6 +607,8 @@ impl Session {
         git_enrichment_policy: GitEnrichmentPolicy,
         windows_sandbox_proxy_settings_mode: codex_sandboxing::WindowsSandboxProxySettingsMode,
         deferred_clear_session_start: Option<super::DeferredClearSessionStart>,
+        runtime_config_change_listener: Option<Arc<dyn crate::RuntimeConfigChangeListener>>,
+        runtime_config_change_gate: Option<crate::RuntimeConfigChangeGate>,
     ) -> anyhow::Result<Arc<Self>> {
         debug!(
             "Configuring session: model={}; provider={:?}",
@@ -1311,6 +1313,8 @@ impl Session {
                 ),
                 tool_search_handler_cache: Default::default(),
                 turn_environments: Arc::clone(&turn_environments),
+                runtime_config_change_listener,
+                runtime_config_change_gate,
             };
             let (mcp_prewarm_tx, mcp_prewarm_rx) = async_channel::bounded(1);
             let sess = Arc::new(Session {

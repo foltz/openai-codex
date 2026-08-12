@@ -143,6 +143,11 @@ pub(crate) async fn run_codex_thread_interactive(
         git_enrichment_policy,
         windows_sandbox_proxy_settings_mode,
         deferred_clear_session_start: None,
+        runtime_config_change_listener: parent_session
+            .services
+            .runtime_config_change_listener
+            .clone(),
+        runtime_config_change_gate: parent_session.services.runtime_config_change_gate.clone(),
     }))
     .or_cancel(&cancel_token)
     .await??;

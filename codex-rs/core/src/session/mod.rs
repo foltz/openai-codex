@@ -467,6 +467,8 @@ pub(crate) struct SessionSpawnArgs {
     pub(crate) windows_sandbox_proxy_settings_mode:
         codex_sandboxing::WindowsSandboxProxySettingsMode,
     pub(crate) deferred_clear_session_start: Option<DeferredClearSessionStart>,
+    pub(crate) runtime_config_change_listener: Option<Arc<dyn crate::RuntimeConfigChangeListener>>,
+    pub(crate) runtime_config_change_gate: Option<crate::RuntimeConfigChangeGate>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -566,6 +568,8 @@ impl Session {
             git_enrichment_policy,
             windows_sandbox_proxy_settings_mode,
             deferred_clear_session_start,
+            runtime_config_change_listener,
+            runtime_config_change_gate,
         } = args;
         let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
         let (tx_event, rx_event) = async_channel::unbounded();
@@ -811,6 +815,8 @@ impl Session {
             git_enrichment_policy,
             windows_sandbox_proxy_settings_mode,
             deferred_clear_session_start,
+            runtime_config_change_listener,
+            runtime_config_change_gate,
         ))
         .await
         .map_err(|e| {
@@ -1722,6 +1728,20 @@ impl Session {
     }
 
     pub(crate) async fn refresh_runtime_config(&self, next_config: Config) {
+        let _change_guard = match self.services.runtime_config_change_gate.as_ref() {
+            Some(gate) => Some(gate.lock().await),
+            None => None,
+        };
+        if let Some(listener) = self.services.runtime_config_change_listener.as_ref() {
+            listener.before_runtime_config_change();
+        }
+        self.refresh_runtime_config_from_host(next_config).await;
+    }
+
+    /// Applies a materialized runtime configuration under a transition the
+    /// host already owns. Callers must hold the matching
+    /// `RuntimeConfigChangeGate` for the entire runtime transition.
+    pub(crate) async fn refresh_runtime_config_from_host(&self, next_config: Config) {
         // Refresh only the user layer from the incoming snapshot. Preserve thread-local
         // layers such as request/session overrides that were present when this session
         // was created.

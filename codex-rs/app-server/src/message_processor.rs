@@ -270,6 +270,7 @@ impl MessageProcessor {
             ),
         );
         let goal_service = Arc::new(GoalService::new());
+        let applied_mcp_config_identity = AppliedMcpConfigIdentity::from_startup_config(&config);
         let thread_manager = Arc::new_cyclic(|thread_manager| {
             let manager = ThreadManager::new(
                 config.as_ref(),
@@ -313,10 +314,13 @@ impl MessageProcessor {
                     thread_state_manager.clone(),
                 )),
             );
-            match code_mode_session_provider {
+            let manager = match code_mode_session_provider {
                 Some(provider) => manager.with_code_mode_session_provider(provider),
                 None => manager,
-            }
+            };
+            manager
+                .with_runtime_config_change_gate(applied_mcp_config_identity.apply_gate())
+                .with_runtime_config_change_listener(Arc::new(applied_mcp_config_identity.clone()))
         });
         let models_manager = thread_manager.get_models_manager();
         let models_refresh_worker =
@@ -338,7 +342,6 @@ impl MessageProcessor {
             Arc::new(workspace_settings::WorkspaceSettingsCache::default());
         let app_list_shutdown_token = CancellationToken::new();
         let request_serialization_queues = RequestSerializationQueues::default();
-        let applied_mcp_config_identity = AppliedMcpConfigIdentity::from_startup_config(&config);
         let config_processor = ConfigRequestProcessor::new(
             outgoing.clone(),
             config_manager.clone(),

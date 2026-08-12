@@ -24,3 +24,19 @@ async fn update_is_refused_with_managed_release_promotion_guidance() -> Result<(
 
     Ok(())
 }
+
+#[tokio::test]
+async fn hidden_pid_update_loop_is_refused_before_updater_setup() -> Result<()> {
+    let codex_home = TempDir::new()?;
+
+    codex_command(codex_home.path())?
+        .args(["app-server", "daemon", "pid-update-loop"])
+        .assert()
+        .failure()
+        .stderr(contains(
+            "codex self-update is disabled in this managed distribution",
+        ))
+        .stderr(contains("managed release and promotion workflow"));
+
+    Ok(())
+}

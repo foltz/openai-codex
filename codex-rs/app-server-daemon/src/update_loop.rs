@@ -1,6 +1,4 @@
 #[cfg(unix)]
-use std::process::Command as StdCommand;
-#[cfg(unix)]
 use std::process::Stdio;
 #[cfg(unix)]
 use std::time::Duration;
@@ -17,8 +15,6 @@ use codex_http_client::HttpClientFactory;
 use codex_http_client::RouteAwareClientPool;
 #[cfg(unix)]
 use futures::FutureExt;
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 #[cfg(unix)]
 use tokio::io::AsyncWriteExt;
 #[cfg(unix)]
@@ -109,7 +105,7 @@ async fn update_once(
     let daemon = Daemon::from_environment()?;
     let managed_codex_bin = resolved_managed_codex_bin(&daemon.managed_codex_bin).await?;
     let managed_identity = executable_identity(&managed_codex_bin).await?;
-    let (restart_mode, updater_refresh_mode) =
+    let (restart_mode, _updater_refresh_mode) =
         update_modes_for_identities(running_updater_identity, &managed_identity);
 
     loop {
@@ -117,7 +113,7 @@ async fn update_once(
             return Ok(UpdateLoopControl::Stop);
         }
         match daemon
-            .try_restart_if_running(restart_mode, updater_refresh_mode, &managed_codex_bin)
+            .try_restart_if_running(restart_mode, &managed_codex_bin)
             .await?
         {
             RestartIfRunningOutcome::Busy => {
@@ -150,19 +146,6 @@ fn update_modes_for_identities(
             UpdaterRefreshMode::ReexecIfManagedBinaryChanged,
         )
     }
-}
-
-#[cfg(unix)]
-pub(crate) fn reexec_managed_updater(managed_codex_bin: &std::path::Path) -> Result<()> {
-    let err = StdCommand::new(managed_codex_bin)
-        .args(["app-server", "daemon", "pid-update-loop"])
-        .exec();
-    Err(err).with_context(|| {
-        format!(
-            "failed to replace updater with managed Codex binary {}",
-            managed_codex_bin.display()
-        )
-    })
 }
 
 #[cfg(unix)]

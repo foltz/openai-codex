@@ -1158,16 +1158,7 @@ async fn cli_main(
                         print_app_server_daemon_output(AppServerLifecycleCommand::Version).await?;
                     }
                     AppServerDaemonSubcommand::PidUpdateLoop => {
-                        let cli_overrides = root_config_overrides
-                            .parse_overrides()
-                            .map_err(anyhow::Error::msg)?;
-                        let config = ConfigBuilder::default()
-                            .cli_overrides(cli_overrides)
-                            .build()
-                            .await
-                            .map_err(anyhow::Error::from);
-                        let http_client_factory = updater_http_client_factory(config);
-                        codex_app_server_daemon::run_pid_update_loop(http_client_factory).await?;
+                        anyhow::bail!(codex_app_server_daemon::MANAGED_UPDATE_DISABLED_MESSAGE);
                     }
                 },
                 Some(AppServerSubcommand::Proxy(proxy_cli)) => {
@@ -2278,6 +2269,7 @@ async fn print_app_server_daemon_output(command: AppServerLifecycleCommand) -> a
     Ok(())
 }
 
+#[cfg(test)]
 fn updater_http_client_factory(
     config: anyhow::Result<codex_core::config::Config>,
 ) -> codex_http_client::HttpClientFactory {

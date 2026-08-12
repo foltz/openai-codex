@@ -3,6 +3,7 @@ mod client;
 mod managed_install;
 mod remote_control_client;
 mod settings;
+#[allow(dead_code)] // The managed boundary rejects before this legacy updater loop can run.
 mod update_loop;
 
 use std::path::Path;
@@ -33,6 +34,8 @@ const UPDATE_PID_FILE_NAME: &str = "app-server-updater.pid";
 const OPERATION_LOCK_FILE_NAME: &str = "daemon.lock";
 const SETTINGS_FILE_NAME: &str = "settings.json";
 const STATE_DIR_NAME: &str = "app-server-daemon";
+
+pub const MANAGED_UPDATE_DISABLED_MESSAGE: &str = "codex self-update is disabled in this managed distribution; use the managed release and promotion workflow instead";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleCommand {
@@ -232,10 +235,9 @@ pub async fn set_remote_control(mode: RemoteControlMode) -> Result<RemoteControl
 }
 
 pub async fn run_pid_update_loop(
-    http_client_factory: codex_http_client::HttpClientFactory,
+    _http_client_factory: codex_http_client::HttpClientFactory,
 ) -> Result<()> {
-    ensure_supported_platform()?;
-    update_loop::run(http_client_factory).await
+    anyhow::bail!(MANAGED_UPDATE_DISABLED_MESSAGE)
 }
 
 #[cfg(unix)]
@@ -334,6 +336,7 @@ impl Daemon {
 
     async fn restart(&self) -> Result<LifecycleOutput> {
         let settings = self.load_settings().await?;
+        self.stop_pid_update_loop(&settings).await?;
         if client::probe(&self.socket_path).await.is_ok()
             && self.running_backend(&settings).await?.is_none()
         {
@@ -360,10 +363,10 @@ impl Daemon {
     }
 
     #[cfg(unix)]
+    #[allow(dead_code)] // The updater loop no longer has authority to call this restart path.
     pub(crate) async fn try_restart_if_running(
         &self,
         mode: RestartMode,
-        updater_refresh_mode: UpdaterRefreshMode,
         managed_codex_bin: &Path,
     ) -> Result<RestartIfRunningOutcome> {
         let operation_lock = self.open_operation_lock_file().await?;
@@ -397,10 +400,6 @@ impl Daemon {
         } else {
             RestartIfRunningOutcome::NotRunning
         };
-
-        if should_reexec_updater(updater_refresh_mode, outcome) {
-            crate::update_loop::reexec_managed_updater(managed_codex_bin)?;
-        }
 
         Ok(outcome)
     }
@@ -585,11 +584,11 @@ impl Daemon {
     }
 
     async fn bootstrap_locked(&self, options: BootstrapOptions) -> Result<BootstrapOutput> {
-        self.ensure_managed_codex_bin()?;
-
         let settings = DaemonSettings {
             remote_control_enabled: options.remote_control_enabled,
         };
+        self.stop_pid_update_loop(&settings).await?;
+        self.ensure_managed_codex_bin()?;
         if client::probe(&self.socket_path).await.is_ok()
             && self.running_backend(&settings).await?.is_none()
         {
@@ -605,18 +604,13 @@ impl Daemon {
 
         let backend = backend::pid_backend(self.backend_paths(&settings));
         backend.start().await?;
-        let updater = backend::pid_update_loop_backend(self.backend_paths(&settings));
-        if updater.is_starting_or_running().await? {
-            updater.stop().await?;
-        }
-        updater.start().await?;
 
         let info = self.wait_until_ready().await?;
         let managed_codex_version = self.managed_codex_version_best_effort().await;
         Ok(BootstrapOutput {
             status: BootstrapStatus::Bootstrapped,
             backend: BackendKind::Pid,
-            auto_update_enabled: true,
+            auto_update_enabled: false,
             remote_control_enabled: settings.remote_control_enabled,
             managed_codex_path: self.managed_codex_bin.clone(),
             managed_codex_version,
@@ -660,8 +654,13 @@ impl Daemon {
     }
 
     async fn is_bootstrapped(&self, settings: &DaemonSettings) -> Result<bool> {
-        let updater = backend::pid_update_loop_backend(self.backend_paths(settings));
-        updater.is_starting_or_running().await
+        Ok(self.running_backend_instance(settings).await?.is_some())
+    }
+
+    async fn stop_pid_update_loop(&self, settings: &DaemonSettings) -> Result<()> {
+        backend::pid_update_loop_backend(self.backend_paths(settings))
+            .stop()
+            .await
     }
 
     fn ensure_managed_codex_bin(&self) -> Result<()> {
@@ -817,13 +816,12 @@ fn restart_decision(
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn should_reexec_updater(
-    updater_refresh_mode: UpdaterRefreshMode,
-    outcome: RestartIfRunningOutcome,
+    _updater_refresh_mode: UpdaterRefreshMode,
+    _outcome: RestartIfRunningOutcome,
 ) -> bool {
-    updater_refresh_mode == UpdaterRefreshMode::ReexecIfManagedBinaryChanged
-        && outcome == RestartIfRunningOutcome::Restarted
+    false
 }
 
 #[cfg(unix)]
@@ -853,11 +851,13 @@ mod tests {
     use tempfile::TempDir;
 
     use super::BackendKind;
+    use super::BootstrapOptions;
     use super::BootstrapOutput;
     use super::BootstrapStatus;
     use super::Daemon;
     use super::LifecycleOutput;
     use super::LifecycleStatus;
+    use super::MANAGED_UPDATE_DISABLED_MESSAGE;
     use super::RemoteControlStartOutput;
     use super::RemoteControlStatus;
     use super::RestartDecision;
@@ -877,7 +877,7 @@ mod tests {
     }
 
     #[test]
-    fn updater_reexec_waits_for_validated_restart() {
+    fn updater_reexec_is_inert_after_validated_restart() {
         assert_eq!(
             [
                 RestartIfRunningOutcome::Busy,
@@ -889,12 +889,12 @@ mod tests {
             .map(|outcome| {
                 should_reexec_updater(UpdaterRefreshMode::ReexecIfManagedBinaryChanged, outcome)
             }),
-            [false, false, false, false, true]
+            [false, false, false, false, false]
         );
     }
 
     #[test]
-    fn unchanged_updater_never_reexecs() {
+    fn unchanged_updater_remains_inert() {
         assert_eq!(
             [
                 RestartIfRunningOutcome::Busy,
@@ -976,7 +976,7 @@ mod tests {
         let bootstrap_output = BootstrapOutput {
             status: BootstrapStatus::Bootstrapped,
             backend: BackendKind::Pid,
-            auto_update_enabled: true,
+            auto_update_enabled: false,
             remote_control_enabled: true,
             managed_codex_path: "codex".into(),
             managed_codex_version: Some("1.2.3".to_string()),
@@ -991,7 +991,7 @@ mod tests {
             serde_json::json!({
                 "status": "bootstrapped",
                 "backend": "pid",
-                "autoUpdateEnabled": true,
+                "autoUpdateEnabled": false,
                 "remoteControlEnabled": true,
                 "managedCodexPath": "codex",
                 "managedCodexVersion": "1.2.3",
@@ -1033,5 +1033,91 @@ mod tests {
                 stderr_log.display()
             )
         );
+    }
+
+    fn daemon_for_test(temp_dir: &TempDir) -> Daemon {
+        Daemon {
+            socket_path: temp_dir.path().join("app-server-control.sock"),
+            pid_file: temp_dir.path().join("app-server.pid"),
+            update_pid_file: temp_dir.path().join("app-server-updater.pid"),
+            operation_lock_file: temp_dir.path().join("daemon.lock"),
+            settings_file: temp_dir.path().join("settings.json"),
+            managed_codex_bin: temp_dir.path().join("codex"),
+        }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_propagates_existing_updater_stop_failure() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let daemon = daemon_for_test(&temp_dir);
+        tokio::fs::write(&daemon.update_pid_file, "not a pid record")
+            .await
+            .expect("write invalid updater pid record");
+
+        let error = daemon
+            .bootstrap_locked(BootstrapOptions {
+                remote_control_enabled: false,
+            })
+            .await
+            .expect_err("bootstrap must propagate updater stop failure");
+
+        assert!(error.to_string().contains("invalid pid file contents"));
+        assert!(!daemon.pid_file.exists());
+    }
+
+    #[tokio::test]
+    async fn restart_propagates_existing_updater_stop_failure() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let daemon = daemon_for_test(&temp_dir);
+        tokio::fs::write(&daemon.update_pid_file, "not a pid record")
+            .await
+            .expect("write invalid updater pid record");
+
+        let error = daemon
+            .restart()
+            .await
+            .expect_err("restart must propagate updater stop failure");
+
+        assert!(error.to_string().contains("invalid pid file contents"));
+        assert!(!daemon.pid_file.exists());
+    }
+
+    #[tokio::test]
+    async fn pid_update_loop_is_refused_before_constructing_the_update_loop() {
+        let error = super::run_pid_update_loop(codex_http_client::HttpClientFactory::new(
+            codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+        ))
+        .await
+        .expect_err("managed distribution must refuse the pid update loop");
+
+        assert_eq!(error.to_string(), MANAGED_UPDATE_DISABLED_MESSAGE);
+    }
+}
+
+#[cfg(all(test, not(unix)))]
+mod non_unix_tests {
+    use pretty_assertions::assert_eq;
+
+    use super::MANAGED_UPDATE_DISABLED_MESSAGE;
+
+    #[test]
+    fn lifecycle_remains_unsupported_without_update_authority() {
+        let error = super::ensure_supported_platform().expect_err("non-Unix lifecycle must fail");
+
+        assert_eq!(
+            error.to_string(),
+            "codex app-server daemon lifecycle is only supported on Unix platforms"
+        );
+    }
+
+    #[tokio::test]
+    async fn pid_update_loop_uses_the_managed_update_refusal_on_non_unix() {
+        let error = super::run_pid_update_loop(codex_http_client::HttpClientFactory::new(
+            codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+        ))
+        .await
+        .expect_err("managed distribution must refuse the pid update loop");
+
+        assert_eq!(error.to_string(), MANAGED_UPDATE_DISABLED_MESSAGE);
     }
 }

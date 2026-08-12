@@ -44,6 +44,35 @@ use codex_utils_git_discovery::GitRootDiscovery;
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 
+/// Receives notice immediately before a session replaces its selected user
+/// runtime configuration.
+///
+/// Hosts that retain process-wide provenance for configuration-derived state
+/// use this boundary to invalidate that provenance before a legacy core reload
+/// can make it stale. The callback is synchronous so it can run before the
+/// session state mutation without extending the core reload's async critical
+/// section.
+pub trait RuntimeConfigChangeListener: Send + Sync {
+    fn before_runtime_config_change(&self);
+}
+
+/// Serializes host-owned and legacy core runtime configuration changes.
+///
+/// A host can retain provenance for configuration-derived runtime state only
+/// when a direct core reload cannot overlap an app-server-owned transition.
+/// The gate deliberately contains no host-specific semantics; the optional
+/// listener remains responsible for invalidating host provenance.
+#[derive(Clone, Debug, Default)]
+pub struct RuntimeConfigChangeGate {
+    lock: Arc<Mutex<()>>,
+}
+
+impl RuntimeConfigChangeGate {
+    pub async fn lock(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        Arc::clone(&self.lock).lock_owned().await
+    }
+}
+
 pub(crate) struct SessionServices {
     /// The single owner of live MCP connections for this thread.
     pub(crate) mcp_runtime: Arc<McpRuntime>,
@@ -99,4 +128,9 @@ pub(crate) struct SessionServices {
     pub(crate) code_mode_service: CodeModeService,
     pub(crate) tool_search_handler_cache: ToolSearchHandlerCache,
     pub(crate) turn_environments: Arc<ThreadEnvironments>,
+    /// Optional host-owned provenance invalidator for runtime configuration
+    /// reloads initiated from core flows.
+    pub(crate) runtime_config_change_listener: Option<Arc<dyn RuntimeConfigChangeListener>>,
+    /// Optional host-owned transition gate shared with legacy core reloads.
+    pub(crate) runtime_config_change_gate: Option<RuntimeConfigChangeGate>,
 }

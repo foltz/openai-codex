@@ -111,10 +111,6 @@ impl McpRequestProcessor {
         Ok(McpServerRefreshResponse {})
     }
 
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "the read must not observe an in-progress MCP runtime identity transition"
-    )]
     async fn mcp_server_config_identity_response(
         &self,
         _params: Option<()>,

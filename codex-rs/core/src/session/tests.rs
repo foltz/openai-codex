@@ -1769,6 +1769,41 @@ async fn reload_user_config_layer_updates_effective_apps_config() {
 }
 
 #[tokio::test]
+async fn reload_user_config_layer_notifies_runtime_config_change_listener() {
+    #[derive(Default)]
+    struct Listener {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::RuntimeConfigChangeListener for Listener {
+        fn before_runtime_config_change(&self) {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    let listener = Arc::new(Listener::default());
+    let (session, _turn_context) =
+        make_session_with_config_and_listener_and_rx(|_| {}, Some(listener.clone()))
+            .await
+            .expect("session should initialize");
+    let codex_home = session.codex_home().await;
+    std::fs::create_dir_all(&codex_home).expect("create codex home");
+    std::fs::write(
+        codex_home.join(CONFIG_TOML_FILE),
+        "[mcp_servers.changed]\ncommand = \"changed\"\n",
+    )
+    .expect("write user config");
+
+    session.reload_user_config_layer().await;
+
+    assert_eq!(
+        listener.calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the legacy core reload path must invalidate host-owned provenance before it changes runtime config"
+    );
+}
+
+#[tokio::test]
 async fn reload_user_config_layer_keeps_previous_config_for_malformed_shell_policy() {
     let (session, _turn_context) = make_session_and_context().await;
     let codex_home = session.codex_home().await;
@@ -5982,6 +6017,8 @@ async fn session_new_fails_when_zsh_fork_enabled_without_packaged_zsh() {
         Some(config.multi_agent_version_from_features()),
         GitEnrichmentPolicy::Fresh,
         codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
+        /*runtime_config_change_listener*/ None,
+        /*runtime_config_change_gate*/ None,
     )
     .await;
 
@@ -6247,6 +6284,8 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         ),
         tool_search_handler_cache: Default::default(),
         turn_environments: Arc::clone(&turn_environments),
+        runtime_config_change_listener: None,
+        runtime_config_change_gate: None,
     };
 
     let session = Session {
@@ -6358,6 +6397,16 @@ async fn load_latest_config_for_session(session: &Session) -> Config {
 async fn make_session_with_config_and_rx(
     mutator: impl FnOnce(&mut Config),
 ) -> anyhow::Result<(Arc<Session>, async_channel::Receiver<Event>)> {
+    make_session_with_config_and_listener_and_rx(mutator, None).await
+}
+
+async fn make_session_with_config_and_listener_and_rx(
+    mutator: impl FnOnce(&mut Config),
+    runtime_config_change_listener: Option<Arc<dyn crate::RuntimeConfigChangeListener>>,
+) -> anyhow::Result<(Arc<Session>, async_channel::Receiver<Event>)> {
+    let runtime_config_change_gate = runtime_config_change_listener
+        .as_ref()
+        .map(|_| crate::RuntimeConfigChangeGate::default());
     let codex_home = tempfile::tempdir().expect("create temp dir");
     let mut config = build_test_config(codex_home.path()).await;
     mutator(&mut config);
@@ -6479,6 +6528,8 @@ async fn make_session_with_config_and_rx(
         Some(config.multi_agent_version_from_features()),
         GitEnrichmentPolicy::Fresh,
         codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
+        runtime_config_change_listener,
+        runtime_config_change_gate,
     )
     .await?;
 
@@ -6618,6 +6669,8 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         Some(config.multi_agent_version_from_features()),
         GitEnrichmentPolicy::Fresh,
         codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
+        /*runtime_config_change_listener*/ None,
+        /*runtime_config_change_gate*/ None,
     )
     .await?;
 
@@ -8505,6 +8558,8 @@ where
         ),
         tool_search_handler_cache: Default::default(),
         turn_environments: Arc::clone(&turn_environments),
+        runtime_config_change_listener: None,
+        runtime_config_change_gate: None,
     };
 
     let session = Arc::new(Session {

@@ -270,7 +270,8 @@ pub struct McpServerRefreshResponse {}
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct McpServerConfigIdentityLayer {
-    /// Canonical absolute path of this selected user configuration layer.
+    /// Normalized absolute path spelling from the accepted selected user
+    /// configuration snapshot. This deliberately does not resolve symlinks.
     pub file_path: String,
     /// Existing canonical layer version, in `sha256:...` form.
     pub version: String,

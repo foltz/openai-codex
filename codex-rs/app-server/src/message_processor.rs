@@ -320,6 +320,7 @@ impl MessageProcessor {
         let extension_event_sink =
             app_server_extension_event_sink(outgoing.clone(), thread_state_manager.clone());
         let mut queue_service = None;
+        let applied_mcp_config_identity = AppliedMcpConfigIdentity::from_startup_config(&config);
         let thread_manager = Arc::new_cyclic(|thread_manager| {
             queue_service = queue_store.map(|queue| {
                 Arc::new(QueuedItemService::new(
@@ -366,10 +367,13 @@ impl MessageProcessor {
                     thread_state_manager.clone(),
                 )),
             );
-            match code_mode_session_provider {
+            let manager = match code_mode_session_provider {
                 Some(provider) => manager.with_code_mode_session_provider(provider),
                 None => manager,
-            }
+            };
+            manager
+                .with_runtime_config_change_gate(applied_mcp_config_identity.apply_gate())
+                .with_runtime_config_change_listener(Arc::new(applied_mcp_config_identity.clone()))
         });
         let model_catalog = Arc::new(crate::model_catalog::ModelCatalog::new(
             config_manager.clone(),
@@ -394,7 +398,6 @@ impl MessageProcessor {
         let thread_list_state_permit = Arc::new(Semaphore::new(/*permits*/ 1));
         let app_list_shutdown_token = CancellationToken::new();
         let request_serialization_queues = RequestSerializationQueues::default();
-        let applied_mcp_config_identity = AppliedMcpConfigIdentity::from_startup_config(&config);
         let config_processor = ConfigRequestProcessor::new(
             outgoing.clone(),
             config_manager.clone(),

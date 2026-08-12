@@ -150,6 +150,8 @@ pub use codex_prompts as review_prompts;
 mod thread_manager;
 pub(crate) mod web_search;
 pub(crate) mod windows_sandbox_read_grants;
+pub use state::RuntimeConfigChangeGate;
+pub use state::RuntimeConfigChangeListener;
 pub use thread_manager::ForkSnapshot;
 pub use thread_manager::InternalSessionParent;
 pub use thread_manager::NewThread;

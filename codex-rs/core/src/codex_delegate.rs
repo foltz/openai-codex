@@ -134,6 +134,11 @@ pub(crate) async fn run_codex_thread_interactive(
         inherited_multi_agent_version: Some(MultiAgentVersion::Disabled),
         git_enrichment_policy,
         windows_sandbox_proxy_settings_mode,
+        runtime_config_change_listener: parent_session
+            .services
+            .runtime_config_change_listener
+            .clone(),
+        runtime_config_change_gate: parent_session.services.runtime_config_change_gate.clone(),
     })
     .or_cancel(&cancel_token)
     .await??;

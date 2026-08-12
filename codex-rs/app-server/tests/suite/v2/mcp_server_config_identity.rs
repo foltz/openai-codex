@@ -51,35 +51,29 @@ async fn mcp_server_config_identity_distinguishes_applied_and_current_config() -
     Ok(())
 }
 
-#[cfg(unix)]
 #[tokio::test]
-async fn mcp_server_config_identity_canonicalizes_symlinked_selected_config() -> Result<()> {
-    use std::os::unix::fs::symlink;
-
-    let real_home = TempDir::new()?;
-    MockResponsesConfig::new("http://localhost")
-        .with_extra_config("[mcp_servers.initial]\ncommand = \"initial\"")
-        .write(real_home.path())?;
-    let link_root = TempDir::new()?;
-    let linked_home = link_root.path().join("linked-home");
-    symlink(real_home.path(), &linked_home)?;
+async fn mcp_server_config_identity_supports_missing_selected_config() -> Result<()> {
+    let codex_home = TempDir::new()?;
 
     let mut app_server = TestAppServer::builder()
-        .with_codex_home(&linked_home)
+        .with_codex_home(codex_home.path())
         .without_auto_env()
         .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
         .await?;
+
     let identity = read_identity(&mut app_server).await?;
-    assert_eq!(
-        identity.applied.layers[0].file_path,
-        std::fs::canonicalize(real_home.path().join("config.toml"))?
-            .display()
-            .to_string()
+    assert_eq!(identity.applied, identity.current);
+    assert_eq!(identity.applied.layers.len(), 1);
+    assert!(
+        identity.applied.layers[0]
+            .file_path
+            .ends_with("/config.toml")
     );
-    assert_ne!(
-        identity.applied.layers[0].file_path,
-        linked_home.join("config.toml").display().to_string()
-    );
+
+    reload_mcp_config(&mut app_server).await?;
+    let reloaded = read_identity(&mut app_server).await?;
+    assert_eq!(reloaded.applied, reloaded.current);
+    assert_eq!(reloaded.applied, identity.applied);
     Ok(())
 }
 

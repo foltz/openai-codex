@@ -1,5 +1,6 @@
 use super::thread_input::ensure_direct_input_allowed;
 use super::*;
+use crate::mcp_config_identity::AppliedMcpConfigIdentity;
 use codex_core::McpManager;
 use codex_mcp::McpServerSource;
 use codex_mcp::ReadResourceRequestParams;
@@ -16,6 +17,7 @@ pub(crate) struct McpRequestProcessor {
     pub(super) outgoing: Arc<OutgoingMessageSender>,
     config_manager: ConfigManager,
     pub(super) thread_state_manager: ThreadStateManager,
+    applied_mcp_config_identity: AppliedMcpConfigIdentity,
 }
 
 impl McpRequestProcessor {
@@ -25,6 +27,7 @@ impl McpRequestProcessor {
         thread_state_manager: ThreadStateManager,
         outgoing: Arc<OutgoingMessageSender>,
         config_manager: ConfigManager,
+        applied_mcp_config_identity: AppliedMcpConfigIdentity,
     ) -> Self {
         Self {
             auth_manager,
@@ -32,6 +35,7 @@ impl McpRequestProcessor {
             outgoing,
             config_manager,
             thread_state_manager,
+            applied_mcp_config_identity,
         }
     }
 
@@ -87,9 +91,13 @@ impl McpRequestProcessor {
         &self,
         _params: Option<()>,
     ) -> Result<McpServerRefreshResponse, JSONRPCErrorError> {
-        crate::mcp_refresh::reload_mcp_config(&self.thread_manager, &self.config_manager)
-            .await
-            .map_err(|err| internal_error(format!("failed to refresh MCP servers: {err}")))?;
+        crate::mcp_refresh::reload_mcp_config(
+            &self.thread_manager,
+            &self.config_manager,
+            &self.applied_mcp_config_identity,
+        )
+        .await
+        .map_err(|err| internal_error(format!("failed to refresh MCP servers: {err}")))?;
         Ok(McpServerRefreshResponse {})
     }
 

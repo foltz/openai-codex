@@ -118,10 +118,7 @@ async fn control_socket_acceptor_upgrades_and_forwards_websocket_text_messages_a
             provenance,
             ..
         } => {
-            assert!(matches!(
-                provenance,
-                ConnectionProvenance::UnixPeerExecutable(_)
-            ));
+            assert_eq!(provenance, expected_same_image_provenance());
             connection_id
         }
         _ => panic!("expected connection opened event"),
@@ -241,10 +238,10 @@ async fn control_socket_entitles_only_a_same_image_peer() {
         socket_path.as_path(),
     )
     .await;
-    assert!(matches!(
+    assert_eq!(
         recv_connection_provenance(&mut transport_event_rx).await,
-        ConnectionProvenance::UnixPeerExecutable(_)
-    ));
+        expected_same_image_provenance()
+    );
 
     let copied_executable = temp_dir.path().join("unentitled-peer");
     tokio::fs::copy(
@@ -281,6 +278,22 @@ async fn run_peer_helper(executable: std::path::PathBuf, socket_path: &Path) {
         .await
         .expect("peer helper should run");
     assert!(status.success(), "peer helper should succeed: {status}");
+}
+
+#[cfg(unix)]
+fn expected_same_image_provenance() -> ConnectionProvenance {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        ConnectionProvenance::UnixPeerExecutable(
+            super::PeerExecutableIdentity::current_process().expect("current executable identity"),
+        )
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        // Darwin intentionally cannot turn LOCAL_PEERPID into a trusted
+        // image proof: proc_pidpath is only a mutable pathname.
+        ConnectionProvenance::Unproven
+    }
 }
 
 #[cfg(unix)]

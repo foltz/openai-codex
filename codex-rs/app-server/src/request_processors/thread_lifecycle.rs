@@ -161,14 +161,25 @@ pub(super) async fn ensure_conversation_listener(
                 "thread {conversation_id} is closing; retry after the thread is closed"
             )));
         }
-        let Some(thread_state) = listener_task_context
+        match listener_task_context
             .thread_state_manager
-            .try_ensure_connection_subscribed(conversation_id, connection_id, raw_events_enabled)
+            .try_ensure_connection_subscribed_for_listener(
+                conversation_id,
+                connection_id,
+                raw_events_enabled,
+            )
             .await
-        else {
-            return Ok(EnsureConversationListenerResult::ConnectionClosed);
-        };
-        thread_state
+        {
+            Ok(thread_state) => thread_state,
+            Err(crate::thread_state::ConnectionSubscriptionError::ConnectionClosed) => {
+                return Ok(EnsureConversationListenerResult::ConnectionClosed);
+            }
+            Err(crate::thread_state::ConnectionSubscriptionError::ClearSuccessorReserved) => {
+                return Err(invalid_request(format!(
+                    "thread {conversation_id} is reserved while its authoritative clear transition completes"
+                )));
+            }
+        }
     };
     if let Err(error) = ensure_listener_task_running(
         listener_task_context.clone(),

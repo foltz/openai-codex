@@ -4,6 +4,7 @@ use super::turn_processor::can_accept_direct_input;
 use super::*;
 use crate::error_code::method_not_found;
 use codex_app_server_protocol::SelectedCapabilityRoot;
+use codex_app_server_protocol::ThreadAttachmentListParams;
 use codex_app_server_protocol::ThreadSection;
 use codex_app_server_protocol::ThreadSectionMoveParams;
 use codex_app_server_protocol::ThreadSectionMoveResponse;
@@ -514,6 +515,18 @@ impl ThreadRequestProcessor {
         self.thread_unsubscribe_response_inner(params, request_id.connection_id)
             .await
             .map(|response| Some(response.into()))
+    }
+
+    pub(crate) async fn thread_attachment_list(
+        &self,
+        _params: ThreadAttachmentListParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        Ok(Some(
+            self.thread_state_manager
+                .thread_attachment_list()
+                .await
+                .into(),
+        ))
     }
 
     pub(crate) async fn thread_resume(

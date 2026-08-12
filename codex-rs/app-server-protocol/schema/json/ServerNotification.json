@@ -3920,6 +3920,49 @@
       ],
       "type": "object"
     },
+    "ThreadAttachmentChangedNotification": {
+      "description": "An atomic attachment-state transition. A zero count explicitly records a removal; it is not encoded by omitting an entry.",
+      "properties": {
+        "changes": {
+          "items": {
+            "$ref": "#/definitions/ThreadAttachmentEntry"
+          },
+          "type": "array"
+        },
+        "generation": {
+          "type": "string"
+        },
+        "revision": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "changes",
+        "generation",
+        "revision"
+      ],
+      "type": "object"
+    },
+    "ThreadAttachmentEntry": {
+      "description": "A server-owned count of trusted interactive clients attached to one exact thread.\n\nThis is attachment evidence only. It does not establish thread succession, loaded state, or authority to transfer a clear transition.",
+      "properties": {
+        "interactiveAttachmentCount": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "interactiveAttachmentCount",
+        "threadId"
+      ],
+      "type": "object"
+    },
     "ThreadClearEndReason": {
       "enum": [
         "clear"
@@ -6094,6 +6137,26 @@
         "params"
       ],
       "title": "Thread/clear/startedNotification",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "thread/attachment/changed"
+          ],
+          "title": "Thread/attachment/changedNotificationMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/ThreadAttachmentChangedNotification"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "title": "Thread/attachment/changedNotification",
       "type": "object"
     },
     {

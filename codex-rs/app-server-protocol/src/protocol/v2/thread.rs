@@ -47,6 +47,51 @@ pub enum ThreadStartSource {
     Clear,
 }
 
+/// A server-owned count of trusted interactive clients attached to one exact
+/// thread.
+///
+/// This is attachment evidence only. It does not establish thread succession,
+/// loaded state, or authority to transfer a clear transition.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub struct ThreadAttachmentEntry {
+    pub thread_id: String,
+    pub interactive_attachment_count: u32,
+}
+
+/// Requests the current authoritative interactive-attachment snapshot.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub struct ThreadAttachmentListParams {}
+
+/// Complete server-owned interactive-attachment state for one app-server
+/// process generation.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub struct ThreadAttachmentListResponse {
+    /// New for each app-server process. A different generation requires the
+    /// caller to discard any cached attachment state.
+    pub generation: String,
+    /// Monotonically increasing only within `generation`.
+    pub revision: u64,
+    /// Exact threads with at least one trusted interactive attachment.
+    pub entries: Vec<ThreadAttachmentEntry>,
+}
+
+/// An atomic attachment-state transition. A zero count explicitly records a
+/// removal; it is not encoded by omitting an entry.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub struct ThreadAttachmentChangedNotification {
+    pub generation: String,
+    pub revision: u64,
+    pub changes: Vec<ThreadAttachmentEntry>,
+}
+
 // === Threads, Turns, and Items ===
 // Thread APIs
 #[derive(

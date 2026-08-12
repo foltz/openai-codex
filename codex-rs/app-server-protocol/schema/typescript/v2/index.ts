@@ -431,6 +431,8 @@ export type { ThreadApproveGuardianDeniedActionResponse } from "./ThreadApproveG
 export type { ThreadArchiveParams } from "./ThreadArchiveParams";
 export type { ThreadArchiveResponse } from "./ThreadArchiveResponse";
 export type { ThreadArchivedNotification } from "./ThreadArchivedNotification";
+export type { ThreadAttachmentChangedNotification } from "./ThreadAttachmentChangedNotification";
+export type { ThreadAttachmentEntry } from "./ThreadAttachmentEntry";
 export type { ThreadClearEndReason } from "./ThreadClearEndReason";
 export type { ThreadClearEndedNotification } from "./ThreadClearEndedNotification";
 export type { ThreadClearParams } from "./ThreadClearParams";

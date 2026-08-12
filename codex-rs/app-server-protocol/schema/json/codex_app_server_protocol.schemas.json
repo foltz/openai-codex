@@ -4454,6 +4454,26 @@
           "properties": {
             "method": {
               "enum": [
+                "thread/attachment/changed"
+              ],
+              "title": "Thread/attachment/changedNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ThreadAttachmentChangedNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Thread/attachment/changedNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
                 "thread/status/changed"
               ],
               "title": "Thread/status/changedNotificationMethod",
@@ -18939,6 +18959,51 @@
           "threadId"
         ],
         "title": "ThreadArchivedNotification",
+        "type": "object"
+      },
+      "ThreadAttachmentChangedNotification": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "An atomic attachment-state transition. A zero count explicitly records a removal; it is not encoded by omitting an entry.",
+        "properties": {
+          "changes": {
+            "items": {
+              "$ref": "#/definitions/v2/ThreadAttachmentEntry"
+            },
+            "type": "array"
+          },
+          "generation": {
+            "type": "string"
+          },
+          "revision": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "changes",
+          "generation",
+          "revision"
+        ],
+        "title": "ThreadAttachmentChangedNotification",
+        "type": "object"
+      },
+      "ThreadAttachmentEntry": {
+        "description": "A server-owned count of trusted interactive clients attached to one exact thread.\n\nThis is attachment evidence only. It does not establish thread succession, loaded state, or authority to transfer a clear transition.",
+        "properties": {
+          "interactiveAttachmentCount": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "threadId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "interactiveAttachmentCount",
+          "threadId"
+        ],
         "type": "object"
       },
       "ThreadClearEndReason": {

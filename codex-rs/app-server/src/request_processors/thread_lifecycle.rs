@@ -675,16 +675,31 @@ pub(super) async fn handle_pending_thread_resume_request(
                 .await;
             return;
         }
-        if !thread_state_manager
+        match thread_state_manager
             .try_add_connection_to_thread(conversation_id, connection_id)
             .await
         {
-            tracing::debug!(
-                thread_id = %conversation_id,
-                connection_id = ?connection_id,
-                "skipping running thread resume for closed connection"
-            );
-            return;
+            Ok(()) => {}
+            Err(crate::thread_state::ConnectionSubscriptionError::ConnectionClosed) => {
+                tracing::debug!(
+                    thread_id = %conversation_id,
+                    connection_id = ?connection_id,
+                    "skipping running thread resume for closed connection"
+                );
+                return;
+            }
+            Err(crate::thread_state::ConnectionSubscriptionError::ClearSuccessorReserved) => {
+                drop(pending_thread_unloads);
+                outgoing
+                    .send_error(
+                        request_id,
+                        invalid_request(format!(
+                            "thread {conversation_id} is reserved while its authoritative clear transition completes; retry thread/resume"
+                        )),
+                    )
+                    .await;
+                return;
+            }
         }
     }
 

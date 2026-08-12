@@ -62,8 +62,8 @@ struct AppServerArgs {
     #[arg(long = "disable-plugin-startup-tasks-for-tests", hide = true)]
     disable_plugin_startup_tasks_for_tests: bool,
 
-    /// Hidden helper used only by the Linux Unix-peer entitlement integration
-    /// test. It connects through the production protocol as this exact binary.
+    /// Hidden helper used only by the Unix-peer entitlement integration test.
+    /// It connects through the production protocol as this exact binary.
     #[cfg(all(debug_assertions, unix))]
     #[arg(long = "interactive-attachment-peer-helper", hide = true)]
     interactive_attachment_peer_helper: Option<PathBuf>,
@@ -163,7 +163,12 @@ async fn run_interactive_attachment_peer_helper(
 
     let stream = tokio::net::UnixStream::connect(socket_path).await?;
     let (mut websocket, response) = client_async("ws://localhost/rpc", stream).await?;
-    anyhow::ensure!(response.status().is_success(), "peer helper upgrade failed");
+    anyhow::ensure!(
+        response.status() == tokio_tungstenite::tungstenite::http::StatusCode::SWITCHING_PROTOCOLS,
+        "peer helper upgrade failed: status={}, headers={:?}",
+        response.status(),
+        response.headers()
+    );
 
     async fn request(
         websocket: &mut tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>,

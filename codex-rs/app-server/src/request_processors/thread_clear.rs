@@ -479,11 +479,17 @@ impl ThreadRequestProcessor {
             ClearTransitionPhase::Completed,
         )
         .await?;
-        if !self
+        let moved = self
             .thread_state_manager
             .move_connection_for_clear(predecessor_thread_id, successor_thread_id, connection_id)
-            .await
-        {
+            .await;
+        // Completed is the explicit durable terminal disposition that owns
+        // release of B's reservation. Do not couple it to the request scope:
+        // post-disclosure errors retain B fail-closed for reconciliation.
+        self.thread_state_manager
+            .terminalize_clear_successor_attachment(predecessor_thread_id, successor_thread_id)
+            .await;
+        if !moved {
             // Completion is durable already. A connection close may win the
             // race after commit; it must not turn a completed transition into
             // a contradictory client error or manufacture an attachment for a

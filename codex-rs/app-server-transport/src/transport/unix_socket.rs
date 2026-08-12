@@ -16,6 +16,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use tokio_tungstenite::accept_async;
 use tokio_util::sync::CancellationToken;
+use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
@@ -117,9 +118,14 @@ fn unix_peer_provenance(
     let Some(running_process_identity) = running_process_identity else {
         return ConnectionProvenance::Unproven;
     };
+    let peer_identity = match peer_identity {
+        Ok(identity) => identity,
+        Err(err) => {
+            debug!("failed to establish Unix peer executable entitlement: {err}");
+            None
+        }
+    };
     peer_identity
-        .ok()
-        .flatten()
         .filter(|identity| *identity == running_process_identity)
         .map(ConnectionProvenance::UnixPeerExecutable)
         .unwrap_or(ConnectionProvenance::Unproven)
@@ -256,7 +262,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn mismatched_peer_executable_fails_closed() {
         let mismatch = ["/bin/sh", "/bin/ls"]

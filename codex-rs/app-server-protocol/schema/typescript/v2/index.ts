@@ -252,6 +252,7 @@ export type { McpElicitationUntitledSingleSelectEnumSchema } from "./McpElicitat
 export type { McpResourceReadParams } from "./McpResourceReadParams";
 export type { McpResourceReadResponse } from "./McpResourceReadResponse";
 export type { McpServerConfigIdentity } from "./McpServerConfigIdentity";
+export type { McpServerConfigIdentityLayer } from "./McpServerConfigIdentityLayer";
 export type { McpServerConfigIdentityResponse } from "./McpServerConfigIdentityResponse";
 export type { McpServerElicitationAction } from "./McpServerElicitationAction";
 export type { McpServerElicitationRequestParams } from "./McpServerElicitationRequestParams";

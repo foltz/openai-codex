@@ -3,6 +3,7 @@ use super::bedrock_auth::set_user_model_provider_to_bedrock;
 use super::*;
 use crate::auth_mode::auth_mode_to_api;
 use crate::external_auth::ExternalAuthBridge;
+use crate::mcp_config_identity::AppliedMcpConfigIdentity;
 use chrono::DateTime;
 use codex_app_server_protocol::DesktopOnboardingEntrypoint;
 use codex_login::LoginOnboardingEntrypoint;
@@ -75,6 +76,7 @@ pub(crate) struct AccountRequestProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     config: Arc<Config>,
     config_manager: ConfigManager,
+    applied_mcp_config_identity: AppliedMcpConfigIdentity,
     active_login: Arc<Mutex<Option<ActiveLogin>>>,
 }
 
@@ -85,6 +87,7 @@ impl AccountRequestProcessor {
         outgoing: Arc<OutgoingMessageSender>,
         config: Arc<Config>,
         config_manager: ConfigManager,
+        applied_mcp_config_identity: AppliedMcpConfigIdentity,
     ) -> Self {
         Self {
             auth_manager,
@@ -92,6 +95,7 @@ impl AccountRequestProcessor {
             outgoing,
             config,
             config_manager,
+            applied_mcp_config_identity,
             active_login: Arc::new(Mutex::new(None)),
         }
     }
@@ -214,6 +218,7 @@ impl AccountRequestProcessor {
         config_manager: &ConfigManager,
         thread_manager: &Arc<ThreadManager>,
         auth: Option<CodexAuth>,
+        applied_mcp_config_identity: AppliedMcpConfigIdentity,
     ) {
         thread_manager
             .plugins_manager()
@@ -230,6 +235,7 @@ impl AccountRequestProcessor {
                 Self::spawn_effective_plugins_changed_task(
                     Arc::clone(thread_manager),
                     config_manager.clone(),
+                    applied_mcp_config_identity.clone(),
                 );
                 let plugins_config = config.plugins_config_input();
                 let refresh_thread_manager = Arc::clone(thread_manager);
@@ -240,6 +246,7 @@ impl AccountRequestProcessor {
                     Self::spawn_effective_plugins_changed_task(
                         Arc::clone(&refresh_thread_manager),
                         refresh_config_manager.clone(),
+                        applied_mcp_config_identity.clone(),
                     );
                 });
                 thread_manager
@@ -267,12 +274,17 @@ impl AccountRequestProcessor {
     fn spawn_effective_plugins_changed_task(
         thread_manager: Arc<ThreadManager>,
         config_manager: ConfigManager,
+        applied_mcp_config_identity: AppliedMcpConfigIdentity,
     ) {
         tokio::spawn(async move {
             thread_manager.plugins_manager().clear_cache();
             thread_manager.skills_service().clear_cache();
-            crate::mcp_refresh::reload_mcp_config_best_effort(&thread_manager, &config_manager)
-                .await;
+            crate::mcp_refresh::reload_mcp_config_best_effort(
+                &thread_manager,
+                &config_manager,
+                &applied_mcp_config_identity,
+            )
+            .await;
             thread_manager.invalidate_mcp_runtimes().await;
         });
     }
@@ -559,6 +571,7 @@ impl AccountRequestProcessor {
         let config_manager = self.config_manager.clone();
         let thread_manager = Arc::clone(&self.thread_manager);
         let config = Arc::clone(&self.config);
+        let applied_mcp_config_identity = self.applied_mcp_config_identity.clone();
         let active_login = self.active_login.clone();
         let auth_url = server.auth_url.clone();
         tokio::spawn(async move {
@@ -589,6 +602,7 @@ impl AccountRequestProcessor {
                 config_manager,
                 thread_manager,
                 config,
+                applied_mcp_config_identity,
                 AccountLoginCompletedNotification {
                     login_id: Some(login_id.to_string()),
                     success,
@@ -649,6 +663,7 @@ impl AccountRequestProcessor {
         let config_manager = self.config_manager.clone();
         let thread_manager = Arc::clone(&self.thread_manager);
         let config = Arc::clone(&self.config);
+        let applied_mcp_config_identity = self.applied_mcp_config_identity.clone();
         let active_login = self.active_login.clone();
         tokio::spawn(async move {
             let (success, error_msg) = tokio::select! {
@@ -668,6 +683,7 @@ impl AccountRequestProcessor {
                 config_manager,
                 thread_manager,
                 config,
+                applied_mcp_config_identity,
                 AccountLoginCompletedNotification {
                     login_id: Some(login_id.to_string()),
                     success,
@@ -799,6 +815,7 @@ impl AccountRequestProcessor {
             &self.config_manager,
             &self.thread_manager,
             self.auth_manager.auth_cached(),
+            self.applied_mcp_config_identity.clone(),
         )
         .await;
 
@@ -826,6 +843,7 @@ impl AccountRequestProcessor {
         config_manager: ConfigManager,
         thread_manager: Arc<ThreadManager>,
         config: Arc<Config>,
+        applied_mcp_config_identity: AppliedMcpConfigIdentity,
         payload_v2: AccountLoginCompletedNotification,
     ) {
         let success = payload_v2.success;
@@ -850,6 +868,7 @@ impl AccountRequestProcessor {
                 &config_manager,
                 &thread_manager,
                 auth.clone(),
+                applied_mcp_config_identity,
             )
             .await;
             let payload_v2 = AccountUpdatedNotification {
@@ -902,6 +921,7 @@ impl AccountRequestProcessor {
             &self.config_manager,
             &self.thread_manager,
             self.auth_manager.auth_cached(),
+            self.applied_mcp_config_identity.clone(),
         )
         .await;
 

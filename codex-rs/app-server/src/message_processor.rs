@@ -338,10 +338,12 @@ impl MessageProcessor {
             Arc::new(workspace_settings::WorkspaceSettingsCache::default());
         let app_list_shutdown_token = CancellationToken::new();
         let request_serialization_queues = RequestSerializationQueues::default();
+        let applied_mcp_config_identity = AppliedMcpConfigIdentity::from_startup_config(&config);
         let config_processor = ConfigRequestProcessor::new(
             outgoing.clone(),
             config_manager.clone(),
             thread_manager.clone(),
+            applied_mcp_config_identity.clone(),
             analytics_events_client.clone(),
         );
         let on_effective_plugins_changed =
@@ -358,6 +360,7 @@ impl MessageProcessor {
             outgoing.clone(),
             Arc::clone(&config),
             config_manager.clone(),
+            applied_mcp_config_identity.clone(),
         );
         let apps_processor = AppsRequestProcessor::new(
             auth_manager.clone(),
@@ -408,7 +411,6 @@ impl MessageProcessor {
             config_manager.clone(),
             Arc::clone(&thread_manager),
         );
-        let applied_mcp_config_identity = AppliedMcpConfigIdentity::from_startup_config(&config);
         let mcp_processor = McpRequestProcessor::new(
             auth_manager.clone(),
             Arc::clone(&thread_manager),

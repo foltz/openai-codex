@@ -4,6 +4,8 @@ use crate::config_manager::ConfigManager;
 use crate::config_manager_service::ConfigManagerError;
 use crate::error_code::internal_error;
 use crate::error_code::invalid_request;
+use crate::mcp_config_identity::AppliedMcpConfigIdentity;
+use crate::mcp_config_identity::McpConfigIdentity;
 use crate::outgoing_message::ConnectionRequestId;
 use crate::outgoing_message::OutgoingMessageSender;
 use codex_analytics::AnalyticsEventsClient;
@@ -65,6 +67,7 @@ pub(crate) struct ConfigRequestProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     config_manager: ConfigManager,
     thread_manager: Arc<ThreadManager>,
+    applied_mcp_config_identity: AppliedMcpConfigIdentity,
     analytics_events_client: AnalyticsEventsClient,
 }
 
@@ -73,12 +76,14 @@ impl ConfigRequestProcessor {
         outgoing: Arc<OutgoingMessageSender>,
         config_manager: ConfigManager,
         thread_manager: Arc<ThreadManager>,
+        applied_mcp_config_identity: AppliedMcpConfigIdentity,
         analytics_events_client: AnalyticsEventsClient,
     ) -> Self {
         Self {
             outgoing,
             config_manager,
             thread_manager,
+            applied_mcp_config_identity,
             analytics_events_client,
         }
     }
@@ -292,10 +297,16 @@ impl ConfigRequestProcessor {
         Ok(ExperimentalFeatureEnablementSetResponse { enablement })
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "runtime config refresh and its retained MCP identity must be one serialized transition"
+    )]
     async fn reload_user_config(&self) {
-        match self.load_latest_config(/*fallback_cwd*/ None).await {
-            Ok(_) => {}
+        let _apply_guard = self.applied_mcp_config_identity.lock_apply().await;
+        let refreshed_config = match self.load_latest_config(/*fallback_cwd*/ None).await {
+            Ok(config) => config,
             Err(err) => {
+                self.applied_mcp_config_identity.invalidate();
                 tracing::warn!(
                     "failed to rebuild user config for runtime refresh: {}",
                     err.message
@@ -303,10 +314,23 @@ impl ConfigRequestProcessor {
                 return;
             }
         };
-        let thread_ids = self.thread_manager.list_thread_ids().await;
-        for thread_id in thread_ids {
-            let Ok(thread) = self.thread_manager.get_thread(thread_id).await else {
-                continue;
+        let candidate_identity = match McpConfigIdentity::from_config(&refreshed_config) {
+            Ok(identity) => identity,
+            Err(err) => {
+                self.applied_mcp_config_identity.invalidate();
+                tracing::warn!(%err, "failed to identify user config for runtime refresh");
+                return;
+            }
+        };
+        let mut refreshes = Vec::new();
+        for thread_id in self.thread_manager.list_thread_ids().await {
+            let thread = match self.thread_manager.get_thread(thread_id).await {
+                Ok(thread) => thread,
+                Err(err) => {
+                    self.applied_mcp_config_identity.invalidate();
+                    tracing::warn!(%thread_id, %err, "failed to load thread for runtime refresh");
+                    return;
+                }
             };
             let current_config = thread.config().await;
             let next_config = match self
@@ -316,12 +340,31 @@ impl ConfigRequestProcessor {
             {
                 Ok(config) => config,
                 Err(err) => {
+                    self.applied_mcp_config_identity.invalidate();
                     tracing::warn!(%thread_id, %err, "failed to reload thread configuration");
-                    continue;
+                    return;
                 }
             };
-            thread.refresh_runtime_config(next_config).await;
+            match McpConfigIdentity::from_config(&next_config) {
+                Ok(identity) if identity == candidate_identity => {
+                    refreshes.push((thread, next_config))
+                }
+                Ok(_) => {
+                    self.applied_mcp_config_identity.invalidate();
+                    tracing::warn!(%thread_id, "selected MCP configuration changed while reloading runtime config");
+                    return;
+                }
+                Err(err) => {
+                    self.applied_mcp_config_identity.invalidate();
+                    tracing::warn!(%thread_id, %err, "failed to identify thread runtime configuration");
+                    return;
+                }
+            }
         }
+        for (thread, config) in refreshes {
+            thread.refresh_runtime_config(config).await;
+        }
+        self.applied_mcp_config_identity.replace(candidate_identity);
     }
 
     async fn emit_plugin_toggle_events(

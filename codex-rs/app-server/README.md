@@ -198,6 +198,15 @@ builds reject clear until the corresponding orchestration is enabled.
 
 ## Stored thread attachments
 
+The KCF interactive relationship is separate from the stored resources below.
+Its experimental snapshot counts only connections requesting
+`initialize.capabilities.interactiveClient` that the server verifies as embedded
+or as a Unix peer with the running executable's file identity. Client name,
+cwd and loaded state establish no entitlement. Generation changes and revision
+gaps require a fresh snapshot. Revisioned changes contain complete counts for
+the changed threads. This is reachability evidence, not authority to transfer
+clear continuity, queued work, replies or names.
+
 - `thread/attachment/add` — add a durable resource reference to a stored thread without loading it. Repeated writes with the same attachment type and identity key return the existing attachment.
 - `thread/attachment/list` — list attachments for one stored thread in a cursor-paginated request, including a thread that is not loaded.
 - `thread/attachment/remove` — remove an attachment by its thread, attachment type, and identity key; returns `{}`.

@@ -95,6 +95,9 @@ pub async fn start_control_socket_acceptor(
         let (path, guard) = codex_uds::validate_private_socket_path(socket_path.as_path())?;
         (AbsolutePathBuf::from_absolute_path_checked(path)?, guard)
     };
+    // Failure to establish a daemon image must not take down the local
+    // control socket. It simply leaves every daemon peer unproven.
+    let running_process_identity = PeerExecutableIdentity::capture_running_process().ok();
     prepare_control_socket_path(socket_path.as_path()).await?;
     let listener = UnixListener::bind(socket_path.as_path()).await?;
     let socket_guard = ControlSocketFileGuard {
@@ -121,6 +124,7 @@ pub async fn start_control_socket_acceptor(
         shutdown_token,
         socket_guard,
         daemon_shutdown_access,
+        running_process_identity,
     )))
 }
 
@@ -130,6 +134,7 @@ async fn run_control_socket_acceptor(
     shutdown_token: CancellationToken,
     socket_guard: ControlSocketFileGuard,
     daemon_shutdown_access: DaemonShutdownAccess,
+    running_process_identity: Option<PeerExecutableIdentity>,
 ) {
     let _socket_guard = socket_guard;
     loop {
@@ -156,10 +161,12 @@ async fn run_control_socket_acceptor(
             }
         };
 
+        let provenance = unix_peer_provenance(
+            running_process_identity,
+            PeerExecutableIdentity::from_unix_stream(&stream),
+        );
         let transport_event_tx = transport_event_tx.clone();
         tokio::spawn(async move {
-            let provenance =
-                unix_peer_provenance(PeerExecutableIdentity::from_unix_stream(&stream));
             let mut shutdown_request = false;
             let websocket_config = WebSocketConfig::default();
             let max_unfragmented_message_bytes = [
@@ -236,12 +243,16 @@ async fn run_daemon_shutdown(
 
 /// Retains only an accept-time executable identity matching this server.
 fn unix_peer_provenance(
+    running_process_identity: Option<PeerExecutableIdentity>,
     peer_identity: IoResult<Option<PeerExecutableIdentity>>,
 ) -> ConnectionProvenance {
+    let Some(running_process_identity) = running_process_identity else {
+        return ConnectionProvenance::Unproven;
+    };
     peer_identity
         .ok()
         .flatten()
-        .filter(|identity| identity.matches_current_process())
+        .filter(|identity| *identity == running_process_identity)
         .map(ConnectionProvenance::UnixPeerExecutable)
         .unwrap_or(ConnectionProvenance::Unproven)
 }
@@ -397,12 +408,16 @@ mod tests {
 
     #[test]
     fn failed_or_missing_peer_identity_fails_closed() {
+        let running = PeerExecutableIdentity::current_process().expect("current executable");
         assert_eq!(
-            unix_peer_provenance(Ok(None)),
+            unix_peer_provenance(Some(running), Ok(None)),
             ConnectionProvenance::Unproven
         );
         assert_eq!(
-            unix_peer_provenance(Err(io::Error::other("peer identity unavailable"))),
+            unix_peer_provenance(
+                Some(running),
+                Err(io::Error::other("peer identity unavailable")),
+            ),
             ConnectionProvenance::Unproven
         );
     }
@@ -411,7 +426,7 @@ mod tests {
     fn established_peer_identity_is_retained_without_a_pid() {
         let identity = PeerExecutableIdentity::current_process().expect("current executable");
         assert_eq!(
-            unix_peer_provenance(Ok(Some(identity))),
+            unix_peer_provenance(Some(identity), Ok(Some(identity))),
             ConnectionProvenance::UnixPeerExecutable(identity)
         );
     }
@@ -425,7 +440,10 @@ mod tests {
             .and_then(|metadata| PeerExecutableIdentity::from_metadata(metadata).ok())
             .expect("mismatched executable identity");
         assert_eq!(
-            unix_peer_provenance(Ok(Some(mismatch))),
+            unix_peer_provenance(
+                Some(PeerExecutableIdentity::current_process().expect("current executable")),
+                Ok(Some(mismatch)),
+            ),
             ConnectionProvenance::Unproven
         );
     }

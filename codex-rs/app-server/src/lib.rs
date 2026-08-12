@@ -961,6 +961,7 @@ pub async fn run_main_with_transport_options(
                             TransportEvent::ConnectionOpened {
                                 connection_id,
                                 origin,
+                                provenance,
                                 writer,
                                 disconnect_sender,
                             } => {
@@ -991,6 +992,7 @@ pub async fn run_main_with_transport_options(
                                     connection_id,
                                     ConnectionState::new(
                                         origin,
+                                        provenance,
                                         outbound_initialized,
                                         outbound_experimental_api_enabled,
                                         outbound_opted_out_notification_methods,
@@ -1080,6 +1082,9 @@ pub async fn run_main_with_transport_options(
                                                     connection_state
                                                         .session
                                                         .request_attestation(),
+                                                    connection_state
+                                                        .session
+                                                        .trusted_interactive(),
                                                 )
                                                 .await;
                                             connection_state

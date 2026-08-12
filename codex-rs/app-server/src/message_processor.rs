@@ -131,6 +131,7 @@ pub(crate) struct MessageProcessor {
 #[derive(Debug)]
 pub(crate) struct ConnectionSessionState {
     pub(crate) rpc_gate: Arc<ConnectionRpcGate>,
+    provenance: crate::transport::ConnectionProvenance,
     initialized: OnceLock<InitializedConnectionSessionState>,
 }
 
@@ -141,6 +142,7 @@ pub(crate) struct InitializedConnectionSessionState {
     pub(crate) app_server_client_name: String,
     pub(crate) client_version: String,
     pub(crate) request_attestation: bool,
+    pub(crate) interactive_client_requested: bool,
     pub(crate) client_mcp_extensions: ClientMcpExtensions,
 }
 
@@ -154,6 +156,23 @@ impl ConnectionSessionState {
     pub(crate) fn new() -> Self {
         Self {
             rpc_gate: Arc::new(ConnectionRpcGate::new()),
+            provenance: crate::transport::ConnectionProvenance::Unproven,
+            initialized: OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn in_process() -> Self {
+        Self {
+            rpc_gate: Arc::new(ConnectionRpcGate::new()),
+            provenance: crate::transport::ConnectionProvenance::InProcess,
+            initialized: OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn with_provenance(provenance: crate::transport::ConnectionProvenance) -> Self {
+        Self {
+            rpc_gate: Arc::new(ConnectionRpcGate::new()),
+            provenance,
             initialized: OnceLock::new(),
         }
     }
@@ -191,6 +210,16 @@ impl ConnectionSessionState {
         self.initialized
             .get()
             .is_some_and(|session| session.request_attestation)
+    }
+
+    pub(crate) fn interactive_client_requested(&self) -> bool {
+        self.initialized
+            .get()
+            .is_some_and(|session| session.interactive_client_requested)
+    }
+
+    pub(crate) fn trusted_interactive(&self) -> bool {
+        crate::transport::trusted_interactive(self.interactive_client_requested(), self.provenance)
     }
 
     pub(crate) fn client_mcp_extensions(&self) -> ClientMcpExtensions {
@@ -696,13 +725,14 @@ impl MessageProcessor {
         &self,
         connection_id: ConnectionId,
         request_attestation: bool,
+        trusted_interactive: bool,
     ) {
         self.thread_processor
             .connection_initialized(
                 connection_id,
                 ConnectionCapabilities {
                     request_attestation,
-                    trusted_interactive: false,
+                    trusted_interactive,
                 },
             )
             .await;
@@ -817,7 +847,7 @@ impl MessageProcessor {
                         connection_id,
                         ConnectionCapabilities {
                             request_attestation: session.request_attestation(),
-                            trusted_interactive: false,
+                            trusted_interactive: session.trusted_interactive(),
                         },
                     )
                     .await;

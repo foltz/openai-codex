@@ -16,6 +16,7 @@ pub use codex_app_server_transport::AppServerTransport;
 pub(crate) use codex_app_server_transport::CHANNEL_CAPACITY;
 pub(crate) use codex_app_server_transport::ConnectionId;
 pub(crate) use codex_app_server_transport::ConnectionOrigin;
+pub(crate) use codex_app_server_transport::ConnectionProvenance;
 pub(crate) use codex_app_server_transport::OutgoingMessage;
 pub(crate) use codex_app_server_transport::QueuedOutgoingMessage;
 pub(crate) use codex_app_server_transport::RemoteControlEnableError;
@@ -47,6 +48,7 @@ pub(crate) struct ConnectionState {
 impl ConnectionState {
     pub(crate) fn new(
         origin: ConnectionOrigin,
+        provenance: ConnectionProvenance,
         outbound_initialized: Arc<AtomicBool>,
         outbound_experimental_api_enabled: Arc<AtomicBool>,
         outbound_opted_out_notification_methods: Arc<RwLock<HashSet<String>>>,
@@ -56,8 +58,62 @@ impl ConnectionState {
             outbound_initialized,
             outbound_experimental_api_enabled,
             outbound_opted_out_notification_methods,
-            session: Arc::new(ConnectionSessionState::new()),
+            session: Arc::new(ConnectionSessionState::with_provenance(provenance)),
         }
+    }
+}
+
+/// Evaluates the server-owned entitlement half of D001. The caller must still
+/// require the explicit client role request before granting attachment state.
+pub(crate) fn trusted_interactive_provenance(provenance: ConnectionProvenance) -> bool {
+    match provenance {
+        ConnectionProvenance::InProcess => true,
+        // `unix_peer_provenance` verifies the identity while accepting the
+        // socket, before any client input is read. This is deliberately a
+        // server-established result, not a client-side claim.
+        ConnectionProvenance::UnixPeerExecutable(_) => true,
+        ConnectionProvenance::Unproven => false,
+    }
+}
+
+pub(crate) fn trusted_interactive(
+    interactive_client_requested: bool,
+    provenance: ConnectionProvenance,
+) -> bool {
+    interactive_client_requested && trusted_interactive_provenance(provenance)
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::ConnectionProvenance;
+    use super::trusted_interactive;
+    use super::trusted_interactive_provenance;
+
+    #[test]
+    fn unproven_connections_cannot_become_interactive() {
+        assert!(!trusted_interactive_provenance(
+            ConnectionProvenance::Unproven
+        ));
+    }
+
+    #[test]
+    fn interactive_role_is_necessary_even_for_the_embedded_connection() {
+        assert!(!trusted_interactive(
+            /*interactive_client_requested*/ false,
+            ConnectionProvenance::InProcess,
+        ));
+        assert!(trusted_interactive(
+            /*interactive_client_requested*/ true,
+            ConnectionProvenance::InProcess,
+        ));
+    }
+
+    #[test]
+    fn interactive_role_cannot_promote_an_unproven_connection() {
+        assert!(!trusted_interactive(
+            /*interactive_client_requested*/ true,
+            ConnectionProvenance::Unproven,
+        ));
     }
 }
 

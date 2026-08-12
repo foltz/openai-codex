@@ -24,6 +24,7 @@ use tracing::warn;
 /// plenty for an interactive CLI.
 pub const CHANNEL_CAPACITY: usize = 128;
 
+mod provenance;
 mod remote_control;
 mod stdio;
 mod unix_socket;
@@ -31,6 +32,7 @@ mod unix_socket;
 mod unix_socket_tests;
 mod websocket;
 
+pub use provenance::PeerExecutableIdentity;
 pub use remote_control::REMOTE_CONTROL_DISABLED_ENV_VAR;
 pub use remote_control::RemoteControlDisabledByRequirements;
 pub use remote_control::RemoteControlEnableError;
@@ -173,6 +175,7 @@ pub enum TransportEvent {
     ConnectionOpened {
         connection_id: ConnectionId,
         origin: ConnectionOrigin,
+        provenance: ConnectionProvenance,
         writer: mpsc::Sender<QueuedOutgoingMessage>,
         disconnect_sender: Option<CancellationToken>,
     },
@@ -183,6 +186,16 @@ pub enum TransportEvent {
         connection_id: ConnectionId,
         message: JSONRPCMessage,
     },
+}
+
+/// Server-observed connection provenance. Client-provided initialize fields do
+/// not contribute to this value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConnectionProvenance {
+    #[default]
+    Unproven,
+    InProcess,
+    UnixPeerExecutable(PeerExecutableIdentity),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

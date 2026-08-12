@@ -1,5 +1,6 @@
 use super::CHANNEL_CAPACITY;
 use super::ConnectionOrigin;
+use super::ConnectionProvenance;
 use super::TransportEvent;
 use super::forward_incoming_message;
 use super::next_connection_id;
@@ -33,6 +34,7 @@ pub async fn start_stdio_connection(
         .send(TransportEvent::ConnectionOpened {
             connection_id,
             origin: ConnectionOrigin::Stdio,
+            provenance: ConnectionProvenance::Unproven,
             writer: writer_tx,
             disconnect_sender: None,
         })

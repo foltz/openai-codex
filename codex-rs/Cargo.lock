@@ -2219,6 +2219,7 @@ dependencies = [
  "hmac 0.12.1",
  "httpdate",
  "jsonwebtoken",
+ "libc",
  "owo-colors",
  "pretty_assertions",
  "rand 0.9.3",

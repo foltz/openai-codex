@@ -25,6 +25,7 @@ async fn thread_attachment_list_is_empty_without_server_entitlement() -> Result<
             Some(InitializeCapabilities {
                 experimental_api: true,
                 request_attestation: false,
+                interactive_client: true,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,
                 extensions: None,

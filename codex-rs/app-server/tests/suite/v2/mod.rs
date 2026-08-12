@@ -121,6 +121,7 @@ mod skills_list;
 mod sleep;
 mod thread_archive;
 mod thread_attachments;
+mod thread_attachment;
 mod thread_clear_websocket;
 mod thread_delete;
 mod thread_environments;

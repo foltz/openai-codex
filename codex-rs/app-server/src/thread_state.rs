@@ -1,6 +1,11 @@
 use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::ConnectionRequestId;
+use crate::outgoing_message::OutgoingMessageSender;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::ServerNotification;
+use codex_app_server_protocol::ThreadAttachmentChangedNotification;
+use codex_app_server_protocol::ThreadAttachmentEntry;
+use codex_app_server_protocol::ThreadAttachmentListResponse;
 use codex_app_server_protocol::ThreadGoal;
 use codex_app_server_protocol::ThreadHistoryBuilder;
 use codex_app_server_protocol::ThreadHistoryTurnMetadata;
@@ -32,6 +37,7 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tracing::error;
+use uuid::Uuid;
 
 type PendingInterruptQueue = Vec<ConnectionRequestId>;
 
@@ -372,6 +378,75 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn attachment_snapshot_tracks_only_trusted_interactive_subscriptions() {
+        let manager = ThreadStateManager::new();
+        let thread_id = ThreadId::new();
+        let trusted_connection = ConnectionId(1);
+        let untrusted_connection = ConnectionId(2);
+
+        let startup_snapshot = manager.thread_attachment_list().await;
+        assert_eq!(startup_snapshot.revision, 0);
+        assert!(startup_snapshot.entries.is_empty());
+
+        manager
+            .connection_initialized(
+                trusted_connection,
+                ConnectionCapabilities {
+                    request_attestation: false,
+                    trusted_interactive: true,
+                },
+            )
+            .await;
+        manager
+            .connection_initialized(untrusted_connection, ConnectionCapabilities::default())
+            .await;
+
+        manager
+            .try_ensure_connection_subscribed(
+                thread_id,
+                untrusted_connection,
+                /* experimental_raw_events */ false,
+            )
+            .await
+            .expect("untrusted connection should be live");
+        let untrusted_snapshot = manager.thread_attachment_list().await;
+        assert_eq!(untrusted_snapshot.revision, 0);
+        assert!(untrusted_snapshot.entries.is_empty());
+
+        manager
+            .try_ensure_connection_subscribed(
+                thread_id,
+                trusted_connection,
+                /* experimental_raw_events */ false,
+            )
+            .await
+            .expect("trusted connection should be live");
+        manager
+            .try_ensure_connection_subscribed(
+                thread_id,
+                trusted_connection,
+                /* experimental_raw_events */ false,
+            )
+            .await
+            .expect("trusted connection should remain live");
+        let attached_snapshot = manager.thread_attachment_list().await;
+        assert_eq!(attached_snapshot.generation, startup_snapshot.generation);
+        assert_eq!(attached_snapshot.revision, 1);
+        assert_eq!(
+            attached_snapshot.entries,
+            vec![ThreadAttachmentEntry {
+                thread_id: thread_id.to_string(),
+                interactive_attachment_count: 1,
+            }]
+        );
+
+        manager.remove_connection(trusted_connection).await;
+        let closed_snapshot = manager.thread_attachment_list().await;
+        assert_eq!(closed_snapshot.revision, 2);
+        assert!(closed_snapshot.entries.is_empty());
+    }
+
     fn thread_settings(model: &str) -> ThreadSettings {
         ThreadSettings {
             disabled_plugin_ids: Vec::new(),
@@ -433,6 +508,55 @@ struct ThreadStateManagerInner {
     threads: HashMap<ThreadId, ThreadEntry>,
     thread_ids_by_connection: HashMap<ConnectionId, HashSet<ThreadId>>,
     clear_transition_reservations: HashSet<ThreadId>,
+    attachment_generation: String,
+    attachment_revision: u64,
+    attachment_counts: HashMap<ThreadId, u32>,
+}
+
+impl ThreadStateManagerInner {
+    fn add_interactive_attachment(&mut self, thread_id: ThreadId) -> ThreadAttachmentEntry {
+        let interactive_attachment_count = self.attachment_counts.entry(thread_id).or_default();
+        *interactive_attachment_count = interactive_attachment_count.saturating_add(1);
+        ThreadAttachmentEntry {
+            thread_id: thread_id.to_string(),
+            interactive_attachment_count: *interactive_attachment_count,
+        }
+    }
+
+    fn remove_interactive_attachment(
+        &mut self,
+        thread_id: ThreadId,
+    ) -> Option<ThreadAttachmentEntry> {
+        let interactive_attachment_count = {
+            let interactive_attachment_count = self.attachment_counts.get_mut(&thread_id)?;
+            *interactive_attachment_count = interactive_attachment_count.saturating_sub(1);
+            *interactive_attachment_count
+        };
+        let entry = ThreadAttachmentEntry {
+            thread_id: thread_id.to_string(),
+            interactive_attachment_count,
+        };
+        if interactive_attachment_count == 0 {
+            self.attachment_counts.remove(&thread_id);
+        }
+        Some(entry)
+    }
+
+    fn attachment_change(
+        &mut self,
+        mut changes: Vec<ThreadAttachmentEntry>,
+    ) -> Option<ThreadAttachmentChangedNotification> {
+        if changes.is_empty() {
+            return None;
+        }
+        changes.sort_unstable_by(|left, right| left.thread_id.cmp(&right.thread_id));
+        self.attachment_revision = self.attachment_revision.saturating_add(1);
+        Some(ThreadAttachmentChangedNotification {
+            generation: self.attachment_generation.clone(),
+            revision: self.attachment_revision,
+            changes,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -442,23 +566,86 @@ pub(crate) enum ClearTransitionAuthorityError {
     TransitionConflict,
 }
 
+/// Server-established connection properties. Client-provided initialize data
+/// must not set `trusted_interactive` without the later entitlement boundary.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct ConnectionCapabilities {
     pub(crate) request_attestation: bool,
+    pub(crate) trusted_interactive: bool,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct ThreadStateManager {
     state: Arc<Mutex<ThreadStateManagerInner>>,
     // Extension event sinks are synchronous, so they need an await-free way to
     // enqueue work on the active per-thread listener.
     listener_commands:
         Arc<StdMutex<HashMap<ThreadId, mpsc::UnboundedSender<ThreadListenerCommand>>>>,
+    attachment_notification_outgoing: Arc<StdMutex<Option<Arc<OutgoingMessageSender>>>>,
+}
+
+impl Default for ThreadStateManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ThreadStateManager {
     pub(crate) fn new() -> Self {
-        Self::default()
+        Self {
+            state: Arc::new(Mutex::new(ThreadStateManagerInner {
+                attachment_generation: Uuid::now_v7().to_string(),
+                ..ThreadStateManagerInner::default()
+            })),
+            listener_commands: Arc::new(StdMutex::new(HashMap::new())),
+            attachment_notification_outgoing: Arc::new(StdMutex::new(None)),
+        }
+    }
+
+    pub(crate) fn set_attachment_notification_outgoing(
+        &self,
+        outgoing: Arc<OutgoingMessageSender>,
+    ) {
+        *self
+            .attachment_notification_outgoing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outgoing);
+    }
+
+    pub(crate) async fn thread_attachment_list(&self) -> ThreadAttachmentListResponse {
+        let state = self.state.lock().await;
+        let mut entries = state
+            .attachment_counts
+            .iter()
+            .map(
+                |(thread_id, interactive_attachment_count)| ThreadAttachmentEntry {
+                    thread_id: thread_id.to_string(),
+                    interactive_attachment_count: *interactive_attachment_count,
+                },
+            )
+            .collect::<Vec<_>>();
+        entries.sort_unstable_by(|left, right| left.thread_id.cmp(&right.thread_id));
+        ThreadAttachmentListResponse {
+            generation: state.attachment_generation.clone(),
+            revision: state.attachment_revision,
+            entries,
+        }
+    }
+
+    async fn publish_attachment_change(&self, change: Option<ThreadAttachmentChangedNotification>) {
+        let Some(change) = change else {
+            return;
+        };
+        let outgoing = self
+            .attachment_notification_outgoing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(outgoing) = outgoing {
+            outgoing
+                .send_server_notification(ServerNotification::ThreadAttachmentChanged(change))
+                .await;
+        }
     }
 
     pub(crate) async fn connection_initialized(
@@ -466,11 +653,33 @@ impl ThreadStateManager {
         connection_id: ConnectionId,
         capabilities: ConnectionCapabilities,
     ) {
-        self.state
-            .lock()
-            .await
-            .live_connections
-            .insert(connection_id, capabilities);
+        let change = {
+            let mut state = self.state.lock().await;
+            let previous = state.live_connections.insert(connection_id, capabilities);
+            let Some(previous) = previous else {
+                return;
+            };
+            if previous.trusted_interactive == capabilities.trusted_interactive {
+                return;
+            }
+            let thread_ids = state
+                .thread_ids_by_connection
+                .get(&connection_id)
+                .cloned()
+                .unwrap_or_default();
+            let changes = thread_ids
+                .into_iter()
+                .filter_map(|thread_id| {
+                    if capabilities.trusted_interactive {
+                        Some(state.add_interactive_attachment(thread_id))
+                    } else {
+                        state.remove_interactive_attachment(thread_id)
+                    }
+                })
+                .collect();
+            state.attachment_change(changes)
+        };
+        self.publish_attachment_change(change).await;
     }
 
     /// Validates client authority and reserves the predecessor for one clear transition.
@@ -590,7 +799,7 @@ impl ThreadStateManager {
     }
 
     pub(crate) async fn remove_thread_state(&self, thread_id: ThreadId) {
-        let thread_state = {
+        let (thread_state, attachment_change) = {
             let mut state = self.state.lock().await;
             let thread_state = state
                 .threads
@@ -600,8 +809,18 @@ impl ThreadStateManager {
                 thread_ids.remove(&thread_id);
                 !thread_ids.is_empty()
             });
-            thread_state
+            let changes = state
+                .attachment_counts
+                .remove(&thread_id)
+                .map(|_| ThreadAttachmentEntry {
+                    thread_id: thread_id.to_string(),
+                    interactive_attachment_count: 0,
+                })
+                .into_iter()
+                .collect();
+            (thread_state, state.attachment_change(changes))
         };
+        self.publish_attachment_change(attachment_change).await;
         self.unregister_listener_command_tx(thread_id);
 
         if let Some(thread_state) = thread_state {
@@ -646,7 +865,7 @@ impl ThreadStateManager {
         thread_id: ThreadId,
         connection_id: ConnectionId,
     ) -> bool {
-        {
+        let change = {
             let mut state = self.state.lock().await;
             if !state.threads.contains_key(&thread_id) {
                 return false;
@@ -660,6 +879,11 @@ impl ThreadStateManager {
                 return false;
             }
 
+            let trusted_interactive = state
+                .live_connections
+                .get(&connection_id)
+                .is_some_and(|capabilities| capabilities.trusted_interactive);
+
             if let Some(thread_ids) = state.thread_ids_by_connection.get_mut(&connection_id) {
                 thread_ids.remove(&thread_id);
                 if thread_ids.is_empty() {
@@ -670,8 +894,14 @@ impl ThreadStateManager {
                 thread_entry.connection_ids.remove(&connection_id);
                 thread_entry.update_has_connections();
             }
+            let changes = trusted_interactive
+                .then(|| state.remove_interactive_attachment(thread_id))
+                .flatten()
+                .into_iter()
+                .collect();
+            state.attachment_change(changes)
         };
-
+        self.publish_attachment_change(change).await;
         true
     }
 
@@ -691,21 +921,33 @@ impl ThreadStateManager {
         connection_id: ConnectionId,
         experimental_raw_events: bool,
     ) -> Option<Arc<Mutex<ThreadState>>> {
-        let thread_state = {
+        let (thread_state, attachment_change) = {
             let mut state = self.state.lock().await;
             if !state.live_connections.contains_key(&connection_id) {
                 return None;
             }
-            state
+            let was_added = state
                 .thread_ids_by_connection
                 .entry(connection_id)
                 .or_default()
                 .insert(thread_id);
-            let thread_entry = state.threads.entry(thread_id).or_default();
-            thread_entry.connection_ids.insert(connection_id);
-            thread_entry.update_has_connections();
-            thread_entry.state.clone()
+            let thread_state = {
+                let thread_entry = state.threads.entry(thread_id).or_default();
+                thread_entry.connection_ids.insert(connection_id);
+                thread_entry.update_has_connections();
+                thread_entry.state.clone()
+            };
+            let changes = state
+                .live_connections
+                .get(&connection_id)
+                .is_some_and(|capabilities| capabilities.trusted_interactive)
+                .then(|| was_added.then(|| state.add_interactive_attachment(thread_id)))
+                .flatten()
+                .into_iter()
+                .collect();
+            (thread_state, state.attachment_change(changes))
         };
+        self.publish_attachment_change(attachment_change).await;
         {
             let mut thread_state_guard = thread_state.lock().await;
             if experimental_raw_events {
@@ -720,25 +962,42 @@ impl ThreadStateManager {
         thread_id: ThreadId,
         connection_id: ConnectionId,
     ) -> bool {
-        let mut state = self.state.lock().await;
-        if !state.live_connections.contains_key(&connection_id) {
-            return false;
-        }
-        state
-            .thread_ids_by_connection
-            .entry(connection_id)
-            .or_default()
-            .insert(thread_id);
-        let thread_entry = state.threads.entry(thread_id).or_default();
-        thread_entry.connection_ids.insert(connection_id);
-        thread_entry.update_has_connections();
+        let change = {
+            let mut state = self.state.lock().await;
+            if !state.live_connections.contains_key(&connection_id) {
+                return false;
+            }
+            let was_added = state
+                .thread_ids_by_connection
+                .entry(connection_id)
+                .or_default()
+                .insert(thread_id);
+            {
+                let thread_entry = state.threads.entry(thread_id).or_default();
+                thread_entry.connection_ids.insert(connection_id);
+                thread_entry.update_has_connections();
+            }
+            let changes = state
+                .live_connections
+                .get(&connection_id)
+                .is_some_and(|capabilities| capabilities.trusted_interactive)
+                .then(|| was_added.then(|| state.add_interactive_attachment(thread_id)))
+                .flatten()
+                .into_iter()
+                .collect();
+            state.attachment_change(changes)
+        };
+        self.publish_attachment_change(change).await;
         true
     }
 
     pub(crate) async fn remove_connection(&self, connection_id: ConnectionId) -> Vec<ThreadId> {
-        {
+        let (thread_ids, attachment_change) = {
             let mut state = self.state.lock().await;
-            state.live_connections.remove(&connection_id);
+            let trusted_interactive = state
+                .live_connections
+                .remove(&connection_id)
+                .is_some_and(|capabilities| capabilities.trusted_interactive);
             let thread_ids = state
                 .thread_ids_by_connection
                 .remove(&connection_id)
@@ -749,7 +1008,18 @@ impl ThreadStateManager {
                     thread_entry.update_has_connections();
                 }
             }
-            thread_ids
+            let changes = if trusted_interactive {
+                {
+                    thread_ids
+                        .iter()
+                        .filter_map(|thread_id| state.remove_interactive_attachment(*thread_id))
+                        .collect()
+                }
+            } else {
+                Default::default()
+            };
+            let attachment_change = state.attachment_change(changes);
+            let threads_to_unload = thread_ids
                 .into_iter()
                 .filter(|thread_id| {
                     state
@@ -757,8 +1027,11 @@ impl ThreadStateManager {
                         .get(thread_id)
                         .is_some_and(|thread_entry| thread_entry.connection_ids.is_empty())
                 })
-                .collect::<Vec<_>>()
-        }
+                .collect::<Vec<_>>();
+            (threads_to_unload, attachment_change)
+        };
+        self.publish_attachment_change(attachment_change).await;
+        thread_ids
     }
 
     pub(crate) async fn subscribe_to_has_connections(

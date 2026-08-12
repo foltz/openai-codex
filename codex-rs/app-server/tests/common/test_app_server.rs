@@ -87,6 +87,7 @@ use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::SkillsExtraRootsSetParams;
 use codex_app_server_protocol::SkillsListParams;
 use codex_app_server_protocol::ThreadArchiveParams;
+use codex_app_server_protocol::ThreadAttachmentListParams;
 use codex_app_server_protocol::ThreadCompactStartParams;
 use codex_app_server_protocol::ThreadDeleteParams;
 use codex_app_server_protocol::ThreadForkParams;
@@ -693,6 +694,15 @@ impl TestAppServer {
     ) -> anyhow::Result<i64> {
         let params = Some(serde_json::to_value(params)?);
         self.send_request("thread/loaded/list", params).await
+    }
+
+    /// Send a `thread/attachment/list` JSON-RPC request.
+    pub async fn send_thread_attachment_list_request(
+        &mut self,
+        params: ThreadAttachmentListParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("thread/attachment/list", params).await
     }
 
     /// Send a `thread/read` JSON-RPC request.

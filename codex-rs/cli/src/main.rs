@@ -1397,56 +1397,9 @@ async fn cli_main(
                     AppServerDaemonSubcommand::Version => {
                         print_app_server_daemon_output(AppServerLifecycleCommand::Version).await?;
                     }
-                    AppServerDaemonSubcommand::PidUpdateLoop {
-                        check_package_ownership: true,
-                        ..
-                    } => return Ok(()),
-                    AppServerDaemonSubcommand::Update {
-                        from_cli: false, ..
-                    }
-                    | AppServerDaemonSubcommand::PidUpdateLoop {
-                        check_package_ownership: false,
-                        ..
-                    } => {
-                        let cli_overrides = root_config_overrides
-                            .parse_overrides()
-                            .map_err(anyhow::Error::msg)?;
-                        let config = ConfigBuilder::default()
-                            .cli_overrides(cli_overrides)
-                            .build()
-                            .await
-                            .map_err(anyhow::Error::from);
-                        let http_client_factory = updater_http_client_factory(config);
-                        if matches!(
-                            daemon_cli.subcommand,
-                            AppServerDaemonSubcommand::Update { .. }
-                        ) {
-                            let result = codex_app_server_daemon::update(http_client_factory)
-                                .await
-                                .map(Some);
-                            daemon_telemetry::record_command(
-                                &root_config_overrides,
-                                analytics_default_enabled,
-                                "public_stable",
-                                &result,
-                            )
-                            .await;
-                            if let Some(output) = result? {
-                                println!("{}", serde_json::to_string(&output)?);
-                            }
-                        } else {
-                            let AppServerDaemonSubcommand::PidUpdateLoop {
-                                restore_release, ..
-                            } = daemon_cli.subcommand
-                            else {
-                                unreachable!()
-                            };
-                            codex_app_server_daemon::run_pid_update_loop(
-                                http_client_factory,
-                                restore_release,
-                            )
-                            .await?;
-                        }
+                    AppServerDaemonSubcommand::PidUpdateLoop { .. }
+                    | AppServerDaemonSubcommand::Update { from_cli: false, .. } => {
+                        anyhow::bail!(codex_app_server_daemon::MANAGED_UPDATE_DISABLED_MESSAGE);
                     }
                 },
                 Some(AppServerSubcommand::Proxy(proxy_cli)) => {
@@ -2685,6 +2638,7 @@ async fn print_app_server_daemon_output(command: AppServerLifecycleCommand) -> a
     Ok(())
 }
 
+#[cfg(test)]
 fn updater_http_client_factory(
     config: anyhow::Result<codex_core::config::Config>,
 ) -> codex_http_client::HttpClientFactory {

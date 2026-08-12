@@ -90,6 +90,7 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
+use crate::mcp_config_identity::AppliedMcpConfigIdentity;
 use crate::models_refresh_worker::ModelsRefreshWorker;
 
 const CONNECTION_RPC_DRAIN_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 30);
@@ -407,11 +408,13 @@ impl MessageProcessor {
             config_manager.clone(),
             Arc::clone(&thread_manager),
         );
+        let applied_mcp_config_identity = AppliedMcpConfigIdentity::from_startup_config(&config);
         let mcp_processor = McpRequestProcessor::new(
             auth_manager.clone(),
             Arc::clone(&thread_manager),
             outgoing.clone(),
             config_manager.clone(),
+            applied_mcp_config_identity,
         );
         let plugin_processor = PluginRequestProcessor::new(
             auth_manager.clone(),

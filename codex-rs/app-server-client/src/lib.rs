@@ -204,6 +204,8 @@ pub struct InProcessClientStartArgs {
     pub experimental_api: bool,
     /// Whether MCP servers may send `openai/form` elicitation requests.
     pub mcp_server_openai_form_elicitation: bool,
+    /// Whether this client requests server-established interactive attachment.
+    pub interactive_client: bool,
     /// Notification methods this client opts out of receiving.
     pub opt_out_notification_methods: Vec<String>,
     /// Queue capacity for command and embedded-runtime channels (clamped to at least 1).
@@ -216,6 +218,7 @@ impl InProcessClientStartArgs {
         let capabilities = InitializeCapabilities {
             experimental_api: self.experimental_api,
             request_attestation: false,
+            interactive_client: self.interactive_client,
             extensions: None,
             opt_out_notification_methods: if self.opt_out_notification_methods.is_empty() {
                 None
@@ -892,6 +895,7 @@ mod tests {
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             mcp_server_openai_form_elicitation: false,
+            interactive_client: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity,
         })
@@ -1101,6 +1105,7 @@ mod tests {
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             mcp_server_openai_form_elicitation: false,
+            interactive_client: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         }
@@ -1425,6 +1430,7 @@ mod tests {
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             mcp_server_openai_form_elicitation: false,
+            interactive_client: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -1515,6 +1521,7 @@ mod tests {
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             mcp_server_openai_form_elicitation: false,
+            interactive_client: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -1535,6 +1542,7 @@ mod tests {
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             mcp_server_openai_form_elicitation: false,
+            interactive_client: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,
         })
@@ -2070,6 +2078,7 @@ mod tests {
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
             mcp_server_openai_form_elicitation: true,
+            interactive_client: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
         }

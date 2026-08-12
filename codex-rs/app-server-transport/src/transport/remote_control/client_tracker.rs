@@ -10,6 +10,7 @@ use super::protocol::StreamId;
 use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::QueuedOutgoingMessage;
 use crate::transport::ConnectionOrigin;
+use crate::transport::ConnectionProvenance;
 use crate::transport::remote_control::QueuedServerEnvelope;
 use codex_app_server_protocol::JSONRPCMessage;
 use std::collections::HashMap;
@@ -171,6 +172,7 @@ impl ClientTracker {
                     connection_id,
                     origin: ConnectionOrigin::RemoteControl,
                     auth: self.auth.clone(),
+                    provenance: ConnectionProvenance::Unproven,
                     writer: writer_tx,
                     disconnect_sender: Some(disconnect_token.clone()),
                 })

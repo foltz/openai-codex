@@ -16,6 +16,11 @@ experimentalApi: boolean,
  */
 requestAttestation: boolean,
 /**
+ * Requests classification as an interactive app-server client. This is a
+ * request only; the server must independently establish entitlement.
+ */
+interactiveClient?: boolean,
+/**
  * Legacy opt-in for the `openai/form` MCP extension.
  *
  * New clients should declare `openai/form` in [`Self::extensions`].

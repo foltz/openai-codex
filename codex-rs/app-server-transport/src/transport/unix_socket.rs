@@ -5,7 +5,9 @@ use std::io::ErrorKind;
 use std::io::Result as IoResult;
 use std::path::Path;
 
+use super::ConnectionProvenance;
 use super::TransportEvent;
+use crate::transport::PeerExecutableIdentity;
 use crate::transport::websocket::run_websocket_connection;
 use codex_uds::UnixListener;
 use codex_uds::UnixStream;
@@ -156,6 +158,8 @@ async fn run_control_socket_acceptor(
 
         let transport_event_tx = transport_event_tx.clone();
         tokio::spawn(async move {
+            let provenance =
+                unix_peer_provenance(PeerExecutableIdentity::from_unix_stream(&stream));
             let mut shutdown_request = false;
             let websocket_config = WebSocketConfig::default();
             let max_unfragmented_message_bytes = [
@@ -200,7 +204,13 @@ async fn run_control_socket_acceptor(
                 return;
             }
             let (websocket_writer, websocket_reader) = websocket_stream.split();
-            run_websocket_connection(websocket_writer, websocket_reader, transport_event_tx).await;
+            run_websocket_connection(
+                websocket_writer,
+                websocket_reader,
+                transport_event_tx,
+                provenance,
+            )
+            .await;
         });
     }
     info!("control socket acceptor shutting down");
@@ -222,6 +232,18 @@ async fn run_daemon_shutdown(
     let _ = transport_event_tx
         .send(TransportEvent::DaemonShutdown)
         .await;
+}
+
+/// Retains only an accept-time executable identity matching this server.
+fn unix_peer_provenance(
+    peer_identity: IoResult<Option<PeerExecutableIdentity>>,
+) -> ConnectionProvenance {
+    peer_identity
+        .ok()
+        .flatten()
+        .filter(|identity| identity.matches_current_process())
+        .map(ConnectionProvenance::UnixPeerExecutable)
+        .unwrap_or(ConnectionProvenance::Unproven)
 }
 
 // Unix callers hold the physical socket's startup lock through bind and publication.
@@ -363,5 +385,48 @@ impl Drop for ControlSocketFileGuard {
                 "failed to remove app-server control socket file"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConnectionProvenance;
+    use super::PeerExecutableIdentity;
+    use super::unix_peer_provenance;
+    use std::io;
+
+    #[test]
+    fn failed_or_missing_peer_identity_fails_closed() {
+        assert_eq!(
+            unix_peer_provenance(Ok(None)),
+            ConnectionProvenance::Unproven
+        );
+        assert_eq!(
+            unix_peer_provenance(Err(io::Error::other("peer identity unavailable"))),
+            ConnectionProvenance::Unproven
+        );
+    }
+
+    #[test]
+    fn established_peer_identity_is_retained_without_a_pid() {
+        let identity = PeerExecutableIdentity::current_process().expect("current executable");
+        assert_eq!(
+            unix_peer_provenance(Ok(Some(identity))),
+            ConnectionProvenance::UnixPeerExecutable(identity)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mismatched_peer_executable_fails_closed() {
+        let mismatch = ["/bin/sh", "/bin/ls"]
+            .into_iter()
+            .find_map(|path| std::fs::metadata(path).ok())
+            .and_then(|metadata| PeerExecutableIdentity::from_metadata(metadata).ok())
+            .expect("mismatched executable identity");
+        assert_eq!(
+            unix_peer_provenance(Ok(Some(mismatch))),
+            ConnectionProvenance::Unproven
+        );
     }
 }

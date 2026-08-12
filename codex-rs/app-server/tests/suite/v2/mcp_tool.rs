@@ -261,6 +261,7 @@ async fn mcp_server_tool_call_forwards_only_server_extensions() -> Result<()> {
         Some(InitializeCapabilities {
             experimental_api: true,
             request_attestation: false,
+            interactive_client: false,
             mcp_server_openai_form_elicitation: true,
             opt_out_notification_methods: None,
             extensions: Some(HashMap::from([
@@ -356,6 +357,7 @@ async fn model_mcp_tool_call_uses_session_client_extensions() -> Result<()> {
         Some(InitializeCapabilities {
             experimental_api: true,
             request_attestation: false,
+            interactive_client: false,
             mcp_server_openai_form_elicitation: true,
             opt_out_notification_methods: None,
             extensions: Some(std::collections::HashMap::from([(

@@ -715,6 +715,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         client_version: env!("CARGO_PKG_VERSION").to_string(),
         experimental_api: true,
         mcp_server_openai_form_elicitation: false,
+        interactive_client: false,
         opt_out_notification_methods: Vec::new(),
         channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
     };

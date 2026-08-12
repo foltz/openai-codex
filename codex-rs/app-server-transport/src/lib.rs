@@ -23,6 +23,8 @@ pub use transport::AppServerTransportParseError;
 pub use transport::CHANNEL_CAPACITY;
 pub use transport::ConnectionOrigin;
 pub use transport::DaemonShutdownAccess;
+pub use transport::ConnectionProvenance;
+pub use transport::PeerExecutableIdentity;
 pub use transport::REMOTE_CONTROL_DISABLED_ENV_VAR;
 pub use transport::RemoteControlDisabledByRequirements;
 pub use transport::RemoteControlEnableError;

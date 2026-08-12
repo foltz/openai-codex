@@ -38,6 +38,7 @@ gethostname = { workspace = true }
 hmac = { workspace = true }
 httpdate = { workspace = true }
 jsonwebtoken = { workspace = true }
+libc = { workspace = true }
 owo-colors = { workspace = true, features = ["supports-colors"] }
 rand = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

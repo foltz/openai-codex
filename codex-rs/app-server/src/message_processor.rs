@@ -175,6 +175,7 @@ pub(crate) struct ConnectionSessionState {
     pub(crate) rpc_gate: Arc<ConnectionRpcGate>,
     pub(crate) origin: crate::transport::ConnectionOrigin,
     pub(crate) mcp_event_streams: McpEventStreams,
+    provenance: crate::transport::ConnectionProvenance,
     initialized: OnceLock<InitializedConnectionSessionState>,
 }
 
@@ -185,15 +186,31 @@ pub(crate) struct InitializedConnectionSessionState {
     pub(crate) app_server_client_name: String,
     pub(crate) client_version: String,
     pub(crate) request_attestation: bool,
+    pub(crate) interactive_client_requested: bool,
     pub(crate) client_mcp_extensions: ClientMcpExtensions,
 }
 
 impl ConnectionSessionState {
     pub(crate) fn new(origin: crate::transport::ConnectionOrigin) -> Self {
+        Self::with_provenance(origin, crate::transport::ConnectionProvenance::Unproven)
+    }
+
+    pub(crate) fn in_process() -> Self {
+        Self::with_provenance(
+            crate::transport::ConnectionOrigin::InProcess,
+            crate::transport::ConnectionProvenance::InProcess,
+        )
+    }
+
+    pub(crate) fn with_provenance(
+        origin: crate::transport::ConnectionOrigin,
+        provenance: crate::transport::ConnectionProvenance,
+    ) -> Self {
         Self {
             origin,
             rpc_gate: Arc::new(ConnectionRpcGate::new()),
             mcp_event_streams: McpEventStreams::default(),
+            provenance,
             initialized: OnceLock::new(),
         }
     }
@@ -231,6 +248,16 @@ impl ConnectionSessionState {
         self.initialized
             .get()
             .is_some_and(|session| session.request_attestation)
+    }
+
+    pub(crate) fn interactive_client_requested(&self) -> bool {
+        self.initialized
+            .get()
+            .is_some_and(|session| session.interactive_client_requested)
+    }
+
+    pub(crate) fn trusted_interactive(&self) -> bool {
+        crate::transport::trusted_interactive(self.interactive_client_requested(), self.provenance)
     }
 
     pub(crate) fn client_mcp_extensions(&self) -> ClientMcpExtensions {
@@ -814,6 +841,7 @@ impl MessageProcessor {
         &self,
         connection_id: ConnectionId,
         request_attestation: bool,
+        trusted_interactive: bool,
     ) {
         self.account_processor
             .notify_workspace_routing_to_connection(connection_id);
@@ -822,8 +850,7 @@ impl MessageProcessor {
                 connection_id,
                 ConnectionCapabilities {
                     request_attestation,
-                    trusted_interactive: false,
-                    trusted_interactive: false,
+                    trusted_interactive,
                 },
             )
             .await;
@@ -948,7 +975,11 @@ impl MessageProcessor {
                 )
                 .await?;
             if connection_initialized {
-                self.connection_initialized(connection_id, session.request_attestation())
+                self.connection_initialized(
+                        connection_id,
+                        session.request_attestation(),
+                        session.trusted_interactive(),
+                    )
                     .await;
             }
             return Ok(());

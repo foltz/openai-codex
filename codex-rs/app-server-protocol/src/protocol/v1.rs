@@ -50,6 +50,10 @@ pub struct InitializeCapabilities {
     /// Opt into `attestation/generate` requests for upstream `x-oai-attestation`.
     #[serde(default)]
     pub request_attestation: bool,
+    /// Requests classification as an interactive app-server client. This is a
+    /// request only; the server must independently establish entitlement.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interactive_client: bool,
     /// Legacy opt-in for the `openai/form` MCP extension.
     ///
     /// New clients should declare `openai/form` in [`Self::extensions`].

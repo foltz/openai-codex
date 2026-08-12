@@ -447,6 +447,49 @@ mod tests {
         assert!(closed_snapshot.entries.is_empty());
     }
 
+    #[tokio::test]
+    async fn reconnect_does_not_retain_interactive_attachment_without_fresh_entitlement() {
+        let manager = ThreadStateManager::new();
+        let thread_id = ThreadId::new();
+        let connection_id = ConnectionId(1);
+
+        manager
+            .connection_initialized(
+                connection_id,
+                ConnectionCapabilities {
+                    request_attestation: false,
+                    trusted_interactive: true,
+                },
+            )
+            .await;
+        manager
+            .try_ensure_connection_subscribed(
+                thread_id,
+                connection_id,
+                /* experimental_raw_events */ false,
+            )
+            .await
+            .expect("entitled connection should be live");
+        assert_eq!(manager.thread_attachment_list().await.entries.len(), 1);
+
+        manager.remove_connection(connection_id).await;
+        manager
+            .connection_initialized(connection_id, ConnectionCapabilities::default())
+            .await;
+        manager
+            .try_ensure_connection_subscribed(
+                thread_id,
+                connection_id,
+                /* experimental_raw_events */ false,
+            )
+            .await
+            .expect("reconnected connection should be live");
+
+        let snapshot = manager.thread_attachment_list().await;
+        assert!(snapshot.entries.is_empty());
+        assert_eq!(snapshot.revision, 2);
+    }
+
     fn thread_settings(model: &str) -> ThreadSettings {
         ThreadSettings {
             disabled_plugin_ids: Vec::new(),

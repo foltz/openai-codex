@@ -280,6 +280,16 @@ switching models. Setting `friendly` or `pragmatic` can replace a previous
 thread's existing instructions or change explicitly supplied base instructions.
 The old `features.personality` flag is ignored.
 
+# Applied MCP configuration identity
+
+`config/mcpServer/identity` returns `{ applied, current }`, where each identity
+has a canonical absolute `filePath` and the configuration layer's existing
+`sha256:...` `version`. `applied` is the snapshot accepted at startup or by
+the most recent successful `config/mcpServer/reload`; `current` is freshly
+loaded from disk. Configuration is current only when both fields match exactly.
+This read-only method does not reload servers, restart the app-server or write
+configuration.
+
 # MCP server capabilities
 
 `mcpServerStatus/list` returns `serverCapabilities` for each initialized MCP server

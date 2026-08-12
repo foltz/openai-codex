@@ -1223,6 +1223,12 @@ client_request_definitions! {
         response: v2::McpServerRefreshResponse,
     },
 
+    McpServerConfigIdentity => "config/mcpServer/identity" {
+        params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
+        serialization: global_shared_read("mcp-registry"),
+        response: v2::McpServerConfigIdentityResponse,
+    },
+
     McpServerStatusList => "mcpServerStatus/list" {
         params: v2::ListMcpServerStatusParams,
         serialization: global("mcp-registry"),

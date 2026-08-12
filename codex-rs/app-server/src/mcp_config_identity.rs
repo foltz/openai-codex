@@ -52,7 +52,6 @@ impl AppliedMcpConfigIdentity {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn current(&self) -> Option<McpConfigIdentity> {
         self.identity
             .read()

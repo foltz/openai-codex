@@ -9,16 +9,18 @@ fn codex_command(codex_home: &Path) -> Result<assert_cmd::Command> {
     Ok(cmd)
 }
 
-#[cfg(debug_assertions)]
 #[tokio::test]
-async fn update_does_not_start_interactive_prompt() -> Result<()> {
+async fn update_is_refused_with_managed_release_promotion_guidance() -> Result<()> {
     let codex_home = TempDir::new()?;
 
     codex_command(codex_home.path())?
         .arg("update")
         .assert()
         .failure()
-        .stderr(contains("`codex update` is not available in debug builds"));
+        .stderr(contains(
+            "codex self-update is disabled in this managed distribution",
+        ))
+        .stderr(contains("managed release and promotion workflow"));
 
     Ok(())
 }

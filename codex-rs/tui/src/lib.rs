@@ -1130,25 +1130,10 @@ async fn run_ratatui_app(
 
     #[cfg(not(debug_assertions))]
     {
-        use crate::update_prompt::UpdatePromptOutcome;
-
         let skip_update_prompt = cli.prompt.as_ref().is_some_and(|prompt| !prompt.is_empty());
         if !skip_update_prompt {
             startup_draft.flush_pending_events(&mut tui).await?;
-            match update_prompt::run_update_prompt_if_needed(&mut tui, &initial_config).await? {
-                UpdatePromptOutcome::Continue => {}
-                UpdatePromptOutcome::RunUpdate(action) => {
-                    terminal_restore_guard.restore()?;
-                    return Ok(AppExitInfo {
-                        token_usage: crate::token_usage::TokenUsage::default(),
-                        thread_id: None,
-                        resume_hint: None,
-                        disconnect_info: None,
-                        update_action: Some(action),
-                        exit_reason: ExitReason::UserRequested,
-                    });
-                }
-            }
+            update_prompt::run_update_prompt_if_needed(&mut tui, &initial_config).await?;
         }
     }
 
@@ -2031,15 +2016,6 @@ struct TerminalRestoreGuard {
 impl TerminalRestoreGuard {
     fn new() -> Self {
         Self { active: true }
-    }
-
-    #[cfg_attr(debug_assertions, allow(dead_code))]
-    fn restore(&mut self) -> color_eyre::Result<()> {
-        if self.active {
-            crate::tui::restore_after_exit()?;
-            self.active = false;
-        }
-        Ok(())
     }
 
     fn restore_silently(&mut self) {

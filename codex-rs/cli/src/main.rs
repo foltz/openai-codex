@@ -34,7 +34,6 @@ use codex_state::StateRuntime;
 use codex_tui::AppExitInfo;
 use codex_tui::Cli as TuiCli;
 use codex_tui::ExitReason;
-use codex_tui::UpdateAction;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_cli::CliConfigOverrides;
 use codex_utils_cli::ProfileV2Name;
@@ -893,10 +892,10 @@ fn parse_socket_path(raw: &str) -> Result<AbsolutePathBuf, String> {
         .map_err(|err| format!("failed to resolve socket path `{raw}`: {err}"))
 }
 
-/// Handle the app exit and print the results. Optionally run the update action.
+/// Handle the app exit and print the results.
 fn handle_app_exit(
     exit_info: AppExitInfo,
-    cli_executable: Option<&std::path::Path>,
+    _cli_executable: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
     let is_fatal = match &exit_info.exit_reason {
         ExitReason::Fatal(message) => {
@@ -909,92 +908,18 @@ fn handle_app_exit(
         | ExitReason::ThreadRemoved => false,
     };
 
-    let update_action = exit_info.update_action;
-    if !matches!(update_action, Some(UpdateAction::Daemon(_))) {
-        let color_enabled = supports_color::on(Stream::Stdout).is_some();
-        for line in exit_info.format_exit_messages(color_enabled) {
-            println!("{line}");
-        }
+    let color_enabled = supports_color::on(Stream::Stdout).is_some();
+    for line in exit_info.format_exit_messages(color_enabled) {
+        println!("{line}");
     }
     if is_fatal {
         std::io::stdout().flush()?;
         std::process::exit(1);
     }
-    if let Some(action) = update_action {
-        run_update_action(action, cli_executable)?;
-    }
     Ok(())
 }
 
-/// Run the update action and print the result.
-fn run_update_action(
-    action: UpdateAction,
-    cli_executable: Option<&std::path::Path>,
-) -> anyhow::Result<()> {
-    if let UpdateAction::Daemon(source) = action {
-        let executable = cli_executable
-            .ok_or_else(|| anyhow::anyhow!("Cannot locate the launching Codex CLI"))?;
-        println!("Updating the local background server...");
-        let status = std::process::Command::new(executable)
-            .args(source.command_args())
-            .env(codex_app_server_daemon::telemetry::HANDOFF_ENV, "1")
-            .status()?;
-        anyhow::ensure!(
-            status.success(),
-            "Daemon update failed with status {status}"
-        );
-        println!("Relaunch Codex to reconnect.");
-        return Ok(());
-    }
-    println!();
-    let cmd_str = action.command_str();
-    println!("Updating Codex via `{cmd_str}`...");
-    let status = {
-        #[cfg(windows)]
-        {
-            let (cmd, args) = action.command_args();
-            let cmd = if action == UpdateAction::StandaloneWindows {
-                // These args contain PowerShell metacharacters, so do not let
-                // PATHEXT select a batch shim for this action.
-                "powershell.exe"
-            } else {
-                cmd
-            };
-            let path_env =
-                std::env::var_os("PATH").ok_or_else(|| anyhow::anyhow!("PATH is not set"))?;
-            let command_path = resolve_windows_update_command_from_path(cmd, &path_env)?;
-            // Do not let a project-local command or package-manager config
-            // influence the updater after the user accepts the update prompt.
-            let update_cwd = tempfile::tempdir()?;
-            // Resolve through PATH without consulting the project cwd. When
-            // this returns a .cmd/.bat shim, std::process::Command routes the
-            // absolute path through the system command processor.
-            std::process::Command::new(command_path)
-                .args(args)
-                .current_dir(update_cwd.path())
-                .status()?
-        }
-        #[cfg(not(windows))]
-        {
-            let (cmd, args) = action.command_args();
-            let command_path = crate::wsl_paths::normalize_for_wsl(cmd);
-            let normalized_args: Vec<String> = args
-                .iter()
-                .map(crate::wsl_paths::normalize_for_wsl)
-                .collect();
-            std::process::Command::new(&command_path)
-                .args(&normalized_args)
-                .status()?
-        }
-    };
-    if !status.success() {
-        anyhow::bail!("`{cmd_str}` failed with status {status}");
-    }
-    println!("\n🎉 Update ran successfully! Please restart Codex.");
-    Ok(())
-}
-
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn resolve_windows_update_command_from_path(
     command: &str,
     path_env: &std::ffi::OsStr,
@@ -1012,22 +937,9 @@ fn resolve_windows_update_command_from_path(
 }
 
 fn run_update_command() -> anyhow::Result<()> {
-    #[cfg(debug_assertions)]
-    {
-        anyhow::bail!(
-            "`codex update` is not available in debug builds. Install a release build of Codex to use this command."
-        );
-    }
-
-    #[cfg(not(debug_assertions))]
-    {
-        let Some(action) = codex_tui::get_update_action() else {
-            anyhow::bail!(
-                "Could not detect the Codex installation method. Please update manually: https://developers.openai.com/codex/cli/"
-            );
-        };
-        run_update_action(action, /*cli_executable*/ None)
-    }
+    anyhow::bail!(
+        "codex self-update is disabled in this managed distribution; use the managed release and promotion workflow instead"
+    )
 }
 
 fn run_execpolicycheck(cmd: ExecPolicyCheckCommand) -> anyhow::Result<()> {

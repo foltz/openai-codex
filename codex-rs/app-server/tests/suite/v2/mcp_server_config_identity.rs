@@ -1,7 +1,10 @@
 use anyhow::Result;
 use app_test_support::MockResponsesConfig;
 use app_test_support::TestAppServer;
+use codex_app_server_protocol::ConfigBatchWriteParams;
+use codex_app_server_protocol::ConfigEdit;
 use codex_app_server_protocol::McpServerConfigIdentityResponse;
+use codex_app_server_protocol::MergeStrategy;
 use codex_app_server_protocol::RequestId;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
@@ -26,12 +29,13 @@ async fn mcp_server_config_identity_distinguishes_applied_and_current_config() -
     let startup = read_identity(&mut app_server).await?;
     assert_eq!(startup.applied, startup.current);
     assert_eq!(
-        startup.applied.file_path,
+        startup.applied.layers[0].file_path,
         std::fs::canonicalize(&config_path)?.display().to_string()
     );
-    assert!(startup.applied.version.starts_with("sha256:"));
+    assert!(startup.applied.layers[0].version.starts_with("sha256:"));
 
-    let changed_config = std::fs::read_to_string(&config_path)?.replace("initial", "changed");
+    let changed_config = std::fs::read_to_string(&config_path)?
+        .replace("command = \"initial\"", "command = \"changed\"");
     std::fs::write(&config_path, changed_config)?;
 
     let changed = read_identity(&mut app_server).await?;
@@ -44,6 +48,73 @@ async fn mcp_server_config_identity_distinguishes_applied_and_current_config() -
     assert_eq!(reloaded.applied, changed.current);
     assert_eq!(reloaded.applied, reloaded.current);
 
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn mcp_server_config_identity_canonicalizes_symlinked_selected_config() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let real_home = TempDir::new()?;
+    MockResponsesConfig::new("http://localhost")
+        .with_extra_config("[mcp_servers.initial]\ncommand = \"initial\"")
+        .write(real_home.path())?;
+    let link_root = TempDir::new()?;
+    let linked_home = link_root.path().join("linked-home");
+    symlink(real_home.path(), &linked_home)?;
+
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(&linked_home)
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
+    let identity = read_identity(&mut app_server).await?;
+    assert_eq!(
+        identity.applied.layers[0].file_path,
+        std::fs::canonicalize(real_home.path().join("config.toml"))?
+            .display()
+            .to_string()
+    );
+    assert_ne!(
+        identity.applied.layers[0].file_path,
+        linked_home.join("config.toml").display().to_string()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn batch_write_runtime_reload_advances_applied_mcp_identity() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new("http://localhost")
+        .with_extra_config("[mcp_servers.initial]\ncommand = \"initial\"")
+        .write(codex_home.path())?;
+    let config_path = codex_home.path().join("config.toml");
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
+    let before = read_identity(&mut app_server).await?;
+
+    let request_id = app_server
+        .send_config_batch_write_request(ConfigBatchWriteParams {
+            file_path: Some(config_path.display().to_string()),
+            edits: vec![ConfigEdit {
+                key_path: "mcp_servers.initial.command".to_string(),
+                value: serde_json::json!("changed"),
+                merge_strategy: MergeStrategy::Replace,
+            }],
+            expected_version: None,
+            reload_user_config: true,
+        })
+        .await?;
+    let _: serde_json::Value =
+        timeout(DEFAULT_READ_TIMEOUT, app_server.read_response(request_id)).await??;
+
+    let after = read_identity(&mut app_server).await?;
+    assert_ne!(after.applied, before.applied);
+    assert_eq!(after.applied, after.current);
     Ok(())
 }
 

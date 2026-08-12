@@ -6,8 +6,9 @@ import type { McpServerConfigIdentity } from "./McpServerConfigIdentity";
 /**
  * Paired MCP configuration identities for diagnostic comparison.
  *
- * `applied` is the selected user configuration layer accepted by the running
- * server's most recent successful startup or strict MCP reload. `current` is
- * read from the selected user configuration layer when this method runs.
+ * `applied` is every selected user configuration layer accepted by the
+ * running server's most recent successful startup or strict MCP reload.
+ * `current` is freshly read from every selected user configuration layer when
+ * this method runs.
  */
 export type McpServerConfigIdentityResponse = { applied: McpServerConfigIdentity, current: McpServerConfigIdentity, };

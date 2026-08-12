@@ -4,6 +4,8 @@ use crate::config_manager::ConfigManager;
 use crate::config_manager_service::ConfigManagerError;
 use crate::error_code::internal_error;
 use crate::error_code::invalid_request;
+use crate::mcp_config_identity::AppliedMcpConfigIdentity;
+use crate::mcp_config_identity::McpConfigIdentity;
 use crate::outgoing_message::ConnectionRequestId;
 use crate::outgoing_message::OutgoingMessageSender;
 use codex_analytics::AnalyticsEventsClient;
@@ -82,6 +84,7 @@ pub(crate) struct ConfigRequestProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     config_manager: ConfigManager,
     thread_manager: Arc<ThreadManager>,
+    applied_mcp_config_identity: AppliedMcpConfigIdentity,
     analytics_events_client: AnalyticsEventsClient,
 }
 
@@ -90,12 +93,14 @@ impl ConfigRequestProcessor {
         outgoing: Arc<OutgoingMessageSender>,
         config_manager: ConfigManager,
         thread_manager: Arc<ThreadManager>,
+        applied_mcp_config_identity: AppliedMcpConfigIdentity,
         analytics_events_client: AnalyticsEventsClient,
     ) -> Self {
         Self {
             outgoing,
             config_manager,
             thread_manager,
+            applied_mcp_config_identity,
             analytics_events_client,
         }
     }
@@ -174,7 +179,7 @@ impl ConfigRequestProcessor {
         if !session_defaults_only {
             self.handle_config_mutation().await;
             if should_reload {
-                reload_user_config(&self.config_manager, &self.thread_manager).await;
+                self.reload_user_config().await;
             }
         }
         Ok(ClientResponsePayload::ConfigBatchWrite(response))
@@ -189,7 +194,7 @@ impl ConfigRequestProcessor {
             .handle_config_mutation_result(self.set_experimental_feature_enablement(params).await)
             .await?;
         if !response.enablement.is_empty() {
-            reload_user_config(&self.config_manager, &self.thread_manager).await;
+            self.reload_user_config().await;
         }
         self.outgoing
             .send_response_as(
@@ -332,6 +337,14 @@ impl ConfigRequestProcessor {
         Ok(ExperimentalFeatureEnablementSetResponse { enablement })
     }
 
+    async fn reload_user_config(&self) {
+        reload_user_config(
+            &self.config_manager,
+            &self.thread_manager,
+            &self.applied_mcp_config_identity,
+        ).await;
+    }
+
     async fn emit_plugin_toggle_events(
         &self,
         pending_changes: std::collections::BTreeMap<String, bool>,
@@ -353,21 +366,44 @@ impl ConfigRequestProcessor {
     }
 }
 
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "runtime config refresh and its retained MCP identity must be one serialized transition"
+)]
 pub(super) async fn reload_user_config(
     config_manager: &ConfigManager,
     thread_manager: &ThreadManager,
+    applied_mcp_config_identity: &AppliedMcpConfigIdentity,
 ) {
-    if let Err(err) = config_manager
-        .load_latest_config(/*fallback_cwd*/ None)
-        .await
-    {
-        tracing::warn!("failed to rebuild user config for runtime refresh: {err}");
-        return;
-    }
-    let thread_ids = thread_manager.list_thread_ids().await;
-    for thread_id in thread_ids {
-        let Ok(thread) = thread_manager.get_thread(thread_id).await else {
-            continue;
+    let _apply_guard = applied_mcp_config_identity.lock_apply().await;
+    let refreshed_config = match config_manager.load_latest_config(/*fallback_cwd*/ None).await {
+        Ok(config) => config,
+        Err(err) => {
+            applied_mcp_config_identity.invalidate();
+            tracing::warn!(
+                "failed to rebuild user config for runtime refresh: {}",
+                err
+            );
+            return;
+        }
+    };
+    let candidate_identity = match McpConfigIdentity::from_config(&refreshed_config) {
+        Ok(identity) => identity,
+        Err(err) => {
+            applied_mcp_config_identity.invalidate();
+            tracing::warn!(%err, "failed to identify user config for runtime refresh");
+            return;
+        }
+    };
+    let mut refreshes = Vec::new();
+    for thread_id in thread_manager.list_thread_ids().await {
+        let thread = match thread_manager.get_thread(thread_id).await {
+            Ok(thread) => thread,
+            Err(err) => {
+                applied_mcp_config_identity.invalidate();
+                tracing::warn!(%thread_id, %err, "failed to load thread for runtime refresh");
+                return;
+            }
         };
         let current_config = thread.config().await;
         let next_config = match config_manager
@@ -379,14 +415,33 @@ pub(super) async fn reload_user_config(
         {
             Ok(config) => config,
             Err(err) => {
+                applied_mcp_config_identity.invalidate();
                 tracing::warn!(%thread_id, %err, "failed to reload thread configuration");
-                continue;
+                return;
             }
         };
-        // Keep runtime refresh state off the request dispatcher's stack.
-        Box::pin(thread.refresh_runtime_config(next_config)).await;
+        match McpConfigIdentity::from_config(&next_config) {
+            Ok(identity) if identity == candidate_identity => {
+                refreshes.push((thread, next_config))
+            }
+            Ok(_) => {
+                applied_mcp_config_identity.invalidate();
+                tracing::warn!(%thread_id, "selected MCP configuration changed while reloading runtime config");
+                return;
+            }
+            Err(err) => {
+                applied_mcp_config_identity.invalidate();
+                tracing::warn!(%thread_id, %err, "failed to identify thread runtime configuration");
+                return;
+            }
+        }
     }
+    for (thread, config) in refreshes {
+        Box::pin(thread.refresh_runtime_config(config)).await;
+    }
+    applied_mcp_config_identity.replace(candidate_identity);
 }
+
 
 fn map_requirements_to_api(
     requirements: Option<ConfigRequirementsToml>,

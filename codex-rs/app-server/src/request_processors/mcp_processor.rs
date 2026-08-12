@@ -111,16 +111,26 @@ impl McpRequestProcessor {
         Ok(McpServerRefreshResponse {})
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the read must not observe an in-progress MCP runtime identity transition"
+    )]
     async fn mcp_server_config_identity_response(
         &self,
         _params: Option<()>,
     ) -> Result<McpServerConfigIdentityResponse, JSONRPCErrorError> {
+        let _apply_guard = self.applied_mcp_config_identity.lock_apply().await;
         let applied = self
             .applied_mcp_config_identity
             .current()
             .ok_or_else(|| internal_error("selected user configuration identity is unavailable"))?;
         let current_config = self.load_latest_config(/*fallback_cwd*/ None).await?;
         let current = McpConfigIdentity::from_config(&current_config)
+            .map_err(|err| {
+                internal_error(format!(
+                    "failed to identify selected MCP configuration: {err}"
+                ))
+            })?
             .ok_or_else(|| internal_error("selected user configuration identity is unavailable"))?;
 
         Ok(McpServerConfigIdentityResponse {
@@ -608,8 +618,14 @@ fn mcp_operation_error(error: anyhow::Error) -> JSONRPCErrorError {
 
 fn mcp_server_config_identity(identity: McpConfigIdentity) -> McpServerConfigIdentity {
     McpServerConfigIdentity {
-        file_path: identity.file_path.to_string_lossy().into_owned(),
-        version: identity.version,
+        layers: identity
+            .layers
+            .into_iter()
+            .map(|layer| McpServerConfigIdentityLayer {
+                file_path: layer.file_path,
+                version: layer.version,
+            })
+            .collect(),
     }
 }
 

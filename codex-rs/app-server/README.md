@@ -282,11 +282,12 @@ The old `features.personality` flag is ignored.
 
 # Applied MCP configuration identity
 
-`config/mcpServer/identity` returns `{ applied, current }`, where each identity
-has a canonical absolute `filePath` and the configuration layer's existing
-`sha256:...` `version`. `applied` is the snapshot accepted at startup or by
-the most recent successful `config/mcpServer/reload`; `current` is freshly
-loaded from disk. Configuration is current only when both fields match exactly.
+`config/mcpServer/identity` returns `{ applied, current }`. Each identity has
+ordered base-to-profile `layers`, whose entries carry canonical absolute
+`filePath` and the configuration layer's existing `sha256:...` `version`.
+`applied` is the complete selected-user snapshot accepted at startup or by the
+most recent successful runtime MCP refresh; `current` is freshly loaded from
+disk. Currentness requires both complete ordered layer lists to match exactly.
 This read-only method does not reload servers, restart the app-server or write
 configuration.
 

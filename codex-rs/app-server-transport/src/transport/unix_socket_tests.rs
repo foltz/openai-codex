@@ -247,6 +247,48 @@ async fn control_socket_entitles_only_a_same_image_peer() {
         expected_same_image_provenance()
     );
 
+    // A copied executable retains its original CodeDirectory and is therefore
+    // the same build. Re-signing that copy with an explicit different
+    // identifier creates a runnable same-signer peer with a different exact
+    // static-code hash; it must not inherit the daemon's entitlement.
+    #[cfg(target_os = "macos")]
+    {
+        let different_build = temp_dir.path().join("different-build-peer");
+        tokio::fs::copy(
+            std::env::current_exe().expect("test executable should resolve"),
+            &different_build,
+        )
+        .await
+        .expect("test executable should copy for re-signing");
+        tokio::fs::set_permissions(&different_build, std::fs::Permissions::from_mode(0o700))
+            .await
+            .expect("different-build helper should be executable");
+        let resign_status = tokio::process::Command::new("/usr/bin/codesign")
+            .args([
+                "--force",
+                "--sign",
+                "-",
+                "--identifier",
+                "com.openai.codex.kcf007.different-build",
+            ])
+            .arg(&different_build)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .expect("codesign should run");
+        assert!(
+            resign_status.success(),
+            "codesign should succeed: {resign_status}"
+        );
+        run_peer_helper(different_build, socket_path.as_path()).await;
+        assert_eq!(
+            recv_connection_provenance(&mut transport_event_rx).await,
+            ConnectionProvenance::Unproven
+        );
+    }
+
     shutdown_token.cancel();
     accept_handle.await.expect("acceptor should join");
 }

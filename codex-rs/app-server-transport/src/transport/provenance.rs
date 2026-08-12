@@ -1,9 +1,9 @@
 //! Server-observed Unix peer executable identity.
 //!
 //! Linux compares an opened executable's file identity while the accepted
-//! connection is still current. Darwin validates the audit-token-bound peer
-//! process against the daemon's code-signing requirement; neither path keeps
-//! a PID as entitlement.
+//! connection is still current. Darwin compares the audit-token-bound peer's
+//! exact static-code identifier with the daemon's captured code-directory
+//! hash; neither path keeps a PID as entitlement.
 
 use codex_uds::UnixStream;
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -16,12 +16,20 @@ pub enum PeerExecutableIdentity {
         device: u64,
         inode: u64,
     },
-    /// Darwin's kernel binds this code-directory hash to the process described
-    /// by an audit token. Unlike `proc_pidpath`, it never resolves a mutable
-    /// filesystem pathname after accepting the peer.
+    /// Darwin's Security framework derives this exact static-code identifier
+    /// from the process described by an audit token. It is not a designated
+    /// requirement, so a different release signed by the same identity does
+    /// not match. Unlike `proc_pidpath`, it never resolves a mutable pathname
+    /// after accepting the peer.
     #[cfg(target_os = "macos")]
-    CodeSignedProcess,
+    ExactCodeDirectoryHash {
+        bytes: [u8; MAX_CODE_DIRECTORY_HASH_BYTES],
+        length: u8,
+    },
 }
+
+#[cfg(target_os = "macos")]
+const MAX_CODE_DIRECTORY_HASH_BYTES: usize = 64;
 
 impl PeerExecutableIdentity {
     /// Captures the daemon image before its listener is published.
@@ -101,6 +109,7 @@ mod platform {
 
 #[cfg(target_os = "macos")]
 mod platform {
+    use super::MAX_CODE_DIRECTORY_HASH_BYTES;
     use super::PeerExecutableIdentity;
     use codex_uds::UnixStream;
     use std::io;
@@ -121,12 +130,13 @@ mod platform {
             flags: u32,
             code: *mut CfRef,
         ) -> Status;
-        fn SecCodeCopyDesignatedRequirement(
+        fn SecCodeCheckValidity(code: CfRef, flags: u32, requirement: CfRef) -> Status;
+        fn SecCodeCopySigningInformation(
             code: CfRef,
             flags: u32,
-            requirement: *mut CfRef,
+            information: *mut CfRef,
         ) -> Status;
-        fn SecCodeCheckValidity(code: CfRef, flags: u32, requirement: CfRef) -> Status;
+        static kSecCodeInfoUnique: CfRef;
     }
     #[link(name = "CoreFoundation", kind = "framework")]
     unsafe extern "C" {
@@ -138,6 +148,9 @@ mod platform {
             values: *const libc::c_void,
         ) -> CfRef;
         fn CFDictionarySetValue(dictionary: CfRef, key: CfRef, value: CfRef);
+        fn CFDictionaryGetValue(dictionary: CfRef, key: CfRef) -> CfRef;
+        fn CFDataGetLength(data: CfRef) -> isize;
+        fn CFDataGetBytePtr(data: CfRef) -> *const u8;
         fn CFRelease(value: CfRef);
     }
 
@@ -147,8 +160,9 @@ mod platform {
         if status != 0 {
             return Err(io::Error::from_raw_os_error(status));
         }
+        let identity = exact_static_code_identity(code);
         unsafe { CFRelease(code) };
-        Ok(PeerExecutableIdentity::CodeSignedProcess)
+        identity
     }
 
     pub(super) fn peer_executable_identity(
@@ -171,11 +185,10 @@ mod platform {
         if result != 0 || token_len as usize != std::mem::size_of::<AuditToken>() {
             return Err(io::Error::last_os_error());
         }
-        peer_matches_running_code(&token)
-            .map(|matches| matches.then_some(PeerExecutableIdentity::CodeSignedProcess))
+        peer_exact_static_code_identity(&token).map(Some)
     }
 
-    fn peer_matches_running_code(token: &AuditToken) -> io::Result<bool> {
+    fn peer_exact_static_code_identity(token: &AuditToken) -> io::Result<PeerExecutableIdentity> {
         let data = unsafe {
             CFDataCreate(
                 std::ptr::null(),
@@ -198,36 +211,63 @@ mod platform {
             ));
         }
         unsafe { CFDictionarySetValue(attributes, kSecGuestAttributeAudit, data) };
-        let (mut self_code, mut peer_code, mut requirement) =
-            (std::ptr::null(), std::ptr::null(), std::ptr::null());
-        let status = unsafe { SecCodeCopySelf(0, &mut self_code) };
-        let status = if status == 0 {
-            unsafe {
-                SecCodeCopyGuestWithAttributes(std::ptr::null(), attributes, 0, &mut peer_code)
-            }
-        } else {
-            status
+        let mut peer_code = std::ptr::null();
+        let status = unsafe {
+            SecCodeCopyGuestWithAttributes(std::ptr::null(), attributes, 0, &mut peer_code)
         };
-        let status = if status == 0 {
-            unsafe { SecCodeCopyDesignatedRequirement(self_code, 0, &mut requirement) }
+        let identity = if status == 0 {
+            exact_static_code_identity(peer_code)
         } else {
-            status
+            Err(io::Error::from_raw_os_error(status))
         };
-        let status = if status == 0 {
-            unsafe { SecCodeCheckValidity(peer_code, 0, requirement) }
-        } else {
-            status
-        };
-        for value in [requirement, peer_code, self_code, attributes, data] {
+        for value in [peer_code, attributes, data] {
             if !value.is_null() {
                 unsafe { CFRelease(value) }
             }
         }
-        if status == 0 {
-            Ok(true)
-        } else {
-            Err(io::Error::from_raw_os_error(status))
+        identity
+    }
+
+    /// `kSecCodeInfoUnique` is Security.framework's stable binary identifier
+    /// for this exact static code, rather than its cross-version signing
+    /// identity. Validating the dynamic `SecCode` first binds the read to the
+    /// process represented by `SecCodeCopySelf` or `LOCAL_PEERTOKEN`.
+    fn exact_static_code_identity(code: CfRef) -> io::Result<PeerExecutableIdentity> {
+        let status = unsafe { SecCodeCheckValidity(code, 0, std::ptr::null()) };
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status));
         }
+        let mut information = std::ptr::null();
+        let status = unsafe { SecCodeCopySigningInformation(code, 0, &mut information) };
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status));
+        }
+        let identity = (|| {
+            let unique = unsafe { CFDictionaryGetValue(information, kSecCodeInfoUnique) };
+            if unique.is_null() {
+                return Err(io::Error::other(
+                    "signed code has no static-code identifier",
+                ));
+            }
+            let length = unsafe { CFDataGetLength(unique) };
+            if length <= 0 || length as usize > MAX_CODE_DIRECTORY_HASH_BYTES {
+                return Err(io::Error::other("invalid static-code identifier length"));
+            }
+            let source = unsafe { CFDataGetBytePtr(unique) };
+            if source.is_null() {
+                return Err(io::Error::other("static-code identifier bytes unavailable"));
+            }
+            let mut bytes = [0; MAX_CODE_DIRECTORY_HASH_BYTES];
+            unsafe {
+                std::ptr::copy_nonoverlapping(source, bytes.as_mut_ptr(), length as usize);
+            }
+            Ok(PeerExecutableIdentity::ExactCodeDirectoryHash {
+                bytes,
+                length: length as u8,
+            })
+        })();
+        unsafe { CFRelease(information) };
+        identity
     }
 }
 

@@ -33,6 +33,7 @@ mod unix_socket_tests;
 mod websocket;
 
 pub use provenance::PeerExecutableIdentity;
+pub(crate) use provenance::identities_match;
 pub use remote_control::REMOTE_CONTROL_DISABLED_ENV_VAR;
 pub use remote_control::RemoteControlDisabledByRequirements;
 pub use remote_control::RemoteControlEnableError;

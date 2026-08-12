@@ -6,6 +6,7 @@ use std::path::Path;
 use super::ConnectionProvenance;
 use super::TransportEvent;
 use crate::transport::PeerExecutableIdentity;
+use crate::transport::identities_match;
 use crate::transport::websocket::run_websocket_connection;
 use codex_uds::UnixListener;
 use codex_uds::UnixStream;
@@ -126,7 +127,7 @@ fn unix_peer_provenance(
         }
     };
     peer_identity
-        .filter(|identity| *identity == running_process_identity)
+        .filter(|identity| identities_match(running_process_identity, *identity))
         .map(ConnectionProvenance::UnixPeerExecutable)
         .unwrap_or(ConnectionProvenance::Unproven)
 }

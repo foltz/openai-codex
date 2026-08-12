@@ -61,6 +61,29 @@ impl PeerExecutableIdentity {
             inode: metadata.ino(),
         })
     }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn static_code_identity_from_path(path: &std::path::Path) -> io::Result<Self> {
+        platform::static_code_identity_from_path(path)
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn shares_designated_requirement_with(
+        daemon_path: &std::path::Path,
+        peer_path: &std::path::Path,
+    ) -> io::Result<bool> {
+        platform::peer_satisfies_designated_requirement(daemon_path, peer_path)
+    }
+}
+
+/// The sole comparison boundary for a captured daemon identity and an
+/// accept-time peer identity. Darwin values are exact static-code hashes, not
+/// designated signing requirements.
+pub(crate) fn identities_match(
+    running: PeerExecutableIdentity,
+    peer: PeerExecutableIdentity,
+) -> bool {
+    running == peer
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -114,6 +137,10 @@ mod platform {
     use codex_uds::UnixStream;
     use std::io;
     use std::os::fd::AsRawFd;
+    #[cfg(test)]
+    use std::os::unix::ffi::OsStrExt;
+    #[cfg(test)]
+    use std::path::Path;
 
     const AUDIT_TOKEN_WORDS: usize = 8;
     type AuditToken = [u32; AUDIT_TOKEN_WORDS];
@@ -136,6 +163,16 @@ mod platform {
             flags: u32,
             information: *mut CfRef,
         ) -> Status;
+        #[cfg(test)]
+        fn SecStaticCodeCreateWithPath(path: CfRef, flags: u32, code: *mut CfRef) -> Status;
+        #[cfg(test)]
+        fn SecCodeCopyDesignatedRequirement(
+            code: CfRef,
+            flags: u32,
+            requirement: *mut CfRef,
+        ) -> Status;
+        #[cfg(test)]
+        fn SecStaticCodeCheckValidity(code: CfRef, flags: u32, requirement: CfRef) -> Status;
         static kSecCodeInfoUnique: CfRef;
     }
     #[link(name = "CoreFoundation", kind = "framework")]
@@ -151,6 +188,13 @@ mod platform {
         fn CFDictionaryGetValue(dictionary: CfRef, key: CfRef) -> CfRef;
         fn CFDataGetLength(data: CfRef) -> isize;
         fn CFDataGetBytePtr(data: CfRef) -> *const u8;
+        #[cfg(test)]
+        fn CFURLCreateFromFileSystemRepresentation(
+            allocator: CfRef,
+            buffer: *const u8,
+            buffer_length: isize,
+            is_directory: bool,
+        ) -> CfRef;
         fn CFRelease(value: CfRef);
     }
 
@@ -237,6 +281,10 @@ mod platform {
         if status != 0 {
             return Err(io::Error::from_raw_os_error(status));
         }
+        copy_static_code_identity(code)
+    }
+
+    fn copy_static_code_identity(code: CfRef) -> io::Result<PeerExecutableIdentity> {
         let mut information = std::ptr::null();
         let status = unsafe { SecCodeCopySigningInformation(code, 0, &mut information) };
         if status != 0 {
@@ -268,6 +316,75 @@ mod platform {
         })();
         unsafe { CFRelease(information) };
         identity
+    }
+
+    #[cfg(test)]
+    pub(super) fn static_code_identity_from_path(
+        path: &Path,
+    ) -> io::Result<PeerExecutableIdentity> {
+        let code = static_code_from_path(path)?;
+        let status = unsafe { SecStaticCodeCheckValidity(code, 0, std::ptr::null()) };
+        let identity = if status == 0 {
+            copy_static_code_identity(code)
+        } else {
+            Err(io::Error::from_raw_os_error(status))
+        };
+        unsafe { CFRelease(code) };
+        identity
+    }
+
+    /// Proves that the fixture pair satisfies the exact comparator used by
+    /// the superseded implementation. This is deliberately test-only: the
+    /// production boundary must not retain or compare a designated
+    /// requirement.
+    #[cfg(test)]
+    pub(super) fn peer_satisfies_designated_requirement(
+        daemon_path: &Path,
+        peer_path: &Path,
+    ) -> io::Result<bool> {
+        let daemon = static_code_from_path(daemon_path)?;
+        let peer = static_code_from_path(peer_path)?;
+        let mut requirement = std::ptr::null();
+        let status = unsafe { SecCodeCopyDesignatedRequirement(daemon, 0, &mut requirement) };
+        let matches = if status == 0 {
+            unsafe { SecStaticCodeCheckValidity(peer, 0, requirement) == 0 }
+        } else {
+            false
+        };
+        for value in [requirement, peer, daemon] {
+            if !value.is_null() {
+                unsafe { CFRelease(value) };
+            }
+        }
+        if status == 0 {
+            Ok(matches)
+        } else {
+            Err(io::Error::from_raw_os_error(status))
+        }
+    }
+
+    #[cfg(test)]
+    fn static_code_from_path(path: &Path) -> io::Result<CfRef> {
+        let bytes = path.as_os_str().as_bytes();
+        let url = unsafe {
+            CFURLCreateFromFileSystemRepresentation(
+                std::ptr::null(),
+                bytes.as_ptr(),
+                bytes.len() as isize,
+                false,
+            )
+        };
+        if url.is_null() {
+            return Err(io::Error::other("could not construct static-code URL"));
+        }
+        let mut code = std::ptr::null();
+        let status = unsafe { SecStaticCodeCreateWithPath(url, 0, &mut code) };
+        unsafe { CFRelease(url) };
+        if status == 0 {
+            Ok(code)
+        } else {
+            Err(io::Error::from_raw_os_error(status))
+        }
     }
 }
 

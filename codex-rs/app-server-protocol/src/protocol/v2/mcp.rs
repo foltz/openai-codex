@@ -189,6 +189,31 @@ pub struct McpServerRefreshParams {}
 #[ts(export_to = "v2/")]
 pub struct McpServerRefreshResponse {}
 
+/// Identity of the selected user configuration layer that supplied MCP
+/// configuration.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct McpServerConfigIdentity {
+    /// Canonical absolute path of the selected user configuration layer.
+    pub file_path: String,
+    /// Existing canonical layer version, in `sha256:...` form.
+    pub version: String,
+}
+
+/// Paired MCP configuration identities for diagnostic comparison.
+///
+/// `applied` is the selected user configuration layer accepted by the running
+/// server's most recent successful startup or strict MCP reload. `current` is
+/// read from the selected user configuration layer when this method runs.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct McpServerConfigIdentityResponse {
+    pub applied: McpServerConfigIdentity,
+    pub current: McpServerConfigIdentity,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]

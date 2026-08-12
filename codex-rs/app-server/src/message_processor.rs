@@ -1376,6 +1376,9 @@ impl MessageProcessor {
             ClientRequest::McpServerRefresh { params, .. } => {
                 self.mcp_processor.mcp_server_refresh(params).await
             }
+            ClientRequest::McpServerConfigIdentity { params, .. } => {
+                self.mcp_processor.mcp_server_config_identity(params).await
+            }
             ClientRequest::McpServerStatusList { params, .. } => {
                 self.mcp_processor
                     .mcp_server_status_list(&request_id, params)

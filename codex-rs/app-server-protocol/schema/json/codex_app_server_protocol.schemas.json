@@ -1843,6 +1843,29 @@
             },
             "method": {
               "enum": [
+                "config/mcpServer/identity"
+              ],
+              "title": "Config/mcpServer/identityRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "id",
+            "method"
+          ],
+          "title": "Config/mcpServer/identityRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
                 "mcpServerStatus/list"
               ],
               "title": "McpServerStatus/listRequestMethod",
@@ -13132,6 +13155,42 @@
           "contents"
         ],
         "title": "McpResourceReadResponse",
+        "type": "object"
+      },
+      "McpServerConfigIdentity": {
+        "description": "Identity of the selected user configuration layer that supplied MCP configuration.",
+        "properties": {
+          "filePath": {
+            "description": "Canonical absolute path of the selected user configuration layer.",
+            "type": "string"
+          },
+          "version": {
+            "description": "Existing canonical layer version, in `sha256:...` form.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "filePath",
+          "version"
+        ],
+        "type": "object"
+      },
+      "McpServerConfigIdentityResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "Paired MCP configuration identities for diagnostic comparison.\n\n`applied` is the selected user configuration layer accepted by the running server's most recent successful startup or strict MCP reload. `current` is read from the selected user configuration layer when this method runs.",
+        "properties": {
+          "applied": {
+            "$ref": "#/definitions/v2/McpServerConfigIdentity"
+          },
+          "current": {
+            "$ref": "#/definitions/v2/McpServerConfigIdentity"
+          }
+        },
+        "required": [
+          "applied",
+          "current"
+        ],
+        "title": "McpServerConfigIdentityResponse",
         "type": "object"
       },
       "McpServerInfo": {

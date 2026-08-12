@@ -1,5 +1,6 @@
 use super::*;
 use crate::mcp_config_identity::AppliedMcpConfigIdentity;
+use crate::mcp_config_identity::McpConfigIdentity;
 use codex_core::McpManager;
 use codex_mcp::McpServerSource;
 
@@ -49,6 +50,15 @@ impl McpRequestProcessor {
             .map(|response| Some(response.into()))
     }
 
+    pub(crate) async fn mcp_server_config_identity(
+        &self,
+        params: Option<()>,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        self.mcp_server_config_identity_response(params)
+            .await
+            .map(|response| Some(response.into()))
+    }
+
     pub(crate) async fn mcp_server_status_list(
         &self,
         request_id: &ConnectionRequestId,
@@ -91,6 +101,24 @@ impl McpRequestProcessor {
         .await
         .map_err(|err| internal_error(format!("failed to refresh MCP servers: {err}")))?;
         Ok(McpServerRefreshResponse {})
+    }
+
+    async fn mcp_server_config_identity_response(
+        &self,
+        _params: Option<()>,
+    ) -> Result<McpServerConfigIdentityResponse, JSONRPCErrorError> {
+        let applied = self
+            .applied_mcp_config_identity
+            .current()
+            .ok_or_else(|| internal_error("selected user configuration identity is unavailable"))?;
+        let current_config = self.load_latest_config(/*fallback_cwd*/ None).await?;
+        let current = McpConfigIdentity::from_config(&current_config)
+            .ok_or_else(|| internal_error("selected user configuration identity is unavailable"))?;
+
+        Ok(McpServerConfigIdentityResponse {
+            applied: mcp_server_config_identity(applied),
+            current: mcp_server_config_identity(current),
+        })
     }
 
     async fn load_latest_config(
@@ -506,6 +534,13 @@ impl McpRequestProcessor {
             outgoing.send_result(request_id, result).await;
         });
         Ok(())
+    }
+}
+
+fn mcp_server_config_identity(identity: McpConfigIdentity) -> McpServerConfigIdentity {
+    McpServerConfigIdentity {
+        file_path: identity.file_path.to_string_lossy().into_owned(),
+        version: identity.version,
     }
 }
 

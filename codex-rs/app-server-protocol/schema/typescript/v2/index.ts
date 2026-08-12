@@ -251,6 +251,8 @@ export type { McpElicitationUntitledMultiSelectEnumSchema } from "./McpElicitati
 export type { McpElicitationUntitledSingleSelectEnumSchema } from "./McpElicitationUntitledSingleSelectEnumSchema";
 export type { McpResourceReadParams } from "./McpResourceReadParams";
 export type { McpResourceReadResponse } from "./McpResourceReadResponse";
+export type { McpServerConfigIdentity } from "./McpServerConfigIdentity";
+export type { McpServerConfigIdentityResponse } from "./McpServerConfigIdentityResponse";
 export type { McpServerElicitationAction } from "./McpServerElicitationAction";
 export type { McpServerElicitationRequestParams } from "./McpServerElicitationRequestParams";
 export type { McpServerElicitationRequestResponse } from "./McpServerElicitationRequestResponse";

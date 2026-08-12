@@ -1,5 +1,6 @@
 use super::AppServerTransport;
 use super::CHANNEL_CAPACITY;
+use super::ConnectionProvenance;
 use super::TransportEvent;
 use super::acquire_app_server_startup_lock;
 use super::app_server_control_socket_path;
@@ -14,6 +15,8 @@ use futures::StreamExt;
 use pretty_assertions::assert_eq;
 use std::io::Result as IoResult;
 use std::path::Path;
+#[cfg(unix)]
+use std::process::Stdio;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tokio::time::timeout;
@@ -21,6 +24,12 @@ use tokio_tungstenite::client_async;
 use tokio_tungstenite::tungstenite::Bytes;
 use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
 use tokio_util::sync::CancellationToken;
+
+#[cfg(unix)]
+const UNIX_SOCKET_PEER_HELPER_SOCKET_ENV: &str = "CODEX_UNIX_SOCKET_PEER_HELPER_SOCKET";
+#[cfg(unix)]
+const UNIX_SOCKET_PEER_HELPER_TEST: &str =
+    "transport::unix_socket_tests::unix_socket_peer_helper_connects";
 
 #[test]
 fn listen_unix_socket_parses_as_unix_socket_transport() {
@@ -81,7 +90,17 @@ async fn control_socket_acceptor_upgrades_and_forwards_websocket_text_messages_a
         .expect("connection opened event should arrive")
         .expect("connection opened event");
     let connection_id = match opened {
-        TransportEvent::ConnectionOpened { connection_id, .. } => connection_id,
+        TransportEvent::ConnectionOpened {
+            connection_id,
+            provenance,
+            ..
+        } => {
+            assert!(matches!(
+                provenance,
+                ConnectionProvenance::UnixPeerExecutable(_)
+            ));
+            connection_id
+        }
         _ => panic!("expected connection opened event"),
     };
 
@@ -139,6 +158,120 @@ async fn control_socket_acceptor_upgrades_and_forwards_websocket_text_messages_a
     shutdown_token.cancel();
     accept_handle.await.expect("acceptor should join");
     assert_socket_path_removed(socket_path.as_path());
+}
+
+/// This is invoked in a separately spawned copy of this test executable. The
+/// parent test chooses whether that executable has the same file identity as
+/// the listener or a deliberately copied (different) identity.
+#[cfg(unix)]
+#[test]
+fn unix_socket_peer_helper_connects() {
+    let Ok(socket_path) = std::env::var(UNIX_SOCKET_PEER_HELPER_SOCKET_ENV) else {
+        return;
+    };
+    let runtime = tokio::runtime::Runtime::new().expect("helper runtime should start");
+    runtime.block_on(async move {
+        let stream = connect_to_socket(Path::new(&socket_path))
+            .await
+            .expect("helper should connect to the control socket");
+        let (mut websocket, response) = client_async("ws://localhost/rpc", stream)
+            .await
+            .expect("helper websocket upgrade should complete");
+        assert_eq!(response.status().as_u16(), 101);
+        websocket
+            .send(WebSocketMessage::Text(
+                serde_json::to_string(&JSONRPCMessage::Notification(JSONRPCNotification {
+                    method: "initialized".to_string(),
+                    params: None,
+                }))
+                .expect("initialized notification should serialize")
+                .into(),
+            ))
+            .await
+            .expect("helper should send initialized notification");
+        websocket
+            .close(None)
+            .await
+            .expect("helper should close websocket");
+    });
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn control_socket_entitles_only_a_same_image_peer() {
+    let temp_dir = tempfile::TempDir::new().expect("temp dir");
+    let socket_path = test_socket_path(temp_dir.path());
+    let (transport_event_tx, mut transport_event_rx) =
+        mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
+    let shutdown_token = CancellationToken::new();
+    let accept_handle = start_control_socket_acceptor(
+        socket_path.clone(),
+        transport_event_tx,
+        shutdown_token.clone(),
+    )
+    .await
+    .expect("control socket acceptor should start");
+
+    run_peer_helper(
+        std::env::current_exe().expect("test executable should resolve"),
+        socket_path.as_path(),
+    )
+    .await;
+    assert!(matches!(
+        recv_connection_provenance(&mut transport_event_rx).await,
+        ConnectionProvenance::UnixPeerExecutable(_)
+    ));
+
+    let copied_executable = temp_dir.path().join("unentitled-peer");
+    tokio::fs::copy(
+        std::env::current_exe().expect("test executable should resolve"),
+        &copied_executable,
+    )
+    .await
+    .expect("test executable should copy");
+    use std::os::unix::fs::PermissionsExt;
+    tokio::fs::set_permissions(&copied_executable, std::fs::Permissions::from_mode(0o700))
+        .await
+        .expect("copied helper should be executable");
+    run_peer_helper(copied_executable, socket_path.as_path()).await;
+    assert_eq!(
+        recv_connection_provenance(&mut transport_event_rx).await,
+        ConnectionProvenance::Unproven
+    );
+
+    shutdown_token.cancel();
+    accept_handle.await.expect("acceptor should join");
+}
+
+#[cfg(unix)]
+async fn run_peer_helper(executable: std::path::PathBuf, socket_path: &Path) {
+    let status = tokio::process::Command::new(executable)
+        .arg("--exact")
+        .arg(UNIX_SOCKET_PEER_HELPER_TEST)
+        .arg("--nocapture")
+        .env(UNIX_SOCKET_PEER_HELPER_SOCKET_ENV, socket_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .expect("peer helper should run");
+    assert!(status.success(), "peer helper should succeed: {status}");
+}
+
+#[cfg(unix)]
+async fn recv_connection_provenance(
+    transport_event_rx: &mut mpsc::Receiver<TransportEvent>,
+) -> ConnectionProvenance {
+    loop {
+        let event = timeout(Duration::from_secs(1), transport_event_rx.recv())
+            .await
+            .expect("connection event should arrive")
+            .expect("transport event channel should remain open");
+        if let TransportEvent::ConnectionOpened { provenance, .. } = event {
+            return provenance;
+        }
+    }
 }
 
 #[tokio::test]

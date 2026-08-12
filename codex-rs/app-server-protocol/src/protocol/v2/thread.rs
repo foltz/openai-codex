@@ -72,8 +72,9 @@ pub struct ThreadAttachmentListParams {}
 #[serde(rename_all = "camelCase")]
 #[ts(rename_all = "camelCase", export_to = "v2/")]
 pub struct ThreadAttachmentListResponse {
-    /// New for each app-server process. A different generation requires the
-    /// caller to discard any cached attachment state.
+    /// New for each app-server process and rotated before its revision can
+    /// overflow. A different generation requires the caller to discard any
+    /// cached attachment state and fetch a new snapshot.
     pub generation: String,
     /// Monotonically increasing only within `generation`.
     pub revision: u64,

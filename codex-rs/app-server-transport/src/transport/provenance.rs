@@ -14,12 +14,14 @@ pub struct PeerExecutableIdentity {
 }
 
 impl PeerExecutableIdentity {
-    pub fn current_process() -> io::Result<Self> {
-        Self::from_metadata(std::fs::metadata(std::env::current_exe()?)?)
+    /// Captures the daemon image before its listener is published.
+    pub(crate) fn capture_running_process() -> io::Result<Self> {
+        platform::running_process_identity()
     }
 
-    pub fn matches_current_process(self) -> bool {
-        Self::current_process().is_ok_and(|identity| identity == self)
+    #[cfg(test)]
+    pub fn current_process() -> io::Result<Self> {
+        Self::capture_running_process()
     }
 
     #[cfg(unix)]
@@ -57,6 +59,10 @@ mod platform {
     use codex_uds::UnixStream;
     use std::io;
     use std::os::fd::AsRawFd;
+
+    pub(super) fn running_process_identity() -> io::Result<PeerExecutableIdentity> {
+        PeerExecutableIdentity::from_metadata(std::fs::metadata("/proc/self/exe")?)
+    }
 
     pub(super) fn peer_executable_identity(
         stream: &UnixStream,
@@ -107,6 +113,12 @@ mod platform {
         fn proc_pidpath(pid: libc::pid_t, buffer: *mut libc::c_void, buffersize: u32) -> i32;
     }
 
+    pub(super) fn running_process_identity() -> io::Result<PeerExecutableIdentity> {
+        let executable = std::env::current_exe()?;
+        let image = std::fs::File::open(executable)?;
+        PeerExecutableIdentity::from_metadata(image.metadata()?)
+    }
+
     pub(super) fn peer_executable_identity(
         stream: &UnixStream,
     ) -> io::Result<Option<PeerExecutableIdentity>> {
@@ -153,10 +165,30 @@ mod platform {
     use codex_uds::UnixStream;
     use std::io;
 
+    pub(super) fn running_process_identity() -> io::Result<PeerExecutableIdentity> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "running executable identity is unsupported on this platform",
+        ))
+    }
+
     pub(super) fn peer_executable_identity(
         _stream: &UnixStream,
     ) -> io::Result<Option<PeerExecutableIdentity>> {
         Ok(None)
+    }
+}
+
+#[cfg(not(unix))]
+mod platform {
+    use super::PeerExecutableIdentity;
+    use std::io;
+
+    pub(super) fn running_process_identity() -> io::Result<PeerExecutableIdentity> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "running executable identity is unsupported on this platform",
+        ))
     }
 }
 

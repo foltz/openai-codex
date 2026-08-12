@@ -226,6 +226,9 @@ pub(crate) async fn resolve_server_request_on_thread_listener(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::outgoing_message::OutgoingEnvelope;
+    use crate::outgoing_message::OutgoingMessage;
+    use codex_analytics::AnalyticsEventsClient;
     use codex_app_server_protocol::ApprovalsReviewer;
     use codex_app_server_protocol::AskForApproval;
     use codex_app_server_protocol::SandboxPolicy;
@@ -234,6 +237,8 @@ mod tests {
     use codex_protocol::config_types::Settings;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
+    use tokio::time::Duration;
+    use tokio::time::timeout;
 
     #[test]
     fn note_thread_settings_reports_only_effective_changes() {
@@ -451,6 +456,220 @@ mod tests {
         assert_eq!(snapshot.revision, 2);
     }
 
+    #[tokio::test]
+    async fn attachment_notifications_are_revisioned_and_ignore_duplicate_subscriptions() {
+        let manager = ThreadStateManager::new();
+        let thread_id = ThreadId::new();
+        let connection_id = ConnectionId(1);
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(8);
+        manager.set_attachment_notification_outgoing(Arc::new(OutgoingMessageSender::new(
+            outgoing_tx,
+            AnalyticsEventsClient::disabled(),
+        )));
+
+        manager
+            .connection_initialized(
+                connection_id,
+                ConnectionCapabilities {
+                    request_attestation: false,
+                    trusted_interactive: true,
+                },
+            )
+            .await;
+        let generation = manager.thread_attachment_list().await.generation;
+
+        manager
+            .try_ensure_connection_subscribed(
+                thread_id,
+                connection_id,
+                /* experimental_raw_events */ false,
+            )
+            .await
+            .expect("trusted connection should be live");
+        let attached = recv_attachment_changed_notification(&mut outgoing_rx).await;
+        assert_eq!(attached.generation, generation);
+        assert_eq!(attached.revision, 1);
+        assert_eq!(
+            attached.changes,
+            vec![ThreadAttachmentEntry {
+                thread_id: thread_id.to_string(),
+                interactive_attachment_count: 1,
+            }]
+        );
+
+        manager
+            .try_ensure_connection_subscribed(
+                thread_id,
+                connection_id,
+                /* experimental_raw_events */ false,
+            )
+            .await
+            .expect("duplicate subscription should remain live");
+        assert!(
+            timeout(Duration::from_millis(50), outgoing_rx.recv())
+                .await
+                .is_err()
+        );
+
+        assert!(
+            manager
+                .unsubscribe_connection_from_thread(thread_id, connection_id)
+                .await
+        );
+        let detached = recv_attachment_changed_notification(&mut outgoing_rx).await;
+        assert_eq!(detached.generation, generation);
+        assert_eq!(detached.revision, 2);
+        assert_eq!(
+            detached.changes,
+            vec![ThreadAttachmentEntry {
+                thread_id: thread_id.to_string(),
+                interactive_attachment_count: 0,
+            }]
+        );
+
+        manager
+            .try_ensure_connection_subscribed(
+                thread_id,
+                connection_id,
+                /* experimental_raw_events */ false,
+            )
+            .await
+            .expect("re-attached connection should be live");
+        let reattached = recv_attachment_changed_notification(&mut outgoing_rx).await;
+        assert_eq!(reattached.revision, 3);
+
+        manager.remove_connection(connection_id).await;
+        let closed = recv_attachment_changed_notification(&mut outgoing_rx).await;
+        assert_eq!(closed.generation, generation);
+        assert_eq!(closed.revision, 4);
+        assert_eq!(
+            closed.changes,
+            vec![ThreadAttachmentEntry {
+                thread_id: thread_id.to_string(),
+                interactive_attachment_count: 0,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn attachment_revision_overflow_rotates_generation_before_publishing() {
+        let manager = ThreadStateManager::new();
+        let thread_id = ThreadId::new();
+        let connection_id = ConnectionId(1);
+        manager
+            .connection_initialized(
+                connection_id,
+                ConnectionCapabilities {
+                    request_attestation: false,
+                    trusted_interactive: true,
+                },
+            )
+            .await;
+
+        let old_generation = {
+            let mut state = manager.state.lock().await;
+            state.attachment_revision = u64::MAX;
+            state.attachment_generation.clone()
+        };
+        manager
+            .try_ensure_connection_subscribed(
+                thread_id,
+                connection_id,
+                /* experimental_raw_events */ false,
+            )
+            .await
+            .expect("trusted connection should be live");
+
+        let snapshot = manager.thread_attachment_list().await;
+        assert_ne!(snapshot.generation, old_generation);
+        assert_eq!(snapshot.revision, 0);
+        assert_eq!(snapshot.entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn clear_moves_only_requester_with_one_attachment_change() {
+        let manager = ThreadStateManager::new();
+        let predecessor_thread_id = ThreadId::new();
+        let successor_thread_id = ThreadId::new();
+        let requester = ConnectionId(1);
+        let bystander = ConnectionId(2);
+        for connection_id in [requester, bystander] {
+            manager
+                .connection_initialized(
+                    connection_id,
+                    ConnectionCapabilities {
+                        request_attestation: false,
+                        trusted_interactive: true,
+                    },
+                )
+                .await;
+            manager
+                .try_ensure_connection_subscribed(
+                    predecessor_thread_id,
+                    connection_id,
+                    /* experimental_raw_events */ false,
+                )
+                .await
+                .expect("trusted connection should be live");
+        }
+        let before = manager.thread_attachment_list().await;
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(8);
+        manager.set_attachment_notification_outgoing(Arc::new(OutgoingMessageSender::new(
+            outgoing_tx,
+            AnalyticsEventsClient::disabled(),
+        )));
+
+        assert!(
+            manager
+                .move_connection_for_clear(predecessor_thread_id, successor_thread_id, requester)
+                .await
+        );
+
+        let changed = recv_attachment_changed_notification(&mut outgoing_rx).await;
+        assert_eq!(changed.generation, before.generation);
+        assert_eq!(changed.revision, before.revision + 1);
+        let mut expected_entries = vec![
+            ThreadAttachmentEntry {
+                thread_id: predecessor_thread_id.to_string(),
+                interactive_attachment_count: 1,
+            },
+            ThreadAttachmentEntry {
+                thread_id: successor_thread_id.to_string(),
+                interactive_attachment_count: 1,
+            },
+        ];
+        expected_entries.sort_unstable_by(|left, right| left.thread_id.cmp(&right.thread_id));
+        assert_eq!(changed.changes, expected_entries);
+        let snapshot = manager.thread_attachment_list().await;
+        assert_eq!(snapshot.revision, changed.revision);
+        assert_eq!(snapshot.entries, expected_entries);
+        assert!(
+            timeout(Duration::from_millis(50), outgoing_rx.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    async fn recv_attachment_changed_notification(
+        outgoing_rx: &mut mpsc::Receiver<OutgoingEnvelope>,
+    ) -> ThreadAttachmentChangedNotification {
+        let envelope = timeout(Duration::from_secs(1), outgoing_rx.recv())
+            .await
+            .expect("timed out waiting for attachment notification")
+            .expect("outgoing channel closed unexpectedly");
+        let OutgoingEnvelope::Broadcast { message } = envelope else {
+            panic!("expected broadcast attachment notification");
+        };
+        let OutgoingMessage::AppServerNotification(envelope) = message else {
+            panic!("expected app-server attachment notification");
+        };
+        let ServerNotification::ThreadAttachmentChanged(notification) = envelope.notification
+        else {
+            panic!("expected thread/attachment/changed notification");
+        };
+        notification
+    }
+
     fn thread_settings(model: &str) -> ThreadSettings {
         ThreadSettings {
             cwd: AbsolutePathBuf::from_absolute_path("/tmp").expect("absolute path"),
@@ -553,7 +772,16 @@ impl ThreadStateManagerInner {
             return None;
         }
         changes.sort_unstable_by(|left, right| left.thread_id.cmp(&right.thread_id));
-        self.attachment_revision = self.attachment_revision.saturating_add(1);
+        self.attachment_revision = match self.attachment_revision.checked_add(1) {
+            Some(revision) => revision,
+            None => {
+                // Never publish two distinct changes with one revision. A new
+                // generation makes every consumer resnapshot rather than
+                // accepting an ambiguous incremental history.
+                self.attachment_generation = Uuid::now_v7().to_string();
+                0
+            }
+        };
         Some(ThreadAttachmentChangedNotification {
             generation: self.attachment_generation.clone(),
             revision: self.attachment_revision,
@@ -902,6 +1130,73 @@ impl ThreadStateManager {
                 .flatten()
                 .into_iter()
                 .collect();
+            state.attachment_change(changes)
+        };
+        self.publish_attachment_change(change).await;
+        true
+    }
+
+    /// Moves one live connection from an authoritative clear predecessor to
+    /// its successor with one attachment revision. The caller has already
+    /// established the durable A/B/T transition and listener readiness.
+    pub(crate) async fn move_connection_for_clear(
+        &self,
+        predecessor_thread_id: ThreadId,
+        successor_thread_id: ThreadId,
+        connection_id: ConnectionId,
+    ) -> bool {
+        let change = {
+            let mut state = self.state.lock().await;
+            if !state.live_connections.contains_key(&connection_id)
+                || !state
+                    .thread_ids_by_connection
+                    .get(&connection_id)
+                    .is_some_and(|thread_ids| thread_ids.contains(&predecessor_thread_id))
+                || state
+                    .thread_ids_by_connection
+                    .get(&connection_id)
+                    .is_some_and(|thread_ids| thread_ids.contains(&successor_thread_id))
+                || !state.threads.contains_key(&predecessor_thread_id)
+            {
+                return false;
+            }
+
+            let trusted_interactive = state
+                .live_connections
+                .get(&connection_id)
+                .is_some_and(|capabilities| capabilities.trusted_interactive);
+            if trusted_interactive && !state.attachment_counts.contains_key(&predecessor_thread_id)
+            {
+                return false;
+            }
+
+            let Some(thread_ids) = state.thread_ids_by_connection.get_mut(&connection_id) else {
+                return false;
+            };
+            thread_ids.remove(&predecessor_thread_id);
+            thread_ids.insert(successor_thread_id);
+
+            if let Some(predecessor) = state.threads.get_mut(&predecessor_thread_id) {
+                predecessor.connection_ids.remove(&connection_id);
+                predecessor.update_has_connections();
+            } else {
+                return false;
+            }
+            let successor = state.threads.entry(successor_thread_id).or_default();
+            successor.connection_ids.insert(connection_id);
+            successor.update_has_connections();
+
+            let changes = if trusted_interactive {
+                let Some(predecessor_change) =
+                    state.remove_interactive_attachment(predecessor_thread_id)
+                else {
+                    return false;
+                };
+                let successor_change = state.add_interactive_attachment(successor_thread_id);
+                vec![successor_change, predecessor_change]
+            } else {
+                Vec::new()
+            };
             state.attachment_change(changes)
         };
         self.publish_attachment_change(change).await;

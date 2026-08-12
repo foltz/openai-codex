@@ -1014,7 +1014,7 @@ impl ThreadRequestProcessor {
         .await
     }
 
-    async fn ensure_listener_task_running(
+    pub(crate) async fn ensure_listener_task_running(
         &self,
         conversation_id: ThreadId,
         conversation: Arc<CodexThread>,

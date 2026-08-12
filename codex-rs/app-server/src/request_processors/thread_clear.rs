@@ -448,21 +448,19 @@ impl ThreadRequestProcessor {
         )
         .await?;
 
-        let attach = self
-            .ensure_conversation_listener(successor_thread_id, connection_id, false)
-            .await?;
-        if !matches!(
-            attach,
-            super::thread_lifecycle::EnsureConversationListenerResult::Attached
-        ) {
-            return Err(clear_error(
-                ThreadClearErrorCode::TransitionConflict,
-                "requester disconnected before successor attachment",
-            ));
-        }
-        self.thread_state_manager
-            .unsubscribe_connection_from_thread(predecessor_thread_id, connection_id)
+        // Start B's listener before the durable transition completes, but do
+        // not subscribe it yet: the state manager moves A -> B atomically
+        // after completion so no attachment notification can expose both.
+        let successor_thread_state = self
+            .thread_state_manager
+            .thread_state(successor_thread_id)
             .await;
+        self.ensure_listener_task_running(
+            successor_thread_id,
+            successor.thread.clone(),
+            successor_thread_state,
+        )
+        .await?;
         advance_phase(
             state_db.as_ref(),
             transition_id,
@@ -470,6 +468,20 @@ impl ThreadRequestProcessor {
             ClearTransitionPhase::Completed,
         )
         .await?;
+        if !self
+            .thread_state_manager
+            .move_connection_for_clear(predecessor_thread_id, successor_thread_id, connection_id)
+            .await
+        {
+            // Completion is durable already. A connection close may win the
+            // race after commit; it must not turn a completed transition into
+            // a contradictory client error or manufacture an attachment for a
+            // client that is no longer present.
+            warn!(
+                transition_id = %transition_id,
+                "clear requester disconnected after durable completion; no attachment move was published"
+            );
+        }
 
         self.outgoing
             .send_server_notification(ServerNotification::ThreadStarted(

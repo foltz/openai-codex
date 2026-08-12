@@ -338,6 +338,17 @@ impl ThreadRequestProcessor {
             }
         };
 
+        if !self
+            .thread_state_manager
+            .reserve_clear_successor_attachment(predecessor_thread_id, successor_thread_id)
+            .await
+        {
+            return Err(clear_error(
+                ThreadClearErrorCode::TransitionConflict,
+                "successor attachment is already reserved by another clear transition",
+            ));
+        }
+
         advance_phase(
             state_db.as_ref(),
             transition_id,

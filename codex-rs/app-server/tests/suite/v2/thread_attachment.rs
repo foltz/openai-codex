@@ -26,6 +26,9 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::time::timeout;
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use tokio::time::sleep;
+
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[tokio::test]
@@ -130,5 +133,70 @@ async fn embedded_interactive_client_populates_public_attachment_snapshot() -> R
     assert_eq!(snapshot.entries[0].interactive_attachment_count, 1);
 
     client.shutdown().await?;
+    Ok(())
+}
+
+/// Exercises the production Unix acceptor, session provenance, interactive
+/// role request, exact subscription, and public aggregate in one process
+/// boundary. The helper is the server binary itself; a copied binary proves a
+/// role request alone remains unentitled.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[tokio::test]
+async fn unix_peer_entitlement_reaches_public_attachment_aggregate() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::process::Command;
+
+    let temp_dir = TempDir::new()?;
+    let socket_path = temp_dir.path().join("app-server.sock");
+    let codex_home = temp_dir.path().join("codex-home");
+    std::fs::create_dir_all(&codex_home)?;
+    let binary = codex_utils_cargo_bin::cargo_bin("codex-app-server")?;
+    let mut server = Command::new(&binary)
+        .args([
+            "--listen",
+            &format!("unix://{}", socket_path.display()),
+            "--disable-plugin-startup-tasks-for-tests",
+        ])
+        .env("CODEX_HOME", &codex_home)
+        .kill_on_drop(true)
+        .spawn()?;
+    for _ in 0..100 {
+        if socket_path.exists() {
+            break;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    anyhow::ensure!(
+        socket_path.exists(),
+        "Unix app-server listener did not start"
+    );
+
+    let entitled = Command::new(&binary)
+        .args([
+            "--interactive-attachment-peer-helper",
+            socket_path.to_str().expect("socket path utf8"),
+        ])
+        .env("CODEX_HOME", &codex_home)
+        .status()
+        .await?;
+    assert!(entitled.success(), "same-image helper should be entitled");
+
+    let copied_binary = temp_dir.path().join("unentitled-codex-app-server");
+    std::fs::copy(&binary, &copied_binary)?;
+    std::fs::set_permissions(&copied_binary, std::fs::Permissions::from_mode(0o700))?;
+    let unentitled = Command::new(copied_binary)
+        .args([
+            "--interactive-attachment-peer-helper",
+            socket_path.to_str().expect("socket path utf8"),
+            "--interactive-attachment-peer-helper-expect-unproven",
+        ])
+        .env("CODEX_HOME", &codex_home)
+        .status()
+        .await?;
+    assert!(
+        unentitled.success(),
+        "different-image helper must remain absent from the aggregate"
+    );
+    server.kill().await?;
     Ok(())
 }

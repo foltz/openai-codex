@@ -650,6 +650,74 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn disclosed_clear_successor_cannot_be_resumed_before_atomic_move() {
+        let manager = ThreadStateManager::new();
+        let predecessor_thread_id = ThreadId::new();
+        let successor_thread_id = ThreadId::new();
+        let requester = ConnectionId(1);
+        manager
+            .connection_initialized(
+                requester,
+                ConnectionCapabilities {
+                    request_attestation: false,
+                    trusted_interactive: true,
+                },
+            )
+            .await;
+        manager
+            .try_ensure_connection_subscribed(predecessor_thread_id, requester, false)
+            .await
+            .expect("requester should be attached to predecessor");
+        assert_eq!(
+            manager
+                .reserve_clear_transition_authority(predecessor_thread_id, requester)
+                .await,
+            Ok(())
+        );
+        assert!(
+            manager
+                .reserve_clear_successor_attachment(predecessor_thread_id, successor_thread_id)
+                .await
+        );
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(4);
+        manager.set_attachment_notification_outgoing(Arc::new(OutgoingMessageSender::new(
+            outgoing_tx,
+            AnalyticsEventsClient::disabled(),
+        )));
+
+        assert!(matches!(
+            manager
+                .try_ensure_connection_subscribed_for_listener(
+                    successor_thread_id,
+                    requester,
+                    false,
+                )
+                .await,
+            Err(ConnectionSubscriptionError::ClearSuccessorReserved)
+        ));
+        assert!(
+            timeout(Duration::from_millis(50), outgoing_rx.recv())
+                .await
+                .is_err(),
+            "the rejected resume must not publish B before the clear move"
+        );
+        assert!(
+            manager
+                .move_connection_for_clear(predecessor_thread_id, successor_thread_id, requester)
+                .await
+        );
+        let changed = recv_attachment_changed_notification(&mut outgoing_rx).await;
+        assert_eq!(changed.changes.len(), 2);
+        assert!(manager.has_subscribers(successor_thread_id).await);
+        assert!(!manager.has_subscribers(predecessor_thread_id).await);
+        assert!(
+            manager
+                .release_clear_transition_authority(predecessor_thread_id)
+                .await
+        );
+    }
+
     async fn recv_attachment_changed_notification(
         outgoing_rx: &mut mpsc::Receiver<OutgoingEnvelope>,
     ) -> ThreadAttachmentChangedNotification {
@@ -730,9 +798,19 @@ struct ThreadStateManagerInner {
     threads: HashMap<ThreadId, ThreadEntry>,
     thread_ids_by_connection: HashMap<ConnectionId, HashSet<ThreadId>>,
     clear_transition_reservations: HashSet<ThreadId>,
+    // B is disclosed to the requester before the durable A -> B attachment
+    // move completes. Keep it unavailable to ordinary subscribe/resume until
+    // that single atomic move consumes the predecessor attachment.
+    clear_successor_reservations: HashMap<ThreadId, ThreadId>,
     attachment_generation: String,
     attachment_revision: u64,
     attachment_counts: HashMap<ThreadId, u32>,
+}
+
+#[derive(Debug)]
+pub(crate) enum ConnectionSubscriptionError {
+    ConnectionClosed,
+    ClearSuccessorReserved,
 }
 
 impl ThreadStateManagerInner {
@@ -942,11 +1020,36 @@ impl ThreadStateManager {
         &self,
         predecessor_thread_id: ThreadId,
     ) -> bool {
-        self.state
-            .lock()
-            .await
+        let mut state = self.state.lock().await;
+        state
+            .clear_successor_reservations
+            .retain(|_, predecessor| *predecessor != predecessor_thread_id);
+        state
             .clear_transition_reservations
             .remove(&predecessor_thread_id)
+    }
+
+    /// Prevents an ordinary resume from attaching the disclosed clear
+    /// successor before the authoritative A -> B move consumes A.
+    pub(crate) async fn reserve_clear_successor_attachment(
+        &self,
+        predecessor_thread_id: ThreadId,
+        successor_thread_id: ThreadId,
+    ) -> bool {
+        let mut state = self.state.lock().await;
+        if !state
+            .clear_transition_reservations
+            .contains(&predecessor_thread_id)
+            || state
+                .clear_successor_reservations
+                .contains_key(&successor_thread_id)
+        {
+            return false;
+        }
+        state
+            .clear_successor_reservations
+            .insert(successor_thread_id, predecessor_thread_id);
+        true
     }
 
     pub(crate) async fn first_attestation_capable_connection_for_thread(
@@ -1213,16 +1316,49 @@ impl ThreadStateManager {
             .is_some_and(|thread_entry| !thread_entry.connection_ids.is_empty())
     }
 
+    #[allow(dead_code)] // Used by in-crate state tests; live requests use the guarded variant.
     pub(crate) async fn try_ensure_connection_subscribed(
         &self,
         thread_id: ThreadId,
         connection_id: ConnectionId,
         experimental_raw_events: bool,
     ) -> Option<Arc<Mutex<ThreadState>>> {
+        self.try_ensure_connection_subscribed_inner(
+            thread_id,
+            connection_id,
+            experimental_raw_events,
+        )
+        .await
+        .ok()
+    }
+
+    pub(crate) async fn try_ensure_connection_subscribed_for_listener(
+        &self,
+        thread_id: ThreadId,
+        connection_id: ConnectionId,
+        experimental_raw_events: bool,
+    ) -> Result<Arc<Mutex<ThreadState>>, ConnectionSubscriptionError> {
+        self.try_ensure_connection_subscribed_inner(
+            thread_id,
+            connection_id,
+            experimental_raw_events,
+        )
+        .await
+    }
+
+    async fn try_ensure_connection_subscribed_inner(
+        &self,
+        thread_id: ThreadId,
+        connection_id: ConnectionId,
+        experimental_raw_events: bool,
+    ) -> Result<Arc<Mutex<ThreadState>>, ConnectionSubscriptionError> {
         let (thread_state, attachment_change) = {
             let mut state = self.state.lock().await;
             if !state.live_connections.contains_key(&connection_id) {
-                return None;
+                return Err(ConnectionSubscriptionError::ConnectionClosed);
+            }
+            if state.clear_successor_reservations.contains_key(&thread_id) {
+                return Err(ConnectionSubscriptionError::ClearSuccessorReserved);
             }
             let was_added = state
                 .thread_ids_by_connection
@@ -1252,7 +1388,7 @@ impl ThreadStateManager {
                 thread_state_guard.set_experimental_raw_events(/*enabled*/ true);
             }
         }
-        Some(thread_state)
+        Ok(thread_state)
     }
 
     pub(crate) async fn try_add_connection_to_thread(

@@ -88,11 +88,11 @@ mod platform {
             return Err(io::Error::last_os_error());
         }
 
-        PeerExecutableIdentity::from_metadata(std::fs::metadata(format!(
-            "/proc/{}/exe",
-            credentials.pid
-        ))?)
-        .map(Some)
+        // Open the procfs executable before inspecting it. The file handle
+        // pins the object we compare, instead of resolving a pathname and
+        // subsequently statting whatever has appeared there.
+        let executable = std::fs::File::open(format!("/proc/{}/exe", credentials.pid))?;
+        PeerExecutableIdentity::from_metadata(executable.metadata()?).map(Some)
     }
 }
 
@@ -100,18 +100,7 @@ mod platform {
 mod platform {
     use super::PeerExecutableIdentity;
     use codex_uds::UnixStream;
-    use std::ffi::CStr;
     use std::io;
-    use std::os::fd::AsRawFd;
-    use std::os::unix::ffi::OsStrExt;
-    use std::path::Path;
-
-    const PROC_PIDPATHINFO_MAXSIZE: usize = 4096;
-
-    #[link(name = "proc")]
-    unsafe extern "C" {
-        fn proc_pidpath(pid: libc::pid_t, buffer: *mut libc::c_void, buffersize: u32) -> i32;
-    }
 
     pub(super) fn running_process_identity() -> io::Result<PeerExecutableIdentity> {
         let executable = std::env::current_exe()?;
@@ -120,39 +109,14 @@ mod platform {
     }
 
     pub(super) fn peer_executable_identity(
-        stream: &UnixStream,
+        _stream: &UnixStream,
     ) -> io::Result<Option<PeerExecutableIdentity>> {
-        let mut peer_pid: libc::pid_t = 0;
-        let mut peer_pid_len: libc::socklen_t = std::mem::size_of::<libc::pid_t>()
-            .try_into()
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid peer pid length"))?;
-        let result = unsafe {
-            libc::getsockopt(
-                stream.as_raw_fd(),
-                libc::SOL_LOCAL,
-                libc::LOCAL_PEERPID,
-                &mut peer_pid as *mut _ as *mut libc::c_void,
-                &mut peer_pid_len,
-            )
-        };
-        if result != 0 || peer_pid <= 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        let mut path = vec![0_i8; PROC_PIDPATHINFO_MAXSIZE];
-        let buffer_size = u32::try_from(path.len()).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "process path buffer exceeds proc_pidpath limit",
-            )
-        })?;
-        let path_len = unsafe { proc_pidpath(peer_pid, path.as_mut_ptr().cast(), buffer_size) };
-        if path_len <= 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let path = unsafe { CStr::from_ptr(path.as_ptr()) };
-        let path = Path::new(std::ffi::OsStr::from_bytes(path.to_bytes()));
-        PeerExecutableIdentity::from_metadata(std::fs::metadata(path)?).map(Some)
+        // Darwin exposes a peer PID but no kernel-bound handle for its mapped
+        // executable. `proc_pidpath` plus `stat` can be substituted between
+        // lookup and use, so it is not entitlement evidence. Keep Darwin
+        // daemon peers unproven until the transport gains a capability whose
+        // possession is bound to the connecting process.
+        Ok(None)
     }
 }
 

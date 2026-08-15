@@ -4,8 +4,8 @@
 //! behavior easier to review without paging through the rest of `chatwidget.rs`.
 
 use super::*;
-use crate::bottom_pane::parse_status_line_entries;
 use crate::bottom_pane::StatusLineConfigEntry;
+use crate::bottom_pane::parse_status_line_entries;
 use crate::bottom_pane::status_line_from_segments;
 use crate::branch_summary;
 use crate::chatwidget::limit_label_for_window;

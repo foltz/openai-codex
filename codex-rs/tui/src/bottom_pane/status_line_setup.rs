@@ -886,6 +886,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn setup_can_disable_one_duplicate_template_and_reorder_the_other() {
+        let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
+        let configured = [
+            "model".to_string(),
+            "template:(k:{lane})".to_string(),
+            "template:(k:{lane})".to_string(),
+            "project-name".to_string(),
+        ];
+        let mut view = StatusLineSetupView::new_with_templates(
+            Some(&configured),
+            &[],
+            &HashMap::from([("lane".to_string(), "dev".to_string())]),
+            /*use_theme_colors*/ true,
+            StatusSurfacePreviewData::default(),
+            AppEventSender::new(tx_raw),
+            crate::keymap::RuntimeKeymap::defaults().list,
+        );
+
+        // The initial cursor is on the non-orderable theme-colors row. Disable
+        // the first duplicate template, then move the remaining duplicate
+        // after project-name before confirming.
+        for _ in 0..2 {
+            view.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        view.handle_key_event(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        view.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        view.handle_key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        view.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let AppEvent::StatusLineSetup { items, .. } = rx.try_recv().expect("setup event") else {
+            panic!("unexpected setup event");
+        };
+        assert_eq!(
+            items
+                .iter()
+                .map(StatusLineConfigEntry::raw_config)
+                .collect::<Vec<_>>(),
+            vec![
+                "model".to_string(),
+                "project-name".to_string(),
+                "template:(k:{lane})".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn setup_preview_marks_unavailable_templates_without_values() {
+        let (entries, invalid) =
+            parse_status_line_entries(["template:{present}:{missing}".to_string()]);
+        assert!(invalid.is_empty());
+        let preview = StatusSurfacePreviewData::default().status_line_for_config_entries(
+            entries.iter(),
+            &HashMap::from([("present".to_string(), "secret-shaped-value".to_string())]),
+            /*use_theme_colors*/ true,
+        );
+        let rendered = line_text(preview).expect("unavailable marker");
+        assert_eq!(rendered, "(unavailable)");
+        assert!(!rendered.contains("secret-shaped-value"));
+    }
+
     fn render_lines(view: &StatusLineSetupView, width: u16) -> String {
         let height = view.desired_height(width);
         let area = Rect::new(0, 0, width, height);

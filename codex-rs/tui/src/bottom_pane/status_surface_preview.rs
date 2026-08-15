@@ -6,7 +6,9 @@ use ratatui::text::Line;
 use super::status_line_from_segments;
 #[cfg(test)]
 use super::status_line_setup::StatusLineItem;
+use super::status_line_template::RenderedStatusLineSegment;
 use super::status_line_template::StatusLineConfigEntry;
+use super::status_line_template::StatusLineDisplayClass;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) enum StatusSurfacePreviewItem {
@@ -261,12 +263,15 @@ impl StatusSurfacePreviewData {
         I: IntoIterator<Item = &'a StatusLineConfigEntry>,
     {
         let segments = entries.into_iter().filter_map(|entry| {
-            entry
-                .render(variables, |item| {
-                    self.value_for(item.preview_item()).map(ToString::to_string)
-                })
-                .ok()
-                .flatten()
+            match entry.render(variables, |item| {
+                self.value_for(item.preview_item()).map(ToString::to_string)
+            }) {
+                Ok(segment) => segment,
+                Err(_) => Some(RenderedStatusLineSegment {
+                    text: "(unavailable)".to_string(),
+                    display_class: StatusLineDisplayClass::Template,
+                }),
+            }
         });
         status_line_from_segments(segments, use_theme_colors)
     }

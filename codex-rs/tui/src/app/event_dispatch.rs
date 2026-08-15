@@ -2354,7 +2354,10 @@ impl App {
                 items,
                 use_theme_colors,
             } => {
-                let ids = items.iter().map(ToString::to_string).collect::<Vec<_>>();
+                let ids = items
+                    .iter()
+                    .map(crate::bottom_pane::StatusLineConfigEntry::raw_config)
+                    .collect::<Vec<_>>();
                 let items_edit = crate::legacy_core::config::edit::status_line_items_edit(&ids);
                 let colors_edit =
                     crate::legacy_core::config::edit::status_line_use_colors_edit(use_theme_colors);

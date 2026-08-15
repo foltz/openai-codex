@@ -45,7 +45,7 @@ use uuid::Uuid;
 use crate::app_command::AppCommand;
 use crate::app_server_session::AppServerStartedThread;
 use crate::bottom_pane::ApprovalRequest;
-use crate::bottom_pane::StatusLineItem;
+use crate::bottom_pane::StatusLineConfigEntry;
 use crate::bottom_pane::TerminalTitleItem;
 use crate::chatwidget::UserMessage;
 use crate::goal_files::GoalDraft;
@@ -1111,7 +1111,7 @@ pub(crate) enum AppEvent {
     },
     /// Apply a user-confirmed status-line item ordering/selection.
     StatusLineSetup {
-        items: Vec<StatusLineItem>,
+        items: Vec<StatusLineConfigEntry>,
         use_theme_colors: bool,
     },
     /// Dismiss the status-line setup UI without changing config.

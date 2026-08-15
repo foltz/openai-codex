@@ -780,6 +780,12 @@ pub struct Config {
     /// When unset, the TUI defaults to: `model-with-reasoning` and `current-dir`.
     pub tui_status_line: Option<Vec<String>>,
 
+    /// Ordered entries prepended to the effective TUI status line.
+    pub tui_status_line_prefix: Vec<String>,
+
+    /// Values available to `template:` TUI status-line entries.
+    pub tui_status_line_variables: HashMap<String, String>,
+
     /// Whether to color status line items with colors from the active syntax theme.
     pub tui_status_line_use_colors: bool,
 
@@ -4328,6 +4334,16 @@ impl Config {
                 .map(|t| t.alternate_screen)
                 .unwrap_or_default(),
             tui_status_line: cfg.tui.as_ref().and_then(|t| t.status_line.clone()),
+            tui_status_line_prefix: cfg
+                .tui
+                .as_ref()
+                .map(|t| t.status_line_prefix.clone())
+                .unwrap_or_default(),
+            tui_status_line_variables: cfg
+                .tui
+                .as_ref()
+                .map(|t| t.status_line_variables.clone())
+                .unwrap_or_default(),
             tui_status_line_use_colors: cfg
                 .tui
                 .as_ref()

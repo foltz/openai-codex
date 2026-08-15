@@ -7,6 +7,8 @@ use ratatui::text::Line;
 use ratatui::text::Span;
 
 use super::status_line_setup::StatusLineItem;
+use super::status_line_template::RenderedStatusLineSegment;
+use super::status_line_template::StatusLineDisplayClass;
 use crate::render::highlight::foreground_style_for_scopes;
 
 const STATUS_LINE_SEPARATOR: &str = " · ";
@@ -25,6 +27,7 @@ enum StatusLineAccent {
     Mode,
     Thread,
     Progress,
+    Template,
 }
 
 impl StatusLineAccent {
@@ -54,6 +57,13 @@ impl StatusLineAccent {
         }
     }
 
+    fn for_display_class(display_class: StatusLineDisplayClass) -> Self {
+        match display_class {
+            StatusLineDisplayClass::BuiltIn(item) => Self::for_item(item),
+            StatusLineDisplayClass::Template => Self::Template,
+        }
+    }
+
     fn scopes(self) -> &'static [&'static str] {
         match self {
             Self::Model => &["entity.name.type", "support.type", "variable"],
@@ -66,6 +76,7 @@ impl StatusLineAccent {
             Self::Mode => &["storage.modifier", "keyword.operator"],
             Self::Thread => &["markup.heading", "entity.name.section"],
             Self::Progress => &["markup.inserted", "constant.numeric"],
+            Self::Template => &["comment", "constant.other"],
         }
     }
 
@@ -74,6 +85,7 @@ impl StatusLineAccent {
             Self::Model | Self::State | Self::Metadata | Self::Mode => Style::default().cyan(),
             Self::Path | Self::Usage | Self::Progress => Style::default().green(),
             Self::Branch | Self::Limit | Self::Thread => Style::default().magenta(),
+            Self::Template => Style::default().cyan(),
         }
     }
 }
@@ -83,7 +95,8 @@ pub(crate) fn status_line_from_segments<I>(
     use_theme_colors: bool,
 ) -> Option<Line<'static>>
 where
-    I: IntoIterator<Item = (StatusLineItem, String)>,
+    I: IntoIterator,
+    I::Item: Into<RenderedStatusLineSegment>,
 {
     status_line_from_segments_with_resolver(segments, use_theme_colors, |accent| {
         foreground_style_for_scopes(accent.scopes())
@@ -96,28 +109,32 @@ fn status_line_from_segments_with_resolver<I, F>(
     theme_style_for_accent: F,
 ) -> Option<Line<'static>>
 where
-    I: IntoIterator<Item = (StatusLineItem, String)>,
+    I: IntoIterator,
+    I::Item: Into<RenderedStatusLineSegment>,
     F: Fn(StatusLineAccent) -> Option<Style>,
 {
     let mut spans = Vec::new();
-    for (item, text) in segments {
+    for segment in segments {
+        let segment = segment.into();
         if !spans.is_empty() {
             spans.push(STATUS_LINE_SEPARATOR.dim());
         }
         let style = if use_theme_colors {
-            let accent = StatusLineAccent::for_item(item);
+            let accent = StatusLineAccent::for_display_class(segment.display_class);
             soften_status_line_style(
                 theme_style_for_accent(accent).unwrap_or_else(|| accent.fallback_style()),
             )
         } else {
             Style::default().dim()
         };
-        let style = if item == StatusLineItem::PullRequestNumber {
+        let style = if segment.display_class
+            == StatusLineDisplayClass::BuiltIn(StatusLineItem::PullRequestNumber)
+        {
             style.underlined()
         } else {
             style
         };
-        spans.push(Span::styled(text, style));
+        spans.push(Span::styled(segment.text, style));
     }
 
     (!spans.is_empty()).then(|| Line::from(spans))
@@ -231,6 +248,35 @@ mod tests {
         assert!(line.spans[1].style.add_modifier.contains(Modifier::DIM));
         assert_eq!(line.spans[2].style.fg, Some(Color::Green));
         assert!(!line.spans[2].style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn template_segments_use_metadata_accent_and_preserve_mixed_order() {
+        let line = status_line_from_segments_with_resolver(
+            [
+                RenderedStatusLineSegment {
+                    text: "gpt-5".to_string(),
+                    display_class: StatusLineDisplayClass::BuiltIn(StatusLineItem::ModelName),
+                },
+                RenderedStatusLineSegment {
+                    text: "(k:dev)".to_string(),
+                    display_class: StatusLineDisplayClass::Template,
+                },
+                RenderedStatusLineSegment {
+                    text: "/repo".to_string(),
+                    display_class: StatusLineDisplayClass::BuiltIn(StatusLineItem::CurrentDir),
+                },
+            ],
+            /*use_theme_colors*/ true,
+            |accent| match accent {
+                StatusLineAccent::Template => Some(Style::default().yellow()),
+                _ => None,
+            },
+        )
+        .expect("status line");
+
+        assert_eq!(line_text(&line), "gpt-5 · (k:dev) · /repo");
+        assert_eq!(line.spans[2].style.fg, Some(Color::Yellow));
     }
 
     #[test]

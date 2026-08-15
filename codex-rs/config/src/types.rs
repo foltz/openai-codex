@@ -818,6 +818,17 @@ pub struct Tui {
     #[serde(default)]
     pub status_line: Option<Vec<String>>,
 
+    /// Ordered entries prepended to the effective status line.
+    ///
+    /// This is kept separate from `status_line` so managed launchers can add
+    /// context without replacing the operator's configured selection.
+    #[serde(default)]
+    pub status_line_prefix: Vec<String>,
+
+    /// Values available to `template:` status-line entries.
+    #[serde(default)]
+    pub status_line_variables: HashMap<String, String>,
+
     /// Color status line items with colors derived from the active syntax theme.
     /// Defaults to `true`.
     #[serde(default = "default_true")]

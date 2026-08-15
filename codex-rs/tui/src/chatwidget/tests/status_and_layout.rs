@@ -6,6 +6,7 @@ use codex_app_server_protocol::SpendControlLimitSnapshot;
 use pretty_assertions::assert_eq;
 use ratatui::backend::TestBackend;
 use serial_test::serial;
+use std::collections::HashMap;
 
 fn enable_test_ambient_pet(chat: &mut ChatWidget) {
     chat.set_pet_image_support_for_tests(crate::pets::PetImageSupport::Supported(
@@ -2789,9 +2790,11 @@ async fn status_line_template_omission_keeps_sibling_segments() {
     chat.thread_id = Some(ThreadId::new());
     chat.config.tui_status_line = Some(vec![
         "model-name".to_string(),
-        "template:(secret:{missing})".to_string(),
+        "template:(secret:{present}:{missing})".to_string(),
         "current-dir".to_string(),
     ]);
+    chat.config.tui_status_line_variables =
+        HashMap::from([("present".to_string(), "secret-shaped-value".to_string())]);
 
     chat.refresh_status_line();
     let line = status_line_text(&chat).expect("built-in siblings remain");

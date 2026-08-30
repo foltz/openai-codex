@@ -127,11 +127,12 @@ pub(crate) struct McpServerConnectionIdentity {
     /// Whether this server opted into thread-identity binding (default
     /// `false`). Mirrors `McpServerConfig::thread_identity_eligible`.
     pub(crate) thread_identity_eligible: bool,
-    /// Canonical Codex `ThreadId` for the owning session. Part of the
-    /// connection identity so a thread change (fork, delegate, reconstructed
-    /// resume) forces a fresh connection rather than reusing a stale bind;
-    /// see `kcf-runtime/04-mcp-thread-identity-contract.md`.
-    pub(crate) canonical_thread_id: String,
+    /// Canonical Codex `ThreadId` for the owning session, or `None` for a
+    /// threadless caller. Part of the connection identity so a thread
+    /// change (fork, delegate, reconstructed resume) forces a fresh
+    /// connection rather than reusing a stale bind; see
+    /// `kcf-runtime/04-mcp-thread-identity-contract.md`.
+    pub(crate) canonical_thread_id: Option<String>,
 }
 
 impl McpServerConnectionIdentity {
@@ -150,7 +151,7 @@ impl McpServerConnectionIdentity {
         codex_apps_cache_identity: Option<(PathBuf, ConnectorRuntimeContextKey)>,
         client_elicitation_capability: ElicitationCapability,
         client_mcp_extensions: ClientMcpExtensions,
-        canonical_thread_id: String,
+        canonical_thread_id: Option<String>,
         previous_identity: Option<&Self>,
     ) -> Self {
         let config = server.config();

@@ -313,7 +313,7 @@ struct ManagedClientStartup {
     cancel_token: CancellationToken,
     startup_complete: Arc<AtomicBool>,
     server_capabilities: Arc<StdMutex<Option<serde_json::Value>>>,
-    canonical_thread_id: String,
+    canonical_thread_id: Option<String>,
 }
 
 impl ManagedClientStartup {
@@ -381,9 +381,12 @@ impl ManagedClientStartup {
                 {
                     Ok(result) => {
                         let client = result?.with_read_only_tools(server.requires_read_only_mcp_tools());
-                        let client = if thread_identity_eligible {
+                        let client = if thread_identity_eligible
+                            && let Some(thread_id) = canonical_thread_id.clone()
+                        {
                             client.with_post_reconnect_hook(thread_identity_reconnect_hook(
-                                canonical_thread_id.clone(),
+                                thread_id,
+                                Some(startup_timeout),
                             ))
                         } else {
                             client
@@ -486,7 +489,7 @@ impl AsyncManagedClient {
         auth_changes: Option<watch::Receiver<AuthChangeState>>,
         protocol_mode: McpProtocolMode,
         catalog_item_limit: usize,
-        canonical_thread_id: String,
+        canonical_thread_id: Option<String>,
     ) -> Self {
         let is_codex_apps_mcp_server = server_name == CODEX_APPS_MCP_SERVER_NAME;
         let reconnect_server_name = server_name.clone();
@@ -991,14 +994,8 @@ async fn start_server_task(
     .await
     .map_err(StartupOutcomeError::from)?;
 
-    if thread_identity_eligible {
-        bind_thread_identity(
-            &client,
-            &initialize_result,
-            &canonical_thread_id,
-            startup_timeout,
-        )
-        .await?;
+    if thread_identity_eligible && let Some(thread_id) = canonical_thread_id.as_deref() {
+        bind_thread_identity(&client, &initialize_result, thread_id, startup_timeout).await?;
     }
 
     let server_disables_tool_catalog_cache = initialize_result
@@ -1212,7 +1209,15 @@ async fn bind_thread_identity(
 /// connection via `ReconnectContext` rather than through
 /// `RmcpClient`'s own (not-yet-`Ready`) state — see `ReconnectContext`'s
 /// doc comment in `rmcp-client` for why.
-fn thread_identity_reconnect_hook(canonical_thread_id: String) -> PostReconnectHook {
+///
+/// `timeout` is the same bounded startup timeout the initial bind uses
+/// (the server's configured `startup_timeout_sec`, or the default) — a
+/// recovering provider that never acknowledges must fail the recovery
+/// closed within a bounded window, not hold it open indefinitely.
+fn thread_identity_reconnect_hook(
+    canonical_thread_id: String,
+    timeout: Option<Duration>,
+) -> PostReconnectHook {
     Box::new(move |context, peer_info| {
         let canonical_thread_id = canonical_thread_id.clone();
         async move {
@@ -1223,7 +1228,7 @@ fn thread_identity_reconnect_hook(canonical_thread_id: String) -> PostReconnectH
                 .send_custom_request(
                     MCP_THREAD_IDENTITY_CAPABILITY,
                     Some(thread_identity_bind_params(&canonical_thread_id)),
-                    /*timeout*/ None,
+                    timeout,
                 )
                 .await?;
             if thread_identity_ack_accepted(&response) {
@@ -1329,7 +1334,7 @@ struct StartServerTaskParams {
     auth_changes: Option<watch::Receiver<AuthChangeState>>,
     catalog_item_limit: usize,
     thread_identity_eligible: bool,
-    canonical_thread_id: String,
+    canonical_thread_id: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1814,7 +1819,7 @@ mod tests {
                 client_mcp_extensions: ClientMcpExtensions::default(),
                 catalog_item_limit: 100,
                 thread_identity_eligible: true,
-                canonical_thread_id: "thread-abc-123".to_string(),
+                canonical_thread_id: Some("thread-abc-123".to_string()),
             },
         )
         .await;
@@ -1923,7 +1928,7 @@ mod tests {
                 client_mcp_extensions,
                 catalog_item_limit: 100,
                 thread_identity_eligible: true,
-                canonical_thread_id: THREAD_ID_MARKER.to_string(),
+                canonical_thread_id: Some(THREAD_ID_MARKER.to_string()),
             },
         )
         .await;
@@ -1973,6 +1978,116 @@ mod tests {
         assert_eq!(
             bind_requests_with_marker, 1,
             "the thread ID marker must appear in exactly the one bind request"
+        );
+
+        client.shutdown().await;
+    }
+
+    /// R02 remediation proof: a threadless production path (connector
+    /// discovery, apps-install probing, and similar session-independent
+    /// callers all pass `canonical_thread_id: None`) must never bind an
+    /// empty or synthetic ID even when the server is configured
+    /// `thread_identity_eligible: true`. Absence is modeled with `Option`
+    /// specifically so this case cannot be reached with an empty-string
+    /// sentinel; this test proves the real production entry point
+    /// (`start_server_task`) honors that absence end to end: no bind
+    /// request is ever sent, and startup still succeeds normally, exactly
+    /// as it would for an ordinary (ineligible) server.
+    #[tokio::test]
+    async fn threadless_caller_never_binds_even_when_server_is_eligible() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(move |request: &Request| {
+                let body: serde_json::Value = request.body_json().expect("valid JSON-RPC request");
+                match body["method"].as_str() {
+                    Some("initialize") => thread_identity_test_initialize_response(
+                        &body,
+                        Some(&serde_json::json!([1])),
+                    ),
+                    Some("notifications/initialized") => ResponseTemplate::new(202),
+                    Some("tools/list") => {
+                        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": body["id"],
+                            "result": {"tools": []},
+                        }))
+                    }
+                    other => panic!(
+                        "unexpected threadless-path test method (bind request must never be \
+                         sent): {other:?}"
+                    ),
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let client = RmcpClient::new_streamable_http_client_with_protocol_mode(
+            "threadless-path-test",
+            &format!("{}/mcp", server.uri()),
+            /*bearer_token*/ None,
+            /*http_headers*/ None,
+            /*env_http_headers*/ None,
+            OAuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::default(),
+            codex_exec_server::Environment::default_for_tests().get_http_client(),
+            /*auth_provider*/ None,
+            McpProtocolMode::Legacy,
+        )
+        .await
+        .expect("client should construct");
+        let client = Arc::new(client);
+
+        let result = start_server_task(
+            "threadless-path-test".to_string(),
+            Arc::clone(&client),
+            StartServerTaskParams {
+                is_codex_apps_mcp_server: false,
+                startup_timeout: Some(Duration::from_secs(5)),
+                tx_event: None,
+                elicitation_requests: ElicitationRequestManager::new(
+                    AskForApproval::default(),
+                    PermissionProfile::read_only(),
+                    /*reviewer*/ None,
+                    /*lifecycle*/ None,
+                    ElicitationRequestRouter::default(),
+                ),
+                codex_apps_tools_cache_context: None,
+                tool_catalog_cache_context: None,
+                tool_catalog_fetch_ticket: None,
+                client_elicitation_capability: ElicitationCapability::default(),
+                client_mcp_extensions: ClientMcpExtensions::default(),
+                catalog_item_limit: 100,
+                // The server is eligible, but this caller is threadless.
+                thread_identity_eligible: true,
+                canonical_thread_id: None,
+            },
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "a threadless caller must start normally, exactly like an ordinary server: {:?}",
+            result.as_ref().err().map(ToString::to_string)
+        );
+
+        let received = server
+            .received_requests()
+            .await
+            .expect("mock server should record requests");
+        assert!(
+            received
+                .iter()
+                .all(
+                    |request| serde_json::from_slice::<serde_json::Value>(&request.body)
+                        .ok()
+                        .and_then(|body| body
+                            .get("method")
+                            .and_then(|m| m.as_str())
+                            .map(str::to_string))
+                        != Some(MCP_THREAD_IDENTITY_CAPABILITY.to_string())
+                ),
+            "no codex/thread-identity bind request may be sent when canonical_thread_id is None"
         );
 
         client.shutdown().await;

@@ -376,7 +376,7 @@ impl Session {
             auth_manager: Some(Arc::clone(&self.services.auth_manager)),
             elicitation_reviewer,
             elicitation_lifecycle: Some(self.mcp_elicitation_lifecycle()),
-            canonical_thread_id: self.services.thread_extension_data.level_id().to_string(),
+            canonical_thread_id: Some(self.services.thread_extension_data.level_id().to_string()),
         }
     }
 }

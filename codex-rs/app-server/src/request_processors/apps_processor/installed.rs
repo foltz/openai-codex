@@ -115,7 +115,7 @@ impl AppsRequestProcessor {
                         auth_manager: codex_apps_auth_manager,
                         elicitation_reviewer: None,
                         elicitation_lifecycle: None,
-                        canonical_thread_id: String::new(),
+                        canonical_thread_id: None,
                     })
                     .await;
 

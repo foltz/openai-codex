@@ -91,6 +91,13 @@ pub struct McpRuntimeInput {
     pub auth_manager: Option<Arc<AuthManager>>,
     pub elicitation_reviewer: Option<ElicitationReviewerHandle>,
     pub elicitation_lifecycle: Option<ElicitationLifecycle>,
+    /// Canonical Codex `ThreadId` for the owning session, used only to
+    /// determine per-connection thread-identity bind eligibility and reuse
+    /// compatibility. Never sent to a server outside the capability-gated
+    /// `codex/thread-identity` bind handshake gated by
+    /// `McpServerConfig::thread_identity_eligible`; see
+    /// `kcf-runtime/04-mcp-thread-identity-contract.md`.
+    pub canonical_thread_id: String,
 }
 
 /// Owns all mutable MCP state for one Codex thread.
@@ -949,6 +956,7 @@ mod tests {
             enabled: true,
             required: false,
             supports_parallel_tool_calls: false,
+            thread_identity_eligible: false,
             omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,

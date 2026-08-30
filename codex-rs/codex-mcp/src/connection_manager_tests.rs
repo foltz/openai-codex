@@ -2225,6 +2225,7 @@ async fn codex_apps_extension_does_not_share_host_owned_tools_cache() -> anyhow:
                 tool_catalog_cache: McpToolCatalogCache::default(),
                 codex_apps_tools_cache_key: cache_key.clone(),
                 client_mcp_extensions: ClientMcpExtensions::default(),
+                canonical_thread_id: String::new(),
                 auth: None,
                 auth_manager: None,
                 elicitation_reviewer: None,
@@ -4565,6 +4566,7 @@ async fn executor_owned_chatgpt_mcp_accepts_only_safe_explicit_authorization() -
                 /*codex_apps_cache_identity*/ None,
                 ElicitationCapability::default(),
                 ClientMcpExtensions::default(),
+                /*canonical_thread_id*/ String::new(),
                 /*previous_identity*/ None,
             )
         };
@@ -4622,6 +4624,7 @@ async fn executor_owned_chatgpt_mcp_accepts_only_safe_explicit_authorization() -
                 auth_manager: None,
                 elicitation_reviewer: None,
                 elicitation_lifecycle: None,
+                canonical_thread_id: String::new(),
             },
             ElicitationRequestRouter::default(),
         )
@@ -4669,6 +4672,7 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
                 enabled: true,
                 required: false,
                 supports_parallel_tool_calls: false,
+                thread_identity_eligible: false,
                 omit_tools_from: None,
                 disabled_reason: None,
                 startup_timeout_sec: None,
@@ -4697,6 +4701,7 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
                 enabled: true,
                 required: false,
                 supports_parallel_tool_calls: false,
+                thread_identity_eligible: false,
                 omit_tools_from: None,
                 disabled_reason: None,
                 startup_timeout_sec: None,
@@ -4741,6 +4746,7 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
             auth_manager: None,
             elicitation_reviewer: None,
             elicitation_lifecycle: None,
+            canonical_thread_id: String::new(),
         },
         ElicitationRequestRouter::default(),
     )
@@ -4808,6 +4814,7 @@ fn mcp_init_error_display_prompts_for_github_pat() {
         enabled: true,
         required: false,
         supports_parallel_tool_calls: false,
+        thread_identity_eligible: false,
         omit_tools_from: None,
         disabled_reason: None,
         startup_timeout_sec: None,
@@ -4968,6 +4975,7 @@ fn mcp_init_error_display_reports_generic_errors() {
         enabled: true,
         required: false,
         supports_parallel_tool_calls: false,
+        thread_identity_eligible: false,
         omit_tools_from: None,
         disabled_reason: None,
         startup_timeout_sec: None,
@@ -5047,6 +5055,7 @@ fn reusable_server_config(url: &str) -> McpServerConfig {
         enabled: true,
         required: false,
         supports_parallel_tool_calls: false,
+        thread_identity_eligible: false,
         omit_tools_from: None,
         disabled_reason: None,
         startup_timeout_sec: None,
@@ -5089,6 +5098,7 @@ fn reusable_server_identity(
         /*codex_apps_cache_identity*/ None,
         ElicitationCapability::default(),
         ClientMcpExtensions::default(),
+        /*canonical_thread_id*/ String::new(),
         /*previous_identity*/ None,
     )
 }
@@ -5178,6 +5188,7 @@ async fn reconcile_reusable_server_with_mcp_config(
             auth_manager: None,
             elicitation_reviewer: None,
             elicitation_lifecycle: None,
+            canonical_thread_id: String::new(),
         },
         ElicitationRequestRouter::default(),
     )
@@ -5775,6 +5786,7 @@ fn connection_identity_uses_effective_authorization_headers() {
                 /*codex_apps_cache_identity*/ None,
                 ElicitationCapability::default(),
                 ClientMcpExtensions::default(),
+                /*canonical_thread_id*/ String::new(),
                 /*previous_identity*/ None,
             )
         };
@@ -5929,6 +5941,7 @@ async fn reconciliation_replaces_connection_when_protocol_mode_changes() {
             auth_manager: None,
             elicitation_reviewer: None,
             elicitation_lifecycle: None,
+            canonical_thread_id: String::new(),
         },
         ElicitationRequestRouter::default(),
     )
@@ -5987,6 +6000,7 @@ async fn reconciliation_reuses_legacy_stdio_server_when_modern_protocol_is_enabl
             auth_manager: None,
             elicitation_reviewer: None,
             elicitation_lifecycle: None,
+            canonical_thread_id: String::new(),
         },
         ElicitationRequestRouter::default(),
     )
@@ -6327,6 +6341,7 @@ async fn connection_identity_distinguishes_accounts_with_the_same_token() -> any
             /*codex_apps_cache_identity*/ None,
             ElicitationCapability::default(),
             ClientMcpExtensions::default(),
+            /*canonical_thread_id*/ String::new(),
             /*previous_identity*/ None,
         )
     };
@@ -6381,6 +6396,7 @@ async fn connection_identity_distinguishes_agent_account_runtime_and_task() -> a
             /*codex_apps_cache_identity*/ None,
             ElicitationCapability::default(),
             ClientMcpExtensions::default(),
+            /*canonical_thread_id*/ String::new(),
             /*previous_identity*/ None,
         )
     };

@@ -3602,6 +3602,10 @@
           "default": null,
           "type": "boolean"
         },
+        "thread_identity_eligible": {
+          "default": null,
+          "type": "boolean"
+        },
         "tool_timeout_sec": {
           "default": null,
           "format": "double",

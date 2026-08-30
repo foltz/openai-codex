@@ -428,11 +428,12 @@ pub struct RmcpClient {
     initialize_context: Mutex<Option<InitializeContext>>,
     session_recovery_lock: Semaphore,
     elicitation_pause_state: ElicitationPauseState,
-    /// Reachable from both startup (via the constructed client, before the
-    /// caller's own post-`initialize()` gate) and the internal
-    /// session-expiry recovery path in `reinitialize_after_session_expiry`
-    /// — the two seams `kcf-runtime/04`'s lifecycle rules require. `None`
-    /// for every ordinary connection.
+    /// Invoked only from the internal session-expiry recovery path in
+    /// `reinitialize_after_session_expiry`. Startup binding is a separate,
+    /// explicit responsibility of the caller (`codex-mcp` calls its own
+    /// bind logic directly after `initialize()` returns, before ever
+    /// installing this hook) — this field does not participate in startup.
+    /// `None` for every ordinary connection.
     post_reconnect_hook: Option<PostReconnectHook>,
 }
 

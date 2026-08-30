@@ -267,7 +267,7 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
         codex_apps_auth_manager,
         elicitation_reviewer: None,
         elicitation_lifecycle: None,
-        canonical_thread_id: String::new(),
+        canonical_thread_id: None,
     })
     .await;
 

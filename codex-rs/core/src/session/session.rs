@@ -572,6 +572,29 @@ impl Session {
         state.session_configuration.originator.clone()
     }
 
+    /// Selects the canonical `ThreadId` for a new `Session` instance from
+    /// its initial-history kind. Extracted as a pure function (no `&self`,
+    /// no I/O) so the exact rule per lifecycle transition — fresh, clear,
+    /// fork, child/delegate, and reconstructed resume all select here;
+    /// already-live resume and compact never call `Session::new` again, so
+    /// they are not represented in this function — is independently,
+    /// decisively unit-testable at this exact entry point, not only
+    /// inferable from the absence of a later conditional in the MCP runtime
+    /// input path that reads whatever this function selected.
+    pub(super) fn select_thread_id(
+        initial_history: &InitialHistory,
+        deferred_clear_session_start: &Option<super::DeferredClearSessionStart>,
+        agent_control: &AgentControl,
+    ) -> ThreadId {
+        match (initial_history, deferred_clear_session_start) {
+            (InitialHistory::Cleared, Some(deferred)) => deferred.successor_thread_id,
+            (InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_), _) => {
+                agent_control.generate_thread_id()
+            }
+            (InitialHistory::Resumed(resumed_history), _) => resumed_history.conversation_id,
+        }
+    }
+
     #[instrument(name = "session_init", level = "info", skip_all)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn new(
@@ -657,13 +680,11 @@ impl Session {
         let multi_agent_version = multi_agent_version.map(OnceLock::from).unwrap_or_default();
         let initial_multi_agent_version = multi_agent_version.get().copied();
 
-        let thread_id = match (&initial_history, &deferred_clear_session_start) {
-            (InitialHistory::Cleared, Some(deferred)) => deferred.successor_thread_id,
-            (InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_), _) => {
-                agent_control.generate_thread_id()
-            }
-            (InitialHistory::Resumed(resumed_history), _) => resumed_history.conversation_id,
-        };
+        let thread_id = Self::select_thread_id(
+            &initial_history,
+            &deferred_clear_session_start,
+            &agent_control,
+        );
         let resumed_session_id = match &initial_history {
             InitialHistory::Resumed(resumed) => {
                 resumed.history.iter().find_map(|item| match item {

@@ -78,11 +78,15 @@ pub struct McpRuntimeInput {
     pub elicitation_lifecycle: Option<ElicitationLifecycle>,
     /// Canonical Codex `ThreadId` for the owning session, used only to
     /// determine per-connection thread-identity bind eligibility and reuse
-    /// compatibility. Never sent to a server outside the capability-gated
-    /// `codex/thread-identity` bind handshake gated by
-    /// `McpServerConfig::thread_identity_eligible`; see
-    /// `kcf-runtime/04-mcp-thread-identity-contract.md`.
-    pub canonical_thread_id: String,
+    /// compatibility. `None` for every threadless caller (connector
+    /// discovery, apps-install probing, and similar session-independent
+    /// paths) — absence is modeled explicitly so a threadless path can
+    /// never be mistaken for a real, bindable ID; the bind gate treats
+    /// `None` as ineligible regardless of `thread_identity_eligible`. Never
+    /// sent to a server outside the capability-gated `codex/thread-identity`
+    /// bind handshake gated by `McpServerConfig::thread_identity_eligible`;
+    /// see `kcf-runtime/04-mcp-thread-identity-contract.md`.
+    pub canonical_thread_id: Option<String>,
 }
 
 /// Owns all mutable MCP state for one Codex thread.

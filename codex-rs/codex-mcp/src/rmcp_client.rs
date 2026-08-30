@@ -57,6 +57,7 @@ use codex_protocol::protocol::McpStartupUpdateEvent;
 use codex_rmcp_client::ExecutorStdioServerLauncher;
 use codex_rmcp_client::LocalStdioServerLauncher;
 use codex_rmcp_client::McpProtocolMode;
+use codex_rmcp_client::PostReconnectHook;
 use codex_rmcp_client::RmcpClient;
 use codex_rmcp_client::StdioServerLauncher;
 use codex_rmcp_client::StreamableHttpRedirectMode;
@@ -66,10 +67,13 @@ use futures::future::BoxFuture;
 use futures::future::FutureExt;
 use futures::future::Shared;
 use rmcp::model::ClientCapabilities;
+use rmcp::model::CustomResult;
 use rmcp::model::ElicitationCapability;
 use rmcp::model::Implementation;
 use rmcp::model::InitializeRequestParams;
 use rmcp::model::ProtocolVersion;
+use rmcp::model::ServerPeerInfo;
+use rmcp::model::ServerResult;
 use rmcp::model::Tool as RmcpTool;
 use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
@@ -84,6 +88,12 @@ pub const MCP_SANDBOX_STATE_META_CAPABILITY: &str = "codex/sandbox-state-meta";
 /// not use it. Its `cacheable: false` property disables sharing tool definitions across connections.
 const MCP_TOOL_CATALOG_CACHE_CAPABILITY: &str = "codex/tool-catalog-cache";
 const MCP_TOOL_CATALOG_CACHEABLE_PROPERTY: &str = "cacheable";
+/// Capability-gated thread-identity bind method and experimental-capability
+/// key (the same string serves both roles); see
+/// `kcf-runtime/04-mcp-thread-identity-contract.md`.
+const MCP_THREAD_IDENTITY_CAPABILITY: &str = "codex/thread-identity";
+const MCP_THREAD_IDENTITY_VERSIONS_PROPERTY: &str = "versions";
+const MCP_THREAD_IDENTITY_SUPPORTED_VERSION: i64 = 1;
 pub(crate) const MCP_TOOLS_LIST_DURATION_METRIC: &str = "codex.mcp.tools.list.duration_ms";
 pub(crate) const MCP_TOOLS_FETCH_UNCACHED_DURATION_METRIC: &str =
     "codex.mcp.tools.fetch_uncached.duration_ms";
@@ -287,6 +297,7 @@ struct ManagedClientStartup {
     catalog_item_limit: usize,
     cancel_token: CancellationToken,
     startup_complete: Arc<AtomicBool>,
+    canonical_thread_id: String,
 }
 
 impl ManagedClientStartup {
@@ -309,8 +320,10 @@ impl ManagedClientStartup {
             catalog_item_limit,
             cancel_token,
             startup_complete,
+            canonical_thread_id,
         } = self.clone();
         let is_codex_apps_mcp_server = server_name == CODEX_APPS_MCP_SERVER_NAME;
+        let thread_identity_eligible = server.config().thread_identity_eligible;
         let startup_timeout = server
             .config()
             .startup_timeout_sec
@@ -341,7 +354,17 @@ impl ManagedClientStartup {
                 )
                 .await
                 {
-                    Ok(result) => Arc::new(result?),
+                    Ok(result) => {
+                        let client = result?;
+                        let client = if thread_identity_eligible {
+                            client.with_post_reconnect_hook(thread_identity_reconnect_hook(
+                                canonical_thread_id.clone(),
+                            ))
+                        } else {
+                            client
+                        };
+                        Arc::new(client)
+                    }
                     Err(_) => {
                         return Err(StartupOutcomeError::from(anyhow!(
                             "MCP client startup timed out after {startup_timeout:?}"
@@ -362,6 +385,8 @@ impl ManagedClientStartup {
                         client_elicitation_capability,
                         client_mcp_extensions,
                         catalog_item_limit,
+                        thread_identity_eligible,
+                        canonical_thread_id,
                     },
                 )
                 .await
@@ -426,6 +451,7 @@ impl AsyncManagedClient {
         client_mcp_extensions: ClientMcpExtensions,
         protocol_mode: McpProtocolMode,
         catalog_item_limit: usize,
+        canonical_thread_id: String,
     ) -> Self {
         let is_codex_apps_mcp_server = server_name == CODEX_APPS_MCP_SERVER_NAME;
         let reconnect_server_name = server_name.clone();
@@ -456,6 +482,7 @@ impl AsyncManagedClient {
             catalog_item_limit,
             cancel_token: cancel_token.clone(),
             startup_complete: Arc::clone(&startup_complete),
+            canonical_thread_id,
         });
         let client = startup.start();
         let startup_reconnect = is_codex_apps_mcp_server.then(|| {
@@ -874,6 +901,8 @@ async fn start_server_task(
         client_elicitation_capability,
         client_mcp_extensions,
         catalog_item_limit,
+        thread_identity_eligible,
+        canonical_thread_id,
     } = params;
     let params =
         mcp_initialize_request_params(client_elicitation_capability, client_mcp_extensions);
@@ -883,6 +912,16 @@ async fn start_server_task(
         .initialize(params, startup_timeout, send_elicitation)
         .await
         .map_err(StartupOutcomeError::from)?;
+
+    if thread_identity_eligible {
+        bind_thread_identity(
+            &client,
+            &initialize_result,
+            &canonical_thread_id,
+            startup_timeout,
+        )
+        .await?;
+    }
 
     let server_disables_tool_catalog_cache = initialize_result
         .capabilities
@@ -956,6 +995,147 @@ async fn start_server_task(
     Ok(managed)
 }
 
+/// Validates a `codex/thread-identity` declaration's `versions` value
+/// against `kcf-runtime/04`'s exact grammar: a non-empty JSON array of
+/// distinct positive integers, compatible only when it contains `1`. An
+/// object that is missing `versions`, has a malformed list (wrong type,
+/// empty, non-positive, non-integer, or duplicate entries), or lacks `1`
+/// is an unsupported declaration in its entirety — not "supported because
+/// `1` appears somewhere in an otherwise malformed array."
+fn is_compatible_thread_identity_versions(versions: &serde_json::Value) -> bool {
+    let Some(entries) = versions.as_array() else {
+        return false;
+    };
+    if entries.is_empty() {
+        return false;
+    }
+    let mut seen = std::collections::HashSet::new();
+    for entry in entries {
+        let Some(version) = entry.as_i64() else {
+            return false;
+        };
+        if version <= 0 {
+            return false;
+        }
+        if !seen.insert(version) {
+            return false;
+        }
+    }
+    seen.contains(&MCP_THREAD_IDENTITY_SUPPORTED_VERSION)
+}
+
+/// Whether `peer_info` declares a compatible `codex/thread-identity`
+/// version, per `kcf-runtime/04`. Shared by both the startup bind path and
+/// the session-expiry recovery rebind hook so declaration-reading logic
+/// exists exactly once.
+fn declares_compatible_thread_identity(peer_info: &ServerPeerInfo) -> bool {
+    peer_info
+        .capabilities
+        .experimental
+        .as_ref()
+        .and_then(|experimental| experimental.get(MCP_THREAD_IDENTITY_CAPABILITY))
+        .and_then(|capability| capability.get(MCP_THREAD_IDENTITY_VERSIONS_PROPERTY))
+        .is_some_and(is_compatible_thread_identity_versions)
+}
+
+fn thread_identity_bind_params(canonical_thread_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "version": MCP_THREAD_IDENTITY_SUPPORTED_VERSION,
+        "threadId": canonical_thread_id,
+    })
+}
+
+/// Whether `response` is exactly the required `{"version": 1, "accepted":
+/// true}` acknowledgement. Shared by both bind paths for the same reason
+/// as [`declares_compatible_thread_identity`].
+fn thread_identity_ack_accepted(response: &ServerResult) -> bool {
+    matches!(
+        response,
+        ServerResult::CustomResult(CustomResult(value))
+            if value == &serde_json::json!({
+                "version": MCP_THREAD_IDENTITY_SUPPORTED_VERSION,
+                "accepted": true,
+            })
+    )
+}
+
+/// Binds the connection-scoped `codex/thread-identity` capability if the
+/// server declared a compatible version, per
+/// `kcf-runtime/04-mcp-thread-identity-contract.md`. Only called for
+/// servers explicitly opted into `thread_identity_eligible`. A server that
+/// does not declare `codex/thread-identity`, or declares only incompatible
+/// versions, is left unbound and startup proceeds normally — declining to
+/// bind is not an error. A server that declares a compatible version but
+/// then rejects or malforms the bind acknowledgement fails startup for this
+/// connection, so no provider operation is ever admitted on an unbound
+/// connection.
+async fn bind_thread_identity(
+    client: &RmcpClient,
+    initialize_result: &ServerPeerInfo,
+    canonical_thread_id: &str,
+    startup_timeout: Option<Duration>,
+) -> Result<(), StartupOutcomeError> {
+    if !declares_compatible_thread_identity(initialize_result) {
+        return Ok(());
+    }
+
+    let response = client
+        .send_custom_request_with_timeout(
+            MCP_THREAD_IDENTITY_CAPABILITY,
+            Some(thread_identity_bind_params(canonical_thread_id)),
+            startup_timeout,
+        )
+        .await
+        .map_err(StartupOutcomeError::from)?;
+    if thread_identity_ack_accepted(&response) {
+        Ok(())
+    } else {
+        Err(StartupOutcomeError::from(anyhow!(
+            "MCP server declared codex/thread-identity but rejected or malformed the bind acknowledgement"
+        )))
+    }
+}
+
+/// Rebinds `codex/thread-identity` after `RmcpClient` transparently
+/// recovers a Streamable HTTP session-expiry: installed as a
+/// [`codex_rmcp_client::PostReconnectHook`] on eligible connections only
+/// (see `make_rmcp_client`), so it is a complete no-op — no extra request,
+/// no extra latency — for every ordinary connection. Shares
+/// `declares_compatible_thread_identity`/`thread_identity_ack_accepted`
+/// with the startup path (`bind_thread_identity`) so the declaration
+/// grammar and acknowledgement shape are checked identically in both
+/// places; only how the request is *sent* differs, because the recovery
+/// path must operate on the specific freshly reconnected physical
+/// connection via `ReconnectContext` rather than through
+/// `RmcpClient`'s own (not-yet-`Ready`) state — see `ReconnectContext`'s
+/// doc comment in `rmcp-client` for why.
+fn thread_identity_reconnect_hook(canonical_thread_id: String) -> PostReconnectHook {
+    Box::new(move |context, peer_info| {
+        let canonical_thread_id = canonical_thread_id.clone();
+        async move {
+            if !declares_compatible_thread_identity(peer_info) {
+                return Ok(());
+            }
+            let response = context
+                .send_custom_request(
+                    MCP_THREAD_IDENTITY_CAPABILITY,
+                    Some(thread_identity_bind_params(&canonical_thread_id)),
+                    /*timeout*/ None,
+                )
+                .await?;
+            if thread_identity_ack_accepted(&response) {
+                Ok(())
+            } else {
+                Err(anyhow!(
+                    "MCP server declared codex/thread-identity but rejected or malformed the \
+                     recovery bind acknowledgement"
+                ))
+            }
+        }
+        .boxed()
+    })
+}
+
 fn mcp_initialize_request_params(
     client_elicitation_capability: ElicitationCapability,
     client_mcp_extensions: ClientMcpExtensions,
@@ -1012,6 +1192,8 @@ struct StartServerTaskParams {
     client_elicitation_capability: ElicitationCapability,
     client_mcp_extensions: ClientMcpExtensions,
     catalog_item_limit: usize,
+    thread_identity_eligible: bool,
+    canonical_thread_id: String,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1130,12 +1312,555 @@ async fn make_rmcp_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::elicitation::ElicitationRequestRouter;
     use codex_protocol::mcp::MCP_APP_UI_EXTENSION_ID;
     use codex_protocol::mcp::OPENAI_FORM_EXTENSION_ID;
+    use codex_protocol::models::PermissionProfile;
+    use codex_protocol::protocol::AskForApproval;
+    use codex_rmcp_client::ElicitationAction;
+    use codex_rmcp_client::ElicitationResponse;
     use pretty_assertions::assert_eq;
+    use rmcp::model::ClientCapabilities;
     use rmcp::model::JsonObject;
     use rmcp::model::MetaObject;
     use rmcp::transport::auth::AuthError;
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::Request;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
+
+    const THREAD_IDENTITY_TEST_LEGACY_VERSION: &str = "2025-06-18";
+
+    fn thread_identity_test_initialize_params() -> InitializeRequestParams {
+        InitializeRequestParams::new(
+            ClientCapabilities::default(),
+            Implementation::new("codex-thread-identity-bind-test", "0.0.0"),
+        )
+        .with_protocol_version(ProtocolVersion::V_2025_06_18)
+    }
+
+    fn thread_identity_test_initialize_response(
+        request: &serde_json::Value,
+        experimental_versions: Option<&serde_json::Value>,
+    ) -> ResponseTemplate {
+        let mut capabilities = serde_json::json!({"tools": {}});
+        if let Some(versions) = experimental_versions {
+            capabilities["experimental"] = serde_json::json!({
+                MCP_THREAD_IDENTITY_CAPABILITY: {"versions": versions},
+            });
+        }
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {
+                "protocolVersion": THREAD_IDENTITY_TEST_LEGACY_VERSION,
+                "capabilities": capabilities,
+                "serverInfo": {"name": "thread-identity-bind-test-server", "version": "1.0.0"},
+            },
+        }))
+    }
+
+    /// Mounts a mock server that declares `experimental_versions` (or no
+    /// declaration at all, when `None`) on `initialize`, and responds to the
+    /// `codex/thread-identity` bind request with `bind_response` (a full
+    /// JSON-RPC `result` value). Returns the connected, initialized client
+    /// plus the mock server (kept alive so `received_requests` works).
+    async fn start_thread_identity_test_client(
+        experimental_versions: Option<serde_json::Value>,
+        bind_response: serde_json::Value,
+    ) -> (RmcpClient, MockServer) {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(move |request: &Request| {
+                let body: serde_json::Value = request.body_json().expect("valid JSON-RPC request");
+                match body["method"].as_str() {
+                    Some("initialize") => thread_identity_test_initialize_response(
+                        &body,
+                        experimental_versions.as_ref(),
+                    ),
+                    Some("notifications/initialized") => ResponseTemplate::new(202),
+                    Some(MCP_THREAD_IDENTITY_CAPABILITY) => ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": body["id"],
+                            "result": bind_response,
+                        })),
+                    other => panic!("unexpected thread-identity test method: {other:?}"),
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let client = RmcpClient::new_streamable_http_client_with_protocol_mode(
+            "thread-identity-bind-test",
+            &format!("{}/mcp", server.uri()),
+            /*bearer_token*/ None,
+            /*http_headers*/ None,
+            /*env_http_headers*/ None,
+            OAuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::default(),
+            codex_exec_server::Environment::default_for_tests().get_http_client(),
+            /*auth_provider*/ None,
+            McpProtocolMode::Legacy,
+        )
+        .await
+        .expect("client should construct");
+        (client, server)
+    }
+
+    async fn thread_identity_test_initialize(client: &RmcpClient) -> ServerPeerInfo {
+        client
+            .initialize(
+                thread_identity_test_initialize_params(),
+                Some(Duration::from_secs(5)),
+                Box::new(|_, _| {
+                    async {
+                        Ok(ElicitationResponse {
+                            action: ElicitationAction::Accept,
+                            content: Some(serde_json::json!({})),
+                            meta: None,
+                        })
+                    }
+                    .boxed()
+                }),
+            )
+            .await
+            .expect("initialize should succeed")
+    }
+
+    #[tokio::test]
+    async fn bind_thread_identity_sends_exact_request_and_accepts_matching_ack() {
+        let (client, server) = start_thread_identity_test_client(
+            Some(serde_json::json!([1])),
+            serde_json::json!({"version": 1, "accepted": true}),
+        )
+        .await;
+        let initialize_result = thread_identity_test_initialize(&client).await;
+        let client = Arc::new(client);
+
+        let result = bind_thread_identity(
+            &client,
+            &initialize_result,
+            "thread-abc-123",
+            Some(Duration::from_secs(5)),
+        )
+        .await;
+
+        assert!(result.is_ok(), "expected bind to succeed: {result:?}");
+
+        let bind_request = server
+            .received_requests()
+            .await
+            .expect("mock server should record requests")
+            .into_iter()
+            .map(|request| request.body_json::<serde_json::Value>().unwrap())
+            .find(|body| body["method"] == MCP_THREAD_IDENTITY_CAPABILITY)
+            .expect("the bind request should have been sent");
+        // The rmcp SDK's `send_request` path attaches a standard
+        // `_meta.progressToken` to every outbound custom request — observed
+        // here against the real client, not assumed. This is uniform
+        // JSON-RPC/MCP progress-tracking envelope machinery applied to every
+        // custom request the SDK sends, not something `bind_thread_identity`
+        // opts into or controls, and it carries no thread/session/identity
+        // data (just an SDK-assigned integer counter). Rather than silently
+        // loosening the assertion, assert the full param key set and the
+        // full shape of `_meta` explicitly, so any future SDK change that
+        // starts smuggling more than a bare progress token through this
+        // envelope breaks this test.
+        let params = bind_request["params"]
+            .as_object()
+            .expect("bind request params should be an object");
+        let mut actual_keys: Vec<&str> = params.keys().map(String::as_str).collect();
+        actual_keys.sort_unstable();
+        assert_eq!(
+            actual_keys,
+            vec!["_meta", "threadId", "version"],
+            "bind request params must carry only kcf-runtime/04's version/threadId plus \
+             the SDK's own request envelope metadata — nothing else"
+        );
+        assert_eq!(params["version"], serde_json::json!(1));
+        assert_eq!(params["threadId"], serde_json::json!("thread-abc-123"));
+        let meta = params["_meta"]
+            .as_object()
+            .expect("_meta should be an object");
+        let mut meta_keys: Vec<&str> = meta.keys().map(String::as_str).collect();
+        meta_keys.sort_unstable();
+        assert_eq!(
+            meta_keys,
+            vec!["progressToken"],
+            "the SDK envelope's _meta must carry only a progress token, no identity data"
+        );
+        assert!(
+            meta["progressToken"].is_number(),
+            "progressToken should be the SDK's own counter, not a smuggled identity value"
+        );
+
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn bind_thread_identity_fails_on_mismatched_ack() {
+        let (client, _server) = start_thread_identity_test_client(
+            Some(serde_json::json!([1])),
+            serde_json::json!({"version": 1, "accepted": false}),
+        )
+        .await;
+        let initialize_result = thread_identity_test_initialize(&client).await;
+        let client = Arc::new(client);
+
+        let result = bind_thread_identity(
+            &client,
+            &initialize_result,
+            "thread-abc-123",
+            Some(Duration::from_secs(5)),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a rejected/malformed ack must fail the bind, blocking all provider operations \
+             on this connection"
+        );
+
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn bind_thread_identity_skips_silently_when_declaration_is_incompatible() {
+        let (client, server) = start_thread_identity_test_client(
+            Some(serde_json::json!([2])),
+            serde_json::json!({"version": 1, "accepted": true}),
+        )
+        .await;
+        let initialize_result = thread_identity_test_initialize(&client).await;
+        let client = Arc::new(client);
+
+        let result = bind_thread_identity(
+            &client,
+            &initialize_result,
+            "thread-abc-123",
+            Some(Duration::from_secs(5)),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "an incompatible declaration must not error, only skip binding"
+        );
+        let sent_bind_request = server
+            .received_requests()
+            .await
+            .expect("mock server should record requests")
+            .into_iter()
+            .map(|request| request.body_json::<serde_json::Value>().unwrap())
+            .any(|body| body["method"] == MCP_THREAD_IDENTITY_CAPABILITY);
+        assert!(
+            !sent_bind_request,
+            "no bind request should be sent for an incompatible/absent declaration"
+        );
+
+        client.shutdown().await;
+    }
+
+    /// Exercises the real production entry point (`start_server_task`), not
+    /// just the private `bind_thread_identity` helper, to prove R003/R004's
+    /// "bind before every provider operation" requirement holds at the
+    /// actual call site: when a thread-identity-eligible server declares a
+    /// compatible version but rejects the bind acknowledgement, startup
+    /// fails and `tools/list` is never sent on that connection.
+    #[tokio::test]
+    async fn start_server_task_blocks_tools_list_when_bind_ack_is_rejected() {
+        let tools_list_called = Arc::new(AtomicBool::new(false));
+        let tools_list_called_for_mock = Arc::clone(&tools_list_called);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(move |request: &Request| {
+                let body: serde_json::Value = request.body_json().expect("valid JSON-RPC request");
+                match body["method"].as_str() {
+                    Some("initialize") => thread_identity_test_initialize_response(
+                        &body,
+                        Some(&serde_json::json!([1])),
+                    ),
+                    Some("notifications/initialized") => ResponseTemplate::new(202),
+                    Some(MCP_THREAD_IDENTITY_CAPABILITY) => ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": body["id"],
+                            "result": {"version": 1, "accepted": false},
+                        })),
+                    Some("tools/list") => {
+                        tools_list_called_for_mock.store(true, Ordering::SeqCst);
+                        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": body["id"],
+                            "result": {"tools": []},
+                        }))
+                    }
+                    other => panic!("unexpected start_server_task test method: {other:?}"),
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let client = RmcpClient::new_streamable_http_client_with_protocol_mode(
+            "start-server-task-bind-reject-test",
+            &format!("{}/mcp", server.uri()),
+            /*bearer_token*/ None,
+            /*http_headers*/ None,
+            /*env_http_headers*/ None,
+            OAuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::default(),
+            codex_exec_server::Environment::default_for_tests().get_http_client(),
+            /*auth_provider*/ None,
+            McpProtocolMode::Legacy,
+        )
+        .await
+        .expect("client should construct");
+        let client = Arc::new(client);
+
+        let result = start_server_task(
+            "start-server-task-bind-reject-test".to_string(),
+            Arc::clone(&client),
+            StartServerTaskParams {
+                is_codex_apps_mcp_server: false,
+                startup_timeout: Some(Duration::from_secs(5)),
+                tx_event: None,
+                elicitation_requests: ElicitationRequestManager::new(
+                    AskForApproval::default(),
+                    PermissionProfile::read_only(),
+                    /*reviewer*/ None,
+                    /*lifecycle*/ None,
+                    ElicitationRequestRouter::default(),
+                ),
+                codex_apps_tools_cache_context: None,
+                tool_catalog_cache_context: None,
+                tool_catalog_fetch_ticket: None,
+                client_elicitation_capability: ElicitationCapability::default(),
+                client_mcp_extensions: ClientMcpExtensions::default(),
+                catalog_item_limit: 100,
+                thread_identity_eligible: true,
+                canonical_thread_id: "thread-abc-123".to_string(),
+            },
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "startup must fail when the server rejects the bind acknowledgement"
+        );
+        assert!(
+            !tools_list_called.load(Ordering::SeqCst),
+            "tools/list must never be requested on a connection whose bind was rejected"
+        );
+
+        client.shutdown().await;
+    }
+
+    /// R006 disclosure-containment proof, real-artifact style: runs a
+    /// thread-identity-eligible connection through its complete real
+    /// startup — `initialize`, the bind request, and `tools/list` — and
+    /// inspects **every** raw wire request actually sent (URL, headers,
+    /// and full JSON body), not just the ones this code is expected to
+    /// touch. Asserts the canonical thread ID appears in exactly the one
+    /// request `kcf-runtime/04` authorizes (`codex/thread-identity`'s
+    /// `params.threadId`) and nowhere else — not in `initialize`, not in
+    /// `tools/list`, not in any URL or header. A marker distinctive enough
+    /// that it cannot collide with any real protocol field name is used so
+    /// an accidental leak through an unexpected path would still be
+    /// caught.
+    #[tokio::test]
+    async fn thread_identity_never_leaks_outside_the_bind_request() {
+        const THREAD_ID_MARKER: &str = "thread-marker-zzq7-must-not-leak-elsewhere";
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(move |request: &Request| {
+                let body: serde_json::Value = request.body_json().expect("valid JSON-RPC request");
+                match body["method"].as_str() {
+                    Some("initialize") => thread_identity_test_initialize_response(
+                        &body,
+                        Some(&serde_json::json!([1])),
+                    ),
+                    Some("notifications/initialized") => ResponseTemplate::new(202),
+                    Some(MCP_THREAD_IDENTITY_CAPABILITY) => ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": body["id"],
+                            "result": {"version": 1, "accepted": true},
+                        })),
+                    Some("tools/list") => {
+                        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": body["id"],
+                            "result": {"tools": []},
+                        }))
+                    }
+                    other => panic!("unexpected containment test method: {other:?}"),
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let client_mcp_extensions = ClientMcpExtensions::new([(
+            MCP_APP_UI_EXTENSION_ID.to_string(),
+            serde_json::json!({"unrelated": "value"}),
+        )]);
+
+        let client = RmcpClient::new_streamable_http_client_with_protocol_mode(
+            "thread-identity-containment-test",
+            &format!("{}/mcp", server.uri()),
+            /*bearer_token*/ None,
+            /*http_headers*/
+            Some(HashMap::from([(
+                "X-Unrelated-Header".to_string(),
+                "unrelated-value".to_string(),
+            )])),
+            /*env_http_headers*/ None,
+            OAuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::default(),
+            codex_exec_server::Environment::default_for_tests().get_http_client(),
+            /*auth_provider*/ None,
+            McpProtocolMode::Legacy,
+        )
+        .await
+        .expect("client should construct");
+        let client = Arc::new(client);
+
+        let result = start_server_task(
+            "thread-identity-containment-test".to_string(),
+            Arc::clone(&client),
+            StartServerTaskParams {
+                is_codex_apps_mcp_server: false,
+                startup_timeout: Some(Duration::from_secs(5)),
+                tx_event: None,
+                elicitation_requests: ElicitationRequestManager::new(
+                    AskForApproval::default(),
+                    PermissionProfile::read_only(),
+                    /*reviewer*/ None,
+                    /*lifecycle*/ None,
+                    ElicitationRequestRouter::default(),
+                ),
+                codex_apps_tools_cache_context: None,
+                tool_catalog_cache_context: None,
+                tool_catalog_fetch_ticket: None,
+                client_elicitation_capability: ElicitationCapability::default(),
+                client_mcp_extensions,
+                catalog_item_limit: 100,
+                thread_identity_eligible: true,
+                canonical_thread_id: THREAD_ID_MARKER.to_string(),
+            },
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "expected full startup to succeed: {:?}",
+            result.as_ref().err().map(ToString::to_string)
+        );
+
+        let received = server
+            .received_requests()
+            .await
+            .expect("mock server should record requests");
+        assert!(
+            received.len() >= 4,
+            "expected at least initialize, notifications/initialized, bind, and tools/list; got {}",
+            received.len()
+        );
+
+        let mut bind_requests_with_marker = 0;
+        for request in &received {
+            let body_text = String::from_utf8_lossy(&request.body);
+            let contains_marker = body_text.contains(THREAD_ID_MARKER)
+                || request.url.as_str().contains(THREAD_ID_MARKER)
+                || request
+                    .headers
+                    .iter()
+                    .any(|(_, value)| value.to_str().unwrap_or("").contains(THREAD_ID_MARKER));
+            let method = serde_json::from_slice::<serde_json::Value>(&request.body)
+                .ok()
+                .and_then(|body| {
+                    body.get("method")
+                        .and_then(|m| m.as_str())
+                        .map(str::to_string)
+                });
+            if contains_marker {
+                assert_eq!(
+                    method.as_deref(),
+                    Some(MCP_THREAD_IDENTITY_CAPABILITY),
+                    "thread ID marker leaked into a request other than the bind request: \
+                     method={method:?} url={} body={body_text}",
+                    request.url
+                );
+                bind_requests_with_marker += 1;
+            }
+        }
+        assert_eq!(
+            bind_requests_with_marker, 1,
+            "the thread ID marker must appear in exactly the one bind request"
+        );
+
+        client.shutdown().await;
+    }
+
+    #[test]
+    fn thread_identity_versions_accepts_array_containing_one() {
+        assert!(is_compatible_thread_identity_versions(&serde_json::json!(
+            [1]
+        )));
+        assert!(is_compatible_thread_identity_versions(&serde_json::json!(
+            [2, 1]
+        )));
+    }
+
+    #[test]
+    fn thread_identity_versions_rejects_missing_one() {
+        assert!(!is_compatible_thread_identity_versions(&serde_json::json!(
+            [2]
+        )));
+        assert!(!is_compatible_thread_identity_versions(&serde_json::json!(
+            []
+        )));
+    }
+
+    #[test]
+    fn thread_identity_versions_rejects_wrong_type() {
+        assert!(!is_compatible_thread_identity_versions(&serde_json::json!(
+            "1"
+        )));
+        assert!(!is_compatible_thread_identity_versions(&serde_json::json!(
+            1
+        )));
+        assert!(!is_compatible_thread_identity_versions(&serde_json::json!(
+            null
+        )));
+    }
+
+    #[test]
+    fn thread_identity_versions_rejects_malformed_list() {
+        // Duplicate entries.
+        assert!(!is_compatible_thread_identity_versions(&serde_json::json!(
+            [1, 1]
+        )));
+        // Non-positive entry.
+        assert!(!is_compatible_thread_identity_versions(&serde_json::json!(
+            [0, 1]
+        )));
+        assert!(!is_compatible_thread_identity_versions(&serde_json::json!(
+            [-1, 1]
+        )));
+        // Non-integer entries.
+        assert!(!is_compatible_thread_identity_versions(&serde_json::json!(
+            [1, "x"]
+        )));
+        assert!(!is_compatible_thread_identity_versions(&serde_json::json!(
+            [1.5]
+        )));
+    }
 
     #[test]
     fn startup_outcome_error_identifies_authentication_required() {

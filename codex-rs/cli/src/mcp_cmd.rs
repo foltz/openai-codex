@@ -372,6 +372,7 @@ async fn run_add(config_overrides: &CliConfigOverrides, add_args: AddArgs) -> Re
         enabled: true,
         required: false,
         supports_parallel_tool_calls: false,
+        thread_identity_eligible: false,
         omit_tools_from: None,
         disabled_reason: None,
         startup_timeout_sec: None,

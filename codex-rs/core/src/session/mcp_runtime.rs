@@ -196,6 +196,7 @@ impl Session {
             codex_apps_auth_manager,
             elicitation_reviewer,
             elicitation_lifecycle: Some(self.mcp_elicitation_lifecycle()),
+            canonical_thread_id: self.services.thread_extension_data.level_id().to_string(),
         }
     }
 }

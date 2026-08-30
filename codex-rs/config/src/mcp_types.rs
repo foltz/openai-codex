@@ -181,6 +181,14 @@ pub struct McpServerConfig {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub supports_parallel_tool_calls: bool,
 
+    /// When `true`, Codex may disclose the canonical thread identity to this
+    /// server via the `codex/thread-identity` capability-gated bind
+    /// handshake, per `kcf-runtime/04-mcp-thread-identity-contract.md`.
+    /// Default `false`: no server is eligible for thread-identity binding
+    /// unless explicitly opted in.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub thread_identity_eligible: bool,
+
     /// Model-facing surfaces from which this server's tools must be omitted.
     /// `None` leaves lower-priority configuration unchanged; an empty list clears it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -309,6 +317,8 @@ pub struct RawMcpServerConfig {
     #[serde(default)]
     pub supports_parallel_tool_calls: Option<bool>,
     #[serde(default)]
+    pub thread_identity_eligible: Option<bool>,
+    #[serde(default)]
     pub omit_tools_from: Option<Vec<ToolExposureSurface>>,
     #[serde(default)]
     pub default_tools_approval_mode: Option<AppToolApproval>,
@@ -352,6 +362,7 @@ impl TryFrom<RawMcpServerConfig> for McpServerConfig {
             enabled,
             required,
             supports_parallel_tool_calls,
+            thread_identity_eligible,
             omit_tools_from,
             default_tools_approval_mode,
             enabled_tools,
@@ -430,6 +441,7 @@ impl TryFrom<RawMcpServerConfig> for McpServerConfig {
             enabled: enabled.unwrap_or_else(default_enabled),
             required: required.unwrap_or_default(),
             supports_parallel_tool_calls: supports_parallel_tool_calls.unwrap_or_default(),
+            thread_identity_eligible: thread_identity_eligible.unwrap_or_default(),
             omit_tools_from,
             disabled_reason: None,
             default_tools_approval_mode,

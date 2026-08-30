@@ -353,6 +353,71 @@ pub struct CancellableEventStreamRequest {
     pub notifications: crate::EventNotificationReceiver,
 }
 
+/// Narrow, state-independent handle to a physical connection that was just
+/// (re-)established, given to a [`PostReconnectHook`] so it can send one
+/// request against that specific connection without touching
+/// [`RmcpClient`]'s shared state. `RmcpClient::state` is deliberately not
+/// yet updated to reflect this connection as `Ready` while the hook runs
+/// (see `reinitialize_after_session_expiry`), so routing the hook's send
+/// through the normal `self.state`-reading path would both be logically
+/// wrong (it could read the previous, expired connection) and would
+/// deadlock (`state` is a non-reentrant lock held by the caller across the
+/// hook's `.await` in spirit, even though not literally locked — the
+/// invariant is "no other code touches this connection until the hook
+/// decides it").
+pub struct ReconnectContext {
+    service: Arc<RunningService<RoleClient, ElicitationClientService>>,
+    elicitation_pause_state: ElicitationPauseState,
+}
+
+impl ReconnectContext {
+    /// Sends one custom JSON-RPC request directly on this physical
+    /// connection, bypassing `RmcpClient`'s connection-state lookup and
+    /// session-expiry retry machinery (recovery is already in progress;
+    /// retrying it here would re-enter `reinitialize_after_session_expiry`).
+    pub async fn send_custom_request(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+        timeout: Option<Duration>,
+    ) -> Result<ServerResult> {
+        let service = Arc::clone(&self.service);
+        RmcpClient::run_service_operation_once(
+            service,
+            "requests/custom",
+            timeout,
+            self.elicitation_pause_state.clone(),
+            &move |service| {
+                let params = params.clone();
+                async move {
+                    service
+                        .send_request(ClientRequest::CustomRequest(CustomRequest::new(
+                            method, params,
+                        )))
+                        .await
+                }
+                .boxed()
+            },
+        )
+        .await
+        .map_err(Into::into)
+    }
+}
+
+/// Runs after a physical connection is (re-)established but before it is
+/// published as usable, so it can perform any additional handshake this
+/// connection requires — e.g. binding a capability-gated identity — before
+/// any provider operation is admitted. Returning `Err` makes the
+/// connection permanently unusable; the caller must obtain a fresh one.
+/// `None` (the default for every `RmcpClient`) is a complete no-op: no
+/// extra request, no extra latency, no behavior change for ordinary
+/// connections that never opt in.
+pub type PostReconnectHook = Box<
+    dyn for<'a> Fn(&'a ReconnectContext, &'a ServerPeerInfo) -> BoxFuture<'a, Result<()>>
+        + Send
+        + Sync,
+>;
+
 /// MCP client implemented on top of the official `rmcp` SDK.
 /// https://github.com/modelcontextprotocol/rust-sdk
 pub struct RmcpClient {
@@ -363,12 +428,29 @@ pub struct RmcpClient {
     initialize_context: Mutex<Option<InitializeContext>>,
     session_recovery_lock: Semaphore,
     elicitation_pause_state: ElicitationPauseState,
+    /// Reachable from both startup (via the constructed client, before the
+    /// caller's own post-`initialize()` gate) and the internal
+    /// session-expiry recovery path in `reinitialize_after_session_expiry`
+    /// — the two seams `kcf-runtime/04`'s lifecycle rules require. `None`
+    /// for every ordinary connection.
+    post_reconnect_hook: Option<PostReconnectHook>,
 }
 
 impl RmcpClient {
     /// Returns the protocol compatibility policy captured when this client was created.
     pub fn protocol_mode(&self) -> McpProtocolMode {
         self.protocol_mode
+    }
+
+    /// Installs a hook that must succeed after every future session-expiry
+    /// recovery on this client before the recovered connection is usable.
+    /// Consuming builder, matching this crate's existing constructor style;
+    /// call before the client is shared. A `None`/never-called client (the
+    /// default) never allocates or invokes anything extra.
+    #[must_use]
+    pub fn with_post_reconnect_hook(mut self, hook: PostReconnectHook) -> Self {
+        self.post_reconnect_hook = Some(hook);
+        self
     }
 
     pub async fn new_in_process_client(
@@ -389,6 +471,7 @@ impl RmcpClient {
             initialize_context: Mutex::new(None),
             session_recovery_lock: Semaphore::new(/*permits*/ 1),
             elicitation_pause_state: ElicitationPauseState::new(),
+            post_reconnect_hook: None,
         })
     }
 
@@ -461,6 +544,7 @@ impl RmcpClient {
             initialize_context: Mutex::new(None),
             session_recovery_lock: Semaphore::new(/*permits*/ 1),
             elicitation_pause_state: ElicitationPauseState::new(),
+            post_reconnect_hook: None,
         })
     }
 
@@ -560,6 +644,7 @@ impl RmcpClient {
             initialize_context: Mutex::new(None),
             session_recovery_lock: Semaphore::new(/*permits*/ 1),
             elicitation_pause_state: ElicitationPauseState::new(),
+            post_reconnect_hook: None,
         })
     }
 
@@ -1440,10 +1525,36 @@ impl RmcpClient {
                 initialize_context.timeout,
             )
             .await?;
-        service
+        let peer_info = service
             .peer()
             .peer_info()
             .ok_or_else(|| anyhow!("recovered handshake succeeded but server info was missing"))?;
+
+        // Run any configured post-reconnect hook (e.g. thread-identity
+        // rebind) BEFORE this connection is published as `Ready`, and
+        // without touching `self.state` at all — see `ReconnectContext`'s
+        // doc comment for why. If the hook fails, `self.state` is left
+        // untouched here (still pointing at the dead, expired connection);
+        // `shutdown()` then makes it explicitly and permanently unusable,
+        // matching `kcf-runtime/04`'s "the physical connection is unusable
+        // for all provider operations... KCF may retry only through a
+        // fresh ... connection." Any concurrent caller that reads the old
+        // state during this window gets the already-dead service, whose
+        // next real operation fails and re-enters this same
+        // semaphore-serialized recovery path rather than ever observing an
+        // unbound-but-live connection.
+        if let Some(hook) = &self.post_reconnect_hook {
+            let context = ReconnectContext {
+                service: Arc::clone(&service),
+                elicitation_pause_state: self.elicitation_pause_state.clone(),
+            };
+            if let Err(error) = hook(&context, &peer_info).await {
+                self.shutdown().await;
+                return Err(
+                    error.context("post-reconnect binding gate rejected recovered connection")
+                );
+            }
+        }
 
         {
             let mut guard = self.state.lock().await;

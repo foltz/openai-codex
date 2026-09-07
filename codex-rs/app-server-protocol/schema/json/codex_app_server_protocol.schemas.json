@@ -13039,7 +13039,8 @@
           "completedReplay",
           "transitionIdConflict",
           "lateCancellation",
-          "authorizationNotAdmitted"
+          "authorizationNotAdmitted",
+          "authoritativeAuthUnavailable"
         ],
         "type": "string"
       },

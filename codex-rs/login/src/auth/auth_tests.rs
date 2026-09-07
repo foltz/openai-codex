@@ -2629,6 +2629,43 @@ async fn plan_type_maps_unknown_to_unknown() {
     pretty_assertions::assert_eq!(auth.account_plan_type(), Some(AccountPlanType::Unknown));
 }
 
+#[test]
+fn authoritative_cached_auth_distinguishes_initial_failure_from_logged_out() {
+    let manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    assert!(manager.authoritative_auth_cached().is_ok());
+    manager
+        .inner
+        .write()
+        .expect("test cache lock")
+        .initial_load_failed = true;
+    assert_eq!(
+        manager.authoritative_auth_cached(),
+        Err(AuthoritativeAuthUnavailable::InitialLoadFailed)
+    );
+}
+
+#[test]
+fn authoritative_cached_auth_reports_cache_lock_unavailable_when_poisoned() {
+    let manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    assert!(manager.authoritative_auth_cached().is_ok());
+
+    let poisoning_manager = Arc::clone(&manager);
+    let poisoned = std::thread::spawn(move || {
+        let _guard = poisoning_manager.inner.write().expect("test cache lock");
+        panic!("deliberately poison the cache lock for this test");
+    })
+    .join();
+    assert!(poisoned.is_err(), "the spawned thread must have panicked");
+
+    assert_eq!(
+        manager.authoritative_auth_cached(),
+        Err(AuthoritativeAuthUnavailable::CacheLockUnavailable),
+        "a poisoned cache lock must fail closed as unavailable, never as logged-out"
+    );
+}
+
 #[tokio::test]
 #[serial(codex_auth_env)]
 async fn missing_plan_type_maps_to_unknown() {

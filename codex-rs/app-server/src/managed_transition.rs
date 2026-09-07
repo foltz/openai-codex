@@ -243,8 +243,13 @@ impl ManagedTransitionCoordinator {
         params: StartManagedTransitionParams,
     ) -> StartManagedTransitionResponse {
         let state = self.state.lock().await;
+        let envelope = params.into();
         StartManagedTransitionResponse::Refused {
-            refusal: authorization_not_admitted(&state, params.into()),
+            refusal: if state.auth_authority_available {
+                authorization_not_admitted(&state, envelope)
+            } else {
+                authoritative_auth_unavailable(&state, &envelope)
+            },
         }
     }
 
@@ -288,8 +293,13 @@ impl ManagedTransitionCoordinator {
         params: ReadManagedTransitionParams,
     ) -> ReadManagedTransitionResponse {
         let state = self.state.lock().await;
+        let envelope = TransitionEnvelope::read(params);
         ReadManagedTransitionResponse::Refused {
-            refusal: authorization_not_admitted(&state, TransitionEnvelope::read(params)),
+            refusal: if state.auth_authority_available {
+                authorization_not_admitted(&state, envelope)
+            } else {
+                authoritative_auth_unavailable(&state, &envelope)
+            },
         }
     }
 
@@ -356,8 +366,13 @@ impl ManagedTransitionCoordinator {
         params: CancelManagedTransitionParams,
     ) -> CancelManagedTransitionResponse {
         let state = self.state.lock().await;
+        let envelope = TransitionEnvelope::cancel(params);
         CancelManagedTransitionResponse::Refused {
-            refusal: authorization_not_admitted(&state, TransitionEnvelope::cancel(params)),
+            refusal: if state.auth_authority_available {
+                authorization_not_admitted(&state, envelope)
+            } else {
+                authoritative_auth_unavailable(&state, &envelope)
+            },
         }
     }
 

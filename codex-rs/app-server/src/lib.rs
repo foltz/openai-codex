@@ -107,6 +107,7 @@ mod fs_watch;
 mod fuzzy_file_search;
 mod image_url;
 pub mod in_process;
+mod managed_transition;
 mod mcp_config_identity;
 mod mcp_refresh;
 mod message_processor;

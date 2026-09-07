@@ -1,0 +1,121 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ManagedTransitionIntent": {
+      "description": "A token-free intent for a managed transition. The credential writer and the authoritative auth operation intentionally live behind later server-side admission stages; neither is represented on this wire surface.",
+      "enum": [
+        "adoptManagedAuth",
+        "adoptManagedLogout"
+      ],
+      "type": "string"
+    },
+    "ManagedTransitionPhase": {
+      "enum": [
+        "idle",
+        "admitted",
+        "draining",
+        "adopting",
+        "resetting",
+        "succeeded",
+        "cancelled",
+        "quarantined"
+      ],
+      "type": "string"
+    },
+    "ManagedTransitionRefusalKind": {
+      "description": "Typed, secret-safe reasons for a transition request to be refused.",
+      "enum": [
+        "invalidRequest",
+        "processMismatch",
+        "staleAuthRevision",
+        "staleTransitionRevision",
+        "staleAuthFingerprint",
+        "concurrentTransition",
+        "completedReplay",
+        "transitionIdConflict",
+        "lateCancellation",
+        "authorizationNotAdmitted"
+      ],
+      "type": "string"
+    },
+    "ManagedTransitionStatus": {
+      "properties": {
+        "authRevision": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "intent": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ManagedTransitionIntent"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "phase": {
+          "$ref": "#/definitions/ManagedTransitionPhase"
+        },
+        "priorAuthFingerprint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "processInstanceId": {
+          "type": "string"
+        },
+        "refusal": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ManagedTransitionRefusalKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "resultAuthFingerprint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "transitionId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "transitionRevision": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "authRevision",
+        "phase",
+        "processInstanceId",
+        "retryable",
+        "transitionRevision"
+      ],
+      "type": "object"
+    }
+  },
+  "properties": {
+    "status": {
+      "$ref": "#/definitions/ManagedTransitionStatus"
+    }
+  },
+  "required": [
+    "status"
+  ],
+  "title": "ManagedTransitionStatusNotification",
+  "type": "object"
+}

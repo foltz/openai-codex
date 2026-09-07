@@ -2212,6 +2212,7 @@ Codex supports these authentication modes. The current mode is surfaced in `acco
 - `account/login/cancel` — cancel a pending managed ChatGPT login by `loginId`.
 - `account/logout` — sign out; triggers `account/updated` on success.
 - `account/updated` (notify) — emitted whenever auth mode changes (`authMode`: `apikey`, `bedrockApiKey`, `chatgpt`, `personalAccessToken`, or `null`) and includes the current ChatGPT `planType` when available.
+- `account/managedTransition/start`, `/read`, `/cancel`, and `account/managedTransition/statusUpdated` — experimental, versioned managed-auth transition protocol. Until a server-derived caller authorization is installed, all three requests refuse with `authorizationNotAdmitted` and make no auth or transition-state change. The protocol carries only correlation and revision/fingerprint metadata; it never accepts credentials or account secrets.
 - `account/rateLimits/read` — fetch ChatGPT rate limits, an optional effective monthly credit limit, whether spend control has been reached, and the earned rate-limit resets currently available, including expiry details when provided by the backend. Rate-limit updates arrive via `account/rateLimits/updated` (notify); reset-credit data is snapshot-only.
 - `account/rateLimitResetCredit/consume` — consume one earned reset using a caller-provided idempotency key, optionally selecting a reset-credit ID returned by `account/rateLimits/read`.
 - `account/usage/read` — fetch ChatGPT account token-activity summary and daily buckets.

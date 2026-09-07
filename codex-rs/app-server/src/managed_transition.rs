@@ -243,13 +243,8 @@ impl ManagedTransitionCoordinator {
         params: StartManagedTransitionParams,
     ) -> StartManagedTransitionResponse {
         let state = self.state.lock().await;
-        let envelope = params.into();
         StartManagedTransitionResponse::Refused {
-            refusal: if state.auth_authority_available {
-                authorization_not_admitted(&state, envelope)
-            } else {
-                authoritative_auth_unavailable(&state, &envelope)
-            },
+            refusal: authorization_not_admitted(&state, params.into()),
         }
     }
 
@@ -293,13 +288,8 @@ impl ManagedTransitionCoordinator {
         params: ReadManagedTransitionParams,
     ) -> ReadManagedTransitionResponse {
         let state = self.state.lock().await;
-        let envelope = TransitionEnvelope::read(params);
         ReadManagedTransitionResponse::Refused {
-            refusal: if state.auth_authority_available {
-                authorization_not_admitted(&state, envelope)
-            } else {
-                authoritative_auth_unavailable(&state, &envelope)
-            },
+            refusal: authorization_not_admitted(&state, TransitionEnvelope::read(params)),
         }
     }
 
@@ -366,13 +356,8 @@ impl ManagedTransitionCoordinator {
         params: CancelManagedTransitionParams,
     ) -> CancelManagedTransitionResponse {
         let state = self.state.lock().await;
-        let envelope = TransitionEnvelope::cancel(params);
         CancelManagedTransitionResponse::Refused {
-            refusal: if state.auth_authority_available {
-                authorization_not_admitted(&state, envelope)
-            } else {
-                authoritative_auth_unavailable(&state, &envelope)
-            },
+            refusal: authorization_not_admitted(&state, TransitionEnvelope::cancel(params)),
         }
     }
 
@@ -1009,6 +994,166 @@ mod tests {
             assert_eq!(retried.result_auth_fingerprint, expected_fingerprint);
             assert_eq!(retried.phase, ManagedTransitionPhase::Admitted);
         }
+    }
+
+    /// Builds the real production authority mapping
+    /// (`AuthManager::new` -> `AuthoritativeAuthState::from_auth_manager`) and
+    /// a coordinator from it, against a genuine on-disk `codex_home`. Used
+    /// directly against the coordinator's own internal `admit`/`advance`/
+    /// `read`/`cancel` methods, never through the public wire gate, so this
+    /// never opens the still-unexposed Slice 2 authorization surface
+    /// (`CODEX-I05-S01-R07-001`'s own required correction).
+    async fn coordinator_from_real_persisted_auth(codex_home: &std::path::Path) -> (ManagedTransitionCoordinator, String) {
+        let auth_manager = codex_login::AuthManager::new(
+            codex_home.to_path_buf(),
+            /*enable_codex_api_key_env*/ false,
+            codex_config::types::AuthCredentialsStoreMode::File,
+            /*forced_chatgpt_workspace_id*/ None,
+            /*chatgpt_base_url*/ None,
+            codex_login::AuthKeyringBackendKind::default(),
+            codex_login::test_support::transport_default_auth_route_config(),
+        )
+        .await;
+        let coordinator = ManagedTransitionCoordinator::from_authoritative_auth_state(
+            AuthoritativeAuthState::from_auth_manager(&auth_manager),
+        );
+        let process_id = coordinator.process_instance_id().await;
+        (coordinator, process_id)
+    }
+
+    fn write_valid_api_key_auth(codex_home: &std::path::Path) {
+        let auth = codex_login::AuthDotJson {
+            auth_mode: None,
+            openai_api_key: Some("test-key".to_owned()),
+            tokens: None,
+            last_refresh: None,
+            agent_identity: None,
+            personal_access_token: None,
+            bedrock_api_key: None,
+        };
+        codex_login::save_auth(
+            codex_home,
+            &auth,
+            codex_config::types::AuthCredentialsStoreMode::File,
+            codex_login::AuthKeyringBackendKind::default(),
+        )
+        .expect("write valid auth.json");
+    }
+
+    #[tokio::test]
+    async fn restart_reconstructs_every_material_phase_through_the_real_persisted_auth_mapper() {
+        let codex_home = tempfile::TempDir::new().expect("create temp codex_home");
+        write_valid_api_key_auth(codex_home.path());
+
+        // Material and terminal phases, each driven from a fresh coordinator
+        // built on the real mapper, restarting (a fresh `AuthManager` reading
+        // the same unchanged on-disk source) between the admitting process
+        // and the process that observes the restart.
+        for (boundary, phases, cancel) in [
+            ("admitted", vec![], false),
+            ("draining", vec![ManagedTransitionPhase::Draining], false),
+            (
+                "succeeded",
+                vec![
+                    ManagedTransitionPhase::Draining,
+                    ManagedTransitionPhase::Adopting,
+                    ManagedTransitionPhase::Resetting,
+                    ManagedTransitionPhase::Succeeded,
+                ],
+                false,
+            ),
+            ("cancelled", vec![], true),
+        ] {
+            let (before_restart, old_process_id) =
+                coordinator_from_real_persisted_auth(codex_home.path()).await;
+            let transition_id = format!("real-mapper-{boundary}");
+            before_restart
+                .admit(request(old_process_id.clone(), &transition_id))
+                .await
+                .unwrap_or_else(|e| panic!("{boundary}: admit under available real auth must succeed: {e:?}"));
+            if cancel {
+                before_restart
+                    .cancel(cancel_request(old_process_id.clone(), &transition_id))
+                    .await
+                    .unwrap();
+            } else {
+                for phase in phases {
+                    before_restart.advance(&transition_id, phase).await.unwrap();
+                }
+            }
+
+            // Restart: a fresh `AuthManager` re-reads the same, unchanged
+            // persisted source and a fresh coordinator is built from it.
+            let (restarted, new_process_id) =
+                coordinator_from_real_persisted_auth(codex_home.path()).await;
+            assert_ne!(
+                new_process_id, old_process_id,
+                "{boundary}: restart must reconstruct a new process identity"
+            );
+
+            // Typed rejection of the old process identity: the restarted
+            // coordinator's own internal `read` (not the public wire gate)
+            // genuinely compares process identity and refuses the stale one.
+            assert_eq!(
+                restarted
+                    .read(read_request(old_process_id, &transition_id))
+                    .await
+                    .unwrap_err()
+                    .kind,
+                ManagedTransitionRefusalKind::ProcessMismatch,
+                "{boundary}: old process identity must never resolve a transition after restart"
+            );
+
+            // No manufactured old outcome or reservation: the restarted
+            // coordinator has no record of the pre-restart transition at all
+            // under its own new process identity.
+            assert_eq!(
+                restarted
+                    .read(read_request(new_process_id.clone(), &transition_id))
+                    .await
+                    .unwrap_err()
+                    .kind,
+                ManagedTransitionRefusalKind::InvalidRequest,
+                "{boundary}: restart must not resurrect or manufacture the pre-restart outcome"
+            );
+
+            // Safe current-state retry: the restarted process can still
+            // admit a fresh transition against the same real, available auth.
+            let retried = restarted
+                .admit(request(new_process_id, &format!("retry-{boundary}")))
+                .await
+                .unwrap_or_else(|e| panic!("{boundary}: retry after restart must succeed: {e:?}"));
+            assert_eq!(retried.phase, ManagedTransitionPhase::Admitted);
+        }
+
+        // Initial-load failure: the real mapper must report the coordinator
+        // as unavailable, and its own internal gate (not the public wire
+        // stub) must refuse with the typed variant before any mutation.
+        std::fs::write(codex_home.path().join("auth.json"), "not valid json")
+            .expect("write unreadable auth.json");
+        let (unavailable, unavailable_process_id) =
+            coordinator_from_real_persisted_auth(codex_home.path()).await;
+        assert_eq!(
+            unavailable
+                .admit(request(unavailable_process_id, "unavailable-transition"))
+                .await
+                .unwrap_err()
+                .kind,
+            ManagedTransitionRefusalKind::AuthoritativeAuthUnavailable,
+            "an unreadable persisted source must refuse admission through the real mapper, not silently log out"
+        );
+
+        // Safe retry after repair: restoring a genuinely readable source
+        // recovers admission, proving the source is retried rather than
+        // latched into a poisoned unavailable state.
+        write_valid_api_key_auth(codex_home.path());
+        let (repaired, repaired_process_id) =
+            coordinator_from_real_persisted_auth(codex_home.path()).await;
+        let repaired_admit = repaired
+            .admit(request(repaired_process_id, "repaired-transition"))
+            .await
+            .unwrap_or_else(|e| panic!("admit after repairing the persisted source must succeed: {e:?}"));
+        assert_eq!(repaired_admit.phase, ManagedTransitionPhase::Admitted);
     }
 
     #[test]

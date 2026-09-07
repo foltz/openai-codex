@@ -1021,12 +1021,43 @@ mod tests {
         (coordinator, process_id)
     }
 
-    fn write_valid_api_key_auth(codex_home: &std::path::Path) {
+    const REAL_MAPPER_TEST_ACCOUNT_ID: &str = "intended-managed-account";
+
+    /// A minimal, genuinely parseable (unsigned, `alg: none`) ID token JWT.
+    /// `IdTokenInfo`'s own on-disk representation round-trips through its raw
+    /// JWT string (`token_data::parse_chatgpt_jwt_claims`), so a `Default`
+    /// value cannot survive a real save-then-load cycle -- this constructs
+    /// the same minimal shape `app_test_support::encode_id_token` uses.
+    fn minimal_id_token_jwt() -> codex_login::token_data::IdTokenInfo {
+        use base64::Engine;
+        let encode = |value: &serde_json::Value| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(value).expect("serialize jwt part"))
+        };
+        let header = encode(&serde_json::json!({ "alg": "none", "typ": "JWT" }));
+        let payload = encode(&serde_json::json!({}));
+        let signature =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"test-signature");
+        let raw_jwt = format!("{header}.{payload}.{signature}");
+        codex_login::token_data::parse_chatgpt_jwt_claims(&raw_jwt)
+            .expect("minimal JWT must parse as valid ID token claims")
+    }
+
+    /// Writes a genuine ChatGPT-mode persisted auth record naming a real
+    /// account id, so the production mapper reconstructs the durable
+    /// intended-account fingerprint rather than a null one (`CODEX-I05-S01-R04`
+    /// Round 08's third required correction).
+    fn write_chatgpt_auth_for_intended_account(codex_home: &std::path::Path, account_id: &str) {
         let auth = codex_login::AuthDotJson {
-            auth_mode: None,
-            openai_api_key: Some("test-key".to_owned()),
-            tokens: None,
-            last_refresh: None,
+            auth_mode: Some(codex_protocol::auth::AuthMode::Chatgpt),
+            openai_api_key: None,
+            tokens: Some(codex_login::TokenData {
+                id_token: minimal_id_token_jwt(),
+                access_token: "test-access-token".to_owned(),
+                refresh_token: "test-refresh-token".to_owned(),
+                account_id: Some(account_id.to_owned()),
+            }),
+            last_refresh: Some(chrono::Utc::now()),
             agent_identity: None,
             personal_access_token: None,
             bedrock_api_key: None,
@@ -1040,18 +1071,89 @@ mod tests {
         .expect("write valid auth.json");
     }
 
+    /// Reproduces the exact domain-separated fingerprint derivation in
+    /// `AuthoritativeAuthState::from_account_id`, above, so the test can
+    /// assert the production mapper reconstructs precisely the intended
+    /// account's fingerprint, not merely a non-null one.
+    fn expected_fingerprint_for_account(account_id: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"codex-app-server/managed-auth-transition/account/v1\\0");
+        hasher.update(account_id.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// Admits a brand-new transition on an already-constructed coordinator,
+    /// drives it all the way to completion, and proves it acknowledges
+    /// truthfully with the re-derived intended fingerprint -- R022's
+    /// "completes and acknowledges" retry contract, not merely a fresh
+    /// `Admitted` re-admission.
+    async fn complete_a_fresh_transition(
+        coordinator: &ManagedTransitionCoordinator,
+        process_id: &str,
+        boundary: &str,
+        expected_fingerprint: &str,
+    ) {
+        let transition_id = format!("retry-{boundary}");
+        let mut retry = request(process_id.to_owned(), &transition_id);
+        retry.expected_auth_fingerprint = Some(expected_fingerprint.to_owned());
+        let admitted = coordinator
+            .admit(retry)
+            .await
+            .unwrap_or_else(|e| panic!("{boundary}: retry after restart must be admitted: {e:?}"));
+        assert_eq!(admitted.phase, ManagedTransitionPhase::Admitted);
+        for phase in [
+            ManagedTransitionPhase::Draining,
+            ManagedTransitionPhase::Adopting,
+            ManagedTransitionPhase::Resetting,
+            ManagedTransitionPhase::Succeeded,
+        ] {
+            coordinator
+                .advance(&transition_id, phase)
+                .await
+                .unwrap_or_else(|e| panic!("{boundary}: retry must advance to {phase:?}: {e:?}"));
+        }
+        let completed = coordinator
+            .read(read_request(process_id.to_owned(), &transition_id))
+            .await
+            .unwrap_or_else(|e| panic!("{boundary}: completed retry must be readable: {e:?}"));
+        assert_eq!(completed.phase, ManagedTransitionPhase::Succeeded);
+        assert_eq!(
+            completed.result_auth_fingerprint.as_deref(),
+            Some(expected_fingerprint),
+            "{boundary}: the completed retry must acknowledge the intended account's own fingerprint"
+        );
+    }
+
     #[tokio::test]
     async fn restart_reconstructs_every_material_phase_through_the_real_persisted_auth_mapper() {
         let codex_home = tempfile::TempDir::new().expect("create temp codex_home");
-        write_valid_api_key_auth(codex_home.path());
+        write_chatgpt_auth_for_intended_account(codex_home.path(), REAL_MAPPER_TEST_ACCOUNT_ID);
+        let expected_fingerprint = expected_fingerprint_for_account(REAL_MAPPER_TEST_ACCOUNT_ID);
 
-        // Material and terminal phases, each driven from a fresh coordinator
-        // built on the real mapper, restarting (a fresh `AuthManager` reading
-        // the same unchanged on-disk source) between the admitting process
-        // and the process that observes the restart.
+        // Every material phase and each terminal state, each driven from a
+        // fresh coordinator built on the real mapper, restarting (a fresh
+        // `AuthManager` reading the same unchanged on-disk source) between
+        // the admitting process and the process that observes the restart.
         for (boundary, phases, cancel) in [
             ("admitted", vec![], false),
             ("draining", vec![ManagedTransitionPhase::Draining], false),
+            (
+                "adopting",
+                vec![
+                    ManagedTransitionPhase::Draining,
+                    ManagedTransitionPhase::Adopting,
+                ],
+                false,
+            ),
+            (
+                "resetting",
+                vec![
+                    ManagedTransitionPhase::Draining,
+                    ManagedTransitionPhase::Adopting,
+                    ManagedTransitionPhase::Resetting,
+                ],
+                false,
+            ),
             (
                 "succeeded",
                 vec![
@@ -1062,15 +1164,30 @@ mod tests {
                 ],
                 false,
             ),
+            (
+                "quarantined",
+                vec![
+                    ManagedTransitionPhase::Draining,
+                    ManagedTransitionPhase::Quarantined,
+                ],
+                false,
+            ),
             ("cancelled", vec![], true),
         ] {
             let (before_restart, old_process_id) =
                 coordinator_from_real_persisted_auth(codex_home.path()).await;
             let transition_id = format!("real-mapper-{boundary}");
-            before_restart
-                .admit(request(old_process_id.clone(), &transition_id))
+            let mut initial = request(old_process_id.clone(), &transition_id);
+            initial.expected_auth_fingerprint = Some(expected_fingerprint.clone());
+            let admitted = before_restart
+                .admit(initial)
                 .await
                 .unwrap_or_else(|e| panic!("{boundary}: admit under available real auth must succeed: {e:?}"));
+            assert_eq!(
+                admitted.result_auth_fingerprint.as_deref(),
+                Some(expected_fingerprint.as_str()),
+                "{boundary}: admission must reconstruct the intended account's own fingerprint"
+            );
             if cancel {
                 before_restart
                     .cancel(cancel_request(old_process_id.clone(), &transition_id))
@@ -1080,6 +1197,16 @@ mod tests {
                 for phase in phases {
                     before_restart.advance(&transition_id, phase).await.unwrap();
                 }
+            }
+            if boundary == "quarantined" {
+                let quarantined_status = before_restart
+                    .read(read_request(old_process_id.clone(), &transition_id))
+                    .await
+                    .unwrap();
+                assert!(
+                    quarantined_status.retryable,
+                    "quarantined is the one terminal phase whose own status must report retryable"
+                );
             }
 
             // Restart: a fresh `AuthManager` re-reads the same, unchanged
@@ -1117,13 +1244,12 @@ mod tests {
                 "{boundary}: restart must not resurrect or manufacture the pre-restart outcome"
             );
 
-            // Safe current-state retry: the restarted process can still
-            // admit a fresh transition against the same real, available auth.
-            let retried = restarted
-                .admit(request(new_process_id, &format!("retry-{boundary}")))
-                .await
-                .unwrap_or_else(|e| panic!("{boundary}: retry after restart must succeed: {e:?}"));
-            assert_eq!(retried.phase, ManagedTransitionPhase::Admitted);
+            // Safe current-state retry, on this same restarted process, that
+            // completes and acknowledges truthfully with the intended
+            // account's own fingerprint -- not merely a fresh `Admitted`
+            // re-admission.
+            complete_a_fresh_transition(&restarted, &new_process_id, boundary, &expected_fingerprint)
+                .await;
         }
 
         // Initial-load failure: the real mapper must report the coordinator
@@ -1143,17 +1269,14 @@ mod tests {
             "an unreadable persisted source must refuse admission through the real mapper, not silently log out"
         );
 
-        // Safe retry after repair: restoring a genuinely readable source
-        // recovers admission, proving the source is retried rather than
-        // latched into a poisoned unavailable state.
-        write_valid_api_key_auth(codex_home.path());
+        // Safe retry after repair: restoring the same genuine intended
+        // account recovers admission and completes truthfully, proving the
+        // source is retried rather than latched into a poisoned state.
+        write_chatgpt_auth_for_intended_account(codex_home.path(), REAL_MAPPER_TEST_ACCOUNT_ID);
         let (repaired, repaired_process_id) =
             coordinator_from_real_persisted_auth(codex_home.path()).await;
-        let repaired_admit = repaired
-            .admit(request(repaired_process_id, "repaired-transition"))
-            .await
-            .unwrap_or_else(|e| panic!("admit after repairing the persisted source must succeed: {e:?}"));
-        assert_eq!(repaired_admit.phase, ManagedTransitionPhase::Admitted);
+        complete_a_fresh_transition(&repaired, &repaired_process_id, "repaired", &expected_fingerprint)
+            .await;
     }
 
     #[test]

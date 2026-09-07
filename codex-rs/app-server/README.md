@@ -385,8 +385,8 @@ persistence, and unloaded reads. It is independent of the client origin in
 
 ## Managed authentication transitions
 
-`account/managedTransition/start`, `/read`, `/cancel`, and
-`account/managedTransition/statusUpdated` form the experimental, versioned
+`account/managedAuthTransition/start`, `/read`, `/cancel`, and
+`account/managedAuthTransition/updated` form the experimental, version-`1`
 managed-auth transition protocol. Until a server-derived caller authorization
 is installed, all three requests refuse with `authorizationNotAdmitted` and
 make no auth or transition-state change. The protocol carries only correlation

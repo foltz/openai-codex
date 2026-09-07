@@ -1329,22 +1329,22 @@ client_request_definitions! {
         response: v2::CancelLoginAccountResponse,
     },
 
-    #[experimental("account/managedTransition")]
-    ManagedTransitionStart => "account/managedTransition/start" {
+    #[experimental("account/managedAuthTransition")]
+    ManagedTransitionStart => "account/managedAuthTransition/start" {
         params: v2::StartManagedTransitionParams,
         serialization: global("managed-account-transition"),
         response: v2::StartManagedTransitionResponse,
     },
 
-    #[experimental("account/managedTransition")]
-    ManagedTransitionRead => "account/managedTransition/read" {
+    #[experimental("account/managedAuthTransition")]
+    ManagedTransitionRead => "account/managedAuthTransition/read" {
         params: v2::ReadManagedTransitionParams,
         serialization: global_shared_read("managed-account-transition"),
         response: v2::ReadManagedTransitionResponse,
     },
 
-    #[experimental("account/managedTransition")]
-    ManagedTransitionCancel => "account/managedTransition/cancel" {
+    #[experimental("account/managedAuthTransition")]
+    ManagedTransitionCancel => "account/managedAuthTransition/cancel" {
         params: v2::CancelManagedTransitionParams,
         serialization: global("managed-account-transition"),
         response: v2::CancelManagedTransitionResponse,
@@ -2034,7 +2034,8 @@ server_notification_definitions! {
     #[experimental("mcpServer/event/stream/notification")]
     McpServerEventStream => "mcpServer/event/stream/notification" (v2::McpServerEventStreamNotification),
     AccountUpdated => "account/updated" (v2::AccountUpdatedNotification),
-    ManagedTransitionStatusUpdated => "account/managedTransition/statusUpdated" (v2::ManagedTransitionStatusNotification),
+    #[experimental("account/managedAuthTransition")]
+    ManagedTransitionStatusUpdated => "account/managedAuthTransition/updated" (v2::ManagedTransitionStatusNotification),
     AccountRateLimitsUpdated => "account/rateLimits/updated" (v2::AccountRateLimitsUpdatedNotification),
     AppListUpdated => "app/list/updated" (v2::AppListUpdatedNotification),
     RemoteControlStatusChanged => "remoteControl/status/changed" (v2::RemoteControlStatusChangedNotification),
@@ -2092,6 +2093,16 @@ server_notification_definitions! {
     AccountLoginCompleted(v2::AccountLoginCompletedNotification),
 
 }
+
+/// Notification methods and payloads intentionally omitted from stable
+/// schema/TypeScript projections. The runtime enum still carries their
+/// `ExperimentalApi` marker so experimental consumers can opt in.
+#[cfg(test)]
+pub(crate) const EXPERIMENTAL_SERVER_NOTIFICATION_METHODS: &[&str] =
+    &["account/managedAuthTransition/updated"];
+#[cfg(test)]
+pub(crate) const EXPERIMENTAL_SERVER_NOTIFICATION_TYPES: &[&str] =
+    &["ManagedTransitionStatusNotification"];
 
 /// Server notification envelope sent over app-server transports.
 ///

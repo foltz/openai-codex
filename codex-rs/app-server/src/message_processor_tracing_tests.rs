@@ -10,13 +10,22 @@ use anyhow::Result;
 use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::write_mock_responses_config_toml;
 use codex_analytics::AppServerRpcTransport;
+use codex_app_server_protocol::CancelManagedTransitionParams;
+use codex_app_server_protocol::CancelManagedTransitionResponse;
 use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::InitializeCapabilities;
 use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::InitializeResponse;
 use codex_app_server_protocol::JSONRPCRequest;
+use codex_app_server_protocol::MANAGED_AUTH_TRANSITION_CONTRACT_VERSION;
+use codex_app_server_protocol::ManagedTransitionIntent;
+use codex_app_server_protocol::ManagedTransitionRefusalKind;
+use codex_app_server_protocol::ReadManagedTransitionParams;
+use codex_app_server_protocol::ReadManagedTransitionResponse;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::StartManagedTransitionParams;
+use codex_app_server_protocol::StartManagedTransitionResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::TurnStartParams;
@@ -897,4 +906,97 @@ async fn turn_start_jsonrpc_span_parents_core_turn_spans() -> Result<()> {
     harness.shutdown().await;
 
     Ok(())
+}
+
+#[test]
+#[serial(app_server_tracing)]
+fn managed_transition_dispatch_paths_refuse_before_authorization_without_reserving_state()
+-> Result<()> {
+    run_current_thread_test_with_stack(
+        "managed_transition_dispatch_paths_refuse_before_authorization_without_reserving_state",
+        async {
+            let mut harness = TracingHarness::new().await?;
+            let process_instance_id = harness
+                .processor
+                .managed_transition_coordinator
+                .process_instance_id()
+                .await;
+            let start_params = StartManagedTransitionParams {
+                contract_version: MANAGED_AUTH_TRANSITION_CONTRACT_VERSION,
+                transition_id: "transition-a".to_owned(),
+                process_instance_id: process_instance_id.clone(),
+                intent: ManagedTransitionIntent::AdoptManagedAuth,
+                expected_auth_revision: 0,
+                expected_transition_revision: 0,
+                expected_auth_fingerprint: None,
+            };
+            let start: StartManagedTransitionResponse = harness
+                .request(
+                    ClientRequest::ManagedTransitionStart {
+                        request_id: RequestId::Integer(40_001),
+                        params: start_params.clone(),
+                    },
+                    None,
+                )
+                .await;
+            let read: ReadManagedTransitionResponse = harness
+                .request(
+                    ClientRequest::ManagedTransitionRead {
+                        request_id: RequestId::Integer(40_002),
+                        params: ReadManagedTransitionParams {
+                            contract_version: MANAGED_AUTH_TRANSITION_CONTRACT_VERSION,
+                            transition_id: start_params.transition_id.clone(),
+                            process_instance_id: process_instance_id.clone(),
+                        },
+                    },
+                    None,
+                )
+                .await;
+            let cancel: CancelManagedTransitionResponse = harness
+                .request(
+                    ClientRequest::ManagedTransitionCancel {
+                        request_id: RequestId::Integer(40_003),
+                        params: CancelManagedTransitionParams {
+                            contract_version: MANAGED_AUTH_TRANSITION_CONTRACT_VERSION,
+                            transition_id: start_params.transition_id.clone(),
+                            process_instance_id,
+                        },
+                    },
+                    None,
+                )
+                .await;
+            for refusal in [
+                match start {
+                    StartManagedTransitionResponse::Refused { refusal } => refusal,
+                    StartManagedTransitionResponse::Accepted { .. } => panic!("start must refuse"),
+                },
+                match read {
+                    ReadManagedTransitionResponse::Refused { refusal } => refusal,
+                    ReadManagedTransitionResponse::Accepted { .. } => panic!("read must refuse"),
+                },
+                match cancel {
+                    CancelManagedTransitionResponse::Refused { refusal } => refusal,
+                    CancelManagedTransitionResponse::Accepted { .. } => {
+                        panic!("cancel must refuse")
+                    }
+                },
+            ] {
+                assert_eq!(
+                    refusal.kind,
+                    ManagedTransitionRefusalKind::AuthorizationNotAdmitted
+                );
+            }
+            assert!(
+                harness
+                    .processor
+                    .managed_transition_coordinator
+                    .admit(start_params)
+                    .await
+                    .is_ok(),
+                "the three real MessageProcessor paths must not reserve the transition"
+            );
+            harness.shutdown().await;
+            Ok(())
+        },
+    )
 }

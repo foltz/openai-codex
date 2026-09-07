@@ -5459,26 +5459,6 @@
           "properties": {
             "method": {
               "enum": [
-                "account/managedTransition/statusUpdated"
-              ],
-              "title": "Account/managedTransition/statusUpdatedNotificationMethod",
-              "type": "string"
-            },
-            "params": {
-              "$ref": "#/definitions/v2/ManagedTransitionStatusNotification"
-            }
-          },
-          "required": [
-            "method",
-            "params"
-          ],
-          "title": "Account/managedTransition/statusUpdatedNotification",
-          "type": "object"
-        },
-        {
-          "properties": {
-            "method": {
-              "enum": [
                 "account/rateLimits/updated"
               ],
               "title": "Account/rateLimits/updatedNotificationMethod",
@@ -14291,6 +14271,7 @@
         "type": "string"
       },
       "ManagedTransitionRefusal": {
+        "additionalProperties": false,
         "properties": {
           "authFingerprint": {
             "type": [
@@ -14322,6 +14303,7 @@
           }
         },
         "required": [
+          "authFingerprint",
           "authRevision",
           "kind",
           "processInstanceId",
@@ -14348,6 +14330,7 @@
         "type": "string"
       },
       "ManagedTransitionStatus": {
+        "additionalProperties": false,
         "properties": {
           "authRevision": {
             "format": "uint64",
@@ -14372,6 +14355,16 @@
               "string",
               "null"
             ]
+          },
+          "priorAuthRevision": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "priorTransitionRevision": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
           },
           "processInstanceId": {
             "type": "string"
@@ -14409,24 +14402,18 @@
         },
         "required": [
           "authRevision",
+          "intent",
           "phase",
+          "priorAuthFingerprint",
+          "priorAuthRevision",
+          "priorTransitionRevision",
           "processInstanceId",
+          "refusal",
+          "resultAuthFingerprint",
           "retryable",
+          "transitionId",
           "transitionRevision"
         ],
-        "type": "object"
-      },
-      "ManagedTransitionStatusNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
-        "properties": {
-          "status": {
-            "$ref": "#/definitions/v2/ManagedTransitionStatus"
-          }
-        },
-        "required": [
-          "status"
-        ],
-        "title": "ManagedTransitionStatusNotification",
         "type": "object"
       },
       "MarketplaceAddParams": {

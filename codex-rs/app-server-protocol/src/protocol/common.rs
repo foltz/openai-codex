@@ -1329,6 +1329,27 @@ client_request_definitions! {
         response: v2::CancelLoginAccountResponse,
     },
 
+    #[experimental("account/managedTransition")]
+    ManagedTransitionStart => "account/managedTransition/start" {
+        params: v2::StartManagedTransitionParams,
+        serialization: global("managed-account-transition"),
+        response: v2::StartManagedTransitionResponse,
+    },
+
+    #[experimental("account/managedTransition")]
+    ManagedTransitionRead => "account/managedTransition/read" {
+        params: v2::ReadManagedTransitionParams,
+        serialization: global_shared_read("managed-account-transition"),
+        response: v2::ReadManagedTransitionResponse,
+    },
+
+    #[experimental("account/managedTransition")]
+    ManagedTransitionCancel => "account/managedTransition/cancel" {
+        params: v2::CancelManagedTransitionParams,
+        serialization: global("managed-account-transition"),
+        response: v2::CancelManagedTransitionResponse,
+    },
+
     LogoutAccount => "account/logout" {
         params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
         serialization: global("account-auth"),
@@ -2013,6 +2034,7 @@ server_notification_definitions! {
     #[experimental("mcpServer/event/stream/notification")]
     McpServerEventStream => "mcpServer/event/stream/notification" (v2::McpServerEventStreamNotification),
     AccountUpdated => "account/updated" (v2::AccountUpdatedNotification),
+    ManagedTransitionStatusUpdated => "account/managedTransition/statusUpdated" (v2::ManagedTransitionStatusNotification),
     AccountRateLimitsUpdated => "account/rateLimits/updated" (v2::AccountRateLimitsUpdatedNotification),
     AppListUpdated => "app/list/updated" (v2::AppListUpdatedNotification),
     RemoteControlStatusChanged => "remoteControl/status/changed" (v2::RemoteControlStatusChangedNotification),

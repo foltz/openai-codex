@@ -383,6 +383,16 @@ persistence, and unloaded reads. It is independent of the client origin in
 `source` and of interactive subscription state. Missing classification remains
 `null`; it is not inferred to be `user` from either origin or subscription.
 
+## Managed authentication transitions
+
+`account/managedTransition/start`, `/read`, `/cancel`, and
+`account/managedTransition/statusUpdated` form the experimental, versioned
+managed-auth transition protocol. Until a server-derived caller authorization
+is installed, all three requests refuse with `authorizationNotAdmitted` and
+make no auth or transition-state change. The protocol carries only correlation
+and revision/fingerprint metadata; it never accepts credentials or account
+secrets.
+
 ## Clear transition observation
 
 Experimental clients can query this hosting server's durable clear record without

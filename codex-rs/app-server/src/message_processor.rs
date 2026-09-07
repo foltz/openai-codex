@@ -242,6 +242,7 @@ pub(crate) struct MessageProcessor {
     fs_processor: FsRequestProcessor,
     git_processor: GitRequestProcessor,
     initialize_processor: InitializeRequestProcessor,
+    managed_transition_coordinator: crate::managed_transition::ManagedTransitionCoordinator,
     marketplace_processor: MarketplaceRequestProcessor,
     mcp_processor: McpRequestProcessor,
     plugin_processor: PluginRequestProcessor,
@@ -615,6 +616,8 @@ impl MessageProcessor {
             rpc_transport,
             Arc::clone(&user_verification),
         );
+        let managed_transition_coordinator =
+            crate::managed_transition::ManagedTransitionCoordinator::new();
         let marketplace_processor = MarketplaceRequestProcessor::new(
             Arc::clone(&config),
             config_manager.clone(),
@@ -761,6 +764,7 @@ impl MessageProcessor {
             fs_processor,
             git_processor,
             initialize_processor,
+            managed_transition_coordinator,
             marketplace_processor,
             mcp_processor,
             plugin_processor,
@@ -2067,6 +2071,24 @@ impl MessageProcessor {
             ClientRequest::CancelLoginAccount { params, .. } => {
                 self.account_processor.cancel_login_account(params).await
             }
+            ClientRequest::ManagedTransitionStart { params, .. } => Ok(Some(
+                self.managed_transition_coordinator
+                    .start_not_admitted_response(params)
+                    .await
+                    .into(),
+            )),
+            ClientRequest::ManagedTransitionRead { params, .. } => Ok(Some(
+                self.managed_transition_coordinator
+                    .read_not_admitted_response(params)
+                    .await
+                    .into(),
+            )),
+            ClientRequest::ManagedTransitionCancel { params, .. } => Ok(Some(
+                self.managed_transition_coordinator
+                    .cancel_not_admitted_response(params)
+                    .await
+                    .into(),
+            )),
             ClientRequest::GetAccount { params, .. } => {
                 self.account_processor.get_account(params).await
             }

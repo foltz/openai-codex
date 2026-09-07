@@ -1980,6 +1980,14 @@
       ],
       "type": "string"
     },
+    "ManagedTransitionIntent": {
+      "description": "A token-free intent for a managed transition. The credential writer and the authoritative auth operation intentionally live behind later server-side admission stages; neither is represented on this wire surface.",
+      "enum": [
+        "adoptManagedAuth",
+        "adoptManagedLogout"
+      ],
+      "type": "string"
+    },
     "MarketplaceAddParams": {
       "properties": {
         "refName": {

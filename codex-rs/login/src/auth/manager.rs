@@ -1692,6 +1692,11 @@ impl AuthDotJson {
 #[derive(Clone)]
 struct CachedAuth {
     auth: Option<CodexAuth>,
+    /// `None` auth is authoritative only when the initial persisted-state read
+    /// completed successfully. Keep an initialization failure distinct so a
+    /// restart-sensitive consumer cannot mistake an unreadable authority for a
+    /// logged-out account.
+    initial_load_failed: bool,
     /// Permanent refresh failure cached for the current auth snapshot so
     /// later refresh attempts for the same credentials fail fast without network.
     permanent_refresh_failure: Option<AuthScopedRefreshFailure>,
@@ -1701,6 +1706,14 @@ struct CachedAuth {
 struct AuthScopedRefreshFailure {
     auth: CodexAuth,
     error: RefreshTokenFailedError,
+}
+
+/// A caller that needs a restart-safe account snapshot must distinguish a
+/// confirmed logged-out state from an unreadable cached authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthoritativeAuthUnavailable {
+    InitialLoadFailed,
+    CacheLockUnavailable,
 }
 
 impl Debug for CachedAuth {
@@ -2046,11 +2059,9 @@ impl AuthManager {
     }
 
     async fn new_from_auth_config(auth_config: AuthConfig, enable_codex_api_key_env: bool) -> Self {
-        let managed_auth = auth_config
-            .load_auth(enable_codex_api_key_env)
-            .await
-            .ok()
-            .flatten();
+        let initial_load = auth_config.load_auth(enable_codex_api_key_env).await;
+        let initial_load_failed = initial_load.is_err();
+        let managed_auth = initial_load.ok().flatten();
         let AuthConfig {
             codex_home,
             auth_credentials_store_mode,
@@ -2068,6 +2079,7 @@ impl AuthManager {
             codex_home,
             inner: RwLock::new(CachedAuth {
                 auth: managed_auth,
+                initial_load_failed,
                 permanent_refresh_failure: None,
             }),
             auth_change_tx,
@@ -2091,6 +2103,7 @@ impl AuthManager {
     pub fn from_auth_for_testing(auth: CodexAuth) -> Arc<Self> {
         let cached = CachedAuth {
             auth: Some(auth),
+            initial_load_failed: false,
             permanent_refresh_failure: None,
         };
         let (auth_change_tx, _auth_change_rx) = watch::channel(0);
@@ -2119,6 +2132,7 @@ impl AuthManager {
     pub fn from_auth_for_testing_with_home(auth: CodexAuth, codex_home: PathBuf) -> Arc<Self> {
         let cached = CachedAuth {
             auth: Some(auth),
+            initial_load_failed: false,
             permanent_refresh_failure: None,
         };
         let (auth_change_tx, _auth_change_rx) = watch::channel(0);
@@ -2150,6 +2164,7 @@ impl AuthManager {
     ) -> Arc<Self> {
         let cached = CachedAuth {
             auth: Some(auth),
+            initial_load_failed: false,
             permanent_refresh_failure: None,
         };
         let (auth_change_tx, _auth_change_rx) = watch::channel(0);
@@ -2183,6 +2198,7 @@ impl AuthManager {
             codex_home: PathBuf::from("non-existent"),
             inner: RwLock::new(CachedAuth {
                 auth: None,
+                initial_load_failed: false,
                 permanent_refresh_failure: None,
             }),
             auth_change_tx,
@@ -2214,6 +2230,23 @@ impl AuthManager {
             .read()
             .ok()
             .and_then(|cached| cached.auth.clone())
+    }
+
+    /// Returns the cached startup authority without collapsing an unavailable
+    /// source into a logged-out state. This is intentionally separate from
+    /// [`Self::auth_cached`], whose established callers treat unavailable auth
+    /// as unauthenticated for their own compatibility reasons.
+    pub fn authoritative_auth_cached(
+        &self,
+    ) -> Result<Option<CodexAuth>, AuthoritativeAuthUnavailable> {
+        let cached = self
+            .inner
+            .read()
+            .map_err(|_| AuthoritativeAuthUnavailable::CacheLockUnavailable)?;
+        if cached.initial_load_failed {
+            return Err(AuthoritativeAuthUnavailable::InitialLoadFailed);
+        }
+        Ok(cached.auth.clone())
     }
 
     /// Subscribes to cached auth changes that can affect request recovery.

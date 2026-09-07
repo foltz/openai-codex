@@ -2471,6 +2471,7 @@
       "type": "string"
     },
     "ManagedTransitionStatus": {
+      "additionalProperties": false,
       "properties": {
         "authRevision": {
           "format": "uint64",
@@ -2495,6 +2496,16 @@
             "string",
             "null"
           ]
+        },
+        "priorAuthRevision": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "priorTransitionRevision": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
         },
         "processInstanceId": {
           "type": "string"
@@ -2532,21 +2543,17 @@
       },
       "required": [
         "authRevision",
+        "intent",
         "phase",
+        "priorAuthFingerprint",
+        "priorAuthRevision",
+        "priorTransitionRevision",
         "processInstanceId",
+        "refusal",
+        "resultAuthFingerprint",
         "retryable",
+        "transitionId",
         "transitionRevision"
-      ],
-      "type": "object"
-    },
-    "ManagedTransitionStatusNotification": {
-      "properties": {
-        "status": {
-          "$ref": "#/definitions/ManagedTransitionStatus"
-        }
-      },
-      "required": [
-        "status"
       ],
       "type": "object"
     },
@@ -7019,26 +7026,6 @@
         "params"
       ],
       "title": "Account/updatedNotification",
-      "type": "object"
-    },
-    {
-      "properties": {
-        "method": {
-          "enum": [
-            "account/managedTransition/statusUpdated"
-          ],
-          "title": "Account/managedTransition/statusUpdatedNotificationMethod",
-          "type": "string"
-        },
-        "params": {
-          "$ref": "#/definitions/ManagedTransitionStatusNotification"
-        }
-      },
-      "required": [
-        "method",
-        "params"
-      ],
-      "title": "Account/managedTransition/statusUpdatedNotification",
       "type": "object"
     },
     {

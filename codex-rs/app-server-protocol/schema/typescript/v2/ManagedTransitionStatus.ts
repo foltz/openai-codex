@@ -5,4 +5,4 @@ import type { ManagedTransitionIntent } from "./ManagedTransitionIntent";
 import type { ManagedTransitionPhase } from "./ManagedTransitionPhase";
 import type { ManagedTransitionRefusalKind } from "./ManagedTransitionRefusalKind";
 
-export type ManagedTransitionStatus = { processInstanceId: string, transitionId: string | null, intent: ManagedTransitionIntent | null, phase: ManagedTransitionPhase, retryable: boolean, authRevision: bigint, transitionRevision: bigint, priorAuthFingerprint: string | null, resultAuthFingerprint: string | null, refusal: ManagedTransitionRefusalKind | null, };
+export type ManagedTransitionStatus = { processInstanceId: string, transitionId: string | null, intent: ManagedTransitionIntent | null, phase: ManagedTransitionPhase, retryable: boolean, priorAuthRevision: bigint, authRevision: bigint, priorTransitionRevision: bigint, transitionRevision: bigint, priorAuthFingerprint: string | null, resultAuthFingerprint: string | null, refusal: ManagedTransitionRefusalKind | null, };

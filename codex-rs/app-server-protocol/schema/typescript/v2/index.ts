@@ -222,7 +222,6 @@ export type { ManagedTransitionPhase } from "./ManagedTransitionPhase";
 export type { ManagedTransitionRefusal } from "./ManagedTransitionRefusal";
 export type { ManagedTransitionRefusalKind } from "./ManagedTransitionRefusalKind";
 export type { ManagedTransitionStatus } from "./ManagedTransitionStatus";
-export type { ManagedTransitionStatusNotification } from "./ManagedTransitionStatusNotification";
 export type { MarketplaceAddParams } from "./MarketplaceAddParams";
 export type { MarketplaceAddResponse } from "./MarketplaceAddResponse";
 export type { MarketplaceInterface } from "./MarketplaceInterface";

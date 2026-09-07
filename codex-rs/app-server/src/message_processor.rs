@@ -441,7 +441,9 @@ impl MessageProcessor {
             rpc_transport,
         );
         let managed_transition_coordinator =
-            crate::managed_transition::ManagedTransitionCoordinator::new();
+            crate::managed_transition::ManagedTransitionCoordinator::from_authoritative_auth_state(
+                crate::managed_transition::AuthoritativeAuthState::from_auth_manager(&auth_manager),
+            );
         let marketplace_processor = MarketplaceRequestProcessor::new(
             Arc::clone(&config),
             config_manager.clone(),

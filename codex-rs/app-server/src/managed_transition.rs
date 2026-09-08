@@ -171,6 +171,18 @@ pub(crate) trait ResetInventory: Send + Sync {
     fn reset_all(&self) -> ResetInventoryFuture<'_>;
 }
 
+/// What `advance_inner` should do to the coordinator's own CAS baseline
+/// (`state.auth_revision`/`auth_fingerprint`) alongside a phase transition
+/// (Issue 05 Slice 4, R014, R064). `Adopted` and `LoggedOut` are used
+/// identically whether the terminal phase is `Succeeded` (ordinary
+/// completion) or `Quarantined` (a reset-inventory failure after auth was
+/// already installed/logged out) -- in both cases the coordinator's own
+/// tracked truth must match what `AuthManager` actually holds.
+enum AdoptedAuthUpdate {
+    Adopted(String),
+    LoggedOut,
+}
+
 /// A fixed, always-consistent-with-itself source, for constructors that do
 /// not care about target evidence (every existing Slice 1-era test).
 /// `declared_profile: None` and `endpoint: String::new()` are themselves
@@ -786,16 +798,29 @@ impl ManagedTransitionCoordinator {
         // transition out of `active` (legal while still Draining) surfaces
         // here as this call's own `Err`, propagated by `?` -- the same
         // "no longer the active transition" refusal every other `advance`
-        // caller already gets from this race.
-        self.advance(transition_id, ManagedTransitionPhase::Adopting)
+        // caller already gets from this race. The status carries this
+        // transition's own declared intent (Slice 1's admission already
+        // fixed it), needed below to distinguish adopt-a-new-account from
+        // deliberate managed logout (R001, R002).
+        let adopting_status = self
+            .advance(transition_id, ManagedTransitionPhase::Adopting)
             .await?;
+        let intent = adopting_status.intent;
+
+        // Captured before the read so `install_managed_adoption`/
+        // `install_managed_logout` can refuse rather than overwrite an
+        // unrelated concurrent cache change that lands during it (R014's
+        // manager-owned CAS).
+        let previous_auth = auth_manager.auth_cached();
 
         // No lock held across this await: `AuthManager` owns its own
         // internal lock, and this call may perform network/file/keyring
         // I/O. Never composes distinct failure classes -- each
         // `ManagedAdoptionSourceOutcome` variant is inspected on its own.
-        let account_id = match auth_manager.read_managed_adoption_source().await {
-            ManagedAdoptionSourceOutcome::Available(new_auth) => {
+        let source_outcome = auth_manager.read_managed_adoption_source().await;
+
+        let account_id = match (intent, source_outcome) {
+            (_, ManagedAdoptionSourceOutcome::Available(new_auth)) => {
                 // `read_managed_adoption_source` already rejects a missing
                 // stable identity before ever returning `Available`, so
                 // `None` here should be unreachable; quarantine rather than
@@ -803,19 +828,47 @@ impl ManagedTransitionCoordinator {
                 let Some(account_id) = new_auth.get_account_id() else {
                     return self.quarantine(transition_id).await;
                 };
-                match auth_manager.install_managed_adoption(new_auth) {
+                match auth_manager.install_managed_adoption(new_auth, previous_auth) {
                     ManagedAdoptionInstallOutcome::Installed(_) => account_id,
-                    ManagedAdoptionInstallOutcome::CacheLockUnavailable => {
+                    ManagedAdoptionInstallOutcome::LoggedOut
+                    | ManagedAdoptionInstallOutcome::CacheLockUnavailable
+                    | ManagedAdoptionInstallOutcome::CacheChangedConcurrently => {
                         return self.quarantine(transition_id).await;
                     }
                 }
             }
-            ManagedAdoptionSourceOutcome::Absent
-            | ManagedAdoptionSourceOutcome::ExternalResolutionFailed
-            | ManagedAdoptionSourceOutcome::BackendIoFailed
-            | ManagedAdoptionSourceOutcome::ParseFailed
-            | ManagedAdoptionSourceOutcome::RestrictionRejected
-            | ManagedAdoptionSourceOutcome::MissingStableIdentity => {
+            // Deliberate managed logout (R001, R002): a persisted absence
+            // reached under a logout-intent transition is a legitimate
+            // success, not a failure to quarantine. Every other
+            // intent/outcome pairing -- including `Absent` under an
+            // adopt-account intent, where there is nothing to adopt --
+            // quarantines.
+            (
+                Some(ManagedTransitionIntent::AdoptManagedLogout),
+                ManagedAdoptionSourceOutcome::Absent,
+            ) => {
+                return match auth_manager.install_managed_logout(previous_auth) {
+                    ManagedAdoptionInstallOutcome::LoggedOut => {
+                        self.reset_and_complete_logout(transition_id, reset_inventory)
+                            .await
+                    }
+                    ManagedAdoptionInstallOutcome::Installed(_)
+                    | ManagedAdoptionInstallOutcome::CacheLockUnavailable
+                    | ManagedAdoptionInstallOutcome::CacheChangedConcurrently => {
+                        self.quarantine(transition_id).await
+                    }
+                };
+            }
+            (
+                _,
+                ManagedAdoptionSourceOutcome::Absent
+                | ManagedAdoptionSourceOutcome::ExternalResolutionFailed
+                | ManagedAdoptionSourceOutcome::BackendIoFailed
+                | ManagedAdoptionSourceOutcome::ParseFailed
+                | ManagedAdoptionSourceOutcome::RestrictionRejected
+                | ManagedAdoptionSourceOutcome::MissingStableIdentity
+                | ManagedAdoptionSourceOutcome::IneligibleAuthMode,
+            ) => {
                 return self.quarantine(transition_id).await;
             }
         };
@@ -827,14 +880,39 @@ impl ManagedTransitionCoordinator {
         // No lock held across this await either. A failed reset leaves
         // account-derived caches/workers in an unknown state, so this fails
         // closed to `Quarantined` rather than reporting `Succeeded` over
-        // known-stale state (R014).
+        // known-stale state (R014). Unlike every other quarantine path
+        // above, auth has *already* been installed here -- `quarantine`
+        // would leave the coordinator's own CAS baseline at the prior
+        // account while `AuthManager` holds the new one (R064's "auth,
+        // revision, reset, acknowledgement, and quarantine remain mutually
+        // consistent"), so this uses the account-aware quarantine instead.
         if reset_inventory.reset_all().await.is_err() {
-            return self.quarantine(transition_id).await;
+            return self
+                .quarantine_after_install(transition_id, account_id)
+                .await;
         }
 
         // Resetting -> Succeeded, atomically with the new CAS baseline and
         // the barrier reopen (see `complete_adoption`).
         self.complete_adoption(transition_id, account_id).await
+    }
+
+    /// The logout counterpart of the Resetting/`complete_adoption` tail
+    /// above: auth is already logged out (installed as `None`), so this
+    /// still runs the full reset inventory and completes to `Succeeded`
+    /// with an empty CAS baseline -- reset failure here gets the same
+    /// account-aware (here, account-absent) quarantine treatment.
+    async fn reset_and_complete_logout(
+        &self,
+        transition_id: &str,
+        reset_inventory: &dyn ResetInventory,
+    ) -> Result<ManagedTransitionStatus, ManagedTransitionRefusal> {
+        self.advance(transition_id, ManagedTransitionPhase::Resetting)
+            .await?;
+        if reset_inventory.reset_all().await.is_err() {
+            return self.quarantine_after_logout(transition_id).await;
+        }
+        self.complete_adoption_logout(transition_id).await
     }
 
     async fn quarantine(
@@ -1108,7 +1186,66 @@ impl ManagedTransitionCoordinator {
         self.advance_inner(
             transition_id,
             ManagedTransitionPhase::Succeeded,
-            Some(new_account_id),
+            Some(AdoptedAuthUpdate::Adopted(new_account_id)),
+        )
+        .await
+    }
+
+    /// The deliberate-managed-logout counterpart of [`Self::complete_adoption`]
+    /// (R001, R002): records an empty CAS baseline (no account) as both
+    /// this record's result and the coordinator's new baseline, and
+    /// reopens the barrier -- same one critical section, same reopen
+    /// coupling.
+    async fn complete_adoption_logout(
+        &self,
+        transition_id: &str,
+    ) -> Result<ManagedTransitionStatus, ManagedTransitionRefusal> {
+        self.advance_inner(
+            transition_id,
+            ManagedTransitionPhase::Succeeded,
+            Some(AdoptedAuthUpdate::LoggedOut),
+        )
+        .await
+    }
+
+    /// Quarantine after auth has *already* been installed to
+    /// `installed_account_id` (a reset-inventory failure following a
+    /// successful adopt) -- unlike plain [`Self::quarantine`], this also
+    /// updates the coordinator's own CAS baseline to match what
+    /// `AuthManager` actually holds. Without this, the coordinator would
+    /// report Quarantined while still believing the prior account is
+    /// current, so a later exact-quarantine cancel (which unconditionally
+    /// reopens once no other owner remains) would let a fresh transition
+    /// admit against a stale pre-adoption CAS baseline while the real
+    /// installed auth had already moved -- the R064 "auth, revision,
+    /// reset, acknowledgement, and quarantine remain mutually consistent"
+    /// violation this closes. The barrier still does not reopen (this is
+    /// `Quarantined`, not `Succeeded`); only the CAS baseline changes.
+    async fn quarantine_after_install(
+        &self,
+        transition_id: &str,
+        installed_account_id: String,
+    ) -> Result<ManagedTransitionStatus, ManagedTransitionRefusal> {
+        self.advance_inner(
+            transition_id,
+            ManagedTransitionPhase::Quarantined,
+            Some(AdoptedAuthUpdate::Adopted(installed_account_id)),
+        )
+        .await
+    }
+
+    /// The deliberate-managed-logout counterpart of
+    /// [`Self::quarantine_after_install`]: a reset-inventory failure after
+    /// auth was already logged out (installed as absent) still updates the
+    /// CAS baseline to empty, for the identical reason.
+    async fn quarantine_after_logout(
+        &self,
+        transition_id: &str,
+    ) -> Result<ManagedTransitionStatus, ManagedTransitionRefusal> {
+        self.advance_inner(
+            transition_id,
+            ManagedTransitionPhase::Quarantined,
+            Some(AdoptedAuthUpdate::LoggedOut),
         )
         .await
     }
@@ -1117,7 +1254,7 @@ impl ManagedTransitionCoordinator {
         &self,
         transition_id: &str,
         next_phase: ManagedTransitionPhase,
-        adopted_account_id: Option<String>,
+        auth_update: Option<AdoptedAuthUpdate>,
     ) -> Result<ManagedTransitionStatus, ManagedTransitionRefusal> {
         let mut state = self.state.lock().await;
         if !state.auth_authority_available {
@@ -1156,9 +1293,14 @@ impl ManagedTransitionCoordinator {
         }
 
         state.transition_revision += 1;
-        if let Some(new_account_id) = adopted_account_id {
+        if let Some(update) = auth_update {
             state.auth_revision += 1;
-            state.auth_fingerprint = Some(account_fingerprint(&new_account_id));
+            state.auth_fingerprint = match update {
+                AdoptedAuthUpdate::Adopted(new_account_id) => {
+                    Some(account_fingerprint(&new_account_id))
+                }
+                AdoptedAuthUpdate::LoggedOut => None,
+            };
         }
         let advanced = TransitionRecord {
             phase: next_phase,
@@ -2920,6 +3062,18 @@ mod tests {
             .expect("auth manager readable")
             .and_then(|auth| auth.get_account_id());
         assert_eq!(installed_account_id, Some("account-b".to_owned()));
+        // The coordinator's own CAS baseline must match what AuthManager
+        // actually holds (B), not the pre-adoption account (A) or `None`
+        // -- otherwise a later exact-quarantine cancel would reopen the
+        // barrier while a fresh admission could still use the stale A
+        // fingerprint even though B is truly installed (R064's "auth,
+        // revision, reset, acknowledgement, and quarantine remain
+        // mutually consistent").
+        assert_eq!(
+            status.result_auth_fingerprint.as_deref(),
+            Some(expected_fingerprint_for_account("account-b").as_str()),
+            "quarantine after a post-install reset failure must adopt B's fingerprint as the new CAS baseline"
+        );
     }
 
     /// Legacy (Slice 1-3) coordinators -- constructed with no adoption

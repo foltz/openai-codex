@@ -865,8 +865,6 @@ impl ManagedTransitionCoordinator {
                 false,
             ));
         }
-        let was_draining = record.phase == ManagedTransitionPhase::Draining;
-
         state.transition_revision += 1;
         let cancelled = TransitionRecord {
             phase: ManagedTransitionPhase::Cancelled,
@@ -878,24 +876,32 @@ impl ManagedTransitionCoordinator {
         state
             .completed
             .insert(cancelled.envelope.transition_id.clone(), cancelled);
-        if was_draining {
-            // Reopen so ordinary account-dependent work resumes immediately
-            // rather than staying refused for the rest of the process's
-            // lifetime over an attempt nothing will ever retry-complete;
-            // wake any in-flight `close_barrier_and_drain` so it observes
-            // this cancellation instead of running to its own timeout.
-            //
-            // Called while still holding `state`'s lock, immediately after
-            // recording `Cancelled` -- not after releasing it -- for the
-            // same reason as the quarantine-cancel branch above: `admit()`
-            // needs this same lock, so a new transition can never be
-            // admitted in the window between this cancellation taking
-            // effect and the barrier actually reopening (verification
-            // round 02's TOCTOU correction). Synchronous calls; holds no
-            // lock across an `.await`.
-            self.account_work_permits.reopen();
-            self.account_work_permits.wake_waiters();
-        }
+        // Unconditional, not gated on `was_draining` (verification round
+        // 03): `admit()` closes the barrier itself as soon as a transition
+        // reaches `Admitted` -- it is the sole closer, since
+        // `close_barrier_and_drain` no longer closes it separately -- so by
+        // the time execution reaches here, the phase guard above has
+        // already ensured `record.phase` was `Admitted` or `Draining`,
+        // either of which means this cancellation's transition held the
+        // barrier closed. A `was_draining`-only gate left an
+        // Admitted-phase cancellation with no reopen path at all,
+        // permanently closing the barrier with no owner. Reopen so
+        // ordinary account-dependent work resumes immediately rather than
+        // staying refused for the rest of the process's lifetime over an
+        // attempt nothing will ever retry-complete; wake any in-flight
+        // `close_barrier_and_drain` so it observes this cancellation
+        // instead of running to its own timeout.
+        //
+        // Called while still holding `state`'s lock, immediately after
+        // recording `Cancelled` -- not after releasing it -- for the same
+        // reason as the quarantine-cancel branch above: `admit()` needs
+        // this same lock, so a new transition can never be admitted in the
+        // window between this cancellation taking effect and the barrier
+        // actually reopening (verification round 02's TOCTOU correction,
+        // preserved here). Synchronous calls; holds no lock across an
+        // `.await`.
+        self.account_work_permits.reopen();
+        self.account_work_permits.wake_waiters();
         drop(state);
         Ok(status)
     }
@@ -1194,6 +1200,39 @@ mod tests {
         assert_eq!(cancelled.phase, ManagedTransitionPhase::Cancelled);
         assert_eq!(cancelled.transition_revision, 2);
         assert!(cancelled.retryable);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_still_admitted_transition_reopens_the_barrier() {
+        // Verification round 03: `admit()` closes the barrier as soon as a
+        // transition reaches `Admitted` (round 02's TOCTOU fix), not only
+        // once it reaches `Draining`. The cancellation reopen was still
+        // gated on `was_draining`, so cancelling a transition that was
+        // cancelled *before* ever advancing past `Admitted` left the
+        // barrier permanently closed with no remaining owner and no
+        // reopen path. This is the discriminating case that gate missed.
+        let coordinator = ManagedTransitionCoordinator::new();
+        let process_id = coordinator.process_instance_id().await;
+        let admitted = coordinator
+            .admit(request(process_id.clone(), "transition-a"))
+            .await
+            .unwrap();
+        assert_eq!(admitted.phase, ManagedTransitionPhase::Admitted);
+        assert!(
+            coordinator.try_acquire_account_work_permit().is_none(),
+            "admit() must close the barrier even before Draining"
+        );
+
+        coordinator
+            .cancel(cancel_request(process_id, "transition-a"))
+            .await
+            .expect("cancelling a still-Admitted transition must succeed");
+
+        assert!(
+            coordinator.try_acquire_account_work_permit().is_some(),
+            "cancelling an Admitted (not yet Draining) transition must \
+             still reopen the barrier"
+        );
     }
 
     #[tokio::test]

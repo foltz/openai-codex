@@ -377,6 +377,16 @@ impl ConnectionSessionState {
         }
     }
 
+    /// Issue 05 Slice 2's caller-authorization leg (`CODEX-I05-S02-R005`):
+    /// narrower than [`Self::trusted_interactive`], see
+    /// `crate::transport::managed_transition_caller_authorized`.
+    pub(crate) fn managed_transition_caller_authorized(&self) -> bool {
+        crate::transport::managed_transition_caller_authorized(
+            self.interactive_client_requested(),
+            self.provenance,
+        )
+    }
+
     pub(crate) fn client_mcp_extensions(&self) -> ClientMcpExtensions {
         self.initialized
             .get()
@@ -616,9 +626,15 @@ impl MessageProcessor {
             rpc_transport,
             Arc::clone(&user_verification),
         );
-        let managed_transition_coordinator =
-            crate::managed_transition::ManagedTransitionCoordinator::from_authoritative_auth_state(
+        let managed_transition_control_socket_endpoint =
+            crate::transport::app_server_control_socket_path(&config.codex_home)
+                .map(|path| path.display().to_string())
+                .unwrap_or_default();
+        let managed_transition_coordinator = crate::managed_transition::ManagedTransitionCoordinator::from_authoritative_auth_state_and_target_evidence_source(
                 crate::managed_transition::AuthoritativeAuthState::from_auth_manager(&auth_manager),
+                std::sync::Arc::new(crate::managed_transition::ProcessTargetEvidenceSource::new(
+                    managed_transition_control_socket_endpoint,
+                )),
             );
         let marketplace_processor = MarketplaceRequestProcessor::new(
             Arc::clone(&config),
@@ -1315,6 +1331,10 @@ impl MessageProcessor {
             _ => None,
         };
         let serialization_scope = codex_request.serialization_scope();
+        // Extracted here, before the request is queued and moved into the
+        // async block below -- server-established at dispatch time, never re-derived
+        // from caller-supplied data (`CODEX-I05-S02-R005`).
+        let managed_transition_caller_authorized = session.managed_transition_caller_authorized();
         let error_request_id = connection_request_id.clone();
         let rpc_gate = Arc::clone(&session.rpc_gate);
         let processor = Arc::clone(self);
@@ -1337,6 +1357,7 @@ impl MessageProcessor {
                     request_context,
                     session,
                     event_stream_ready,
+                    managed_transition_caller_authorized,
                 ))
                 .await;
                 if let Err(error) = result {
@@ -1366,6 +1387,7 @@ impl MessageProcessor {
         request_context: RequestContext,
         session: Arc<ConnectionSessionState>,
         event_stream_ready: Option<McpEventStreamReady>,
+        managed_transition_caller_authorized: bool,
     ) -> Result<(), JSONRPCErrorError> {
         let connection_id = connection_request_id.connection_id;
         let app_server_client_name = session.app_server_client_name().map(str::to_string);
@@ -2075,19 +2097,19 @@ impl MessageProcessor {
             }
             ClientRequest::ManagedTransitionStart { params, .. } => Ok(Some(
                 self.managed_transition_coordinator
-                    .start_not_admitted_response(params)
+                    .start_dispatch(params, managed_transition_caller_authorized)
                     .await
                     .into(),
             )),
             ClientRequest::ManagedTransitionRead { params, .. } => Ok(Some(
                 self.managed_transition_coordinator
-                    .read_not_admitted_response(params)
+                    .read_dispatch(params, managed_transition_caller_authorized)
                     .await
                     .into(),
             )),
             ClientRequest::ManagedTransitionCancel { params, .. } => Ok(Some(
                 self.managed_transition_coordinator
-                    .cancel_not_admitted_response(params)
+                    .cancel_dispatch(params, managed_transition_caller_authorized)
                     .await
                     .into(),
             )),

@@ -27,6 +27,38 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub(crate) struct ManagedTransitionCoordinator {
     state: Arc<Mutex<CoordinatorState>>,
+    /// Immutable per-coordinator; not behind `state`'s lock since revalidation
+    /// only ever queries it, never mutates it.
+    target_evidence_source: Arc<dyn TargetEvidenceSource>,
+}
+
+/// A fixed, always-consistent-with-itself source, for constructors that do
+/// not care about target evidence (every existing Slice 1-era test).
+/// `declared_profile: None` and `endpoint: String::new()` are themselves
+/// synthetic, never real production values.
+struct UnsetTargetEvidenceSource;
+
+impl TargetEvidenceSource for UnsetTargetEvidenceSource {
+    fn declared_profile(&self) -> Option<String> {
+        None
+    }
+
+    fn executable_identity(
+        &self,
+    ) -> std::io::Result<codex_app_server_transport::PeerExecutableIdentity> {
+        Ok(codex_app_server_transport::PeerExecutableIdentity::FileIdentity {
+            device: 0,
+            inode: 0,
+        })
+    }
+
+    fn endpoint(&self) -> String {
+        String::new()
+    }
+
+    fn pid(&self) -> u32 {
+        0
+    }
 }
 
 /// The credential-free transition view of the persisted current auth state.
@@ -75,6 +107,107 @@ impl AuthoritativeAuthState {
     }
 }
 
+/// The environment variable a future repository-owned command (Slice 5) sets
+/// to declare which profile it started this server under. Slice 2 defines and
+/// reads this contract now so its target-evidence record is stable; no
+/// launcher/profile entry point exists yet (`CODEX-I05-S02-R049`,
+/// `CODEX-I05-S02-R053`), so in every current production deployment this
+/// reads back `None`.
+pub(crate) const MANAGED_PROFILE_ENV_VAR: &str = "KESTREL_CODEX_MANAGED_PROFILE";
+
+/// Injectable source of the server's own token-free target-evidence facts
+/// (`CODEX-I05-S02-R004`). Production reads real process/environment state;
+/// disposable tests inject synthetic facts (`CODEX-I05-S02-R038`) to prove
+/// the coordinator detects a simulated replacement without ever touching a
+/// real installed profile, launcher, or live target
+/// (`R049-R050`, `R053`, `R060-R062`).
+pub(crate) trait TargetEvidenceSource: Send + Sync {
+    fn declared_profile(&self) -> Option<String>;
+    fn executable_identity(&self) -> std::io::Result<codex_app_server_transport::PeerExecutableIdentity>;
+    fn endpoint(&self) -> String;
+    fn pid(&self) -> u32;
+}
+
+/// Reads the server's own real facts: `MANAGED_PROFILE_ENV_VAR`, the same
+/// platform-correct running-executable identity Unix peer provenance already
+/// captures, the real OS process id, and the real control-socket path.
+pub(crate) struct ProcessTargetEvidenceSource {
+    endpoint: String,
+}
+
+impl ProcessTargetEvidenceSource {
+    pub(crate) fn new(endpoint: String) -> Self {
+        Self { endpoint }
+    }
+}
+
+impl TargetEvidenceSource for ProcessTargetEvidenceSource {
+    fn declared_profile(&self) -> Option<String> {
+        std::env::var(MANAGED_PROFILE_ENV_VAR).ok()
+    }
+
+    fn executable_identity(&self) -> std::io::Result<codex_app_server_transport::PeerExecutableIdentity> {
+        codex_app_server_transport::PeerExecutableIdentity::capture_running_process()
+    }
+
+    fn endpoint(&self) -> String {
+        self.endpoint.clone()
+    }
+
+    fn pid(&self) -> u32 {
+        std::process::id()
+    }
+}
+
+/// A server-produced, token-free description of the exact process a caller
+/// is bound to (`CODEX-I05-S02-R004`). Evidence only, never a bearer grant:
+/// comparison against externally, independently known expected facts is
+/// Slice 5's own repository-command responsibility. Re-derived (not cached)
+/// at each revalidation point so a legitimate or illegitimate change is
+/// observed rather than masked by a stale snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TargetEvidence {
+    declared_profile: Option<String>,
+    executable_identity: Option<codex_app_server_transport::PeerExecutableIdentity>,
+    endpoint: String,
+    pid: u32,
+    /// A fresh opaque identity for this specific evidence snapshot, distinct
+    /// from the coordinator's own process-instance identity: it changes on
+    /// every capture, not only on restart, so two captures within the same
+    /// process are still distinguishable records.
+    record_identity: String,
+}
+
+impl TargetEvidence {
+    fn capture(source: &dyn TargetEvidenceSource) -> Self {
+        Self {
+            declared_profile: source.declared_profile(),
+            // Lookup failure is evidence of an unavailable target, not a
+            // logged-out-shaped `None`; keep it distinct from "not captured".
+            executable_identity: source.executable_identity().ok(),
+            endpoint: source.endpoint(),
+            pid: source.pid(),
+            record_identity: Uuid::new_v4().to_string(),
+        }
+    }
+
+    /// True only when every replacement-sensitive fact this capture observed
+    /// is identical to the reference capture (`record_identity` excluded --
+    /// it identifies the snapshot itself, not the target). `executable_identity`
+    /// missing on *either* side is never treated as a match: an unavailable
+    /// executable identity is exactly the "replaced/unreadable process"
+    /// condition this check exists to catch, not evidence of consistency.
+    fn matches_target(&self, reference: &TargetEvidence) -> bool {
+        self.declared_profile == reference.declared_profile
+            && self.endpoint == reference.endpoint
+            && self.pid == reference.pid
+            && matches!(
+                (self.executable_identity, reference.executable_identity),
+                (Some(a), Some(b)) if a == b
+            )
+    }
+}
+
 #[derive(Debug)]
 struct CoordinatorState {
     process_instance_id: String,
@@ -82,6 +215,7 @@ struct CoordinatorState {
     transition_revision: u64,
     auth_fingerprint: Option<String>,
     auth_authority_available: bool,
+    target_evidence: TargetEvidence,
     active: Option<TransitionRecord>,
     completed: HashMap<String, TransitionRecord>,
 }
@@ -120,9 +254,26 @@ impl ManagedTransitionCoordinator {
         })
     }
 
+    /// Construction with target evidence unset, for the many existing tests
+    /// that exercise coordinator/auth behavior and do not care about Slice
+    /// 2's own target-binding leg.
     pub(crate) fn from_authoritative_auth_state(
         authoritative_auth: AuthoritativeAuthState,
     ) -> Self {
+        Self::from_authoritative_auth_state_and_target_evidence_source(
+            authoritative_auth,
+            Arc::new(UnsetTargetEvidenceSource),
+        )
+    }
+
+    /// The real production construction path
+    /// (`app-server/src/message_processor.rs`'s constructor) and Slice 2's
+    /// own disposable target-evidence tests use this directly.
+    pub(crate) fn from_authoritative_auth_state_and_target_evidence_source(
+        authoritative_auth: AuthoritativeAuthState,
+        target_evidence_source: Arc<dyn TargetEvidenceSource>,
+    ) -> Self {
+        let target_evidence = TargetEvidence::capture(target_evidence_source.as_ref());
         Self {
             state: Arc::new(Mutex::new(CoordinatorState {
                 process_instance_id: Uuid::now_v7().to_string(),
@@ -130,9 +281,11 @@ impl ManagedTransitionCoordinator {
                 transition_revision: 0,
                 auth_fingerprint: authoritative_auth.auth_fingerprint,
                 auth_authority_available: authoritative_auth.authority_available,
+                target_evidence,
                 active: None,
                 completed: HashMap::new(),
             })),
+            target_evidence_source,
         }
     }
 
@@ -140,15 +293,39 @@ impl ManagedTransitionCoordinator {
         self.state.lock().await.process_instance_id.clone()
     }
 
+    /// Re-derives current target evidence from this coordinator's own source
+    /// and compares it against the reference captured at construction
+    /// (`CODEX-I05-S02-R004`). This is the reusable revalidation primitive;
+    /// Slice 2 calls it before effect in [`Self::admit`]. Later slices call
+    /// it again after writer completion, before dispatch, and before
+    /// acknowledgement as those mechanisms come online.
+    async fn target_evidence_still_matches(&self) -> bool {
+        let current = TargetEvidence::capture(self.target_evidence_source.as_ref());
+        let state = self.state.lock().await;
+        current.matches_target(&state.target_evidence)
+    }
+
     pub(crate) async fn admit(
         &self,
         params: StartManagedTransitionParams,
     ) -> Result<ManagedTransitionStatus, ManagedTransitionRefusal> {
         let envelope = TransitionEnvelope::from(params);
+        // Revalidated before acquiring `state`'s own lock -- this method
+        // re-locks internally and must never be called while already held.
+        let target_evidence_matches = self.target_evidence_still_matches().await;
         let mut state = self.state.lock().await;
 
         if !state.auth_authority_available {
             return Err(authoritative_auth_unavailable(&state, &envelope));
+        }
+
+        if !target_evidence_matches {
+            return Err(refusal(
+                &state,
+                &envelope,
+                ManagedTransitionRefusalKind::InvalidRequest,
+                false,
+            ));
         }
 
         if envelope.transition_id.is_empty() || envelope.process_instance_id.is_empty() {
@@ -238,13 +415,28 @@ impl ManagedTransitionCoordinator {
     /// Slice 1 exposes the versioned wire contract but deliberately does not
     /// admit a caller. Slice 2 replaces this gate with server-derived caller
     /// authorization before it can create or alter a transition record.
-    pub(crate) async fn start_not_admitted_response(
+    /// Issue 05 Slice 2's public wire entry point (`CODEX-I05-S02-R005`).
+    /// `caller_authorized` must be exactly
+    /// `session.managed_transition_caller_authorized()`, evaluated by the
+    /// dispatcher from server-established connection state before this call
+    /// -- never re-derived here from caller-supplied data. An unauthorized
+    /// caller receives the identical `AuthorizationNotAdmitted` refusal
+    /// regardless of target-evidence or coordinator state, so no signal about
+    /// server-side health leaks to a caller that has not yet qualified.
+    pub(crate) async fn start_dispatch(
         &self,
         params: StartManagedTransitionParams,
+        caller_authorized: bool,
     ) -> StartManagedTransitionResponse {
-        let state = self.state.lock().await;
-        StartManagedTransitionResponse::Refused {
-            refusal: authorization_not_admitted(&state, params.into()),
+        if !caller_authorized {
+            let state = self.state.lock().await;
+            return StartManagedTransitionResponse::Refused {
+                refusal: authorization_not_admitted(&state, params.into()),
+            };
+        }
+        match self.admit(params).await {
+            Ok(status) => StartManagedTransitionResponse::Accepted { status },
+            Err(refusal) => StartManagedTransitionResponse::Refused { refusal },
         }
     }
 
@@ -283,13 +475,21 @@ impl ManagedTransitionCoordinator {
         ))
     }
 
-    pub(crate) async fn read_not_admitted_response(
+    /// See [`Self::start_dispatch`] for the `caller_authorized` contract.
+    pub(crate) async fn read_dispatch(
         &self,
         params: ReadManagedTransitionParams,
+        caller_authorized: bool,
     ) -> ReadManagedTransitionResponse {
-        let state = self.state.lock().await;
-        ReadManagedTransitionResponse::Refused {
-            refusal: authorization_not_admitted(&state, TransitionEnvelope::read(params)),
+        if !caller_authorized {
+            let state = self.state.lock().await;
+            return ReadManagedTransitionResponse::Refused {
+                refusal: authorization_not_admitted(&state, TransitionEnvelope::read(params)),
+            };
+        }
+        match self.read(params).await {
+            Ok(status) => ReadManagedTransitionResponse::Accepted { status },
+            Err(refusal) => ReadManagedTransitionResponse::Refused { refusal },
         }
     }
 
@@ -351,13 +551,21 @@ impl ManagedTransitionCoordinator {
         Ok(status)
     }
 
-    pub(crate) async fn cancel_not_admitted_response(
+    /// See [`Self::start_dispatch`] for the `caller_authorized` contract.
+    pub(crate) async fn cancel_dispatch(
         &self,
         params: CancelManagedTransitionParams,
+        caller_authorized: bool,
     ) -> CancelManagedTransitionResponse {
-        let state = self.state.lock().await;
-        CancelManagedTransitionResponse::Refused {
-            refusal: authorization_not_admitted(&state, TransitionEnvelope::cancel(params)),
+        if !caller_authorized {
+            let state = self.state.lock().await;
+            return CancelManagedTransitionResponse::Refused {
+                refusal: authorization_not_admitted(&state, TransitionEnvelope::cancel(params)),
+            };
+        }
+        match self.cancel(params).await {
+            Ok(status) => CancelManagedTransitionResponse::Accepted { status },
+            Err(refusal) => CancelManagedTransitionResponse::Refused { refusal },
         }
     }
 
@@ -679,14 +887,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wire_admission_refuses_until_server_authorization_exists_without_mutation() {
+    async fn wire_admission_refuses_an_unauthorized_caller_without_mutation() {
         let coordinator = ManagedTransitionCoordinator::new();
         let process_id = coordinator.process_instance_id().await;
         let refused = coordinator
-            .start_not_admitted_response(request(process_id.clone(), "transition-a"))
+            .start_dispatch(
+                request(process_id.clone(), "transition-a"),
+                /*caller_authorized*/ false,
+            )
             .await;
         let StartManagedTransitionResponse::Refused { refusal } = refused else {
-            panic!("Slice 1 wire admission must remain authorization-gated");
+            panic!("an unauthorized wire caller must never be admitted");
         };
         assert_eq!(
             refusal.kind,
@@ -697,6 +908,161 @@ mod tests {
             .admit(request(process_id, "transition-a"))
             .await
             .expect("the refused wire request must not reserve the transition id");
+        assert_eq!(admitted.phase, ManagedTransitionPhase::Admitted);
+    }
+
+    #[tokio::test]
+    async fn wire_admission_admits_an_authorized_caller_with_matching_target_evidence() {
+        let coordinator = ManagedTransitionCoordinator::new();
+        let process_id = coordinator.process_instance_id().await;
+        let accepted = coordinator
+            .start_dispatch(
+                request(process_id, "transition-a"),
+                /*caller_authorized*/ true,
+            )
+            .await;
+        let StartManagedTransitionResponse::Accepted { status } = accepted else {
+            panic!("an authorized caller with matching target evidence must be admitted");
+        };
+        assert_eq!(status.phase, ManagedTransitionPhase::Admitted);
+    }
+
+    /// Disposable synthetic target-evidence source (`CODEX-I05-S02-R038`)
+    /// whose facts can be swapped mid-test, simulating a replaced process
+    /// without touching any real installed profile, launcher, or live target.
+    struct SyntheticTargetEvidenceSource {
+        facts: std::sync::Mutex<SyntheticTargetFacts>,
+    }
+
+    #[derive(Clone)]
+    struct SyntheticTargetFacts {
+        declared_profile: Option<String>,
+        executable_identity_inode: u64,
+        endpoint: String,
+        pid: u32,
+    }
+
+    impl SyntheticTargetFacts {
+        fn baseline() -> Self {
+            Self {
+                declared_profile: Some("dev".to_owned()),
+                executable_identity_inode: 42,
+                endpoint: "/synthetic/control.sock".to_owned(),
+                pid: 4242,
+            }
+        }
+    }
+
+    impl SyntheticTargetEvidenceSource {
+        fn new(facts: SyntheticTargetFacts) -> Arc<Self> {
+            Arc::new(Self {
+                facts: std::sync::Mutex::new(facts),
+            })
+        }
+
+        fn replace_facts(&self, facts: SyntheticTargetFacts) {
+            *self.facts.lock().expect("synthetic facts lock") = facts;
+        }
+    }
+
+    impl TargetEvidenceSource for SyntheticTargetEvidenceSource {
+        fn declared_profile(&self) -> Option<String> {
+            self.facts.lock().expect("synthetic facts lock").declared_profile.clone()
+        }
+
+        fn executable_identity(
+            &self,
+        ) -> std::io::Result<codex_app_server_transport::PeerExecutableIdentity> {
+            Ok(codex_app_server_transport::PeerExecutableIdentity::FileIdentity {
+                device: 1,
+                inode: self.facts.lock().expect("synthetic facts lock").executable_identity_inode,
+            })
+        }
+
+        fn endpoint(&self) -> String {
+            self.facts.lock().expect("synthetic facts lock").endpoint.clone()
+        }
+
+        fn pid(&self) -> u32 {
+            self.facts.lock().expect("synthetic facts lock").pid
+        }
+    }
+
+    #[tokio::test]
+    async fn admit_refuses_when_target_evidence_no_longer_matches_the_captured_reference() {
+        let source = SyntheticTargetEvidenceSource::new(SyntheticTargetFacts::baseline());
+        let coordinator = ManagedTransitionCoordinator::from_authoritative_auth_state_and_target_evidence_source(
+            AuthoritativeAuthState {
+                authority_available: true,
+                auth_revision: 0,
+                auth_fingerprint: None,
+            },
+            source.clone(),
+        );
+        let process_id = coordinator.process_instance_id().await;
+
+        // A simulated replacement: the same coordinator, but its target
+        // evidence source now reports a different running executable --
+        // exactly the "replaced-process" case the plan's own validation
+        // signal names.
+        let mut replaced = SyntheticTargetFacts::baseline();
+        replaced.executable_identity_inode += 1;
+        source.replace_facts(replaced);
+
+        let refused = coordinator
+            .admit(request(process_id, "transition-a"))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.kind, ManagedTransitionRefusalKind::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn admit_refuses_when_declared_profile_or_endpoint_or_pid_changes() {
+        for mutate in [
+            (|facts: &mut SyntheticTargetFacts| facts.declared_profile = Some("live".to_owned()))
+                as fn(&mut SyntheticTargetFacts),
+            |facts: &mut SyntheticTargetFacts| facts.endpoint = "/synthetic/other.sock".to_owned(),
+            |facts: &mut SyntheticTargetFacts| facts.pid += 1,
+        ] {
+            let source = SyntheticTargetEvidenceSource::new(SyntheticTargetFacts::baseline());
+            let coordinator = ManagedTransitionCoordinator::from_authoritative_auth_state_and_target_evidence_source(
+                AuthoritativeAuthState {
+                    authority_available: true,
+                    auth_revision: 0,
+                    auth_fingerprint: None,
+                },
+                source.clone(),
+            );
+            let process_id = coordinator.process_instance_id().await;
+
+            let mut mutated = SyntheticTargetFacts::baseline();
+            mutate(&mut mutated);
+            source.replace_facts(mutated);
+
+            let refused = coordinator
+                .admit(request(process_id, "transition-a"))
+                .await
+                .unwrap_err();
+            assert_eq!(refused.kind, ManagedTransitionRefusalKind::InvalidRequest);
+        }
+    }
+
+    #[tokio::test]
+    async fn admit_succeeds_when_target_evidence_is_re_derived_identically() {
+        let source = SyntheticTargetEvidenceSource::new(SyntheticTargetFacts::baseline());
+        let coordinator = ManagedTransitionCoordinator::from_authoritative_auth_state_and_target_evidence_source(
+            AuthoritativeAuthState {
+                authority_available: true,
+                auth_revision: 0,
+                auth_fingerprint: None,
+            },
+            source,
+        );
+        let process_id = coordinator.process_instance_id().await;
+        let admitted = coordinator
+            .admit(request(process_id, "transition-a"))
+            .await
+            .expect("unchanged target evidence must not refuse admission");
         assert_eq!(admitted.phase, ManagedTransitionPhase::Admitted);
     }
 
@@ -1558,17 +1924,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_wire_gate_refuses_without_reserving_or_mutating_a_transition() {
+    async fn every_wire_gate_refuses_an_unauthorized_caller_without_reserving_or_mutating_a_transition()
+     {
         let coordinator = ManagedTransitionCoordinator::new();
         let process_id = coordinator.process_instance_id().await;
         let start = coordinator
-            .start_not_admitted_response(request(process_id.clone(), "transition-a"))
+            .start_dispatch(
+                request(process_id.clone(), "transition-a"),
+                /*caller_authorized*/ false,
+            )
             .await;
         let read = coordinator
-            .read_not_admitted_response(read_request(process_id.clone(), "transition-a"))
+            .read_dispatch(
+                read_request(process_id.clone(), "transition-a"),
+                /*caller_authorized*/ false,
+            )
             .await;
         let cancel = coordinator
-            .cancel_not_admitted_response(cancel_request(process_id.clone(), "transition-a"))
+            .cancel_dispatch(
+                cancel_request(process_id.clone(), "transition-a"),
+                /*caller_authorized*/ false,
+            )
             .await;
         let refusals = [
             match start {

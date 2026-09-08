@@ -91,6 +91,93 @@ pub(crate) fn trusted_interactive(
     interactive_client_requested && trusted_interactive_provenance(provenance)
 }
 
+/// Evaluates the server-owned entitlement half of Issue 05's managed-transition
+/// caller authorization (`CODEX-I05-S02-R005`). Deliberately narrower than
+/// [`trusted_interactive_provenance`]: an in-process embedder shares the
+/// server's own address space and has no independent, externally-verifiable
+/// process target to bind against, so it is not accepted here even though it
+/// is otherwise a trusted interactive caller for thread attachment. Only a
+/// server-established same-executable Unix peer proof qualifies.
+pub(crate) fn managed_transition_caller_provenance_authorized(
+    provenance: ConnectionProvenance,
+) -> bool {
+    matches!(provenance, ConnectionProvenance::UnixPeerExecutable(_))
+}
+
+pub(crate) fn managed_transition_caller_authorized(
+    interactive_client_requested: bool,
+    provenance: ConnectionProvenance,
+) -> bool {
+    interactive_client_requested && managed_transition_caller_provenance_authorized(provenance)
+}
+
+#[cfg(test)]
+mod managed_transition_caller_tests {
+    use super::ConnectionProvenance;
+    use super::managed_transition_caller_authorized;
+    use super::managed_transition_caller_provenance_authorized;
+    use codex_app_server_transport::PeerExecutableIdentity;
+
+    /// `PeerExecutableIdentity`'s own accept-time constructors are private to
+    /// its crate (correctly -- production identity must only ever come from a
+    /// live accept-time proof). Its `FileIdentity` variant fields are public,
+    /// so a synthetic disposable value is constructible here without any new
+    /// cross-crate production API; the predicates under test only branch on
+    /// the `ConnectionProvenance` variant, never on the identity's own
+    /// content, so a fixed synthetic identity is sufficient evidence.
+    fn synthetic_peer_identity() -> PeerExecutableIdentity {
+        PeerExecutableIdentity::FileIdentity {
+            device: 1,
+            inode: 1,
+        }
+    }
+
+    #[test]
+    fn in_process_provenance_is_not_authorized() {
+        assert!(!managed_transition_caller_provenance_authorized(
+            ConnectionProvenance::InProcess
+        ));
+    }
+
+    #[test]
+    fn unproven_provenance_is_not_authorized() {
+        assert!(!managed_transition_caller_provenance_authorized(
+            ConnectionProvenance::Unproven
+        ));
+    }
+
+    #[test]
+    fn unix_peer_executable_provenance_is_authorized() {
+        assert!(managed_transition_caller_provenance_authorized(
+            ConnectionProvenance::UnixPeerExecutable(synthetic_peer_identity())
+        ));
+    }
+
+    #[test]
+    fn missing_role_refuses_even_with_qualifying_provenance() {
+        assert!(!managed_transition_caller_authorized(
+            /*interactive_client_requested*/ false,
+            ConnectionProvenance::UnixPeerExecutable(synthetic_peer_identity())
+        ));
+    }
+
+    #[test]
+    fn explicit_role_and_qualifying_provenance_together_authorize() {
+        assert!(managed_transition_caller_authorized(
+            /*interactive_client_requested*/ true,
+            ConnectionProvenance::UnixPeerExecutable(synthetic_peer_identity())
+        ));
+    }
+
+    #[test]
+    fn explicit_role_cannot_promote_in_process_provenance() {
+        assert!(!managed_transition_caller_authorized(
+            /*interactive_client_requested*/ true,
+            ConnectionProvenance::InProcess
+        ));
+    }
+}
+
 #[cfg(test)]
 mod provenance_tests {
     use super::ConnectionOrigin;

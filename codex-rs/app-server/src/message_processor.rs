@@ -837,10 +837,12 @@ impl MessageProcessor {
             )
             .await
         {
-            Ok(RetentionReleaseOutcome::Released) => Ok(ThreadRetentionReleaseResponse::Released),
-            Ok(RetentionReleaseOutcome::NotHeld) => Ok(ThreadRetentionReleaseResponse::NotHeld),
+            Ok(RetentionReleaseOutcome::Released) => {
+                Ok(ThreadRetentionReleaseResponse::Released {})
+            }
+            Ok(RetentionReleaseOutcome::NotHeld) => Ok(ThreadRetentionReleaseResponse::NotHeld {}),
             Ok(RetentionReleaseOutcome::GrantMismatch) => {
-                Ok(ThreadRetentionReleaseResponse::GrantMismatch)
+                Ok(ThreadRetentionReleaseResponse::GrantMismatch {})
             }
             Err(error) => Ok(ThreadRetentionReleaseResponse::Refused {
                 reason: retention_refusal_reason(error),

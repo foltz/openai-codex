@@ -140,9 +140,9 @@ pub struct ThreadRetentionReleaseParams {
 )]
 #[ts(rename_all = "camelCase", export_to = "v2/")]
 pub enum ThreadRetentionReleaseResponse {
-    Released,
-    NotHeld,
-    GrantMismatch,
+    Released {},
+    NotHeld {},
+    GrantMismatch {},
     Refused {
         reason: ThreadRetentionRefusalReason,
     },
@@ -180,6 +180,23 @@ mod retention_wire_tests {
         assert!(
             serde_json::from_value::<ThreadRetentionAcquireResponse>(
                 serde_json::json!({"status": "acquired", "grantId": "g", "unexpected": true})
+            )
+            .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(ThreadRetentionReleaseResponse::GrantMismatch {})
+                .expect("release response serializes"),
+            serde_json::json!({"status": "grantMismatch"})
+        );
+        assert!(
+            serde_json::from_value::<ThreadRetentionReleaseParams>(
+                serde_json::json!({"threadId": "t", "grantId": "g", "unexpected": true})
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ThreadRetentionReleaseResponse>(
+                serde_json::json!({"status": "notHeld", "unexpected": true})
             )
             .is_err()
         );

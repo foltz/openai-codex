@@ -125,7 +125,7 @@ async fn retention_carrier_is_exact_and_uses_opaque_idempotent_handles() -> Resu
             .await?
             .map_err(|err| anyhow::anyhow!("mismatched release should respond: {err:?}"))?,
     )?;
-    assert_eq!(mismatched, ThreadRetentionReleaseResponse::GrantMismatch);
+    assert_eq!(mismatched, ThreadRetentionReleaseResponse::GrantMismatch {});
 
     let release = |request_id, grant_id: String| ClientRequest::ThreadRetentionRelease {
         request_id: RequestId::Integer(request_id),
@@ -140,7 +140,7 @@ async fn retention_carrier_is_exact_and_uses_opaque_idempotent_handles() -> Resu
             .await?
             .map_err(|err| anyhow::anyhow!("retention release should succeed: {err:?}"))?,
     )?;
-    assert_eq!(released, ThreadRetentionReleaseResponse::Released);
+    assert_eq!(released, ThreadRetentionReleaseResponse::Released {});
     let spent: ThreadRetentionReleaseResponse = serde_json::from_value(
         client
             .request(release(6, grant_id))
@@ -153,8 +153,8 @@ async fn retention_carrier_is_exact_and_uses_opaque_idempotent_handles() -> Resu
             .await?
             .map_err(|err| anyhow::anyhow!("unknown retention release should respond: {err:?}"))?,
     )?;
-    assert_eq!(spent, ThreadRetentionReleaseResponse::NotHeld);
-    assert_eq!(unknown, ThreadRetentionReleaseResponse::NotHeld);
+    assert_eq!(spent, ThreadRetentionReleaseResponse::NotHeld {});
+    assert_eq!(unknown, ThreadRetentionReleaseResponse::NotHeld {});
 
     client.shutdown().await?;
     Ok(())

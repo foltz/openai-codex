@@ -347,9 +347,21 @@ const RESET_THREAD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 impl crate::managed_transition::ResetInventory for ProductionResetInventory {
     fn reset_all(&self) -> crate::managed_transition::ResetInventoryFuture<'_> {
         Box::pin(async move {
-            self.thread_manager
+            // Result-bearing: a thread that didn't fully shut down can
+            // still hold the prior account's provider/session/MCP state,
+            // so this must fail the whole reset (and quarantine) rather
+            // than silently report success over an incomplete report.
+            let shutdown_report = self
+                .thread_manager
                 .shutdown_all_threads_bounded(RESET_THREAD_SHUTDOWN_TIMEOUT)
                 .await;
+            if !shutdown_report.submit_failed.is_empty() || !shutdown_report.timed_out.is_empty() {
+                return Err(format!(
+                    "thread shutdown incomplete: {} submit-failed, {} timed out",
+                    shutdown_report.submit_failed.len(),
+                    shutdown_report.timed_out.len()
+                ));
+            }
             self.thread_manager.invalidate_mcp_runtimes().await;
 
             // Mirrors `account_processor.rs`'s own established
@@ -359,13 +371,20 @@ impl crate::managed_transition::ResetInventory for ProductionResetInventory {
             // eligibility filtering (`target_curated_marketplace`,
             // `remote_global_catalog_active`) would otherwise keep judging
             // by the just-replaced account's auth mode until some
-            // unrelated session happened to update it.
+            // unrelated session happened to update it. The remote-
+            // installed-plugins cache is likewise unkeyed by account;
+            // clearing it here (rather than only the recommended-plugins
+            // cache) prevents a late in-flight refresh for the prior
+            // account from repopulating it after this reset already ran.
             self.thread_manager
                 .plugins_manager()
                 .set_auth_mode(self.auth_manager.get_api_auth_mode());
             self.thread_manager
                 .plugins_manager()
                 .clear_recommended_plugins_cache();
+            self.thread_manager
+                .plugins_manager()
+                .clear_remote_installed_plugins_cache();
 
             // Swap in a freshly spawned worker rather than calling terminal
             // `shutdown()` with no successor: the process must keep
@@ -388,6 +407,20 @@ impl crate::managed_transition::ResetInventory for ProductionResetInventory {
                 )
             };
             old_worker.shutdown();
+
+            // Awaited, not fire-and-forget: the freshly spawned worker's
+            // own first refresh runs on its own schedule and is not
+            // awaited by anything, so without this call the barrier could
+            // reopen and a caller could read the *previous* account's
+            // model catalog for one refresh round-trip. Blocking here
+            // closes that window before `Succeeded`/reopen instead of
+            // reporting success over a catalog that has not caught up yet.
+            self.models_manager
+                .list_models(
+                    codex_models_manager::manager::RefreshStrategy::Online,
+                    self.http_client_factory.clone(),
+                )
+                .await;
 
             Ok(())
         })

@@ -2698,3 +2698,186 @@ async fn missing_plan_type_maps_to_unknown() {
 
     pretty_assertions::assert_eq!(auth.account_plan_type(), Some(AccountPlanType::Unknown));
 }
+
+// --- Issue 05 Slice 4 managed-auth-transition adoption (R014, R001, R002,
+// R044, R045, R064) -----------------------------------------------------
+
+fn write_api_key_auth_file(codex_home: &Path, api_key: &str) {
+    let auth_dot_json = AuthDotJson {
+        auth_mode: Some(AuthMode::ApiKey),
+        openai_api_key: Some(api_key.to_owned()),
+        tokens: None,
+        last_refresh: None,
+        agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
+    };
+    super::save_auth(
+        codex_home,
+        &auth_dot_json,
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
+    )
+    .expect("write api key auth.json");
+}
+
+/// R044/R045: external auth authority (agent identity, injected tokens) is
+/// excluded from managed-auth-transition adoption regardless of what it
+/// would resolve to -- `read_managed_adoption_source` must never attempt
+/// resolution at all, let alone return `Available`.
+#[tokio::test]
+async fn read_managed_adoption_source_excludes_external_auth_authority() {
+    let codex_home = tempdir().unwrap();
+    let manager = AuthManager::new(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::Ephemeral,
+        /*forced_chatgpt_workspace_id*/ None,
+        /*chatgpt_base_url*/ None,
+        AuthKeyringBackendKind::default(),
+        crate::test_support::transport_default_auth_route_config(),
+    )
+    .await;
+    manager
+        .set_external_auth(Arc::new(StaticExternalAuth(CodexAuth::from_api_key(
+            "sk-external",
+        ))))
+        .await
+        .expect("external auth should install");
+
+    let outcome = manager.read_managed_adoption_source().await;
+    assert!(
+        matches!(outcome, ManagedAdoptionSourceOutcome::IneligibleAuthMode),
+        "external auth authority must never be treated as an adoptable managed source, got {outcome:?}"
+    );
+}
+
+/// R002: a persisted, non-ChatGPT mode with a stable account identity
+/// (API key mode here; `AgentIdentity`/`PersonalAccessToken` share the
+/// same `get_account_id().is_some()` shape but require network-backed
+/// construction not practical in this offline test) must refuse as
+/// `IneligibleAuthMode`, not slip through because a stable identity
+/// happens to be present. This is the exact `unsupported ... modes
+/// refuse` boundary R002 requires and would previously have been
+/// misclassified as `MissingStableIdentity` or, worse, accepted.
+#[tokio::test]
+async fn read_managed_adoption_source_excludes_persisted_non_chatgpt_mode() {
+    let codex_home = tempdir().unwrap();
+    write_api_key_auth_file(codex_home.path(), "sk-persisted");
+    let manager = AuthManager::new(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+        /*forced_chatgpt_workspace_id*/ None,
+        /*chatgpt_base_url*/ None,
+        AuthKeyringBackendKind::default(),
+        crate::test_support::transport_default_auth_route_config(),
+    )
+    .await;
+
+    let outcome = manager.read_managed_adoption_source().await;
+    assert!(
+        matches!(outcome, ManagedAdoptionSourceOutcome::IneligibleAuthMode),
+        "a persisted non-ChatGPT mode must refuse as IneligibleAuthMode, got {outcome:?}"
+    );
+}
+
+/// R001: deliberate managed logout is a legitimate success, not a
+/// failure -- `install_managed_logout` must clear the cache, publish the
+/// auth-change signal, and never touch the durable store (no file is
+/// written by this call).
+#[tokio::test]
+async fn install_managed_logout_clears_the_cache_and_publishes_a_revision() {
+    let codex_home = tempdir().unwrap();
+    write_api_key_auth_file(codex_home.path(), "sk-before-logout");
+    let manager = AuthManager::new(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+        /*forced_chatgpt_workspace_id*/ None,
+        /*chatgpt_base_url*/ None,
+        AuthKeyringBackendKind::default(),
+        crate::test_support::transport_default_auth_route_config(),
+    )
+    .await;
+    manager.reload().await;
+    let previous = manager.auth_cached();
+    assert!(previous.is_some(), "precondition: an auth was cached");
+    let mut revisions = manager.auth_change_receiver();
+
+    let outcome = manager.install_managed_logout(previous);
+    assert!(
+        matches!(outcome, ManagedAdoptionInstallOutcome::LoggedOut),
+        "expected LoggedOut, got {outcome:?}"
+    );
+    assert_eq!(manager.auth_cached(), None);
+    assert!(
+        revisions.has_changed().unwrap_or(false),
+        "logout must publish an auth-change signal like any other adoption"
+    );
+    assert!(
+        get_auth_file(codex_home.path()).exists(),
+        "managed logout must never touch the durable store -- the writer boundary is separately owned"
+    );
+}
+
+/// R014's manager-owned CAS: installing must refuse rather than
+/// overwrite when the cache no longer holds the snapshot observed
+/// immediately before the read that produced the value being installed
+/// -- an ordinary non-managed login/logout landing concurrently during
+/// adoption must not be silently clobbered.
+#[tokio::test]
+async fn install_managed_adoption_refuses_when_the_cache_changed_concurrently() {
+    let codex_home = tempdir().unwrap();
+    let manager = AuthManager::new(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::Ephemeral,
+        /*forced_chatgpt_workspace_id*/ None,
+        /*chatgpt_base_url*/ None,
+        AuthKeyringBackendKind::default(),
+        crate::test_support::transport_default_auth_route_config(),
+    )
+    .await;
+    let observed_previous = manager.auth_cached();
+    assert_eq!(observed_previous, None, "precondition: nothing cached yet");
+
+    // Something else installs concurrently while the (simulated) read was
+    // in flight.
+    manager
+        .set_external_auth(Arc::new(StaticExternalAuth(CodexAuth::from_api_key(
+            "sk-concurrent-writer",
+        ))))
+        .await
+        .expect("concurrent external auth should install");
+
+    let new_auth = CodexAuth::from_api_key("sk-intended-adoption");
+    let outcome = manager.install_managed_adoption(new_auth, observed_previous);
+    assert!(
+        matches!(
+            outcome,
+            ManagedAdoptionInstallOutcome::CacheChangedConcurrently
+        ),
+        "expected CacheChangedConcurrently, got {outcome:?}"
+    );
+    assert_eq!(
+        manager
+            .auth_cached()
+            .as_ref()
+            .and_then(CodexAuth::api_key),
+        Some("sk-concurrent-writer"),
+        "a refused install must never overwrite the concurrent value"
+    );
+}
+
+/// The credential-bearing outcome enums must never render key/token
+/// material through `{:?}` -- only the auth mode, matching the existing
+/// `CachedAuth` Debug precedent in this same file.
+#[tokio::test]
+async fn managed_adoption_outcomes_never_debug_print_credential_material() {
+    let secret = "sk-must-never-appear-in-debug-output";
+    let source_outcome = ManagedAdoptionSourceOutcome::Available(CodexAuth::from_api_key(secret));
+    let install_outcome = ManagedAdoptionInstallOutcome::Installed(CodexAuth::from_api_key(secret));
+    assert!(!format!("{source_outcome:?}").contains(secret));
+    assert!(!format!("{install_outcome:?}").contains(secret));
+}

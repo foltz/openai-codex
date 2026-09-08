@@ -1717,12 +1717,14 @@ pub enum AuthoritativeAuthUnavailable {
 }
 
 /// Distinguishes managed-auth-transition adoption source-read outcomes
-/// (Issue 05 Slice 4, R014). Never carries credential material -- variants
-/// distinguish *why*, not the underlying error text.
-#[derive(Debug)]
+/// (Issue 05 Slice 4, R014, R002, R044, R045). Never carries credential
+/// material in `Debug` output (see the manual `Debug` impl below) --
+/// variants distinguish *why*, not the underlying error text or the
+/// wrapped [`CodexAuth`]'s own contents.
 pub enum ManagedAdoptionSourceOutcome {
-    /// The intended account's auth was read, parsed, and passed every
-    /// configured restriction; the stable account identity is present.
+    /// The intended account's auth was read, parsed, passed every
+    /// configured restriction, is persisted managed ChatGPT mode
+    /// specifically, and the stable account identity is present.
     Available(CodexAuth),
     /// No persisted auth exists at the authoritative source.
     Absent,
@@ -1739,14 +1741,62 @@ pub enum ManagedAdoptionSourceOutcome {
     /// The loaded auth lacks the stable account identity managed-auth
     /// transition requires for fingerprinting.
     MissingStableIdentity,
+    /// The resolved/loaded auth exists but is not persisted managed
+    /// ChatGPT mode -- external auth authority (agent identity, injected
+    /// tokens) and every other mode are excluded from managed-auth-
+    /// transition adoption by R002/R044/R045, regardless of whether they
+    /// would otherwise resolve successfully or expose a stable identity.
+    IneligibleAuthMode,
+}
+
+impl std::fmt::Debug for ManagedAdoptionSourceOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Available(auth) => f
+                .debug_tuple("Available")
+                .field(&auth.api_auth_mode())
+                .finish(),
+            Self::Absent => write!(f, "Absent"),
+            Self::ExternalResolutionFailed => write!(f, "ExternalResolutionFailed"),
+            Self::BackendIoFailed => write!(f, "BackendIoFailed"),
+            Self::ParseFailed => write!(f, "ParseFailed"),
+            Self::RestrictionRejected => write!(f, "RestrictionRejected"),
+            Self::MissingStableIdentity => write!(f, "MissingStableIdentity"),
+            Self::IneligibleAuthMode => write!(f, "IneligibleAuthMode"),
+        }
+    }
 }
 
 /// Distinguishes managed-auth-transition install outcomes (Issue 05 Slice
-/// 4, R014).
-#[derive(Debug)]
+/// 4, R014, R064). Never carries credential material in `Debug` output.
 pub enum ManagedAdoptionInstallOutcome {
     Installed(CodexAuth),
+    /// A deliberate managed logout was installed: the cache now holds no
+    /// auth (R001's "deliberate logged-out state").
+    LoggedOut,
+    /// The cache lock could not be acquired.
     CacheLockUnavailable,
+    /// The cache no longer held the auth snapshot observed immediately
+    /// before this install started -- something else (an ordinary
+    /// non-managed login/logout, a token refresh landing concurrently)
+    /// changed it. Refusing rather than overwriting an unrelated
+    /// concurrent change is the CAS half of the manager-owned adoption
+    /// seam (R014's "revalidates the expected prior cache/revision").
+    CacheChangedConcurrently,
+}
+
+impl std::fmt::Debug for ManagedAdoptionInstallOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Installed(auth) => f
+                .debug_tuple("Installed")
+                .field(&auth.api_auth_mode())
+                .finish(),
+            Self::LoggedOut => write!(f, "LoggedOut"),
+            Self::CacheLockUnavailable => write!(f, "CacheLockUnavailable"),
+            Self::CacheChangedConcurrently => write!(f, "CacheChangedConcurrently"),
+        }
+    }
 }
 
 impl Debug for CachedAuth {
@@ -2531,18 +2581,23 @@ impl AuthManager {
     }
 
     /// Fallibly reads and classifies the authoritative auth source for
-    /// managed-auth-transition adoption (Issue 05 Slice 4, R014). Unlike
-    /// [`Self::load_auth`], never composes external-resolution, file I/O,
-    /// parse/deserialization, keyring/secrets, restriction, or
+    /// managed-auth-transition adoption (Issue 05 Slice 4, R014, R002,
+    /// R044, R045). Unlike [`Self::load_auth`], never composes
+    /// external-resolution, file I/O, parse/deserialization,
+    /// keyring/secrets, restriction, mode-eligibility, or
     /// missing-stable-identity outcomes through `.ok()`/`.flatten()`/a
     /// filter -- each is a distinct, typed result. Never logs or returns
-    /// credential material.
+    /// credential material. Only persisted managed ChatGPT mode
+    /// (`CodexAuth::Chatgpt`) can ever resolve to `Available`; every other
+    /// mode -- including external auth authority resolved successfully --
+    /// is `IneligibleAuthMode`, per R002/R044/R045's exact scope.
     pub async fn read_managed_adoption_source(&self) -> ManagedAdoptionSourceOutcome {
-        if let Some(external_auth) = self.external_auth() {
-            return match self.resolve_external_auth(&external_auth).await {
-                Ok(auth) => ManagedAdoptionSourceOutcome::Available(auth),
-                Err(_) => ManagedAdoptionSourceOutcome::ExternalResolutionFailed,
-            };
+        if self.external_auth().is_some() {
+            // External auth authority (agent identity, injected tokens) is
+            // explicitly excluded from managed-auth-transition adoption
+            // (R044/R045) regardless of what it would resolve to -- it is
+            // never the persisted managed ChatGPT source R002 requires.
+            return ManagedAdoptionSourceOutcome::IneligibleAuthMode;
         }
 
         let allowed_login_methods = self.allowed_login_methods();
@@ -2591,6 +2646,16 @@ impl AuthManager {
             return ManagedAdoptionSourceOutcome::RestrictionRejected;
         }
 
+        // R002 admits only persisted managed ChatGPT mode -- not
+        // `ChatgptAuthTokens` (external/env-sourced, not disk-persisted;
+        // see `CodexAuth::is_external_chatgpt_tokens`), and not any other
+        // mode. A stable identity on an excluded mode (`AgentIdentity` and
+        // `PersonalAccessToken` both expose one) must not be mistaken for
+        // eligibility.
+        if !matches!(auth, CodexAuth::Chatgpt(_)) {
+            return ManagedAdoptionSourceOutcome::IneligibleAuthMode;
+        }
+
         if auth.get_account_id().is_none() {
             return ManagedAdoptionSourceOutcome::MissingStableIdentity;
         }
@@ -2599,16 +2664,27 @@ impl AuthManager {
     }
 
     /// Installs a managed-auth-transition-adopted auth value (Issue 05
-    /// Slice 4, R014). The caller (the managed-transition coordinator) owns
-    /// all CAS/revision revalidation against its own transition state
-    /// before calling this; this method's only contract is "acquire the
-    /// cache lock, install, publish the change signal, release" as one
-    /// short synchronous step -- it holds the lock for no `.await`.
-    pub fn install_managed_adoption(&self, new_auth: CodexAuth) -> ManagedAdoptionInstallOutcome {
+    /// Slice 4, R014, R064). The caller (the managed-transition
+    /// coordinator) owns all revision/target revalidation against its own
+    /// transition state before calling this. `expected_previous` is the
+    /// auth snapshot observed immediately before the source read that
+    /// produced `new_auth` (typically [`Self::auth_cached`]) -- installing
+    /// only proceeds if the cache still holds exactly that snapshot,
+    /// refusing rather than overwriting an unrelated concurrent change
+    /// (an ordinary non-managed login/logout, or a token refresh) that
+    /// landed during the read. Holds the lock for no `.await`.
+    pub fn install_managed_adoption(
+        &self,
+        new_auth: CodexAuth,
+        expected_previous: Option<CodexAuth>,
+    ) -> ManagedAdoptionInstallOutcome {
         let Ok(mut guard) = self.inner.write() else {
             return ManagedAdoptionInstallOutcome::CacheLockUnavailable;
         };
         let previous = guard.auth.as_ref();
+        if !Self::auths_equal_for_refresh(previous, expected_previous.as_ref()) {
+            return ManagedAdoptionInstallOutcome::CacheChangedConcurrently;
+        }
         let auth_changed_for_refresh = !Self::auths_equal_for_refresh(previous, Some(&new_auth));
         if auth_changed_for_refresh {
             guard.permanent_refresh_failure = None;
@@ -2618,6 +2694,34 @@ impl AuthManager {
             self.auth_change_tx.send_modify(|revision| *revision += 1);
         }
         ManagedAdoptionInstallOutcome::Installed(new_auth)
+    }
+
+    /// Installs a deliberate managed logout (Issue 05 Slice 4, R001, R002,
+    /// R064): the cache becomes `None`, the process-wide "deliberate
+    /// logged-out state" R001 requires as a legitimate success outcome,
+    /// not a failure. Same concurrent-change CAS contract as
+    /// [`Self::install_managed_adoption`]; never touches the durable
+    /// store (the writer boundary remains separately owned, R066-R068).
+    pub fn install_managed_logout(
+        &self,
+        expected_previous: Option<CodexAuth>,
+    ) -> ManagedAdoptionInstallOutcome {
+        let Ok(mut guard) = self.inner.write() else {
+            return ManagedAdoptionInstallOutcome::CacheLockUnavailable;
+        };
+        let previous = guard.auth.as_ref();
+        if !Self::auths_equal_for_refresh(previous, expected_previous.as_ref()) {
+            return ManagedAdoptionInstallOutcome::CacheChangedConcurrently;
+        }
+        let auth_changed_for_refresh = previous.is_some();
+        if auth_changed_for_refresh {
+            guard.permanent_refresh_failure = None;
+        }
+        guard.auth = None;
+        if auth_changed_for_refresh {
+            self.auth_change_tx.send_modify(|revision| *revision += 1);
+        }
+        ManagedAdoptionInstallOutcome::LoggedOut
     }
 
     pub async fn set_external_auth(

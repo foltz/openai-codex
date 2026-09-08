@@ -4,7 +4,7 @@
 
 use std::future::Future;
 use std::io;
-use std::time::Duration;
+use std::sync::Arc;
 
 use codex_utils_pty::Command;
 use futures::FutureExt;
@@ -16,13 +16,15 @@ use rmcp::transport::async_rw::AsyncRwTransport;
 use tokio::process::ChildStderr;
 use tokio::process::ChildStdin;
 use tokio::process::ChildStdout;
+use tokio::sync::watch;
+use tokio::task::AbortHandle;
 
 use crate::bounded_stdio_transport::BoundedStdioTransport;
 use crate::protocol_mode::McpProtocolMode;
-use codex_utils_pty::Child;
 
 pub(super) struct LocalStdioTransport {
-    child: Box<Child>,
+    process_id: Option<u32>,
+    exit_observer: LocalProcessExitObserver,
     transport: StdioTransport,
 }
 
@@ -33,6 +35,66 @@ enum StdioTransport {
     V20260728(BoundedStdioTransport),
 }
 
+/// One terminal observation for a locally spawned stdio process.
+///
+/// The supervisor owns the child and sends exactly one terminal result. This
+/// lets the transport and the separately-held process handle await the same
+/// fact without racing to call `Child::wait`.
+#[derive(Clone)]
+pub(super) struct LocalProcessExitObserver {
+    state: watch::Receiver<LocalProcessExit>,
+    supervisor: Arc<LocalProcessSupervisor>,
+}
+
+struct LocalProcessSupervisor {
+    abort_handle: AbortHandle,
+}
+
+impl Drop for LocalProcessSupervisor {
+    fn drop(&mut self) {
+        // A dropped AbortHandle alone detaches its task. The final observer
+        // instead releases the owned Child and preserves kill_on_drop, even
+        // when launcher setup fails before a process handle can be created.
+        self.abort_handle.abort();
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+enum LocalProcessExit {
+    #[default]
+    Pending,
+    Exited,
+    Failed(Arc<str>),
+}
+
+impl LocalProcessExitObserver {
+    pub(super) async fn wait(&mut self) -> io::Result<()> {
+        loop {
+            let state = self.state.borrow_and_update().clone();
+            match state {
+                LocalProcessExit::Pending => {
+                    self.state.changed().await.map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "local MCP exit observer closed before terminal exit",
+                        )
+                    })?;
+                }
+                LocalProcessExit::Exited => return Ok(()),
+                LocalProcessExit::Failed(message) => {
+                    return Err(io::Error::other(message.to_string()));
+                }
+            }
+        }
+    }
+
+    /// Drops the child owned by the supervisor, preserving `kill_on_drop` when
+    /// no platform process-group or job terminator could be created.
+    pub(super) fn abort(&self) {
+        self.supervisor.abort_handle.abort();
+    }
+}
+
 impl LocalStdioTransport {
     pub(super) fn spawn(
         command: Command,
@@ -40,6 +102,7 @@ impl LocalStdioTransport {
         protocol_mode: McpProtocolMode,
     ) -> io::Result<(Self, Option<ChildStderr>)> {
         let mut child = command.spawn()?;
+        let process_id = child.id();
         let stdin = child
             .stdin
             .take()
@@ -55,9 +118,23 @@ impl LocalStdioTransport {
                 StdioTransport::V20260728(BoundedStdioTransport::new(stdin, stdout, program_name))
             }
         };
+        let (exit_tx, exit_rx) = watch::channel(LocalProcessExit::Pending);
+        let supervisor = tokio::spawn(async move {
+            let terminal = match child.wait().await {
+                Ok(_) => LocalProcessExit::Exited,
+                Err(error) => LocalProcessExit::Failed(Arc::from(error.to_string())),
+            };
+            let _ = exit_tx.send(terminal);
+        });
         Ok((
             Self {
-                child: Box::new(child),
+                process_id,
+                exit_observer: LocalProcessExitObserver {
+                    state: exit_rx,
+                    supervisor: Arc::new(LocalProcessSupervisor {
+                        abort_handle: supervisor.abort_handle(),
+                    }),
+                },
                 transport,
             },
             stderr,
@@ -65,7 +142,11 @@ impl LocalStdioTransport {
     }
 
     pub(super) fn id(&self) -> Option<u32> {
-        self.child.id()
+        self.process_id
+    }
+
+    pub(super) fn exit_observer(&self) -> LocalProcessExitObserver {
+        self.exit_observer.clone()
     }
 }
 
@@ -94,9 +175,20 @@ impl Transport<RoleClient> for LocalStdioTransport {
             StdioTransport::Legacy(transport) => transport.close().await?,
             StdioTransport::V20260728(transport) => transport.close().await?,
         }
-        match tokio::time::timeout(Duration::from_secs(3), self.child.wait()).await {
-            Ok(status) => status.map(|_| ()),
-            Err(_) => self.child.kill().await,
+        let mut exit_observer = self.exit_observer.clone();
+        match tokio::time::timeout(
+            super::stdio_server_launcher::PROCESS_RETIREMENT_TIMEOUT,
+            exit_observer.wait(),
+        ).await {
+            Ok(result) => result,
+            Err(_) => {
+                self.exit_observer.abort();
+                Err(io::Error::new(io::ErrorKind::TimedOut, "local MCP exit timed out"))
+            }
         }
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "local_stdio_transport_tests.rs"]
+mod tests;

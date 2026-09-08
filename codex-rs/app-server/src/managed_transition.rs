@@ -555,6 +555,14 @@ impl ManagedTransitionCoordinator {
         };
         let status = status_for(&record);
         state.active = Some(record);
+        // Closed synchronously while still holding `state`'s lock,
+        // immediately after installing the active record -- not by a
+        // separate later call in `close_barrier_and_drain` -- so no
+        // observer that can see this active Admitted record (via the same
+        // lock) can ever also see the barrier still open (verification
+        // round 02's TOCTOU correction, admission-side half). Idempotent;
+        // harmless if this transition never advances past `Admitted`.
+        self.account_work_permits.close();
         Ok(status)
     }
 
@@ -598,14 +606,17 @@ impl ManagedTransitionCoordinator {
         }
     }
 
-    /// Closes the process-wide account-work barrier and awaits zero drain
-    /// within [`DRAIN_DEADLINE`] (`CODEX-I05-S03-R009`, `R012`, `R013`).
-    /// Called once, synchronously, immediately after a successful
-    /// [`Self::admit`] as one continuous step of `start`'s own wire
-    /// handling -- the canonical plan describes barrier close and drain
-    /// await as part of `start`, not a detached background task, so a
-    /// client's `ManagedTransitionStart` response is not sent until this
-    /// resolves (bounded to `DRAIN_DEADLINE`).
+    /// Awaits zero drain of the process-wide account-work barrier within
+    /// [`DRAIN_DEADLINE`] (`CODEX-I05-S03-R009`, `R012`, `R013`). The
+    /// barrier itself is already closed by the time this runs -- `admit()`
+    /// closes it synchronously in its own critical section (verification
+    /// round 02), not this method -- so no observer can ever see an active
+    /// Admitted record with the barrier still open. Called once,
+    /// immediately after a successful [`Self::admit`], as one continuous
+    /// step of `start`'s own wire handling -- the canonical plan describes
+    /// barrier close and drain await as part of `start`, not a detached
+    /// background task, so a client's `ManagedTransitionStart` response is
+    /// not sent until this resolves (bounded to `DRAIN_DEADLINE`).
     ///
     /// A concurrent [`Self::cancel`] of the same transition is a *different*
     /// wire call -- itself never gated by this barrier, since
@@ -620,7 +631,9 @@ impl ManagedTransitionCoordinator {
         &self,
         transition_id: &str,
     ) -> Result<ManagedTransitionStatus, ManagedTransitionRefusal> {
-        self.account_work_permits.close();
+        // `admit()` already closed the barrier synchronously in its own
+        // critical section (verification round 02); no separate close call
+        // is needed or made here.
         self.advance(transition_id, ManagedTransitionPhase::Draining)
             .await?;
 
@@ -797,20 +810,24 @@ impl ManagedTransitionCoordinator {
             // own quarantine-conflict refusal (added alongside this fix)
             // already prevents any other transition from becoming active or
             // Quarantined while this one remains unresolved, so this should
-            // always evaluate true here. Re-checked anyway rather than
-            // assumed, so an unconditional reopen can never yank the
-            // barrier out from under a transition it does not own
-            // (verification round 02).
+            // always evaluate true here. Checked *and acted upon* while
+            // still holding `state`'s lock -- not checked under it and then
+            // acted on after releasing -- so `admit()` (which needs this
+            // same lock) can never admit a new transition in the window
+            // between this decision and the barrier actually reopening
+            // (verification round 02's TOCTOU correction on top of round
+            // 02's own single-owner fix). `reopen`/`wake_waiters` are
+            // synchronous, so this holds no lock across an `.await`.
             let no_other_owner = state.active.is_none()
                 && !state
                     .completed
                     .values()
                     .any(|other| other.phase == ManagedTransitionPhase::Quarantined);
-            drop(state);
             if no_other_owner {
                 self.account_work_permits.reopen();
                 self.account_work_permits.wake_waiters();
             }
+            drop(state);
             return Ok(status);
         }
 
@@ -861,16 +878,25 @@ impl ManagedTransitionCoordinator {
         state
             .completed
             .insert(cancelled.envelope.transition_id.clone(), cancelled);
-        drop(state);
         if was_draining {
             // Reopen so ordinary account-dependent work resumes immediately
             // rather than staying refused for the rest of the process's
             // lifetime over an attempt nothing will ever retry-complete;
             // wake any in-flight `close_barrier_and_drain` so it observes
             // this cancellation instead of running to its own timeout.
+            //
+            // Called while still holding `state`'s lock, immediately after
+            // recording `Cancelled` -- not after releasing it -- for the
+            // same reason as the quarantine-cancel branch above: `admit()`
+            // needs this same lock, so a new transition can never be
+            // admitted in the window between this cancellation taking
+            // effect and the barrier actually reopening (verification
+            // round 02's TOCTOU correction). Synchronous calls; holds no
+            // lock across an `.await`.
             self.account_work_permits.reopen();
             self.account_work_permits.wake_waiters();
         }
+        drop(state);
         Ok(status)
     }
 
@@ -1603,6 +1629,80 @@ mod tests {
             coordinator.try_acquire_account_work_permit().is_some(),
             "cancelling a Draining transition must reopen the barrier"
         );
+    }
+
+    #[tokio::test]
+    async fn admit_closes_the_barrier_synchronously_before_returning() {
+        // Verification round 02's TOCTOU correction, admission-side half:
+        // `admit()` itself closes the barrier, inside the same
+        // `CoordinatorState` critical section that installs the active
+        // record, before releasing the lock -- not `close_barrier_and_drain`
+        // afterward as a separate step. Calling `admit()` directly (not
+        // `start_dispatch`, which would already have run the drain by the
+        // time it returns and so could not distinguish the two) and
+        // checking the barrier immediately on return is what proves this:
+        // pre-fix, a bare `admit()` call left the barrier open until
+        // `close_barrier_and_drain` ran afterward, so this exact assertion
+        // would have failed against that code.
+        let coordinator = ManagedTransitionCoordinator::new();
+        let process_id = coordinator.process_instance_id().await;
+        let admitted = coordinator
+            .admit(request(process_id, "transition-a"))
+            .await
+            .unwrap();
+        assert_eq!(admitted.phase, ManagedTransitionPhase::Admitted);
+        assert!(
+            coordinator.try_acquire_account_work_permit().is_none(),
+            "admit() must close the barrier itself, before this method \
+             returns -- not rely on a later, separate close call"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_reopens_the_barrier_before_a_later_transition_can_admit() {
+        // Verification round 02's TOCTOU correction, cancellation-side
+        // half, proved sequentially and deterministically: `cancel()`
+        // reopens the barrier (and, in the quarantine branch, checks for
+        // any other owner) while still holding `state`'s lock, before
+        // returning. Because both admission's `close()` and cancellation's
+        // `reopen()` now execute only while that same `MutexGuard` is held,
+        // and Rust's `Mutex` guarantees mutual exclusion over it, no other
+        // call that needs the same lock -- including a later `admit()` --
+        // can ever run between one owner's state mutation and its matching
+        // barrier mutation. That guarantee is the actual concurrency proof;
+        // this test corroborates its observable, sequential consequence: by
+        // the time `cancel()` returns, the barrier is already reopened, and
+        // a subsequent `admit()` for a new transition succeeds immediately,
+        // with no intervening step required to "catch up".
+        let coordinator = ManagedTransitionCoordinator::new();
+        let process_id = coordinator.process_instance_id().await;
+        coordinator
+            .admit(request(process_id.clone(), "transition-a"))
+            .await
+            .unwrap();
+        coordinator
+            .advance("transition-a", ManagedTransitionPhase::Draining)
+            .await
+            .unwrap();
+
+        let cancelled = coordinator
+            .cancel(cancel_request(process_id.clone(), "transition-a"))
+            .await
+            .expect("cancelling the Draining transition must succeed");
+        assert!(
+            coordinator.try_acquire_account_work_permit().is_some(),
+            "the barrier must already be reopened by the time cancel() returns"
+        );
+
+        let next = coordinator
+            .admit(request_at_revision(
+                process_id,
+                "transition-b",
+                cancelled.transition_revision,
+            ))
+            .await
+            .expect("a fresh transition must admit immediately after the prior one's cancel");
+        assert_eq!(next.phase, ManagedTransitionPhase::Admitted);
     }
 
     #[tokio::test]

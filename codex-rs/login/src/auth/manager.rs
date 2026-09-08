@@ -1800,6 +1800,39 @@ pub enum AuthoritativeAuthUnavailable {
     CacheLockUnavailable,
 }
 
+/// Distinguishes managed-auth-transition adoption source-read outcomes
+/// (Issue 05 Slice 4, R014). Never carries credential material -- variants
+/// distinguish *why*, not the underlying error text.
+#[derive(Debug)]
+pub enum ManagedAdoptionSourceOutcome {
+    /// The intended account's auth was read, parsed, and passed every
+    /// configured restriction; the stable account identity is present.
+    Available(CodexAuth),
+    /// No persisted auth exists at the authoritative source.
+    Absent,
+    /// The configured external auth resolver failed.
+    ExternalResolutionFailed,
+    /// The storage backend's read failed (file I/O, or a keyring failure
+    /// that also failed its own internal file fallback).
+    BackendIoFailed,
+    /// The persisted content could not be parsed/deserialized.
+    ParseFailed,
+    /// A configured allowed-login-method or workspace restriction rejected
+    /// the loaded auth.
+    RestrictionRejected,
+    /// The loaded auth lacks the stable account identity managed-auth
+    /// transition requires for fingerprinting.
+    MissingStableIdentity,
+}
+
+/// Distinguishes managed-auth-transition install outcomes (Issue 05 Slice
+/// 4, R014).
+#[derive(Debug)]
+pub enum ManagedAdoptionInstallOutcome {
+    Installed(CodexAuth),
+    CacheLockUnavailable,
+}
+
 impl Debug for CachedAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CachedAuth")
@@ -2642,6 +2675,96 @@ impl AuthManager {
         } else {
             false
         }
+    }
+
+    /// Fallibly reads and classifies the authoritative auth source for
+    /// managed-auth-transition adoption (Issue 05 Slice 4, R014). Unlike
+    /// [`Self::load_auth`], never composes external-resolution, file I/O,
+    /// parse/deserialization, keyring/secrets, restriction, or
+    /// missing-stable-identity outcomes through `.ok()`/`.flatten()`/a
+    /// filter -- each is a distinct, typed result. Never logs or returns
+    /// credential material.
+    pub async fn read_managed_adoption_source(&self) -> ManagedAdoptionSourceOutcome {
+        if let Some(external_auth) = self.external_auth() {
+            return match self.resolve_external_auth(&external_auth).await {
+                Ok(auth) => ManagedAdoptionSourceOutcome::Available(auth),
+                Err(_) => ManagedAdoptionSourceOutcome::ExternalResolutionFailed,
+            };
+        }
+
+        let allowed_login_methods = self.allowed_login_methods();
+        let effective_chatgpt_workspaces = self.effective_chatgpt_workspaces();
+        let loaded = load_auth(
+            &self.codex_home,
+            self.enable_codex_api_key_env,
+            self.auth_credentials_store_mode,
+            Some(&allowed_login_methods),
+            effective_chatgpt_workspaces.as_deref(),
+            self.chatgpt_base_url.as_deref(),
+            self.keyring_backend_kind,
+            self.agent_identity_authapi_base_url.as_deref(),
+            &self.auth_route_config,
+        )
+        .await;
+
+        let auth = match loaded {
+            Ok(Some(auth)) => auth,
+            Ok(None) => return ManagedAdoptionSourceOutcome::Absent,
+            Err(err) => {
+                // `serde_json::Error`'s `From<Error> for io::Error` maps
+                // syntax/data errors to `InvalidData` and truncated input
+                // to `UnexpectedEof`; every other kind reaches this point
+                // only from a genuine backend I/O failure (file or
+                // keyring -- `AutoAuthStorage` already falls back
+                // keyring-to-file internally before this call ever sees an
+                // error, so a surfaced error here is a failure of the
+                // whole backend chain, not a recoverable keyring miss).
+                return match err.kind() {
+                    std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof => {
+                        ManagedAdoptionSourceOutcome::ParseFailed
+                    }
+                    _ => ManagedAdoptionSourceOutcome::BackendIoFailed,
+                };
+            }
+        };
+
+        if validate_auth_restrictions(
+            Some(&allowed_login_methods),
+            effective_chatgpt_workspaces.as_deref(),
+            &auth,
+        )
+        .is_err()
+        {
+            return ManagedAdoptionSourceOutcome::RestrictionRejected;
+        }
+
+        if auth.get_account_id().is_none() {
+            return ManagedAdoptionSourceOutcome::MissingStableIdentity;
+        }
+
+        ManagedAdoptionSourceOutcome::Available(auth)
+    }
+
+    /// Installs a managed-auth-transition-adopted auth value (Issue 05
+    /// Slice 4, R014). The caller (the managed-transition coordinator) owns
+    /// all CAS/revision revalidation against its own transition state
+    /// before calling this; this method's only contract is "acquire the
+    /// cache lock, install, publish the change signal, release" as one
+    /// short synchronous step -- it holds the lock for no `.await`.
+    pub fn install_managed_adoption(&self, new_auth: CodexAuth) -> ManagedAdoptionInstallOutcome {
+        let Ok(mut guard) = self.inner.write() else {
+            return ManagedAdoptionInstallOutcome::CacheLockUnavailable;
+        };
+        let previous = guard.auth.as_ref();
+        let auth_changed_for_refresh = !Self::auths_equal_for_refresh(previous, Some(&new_auth));
+        if auth_changed_for_refresh {
+            guard.permanent_refresh_failure = None;
+        }
+        guard.auth = Some(new_auth.clone());
+        if auth_changed_for_refresh {
+            self.auth_change_tx.send_modify(|revision| *revision += 1);
+        }
+        ManagedAdoptionInstallOutcome::Installed(new_auth)
     }
 
     pub async fn set_external_auth(

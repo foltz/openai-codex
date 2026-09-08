@@ -229,7 +229,9 @@ pub(crate) struct MessageProcessor {
     user_verification: Arc<crate::user_verification::Service>,
     outgoing: Arc<OutgoingMessageSender>,
     thread_manager: Arc<ThreadManager>,
-    models_refresh_worker: ModelsRefreshWorker,
+    /// Replaceable on managed account adoption; the async mutex also retains
+    /// the current worker while its terminal shutdown is observed.
+    models_refresh_worker: Arc<Mutex<ModelsRefreshWorker>>,
     turn_cost_worker: Option<TurnCostWorker>,
     skills_watcher: Arc<SkillsWatcher>,
     account_processor: Arc<AccountRequestProcessor>,
@@ -424,6 +426,108 @@ pub(crate) struct MessageProcessorArgs {
     pub(crate) control_endpoint: Option<String>,
 }
 
+/// Production wiring for `managed_transition::ResetInventory` (Issue 05
+/// Slice 4, R014): clears every account-derived cache/worker this process
+/// owns once a managed-auth adoption has installed the new account, so no
+/// caller can observe stale data from the account that just transitioned
+/// out. Deliberately never receives the adopted auth value itself -- only
+/// the already-installed `AuthManager` and the handles needed to reset
+/// around it.
+///
+/// **Scope note (reported to the driver alongside this change).** This
+/// wiring resets thread/session and MCP-runtime state
+/// (`ThreadManager::shutdown_all_threads_bounded`,
+/// `ThreadManager::invalidate_mcp_runtimes`), respawns the models-refresh
+/// worker so the model catalog picks up the new account, and re-derives
+/// `PluginsManager`'s auth mode (`set_auth_mode` +
+/// `clear_recommended_plugins_cache`) -- the same two calls
+/// `account_processor.rs`'s own established account-change path
+/// (`clear_external_auth`, `maybe_refresh_plugin_caches_for_current_config`)
+/// already makes for the ordinary (non-managed) login/logout transition.
+///
+/// Three other candidate surfaces were investigated and are deliberately
+/// **not** wired here, each with source evidence rather than an
+/// assumption:
+/// - **Skills** (`HostSkillsService::clear_cache`, reachable via
+///   `thread_manager.skills_service()`): `ext/skills/src/host_service.rs`'s
+///   cache is keyed purely by cwd/config/plugin-root state
+///   (`HostSkillsLoadInput` carries no auth or account field, and neither
+///   `HostSkillsService` nor its cache types reference `AuthManager`,
+///   `CodexAuth`, or an account id anywhere) -- proven independent.
+/// - **Codex Apps tools cache** (`CodexAppsToolsCache` /
+///   `connectors::ConnectorRuntimeManager<ToolInfo>`, owned by
+///   `McpManager`): its own module doc calls it a "process-scoped
+///   registry of connector runtime state by account and workspace";
+///   entries are keyed by `ConnectorRuntimeContextKey`, built from
+///   `account_id`/`chatgpt_user_id`/`is_workspace_account`
+///   (`connectors::connector_runtime_context_key`) -- a new account is a
+///   cache miss on a new key, never stale data served from the old one --
+///   proven independent, the same self-isolating-by-account-key shape
+///   already relied on elsewhere in this codebase
+///   (`WorkspaceSettingsCache`, the cloud-config bundle cache).
+/// - **codex-mcp's per-connection `shutdown()`**
+///   (`codex-mcp/src/connection_manager.rs`): that manager's own state
+///   (`self.servers`) is owned per-thread, not by any process-wide
+///   singleton reachable from `ThreadManager` (no reference to it exists
+///   in `thread_manager.rs`) -- already torn down as part of
+///   `shutdown_all_threads_bounded` above, not a separate surface.
+struct ProductionResetInventory {
+    thread_manager: Arc<ThreadManager>,
+    models_refresh_worker: Arc<Mutex<ModelsRefreshWorker>>,
+    model_catalog: Arc<crate::model_catalog::ModelCatalog>,
+    auth_manager: Arc<AuthManager>,
+}
+
+/// Bounded, not indefinite: Slice 03's admission barrier already drains
+/// account-dependent work to zero before this ever runs, so every tracked
+/// thread here is expected to already be idle. This bound only protects
+/// against a thread that fails to observe its own shutdown signal.
+const RESET_THREAD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+impl crate::managed_transition::ResetInventory for ProductionResetInventory {
+    fn reset_all(&self) -> crate::managed_transition::ResetInventoryFuture<'_> {
+        Box::pin(async move {
+            self.thread_manager
+                .shutdown_all_threads_bounded(RESET_THREAD_SHUTDOWN_TIMEOUT)
+                .await;
+            self.thread_manager.invalidate_mcp_runtimes().await;
+
+            // Mirrors `account_processor.rs`'s own established
+            // account-change reset for the ordinary (non-managed)
+            // login/logout path: `PluginsManager::auth_mode` is a bare
+            // field, not itself keyed by account, so marketplace/plugin
+            // eligibility filtering (`target_curated_marketplace`,
+            // `remote_global_catalog_active`) would otherwise keep judging
+            // by the just-replaced account's auth mode until some
+            // unrelated session happened to update it.
+            self.thread_manager
+                .plugins_manager()
+                .set_auth_mode(self.auth_manager.get_api_auth_mode());
+            self.thread_manager
+                .plugins_manager()
+                .clear_recommended_plugins_cache();
+
+            // Swap in a freshly spawned worker rather than calling terminal
+            // `shutdown()` with no successor: the process must keep
+            // refreshing models on its normal interval, now against the
+            // newly-installed account, for its entire remaining lifetime.
+            // The lock is held only for this synchronous replace; the old
+            // worker's own `shutdown()` (also synchronous) runs after the
+            // guard is already dropped.
+            let old_worker = {
+                let mut worker = self.models_refresh_worker.lock().await;
+                std::mem::replace(
+                    &mut *worker,
+                    crate::models_refresh_worker::spawn(&self.model_catalog),
+                )
+            };
+            old_worker.shutdown();
+
+            Ok(())
+        })
+    }
+}
+
 impl MessageProcessor {
     /// Create a new `MessageProcessor`, retaining a handle to the outgoing
     /// `Sender` so handlers can enqueue messages to be written to stdout.
@@ -540,7 +644,9 @@ impl MessageProcessor {
             Arc::clone(&config),
             thread_manager.get_models_manager(),
         ));
-        let models_refresh_worker = crate::models_refresh_worker::spawn(&model_catalog);
+        let models_refresh_worker = Arc::new(Mutex::new(
+            crate::models_refresh_worker::spawn(&model_catalog),
+        ));
         let turn_cost_worker =
             TurnCostWorker::spawn(Arc::clone(&config), Arc::clone(&auth_manager));
         thread_manager
@@ -633,11 +739,20 @@ impl MessageProcessor {
             crate::transport::app_server_control_socket_path(&config.codex_home)
                 .map(|path| path.display().to_string())
                 .unwrap_or_default();
-        let managed_transition_coordinator = crate::managed_transition::ManagedTransitionCoordinator::from_authoritative_auth_state_and_target_evidence_source(
+        let reset_inventory: Arc<dyn crate::managed_transition::ResetInventory> =
+            Arc::new(ProductionResetInventory {
+                thread_manager: Arc::clone(&thread_manager),
+                models_refresh_worker: Arc::clone(&models_refresh_worker),
+                model_catalog: Arc::clone(&model_catalog),
+                auth_manager: Arc::clone(&auth_manager),
+            });
+        let managed_transition_coordinator = crate::managed_transition::ManagedTransitionCoordinator::from_authoritative_auth_state_target_evidence_and_adoption(
                 crate::managed_transition::AuthoritativeAuthState::from_auth_manager(&auth_manager),
                 std::sync::Arc::new(crate::managed_transition::ProcessTargetEvidenceSource::new(
                     managed_transition_control_socket_endpoint,
                 )),
+                Arc::clone(&auth_manager),
+                reset_inventory,
             );
         let marketplace_processor = MarketplaceRequestProcessor::new(
             Arc::clone(&config),
@@ -803,10 +918,17 @@ impl MessageProcessor {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn thread_manager_for_tests(&self) -> &Arc<ThreadManager> {
+        &self.thread_manager
+    }
+
     pub(crate) fn clear_runtime_references(&self) {
         self.account_processor.clear_external_auth();
         self.apps_processor.shutdown();
-        self.models_refresh_worker.shutdown();
+        if let Ok(worker) = self.models_refresh_worker.try_lock() {
+            worker.shutdown();
+        }
         self.skills_watcher.shutdown();
         let _ = self.auxiliary_tasks.close_registration();
     }
@@ -1111,11 +1233,19 @@ impl MessageProcessor {
     }
 
     pub(crate) async fn drain_background_tasks(&self) {
-        self.models_refresh_worker.shutdown();
+        self.models_refresh_worker.lock().await.shutdown();
         if let Some(worker) = &self.turn_cost_worker {
             worker.shutdown();
         }
         self.thread_processor.drain_background_tasks().await;
+    }
+
+    async fn shutdown_models_refresh_worker_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> crate::models_refresh_worker::ModelsRefreshShutdown {
+        let worker = self.models_refresh_worker.lock().await;
+        worker.shutdown_until(deadline).await
     }
 
     /// Independent terminal observations under one caller-owned deadline.
@@ -1128,7 +1258,7 @@ impl MessageProcessor {
     ) -> ProcessorBackgroundShutdown {
         let plugins_manager = self.thread_manager.plugins_manager();
         let (models, thread_starts, apps, skills, plugins, auxiliary_tasks) = tokio::join!(
-            self.models_refresh_worker.shutdown_until(deadline),
+            self.shutdown_models_refresh_worker_until(deadline),
             self.thread_processor.drain_background_tasks_until(deadline),
             self.apps_processor.shutdown_until(deadline),
             self.skills_watcher.shutdown_until(deadline),

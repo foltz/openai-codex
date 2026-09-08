@@ -1052,6 +1052,54 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn clear_revokes_the_requesters_predecessor_retention_grant() {
+        let manager = ThreadStateManager::new();
+        let predecessor_thread_id = ThreadId::new();
+        let successor_thread_id = ThreadId::new();
+        let requester = ConnectionId(1);
+        let principal = RetentionPrincipalId::new();
+        manager
+            .connection_initialized(
+                requester,
+                ConnectionCapabilities {
+                    retention_principal: Some(principal),
+                    ..ConnectionCapabilities::default()
+                },
+            )
+            .await;
+        manager
+            .try_ensure_connection_subscribed(predecessor_thread_id, requester, false)
+            .await
+            .expect("requester should be subscribed to the clear predecessor");
+        let RetentionAcquireOutcome::Acquired { grant_id } = manager
+            .acquire_retention(predecessor_thread_id, principal)
+            .await
+            .expect("requester principal should acquire an exact predecessor grant")
+        else {
+            panic!("first acquire must mint a grant");
+        };
+
+        assert!(
+            manager
+                .move_connection_for_clear(predecessor_thread_id, successor_thread_id, requester)
+                .await
+        );
+        assert_eq!(
+            manager
+                .release_retention(predecessor_thread_id, principal, &grant_id)
+                .await,
+            Ok(RetentionReleaseOutcome::NotHeld),
+            "clear must revoke A's exact grant"
+        );
+        assert!(matches!(
+            manager
+                .acquire_retention(successor_thread_id, principal)
+                .await,
+            Ok(RetentionAcquireOutcome::Acquired { .. })
+        ));
+    }
+
     async fn recv_interactive_subscription_changed_notification(
         outgoing_rx: &mut mpsc::Receiver<OutgoingEnvelope>,
     ) -> ThreadInteractiveSubscriptionChangedNotification {
@@ -1758,6 +1806,10 @@ impl ThreadStateManager {
                 .live_connections
                 .get(&connection_id)
                 .is_some_and(|capabilities| capabilities.trusted_interactive);
+            let retention_principal = state
+                .live_connections
+                .get(&connection_id)
+                .and_then(|capabilities| capabilities.retention_principal);
             if trusted_interactive && !state.interactive_subscription_counts.contains_key(&predecessor_thread_id)
             {
                 return false;
@@ -1778,6 +1830,14 @@ impl ThreadStateManager {
             let successor = state.threads.entry(successor_thread_id).or_default();
             successor.connection_ids.insert(connection_id);
             successor.update_has_connections();
+
+            // The authoritative A -> B clear transition moves observation,
+            // not retention. Revoke only after every move guard has passed,
+            // in this same mutex transaction; the successor never inherits
+            // the predecessor's exact grant.
+            if let Some(principal) = retention_principal {
+                state.revoke_retention_grant(predecessor_thread_id, principal);
+            }
 
             let changes = if trusted_interactive {
                 let Some(predecessor_change) =

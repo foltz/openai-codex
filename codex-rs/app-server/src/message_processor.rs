@@ -4,10 +4,13 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 
+use crate::account_dependency::AccountDependency;
+use crate::account_dependency::classify;
 use crate::attestation::app_server_attestation_provider;
 use crate::config_manager::ConfigManager;
 use crate::connection_rpc_gate::ConnectionRpcGate;
 use crate::current_time::app_server_time_provider;
+use crate::error_code::account_transition_in_progress;
 use crate::error_code::invalid_request;
 use crate::extensions::ThreadExtensionDependencies;
 use crate::extensions::app_server_extension_event_sink;
@@ -902,6 +905,28 @@ impl MessageProcessor {
         {
             return Err(invalid_request(experimental_required_message(reason)));
         }
+
+        // Classified and gated before any per-request bookkeeping, auth
+        // capture, or provider effect (`CODEX-I05-S03-R009`, `R010`). Only
+        // `Permit`-classified requests need a permit at all; classification
+        // is a plain exhaustive match with no lock or I/O
+        // (`crate::account_dependency::classify`). A closed barrier refuses
+        // here, synchronously, without queueing or spawning the request --
+        // silently deferring it would violate R010's "never queue or
+        // reroute" requirement.
+        let account_work_permit = match classify(&codex_request) {
+            AccountDependency::Permit => {
+                match self
+                    .managed_transition_coordinator
+                    .try_acquire_account_work_permit()
+                {
+                    Some(guard) => Some(guard),
+                    None => return Err(account_transition_in_progress()),
+                }
+            }
+            AccountDependency::Independent => None,
+        };
+
         let connection_id = connection_request_id.connection_id;
         self.initialize_processor.track_initialized_request(
             connection_id,
@@ -925,6 +950,11 @@ impl MessageProcessor {
         let request = QueuedInitializedRequest::new(
             rpc_gate,
             async move {
+                // Held across the whole handling future, including every
+                // retry/prewarm/effect inside it, and released exactly once
+                // on drop regardless of which terminal path this future
+                // exits through (`CODEX-I05-S03-R009`).
+                let _account_work_permit = account_work_permit;
                 let processor_for_request = Arc::clone(&processor);
                 let result = processor_for_request
                     .handle_initialized_client_request(

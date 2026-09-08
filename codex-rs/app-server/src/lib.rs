@@ -82,6 +82,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 const SQLITE_RECOVERY_CONFIG_WARNING_SUMMARY: &str = "Codex rebuilt its local database.";
 
+mod account_dependency;
 mod analytics_utils;
 mod app_info;
 mod app_server_tracing;

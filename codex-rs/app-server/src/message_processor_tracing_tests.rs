@@ -815,3 +815,86 @@ fn managed_transition_dispatch_paths_refuse_before_authorization_without_reservi
         },
     )
 }
+
+/// End-to-end proof that a real managed-auth adoption, driven through the
+/// actual production-wired `MessageProcessor` (not a synthetic
+/// `ResetInventory` double), genuinely resets the account-derived surfaces
+/// this session's Slice 4 work newly wired -- specifically
+/// `PluginsManager::auth_mode`, which is a bare field rather than a
+/// self-isolating account-keyed cache, so nothing but an explicit reset
+/// call could ever make it correct after adoption. Wire authorization is
+/// bypassed the same way the sibling test above does, via
+/// `managed_transition_coordinator.start_dispatch` directly -- that gate
+/// is a separate, already-covered concern
+/// (`managed_transition_dispatch_paths_refuse_before_authorization_without_reserving_state`).
+#[test]
+#[serial(app_server_tracing)]
+fn managed_transition_adoption_resets_plugins_manager_auth_mode_for_the_new_account() -> Result<()> {
+    run_current_thread_test_with_stack(
+        "managed_transition_adoption_resets_plugins_manager_auth_mode_for_the_new_account",
+        async {
+            let harness = TracingHarness::new().await?;
+            assert_eq!(
+                harness
+                    .processor
+                    .thread_manager_for_tests()
+                    .plugins_manager()
+                    .auth_mode(),
+                None,
+                "no auth is installed yet, so the plugins manager must not already believe otherwise"
+            );
+
+            let process_instance_id = harness
+                .processor
+                .managed_transition_coordinator
+                .process_instance_id()
+                .await;
+            let start_params = StartManagedTransitionParams {
+                contract_version: MANAGED_AUTH_TRANSITION_CONTRACT_VERSION,
+                transition_id: "adopt-and-reset-plugins-auth-mode".to_owned(),
+                process_instance_id,
+                intent: ManagedTransitionIntent::AdoptManagedAuth,
+                expected_auth_revision: 0,
+                expected_transition_revision: 0,
+                // No auth is installed at harness startup (the mock config
+                // helper writes only `config.toml`, never `auth.json`), so
+                // the coordinator's own initial fingerprint is `None`.
+                expected_auth_fingerprint: None,
+            };
+
+            // A real managed account lands on disk before Adopting reads
+            // it -- the same fixture builder the rest of this app-server
+            // test suite already relies on for genuine ChatGPT auth.
+            app_test_support::write_chatgpt_auth(
+                harness._codex_home.path(),
+                app_test_support::ChatGptAuthFixture::new("access-token")
+                    .account_id("managed-adoption-account"),
+                codex_config::types::AuthCredentialsStoreMode::File,
+            )
+            .expect("write real chatgpt auth.json for adoption");
+
+            let status = harness
+                .processor
+                .managed_transition_coordinator
+                .start_dispatch(start_params, /*caller_authorized*/ true)
+                .await;
+            let StartManagedTransitionResponse::Accepted { status } = status else {
+                panic!("expected the real production coordinator to accept and complete adoption");
+            };
+            assert_eq!(status.phase, codex_app_server_protocol::ManagedTransitionPhase::Succeeded);
+
+            assert_eq!(
+                harness
+                    .processor
+                    .thread_manager_for_tests()
+                    .plugins_manager()
+                    .auth_mode(),
+                Some(codex_protocol::auth::AuthMode::Chatgpt),
+                "ProductionResetInventory must have re-derived PluginsManager's auth mode from the newly-adopted account"
+            );
+
+            harness.shutdown().await;
+            Ok(())
+        },
+    )
+}

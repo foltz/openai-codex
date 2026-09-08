@@ -17,9 +17,13 @@ use codex_app_server_protocol::ReadManagedTransitionResponse;
 use codex_app_server_protocol::StartManagedTransitionParams;
 use codex_app_server_protocol::StartManagedTransitionResponse;
 use codex_login::AuthManager;
+use codex_login::auth::ManagedAdoptionInstallOutcome;
+use codex_login::auth::ManagedAdoptionSourceOutcome;
 use sha2::Digest;
 use sha2::Sha256;
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
@@ -137,6 +141,34 @@ pub(crate) struct ManagedTransitionCoordinator {
     /// only ever queries it, never mutates it.
     target_evidence_source: Arc<dyn TargetEvidenceSource>,
     account_work_permits: AccountWorkPermits,
+    /// `None` for every Slice 1-3 construction path (`new`,
+    /// `from_authoritative_auth_state[_and_target_evidence_source]`): those
+    /// coordinators keep exactly their pre-Slice-4 behavior, closing the
+    /// barrier and draining but never auto-continuing into adoption. `Some`
+    /// only via
+    /// [`Self::from_authoritative_auth_state_target_evidence_and_adoption`],
+    /// the real production path (Issue 05 Slice 4, R014).
+    adoption: Option<AdoptionDependencies>,
+}
+
+#[derive(Clone)]
+struct AdoptionDependencies {
+    auth_manager: Arc<AuthManager>,
+    reset_inventory: Arc<dyn ResetInventory>,
+}
+
+pub(crate) type ResetInventoryFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+
+/// Injectable, credential-free reset of every account-derived cache/worker
+/// after a successful managed-auth adoption (Issue 05 Slice 4, R014). Never
+/// receives the adopted auth value -- only "reset now, using whatever
+/// `AuthManager` already has installed." Production wiring lives in
+/// `message_processor.rs`; disposable tests inject a synthetic
+/// implementation to prove the coordinator's phase/barrier sequencing
+/// without touching any real subsystem.
+pub(crate) trait ResetInventory: Send + Sync {
+    fn reset_all(&self) -> ResetInventoryFuture<'_>;
 }
 
 /// A fixed, always-consistent-with-itself source, for constructors that do
@@ -190,12 +222,7 @@ impl AuthoritativeAuthState {
     }
 
     fn from_account_id(account_id: Option<String>) -> Self {
-        let auth_fingerprint = account_id.map(|account_id| {
-            let mut hasher = Sha256::new();
-            hasher.update(b"codex-app-server/managed-auth-transition/account/v1\\0");
-            hasher.update(account_id.as_bytes());
-            format!("{:x}", hasher.finalize())
-        });
+        let auth_fingerprint = account_id.as_deref().map(account_fingerprint);
         Self {
             authority_available: true,
             // This kernel does not perform adoption. The first authoritative
@@ -212,6 +239,19 @@ impl AuthoritativeAuthState {
             auth_fingerprint: None,
         }
     }
+}
+
+/// The single domain-separated account-fingerprint derivation shared by
+/// every reader of the credential-free auth state: the process-startup
+/// snapshot ([`AuthoritativeAuthState::from_account_id`]) and a successful
+/// managed-auth adoption's new CAS baseline
+/// (`ManagedTransitionCoordinator::complete_adoption`, Issue 05 Slice 4).
+/// Never reversible and never logs or returns the account id itself.
+fn account_fingerprint(account_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"codex-app-server/managed-auth-transition/account/v1\\0");
+    hasher.update(account_id.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 /// The environment variable a future repository-owned command (Slice 5) sets
@@ -401,7 +441,32 @@ impl ManagedTransitionCoordinator {
             })),
             target_evidence_source,
             account_work_permits: AccountWorkPermits::new(),
+            adoption: None,
         }
+    }
+
+    /// The real production construction path once adoption is wired
+    /// (`app-server/src/message_processor.rs`, Issue 05 Slice 4). Identical
+    /// to
+    /// [`Self::from_authoritative_auth_state_and_target_evidence_source`]
+    /// except that a successfully-drained transition now auto-continues
+    /// through Adopting/Resetting to its terminal outcome instead of
+    /// returning the `Draining` status (see [`Self::close_barrier_and_drain`]).
+    pub(crate) fn from_authoritative_auth_state_target_evidence_and_adoption(
+        authoritative_auth: AuthoritativeAuthState,
+        target_evidence_source: Arc<dyn TargetEvidenceSource>,
+        auth_manager: Arc<AuthManager>,
+        reset_inventory: Arc<dyn ResetInventory>,
+    ) -> Self {
+        let mut coordinator = Self::from_authoritative_auth_state_and_target_evidence_source(
+            authoritative_auth,
+            target_evidence_source,
+        );
+        coordinator.adoption = Some(AdoptionDependencies {
+            auth_manager,
+            reset_inventory,
+        });
+        coordinator
     }
 
     pub(crate) async fn process_instance_id(&self) -> String {
@@ -684,7 +749,100 @@ impl ManagedTransitionCoordinator {
             }
         }
 
-        self.current_transition_status(transition_id).await
+        // Drain completed by permit count reaching zero (not by timeout or a
+        // concurrent cancel, both already returned above). Slice 1-3
+        // coordinators (`adoption: None`) keep exactly their old behavior:
+        // report the still-`Draining` status and go no further. Slice 4's
+        // real production coordinator auto-continues through Adopting and
+        // Resetting to its terminal outcome (Issue 05 Slice 4, R014).
+        match &self.adoption {
+            Some(deps) => {
+                self.adopt_and_reset(
+                    transition_id,
+                    deps.auth_manager.as_ref(),
+                    deps.reset_inventory.as_ref(),
+                )
+                .await
+            }
+            None => self.current_transition_status(transition_id).await,
+        }
+    }
+
+    /// Drives a successfully-drained transition through Adopting, Resetting,
+    /// and its terminal outcome (Succeeded+reopen, atomically, or
+    /// Quarantined+closed), per the tokenized-phase contract: `state`'s lock
+    /// is taken only to validate and advance the phase (inside [`Self::advance`]
+    /// / [`Self::complete_adoption`]); it is never held across the `.await`
+    /// that does the actual work (`AuthManager` I/O, the reset inventory).
+    /// Called once, only from [`Self::close_barrier_and_drain`]'s
+    /// drain-completed-by-count path.
+    async fn adopt_and_reset(
+        &self,
+        transition_id: &str,
+        auth_manager: &AuthManager,
+        reset_inventory: &dyn ResetInventory,
+    ) -> Result<ManagedTransitionStatus, ManagedTransitionRefusal> {
+        // Draining -> Adopting. A concurrent cancel that already took the
+        // transition out of `active` (legal while still Draining) surfaces
+        // here as this call's own `Err`, propagated by `?` -- the same
+        // "no longer the active transition" refusal every other `advance`
+        // caller already gets from this race.
+        self.advance(transition_id, ManagedTransitionPhase::Adopting)
+            .await?;
+
+        // No lock held across this await: `AuthManager` owns its own
+        // internal lock, and this call may perform network/file/keyring
+        // I/O. Never composes distinct failure classes -- each
+        // `ManagedAdoptionSourceOutcome` variant is inspected on its own.
+        let account_id = match auth_manager.read_managed_adoption_source().await {
+            ManagedAdoptionSourceOutcome::Available(new_auth) => {
+                // `read_managed_adoption_source` already rejects a missing
+                // stable identity before ever returning `Available`, so
+                // `None` here should be unreachable; quarantine rather than
+                // trust that invariant with an unwrap/panic.
+                let Some(account_id) = new_auth.get_account_id() else {
+                    return self.quarantine(transition_id).await;
+                };
+                match auth_manager.install_managed_adoption(new_auth) {
+                    ManagedAdoptionInstallOutcome::Installed(_) => account_id,
+                    ManagedAdoptionInstallOutcome::CacheLockUnavailable => {
+                        return self.quarantine(transition_id).await;
+                    }
+                }
+            }
+            ManagedAdoptionSourceOutcome::Absent
+            | ManagedAdoptionSourceOutcome::ExternalResolutionFailed
+            | ManagedAdoptionSourceOutcome::BackendIoFailed
+            | ManagedAdoptionSourceOutcome::ParseFailed
+            | ManagedAdoptionSourceOutcome::RestrictionRejected
+            | ManagedAdoptionSourceOutcome::MissingStableIdentity => {
+                return self.quarantine(transition_id).await;
+            }
+        };
+
+        // Adopting -> Resetting.
+        self.advance(transition_id, ManagedTransitionPhase::Resetting)
+            .await?;
+
+        // No lock held across this await either. A failed reset leaves
+        // account-derived caches/workers in an unknown state, so this fails
+        // closed to `Quarantined` rather than reporting `Succeeded` over
+        // known-stale state (R014).
+        if reset_inventory.reset_all().await.is_err() {
+            return self.quarantine(transition_id).await;
+        }
+
+        // Resetting -> Succeeded, atomically with the new CAS baseline and
+        // the barrier reopen (see `complete_adoption`).
+        self.complete_adoption(transition_id, account_id).await
+    }
+
+    async fn quarantine(
+        &self,
+        transition_id: &str,
+    ) -> Result<ManagedTransitionStatus, ManagedTransitionRefusal> {
+        self.advance(transition_id, ManagedTransitionPhase::Quarantined)
+            .await
     }
 
     /// Defensive re-read used only by [`Self::close_barrier_and_drain`]'s
@@ -931,6 +1089,36 @@ impl ManagedTransitionCoordinator {
         transition_id: &str,
         next_phase: ManagedTransitionPhase,
     ) -> Result<ManagedTransitionStatus, ManagedTransitionRefusal> {
+        self.advance_inner(transition_id, next_phase, None).await
+    }
+
+    /// Atomically finalizes a successful managed-auth adoption
+    /// (Resetting -> Succeeded): records the newly-adopted account's
+    /// fingerprint/revision as both this record's result and the
+    /// coordinator's new CAS baseline, and reopens the account-work
+    /// barrier -- all inside the one `state` critical section this shares
+    /// with every other phase transition (Issue 05 Slice 4, R014). Never
+    /// touches credential material; `new_account_id` only derives the same
+    /// domain-separated fingerprint [`AuthoritativeAuthState`] uses.
+    pub(crate) async fn complete_adoption(
+        &self,
+        transition_id: &str,
+        new_account_id: String,
+    ) -> Result<ManagedTransitionStatus, ManagedTransitionRefusal> {
+        self.advance_inner(
+            transition_id,
+            ManagedTransitionPhase::Succeeded,
+            Some(new_account_id),
+        )
+        .await
+    }
+
+    async fn advance_inner(
+        &self,
+        transition_id: &str,
+        next_phase: ManagedTransitionPhase,
+        adopted_account_id: Option<String>,
+    ) -> Result<ManagedTransitionStatus, ManagedTransitionRefusal> {
         let mut state = self.state.lock().await;
         if !state.auth_authority_available {
             return Err(refusal_for_transition_id(
@@ -968,10 +1156,16 @@ impl ManagedTransitionCoordinator {
         }
 
         state.transition_revision += 1;
+        if let Some(new_account_id) = adopted_account_id {
+            state.auth_revision += 1;
+            state.auth_fingerprint = Some(account_fingerprint(&new_account_id));
+        }
         let advanced = TransitionRecord {
             phase: next_phase,
             retryable: next_phase == ManagedTransitionPhase::Quarantined,
             result_transition_revision: state.transition_revision,
+            result_auth_revision: state.auth_revision,
+            result_auth_fingerprint: state.auth_fingerprint.clone(),
             ..record
         };
         let status = status_for(&advanced);
@@ -981,6 +1175,19 @@ impl ManagedTransitionCoordinator {
                 .insert(advanced.envelope.transition_id.clone(), advanced);
         } else {
             state.active = Some(advanced);
+        }
+        // `Succeeded` is the only terminal phase that is never a barrier
+        // owner (the biconditional carried from Slice 03: an owner is an
+        // active Admitted|Draining|Adopting|Resetting transition, or a
+        // completed unresolved Quarantined one). Reopening here, still
+        // under `state`'s lock, closes the exact gap Slice 03 flagged as
+        // its own carry-forward: no successful terminal advance existed yet
+        // to couple to a reopen. `Quarantined` intentionally does NOT
+        // reopen -- it must stay closed until an explicit cancel of that
+        // exact transition (R016/R017).
+        if next_phase == ManagedTransitionPhase::Succeeded {
+            self.account_work_permits.reopen();
+            self.account_work_permits.wake_waiters();
         }
         Ok(status)
     }
@@ -2503,6 +2710,238 @@ mod tests {
             coordinator_from_real_persisted_auth(codex_home.path()).await;
         complete_a_fresh_transition(&repaired, &repaired_process_id, "repaired", &expected_fingerprint)
             .await;
+    }
+
+    /// A synthetic [`ResetInventory`] that records whether it ran and can be
+    /// told to fail, without touching any real subsystem (Issue 05 Slice 4).
+    struct RecordingResetInventory {
+        called: AtomicBool,
+        should_fail: bool,
+    }
+
+    impl RecordingResetInventory {
+        fn new(should_fail: bool) -> Self {
+            Self {
+                called: AtomicBool::new(false),
+                should_fail,
+            }
+        }
+
+        fn was_called(&self) -> bool {
+            self.called.load(Ordering::Acquire)
+        }
+    }
+
+    impl ResetInventory for RecordingResetInventory {
+        fn reset_all(&self) -> ResetInventoryFuture<'_> {
+            Box::pin(async move {
+                self.called.store(true, Ordering::Release);
+                if self.should_fail {
+                    Err("synthetic reset failure".to_owned())
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    }
+
+    async fn real_auth_manager(codex_home: &std::path::Path) -> codex_login::AuthManager {
+        codex_login::AuthManager::new(
+            codex_home.to_path_buf(),
+            /*enable_codex_api_key_env*/ false,
+            codex_config::types::AuthCredentialsStoreMode::File,
+            /*forced_chatgpt_workspace_id*/ None,
+            /*chatgpt_base_url*/ None,
+            codex_login::AuthKeyringBackendKind::default(),
+            codex_login::test_support::transport_default_auth_route_config(),
+        )
+        .await
+    }
+
+    /// The full production Adopting/Resetting/Succeeded chain, driven
+    /// end-to-end through the public `start_dispatch` wire entry point
+    /// exactly as `message_processor.rs` calls it, against a genuine
+    /// on-disk `codex_home` and a real `AuthManager` (Issue 05 Slice 4,
+    /// R014). Proves: the new account's fingerprint becomes both the
+    /// transition's own result and the coordinator's new CAS baseline; the
+    /// reset inventory actually runs; the barrier reopens; and the auth
+    /// manager has genuinely installed the new account, not merely
+    /// recorded a fingerprint.
+    #[tokio::test]
+    async fn full_adoption_reads_installs_resets_and_reopens_with_the_new_accounts_fingerprint() {
+        let codex_home = tempfile::TempDir::new().expect("create temp codex_home");
+        write_chatgpt_auth_for_intended_account(codex_home.path(), "account-a");
+        let auth_manager = Arc::new(real_auth_manager(codex_home.path()).await);
+        let reset_inventory = Arc::new(RecordingResetInventory::new(false));
+        let coordinator = ManagedTransitionCoordinator::from_authoritative_auth_state_target_evidence_and_adoption(
+            AuthoritativeAuthState::from_auth_manager(&auth_manager),
+            Arc::new(UnsetTargetEvidenceSource),
+            Arc::clone(&auth_manager),
+            Arc::clone(&reset_inventory) as Arc<dyn ResetInventory>,
+        );
+        let process_id = coordinator.process_instance_id().await;
+
+        // A different account lands on disk before the transition reaches
+        // Adopting -- simulating the operator's external managed-auth write
+        // -- so the coordinator must read this fresh value, not the one
+        // captured at admission time.
+        write_chatgpt_auth_for_intended_account(codex_home.path(), "account-b");
+        let expected_new_fingerprint = expected_fingerprint_for_account("account-b");
+
+        let mut start = request(process_id.clone(), "adopt-b");
+        start.expected_auth_fingerprint = Some(expected_fingerprint_for_account("account-a"));
+        let status = match coordinator.start_dispatch(start, true).await {
+            StartManagedTransitionResponse::Accepted { status } => status,
+            StartManagedTransitionResponse::Refused { refusal } => {
+                panic!("expected acceptance, got refusal: {refusal:?}")
+            }
+        };
+        assert_eq!(status.phase, ManagedTransitionPhase::Succeeded);
+        assert_eq!(
+            status.result_auth_fingerprint.as_deref(),
+            Some(expected_new_fingerprint.as_str())
+        );
+        assert!(
+            reset_inventory.was_called(),
+            "the reset inventory must run before a successful terminal outcome"
+        );
+        assert!(
+            coordinator.try_acquire_account_work_permit().is_some(),
+            "the barrier must reopen once adoption succeeds"
+        );
+
+        let installed_account_id = auth_manager
+            .authoritative_auth_cached()
+            .expect("auth manager readable after adoption")
+            .and_then(|auth| auth.get_account_id());
+        assert_eq!(
+            installed_account_id,
+            Some("account-b".to_owned()),
+            "AuthManager must have the newly-adopted account actually installed, not just a bookkeeping fingerprint"
+        );
+
+        // The coordinator's own CAS baseline must reflect the adoption too:
+        // a fresh admission using the new fingerprint succeeds immediately.
+        let mut retry = request(process_id, "post-adopt-check");
+        retry.expected_auth_fingerprint = Some(expected_new_fingerprint);
+        retry.expected_auth_revision = status.auth_revision;
+        retry.expected_transition_revision = status.transition_revision;
+        assert_eq!(
+            coordinator.admit(retry).await.unwrap().phase,
+            ManagedTransitionPhase::Admitted
+        );
+    }
+
+    /// A source-read failure (no on-disk auth by the time Adopting runs)
+    /// must quarantine rather than report a false success or silently
+    /// touch nothing -- credential material is never involved, only the
+    /// coordinator's typed classification of the read outcome.
+    #[tokio::test]
+    async fn adoption_source_read_failure_quarantines_and_never_calls_reset() {
+        let codex_home = tempfile::TempDir::new().expect("create temp codex_home");
+        write_chatgpt_auth_for_intended_account(codex_home.path(), "account-a");
+        let auth_manager = Arc::new(real_auth_manager(codex_home.path()).await);
+        let reset_inventory = Arc::new(RecordingResetInventory::new(false));
+        let coordinator = ManagedTransitionCoordinator::from_authoritative_auth_state_target_evidence_and_adoption(
+            AuthoritativeAuthState::from_auth_manager(&auth_manager),
+            Arc::new(UnsetTargetEvidenceSource),
+            Arc::clone(&auth_manager),
+            Arc::clone(&reset_inventory) as Arc<dyn ResetInventory>,
+        );
+        let process_id = coordinator.process_instance_id().await;
+
+        // The source disappears before Adopting reads it.
+        std::fs::remove_file(codex_home.path().join("auth.json")).expect("remove auth.json");
+
+        let mut start = request(process_id, "adopt-missing");
+        start.expected_auth_fingerprint = Some(expected_fingerprint_for_account("account-a"));
+        let status = match coordinator.start_dispatch(start, true).await {
+            StartManagedTransitionResponse::Accepted { status } => status,
+            StartManagedTransitionResponse::Refused { refusal } => {
+                panic!("expected acceptance carrying a quarantined status, got refusal: {refusal:?}")
+            }
+        };
+        assert_eq!(status.phase, ManagedTransitionPhase::Quarantined);
+        assert!(status.retryable);
+        assert!(
+            !reset_inventory.was_called(),
+            "a source-read failure must quarantine before ever reaching the reset step"
+        );
+        assert!(
+            coordinator.try_acquire_account_work_permit().is_none(),
+            "quarantine must keep the barrier closed until an explicit cancel"
+        );
+    }
+
+    /// A reset-inventory failure after a successful read/install must also
+    /// quarantine (fail closed) rather than report `Succeeded` over
+    /// known-stale account-derived caches/workers (R014).
+    #[tokio::test]
+    async fn adoption_reset_inventory_failure_quarantines_after_installing_auth() {
+        let codex_home = tempfile::TempDir::new().expect("create temp codex_home");
+        write_chatgpt_auth_for_intended_account(codex_home.path(), "account-a");
+        let auth_manager = Arc::new(real_auth_manager(codex_home.path()).await);
+        let reset_inventory = Arc::new(RecordingResetInventory::new(true));
+        let coordinator = ManagedTransitionCoordinator::from_authoritative_auth_state_target_evidence_and_adoption(
+            AuthoritativeAuthState::from_auth_manager(&auth_manager),
+            Arc::new(UnsetTargetEvidenceSource),
+            Arc::clone(&auth_manager),
+            Arc::clone(&reset_inventory) as Arc<dyn ResetInventory>,
+        );
+        let process_id = coordinator.process_instance_id().await;
+        write_chatgpt_auth_for_intended_account(codex_home.path(), "account-b");
+
+        let mut start = request(process_id, "adopt-then-fail-reset");
+        start.expected_auth_fingerprint = Some(expected_fingerprint_for_account("account-a"));
+        let status = match coordinator.start_dispatch(start, true).await {
+            StartManagedTransitionResponse::Accepted { status } => status,
+            StartManagedTransitionResponse::Refused { refusal } => {
+                panic!("expected acceptance carrying a quarantined status, got refusal: {refusal:?}")
+            }
+        };
+        assert_eq!(status.phase, ManagedTransitionPhase::Quarantined);
+        assert!(status.retryable);
+        assert!(
+            reset_inventory.was_called(),
+            "the reset inventory must have run before it reported failure"
+        );
+        assert!(
+            coordinator.try_acquire_account_work_permit().is_none(),
+            "quarantine must keep the barrier closed until an explicit cancel"
+        );
+        // Auth was already installed before the reset step ran -- this
+        // implementation deliberately does not roll it back on a reset
+        // failure (rolling back a real credential swap is its own hazard);
+        // quarantine exists precisely to make this state visible and
+        // require an explicit operator decision rather than silently
+        // reporting success over it.
+        let installed_account_id = auth_manager
+            .authoritative_auth_cached()
+            .expect("auth manager readable")
+            .and_then(|auth| auth.get_account_id());
+        assert_eq!(installed_account_id, Some("account-b".to_owned()));
+    }
+
+    /// Legacy (Slice 1-3) coordinators -- constructed with no adoption
+    /// dependencies wired -- must keep their exact pre-Slice-4 behavior:
+    /// a successfully-drained transition reports `Draining`, not an
+    /// auto-continuation into Adopting. This is what makes every existing
+    /// Slice 1-3 test above still valid: opting into the Slice 4 chain is a
+    /// property of construction, not of drain completion.
+    #[tokio::test]
+    async fn a_coordinator_without_adoption_dependencies_stops_at_draining_after_a_completed_drain() {
+        let coordinator = ManagedTransitionCoordinator::new();
+        let process_id = coordinator.process_instance_id().await;
+        let response = coordinator
+            .start_dispatch(request(process_id, "no-adoption-wired"), true)
+            .await;
+        let status = match response {
+            StartManagedTransitionResponse::Accepted { status } => status,
+            StartManagedTransitionResponse::Refused { refusal } => {
+                panic!("expected acceptance, got refusal: {refusal:?}")
+            }
+        };
+        assert_eq!(status.phase, ManagedTransitionPhase::Draining);
     }
 
     #[test]

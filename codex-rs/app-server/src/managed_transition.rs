@@ -21,8 +21,114 @@ use sha2::Digest;
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio::sync::Notify;
 use uuid::Uuid;
+
+/// The bounded wait for admitted account-dependent work to drain to zero
+/// before auth mutation (`CODEX-I05-S03-R012`). Fixed rather than
+/// injectable: tests get deterministic control via this codebase's existing
+/// `#[tokio::test(start_paused = true)]` plus `tokio::time::advance`
+/// convention, not a custom clock trait, so `R012`'s "controllable for
+/// deterministic tests" is satisfied without a new abstraction.
+pub(crate) const DRAIN_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Bounded, credential-free permit registry for account-dependent work
+/// (`CODEX-I05-S03-R009`, `R012`). Holds no auth value and never will --
+/// only a barrier flag and an admitted-work count. Deliberately not behind
+/// `CoordinatorState`'s `Mutex`: every `Permit`-classified request calls
+/// [`Self::try_acquire`] on the dispatch hot path
+/// (`crate::account_dependency::classify`), and acquiring the transition
+/// state lock there would serialize unrelated ordinary work behind
+/// managed-transition bookkeeping it has nothing to do with.
+#[derive(Clone)]
+pub(crate) struct AccountWorkPermits {
+    inner: Arc<AccountWorkPermitsInner>,
+}
+
+struct AccountWorkPermitsInner {
+    barrier_closed: AtomicBool,
+    admitted: AtomicU64,
+    /// Shared by permit release and by cancellation of a draining
+    /// transition -- both are "something the drain wait should recheck"
+    /// events. A spurious wake from the other event class costs only one
+    /// extra recheck of the two loop conditions.
+    signal: Notify,
+}
+
+/// Held for the lifetime of one admitted account-dependent request's
+/// handling. Releases exactly once, from every terminal path (success,
+/// error, or task cancellation/drop), without the holder ever calling a
+/// release method (`CODEX-I05-S03-R009`: "release permits exactly once
+/// across every terminal path").
+pub(crate) struct AccountWorkPermitGuard {
+    permits: AccountWorkPermits,
+}
+
+impl Drop for AccountWorkPermitGuard {
+    fn drop(&mut self) {
+        self.permits.inner.admitted.fetch_sub(1, Ordering::AcqRel);
+        self.permits.inner.signal.notify_waiters();
+    }
+}
+
+impl AccountWorkPermits {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(AccountWorkPermitsInner {
+                barrier_closed: AtomicBool::new(false),
+                admitted: AtomicU64::new(0),
+                signal: Notify::new(),
+            }),
+        }
+    }
+
+    /// Increment-then-check, not check-then-increment: this ordering means
+    /// a permit acquired concurrently with [`Self::close`] either observes
+    /// the close and backs out, or is guaranteed visible to the close's own
+    /// drain wait, because it incremented the count before that wait's
+    /// first read of it could possibly have happened. No straggler can
+    /// slip past the barrier undetected in either direction.
+    pub(crate) fn try_acquire(&self) -> Option<AccountWorkPermitGuard> {
+        self.inner.admitted.fetch_add(1, Ordering::AcqRel);
+        if self.inner.barrier_closed.load(Ordering::Acquire) {
+            self.inner.admitted.fetch_sub(1, Ordering::AcqRel);
+            self.inner.signal.notify_waiters();
+            return None;
+        }
+        Some(AccountWorkPermitGuard {
+            permits: self.clone(),
+        })
+    }
+
+    fn close(&self) {
+        self.inner.barrier_closed.store(true, Ordering::Release);
+    }
+
+    fn reopen(&self) {
+        self.inner.barrier_closed.store(false, Ordering::Release);
+    }
+
+    fn admitted_count(&self) -> u64 {
+        self.inner.admitted.load(Ordering::Acquire)
+    }
+
+    fn wake_waiters(&self) {
+        self.inner.signal.notify_waiters();
+    }
+
+    /// Per `tokio::sync::Notify`'s documented race-free idiom: the listener
+    /// is created before the caller checks any condition, so a release or a
+    /// [`Self::wake_waiters`] call that happens between creation and the
+    /// caller's `.await` is never lost.
+    fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.inner.signal.notified()
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct ManagedTransitionCoordinator {
@@ -30,6 +136,7 @@ pub(crate) struct ManagedTransitionCoordinator {
     /// Immutable per-coordinator; not behind `state`'s lock since revalidation
     /// only ever queries it, never mutates it.
     target_evidence_source: Arc<dyn TargetEvidenceSource>,
+    account_work_permits: AccountWorkPermits,
 }
 
 /// A fixed, always-consistent-with-itself source, for constructors that do
@@ -293,11 +400,21 @@ impl ManagedTransitionCoordinator {
                 completed: HashMap::new(),
             })),
             target_evidence_source,
+            account_work_permits: AccountWorkPermits::new(),
         }
     }
 
     pub(crate) async fn process_instance_id(&self) -> String {
         self.state.lock().await.process_instance_id.clone()
+    }
+
+    /// The dispatch-time acquisition point for every `Permit`-classified
+    /// request (`crate::account_dependency::classify`,
+    /// `CODEX-I05-S03-R009`). Returns `None` when the barrier is closed;
+    /// the caller must refuse before any auth/provider effect and must not
+    /// queue or retry internally (`R010`).
+    pub(crate) fn try_acquire_account_work_permit(&self) -> Option<AccountWorkPermitGuard> {
+        self.account_work_permits.try_acquire()
     }
 
     /// Re-derives current target evidence from this coordinator's own source
@@ -440,10 +557,104 @@ impl ManagedTransitionCoordinator {
                 refusal: authorization_not_admitted(params.into()),
             };
         }
+        let transition_id = params.transition_id.clone();
         match self.admit(params).await {
-            Ok(status) => StartManagedTransitionResponse::Accepted { status },
+            Ok(_admitted) => match self.close_barrier_and_drain(&transition_id).await {
+                Ok(status) => StartManagedTransitionResponse::Accepted { status },
+                Err(refusal) => StartManagedTransitionResponse::Refused { refusal },
+            },
             Err(refusal) => StartManagedTransitionResponse::Refused { refusal },
         }
+    }
+
+    /// Closes the process-wide account-work barrier and awaits zero drain
+    /// within [`DRAIN_DEADLINE`] (`CODEX-I05-S03-R009`, `R012`, `R013`).
+    /// Called once, synchronously, immediately after a successful
+    /// [`Self::admit`] as one continuous step of `start`'s own wire
+    /// handling -- the canonical plan describes barrier close and drain
+    /// await as part of `start`, not a detached background task, so a
+    /// client's `ManagedTransitionStart` response is not sent until this
+    /// resolves (bounded to `DRAIN_DEADLINE`).
+    ///
+    /// A concurrent [`Self::cancel`] of the same transition is a *different*
+    /// wire call -- itself never gated by this barrier, since
+    /// `crate::account_dependency::classify` treats every
+    /// `ManagedTransition*` control request as independent, precisely to
+    /// avoid the barrier it closes also blocking the only call that can
+    /// reopen it. This method detects that concurrent cancellation by
+    /// rechecking the transition's own phase on every wake, not only the
+    /// permit count, and reports the transition's now-`Cancelled` status
+    /// truthfully instead of fabricating a drain or timeout outcome.
+    async fn close_barrier_and_drain(
+        &self,
+        transition_id: &str,
+    ) -> Result<ManagedTransitionStatus, ManagedTransitionRefusal> {
+        self.account_work_permits.close();
+        self.advance(transition_id, ManagedTransitionPhase::Draining)
+            .await?;
+
+        let deadline = tokio::time::Instant::now() + DRAIN_DEADLINE;
+        loop {
+            // Race-free per `tokio::sync::Notify`'s documented pattern: the
+            // listener is created before either condition below is read, so
+            // a permit release or a concurrent cancel that lands between
+            // this line and the `.await` further down is never missed.
+            let notified = self.account_work_permits.notified();
+
+            let still_draining = {
+                let state = self.state.lock().await;
+                matches!(
+                    &state.active,
+                    Some(record)
+                        if record.envelope.transition_id == transition_id
+                            && record.phase == ManagedTransitionPhase::Draining
+                )
+            };
+            if !still_draining {
+                return self.current_transition_status(transition_id).await;
+            }
+            if self.account_work_permits.admitted_count() == 0 {
+                break;
+            }
+
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                // Deadline elapsed. `advance` sets `retryable: true` for
+                // `Quarantined` already; no auth was ever touched and
+                // admitted work was never cancelled or killed (R013).
+                return self
+                    .advance(transition_id, ManagedTransitionPhase::Quarantined)
+                    .await;
+            }
+        }
+
+        self.current_transition_status(transition_id).await
+    }
+
+    /// Defensive re-read used only by [`Self::close_barrier_and_drain`]'s
+    /// two return points, where the transition is already known to exist
+    /// (this coordinator admitted it moments earlier in the same call
+    /// chain); the `InvalidRequest` arm should be unreachable in practice.
+    async fn current_transition_status(
+        &self,
+        transition_id: &str,
+    ) -> Result<ManagedTransitionStatus, ManagedTransitionRefusal> {
+        let state = self.state.lock().await;
+        if let Some(record) = state
+            .active
+            .as_ref()
+            .filter(|record| record.envelope.transition_id == transition_id)
+        {
+            return Ok(status_for(record));
+        }
+        if let Some(record) = state.completed.get(transition_id) {
+            return Ok(status_for(record));
+        }
+        Err(refusal_for_transition_id(
+            &state,
+            transition_id,
+            ManagedTransitionRefusalKind::InvalidRequest,
+            false,
+        ))
     }
 
     pub(crate) async fn read(
@@ -532,7 +743,15 @@ impl ManagedTransitionCoordinator {
                 true,
             ));
         }
-        if record.phase != ManagedTransitionPhase::Admitted {
+        // Admitted and Draining are both pre-mutation phases (`R012`: auth
+        // mutation cannot start until zero drain completes); `R017`
+        // requires cancellation to work anywhere before that boundary, not
+        // only from Admitted. Adopting/Resetting are post-mutation and stay
+        // refused as `LateCancellation`, governed by R064 in a later slice.
+        if !matches!(
+            record.phase,
+            ManagedTransitionPhase::Admitted | ManagedTransitionPhase::Draining
+        ) {
             state.active = Some(record);
             return Err(refusal(
                 &state,
@@ -541,6 +760,7 @@ impl ManagedTransitionCoordinator {
                 false,
             ));
         }
+        let was_draining = record.phase == ManagedTransitionPhase::Draining;
 
         state.transition_revision += 1;
         let cancelled = TransitionRecord {
@@ -553,6 +773,16 @@ impl ManagedTransitionCoordinator {
         state
             .completed
             .insert(cancelled.envelope.transition_id.clone(), cancelled);
+        drop(state);
+        if was_draining {
+            // Reopen so ordinary account-dependent work resumes immediately
+            // rather than staying refused for the rest of the process's
+            // lifetime over an attempt nothing will ever retry-complete;
+            // wake any in-flight `close_barrier_and_drain` so it observes
+            // this cancellation instead of running to its own timeout.
+            self.account_work_permits.reopen();
+            self.account_work_permits.wake_waiters();
+        }
         Ok(status)
     }
 
@@ -943,7 +1173,13 @@ mod tests {
         let StartManagedTransitionResponse::Accepted { status } = accepted else {
             panic!("an authorized caller with matching target evidence must be admitted");
         };
-        assert_eq!(status.phase, ManagedTransitionPhase::Admitted);
+        // Slice 3: `start_dispatch` now closes the barrier and awaits zero
+        // drain as one continuous step of `start`'s own handling (plan
+        // Slice 3), so a successful response reports the post-drain phase.
+        // With zero admitted account-dependent work outstanding, the drain
+        // completes immediately and the transition is already `Draining`
+        // (not `Admitted`) by the time this response is observed.
+        assert_eq!(status.phase, ManagedTransitionPhase::Draining);
     }
 
     /// Disposable synthetic target-evidence source (`CODEX-I05-S02-R038`)
@@ -1195,7 +1431,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_is_only_legal_from_admitted_and_preserves_the_active_record_on_refusal() {
+    async fn cancel_is_legal_through_draining_and_late_only_once_adopting_begins() {
+        // Admitted and Draining are both pre-mutation (R012); R017 requires
+        // cancellation to work through both, not only Admitted -- unlike
+        // the pre-Slice-3 assumption this test used to encode.
         let coordinator = ManagedTransitionCoordinator::new();
         let process_id = coordinator.process_instance_id().await;
         coordinator
@@ -1204,6 +1443,29 @@ mod tests {
             .unwrap();
         coordinator
             .advance("transition-a", ManagedTransitionPhase::Draining)
+            .await
+            .unwrap();
+        let cancelled = coordinator
+            .cancel(cancel_request(process_id.clone(), "transition-a"))
+            .await
+            .expect("cancellation during Draining is pre-mutation and must succeed");
+        assert_eq!(cancelled.phase, ManagedTransitionPhase::Cancelled);
+        assert!(cancelled.retryable);
+
+        // Adopting is past the mutation boundary; late cancellation there
+        // is refused and the active record is preserved untouched.
+        let coordinator = ManagedTransitionCoordinator::new();
+        let process_id = coordinator.process_instance_id().await;
+        coordinator
+            .admit(request(process_id.clone(), "transition-a"))
+            .await
+            .unwrap();
+        coordinator
+            .advance("transition-a", ManagedTransitionPhase::Draining)
+            .await
+            .unwrap();
+        coordinator
+            .advance("transition-a", ManagedTransitionPhase::Adopting)
             .await
             .unwrap();
         let refusal = coordinator
@@ -1217,8 +1479,164 @@ mod tests {
                 .await
                 .unwrap()
                 .phase,
-            ManagedTransitionPhase::Draining
+            ManagedTransitionPhase::Adopting
         );
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_draining_transition_reopens_the_barrier_for_new_account_work() {
+        let coordinator = ManagedTransitionCoordinator::new();
+        let process_id = coordinator.process_instance_id().await;
+        // `start_dispatch` (not `admit`) is what actually closes the
+        // barrier, as one continuous step of `start`'s own handling; with
+        // zero permits outstanding the drain completes immediately and the
+        // transition is already Draining by the time this returns.
+        let accepted = coordinator
+            .start_dispatch(
+                request(process_id.clone(), "transition-a"),
+                /*caller_authorized*/ true,
+            )
+            .await;
+        let StartManagedTransitionResponse::Accepted { status } = accepted else {
+            panic!("admission must succeed with zero outstanding permits");
+        };
+        assert_eq!(status.phase, ManagedTransitionPhase::Draining);
+        assert!(
+            coordinator.try_acquire_account_work_permit().is_none(),
+            "the barrier must be closed while Draining"
+        );
+
+        coordinator
+            .cancel(cancel_request(process_id, "transition-a"))
+            .await
+            .expect("cancellation during Draining must succeed");
+
+        assert!(
+            coordinator.try_acquire_account_work_permit().is_some(),
+            "cancelling a Draining transition must reopen the barrier"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_closed_barrier_refuses_new_account_work_across_repeated_attempts() {
+        // R030: the barrier refuses every new-turn attempt, not just the
+        // first one, and does so without reserving/mutating anything.
+        let coordinator = ManagedTransitionCoordinator::new();
+        let process_id = coordinator.process_instance_id().await;
+        let accepted = coordinator
+            .start_dispatch(
+                request(process_id, "transition-a"),
+                /*caller_authorized*/ true,
+            )
+            .await;
+        assert!(matches!(
+            accepted,
+            StartManagedTransitionResponse::Accepted { .. }
+        ));
+
+        for _ in 0..3 {
+            assert!(
+                coordinator.try_acquire_account_work_permit().is_none(),
+                "every attempt while Draining must be refused, not only the first"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admitted_work_permit_delays_the_drain_until_released_then_it_completes() {
+        // R031: pre-barrier admitted work retains its permit and the drain
+        // does not report success while it is outstanding; once released,
+        // the drain completes and the transition reaches Draining.
+        let coordinator = ManagedTransitionCoordinator::new();
+        let process_id = coordinator.process_instance_id().await;
+        let guard = coordinator
+            .try_acquire_account_work_permit()
+            .expect("the barrier starts open");
+
+        let start = coordinator.start_dispatch(request(process_id, "transition-a"), true);
+        let release_after_yield = async {
+            // Let the drain loop observe the nonzero count and register its
+            // notification listener before the permit is released, so this
+            // exercises the real wait-then-wake path rather than a race
+            // that happens to resolve before the drain even starts waiting.
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+            drop(guard);
+        };
+        let (response, ()) = tokio::join!(start, release_after_yield);
+        let StartManagedTransitionResponse::Accepted { status } = response else {
+            panic!("admission must eventually succeed once the held permit releases");
+        };
+        assert_eq!(status.phase, ManagedTransitionPhase::Draining);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_timeout_quarantines_without_touching_auth_or_killing_admitted_work() {
+        // R013/R034: a permit that is never released forces the deadline;
+        // the outcome is Quarantined/retryable, not a refusal, and no auth
+        // field changes from its pre-admission value.
+        let coordinator = ManagedTransitionCoordinator::new();
+        let process_id = coordinator.process_instance_id().await;
+        let auth_before = coordinator.state.lock().await.auth_fingerprint.clone();
+        let auth_revision_before = coordinator.state.lock().await.auth_revision;
+
+        let held_guard = coordinator
+            .try_acquire_account_work_permit()
+            .expect("the barrier starts open");
+
+        let coordinator_for_task = coordinator.clone();
+        let handle = tokio::spawn(async move {
+            coordinator_for_task
+                .start_dispatch(request(process_id, "transition-a"), true)
+                .await
+        });
+        tokio::time::advance(DRAIN_DEADLINE + Duration::from_millis(1)).await;
+
+        let response = handle.await.expect("start_dispatch task");
+        let StartManagedTransitionResponse::Accepted { status } = response else {
+            panic!("a timed-out drain is a status transition, not a refusal");
+        };
+        assert_eq!(status.phase, ManagedTransitionPhase::Quarantined);
+        assert!(status.retryable);
+
+        let state = coordinator.state.lock().await;
+        assert_eq!(state.auth_fingerprint, auth_before);
+        assert_eq!(state.auth_revision, auth_revision_before);
+        drop(state);
+
+        // The held permit itself was never force-released; it is still
+        // valid and only ends when its own holder drops it, proving the
+        // timeout did not kill admitted work (R013).
+        drop(held_guard);
+    }
+
+    #[tokio::test]
+    async fn cancelling_during_drain_wins_the_race_against_the_timeout() {
+        // Proves close_barrier_and_drain's per-wake recheck: a cancel that
+        // lands while draining must be observed and reported truthfully
+        // instead of the drain loop reporting a fabricated outcome.
+        let coordinator = ManagedTransitionCoordinator::new();
+        let process_id = coordinator.process_instance_id().await;
+        let guard = coordinator
+            .try_acquire_account_work_permit()
+            .expect("the barrier starts open");
+
+        let start = coordinator.start_dispatch(request(process_id.clone(), "transition-a"), true);
+        let cancel_after_yield = async {
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+            coordinator
+                .cancel(cancel_request(process_id, "transition-a"))
+                .await
+        };
+        let (response, cancel_result) = tokio::join!(start, cancel_after_yield);
+        cancel_result.expect("cancellation during Draining must succeed");
+
+        let StartManagedTransitionResponse::Accepted { status } = response else {
+            panic!("close_barrier_and_drain reports status via Accepted even when cancelled");
+        };
+        assert_eq!(status.phase, ManagedTransitionPhase::Cancelled);
+        drop(guard);
     }
 
     #[tokio::test]

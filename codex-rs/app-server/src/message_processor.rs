@@ -115,6 +115,10 @@ fn retention_refusal_reason(error: RetentionAuthorityError) -> ThreadRetentionRe
         RetentionAuthorityError::IneligiblePrincipal => {
             ThreadRetentionRefusalReason::IneligiblePrincipal
         }
+        // Self-retention is an ineligible authorization shape, not a separate
+        // client capability. Keep the wire refusal closed while the authority
+        // kernel makes the structural invariant explicit.
+        RetentionAuthorityError::SelfRetention => ThreadRetentionRefusalReason::IneligiblePrincipal,
         RetentionAuthorityError::UnknownThread => ThreadRetentionRefusalReason::UnknownThread,
     }
 }

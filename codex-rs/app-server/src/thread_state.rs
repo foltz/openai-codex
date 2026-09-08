@@ -82,25 +82,27 @@ impl RetentionPrincipalId {
 /// target `ThreadId`; the wire representation is produced only at the request
 /// boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RetentionGrantId(String);
+pub(crate) enum RetentionGrantId {
+    Minted(Uuid),
+    Unrecognized,
+}
 
 impl RetentionGrantId {
     fn new() -> Self {
-        Self(Uuid::now_v7().to_string())
+        Self::Minted(Uuid::now_v7())
     }
 
-    pub(crate) fn from_wire(value: String) -> Self {
-        Self(value)
+    pub(crate) fn from_wire(value: &str) -> Self {
+        Uuid::parse_str(value)
+            .map(Self::Minted)
+            .unwrap_or(Self::Unrecognized)
     }
 
     pub(crate) fn into_wire(self) -> String {
-        self.0
-    }
-}
-
-impl AsRef<str> for RetentionGrantId {
-    fn as_ref(&self) -> &str {
-        &self.0
+        match self {
+            Self::Minted(value) => value.to_string(),
+            Self::Unrecognized => unreachable!("unrecognized handle is never minted by the server"),
+        }
     }
 }
 
@@ -1009,7 +1011,7 @@ mod tests {
                 .release_retention(
                     thread_id,
                     principal,
-                    &RetentionGrantId::from_wire("different-active-grant".to_string()),
+                    &RetentionGrantId::from_wire(&Uuid::now_v7().to_string()),
                 )
                 .await,
             Ok(RetentionReleaseOutcome::GrantMismatch)
@@ -1031,7 +1033,7 @@ mod tests {
                 .release_retention(
                     thread_id,
                     principal,
-                    &RetentionGrantId::from_wire("never-issued".to_string()),
+                    &RetentionGrantId::from_wire(&Uuid::now_v7().to_string()),
                 )
                 .await,
             Ok(RetentionReleaseOutcome::NotHeld)

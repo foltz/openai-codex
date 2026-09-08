@@ -119,9 +119,11 @@ pub struct ThreadRetentionAcquireParams {
 #[ts(rename_all = "camelCase", export_to = "v2/")]
 pub enum ThreadRetentionAcquireResponse {
     Acquired {
+        #[schemars(rename = "grantId")]
         grant_id: String,
     },
     AlreadyHeld {
+        #[schemars(rename = "grantId")]
         grant_id: String,
     },
     Refused {

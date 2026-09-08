@@ -944,13 +944,12 @@ impl MessageProcessor {
                 reason: ThreadRetentionRefusalReason::InvalidThreadId,
             });
         };
+        // Preserve the opaque-handle outcome matrix: an unrecognized handle
+        // is not distinguishable from any other nonmatching handle.
+        let grant_id = RetentionGrantId::from_wire(&params.grant_id);
         match self
             .thread_state_manager
-            .release_retention(
-                thread_id,
-                principal,
-                &RetentionGrantId::from_wire(params.grant_id),
-            )
+            .release_retention(thread_id, principal, &grant_id)
             .await
         {
             Ok(RetentionReleaseOutcome::Released) => {

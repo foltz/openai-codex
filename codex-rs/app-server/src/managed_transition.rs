@@ -165,7 +165,14 @@ impl TargetEvidenceSource for ProcessTargetEvidenceSource {
 /// Slice 5's own repository-command responsibility. Re-derived (not cached)
 /// at each revalidation point so a legitimate or illegitimate change is
 /// observed rather than masked by a stale snapshot.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Deliberately does not derive `PartialEq`/`Eq`: the only intended
+/// comparison is [`Self::matches_target`], which excludes `record_identity`.
+/// A derived structural equality would silently disagree with that
+/// semantics (it would compare `record_identity` too, so it would always be
+/// `false` between any two captures) — see `CODEX-I05-S02` verification
+/// round 01, M2.
+#[derive(Debug, Clone)]
 pub(crate) struct TargetEvidence {
     declared_profile: Option<String>,
     executable_identity: Option<codex_app_server_transport::PeerExecutableIdentity>,
@@ -429,9 +436,8 @@ impl ManagedTransitionCoordinator {
         caller_authorized: bool,
     ) -> StartManagedTransitionResponse {
         if !caller_authorized {
-            let state = self.state.lock().await;
             return StartManagedTransitionResponse::Refused {
-                refusal: authorization_not_admitted(&state, params.into()),
+                refusal: authorization_not_admitted(params.into()),
             };
         }
         match self.admit(params).await {
@@ -482,9 +488,8 @@ impl ManagedTransitionCoordinator {
         caller_authorized: bool,
     ) -> ReadManagedTransitionResponse {
         if !caller_authorized {
-            let state = self.state.lock().await;
             return ReadManagedTransitionResponse::Refused {
-                refusal: authorization_not_admitted(&state, TransitionEnvelope::read(params)),
+                refusal: authorization_not_admitted(TransitionEnvelope::read(params)),
             };
         }
         match self.read(params).await {
@@ -558,9 +563,8 @@ impl ManagedTransitionCoordinator {
         caller_authorized: bool,
     ) -> CancelManagedTransitionResponse {
         if !caller_authorized {
-            let state = self.state.lock().await;
             return CancelManagedTransitionResponse::Refused {
-                refusal: authorization_not_admitted(&state, TransitionEnvelope::cancel(params)),
+                refusal: authorization_not_admitted(TransitionEnvelope::cancel(params)),
             };
         }
         match self.cancel(params).await {
@@ -703,16 +707,30 @@ fn refusal_for_transition_id(
     }
 }
 
-fn authorization_not_admitted(
-    state: &CoordinatorState,
-    envelope: TransitionEnvelope,
-) -> ManagedTransitionRefusal {
-    refusal(
-        state,
-        &envelope,
-        ManagedTransitionRefusalKind::AuthorizationNotAdmitted,
-        false,
-    )
+/// Generic, non-disclosing refusal for a caller that has not qualified for
+/// managed-transition authorization. Retains only `transition_id` from the
+/// caller's own envelope -- a client needing to correlate multiple
+/// concurrent start attempts by id genuinely needs it echoed back. Every
+/// other field is a fixed, non-live, schema-preserving placeholder rather
+/// than the coordinator's real state: `process_instance_id` is blanked even
+/// though it is caller-supplied too, since echoing it back serves no
+/// correlation purpose the caller cannot already do with the value it sent;
+/// `auth_revision`/`transition_revision`/`auth_fingerprint` are
+/// coordinator-derived and must never appear here at all, so an unauthorized
+/// caller cannot poll this refusal as a transition/auth oracle
+/// (`CODEX-I05-S02-R005`). Deliberately takes no `&CoordinatorState`, so the
+/// dispatch trio no longer needs to acquire the state lock on this path at
+/// all.
+fn authorization_not_admitted(envelope: TransitionEnvelope) -> ManagedTransitionRefusal {
+    ManagedTransitionRefusal {
+        kind: ManagedTransitionRefusalKind::AuthorizationNotAdmitted,
+        retryable: false,
+        process_instance_id: String::new(),
+        transition_id: envelope.transition_id,
+        auth_revision: 0,
+        transition_revision: 0,
+        auth_fingerprint: None,
+    }
 }
 
 fn authoritative_auth_unavailable(
@@ -1010,10 +1028,25 @@ mod tests {
         source.replace_facts(replaced);
 
         let refused = coordinator
-            .admit(request(process_id, "transition-a"))
+            .admit(request(process_id.clone(), "transition-a"))
             .await
             .unwrap_err();
         assert_eq!(refused.kind, ManagedTransitionRefusalKind::InvalidRequest);
+
+        // Exact no-effect snapshot: the refused attempt must not have
+        // reserved the transition id or consumed a transition-revision
+        // slot. Restoring the original evidence and re-admitting the same
+        // transition id proves both -- a reservation would surface as
+        // `TransitionIdConflict`, and a consumed revision would surface as
+        // `prior_transition_revision != 0`.
+        source.replace_facts(SyntheticTargetFacts::baseline());
+        let admitted = coordinator
+            .admit(request(process_id, "transition-a"))
+            .await
+            .expect("the refused attempt must not have reserved the transition id");
+        assert_eq!(admitted.phase, ManagedTransitionPhase::Admitted);
+        assert_eq!(admitted.prior_transition_revision, 0);
+        assert_eq!(admitted.transition_revision, 1);
     }
 
     #[tokio::test]
@@ -1040,10 +1073,21 @@ mod tests {
             source.replace_facts(mutated);
 
             let refused = coordinator
-                .admit(request(process_id, "transition-a"))
+                .admit(request(process_id.clone(), "transition-a"))
                 .await
                 .unwrap_err();
             assert_eq!(refused.kind, ManagedTransitionRefusalKind::InvalidRequest);
+
+            // Exact no-effect snapshot, same rationale as the
+            // executable-identity-replacement case above.
+            source.replace_facts(SyntheticTargetFacts::baseline());
+            let admitted = coordinator
+                .admit(request(process_id, "transition-a"))
+                .await
+                .expect("the refused attempt must not have reserved the transition id");
+            assert_eq!(admitted.phase, ManagedTransitionPhase::Admitted);
+            assert_eq!(admitted.prior_transition_revision, 0);
+            assert_eq!(admitted.transition_revision, 1);
         }
     }
 

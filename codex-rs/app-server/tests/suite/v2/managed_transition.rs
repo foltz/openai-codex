@@ -37,12 +37,26 @@ async fn start_refusal(
         .await
 }
 
-/// Proves Slice 1's temporary public start/read/cancel gates stay
-/// unconditionally `AuthorizationNotAdmitted` across a restart, regardless of
-/// the real persisted-auth source's health, per `CODEX-I05-S01-R07-001`. An
-/// unauthorized wire caller must never observe whether the server's own
-/// auth backend is readable -- that would leak health signal before Slice 2's
-/// own authorization decision exists. The production auth mapper's own
+/// Proves the wire start/read/cancel gates stay `AuthorizationNotAdmitted`
+/// for an unproven-provenance (stdio) caller across a restart, regardless of
+/// the real persisted-auth source's health, per `CODEX-I05-S01-R07-001`.
+/// Slice 2 makes admission conditional on server-derived caller
+/// authorization (`CODEX-I05-S02-R005`); `TestAppServer` connects over
+/// stdio, which is always `ConnectionProvenance::Unproven`, so it can never
+/// satisfy that predicate. This test is therefore about the
+/// unproven-provenance population specifically -- not a claim that every
+/// caller is refused unconditionally, which Slice 2 makes false for a
+/// `UnixPeerExecutable` caller with an explicit offer (see
+/// `managed_transition::tests::wire_admission_admits_an_authorized_caller_with_matching_target_evidence`).
+///
+/// It also proves the unauthorized refusal is generic (`CODEX-I05-S02`
+/// verification round 01, S1): `transition_id` echoes what the caller
+/// supplied (a client correlating concurrent start attempts needs it), but
+/// `process_instance_id` is always a blank placeholder rather than a
+/// coordinator-derived value, so an unauthorized caller across a restart
+/// cannot use this response to detect the server's own persisted-auth
+/// health or the coordinator's real process identity. The production auth
+/// mapper's own
 /// per-source behavior (confirmed absent/present/unreadable/cache-lock) is
 /// proven separately, through an internal test-only seam that never crosses
 /// this wire boundary, by
@@ -50,7 +64,7 @@ async fn start_refusal(
 /// and, for the lock-poisoning case with no restart analogue, by
 /// `codex_login::auth::auth_tests::authoritative_cached_auth_reports_cache_lock_unavailable_when_poisoned`.
 #[tokio::test]
-async fn wire_gates_stay_unconditionally_not_admitted_across_every_persisted_auth_source_boundary()
+async fn stdio_wire_gates_stay_not_admitted_across_every_persisted_auth_source_boundary()
 -> Result<()> {
     let codex_home = TempDir::new()?;
     let responses = create_mock_responses_server_repeating_assistant("Done").await;
@@ -63,19 +77,27 @@ async fn wire_gates_stay_unconditionally_not_admitted_across_every_persisted_aut
         .await?;
     let initial_response = start_refusal(&mut initial, "first-process".to_owned()).await?;
     let StartManagedTransitionResponse::Refused { refusal } = initial_response else {
-        panic!("Slice 1 must not admit a wire caller");
+        panic!("an unproven-provenance caller must not be admitted");
     };
     assert_eq!(
         refusal.kind,
         ManagedTransitionRefusalKind::AuthorizationNotAdmitted,
-        "confirmed-absent auth must not change the temporary gate's refusal kind"
+        "confirmed-absent auth must not change the unauthorized gate's refusal kind"
     );
-    let initial_process_id = refusal.process_instance_id;
+    assert_eq!(
+        refusal.process_instance_id, "",
+        "the generic unauthorized refusal must never echo the caller-supplied process id"
+    );
+    assert_eq!(
+        refusal.transition_id, "restart-transition",
+        "the generic unauthorized refusal must still echo the caller-supplied transition id"
+    );
     initial.shutdown_gracefully().await?;
 
     // Boundary 2: initial-load failure (an unreadable/unparseable persisted
-    // source). The gate must stay unconditional here too -- this is exactly
-    // the case `CODEX-I05-S01-R07-001` found leaking a distinct refusal kind.
+    // source). The gate must stay unauthorized-refused here too -- this is
+    // exactly the case `CODEX-I05-S01-R07-001` found leaking a distinct
+    // refusal kind.
     std::fs::write(codex_home.path().join("auth.json"), "not valid json")?;
     let mut unreadable = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -88,13 +110,12 @@ async fn wire_gates_stay_unconditionally_not_admitted_across_every_persisted_aut
     assert_eq!(
         refusal.kind,
         ManagedTransitionRefusalKind::AuthorizationNotAdmitted,
-        "an unreadable persisted-auth source must not be observable through the temporary wire gate"
+        "an unreadable persisted-auth source must not be observable through the unauthorized gate"
     );
-    assert_ne!(
-        refusal.process_instance_id, initial_process_id,
-        "each restart must reconstruct a new process identity"
+    assert_eq!(
+        refusal.process_instance_id, "",
+        "the generic unauthorized refusal must never echo the caller-supplied process id"
     );
-    let unreadable_process_id = refusal.process_instance_id;
 
     // Same boundary, read and cancel gates: the review's required correction
     // asks for all three real gates in the unavailable-source population, not
@@ -105,7 +126,7 @@ async fn wire_gates_stay_unconditionally_not_admitted_across_every_persisted_aut
             params: codex_app_server_protocol::ReadManagedTransitionParams {
                 contract_version: MANAGED_AUTH_TRANSITION_CONTRACT_VERSION,
                 transition_id: "restart-transition".to_owned(),
-                process_instance_id: unreadable_process_id.clone(),
+                process_instance_id: "second-process".to_owned(),
             },
         })
         .await?;
@@ -126,7 +147,7 @@ async fn wire_gates_stay_unconditionally_not_admitted_across_every_persisted_aut
             params: codex_app_server_protocol::CancelManagedTransitionParams {
                 contract_version: MANAGED_AUTH_TRANSITION_CONTRACT_VERSION,
                 transition_id: "restart-transition".to_owned(),
-                process_instance_id: unreadable_process_id.clone(),
+                process_instance_id: "second-process".to_owned(),
             },
         })
         .await?;
@@ -144,8 +165,8 @@ async fn wire_gates_stay_unconditionally_not_admitted_across_every_persisted_aut
 
     // Boundary 3: confirmed present (a genuine, readable persisted account),
     // following directly after the unreadable-source restart above with no
-    // other change but a valid write -- the gate must still be exactly the
-    // same unconditional refusal, proving no coordinator mutation or
+    // other change but a valid write -- the gate must still refuse through
+    // the same generic response, proving no coordinator mutation or
     // reservation happened at any boundary above.
     write_chatgpt_auth(
         codex_home.path(),
@@ -158,36 +179,37 @@ async fn wire_gates_stay_unconditionally_not_admitted_across_every_persisted_aut
         .await?;
     let present_response = start_refusal(&mut present, "third-process".to_owned()).await?;
     let StartManagedTransitionResponse::Refused { refusal } = present_response else {
-        panic!("Slice 1 must not admit a wire caller even once auth is present");
+        panic!("an unproven-provenance caller must not be admitted even once auth is present");
     };
     assert_eq!(
         refusal.kind,
         ManagedTransitionRefusalKind::AuthorizationNotAdmitted,
-        "confirmed-present auth must not change the temporary gate's refusal kind"
+        "confirmed-present auth must not change the unauthorized gate's refusal kind"
     );
-    assert_ne!(
-        refusal.process_instance_id, unreadable_process_id,
-        "each restart must reconstruct a new process identity"
+    assert_eq!(
+        refusal.process_instance_id, "",
+        "the generic unauthorized refusal must never echo the caller-supplied process id"
     );
-    let present_process_id = refusal.process_instance_id;
 
-    // No manufactured old outcome or reservation: a prior process's own
-    // transition id resolves through the same unconditional refusal after
-    // restart, never through a resurrected admission from an earlier process.
+    // No manufactured old outcome or reservation: reading with a prior
+    // process's own stale caller-supplied process id after restart still
+    // resolves through the same generic unauthorized refusal -- never
+    // through a resurrected admission, and without ever revealing whether
+    // that id matches the new process's real identity.
     let read_as_prior_process = present
         .request(|request_id| ClientRequest::ManagedTransitionRead {
             request_id,
             params: codex_app_server_protocol::ReadManagedTransitionParams {
                 contract_version: MANAGED_AUTH_TRANSITION_CONTRACT_VERSION,
                 transition_id: "restart-transition".to_owned(),
-                process_instance_id: unreadable_process_id,
+                process_instance_id: "second-process".to_owned(),
             },
         })
         .await?;
     let codex_app_server_protocol::ReadManagedTransitionResponse::Refused { refusal } =
         read_as_prior_process
     else {
-        panic!("a prior process identity must never resolve a live transition after restart");
+        panic!("a stale caller-supplied process id must never resolve a live transition after restart");
     };
     assert_eq!(
         refusal.kind,
@@ -195,8 +217,13 @@ async fn wire_gates_stay_unconditionally_not_admitted_across_every_persisted_aut
         "restart must not manufacture or resurrect a reservation from a previous process"
     );
     assert_eq!(
-        refusal.process_instance_id, present_process_id,
-        "the refusal must report the current process identity, not the stale caller's"
+        refusal.process_instance_id, "",
+        "the generic unauthorized refusal must never echo any process id, stale or current, \
+         and must never reveal the coordinator's real identity"
+    );
+    assert_eq!(
+        refusal.transition_id, "restart-transition",
+        "the generic unauthorized refusal must still echo the caller-supplied transition id"
     );
 
     Ok(())

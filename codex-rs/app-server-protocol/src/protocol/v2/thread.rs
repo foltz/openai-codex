@@ -163,6 +163,7 @@ pub enum ThreadRetentionReleaseResponse {
 #[ts(rename_all = "camelCase", export_to = "v2/")]
 pub enum ThreadRetentionRefusalReason {
     IneligiblePrincipal,
+    AuthorityUnavailable,
     UnknownThread,
     InvalidThreadId,
 }

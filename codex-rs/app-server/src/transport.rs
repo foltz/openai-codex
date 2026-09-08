@@ -1,5 +1,6 @@
 use crate::message_processor::ConnectionSessionState;
 use crate::outgoing_message::OutgoingEnvelope;
+use crate::thread_state::RetentionPrincipalId;
 use codex_app_server_protocol::ExperimentalApi;
 use codex_app_server_protocol::ServerRequest;
 use std::collections::HashMap;
@@ -54,7 +55,9 @@ impl ConnectionState {
         outbound_experimental_api_enabled: Arc<AtomicBool>,
         outbound_opted_out_notification_methods: Arc<RwLock<HashSet<String>>>,
     ) -> Self {
-        let mut session = ConnectionSessionState::with_provenance(origin, provenance);
+        // The transport boundary explicitly classifies the principal's owner;
+        // upstream connection authentication remains on its separate RPC gate.
+        let mut session = ConnectionSessionState::with_provenance(origin, provenance, RetentionPrincipalId::connection_owned());
         let mut rpc_gate = crate::connection_rpc_gate::ConnectionRpcGate::new();
         rpc_gate.auth = auth;
         session.rpc_gate = Arc::new(rpc_gate);
@@ -90,9 +93,19 @@ pub(crate) fn trusted_interactive(
 
 #[cfg(test)]
 mod provenance_tests {
+    use crate::message_processor::InitializedConnectionSessionState;
+    use super::ConnectionOrigin;
     use super::ConnectionProvenance;
+    use super::ConnectionState;
     use super::trusted_interactive;
     use super::trusted_interactive_provenance;
+    use crate::thread_state::RetentionPrincipalOwner;
+    use codex_app_server_transport::PeerExecutableIdentity;
+    use codex_protocol::mcp::ClientMcpExtensions;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::sync::RwLock;
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn unproven_connections_cannot_become_interactive() {
@@ -119,6 +132,44 @@ mod provenance_tests {
             /*interactive_client_requested*/ true,
             ConnectionProvenance::Unproven,
         ));
+    }
+
+    #[test]
+    fn normal_transport_construction_marks_a_verified_peer_connection_owned() {
+        let connection = ConnectionState::new(
+            ConnectionOrigin::WebSocket,
+            /*auth*/ None,
+            ConnectionProvenance::UnixPeerExecutable(
+                PeerExecutableIdentity::FileIdentity {
+                    device: 1,
+                    inode: 2,
+                },
+            ),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(RwLock::new(HashSet::new())),
+        );
+
+        connection
+            .session
+            .initialize(InitializedConnectionSessionState {
+                experimental_api_enabled: true,
+                opted_out_notification_methods: HashSet::new(),
+                app_server_client_name: "test".to_string(),
+                client_version: "0.0.0".to_string(),
+                request_attestation: true,
+                interactive_client_requested: true,
+                client_mcp_extensions: ClientMcpExtensions::default(),
+            })
+            .expect("test session initializes once");
+        assert_eq!(
+            connection
+                .session
+                .retention_principal()
+                .map(|principal| principal.owner()),
+            Some(RetentionPrincipalOwner::ConnectionOwned),
+            "the normal transport seam must classify its server-minted principal explicitly"
+        );
     }
 }
 

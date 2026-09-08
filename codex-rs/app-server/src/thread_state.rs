@@ -47,32 +47,50 @@ type PendingInterruptQueue = Vec<ConnectionRequestId>;
 /// routing and retention authority have different lifetimes and must not be
 /// interchangeable at call sites.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum RetentionPrincipalOwner {
+    /// No lifecycle census has established whether this principal is
+    /// connection-owned or belongs to a thread runtime. This state must never
+    /// grant retention authority.
+    Unclassified,
+    /// The principal belongs to a connection whose lifetime is independent of
+    /// any app-server thread.
+    ConnectionOwned,
+    /// The principal belongs to a runtime owned by the named thread.
+    #[allow(dead_code)] // Structural R009 control; no production caller exists at this basis.
+    ThreadOwned(ThreadId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct RetentionPrincipalId {
     id: Uuid,
-    // A thread-owned runtime is not currently a principal source in
-    // app-server, but retain this classification in the authority type so a
-    // future source cannot make self-retention representable by accident.
-    runtime_owner: Option<ThreadId>,
+    owner: RetentionPrincipalOwner,
 }
 
 impl RetentionPrincipalId {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn unclassified() -> Self {
         Self {
             id: Uuid::now_v7(),
-            runtime_owner: None,
+            owner: RetentionPrincipalOwner::Unclassified,
         }
     }
 
-    #[allow(dead_code)] // Reserved for the D-07 runtime-owned caller.
+    pub(crate) fn connection_owned() -> Self {
+        Self {
+            id: Uuid::now_v7(),
+            owner: RetentionPrincipalOwner::ConnectionOwned,
+        }
+    }
+
+    #[allow(dead_code)] // Structural R009 control; exercised by the test kernel.
     pub(crate) fn for_thread_runtime(thread_id: ThreadId) -> Self {
         Self {
             id: Uuid::now_v7(),
-            runtime_owner: Some(thread_id),
+            owner: RetentionPrincipalOwner::ThreadOwned(thread_id),
         }
     }
 
-    fn owns_runtime_for(self, thread_id: ThreadId) -> bool {
-        self.runtime_owner == Some(thread_id)
+    pub(crate) fn owner(self) -> RetentionPrincipalOwner {
+        self.owner
     }
 }
 
@@ -122,6 +140,7 @@ pub(crate) enum RetentionReleaseOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RetentionAuthorityError {
     IneligiblePrincipal,
+    AuthorityUnavailable,
     UnknownThread,
     SelfRetention,
 }
@@ -964,7 +983,7 @@ mod tests {
         let manager = ThreadStateManager::new();
         let thread_id = ThreadId::new();
         let connection = ConnectionId(1);
-        let principal = RetentionPrincipalId::new();
+        let principal = RetentionPrincipalId::connection_owned();
         manager
             .connection_initialized(
                 connection,
@@ -989,7 +1008,7 @@ mod tests {
                 grant_id: grant_id.clone()
             })
         );
-        let other_principal = RetentionPrincipalId::new();
+        let other_principal = RetentionPrincipalId::connection_owned();
         manager
             .connection_initialized(
                 ConnectionId(2),
@@ -1063,10 +1082,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn thread_owned_runtime_may_retain_a_different_thread() {
+        let manager = ThreadStateManager::new();
+        let owning_thread_id = ThreadId::new();
+        let target_thread_id = ThreadId::new();
+        let principal = RetentionPrincipalId::for_thread_runtime(owning_thread_id);
+        manager
+            .connection_initialized(
+                ConnectionId(1),
+                ConnectionCapabilities {
+                    retention_principal: Some(principal),
+                    ..ConnectionCapabilities::default()
+                },
+            )
+            .await;
+        manager.thread_state(target_thread_id).await;
+
+        assert!(matches!(
+            manager.acquire_retention(target_thread_id, principal).await,
+            Ok(RetentionAcquireOutcome::Acquired { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn unclassified_principal_cannot_retain_a_thread() {
+        let manager = ThreadStateManager::new();
+        let thread_id = ThreadId::new();
+        let principal = RetentionPrincipalId::unclassified();
+        manager
+            .connection_initialized(
+                ConnectionId(1),
+                ConnectionCapabilities {
+                    retention_principal: Some(principal),
+                    ..ConnectionCapabilities::default()
+                },
+            )
+            .await;
+        manager.thread_state(thread_id).await;
+
+        assert_eq!(
+            manager.acquire_retention(thread_id, principal).await,
+            Err(RetentionAuthorityError::AuthorityUnavailable)
+        );
+        assert_eq!(
+            manager.acquire_retention(ThreadId::new(), principal).await,
+            Err(RetentionAuthorityError::AuthorityUnavailable),
+            "unclassified authority must not disclose whether a target exists"
+        );
+        let handle = RetentionGrantId::from_wire(&Uuid::now_v7().to_string());
+        assert_eq!(
+            manager.release_retention(thread_id, principal, &handle).await,
+            Err(RetentionAuthorityError::AuthorityUnavailable)
+        );
+        assert_eq!(
+            manager
+                .release_retention(ThreadId::new(), principal, &handle)
+                .await,
+            Err(RetentionAuthorityError::AuthorityUnavailable),
+            "unclassified release must not disclose whether a target exists"
+        );
+    }
+
+    #[tokio::test]
     async fn removing_thread_state_revokes_its_retention_grants() {
         let manager = ThreadStateManager::new();
         let thread_id = ThreadId::new();
-        let principal = RetentionPrincipalId::new();
+        let principal = RetentionPrincipalId::connection_owned();
         manager
             .connection_initialized(
                 ConnectionId(1),
@@ -1098,7 +1179,7 @@ mod tests {
         let manager = ThreadStateManager::new();
         let thread_id = ThreadId::new();
         let connection = ConnectionId(1);
-        let principal = RetentionPrincipalId::new();
+        let principal = RetentionPrincipalId::connection_owned();
         manager
             .connection_initialized(
                 connection,
@@ -1152,7 +1233,7 @@ mod tests {
         let predecessor_thread_id = ThreadId::new();
         let successor_thread_id = ThreadId::new();
         let requester = ConnectionId(1);
-        let principal = RetentionPrincipalId::new();
+        let principal = RetentionPrincipalId::connection_owned();
         manager
             .connection_initialized(
                 requester,
@@ -1507,11 +1588,18 @@ impl ThreadStateManager {
         if !state.retention_principal_is_live(principal) {
             return Err(RetentionAuthorityError::IneligiblePrincipal);
         }
+        match principal.owner() {
+            RetentionPrincipalOwner::ConnectionOwned => {}
+            RetentionPrincipalOwner::Unclassified => {
+                return Err(RetentionAuthorityError::AuthorityUnavailable);
+            }
+            RetentionPrincipalOwner::ThreadOwned(owner) if owner == thread_id => {
+                return Err(RetentionAuthorityError::SelfRetention);
+            }
+            RetentionPrincipalOwner::ThreadOwned(_) => {}
+        }
         if !state.threads.contains_key(&thread_id) {
             return Err(RetentionAuthorityError::UnknownThread);
-        }
-        if principal.owns_runtime_for(thread_id) {
-            return Err(RetentionAuthorityError::SelfRetention);
         }
 
         let grants = state
@@ -1546,6 +1634,12 @@ impl ThreadStateManager {
         let mut state = self.state.lock().await;
         if !state.retention_principal_is_live(principal) {
             return Err(RetentionAuthorityError::IneligiblePrincipal);
+        }
+        match principal.owner() {
+            RetentionPrincipalOwner::Unclassified => {
+                return Err(RetentionAuthorityError::AuthorityUnavailable);
+            }
+            RetentionPrincipalOwner::ConnectionOwned | RetentionPrincipalOwner::ThreadOwned(_) => {}
         }
         if !state.threads.contains_key(&thread_id) {
             return Err(RetentionAuthorityError::UnknownThread);

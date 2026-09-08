@@ -32,8 +32,13 @@ pub enum PeerExecutableIdentity {
 const MAX_CODE_DIRECTORY_HASH_BYTES: usize = 64;
 
 impl PeerExecutableIdentity {
-    /// Captures the daemon image before its listener is published.
-    pub(crate) fn capture_running_process() -> io::Result<Self> {
+    /// Captures the daemon image before its listener is published. Public so
+    /// a consumer crate's own self-describing target evidence (Issue 05
+    /// Slice 2, `CODEX-I05-S02-R004`) can reuse the identical platform-correct
+    /// capture this module already uses for accept-time peer comparison,
+    /// rather than reimplementing it; this is a read-only query with no
+    /// broadened side effect.
+    pub fn capture_running_process() -> io::Result<Self> {
         platform::running_process_identity()
     }
 

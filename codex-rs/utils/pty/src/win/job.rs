@@ -10,6 +10,7 @@ use winapi::shared::ntdef::NT_SUCCESS;
 use winapi::shared::ntdef::NTSTATUS;
 use winapi::um::jobapi2::AssignProcessToJobObject;
 use winapi::um::jobapi2::CreateJobObjectW;
+use winapi::um::jobapi2::QueryInformationJobObject;
 use winapi::um::jobapi2::SetInformationJobObject;
 use winapi::um::jobapi2::TerminateJobObject;
 use winapi::um::processthreadsapi::OpenProcess;
@@ -18,7 +19,9 @@ use winapi::um::winbase::CREATE_SUSPENDED;
 use winapi::um::winnt::HANDLE;
 use winapi::um::winnt::JOB_OBJECT_LIMIT_BREAKAWAY_OK;
 use winapi::um::winnt::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+use winapi::um::winnt::JOBOBJECT_BASIC_ACCOUNTING_INFORMATION;
 use winapi::um::winnt::JOBOBJECT_EXTENDED_LIMIT_INFORMATION;
+use winapi::um::winnt::JobObjectBasicAccountingInformation;
 use winapi::um::winnt::JobObjectExtendedLimitInformation;
 use winapi::um::winnt::PROCESS_SET_QUOTA;
 use winapi::um::winnt::PROCESS_SUSPEND_RESUME;
@@ -39,6 +42,24 @@ pub struct JobObject {
 }
 
 impl JobObject {
+    /// Read-only terminal evidence for the complete owned process job.
+    pub fn has_active_processes(&self) -> io::Result<bool> {
+        let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+        let queried = unsafe {
+            QueryInformationJobObject(
+                self.handle.as_raw_handle().cast(),
+                JobObjectBasicAccountingInformation,
+                (&mut info as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                std::mem::size_of_val(&info) as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        if queried == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(info.ActiveProcesses != 0)
+    }
+
     /// Creates a Job Object configured to terminate all members when its last handle closes.
     pub fn create() -> io::Result<Self> {
         let handle = unsafe { CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()) };

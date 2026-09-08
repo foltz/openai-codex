@@ -228,6 +228,14 @@ impl ExecutorProcessTransport {
         let index = PROCESS_COUNTER.fetch_add(1, Ordering::Relaxed);
         ProcessId::from(format!("mcp-stdio-{index}"))
     }
+
+    /// Records a terminal observation made by the owning stdio process handle.
+    /// The handle subscribes before sending termination, so it is the one
+    /// place that can prove `Closed` without a second terminate request.
+    pub(super) fn mark_closed_after_terminal_observation(&mut self) {
+        self.closed = true;
+        self.terminated = true;
+    }
 }
 
 impl Transport<RoleClient> for ExecutorProcessTransport {

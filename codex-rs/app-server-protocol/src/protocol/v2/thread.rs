@@ -103,14 +103,19 @@ pub struct ThreadInteractiveSubscriptionChangedNotification {
 /// Requests an explicit, process-local retention grant for one exact thread.
 /// The server derives the eligible principal; callers cannot provide one.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[ts(rename_all = "camelCase", export_to = "v2/")]
 pub struct ThreadRetentionAcquireParams {
     pub thread_id: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase", tag = "status")]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "status",
+    deny_unknown_fields
+)]
 #[ts(rename_all = "camelCase", export_to = "v2/")]
 pub enum ThreadRetentionAcquireResponse {
     Acquired {
@@ -126,7 +131,7 @@ pub enum ThreadRetentionAcquireResponse {
 
 /// Releases one opaque, process-local retention grant for one exact thread.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[ts(rename_all = "camelCase", export_to = "v2/")]
 pub struct ThreadRetentionReleaseParams {
     pub thread_id: String,
@@ -134,7 +139,12 @@ pub struct ThreadRetentionReleaseParams {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase", tag = "status")]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "status",
+    deny_unknown_fields
+)]
 #[ts(rename_all = "camelCase", export_to = "v2/")]
 pub enum ThreadRetentionReleaseResponse {
     Released,
@@ -153,6 +163,34 @@ pub enum ThreadRetentionRefusalReason {
     IneligiblePrincipal,
     UnknownThread,
     InvalidThreadId,
+}
+
+#[cfg(test)]
+mod retention_wire_tests {
+    use super::*;
+
+    #[test]
+    fn retention_carrier_uses_closed_camel_case_wire_shapes() {
+        let response = ThreadRetentionAcquireResponse::Acquired {
+            grant_id: "server-minted".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(response).expect("response serializes"),
+            serde_json::json!({"status": "acquired", "grantId": "server-minted"})
+        );
+        assert!(
+            serde_json::from_value::<ThreadRetentionAcquireParams>(
+                serde_json::json!({"threadId": "t", "unexpected": true})
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ThreadRetentionAcquireResponse>(
+                serde_json::json!({"status": "acquired", "grantId": "g", "unexpected": true})
+            )
+            .is_err()
+        );
+    }
 }
 
 // === Threads, Turns, and Items ===

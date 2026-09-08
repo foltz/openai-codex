@@ -47,11 +47,32 @@ type PendingInterruptQueue = Vec<ConnectionRequestId>;
 /// routing and retention authority have different lifetimes and must not be
 /// interchangeable at call sites.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct RetentionPrincipalId(Uuid);
+pub(crate) struct RetentionPrincipalId {
+    id: Uuid,
+    // A thread-owned runtime is not currently a principal source in
+    // app-server, but retain this classification in the authority type so a
+    // future source cannot make self-retention representable by accident.
+    runtime_owner: Option<ThreadId>,
+}
 
 impl RetentionPrincipalId {
     pub(crate) fn new() -> Self {
-        Self(Uuid::now_v7())
+        Self {
+            id: Uuid::now_v7(),
+            runtime_owner: None,
+        }
+    }
+
+    #[allow(dead_code)] // Reserved for the D-07 runtime-owned caller.
+    pub(crate) fn for_thread_runtime(thread_id: ThreadId) -> Self {
+        Self {
+            id: Uuid::now_v7(),
+            runtime_owner: Some(thread_id),
+        }
+    }
+
+    fn owns_runtime_for(self, thread_id: ThreadId) -> bool {
+        self.runtime_owner == Some(thread_id)
     }
 }
 
@@ -100,6 +121,7 @@ pub(crate) enum RetentionReleaseOutcome {
 pub(crate) enum RetentionAuthorityError {
     IneligiblePrincipal,
     UnknownThread,
+    SelfRetention,
 }
 
 pub(crate) struct PendingThreadResumeRequest {
@@ -1017,6 +1039,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn thread_owned_runtime_cannot_retain_its_own_thread() {
+        let manager = ThreadStateManager::new();
+        let thread_id = ThreadId::new();
+        let principal = RetentionPrincipalId::for_thread_runtime(thread_id);
+        manager
+            .connection_initialized(
+                ConnectionId(1),
+                ConnectionCapabilities {
+                    retention_principal: Some(principal),
+                    ..ConnectionCapabilities::default()
+                },
+            )
+            .await;
+        manager.thread_state(thread_id).await;
+
+        assert_eq!(
+            manager.acquire_retention(thread_id, principal).await,
+            Err(RetentionAuthorityError::SelfRetention)
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_thread_state_revokes_its_retention_grants() {
+        let manager = ThreadStateManager::new();
+        let thread_id = ThreadId::new();
+        let principal = RetentionPrincipalId::new();
+        manager
+            .connection_initialized(
+                ConnectionId(1),
+                ConnectionCapabilities {
+                    retention_principal: Some(principal),
+                    ..ConnectionCapabilities::default()
+                },
+            )
+            .await;
+        manager.thread_state(thread_id).await;
+        assert!(matches!(
+            manager.acquire_retention(thread_id, principal).await,
+            Ok(RetentionAcquireOutcome::Acquired { .. })
+        ));
+
+        manager.remove_thread_state(thread_id).await;
+        manager.thread_state(thread_id).await;
+        assert!(
+            matches!(
+                manager.acquire_retention(thread_id, principal).await,
+                Ok(RetentionAcquireOutcome::Acquired { .. })
+            ),
+            "a reused thread id must not inherit a removed thread's grant"
+        );
+    }
+
+    #[tokio::test]
     async fn unsubscribe_and_disconnect_revoke_exact_retention_authority() {
         let manager = ThreadStateManager::new();
         let thread_id = ThreadId::new();
@@ -1266,6 +1341,22 @@ impl ThreadStateManagerInner {
         }
     }
 
+    fn revoke_all_retention_for_thread(&mut self, thread_id: ThreadId) {
+        let Some(grants) = self.retention_grants_by_thread.remove(&thread_id) else {
+            return;
+        };
+        for principal in grants.into_keys() {
+            let mut remove_principal_index = false;
+            if let Some(thread_ids) = self.retention_threads_by_principal.get_mut(&principal) {
+                thread_ids.remove(&thread_id);
+                remove_principal_index = thread_ids.is_empty();
+            }
+            if remove_principal_index {
+                self.retention_threads_by_principal.remove(&principal);
+            }
+        }
+    }
+
     fn add_interactive_subscription(&mut self, thread_id: ThreadId) -> ThreadInteractiveSubscriptionEntry {
         let interactive_subscription_count = self.interactive_subscription_counts.entry(thread_id).or_default();
         *interactive_subscription_count = interactive_subscription_count.saturating_add(1);
@@ -1416,6 +1507,9 @@ impl ThreadStateManager {
         }
         if !state.threads.contains_key(&thread_id) {
             return Err(RetentionAuthorityError::UnknownThread);
+        }
+        if principal.owns_runtime_for(thread_id) {
+            return Err(RetentionAuthorityError::SelfRetention);
         }
 
         let grants = state
@@ -1686,6 +1780,7 @@ impl ThreadStateManager {
                 .threads
                 .remove(&thread_id)
                 .map(|thread_entry| thread_entry.state);
+            state.revoke_all_retention_for_thread(thread_id);
             state.thread_ids_by_connection.retain(|_, thread_ids| {
                 thread_ids.remove(&thread_id);
                 !thread_ids.is_empty()

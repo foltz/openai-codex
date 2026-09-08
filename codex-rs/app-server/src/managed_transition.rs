@@ -547,6 +547,15 @@ impl ManagedTransitionCoordinator {
     /// caller receives the identical `AuthorizationNotAdmitted` refusal
     /// regardless of target-evidence or coordinator state, so no signal about
     /// server-side health leaks to a caller that has not yet qualified.
+    ///
+    /// **Client-facing latency contract (verification round 01, M1).** A
+    /// successful admission does not return immediately: this method also
+    /// runs [`Self::close_barrier_and_drain`], so an authorized caller's
+    /// `ManagedTransitionStart` response can be held for up to
+    /// [`DRAIN_DEADLINE`] before it is sent. The response's `phase` (and,
+    /// on timeout, `Quarantined`/`retryable: true`) is the caller's only
+    /// signal here; there is currently no distinct "still draining" versus
+    /// "hung" indication before that response arrives.
     pub(crate) async fn start_dispatch(
         &self,
         params: StartManagedTransitionParams,
@@ -595,10 +604,23 @@ impl ManagedTransitionCoordinator {
 
         let deadline = tokio::time::Instant::now() + DRAIN_DEADLINE;
         loop {
-            // Race-free per `tokio::sync::Notify`'s documented pattern: the
-            // listener is created before either condition below is read, so
-            // a permit release or a concurrent cancel that lands between
-            // this line and the `.await` further down is never missed.
+            // Race-free: `Notify::notified()` captures its
+            // `notify_waiters_calls` baseline at *creation* (before this
+            // line ever runs anything else), and `notify_waiters()` always
+            // increments that counter even with zero registered listeners.
+            // So a release or a concurrent cancel that lands anywhere from
+            // here through the `state.lock().await` below -- including
+            // before this future is ever polled -- is still correctly
+            // observed on its first real poll further down, without
+            // needing the deadline. Verification round 01's B1 raised this
+            // exact concern and proposed pinning+`enable()`-ing the
+            // listener early (`core/src/unified_exec/async_watcher.rs`'s
+            // idiom for a *different* hazard); independently verified
+            // against `tokio::sync::notify`'s own source and an isolated
+            // reproduction before accepting the finding, found the
+            // `notify_waiters()`-only case (this file's only usage) does
+            // not need it, and the finding was withdrawn as invalid
+            // (`notify_one`/`notify_waiters` conflation) rather than fixed.
             let notified = self.account_work_permits.notified();
 
             let still_draining = {
@@ -726,6 +748,35 @@ impl ManagedTransitionCoordinator {
                 true,
             ));
         }
+
+        // `Quarantined` is terminal (`ManagedTransitionPhase::is_terminal`),
+        // so a drain-timeout record already lives in `completed`, never in
+        // `active`. R013/R016/R017 require quarantine to stay observable
+        // and closed to new account-dependent work while it remains, but
+        // still support an explicit, safe, attributable cancel of *this
+        // exact* transition -- verification round 01's delegated B2 remedy:
+        // do not reopen automatically at timeout; only an explicit cancel
+        // of the quarantined transition itself reopens the barrier.
+        if let Some(record) = state.completed.get(&envelope.transition_id).cloned()
+            && record.phase == ManagedTransitionPhase::Quarantined
+        {
+            state.transition_revision += 1;
+            let cancelled = TransitionRecord {
+                phase: ManagedTransitionPhase::Cancelled,
+                retryable: true,
+                result_transition_revision: state.transition_revision,
+                ..record
+            };
+            let status = status_for(&cancelled);
+            state
+                .completed
+                .insert(cancelled.envelope.transition_id.clone(), cancelled);
+            drop(state);
+            self.account_work_permits.reopen();
+            self.account_work_permits.wake_waiters();
+            return Ok(status);
+        }
+
         let Some(record) = state.active.take() else {
             return Err(refusal(
                 &state,
@@ -1608,6 +1659,15 @@ mod tests {
         // valid and only ends when its own holder drops it, proving the
         // timeout did not kill admitted work (R013).
         drop(held_guard);
+
+        // Verification round 01, B2: a real drain timeout must not
+        // auto-reopen the barrier. Quarantine stays observable and closed
+        // to new account-dependent work until this exact transition is
+        // explicitly cancelled (R016).
+        assert!(
+            coordinator.try_acquire_account_work_permit().is_none(),
+            "a real drain timeout must leave the barrier closed, not reopen it"
+        );
     }
 
     #[tokio::test]
@@ -1637,6 +1697,89 @@ mod tests {
         };
         assert_eq!(status.phase, ManagedTransitionPhase::Cancelled);
         drop(guard);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_explicit_cancel_of_the_exact_quarantined_transition_reopens_and_a_fresh_start_revalidates_normally()
+     {
+        // Verification round 01, B2's delegated remedy end to end: real
+        // deadline -> observable Quarantined that refuses new work -> an
+        // explicit cancel of that exact transition -> Cancelled/retryable
+        // -> barrier reopens -> a fresh Start passes all normal validation
+        // (CAS, target evidence, auth availability) rather than inheriting
+        // any authority from the quarantined attempt. Timeout itself must
+        // not auto-reopen (checked in
+        // `drain_timeout_quarantines_without_touching_auth_or_killing_admitted_work`);
+        // this test is the recovery half.
+        let coordinator = ManagedTransitionCoordinator::new();
+        let process_id = coordinator.process_instance_id().await;
+
+        let held_guard = coordinator
+            .try_acquire_account_work_permit()
+            .expect("the barrier starts open");
+        let coordinator_for_task = coordinator.clone();
+        let handle = tokio::spawn(async move {
+            coordinator_for_task
+                .start_dispatch(request(process_id.clone(), "transition-a"), true)
+                .await
+        });
+        tokio::time::advance(DRAIN_DEADLINE + Duration::from_millis(1)).await;
+        let response = handle.await.expect("start_dispatch task");
+        let StartManagedTransitionResponse::Accepted { status } = response else {
+            panic!("a timed-out drain is a status transition, not a refusal");
+        };
+        assert_eq!(status.phase, ManagedTransitionPhase::Quarantined);
+        drop(held_guard);
+        assert!(
+            coordinator.try_acquire_account_work_permit().is_none(),
+            "quarantine must refuse new account-dependent work while it remains"
+        );
+
+        // A different transition id must still be refused as LateCancellation
+        // (this is not merely "any cancel reopens").
+        let process_id = coordinator.process_instance_id().await;
+        let wrong_id_refusal = coordinator
+            .cancel(cancel_request(process_id.clone(), "transition-b"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            wrong_id_refusal.kind,
+            ManagedTransitionRefusalKind::LateCancellation
+        );
+        assert!(
+            coordinator.try_acquire_account_work_permit().is_none(),
+            "an unrelated cancel attempt must not reopen the barrier"
+        );
+
+        // Cancelling the exact quarantined transition succeeds, reopens the
+        // barrier, and produces an attributable retryable Cancelled result.
+        let cancelled = coordinator
+            .cancel(cancel_request(process_id.clone(), "transition-a"))
+            .await
+            .expect("cancelling the exact quarantined transition must succeed");
+        assert_eq!(cancelled.phase, ManagedTransitionPhase::Cancelled);
+        assert!(cancelled.retryable);
+        assert!(
+            coordinator.try_acquire_account_work_permit().is_some(),
+            "the explicit cancel must reopen the barrier"
+        );
+
+        // A fresh Start for a new transition id passes all normal
+        // validation and is admitted -- it does not inherit authority from
+        // the quarantined-then-cancelled attempt. Uses the cancel
+        // response's own `transition_revision` as the CAS expectation,
+        // exactly as a real client would after reading current status --
+        // this is normal revalidation, not special-cased leniency.
+        let fresh = coordinator
+            .start_dispatch(
+                request_at_revision(process_id, "transition-c", cancelled.transition_revision),
+                true,
+            )
+            .await;
+        let StartManagedTransitionResponse::Accepted { status } = fresh else {
+            panic!("a fresh Start after explicit recovery must be admitted normally");
+        };
+        assert_eq!(status.phase, ManagedTransitionPhase::Draining);
     }
 
     #[tokio::test]

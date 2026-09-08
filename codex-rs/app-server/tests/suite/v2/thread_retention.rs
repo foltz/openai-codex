@@ -23,6 +23,7 @@ use codex_feedback::CodexFeedback;
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
 use tempfile::TempDir;
+use uuid::Uuid;
 
 async fn start_in_process_client(
     experimental_api: bool,
@@ -119,13 +120,26 @@ async fn retention_carrier_is_exact_and_uses_opaque_idempotent_handles() -> Resu
                 request_id: RequestId::Integer(4),
                 params: ThreadRetentionReleaseParams {
                     thread_id: started.thread.id.clone(),
-                    grant_id: "different-active-grant".to_string(),
+                    grant_id: Uuid::now_v7().to_string(),
                 },
             })
             .await?
             .map_err(|err| anyhow::anyhow!("mismatched release should respond: {err:?}"))?,
     )?;
     assert_eq!(mismatched, ThreadRetentionReleaseResponse::GrantMismatch {});
+
+    let malformed = client
+        .request(ClientRequest::ThreadRetentionRelease {
+            request_id: RequestId::Integer(5),
+            params: ThreadRetentionReleaseParams {
+                thread_id: started.thread.id.clone(),
+                grant_id: "not-an-opaque-grant-handle".to_string(),
+            },
+        })
+        .await?
+        .map_err(|err| anyhow::anyhow!("malformed handle must remain opaque: {err:?}"))?;
+    let malformed: ThreadRetentionReleaseResponse = serde_json::from_value(malformed)?;
+    assert_eq!(malformed, ThreadRetentionReleaseResponse::GrantMismatch {});
 
     let release = |request_id, grant_id: String| ClientRequest::ThreadRetentionRelease {
         request_id: RequestId::Integer(request_id),
@@ -136,25 +150,36 @@ async fn retention_carrier_is_exact_and_uses_opaque_idempotent_handles() -> Resu
     };
     let released: ThreadRetentionReleaseResponse = serde_json::from_value(
         client
-            .request(release(5, grant_id.clone()))
+            .request(release(6, grant_id.clone()))
             .await?
             .map_err(|err| anyhow::anyhow!("retention release should succeed: {err:?}"))?,
     )?;
     assert_eq!(released, ThreadRetentionReleaseResponse::Released {});
     let spent: ThreadRetentionReleaseResponse = serde_json::from_value(
         client
-            .request(release(6, grant_id))
+            .request(release(7, grant_id))
             .await?
             .map_err(|err| anyhow::anyhow!("spent retention release should respond: {err:?}"))?,
     )?;
     let unknown: ThreadRetentionReleaseResponse = serde_json::from_value(
         client
-            .request(release(7, "never-issued".to_string()))
+            .request(release(8, Uuid::now_v7().to_string()))
             .await?
             .map_err(|err| anyhow::anyhow!("unknown retention release should respond: {err:?}"))?,
     )?;
     assert_eq!(spent, ThreadRetentionReleaseResponse::NotHeld {});
     assert_eq!(unknown, ThreadRetentionReleaseResponse::NotHeld {});
+
+    let malformed_after_release: ThreadRetentionReleaseResponse = serde_json::from_value(
+        client
+            .request(release(9, "not-an-opaque-grant-handle".to_string()))
+            .await?
+            .map_err(|err| anyhow::anyhow!("malformed handle must remain opaque: {err:?}"))?,
+    )?;
+    assert_eq!(
+        malformed_after_release,
+        ThreadRetentionReleaseResponse::NotHeld {}
+    );
 
     client.shutdown().await?;
     Ok(())

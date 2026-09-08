@@ -39,6 +39,39 @@ use uuid::Uuid;
 
 type PendingInterruptQueue = Vec<ConnectionRequestId>;
 
+/// A server-minted, process-local identity for one eligible connection.
+///
+/// This deliberately cannot be constructed from a `ConnectionId`: connection
+/// routing and retention authority have different lifetimes and must not be
+/// interchangeable at call sites.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct RetentionPrincipalId(Uuid);
+
+impl RetentionPrincipalId {
+    pub(crate) fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum RetentionAcquireOutcome {
+    Acquired { grant_id: String },
+    AlreadyHeld { grant_id: String },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RetentionReleaseOutcome {
+    Released,
+    NotHeld,
+    GrantMismatch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RetentionAuthorityError {
+    IneligiblePrincipal,
+    UnknownThread,
+}
+
 pub(crate) struct PendingThreadResumeRequest {
     pub(crate) request_id: ConnectionRequestId,
     pub(crate) history_items: Vec<RolloutItem>,
@@ -361,6 +394,7 @@ mod tests {
                 ConnectionCapabilities {
                     request_attestation: false,
                     trusted_interactive: true,
+                    retention_principal: None,
                 },
             )
             .await;
@@ -425,6 +459,7 @@ mod tests {
                 ConnectionCapabilities {
                     request_attestation: false,
                     trusted_interactive: true,
+                    retention_principal: None,
                 },
             )
             .await;
@@ -473,6 +508,7 @@ mod tests {
                 ConnectionCapabilities {
                     request_attestation: false,
                     trusted_interactive: true,
+                    retention_principal: None,
                 },
             )
             .await;
@@ -562,6 +598,7 @@ mod tests {
                 ConnectionCapabilities {
                     request_attestation: false,
                     trusted_interactive: true,
+                    retention_principal: None,
                 },
             )
             .await;
@@ -600,6 +637,7 @@ mod tests {
                     ConnectionCapabilities {
                         request_attestation: false,
                         trusted_interactive: true,
+                        retention_principal: None,
                     },
                 )
                 .await;
@@ -662,6 +700,7 @@ mod tests {
                 ConnectionCapabilities {
                     request_attestation: false,
                     trusted_interactive: true,
+                    retention_principal: None,
                 },
             )
             .await;
@@ -767,6 +806,115 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn retention_grants_are_exact_principal_handles_and_idempotent_when_spent() {
+        let manager = ThreadStateManager::new();
+        let thread_id = ThreadId::new();
+        let connection = ConnectionId(1);
+        let principal = RetentionPrincipalId::new();
+        manager
+            .connection_initialized(
+                connection,
+                ConnectionCapabilities {
+                    retention_principal: Some(principal),
+                    ..ConnectionCapabilities::default()
+                },
+            )
+            .await;
+        manager.thread_state(thread_id).await;
+
+        let RetentionAcquireOutcome::Acquired { grant_id } = manager
+            .acquire_retention(thread_id, principal)
+            .await
+            .expect("live server-minted principal is eligible")
+        else {
+            panic!("first acquire must mint a grant");
+        };
+        assert_eq!(
+            manager.acquire_retention(thread_id, principal).await,
+            Ok(RetentionAcquireOutcome::AlreadyHeld {
+                grant_id: grant_id.clone()
+            })
+        );
+        assert_eq!(
+            manager
+                .release_retention(thread_id, principal, "different-active-grant")
+                .await,
+            Ok(RetentionReleaseOutcome::GrantMismatch)
+        );
+        assert_eq!(
+            manager
+                .release_retention(thread_id, principal, &grant_id)
+                .await,
+            Ok(RetentionReleaseOutcome::Released)
+        );
+        assert_eq!(
+            manager
+                .release_retention(thread_id, principal, &grant_id)
+                .await,
+            Ok(RetentionReleaseOutcome::NotHeld)
+        );
+        assert_eq!(
+            manager
+                .release_retention(thread_id, principal, "never-issued")
+                .await,
+            Ok(RetentionReleaseOutcome::NotHeld)
+        );
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_and_disconnect_revoke_exact_retention_authority() {
+        let manager = ThreadStateManager::new();
+        let thread_id = ThreadId::new();
+        let connection = ConnectionId(1);
+        let principal = RetentionPrincipalId::new();
+        manager
+            .connection_initialized(
+                connection,
+                ConnectionCapabilities {
+                    retention_principal: Some(principal),
+                    ..ConnectionCapabilities::default()
+                },
+            )
+            .await;
+        manager
+            .try_ensure_connection_subscribed(thread_id, connection, false)
+            .await
+            .expect("connection should subscribe");
+        let RetentionAcquireOutcome::Acquired { grant_id } = manager
+            .acquire_retention(thread_id, principal)
+            .await
+            .expect("acquire should succeed")
+        else {
+            panic!("first acquire must mint a grant");
+        };
+
+        assert!(
+            manager
+                .unsubscribe_connection_from_thread(thread_id, connection)
+                .await
+        );
+        assert_eq!(
+            manager
+                .release_retention(thread_id, principal, &grant_id)
+                .await,
+            Ok(RetentionReleaseOutcome::NotHeld)
+        );
+
+        let RetentionAcquireOutcome::Acquired { .. } = manager
+            .acquire_retention(thread_id, principal)
+            .await
+            .expect("unsubscribe does not revoke the live principal")
+        else {
+            panic!("reacquire must mint a new grant");
+        };
+        manager.remove_connection(connection).await;
+        assert_eq!(
+            manager.acquire_retention(thread_id, principal).await,
+            Err(RetentionAuthorityError::IneligiblePrincipal)
+        );
+    }
+
     async fn recv_attachment_changed_notification(
         outgoing_rx: &mut mpsc::Receiver<OutgoingEnvelope>,
     ) -> ThreadAttachmentChangedNotification {
@@ -846,6 +994,11 @@ struct ThreadStateManagerInner {
     live_connections: HashMap<ConnectionId, ConnectionCapabilities>,
     threads: HashMap<ThreadId, ThreadEntry>,
     thread_ids_by_connection: HashMap<ConnectionId, HashSet<ThreadId>>,
+    // Retention authority is intentionally distinct from observation. The
+    // forward and inverse maps are updated in one mutex domain so a grant can
+    // neither survive its principal nor be released by another principal.
+    retention_grants_by_thread: HashMap<ThreadId, HashMap<RetentionPrincipalId, String>>,
+    retention_threads_by_principal: HashMap<RetentionPrincipalId, HashSet<ThreadId>>,
     clear_transition_reservations: HashSet<ThreadId>,
     // B is disclosed to the requester before the durable A -> B attachment
     // move completes. Keep it unavailable to ordinary subscribe/resume until
@@ -863,6 +1016,52 @@ pub(crate) enum ConnectionSubscriptionError {
 }
 
 impl ThreadStateManagerInner {
+    fn retention_principal_is_live(&self, principal: RetentionPrincipalId) -> bool {
+        self.live_connections
+            .values()
+            .any(|capabilities| capabilities.retention_principal == Some(principal))
+    }
+
+    fn revoke_retention_grant(
+        &mut self,
+        thread_id: ThreadId,
+        principal: RetentionPrincipalId,
+    ) -> bool {
+        let removed = self
+            .retention_grants_by_thread
+            .get_mut(&thread_id)
+            .and_then(|grants| grants.remove(&principal));
+        if self
+            .retention_grants_by_thread
+            .get(&thread_id)
+            .is_some_and(HashMap::is_empty)
+        {
+            self.retention_grants_by_thread.remove(&thread_id);
+        }
+        if let Some(thread_ids) = self.retention_threads_by_principal.get_mut(&principal) {
+            thread_ids.remove(&thread_id);
+            if thread_ids.is_empty() {
+                self.retention_threads_by_principal.remove(&principal);
+            }
+        }
+        removed.is_some()
+    }
+
+    fn revoke_all_retention_for_principal(&mut self, principal: RetentionPrincipalId) {
+        let thread_ids = self
+            .retention_threads_by_principal
+            .remove(&principal)
+            .unwrap_or_default();
+        for thread_id in thread_ids {
+            if let Some(grants) = self.retention_grants_by_thread.get_mut(&thread_id) {
+                grants.remove(&principal);
+                if grants.is_empty() {
+                    self.retention_grants_by_thread.remove(&thread_id);
+                }
+            }
+        }
+    }
+
     fn add_interactive_attachment(&mut self, thread_id: ThreadId) -> ThreadAttachmentEntry {
         let interactive_attachment_count = self.attachment_counts.entry(thread_id).or_default();
         *interactive_attachment_count = interactive_attachment_count.saturating_add(1);
@@ -930,6 +1129,7 @@ pub(crate) enum ClearTransitionAuthorityError {
 pub(crate) struct ConnectionCapabilities {
     pub(crate) request_attestation: bool,
     pub(crate) trusted_interactive: bool,
+    pub(crate) retention_principal: Option<RetentionPrincipalId>,
 }
 
 #[derive(Clone)]
@@ -988,6 +1188,76 @@ impl ThreadStateManager {
             revision: state.attachment_revision,
             entries,
         }
+    }
+
+    /// Exercises explicit retention authority for one exact loaded thread.
+    ///
+    /// The principal is accepted only when a live connection supplied the
+    /// server-minted identity during initialization. This keeps request
+    /// contents, subscription, and client-declared roles out of the authority
+    /// decision.
+    pub(crate) async fn acquire_retention(
+        &self,
+        thread_id: ThreadId,
+        principal: RetentionPrincipalId,
+    ) -> Result<RetentionAcquireOutcome, RetentionAuthorityError> {
+        let mut state = self.state.lock().await;
+        if !state.retention_principal_is_live(principal) {
+            return Err(RetentionAuthorityError::IneligiblePrincipal);
+        }
+        if !state.threads.contains_key(&thread_id) {
+            return Err(RetentionAuthorityError::UnknownThread);
+        }
+
+        let grants = state
+            .retention_grants_by_thread
+            .entry(thread_id)
+            .or_default();
+        if let Some(grant_id) = grants.get(&principal) {
+            return Ok(RetentionAcquireOutcome::AlreadyHeld {
+                grant_id: grant_id.clone(),
+            });
+        }
+
+        let grant_id = Uuid::now_v7().to_string();
+        grants.insert(principal, grant_id.clone());
+        state
+            .retention_threads_by_principal
+            .entry(principal)
+            .or_default()
+            .insert(thread_id);
+        Ok(RetentionAcquireOutcome::Acquired { grant_id })
+    }
+
+    /// Releases only the caller's exact active grant. A random or stale handle
+    /// cannot release a currently active grant, while spent and never-issued
+    /// handles are intentionally indistinguishable when no grant remains.
+    pub(crate) async fn release_retention(
+        &self,
+        thread_id: ThreadId,
+        principal: RetentionPrincipalId,
+        grant_id: &str,
+    ) -> Result<RetentionReleaseOutcome, RetentionAuthorityError> {
+        let mut state = self.state.lock().await;
+        if !state.retention_principal_is_live(principal) {
+            return Err(RetentionAuthorityError::IneligiblePrincipal);
+        }
+        if !state.threads.contains_key(&thread_id) {
+            return Err(RetentionAuthorityError::UnknownThread);
+        }
+        let Some(active_grant_id) = state
+            .retention_grants_by_thread
+            .get(&thread_id)
+            .and_then(|grants| grants.get(&principal))
+            .cloned()
+        else {
+            return Ok(RetentionReleaseOutcome::NotHeld);
+        };
+        if active_grant_id != grant_id {
+            return Ok(RetentionReleaseOutcome::GrantMismatch);
+        }
+        state.revoke_retention_grant(thread_id, principal);
+        Ok(RetentionReleaseOutcome::Released)
     }
 
     async fn publish_attachment_change(&self, change: Option<ThreadAttachmentChangedNotification>) {
@@ -1294,6 +1564,13 @@ impl ThreadStateManager {
                 thread_entry.connection_ids.remove(&connection_id);
                 thread_entry.update_has_connections();
             }
+            if let Some(principal) = state
+                .live_connections
+                .get(&connection_id)
+                .and_then(|capabilities| capabilities.retention_principal)
+            {
+                state.revoke_retention_grant(thread_id, principal);
+            }
             let changes = trusted_interactive
                 .then(|| state.remove_interactive_attachment(thread_id))
                 .flatten()
@@ -1497,10 +1774,15 @@ impl ThreadStateManager {
     pub(crate) async fn remove_connection(&self, connection_id: ConnectionId) -> Vec<ThreadId> {
         let (thread_ids, attachment_change) = {
             let mut state = self.state.lock().await;
-            let trusted_interactive = state
-                .live_connections
-                .remove(&connection_id)
+            let removed_capabilities = state.live_connections.remove(&connection_id);
+            let trusted_interactive = removed_capabilities
+                .as_ref()
                 .is_some_and(|capabilities| capabilities.trusted_interactive);
+            if let Some(principal) =
+                removed_capabilities.and_then(|capabilities| capabilities.retention_principal)
+            {
+                state.revoke_all_retention_for_principal(principal);
+            }
             let thread_ids = state
                 .thread_ids_by_connection
                 .remove(&connection_id)

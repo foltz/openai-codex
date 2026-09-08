@@ -1387,6 +1387,7 @@ mod thread_processor_behavior_tests {
                 ConnectionCapabilities {
                     request_attestation: true,
                     trusted_interactive: false,
+                    retention_principal: None,
                 },
             )
             .await;
@@ -1396,6 +1397,7 @@ mod thread_processor_behavior_tests {
                 ConnectionCapabilities {
                     request_attestation: true,
                     trusted_interactive: false,
+                    retention_principal: None,
                 },
             )
             .await;
@@ -1405,6 +1407,7 @@ mod thread_processor_behavior_tests {
                 ConnectionCapabilities {
                     request_attestation: true,
                     trusted_interactive: false,
+                    retention_principal: None,
                 },
             )
             .await;

@@ -105,6 +105,8 @@ use codex_app_server_protocol::ThreadRealtimeListVoicesParams;
 use codex_app_server_protocol::ThreadRealtimeStartParams;
 use codex_app_server_protocol::ThreadRealtimeStopParams;
 use codex_app_server_protocol::ThreadResumeParams;
+use codex_app_server_protocol::ThreadRetentionAcquireParams;
+use codex_app_server_protocol::ThreadRetentionReleaseParams;
 use codex_app_server_protocol::ThreadSearchOccurrencesParams;
 use codex_app_server_protocol::ThreadSearchParams;
 use codex_app_server_protocol::ThreadSectionMoveParams;
@@ -704,6 +706,24 @@ impl TestAppServer {
         let params = Some(serde_json::to_value(params)?);
         self.send_request("kcf/thread/interactiveSubscription/list", params)
             .await
+    }
+
+    /// Send an experimental `thread/retention/acquire` JSON-RPC request.
+    pub async fn send_thread_retention_acquire_request(
+        &mut self,
+        params: ThreadRetentionAcquireParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("thread/retention/acquire", params).await
+    }
+
+    /// Send an experimental `thread/retention/release` JSON-RPC request.
+    pub async fn send_thread_retention_release_request(
+        &mut self,
+        params: ThreadRetentionReleaseParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("thread/retention/release", params).await
     }
 
     /// Send a `thread/read` JSON-RPC request.

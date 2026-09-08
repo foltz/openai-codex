@@ -54,6 +54,10 @@ use crate::request_serialization::RequestSerializationQueueKey;
 use crate::request_serialization::RequestSerializationQueues;
 use crate::skills_watcher::SkillsWatcher;
 use crate::thread_state::ConnectionCapabilities;
+use crate::thread_state::RetentionAcquireOutcome;
+use crate::thread_state::RetentionAuthorityError;
+use crate::thread_state::RetentionPrincipalId;
+use crate::thread_state::RetentionReleaseOutcome;
 use crate::thread_state::ThreadStateManager;
 use crate::transport::AppServerTransport;
 use crate::transport::RemoteControlHandle;
@@ -71,6 +75,11 @@ use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::UserVerificationCancelResponse;
+use codex_app_server_protocol::ThreadRetentionAcquireParams;
+use codex_app_server_protocol::ThreadRetentionAcquireResponse;
+use codex_app_server_protocol::ThreadRetentionRefusalReason;
+use codex_app_server_protocol::ThreadRetentionReleaseParams;
+use codex_app_server_protocol::ThreadRetentionReleaseResponse;
 use codex_app_server_protocol::experimental_required_message;
 use codex_arg0::Arg0DispatchPaths;
 use codex_code_mode::CodeModeSessionProvider;
@@ -137,6 +146,15 @@ fn reject_removed_permission_profile(request: &JSONRPCRequest) -> Result<(), JSO
     Ok(())
 }
 
+fn retention_refusal_reason(error: RetentionAuthorityError) -> ThreadRetentionRefusalReason {
+    match error {
+        RetentionAuthorityError::IneligiblePrincipal => {
+            ThreadRetentionRefusalReason::IneligiblePrincipal
+        }
+        RetentionAuthorityError::UnknownThread => ThreadRetentionRefusalReason::UnknownThread,
+    }
+}
+
 pub(crate) struct MessageProcessor {
     pub(crate) turn_admission: TurnAdmission,
     user_verification: Arc<crate::user_verification::Service>,
@@ -165,6 +183,7 @@ pub(crate) struct MessageProcessor {
     thread_goal_processor: ThreadGoalRequestProcessor,
     thread_queue_processor: ThreadQueueRequestProcessor,
     thread_processor: ThreadRequestProcessor,
+    thread_state_manager: ThreadStateManager,
     turn_processor: TurnRequestProcessor,
     windows_sandbox_processor: WindowsSandboxRequestProcessor,
     request_serialization_queues: RequestSerializationQueues,
@@ -176,6 +195,7 @@ pub(crate) struct ConnectionSessionState {
     pub(crate) origin: crate::transport::ConnectionOrigin,
     pub(crate) mcp_event_streams: McpEventStreams,
     provenance: crate::transport::ConnectionProvenance,
+    retention_principal: RetentionPrincipalId,
     initialized: OnceLock<InitializedConnectionSessionState>,
 }
 
@@ -211,6 +231,7 @@ impl ConnectionSessionState {
             rpc_gate: Arc::new(ConnectionRpcGate::new()),
             mcp_event_streams: McpEventStreams::default(),
             provenance,
+            retention_principal: RetentionPrincipalId::new(),
             initialized: OnceLock::new(),
         }
     }
@@ -258,6 +279,14 @@ impl ConnectionSessionState {
 
     pub(crate) fn trusted_interactive(&self) -> bool {
         crate::transport::trusted_interactive(self.interactive_client_requested(), self.provenance)
+    }
+
+    /// A retention principal is minted by the server and released only for a
+    /// positively established local/executable provenance. Client-provided
+    /// initialization fields intentionally do not participate in this check.
+    pub(crate) fn retention_principal(&self) -> Option<RetentionPrincipalId> {
+        (self.initialized() && crate::transport::trusted_interactive_provenance(self.provenance))
+            .then_some(self.retention_principal)
     }
 
     pub(crate) fn client_mcp_extensions(&self) -> ClientMcpExtensions {
@@ -555,7 +584,7 @@ impl MessageProcessor {
             Arc::clone(&config),
             config_manager.clone(),
             pending_thread_unloads,
-            thread_state_manager,
+            thread_state_manager.clone(),
             thread_watch_manager,
             Arc::clone(&skills_watcher),
             turn_cost_worker.as_ref().map(TurnCostWorker::handle),
@@ -632,6 +661,7 @@ impl MessageProcessor {
             thread_goal_processor,
             thread_queue_processor,
             thread_processor,
+            thread_state_manager,
             turn_processor,
             windows_sandbox_processor,
             request_serialization_queues,
@@ -842,6 +872,7 @@ impl MessageProcessor {
         connection_id: ConnectionId,
         request_attestation: bool,
         trusted_interactive: bool,
+        retention_principal: Option<RetentionPrincipalId>,
     ) {
         self.account_processor
             .notify_workspace_routing_to_connection(connection_id);
@@ -851,9 +882,73 @@ impl MessageProcessor {
                 ConnectionCapabilities {
                     request_attestation,
                     trusted_interactive,
+                    retention_principal,
                 },
             )
             .await;
+    }
+
+    async fn thread_retention_acquire(
+        &self,
+        params: ThreadRetentionAcquireParams,
+        principal: Option<RetentionPrincipalId>,
+    ) -> Result<ThreadRetentionAcquireResponse, JSONRPCErrorError> {
+        let Some(principal) = principal else {
+            return Ok(ThreadRetentionAcquireResponse::Refused {
+                reason: ThreadRetentionRefusalReason::IneligiblePrincipal,
+            });
+        };
+        let Ok(thread_id) = ThreadId::from_string(&params.thread_id) else {
+            return Ok(ThreadRetentionAcquireResponse::Refused {
+                reason: ThreadRetentionRefusalReason::InvalidThreadId,
+            });
+        };
+        match self
+            .thread_state_manager
+            .acquire_retention(thread_id, principal)
+            .await
+        {
+            Ok(RetentionAcquireOutcome::Acquired { grant_id }) => {
+                Ok(ThreadRetentionAcquireResponse::Acquired { grant_id })
+            }
+            Ok(RetentionAcquireOutcome::AlreadyHeld { grant_id }) => {
+                Ok(ThreadRetentionAcquireResponse::AlreadyHeld { grant_id })
+            }
+            Err(error) => Ok(ThreadRetentionAcquireResponse::Refused {
+                reason: retention_refusal_reason(error),
+            }),
+        }
+    }
+
+    async fn thread_retention_release(
+        &self,
+        params: ThreadRetentionReleaseParams,
+        principal: Option<RetentionPrincipalId>,
+    ) -> Result<ThreadRetentionReleaseResponse, JSONRPCErrorError> {
+        let Some(principal) = principal else {
+            return Ok(ThreadRetentionReleaseResponse::Refused {
+                reason: ThreadRetentionRefusalReason::IneligiblePrincipal,
+            });
+        };
+        let Ok(thread_id) = ThreadId::from_string(&params.thread_id) else {
+            return Ok(ThreadRetentionReleaseResponse::Refused {
+                reason: ThreadRetentionRefusalReason::InvalidThreadId,
+            });
+        };
+        match self
+            .thread_state_manager
+            .release_retention(thread_id, principal, &params.grant_id)
+            .await
+        {
+            Ok(RetentionReleaseOutcome::Released) => Ok(ThreadRetentionReleaseResponse::Released),
+            Ok(RetentionReleaseOutcome::NotHeld) => Ok(ThreadRetentionReleaseResponse::NotHeld),
+            Ok(RetentionReleaseOutcome::GrantMismatch) => {
+                Ok(ThreadRetentionReleaseResponse::GrantMismatch)
+            }
+            Err(error) => Ok(ThreadRetentionReleaseResponse::Refused {
+                reason: retention_refusal_reason(error),
+            }),
+        }
     }
 
     pub(crate) async fn send_initialize_notifications(&self) {
@@ -979,6 +1074,7 @@ impl MessageProcessor {
                         connection_id,
                         session.request_attestation(),
                         session.trusted_interactive(),
+                        session.retention_principal(),
                     )
                     .await;
             }
@@ -1103,6 +1199,7 @@ impl MessageProcessor {
     ) -> Result<(), JSONRPCErrorError> {
         let connection_id = connection_request_id.connection_id;
         let app_server_client_name = session.app_server_client_name().map(str::to_string);
+        let retention_principal = session.retention_principal();
         let client_version = session.client_version().map(str::to_string);
         let client_mcp_extensions = session.client_mcp_extensions();
         let request_id = ConnectionRequestId {
@@ -1339,6 +1436,14 @@ impl MessageProcessor {
                     .thread_interactive_subscription_list(params)
                     .await
             }
+            ClientRequest::ThreadRetentionAcquire { params, .. } => self
+                .thread_retention_acquire(params, retention_principal)
+                .await
+                .map(|response| Some(response.into())),
+            ClientRequest::ThreadRetentionRelease { params, .. } => self
+                .thread_retention_release(params, retention_principal)
+                .await
+                .map(|response| Some(response.into())),
             ClientRequest::ThreadResume { params, .. } => {
                 self.thread_processor
                     .thread_resume(

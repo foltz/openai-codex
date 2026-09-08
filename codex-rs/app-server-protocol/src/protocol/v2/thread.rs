@@ -100,6 +100,61 @@ pub struct ThreadInteractiveSubscriptionChangedNotification {
     pub changes: Vec<ThreadInteractiveSubscriptionEntry>,
 }
 
+/// Requests an explicit, process-local retention grant for one exact thread.
+/// The server derives the eligible principal; callers cannot provide one.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub struct ThreadRetentionAcquireParams {
+    pub thread_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", tag = "status")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub enum ThreadRetentionAcquireResponse {
+    Acquired {
+        grant_id: String,
+    },
+    AlreadyHeld {
+        grant_id: String,
+    },
+    Refused {
+        reason: ThreadRetentionRefusalReason,
+    },
+}
+
+/// Releases one opaque, process-local retention grant for one exact thread.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub struct ThreadRetentionReleaseParams {
+    pub thread_id: String,
+    pub grant_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", tag = "status")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub enum ThreadRetentionReleaseResponse {
+    Released,
+    NotHeld,
+    GrantMismatch,
+    Refused {
+        reason: ThreadRetentionRefusalReason,
+    },
+}
+
+/// A typed, no-mutation refusal for the exact-thread retention carrier.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub enum ThreadRetentionRefusalReason {
+    IneligiblePrincipal,
+    UnknownThread,
+    InvalidThreadId,
+}
+
 // === Threads, Turns, and Items ===
 // Thread APIs
 #[derive(

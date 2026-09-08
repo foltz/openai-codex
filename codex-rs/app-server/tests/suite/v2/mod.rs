@@ -139,6 +139,7 @@ mod thread_queue;
 mod thread_read;
 mod thread_resume;
 mod thread_revert;
+mod thread_retention;
 mod thread_sections;
 mod thread_settings_update;
 mod thread_shell_command;

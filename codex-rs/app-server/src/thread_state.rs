@@ -864,6 +864,23 @@ mod tests {
                 grant_id: grant_id.clone()
             })
         );
+        let other_principal = RetentionPrincipalId::new();
+        manager
+            .connection_initialized(
+                ConnectionId(2),
+                ConnectionCapabilities {
+                    retention_principal: Some(other_principal),
+                    ..ConnectionCapabilities::default()
+                },
+            )
+            .await;
+        assert_eq!(
+            manager
+                .release_retention(thread_id, other_principal, &grant_id)
+                .await,
+            Ok(RetentionReleaseOutcome::NotHeld),
+            "a second live principal cannot release the first principal's grant"
+        );
         assert_eq!(
             manager
                 .release_retention(

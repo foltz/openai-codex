@@ -637,6 +637,22 @@ fn thread_start_jsonrpc_span_exports_server_span_and_parents_children() -> Resul
 
 #[tokio::test(flavor = "current_thread")]
 #[serial(app_server_tracing)]
+async fn initialized_unproven_connection_has_no_retention_principal() -> Result<()> {
+    let harness = TracingHarness::new().await?;
+
+    assert!(harness.session.initialized());
+    assert_eq!(
+        harness.session.retention_principal(),
+        None,
+        "client initialization and experimental opt-in cannot establish retention eligibility"
+    );
+
+    harness.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial(app_server_tracing)]
 async fn turn_start_jsonrpc_span_parents_core_turn_spans() -> Result<()> {
     let mut harness = TracingHarness::new().await?;
     let thread_start_response = harness.start_thread(/*request_id*/ 2, /*trace*/ None).await;

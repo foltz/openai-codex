@@ -712,9 +712,10 @@ fn refusal_for_transition_id(
 /// caller's own envelope -- a client needing to correlate multiple
 /// concurrent start attempts by id genuinely needs it echoed back. Every
 /// other field is a fixed, non-live, schema-preserving placeholder rather
-/// than the coordinator's real state: `process_instance_id` is blanked even
-/// though it is caller-supplied too, since echoing it back serves no
-/// correlation purpose the caller cannot already do with the value it sent;
+/// than the coordinator's real state: `process_instance_id` is always
+/// blanked -- unlike `transition_id`, it was never derived from the
+/// caller's own request even before this fix, only from `CoordinatorState`,
+/// which is exactly the disclosure this fix stops;
 /// `auth_revision`/`transition_revision`/`auth_fingerprint` are
 /// coordinator-derived and must never appear here at all, so an unauthorized
 /// caller cannot poll this refusal as a transition/auth oracle

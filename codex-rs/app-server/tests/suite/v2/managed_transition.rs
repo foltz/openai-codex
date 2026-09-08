@@ -86,7 +86,7 @@ async fn stdio_wire_gates_stay_not_admitted_across_every_persisted_auth_source_b
     );
     assert_eq!(
         refusal.process_instance_id, "",
-        "the generic unauthorized refusal must never echo the caller-supplied process id"
+        "the generic unauthorized refusal must never carry the coordinator's real process id"
     );
     assert_eq!(
         refusal.transition_id, "restart-transition",
@@ -114,7 +114,7 @@ async fn stdio_wire_gates_stay_not_admitted_across_every_persisted_auth_source_b
     );
     assert_eq!(
         refusal.process_instance_id, "",
-        "the generic unauthorized refusal must never echo the caller-supplied process id"
+        "the generic unauthorized refusal must never carry the coordinator's real process id"
     );
 
     // Same boundary, read and cancel gates: the review's required correction
@@ -188,7 +188,7 @@ async fn stdio_wire_gates_stay_not_admitted_across_every_persisted_auth_source_b
     );
     assert_eq!(
         refusal.process_instance_id, "",
-        "the generic unauthorized refusal must never echo the caller-supplied process id"
+        "the generic unauthorized refusal must never carry the coordinator's real process id"
     );
 
     // No manufactured old outcome or reservation: reading with a prior

@@ -55,10 +55,38 @@ impl RetentionPrincipalId {
     }
 }
 
+/// A server-minted, process-local capability for one exact retention grant.
+///
+/// It is intentionally distinct from both the retaining principal and the
+/// target `ThreadId`; the wire representation is produced only at the request
+/// boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RetentionGrantId(String);
+
+impl RetentionGrantId {
+    fn new() -> Self {
+        Self(Uuid::now_v7().to_string())
+    }
+
+    pub(crate) fn from_wire(value: String) -> Self {
+        Self(value)
+    }
+
+    pub(crate) fn into_wire(self) -> String {
+        self.0
+    }
+}
+
+impl AsRef<str> for RetentionGrantId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RetentionAcquireOutcome {
-    Acquired { grant_id: String },
-    AlreadyHeld { grant_id: String },
+    Acquired { grant_id: RetentionGrantId },
+    AlreadyHeld { grant_id: RetentionGrantId },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -939,7 +967,11 @@ mod tests {
         );
         assert_eq!(
             manager
-                .release_retention(thread_id, principal, "different-active-grant")
+                .release_retention(
+                    thread_id,
+                    principal,
+                    &RetentionGrantId::from_wire("different-active-grant".to_string()),
+                )
                 .await,
             Ok(RetentionReleaseOutcome::GrantMismatch)
         );
@@ -957,7 +989,11 @@ mod tests {
         );
         assert_eq!(
             manager
-                .release_retention(thread_id, principal, "never-issued")
+                .release_retention(
+                    thread_id,
+                    principal,
+                    &RetentionGrantId::from_wire("never-issued".to_string()),
+                )
                 .await,
             Ok(RetentionReleaseOutcome::NotHeld)
         );
@@ -1100,7 +1136,7 @@ struct ThreadStateManagerInner {
     // Retention authority is intentionally distinct from observation. The
     // forward and inverse maps are updated in one mutex domain so a grant can
     // neither survive its principal nor be released by another principal.
-    retention_grants_by_thread: HashMap<ThreadId, HashMap<RetentionPrincipalId, String>>,
+    retention_grants_by_thread: HashMap<ThreadId, HashMap<RetentionPrincipalId, RetentionGrantId>>,
     retention_threads_by_principal: HashMap<RetentionPrincipalId, HashSet<ThreadId>>,
     clear_transition_reservations: HashSet<ThreadId>,
     // B is disclosed to the requester before the durable A -> B subscription
@@ -1327,7 +1363,7 @@ impl ThreadStateManager {
             });
         }
 
-        let grant_id = Uuid::now_v7().to_string();
+        let grant_id = RetentionGrantId::new();
         grants.insert(principal, grant_id.clone());
         state
             .retention_threads_by_principal
@@ -1344,7 +1380,7 @@ impl ThreadStateManager {
         &self,
         thread_id: ThreadId,
         principal: RetentionPrincipalId,
-        grant_id: &str,
+        grant_id: &RetentionGrantId,
     ) -> Result<RetentionReleaseOutcome, RetentionAuthorityError> {
         let mut state = self.state.lock().await;
         if !state.retention_principal_is_live(principal) {
@@ -1361,7 +1397,7 @@ impl ThreadStateManager {
         else {
             return Ok(RetentionReleaseOutcome::NotHeld);
         };
-        if active_grant_id != grant_id {
+        if active_grant_id != *grant_id {
             return Ok(RetentionReleaseOutcome::GrantMismatch);
         }
         state.revoke_retention_grant(thread_id, principal);

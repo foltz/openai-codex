@@ -56,6 +56,7 @@ use crate::skills_watcher::SkillsWatcher;
 use crate::thread_state::ConnectionCapabilities;
 use crate::thread_state::RetentionAcquireOutcome;
 use crate::thread_state::RetentionAuthorityError;
+use crate::thread_state::RetentionGrantId;
 use crate::thread_state::RetentionPrincipalId;
 use crate::thread_state::RetentionReleaseOutcome;
 use crate::thread_state::ThreadStateManager;
@@ -909,10 +910,14 @@ impl MessageProcessor {
             .await
         {
             Ok(RetentionAcquireOutcome::Acquired { grant_id }) => {
-                Ok(ThreadRetentionAcquireResponse::Acquired { grant_id })
+                Ok(ThreadRetentionAcquireResponse::Acquired {
+                    grant_id: grant_id.into_wire(),
+                })
             }
             Ok(RetentionAcquireOutcome::AlreadyHeld { grant_id }) => {
-                Ok(ThreadRetentionAcquireResponse::AlreadyHeld { grant_id })
+                Ok(ThreadRetentionAcquireResponse::AlreadyHeld {
+                    grant_id: grant_id.into_wire(),
+                })
             }
             Err(error) => Ok(ThreadRetentionAcquireResponse::Refused {
                 reason: retention_refusal_reason(error),
@@ -937,7 +942,11 @@ impl MessageProcessor {
         };
         match self
             .thread_state_manager
-            .release_retention(thread_id, principal, &params.grant_id)
+            .release_retention(
+                thread_id,
+                principal,
+                &RetentionGrantId::from_wire(params.grant_id),
+            )
             .await
         {
             Ok(RetentionReleaseOutcome::Released) => Ok(ThreadRetentionReleaseResponse::Released),

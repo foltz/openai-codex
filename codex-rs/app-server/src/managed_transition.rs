@@ -492,6 +492,28 @@ impl ManagedTransitionCoordinator {
                 true,
             ));
         }
+        // A completed `Quarantined` record still effectively owns the
+        // single process-wide transition/barrier slot: it is structurally
+        // "completed" (`ManagedTransitionPhase::is_terminal`), but R016
+        // requires it to stay closed to new work until explicitly resolved
+        // by cancelling that exact transition, not superseded by admitting
+        // an unrelated one. Without this check, a second transition could
+        // become active/Draining while the first is still quarantined, and
+        // an explicit cancel of the first would then reopen the barrier
+        // out from under the second's own in-progress drain (verification
+        // round 02, confirmed against source before this fix).
+        if state
+            .completed
+            .values()
+            .any(|record| record.phase == ManagedTransitionPhase::Quarantined)
+        {
+            return Err(refusal(
+                &state,
+                &envelope,
+                ManagedTransitionRefusalKind::ConcurrentTransition,
+                true,
+            ));
+        }
         if envelope.expected_auth_revision != state.auth_revision {
             return Err(refusal(
                 &state,
@@ -771,9 +793,24 @@ impl ManagedTransitionCoordinator {
             state
                 .completed
                 .insert(cancelled.envelope.transition_id.clone(), cancelled);
+            // Defensive, not load-bearing under normal operation: `admit()`'s
+            // own quarantine-conflict refusal (added alongside this fix)
+            // already prevents any other transition from becoming active or
+            // Quarantined while this one remains unresolved, so this should
+            // always evaluate true here. Re-checked anyway rather than
+            // assumed, so an unconditional reopen can never yank the
+            // barrier out from under a transition it does not own
+            // (verification round 02).
+            let no_other_owner = state.active.is_none()
+                && !state
+                    .completed
+                    .values()
+                    .any(|other| other.phase == ManagedTransitionPhase::Quarantined);
             drop(state);
-            self.account_work_permits.reopen();
-            self.account_work_permits.wake_waiters();
+            if no_other_owner {
+                self.account_work_permits.reopen();
+                self.account_work_permits.wake_waiters();
+            }
             return Ok(status);
         }
 
@@ -1778,6 +1815,84 @@ mod tests {
             .await;
         let StartManagedTransitionResponse::Accepted { status } = fresh else {
             panic!("a fresh Start after explicit recovery must be admitted normally");
+        };
+        assert_eq!(status.phase, ManagedTransitionPhase::Draining);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_second_transition_is_refused_while_the_first_remains_quarantined_then_admits_after_explicit_cancel()
+     {
+        // Verification round 02: a completed Quarantined record still
+        // effectively owns the single transition/barrier slot. Before this
+        // fix, admit() only ever checked `completed` for the *same*
+        // transition id, so an unrelated transition B could become active
+        // and Draining while A was still Quarantined -- and an explicit
+        // cancel of A would then unconditionally reopen the barrier out
+        // from under B's own in-progress drain, admitting account work
+        // during B. This proves the discriminating sequence: A quarantines
+        // -> B is refused while A remains Quarantined -> cancelling A
+        // reopens -> a fresh B then admits normally.
+        let coordinator = ManagedTransitionCoordinator::new();
+        let process_id = coordinator.process_instance_id().await;
+
+        // Transition A quarantines via a real drain timeout.
+        let held_guard = coordinator
+            .try_acquire_account_work_permit()
+            .expect("the barrier starts open");
+        let coordinator_for_task = coordinator.clone();
+        let handle = tokio::spawn(async move {
+            coordinator_for_task
+                .start_dispatch(request(process_id.clone(), "transition-a"), true)
+                .await
+        });
+        tokio::time::advance(DRAIN_DEADLINE + Duration::from_millis(1)).await;
+        let response = handle.await.expect("start_dispatch task");
+        let StartManagedTransitionResponse::Accepted { status: a_status } = response else {
+            panic!("a timed-out drain is a status transition, not a refusal");
+        };
+        assert_eq!(a_status.phase, ManagedTransitionPhase::Quarantined);
+        drop(held_guard);
+
+        // A fresh, otherwise-valid transition B must be refused while A
+        // remains quarantined, even though nothing is `active` and B's own
+        // CAS/target-evidence would otherwise pass.
+        let process_id = coordinator.process_instance_id().await;
+        let b_refused = coordinator
+            .start_dispatch(
+                request_at_revision(
+                    process_id.clone(),
+                    "transition-b",
+                    a_status.transition_revision,
+                ),
+                true,
+            )
+            .await;
+        let StartManagedTransitionResponse::Refused { refusal } = b_refused else {
+            panic!("B must be refused while A is still Quarantined");
+        };
+        assert_eq!(refusal.kind, ManagedTransitionRefusalKind::ConcurrentTransition);
+        assert!(
+            coordinator.try_acquire_account_work_permit().is_none(),
+            "the barrier must still be closed after B's refused attempt"
+        );
+
+        // Cancelling A resolves it and reopens the barrier.
+        let cancelled = coordinator
+            .cancel(cancel_request(process_id.clone(), "transition-a"))
+            .await
+            .expect("cancelling the exact quarantined transition must succeed");
+        assert_eq!(cancelled.phase, ManagedTransitionPhase::Cancelled);
+
+        // A fresh B now admits normally, once A's quarantine is genuinely
+        // resolved rather than superseded.
+        let b_admitted = coordinator
+            .start_dispatch(
+                request_at_revision(process_id, "transition-b", cancelled.transition_revision),
+                true,
+            )
+            .await;
+        let StartManagedTransitionResponse::Accepted { status } = b_admitted else {
+            panic!("B must admit normally once A's quarantine is explicitly resolved");
         };
         assert_eq!(status.phase, ManagedTransitionPhase::Draining);
     }

@@ -13,6 +13,10 @@ use codex_app_server_protocol::StartManagedTransitionResponse;
 use codex_config::types::AuthCredentialsStoreMode;
 use tempfile::TempDir;
 
+#[cfg(unix)]
+#[path = "managed_transition_process.rs"]
+mod process_proofs;
+
 fn start_params(process_instance_id: String) -> StartManagedTransitionParams {
     StartManagedTransitionParams {
         contract_version: MANAGED_AUTH_TRANSITION_CONTRACT_VERSION,
@@ -22,6 +26,7 @@ fn start_params(process_instance_id: String) -> StartManagedTransitionParams {
         expected_auth_revision: 0,
         expected_transition_revision: 0,
         expected_auth_fingerprint: None,
+        intended_result_auth_fingerprint: Some("intended-account".to_owned()),
     }
 }
 
@@ -209,7 +214,9 @@ async fn stdio_wire_gates_stay_not_admitted_across_every_persisted_auth_source_b
     let codex_app_server_protocol::ReadManagedTransitionResponse::Refused { refusal } =
         read_as_prior_process
     else {
-        panic!("a stale caller-supplied process id must never resolve a live transition after restart");
+        panic!(
+            "a stale caller-supplied process id must never resolve a live transition after restart"
+        );
     };
     assert_eq!(
         refusal.kind,

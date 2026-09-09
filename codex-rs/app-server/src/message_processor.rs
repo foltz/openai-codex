@@ -336,6 +336,7 @@ struct ProductionResetInventory {
     models_manager: SharedModelsManager,
     http_client_factory: HttpClientFactory,
     auth_manager: Arc<AuthManager>,
+    remote_control_handle: Option<RemoteControlHandle>,
 }
 
 /// Bounded, not indefinite: Slice 03's admission barrier already drains
@@ -347,6 +348,11 @@ const RESET_THREAD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 impl crate::managed_transition::ResetInventory for ProductionResetInventory {
     fn reset_all(&self) -> crate::managed_transition::ResetInventoryFuture<'_> {
         Box::pin(async move {
+            if let Some(handle) = &self.remote_control_handle {
+                handle.reset_auth_cycle().await.map_err(|_| {
+                    "remote control auth-cycle retirement was not acknowledged".to_owned()
+                })?;
+            }
             // Result-bearing: a thread that didn't fully shut down can
             // still hold the prior account's provider/session/MCP state,
             // so this must fail the whole reset (and quarantine) rather
@@ -384,7 +390,9 @@ impl crate::managed_transition::ResetInventory for ProductionResetInventory {
                 .clear_recommended_plugins_cache();
             self.thread_manager
                 .plugins_manager()
-                .clear_remote_installed_plugins_cache();
+                .reset_remote_installed_plugins()
+                .await
+                .map_err(|_| "plugin bundle retirement was not acknowledged".to_owned())?;
 
             // Swap in a freshly spawned worker rather than calling terminal
             // `shutdown()` with no successor: the process must keep
@@ -415,12 +423,17 @@ impl crate::managed_transition::ResetInventory for ProductionResetInventory {
             // model catalog for one refresh round-trip. Blocking here
             // closes that window before `Succeeded`/reopen instead of
             // reporting success over a catalog that has not caught up yet.
-            self.models_manager
-                .list_models(
-                    codex_models_manager::manager::RefreshStrategy::Online,
-                    self.http_client_factory.clone(),
-                )
-                .await;
+            tokio::time::timeout(
+                RESET_THREAD_SHUTDOWN_TIMEOUT,
+                self.models_manager
+                    .reset_for_managed_auth(self.http_client_factory.clone()),
+            )
+            .await
+            .map_err(|_| "model catalog reset timed out".to_owned())?
+            .map_err(|error| {
+                tracing::warn!(outcome = ?error, "managed model catalog reset refused");
+                "model catalog reset was not acknowledged".to_owned()
+            })?;
 
             Ok(())
         })
@@ -626,6 +639,7 @@ impl MessageProcessor {
                 models_manager: models_manager.clone(),
                 http_client_factory: config.http_client_factory(),
                 auth_manager: Arc::clone(&auth_manager),
+                remote_control_handle: remote_control_handle.clone(),
             });
         let managed_transition_coordinator = crate::managed_transition::ManagedTransitionCoordinator::from_authoritative_auth_state_target_evidence_and_adoption(
                 crate::managed_transition::AuthoritativeAuthState::from_auth_manager(&auth_manager),

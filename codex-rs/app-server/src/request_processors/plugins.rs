@@ -2415,6 +2415,7 @@ fn remote_plugin_detail_to_info(
 fn remote_plugin_catalog_error_type(err: &RemotePluginCatalogError) -> &'static str {
     match err {
         RemotePluginCatalogError::AuthRequired => "remote_catalog_auth_required",
+        RemotePluginCatalogError::AuthChanged => "remote_catalog_auth_changed",
         RemotePluginCatalogError::UnsupportedAuthMode => "remote_catalog_unsupported_auth_mode",
         RemotePluginCatalogError::AuthToken(_) => "remote_catalog_auth_token",
         RemotePluginCatalogError::Request { .. } => "remote_catalog_request",
@@ -2487,9 +2488,9 @@ fn remote_plugin_catalog_error_to_jsonrpc(
 ) -> JSONRPCErrorError {
     let message = format!("{context}: {err}");
     match &err {
-        RemotePluginCatalogError::AuthRequired | RemotePluginCatalogError::UnsupportedAuthMode => {
-            invalid_request(message)
-        }
+        RemotePluginCatalogError::AuthRequired
+        | RemotePluginCatalogError::UnsupportedAuthMode
+        | RemotePluginCatalogError::AuthChanged => invalid_request(message),
         RemotePluginCatalogError::UnexpectedStatus { status, .. } if status.as_u16() == 404 => {
             invalid_request(message)
         }

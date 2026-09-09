@@ -161,6 +161,11 @@ pub struct StartManagedTransitionParams {
     #[serde(deserialize_with = "deserialize_required_nullable")]
     #[schemars(required, schema_with = "nullable_string_schema")]
     pub expected_auth_fingerprint: Option<String>,
+    /// Independently binds the intended result. Explicit null means managed
+    /// logout; account adoption requires a nonempty opaque fingerprint.
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    #[schemars(required, schema_with = "nullable_string_schema")]
+    pub intended_result_auth_fingerprint: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
@@ -229,6 +234,7 @@ mod tests {
             expected_auth_revision: 4,
             expected_transition_revision: 7,
             expected_auth_fingerprint: Some("opaque-fingerprint".to_owned()),
+            intended_result_auth_fingerprint: Some("intended-fingerprint".to_owned()),
         };
         let json = serde_json::to_string(&params).unwrap();
         assert_eq!(
@@ -255,6 +261,7 @@ mod tests {
             expected_auth_revision: 4,
             expected_transition_revision: 7,
             expected_auth_fingerprint: None,
+            intended_result_auth_fingerprint: None,
         };
         let mut unknown = serde_json::to_value(&start).unwrap();
         unknown["accessToken"] = serde_json::json!("secret");
@@ -272,6 +279,12 @@ mod tests {
         assert!(
             serde_json::from_value::<StartManagedTransitionParams>(missing_fingerprint).is_err()
         );
+        let mut missing_intended = serde_json::to_value(&start).unwrap();
+        missing_intended
+            .as_object_mut()
+            .unwrap()
+            .remove("intendedResultAuthFingerprint");
+        assert!(serde_json::from_value::<StartManagedTransitionParams>(missing_intended).is_err());
 
         for value in [
             serde_json::json!({

@@ -28,6 +28,7 @@ use codex_keyring_store::DefaultKeyringStore;
 use codex_keyring_store::KeyringStore;
 use codex_protocol::account::PlanType as AccountPlanType;
 use codex_protocol::auth::AuthMode;
+use codex_secrets::LocalSecretsBackend;
 use codex_secrets::LocalSecretsNamespace;
 use codex_secrets::SecretName;
 use codex_secrets::SecretScope;
@@ -162,8 +163,274 @@ pub(super) fn delete_file_if_exists(codex_home: &Path) -> std::io::Result<bool> 
 
 pub(super) trait AuthStorageBackend: Debug + Send + Sync {
     fn load(&self) -> std::io::Result<Option<AuthDotJson>>;
+    /// Reads the managed transition's persisted source without lossy fallback.
+    fn load_managed(&self) -> Result<ManagedAuthStorageRead, ManagedAuthStorageError> {
+        self.read_managed_bytes()?.into_parsed()
+    }
+    /// Revalidates only source bytes, never parses or adopts a replacement auth.
+    fn verify_managed_preimage(
+        &self,
+        expected: &ManagedAuthStoragePreimage,
+    ) -> Result<bool, ManagedAuthStorageError> {
+        Ok(self.read_managed_bytes()?.preimage == *expected)
+    }
+    fn read_managed_bytes(&self) -> Result<ManagedAuthStorageBytes, ManagedAuthStorageError>;
+    fn lock_managed_source(&self) -> Result<ManagedAuthSourceGuard<'_>, ManagedAuthStorageError> {
+        Err(ManagedAuthStorageError::ReadFailed(
+            ManagedAuthStorageFailure::UnsupportedStorage,
+        ))
+    }
     fn save(&self, auth: &AuthDotJson) -> std::io::Result<()>;
     fn delete(&self) -> std::io::Result<bool>;
+}
+
+/// Provenance of the single parsed snapshot used by managed adoption.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManagedAuthStorageSource {
+    File,
+    Keyring,
+    Secrets,
+    FileAfterKeyringAbsence,
+}
+
+/// Classified failures contain no credential, path, or backend error text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManagedAuthStorageFailure {
+    FileIo(std::io::ErrorKind),
+    Parse(ManagedAuthStorageSource),
+    Keyring,
+    Secrets,
+    UnsupportedStorage,
+    CoordinationUnavailable(std::io::ErrorKind),
+    CoordinationContended,
+}
+
+/// Holds repository-owned durable writers out until cache installation finishes.
+/// The coordination file is permanent: unlinking it would split the lock domain.
+pub(super) struct ManagedAuthSourceGuard<'a> {
+    _file: File,
+    backend: &'a dyn AuthStorageBackend,
+}
+
+impl Debug for ManagedAuthSourceGuard<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ManagedAuthSourceGuard([locked])")
+    }
+}
+
+impl ManagedAuthSourceGuard<'_> {
+    pub(super) fn verify_managed_preimage(
+        &self,
+        expected: &ManagedAuthStoragePreimage,
+    ) -> Result<bool, ManagedAuthStorageError> {
+        self.backend.verify_managed_preimage(expected)
+    }
+}
+
+#[derive(Debug)]
+struct LockedAuthStorage {
+    codex_home: PathBuf,
+    backend: Arc<dyn AuthStorageBackend>,
+}
+
+const MANAGED_AUTH_COORDINATION_FILE: &str = ".managed-auth-source.lock";
+
+fn coordination_error(error: std::io::Error) -> ManagedAuthStorageError {
+    ManagedAuthStorageError::ReadFailed(ManagedAuthStorageFailure::CoordinationUnavailable(
+        error.kind(),
+    ))
+}
+
+fn acquire_auth_source_lock(codex_home: &Path) -> Result<File, ManagedAuthStorageError> {
+    let canonical_home = codex_home.canonicalize().map_err(coordination_error)?;
+    let path = canonical_home.join(MANAGED_AUTH_COORDINATION_FILE);
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = match options.open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = std::fs::symlink_metadata(&path).map_err(coordination_error)?;
+            if !metadata.file_type().is_file() {
+                return Err(coordination_error(std::io::Error::from(
+                    std::io::ErrorKind::PermissionDenied,
+                )));
+            }
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .map_err(coordination_error)?
+        }
+        Err(error) => return Err(coordination_error(error)),
+    };
+    let path_metadata = std::fs::symlink_metadata(&path).map_err(coordination_error)?;
+    let file_metadata = file.metadata().map_err(coordination_error)?;
+    if !path_metadata.file_type().is_file() || !file_metadata.file_type().is_file() {
+        return Err(coordination_error(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let home_metadata = std::fs::metadata(&canonical_home).map_err(coordination_error)?;
+        if path_metadata.dev() != file_metadata.dev()
+            || path_metadata.ino() != file_metadata.ino()
+            || file_metadata.nlink() != 1
+            || file_metadata.uid() != home_metadata.uid()
+            || file_metadata.mode() & 0o077 != 0
+        {
+            return Err(coordination_error(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied,
+            )));
+        }
+    }
+    file.try_lock().map_err(|error| match error {
+        std::fs::TryLockError::WouldBlock => {
+            ManagedAuthStorageError::ReadFailed(ManagedAuthStorageFailure::CoordinationContended)
+        }
+        std::fs::TryLockError::Error(error) => coordination_error(error),
+    })?;
+    Ok(file)
+}
+
+impl AuthStorageBackend for LockedAuthStorage {
+    fn load(&self) -> std::io::Result<Option<AuthDotJson>> {
+        self.backend.load()
+    }
+
+    fn load_managed(&self) -> Result<ManagedAuthStorageRead, ManagedAuthStorageError> {
+        let guard = self.lock_managed_source()?;
+        guard.backend.load_managed()
+    }
+
+    fn lock_managed_source(&self) -> Result<ManagedAuthSourceGuard<'_>, ManagedAuthStorageError> {
+        Ok(ManagedAuthSourceGuard {
+            _file: acquire_auth_source_lock(&self.codex_home)?,
+            backend: self.backend.as_ref(),
+        })
+    }
+
+    fn verify_managed_preimage(
+        &self,
+        expected: &ManagedAuthStoragePreimage,
+    ) -> Result<bool, ManagedAuthStorageError> {
+        self.lock_managed_source()?
+            .verify_managed_preimage(expected)
+    }
+
+    fn read_managed_bytes(&self) -> Result<ManagedAuthStorageBytes, ManagedAuthStorageError> {
+        let guard = self.lock_managed_source()?;
+        guard.backend.read_managed_bytes()
+    }
+
+    fn save(&self, auth: &AuthDotJson) -> std::io::Result<()> {
+        // Match the ordinary file writer's ability to initialize CODEX_HOME.
+        std::fs::create_dir_all(&self.codex_home)?;
+        let _guard = self.lock_managed_source().map_err(std::io::Error::other)?;
+        self.backend.save(auth)
+    }
+
+    fn delete(&self) -> std::io::Result<bool> {
+        std::fs::create_dir_all(&self.codex_home)?;
+        let _guard = self.lock_managed_source().map_err(std::io::Error::other)?;
+        self.backend.delete()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManagedAuthStorageError {
+    ReadFailed(ManagedAuthStorageFailure),
+    /// Ordinary Auto loading would hide this failure by trying another source.
+    /// A transition must instead refuse; fallback absence is not logout proof.
+    AutoFallbackRequired(ManagedAuthStorageFailure),
+}
+
+impl std::fmt::Display for ManagedAuthStorageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "managed auth storage unavailable: {self:?}")
+    }
+}
+
+impl std::error::Error for ManagedAuthStorageError {}
+
+pub(super) struct ManagedAuthStorageRead {
+    pub auth: Option<AuthDotJson>,
+    pub source: ManagedAuthStorageSource,
+    pub preimage: ManagedAuthStoragePreimage,
+}
+
+/// Process-local comparison evidence; never formatted as a credential digest.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct ManagedAuthStoragePreimage([u8; 32]);
+
+impl Debug for ManagedAuthStoragePreimage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ManagedAuthStoragePreimage([redacted])")
+    }
+}
+
+pub(super) struct ManagedAuthStorageBytes {
+    bytes: Option<Vec<u8>>,
+    source: ManagedAuthStorageSource,
+    preimage: ManagedAuthStoragePreimage,
+}
+
+impl ManagedAuthStorageBytes {
+    fn into_parsed(self) -> Result<ManagedAuthStorageRead, ManagedAuthStorageError> {
+        let auth = self
+            .bytes
+            .as_deref()
+            .map(serde_json::from_slice)
+            .transpose()
+            .map_err(|_| {
+                ManagedAuthStorageError::ReadFailed(ManagedAuthStorageFailure::Parse(self.source))
+            })?;
+        Ok(ManagedAuthStorageRead {
+            auth,
+            source: self.source,
+            preimage: self.preimage,
+        })
+    }
+    fn new(
+        bytes: Option<Vec<u8>>,
+        source: ManagedAuthStorageSource,
+        identity: &[u8],
+        backend_evidence: &[u8],
+    ) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"codex-managed-auth/storage-preimage/v1\0");
+        hasher.update([match source {
+            ManagedAuthStorageSource::File => 0,
+            ManagedAuthStorageSource::Keyring => 1,
+            ManagedAuthStorageSource::Secrets => 2,
+            ManagedAuthStorageSource::FileAfterKeyringAbsence => 3,
+        }]);
+        hasher.update((identity.len() as u64).to_le_bytes());
+        hasher.update(identity);
+        hasher.update((backend_evidence.len() as u64).to_le_bytes());
+        hasher.update(backend_evidence);
+        hasher.update([u8::from(bytes.is_some())]);
+        if let Some(bytes) = &bytes {
+            hasher.update(bytes);
+        }
+        Self {
+            bytes,
+            source,
+            preimage: ManagedAuthStoragePreimage(hasher.finalize().into()),
+        }
+    }
+}
+
+impl Debug for ManagedAuthStorageRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManagedAuthStorageRead")
+            .field("source", &self.source)
+            .field("auth_present", &self.auth.is_some())
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -189,6 +456,40 @@ impl FileAuthStorage {
 }
 
 impl AuthStorageBackend for FileAuthStorage {
+    fn read_managed_bytes(&self) -> Result<ManagedAuthStorageBytes, ManagedAuthStorageError> {
+        let canonical_home = self.codex_home.canonicalize().map_err(|error| {
+            ManagedAuthStorageError::ReadFailed(ManagedAuthStorageFailure::FileIo(error.kind()))
+        })?;
+        // Only opening a genuinely absent source establishes absence. A read
+        // error after opening (including NotFound) never becomes logout proof.
+        let mut file = match File::open(get_auth_file(&self.codex_home)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ManagedAuthStorageBytes::new(
+                    None,
+                    ManagedAuthStorageSource::File,
+                    canonical_home.as_os_str().as_encoded_bytes(),
+                    &[],
+                ));
+            }
+            Err(error) => {
+                return Err(ManagedAuthStorageError::ReadFailed(
+                    ManagedAuthStorageFailure::FileIo(error.kind()),
+                ));
+            }
+        };
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents).map_err(|error| {
+            ManagedAuthStorageError::ReadFailed(ManagedAuthStorageFailure::FileIo(error.kind()))
+        })?;
+        Ok(ManagedAuthStorageBytes::new(
+            Some(contents),
+            ManagedAuthStorageSource::File,
+            canonical_home.as_os_str().as_encoded_bytes(),
+            &[],
+        ))
+    }
+
     fn load(&self) -> std::io::Result<Option<AuthDotJson>> {
         let auth_file = get_auth_file(&self.codex_home);
         let auth_dot_json = match self.try_read_auth_json(&auth_file) {
@@ -244,6 +545,17 @@ fn compute_store_key(codex_home: &Path) -> std::io::Result<String> {
     Ok(format!("cli|{truncated}"))
 }
 
+fn compute_managed_store_key(codex_home: &Path) -> Result<String, ManagedAuthStorageError> {
+    let canonical = codex_home
+        .canonicalize()
+        .map_err(|_| ManagedAuthStorageError::ReadFailed(ManagedAuthStorageFailure::Keyring))?;
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.to_string_lossy().as_bytes());
+    let hex = format!("{:x}", hasher.finalize());
+    let truncated = hex.get(..16).unwrap_or(&hex);
+    Ok(format!("cli|{truncated}"))
+}
+
 #[derive(Clone, Debug)]
 struct DirectKeyringAuthStorage {
     codex_home: PathBuf,
@@ -289,6 +601,27 @@ impl DirectKeyringAuthStorage {
 }
 
 impl AuthStorageBackend for DirectKeyringAuthStorage {
+    fn read_managed_bytes(&self) -> Result<ManagedAuthStorageBytes, ManagedAuthStorageError> {
+        let key = compute_managed_store_key(&self.codex_home)?;
+        match self.keyring_store.load(KEYRING_SERVICE, &key) {
+            Ok(Some(serialized)) => Ok(ManagedAuthStorageBytes::new(
+                Some(serialized.into_bytes()),
+                ManagedAuthStorageSource::Keyring,
+                key.as_bytes(),
+                &[],
+            )),
+            Ok(None) => Ok(ManagedAuthStorageBytes::new(
+                None,
+                ManagedAuthStorageSource::Keyring,
+                key.as_bytes(),
+                &[],
+            )),
+            Err(_) => Err(ManagedAuthStorageError::ReadFailed(
+                ManagedAuthStorageFailure::Keyring,
+            )),
+        }
+    }
+
     fn load(&self) -> std::io::Result<Option<AuthDotJson>> {
         let key = compute_store_key(&self.codex_home)?;
         self.load_from_keyring(&key)
@@ -352,6 +685,27 @@ impl SecretsKeyringAuthStorage {
 }
 
 impl AuthStorageBackend for SecretsKeyringAuthStorage {
+    fn read_managed_bytes(&self) -> Result<ManagedAuthStorageBytes, ManagedAuthStorageError> {
+        let canonical_home = self
+            .codex_home
+            .canonicalize()
+            .map_err(|_| ManagedAuthStorageError::ReadFailed(ManagedAuthStorageFailure::Secrets))?;
+        let backend = LocalSecretsBackend::new_with_namespace(
+            self.codex_home.clone(),
+            Arc::clone(&self.direct_storage.keyring_store),
+            LocalSecretsNamespace::CodexAuth,
+        );
+        let (serialized, ciphertext_preimage) = backend
+            .get_existing_with_preimage(&SecretScope::Global, &CODEX_AUTH_SECRET_NAME)
+            .map_err(|_| ManagedAuthStorageError::ReadFailed(ManagedAuthStorageFailure::Secrets))?;
+        Ok(ManagedAuthStorageBytes::new(
+            serialized.map(String::into_bytes),
+            ManagedAuthStorageSource::Secrets,
+            canonical_home.as_os_str().as_encoded_bytes(),
+            &ciphertext_preimage,
+        ))
+    }
+
     fn load(&self) -> std::io::Result<Option<AuthDotJson>> {
         match self
             .secrets_manager
@@ -425,6 +779,38 @@ impl AutoAuthStorage {
 }
 
 impl AuthStorageBackend for AutoAuthStorage {
+    fn load_managed(&self) -> Result<ManagedAuthStorageRead, ManagedAuthStorageError> {
+        let read = self.read_managed_bytes()?;
+        let primary = matches!(
+            read.source,
+            ManagedAuthStorageSource::Keyring | ManagedAuthStorageSource::Secrets
+        );
+        read.into_parsed().map_err(|error| match error {
+            ManagedAuthStorageError::ReadFailed(cause) if primary => {
+                ManagedAuthStorageError::AutoFallbackRequired(cause)
+            }
+            error => error,
+        })
+    }
+    fn read_managed_bytes(&self) -> Result<ManagedAuthStorageBytes, ManagedAuthStorageError> {
+        match self.keyring_storage.read_managed_bytes() {
+            Ok(read) if read.bytes.is_some() => Ok(read),
+            Ok(primary) => {
+                let read = self.file_storage.read_managed_bytes()?;
+                Ok(ManagedAuthStorageBytes::new(
+                    read.bytes,
+                    ManagedAuthStorageSource::FileAfterKeyringAbsence,
+                    &primary.preimage.0,
+                    &read.preimage.0,
+                ))
+            }
+            Err(ManagedAuthStorageError::ReadFailed(cause))
+            | Err(ManagedAuthStorageError::AutoFallbackRequired(cause)) => {
+                Err(ManagedAuthStorageError::AutoFallbackRequired(cause))
+            }
+        }
+    }
+
     fn load(&self) -> std::io::Result<Option<AuthDotJson>> {
         match self.keyring_storage.load() {
             Ok(Some(auth)) => Ok(Some(auth)),
@@ -479,6 +865,12 @@ impl EphemeralAuthStorage {
 }
 
 impl AuthStorageBackend for EphemeralAuthStorage {
+    fn read_managed_bytes(&self) -> Result<ManagedAuthStorageBytes, ManagedAuthStorageError> {
+        Err(ManagedAuthStorageError::ReadFailed(
+            ManagedAuthStorageFailure::UnsupportedStorage,
+        ))
+    }
+
     fn load(&self) -> std::io::Result<Option<AuthDotJson>> {
         self.with_store(|store, key| Ok(store.get(&key).cloned()))
     }
@@ -510,18 +902,27 @@ fn create_auth_storage_with_store(
     keyring_store: Arc<dyn KeyringStore>,
     keyring_backend_kind: AuthKeyringBackendKind,
 ) -> Arc<dyn AuthStorageBackend> {
-    match mode {
-        AuthCredentialsStoreMode::File => Arc::new(FileAuthStorage::new(codex_home)),
+    if mode == AuthCredentialsStoreMode::Ephemeral {
+        return Arc::new(EphemeralAuthStorage::new(codex_home));
+    }
+    let backend: Arc<dyn AuthStorageBackend> = match mode {
+        AuthCredentialsStoreMode::File => Arc::new(FileAuthStorage::new(codex_home.clone())),
         AuthCredentialsStoreMode::Keyring => {
-            create_keyring_auth_storage(codex_home, keyring_store, keyring_backend_kind)
+            create_keyring_auth_storage(codex_home.clone(), keyring_store, keyring_backend_kind)
         }
         AuthCredentialsStoreMode::Auto => Arc::new(AutoAuthStorage::new(
-            codex_home,
+            codex_home.clone(),
             keyring_store,
             keyring_backend_kind,
         )),
-        AuthCredentialsStoreMode::Ephemeral => Arc::new(EphemeralAuthStorage::new(codex_home)),
-    }
+        AuthCredentialsStoreMode::Ephemeral => {
+            Arc::new(EphemeralAuthStorage::new(codex_home.clone()))
+        }
+    };
+    Arc::new(LockedAuthStorage {
+        codex_home,
+        backend,
+    })
 }
 
 fn create_keyring_auth_storage(

@@ -66,6 +66,7 @@ use tokio_tungstenite::accept_hdr_async;
 use tokio_tungstenite::tungstenite;
 use tokio_util::sync::CancellationToken;
 
+mod auth_cycle_tests;
 mod clients_tests;
 mod pairing_tests;
 
@@ -409,6 +410,7 @@ pub(super) fn remote_control_handle_with_current_enrollment(
         },
     )));
     RemoteControlHandle {
+        auth_cycle_reset: auth_cycle::AuthCycleReset::new().0,
         policy: RemoteControlPolicy::Allowed,
         desired_state_tx: Arc::new(desired_state_tx),
         desired_state_rpc_lock: Arc::new(Semaphore::new(1)),

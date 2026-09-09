@@ -57,10 +57,12 @@ mod tests;
 
 pub use remote_installed_plugin_sync::RemoteInstalledPluginBundleSyncError;
 pub use remote_installed_plugin_sync::RemoteInstalledPluginBundleSyncOutcome;
+pub(crate) use remote_installed_plugin_sync::RemotePluginBundleSyncGeneration;
 pub use remote_installed_plugin_sync::RemotePluginCacheMutationGuard;
 pub use remote_installed_plugin_sync::RemotePluginMaterialization;
 pub use remote_installed_plugin_sync::mark_remote_plugin_cache_mutation_in_flight;
 pub(crate) use remote_installed_plugin_sync::maybe_start_remote_installed_plugin_bundle_sync;
+pub(crate) use remote_installed_plugin_sync::retire_remote_plugin_bundle_sync;
 pub use remote_installed_plugin_sync::sync_remote_installed_plugin_bundles_once;
 pub use search::RemotePluginSearchPage;
 pub use search::RemotePluginSearchRequest;
@@ -368,6 +370,9 @@ pub fn validate_remote_plugin_id(plugin_id: &str) -> Result<(), JSONRPCErrorErro
 
 #[derive(Debug, thiserror::Error)]
 pub enum RemotePluginCatalogError {
+    #[error("authentication changed while fetching remote plugins")]
+    AuthChanged,
+
     #[error("chatgpt authentication required for remote plugin catalog")]
     AuthRequired,
 
@@ -466,7 +471,8 @@ impl RemotePluginCatalogError {
             Self::UnexpectedStatus { status, .. } => {
                 Some(http_status_sub_error_type(*status).to_string())
             }
-            Self::AuthRequired
+            Self::AuthChanged
+            | Self::AuthRequired
             | Self::UnsupportedAuthMode
             | Self::AuthToken(_)
             | Self::Request { .. }

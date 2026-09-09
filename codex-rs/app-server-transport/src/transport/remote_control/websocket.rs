@@ -455,7 +455,7 @@ impl RemoteControlWebsocket {
     pub(crate) async fn run(
         mut self,
         app_server_client_name_rx: Option<oneshot::Receiver<String>>,
-    ) {
+    ) -> bool {
         info!(
             remote_control_url = %self.remote_control_url,
             installation_id = %self.installation_id,
@@ -476,8 +476,7 @@ impl RemoteControlWebsocket {
                     shutdown_requested = self.shutdown_token.is_cancelled(),
                     "app-server remote control websocket loop stopped before client name was ready"
                 );
-                self.client_tracker.lock().await.shutdown().await;
-                return;
+                return self.client_tracker.lock().await.shutdown().await;
             }
         };
         self.pairing_persistence_key
@@ -489,8 +488,7 @@ impl RemoteControlWebsocket {
             .resolve_unknown_desired_state(app_server_client_name.as_deref())
             .await
         {
-            self.client_tracker.lock().await.shutdown().await;
-            return;
+            return self.client_tracker.lock().await.shutdown().await;
         }
 
         loop {
@@ -546,7 +544,7 @@ impl RemoteControlWebsocket {
             );
         }
 
-        self.client_tracker.lock().await.shutdown().await;
+        let cleanup_succeeded = self.client_tracker.lock().await.shutdown().await;
         info!(
             remote_control_url = %self.remote_control_url,
             installation_id = %self.installation_id,
@@ -554,6 +552,7 @@ impl RemoteControlWebsocket {
             shutdown_requested = self.shutdown_token.is_cancelled(),
             "app-server remote control websocket loop exited"
         );
+        cleanup_succeeded
     }
 
     async fn wait_for_app_server_client_name(

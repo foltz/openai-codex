@@ -80,8 +80,27 @@ impl fmt::Display for RefreshStrategy {
 
 type SharedModelsEndpointClient = Arc<dyn ModelsEndpointClient>;
 
+/// Secret-safe failure to establish a fresh account-bound model catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedModelsResetError {
+    Unsupported,
+    BundledCatalog,
+    Cache,
+    Endpoint,
+    AuthChanged,
+}
+
 /// Coordinates model discovery plus cached metadata on disk.
 pub trait ModelsManager: fmt::Debug + Send + Sync {
+    /// Fence prior refreshes and replace account-bound state before managed success.
+    /// Unknown implementations must not silently claim that reset completed.
+    fn reset_for_managed_auth(
+        &self,
+        _http_client_factory: HttpClientFactory,
+    ) -> ModelsManagerFuture<'_, Result<(), ManagedModelsResetError>> {
+        Box::pin(async { Err(ManagedModelsResetError::Unsupported) })
+    }
+
     /// List all available models, refreshing according to the specified strategy.
     ///
     /// Returns model presets sorted by priority and filtered by auth mode and visibility.
@@ -216,6 +235,9 @@ pub type SharedModelsManager = Arc<dyn ModelsManager>;
 /// OpenAI-compatible model manager backed by bundled models, cache, and `/models`.
 #[derive(Debug)]
 pub struct OpenAiModelsManager {
+    // Serializes refresh/cache publication with managed reset, including cache I/O.
+    // This is an async operation lock, never a blocking state guard across an await.
+    refresh_operation: tokio::sync::Mutex<()>,
     remote_models: RwLock<Vec<ModelInfo>>,
     etag: RwLock<Option<String>>,
     cache: Option<Arc<dyn ModelsCache>>,
@@ -275,6 +297,7 @@ impl OpenAiModelsManager {
     ) -> Self {
         let remote_models = load_remote_models_from_file().unwrap_or_default();
         Self {
+            refresh_operation: tokio::sync::Mutex::new(()),
             remote_models: RwLock::new(remote_models),
             etag: RwLock::new(None),
             cache,
@@ -295,6 +318,84 @@ impl StaticModelsManager {
 }
 
 impl ModelsManager for OpenAiModelsManager {
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "async operation mutex fences complete refresh publication against account reset; no cache state guard spans network I/O"
+    )]
+    fn reset_for_managed_auth(
+        &self,
+        http_client_factory: HttpClientFactory,
+    ) -> ModelsManagerFuture<'_, Result<(), ManagedModelsResetError>> {
+        Box::pin(async move {
+            // A prior worker must finish publication before invalidation. A queued
+            // refresh resolves auth only after this lock, so cannot publish old auth.
+            let _operation = self.refresh_operation.lock().await;
+            let auth_changes = self
+                .auth_manager
+                .as_ref()
+                .map(|auth| auth.auth_change_receiver());
+            let bundled = load_remote_models_from_file()
+                .map_err(|_| ManagedModelsResetError::BundledCatalog)?;
+            *self.remote_models.write().await = bundled.clone();
+            *self.etag.write().await = None;
+            let client_version = crate::client_version_to_whole();
+            if let Some(cache) = self.cache.as_ref() {
+                cache
+                    .store(&ModelsCacheEntry {
+                        fetched_at: Utc::now(),
+                        etag: None,
+                        client_version: Some(client_version.clone()),
+                        models: bundled,
+                    })
+                    .await
+                    .map_err(|_| ManagedModelsResetError::Cache)?;
+            }
+            // Logout uses the bundled account-independent catalog, never the
+            // previous account's persisted cache or an unauthenticated fetch.
+            let should_refresh = self.should_refresh_models().await;
+            if auth_changes
+                .as_ref()
+                .is_some_and(|changes| changes.has_changed().unwrap_or(true))
+            {
+                return Err(ManagedModelsResetError::AuthChanged);
+            }
+            if !should_refresh {
+                return Ok(());
+            }
+            let (models, etag) = self
+                .endpoint_client
+                .list_models(&client_version, http_client_factory)
+                .await
+                .map_err(|_| ManagedModelsResetError::Endpoint)?;
+            if auth_changes
+                .as_ref()
+                .is_some_and(|changes| changes.has_changed().unwrap_or(true))
+            {
+                return Err(ManagedModelsResetError::AuthChanged);
+            }
+            if let Some(cache) = self.cache.as_ref() {
+                cache
+                    .store(&ModelsCacheEntry {
+                        fetched_at: Utc::now(),
+                        etag: etag.clone(),
+                        client_version: Some(client_version),
+                        models: models.clone(),
+                    })
+                    .await
+                    .map_err(|_| ManagedModelsResetError::Cache)?;
+            }
+            if auth_changes
+                .as_ref()
+                .is_some_and(|changes| changes.has_changed().unwrap_or(true))
+            {
+                return Err(ManagedModelsResetError::AuthChanged);
+            }
+            self.apply_remote_models(models).await;
+            *self.etag.write().await = etag;
+            Ok(())
+        })
+    }
+
     fn raw_model_catalog(
         &self,
         refresh_strategy: RefreshStrategy,
@@ -353,7 +454,12 @@ impl OpenAiModelsManager {
         }
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "async operation mutex serializes refresh and reset publication, including disk cache writes"
+    )]
     async fn refresh_if_new_etag(&self, etag: String, http_client_factory: HttpClientFactory) {
+        let _operation = self.refresh_operation.lock().await;
         let current_etag = self.get_etag().await;
         if current_etag.clone().is_some() && current_etag.as_deref() == Some(etag.as_str()) {
             if let Some(cache) = self.cache.as_ref()
@@ -364,7 +470,7 @@ impl OpenAiModelsManager {
             return;
         }
         if let Err(err) = self
-            .refresh_available_models(RefreshStrategy::Online, &http_client_factory)
+            .refresh_available_models_inner(RefreshStrategy::Online, &http_client_factory)
             .await
         {
             error!("failed to refresh available models: {err}");
@@ -372,7 +478,21 @@ impl OpenAiModelsManager {
     }
 
     /// Refresh available models according to the specified strategy.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "async operation mutex serializes refresh and reset publication, including disk cache writes"
+    )]
     async fn refresh_available_models(
+        &self,
+        refresh_strategy: RefreshStrategy,
+        http_client_factory: &HttpClientFactory,
+    ) -> CoreResult<()> {
+        let _operation = self.refresh_operation.lock().await;
+        self.refresh_available_models_inner(refresh_strategy, http_client_factory)
+            .await
+    }
+
+    async fn refresh_available_models_inner(
         &self,
         refresh_strategy: RefreshStrategy,
         http_client_factory: &HttpClientFactory,
@@ -413,11 +533,23 @@ impl OpenAiModelsManager {
         &self,
         http_client_factory: &HttpClientFactory,
     ) -> CoreResult<()> {
+        let auth_changes = self
+            .auth_manager
+            .as_ref()
+            .map(|auth| auth.auth_change_receiver());
         let client_version = crate::client_version_to_whole();
         let (models, etag) = self
             .endpoint_client
             .list_models(&client_version, http_client_factory.clone())
             .await?;
+        if auth_changes
+            .as_ref()
+            .is_some_and(|changes| changes.has_changed().unwrap_or(true))
+        {
+            return Err(codex_protocol::error::CodexErr::InvalidRequest(
+                "model catalog auth changed during refresh".to_owned(),
+            ));
+        }
         self.apply_remote_models(models.clone()).await;
         *self.etag.write().await = etag.clone();
         if let Some(cache) = self.cache.as_ref() {
@@ -517,6 +649,14 @@ impl OpenAiModelsManager {
 }
 
 impl ModelsManager for StaticModelsManager {
+    fn reset_for_managed_auth(
+        &self,
+        _http_client_factory: HttpClientFactory,
+    ) -> ModelsManagerFuture<'_, Result<(), ManagedModelsResetError>> {
+        // This authoritative in-process catalog has no account-derived cache.
+        Box::pin(async { Ok(()) })
+    }
+
     fn get_default_model<'a>(
         &'a self,
         model: &'a Option<String>,

@@ -22,6 +22,7 @@ fn client_management_handle(
         environment_id: None,
     });
     RemoteControlHandle {
+        auth_cycle_reset: auth_cycle::AuthCycleReset::new().0,
         policy: RemoteControlPolicy::Allowed,
         desired_state_tx: Arc::new(desired_state_tx),
         desired_state_rpc_lock: Arc::new(Semaphore::new(1)),

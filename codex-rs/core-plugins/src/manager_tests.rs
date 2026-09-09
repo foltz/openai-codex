@@ -6679,6 +6679,7 @@ fn remote_installed_plugins_cache_refresh_coalesces_materializations() {
     };
     let request =
         |change, on_effective_plugins_changed| RemoteInstalledPluginsCacheRefreshRequest {
+            generation: manager.remote_installed_plugins_generation(),
             service_config: RemotePluginServiceConfig::new(
                 "https://example.com".to_string(),
                 test_http_client_factory(),
@@ -6721,6 +6722,207 @@ fn remote_installed_plugins_cache_refresh_coalesces_materializations() {
         unrelated_callback_count.load(std::sync::atomic::Ordering::Relaxed),
         0
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_reset_fences_late_remote_installed_success_and_auth_errors() {
+    for outcome in [
+        Ok(vec![remote_installed_plugin("account-a")]),
+        Err(RemotePluginCatalogError::AuthRequired),
+        Err(RemotePluginCatalogError::UnsupportedAuthMode),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let manager = Arc::new(test_plugins_manager(tmp.path().to_path_buf()));
+        manager.write_remote_installed_plugins_cache(vec![remote_installed_plugin("account-a")]);
+        let callback_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&callback_count);
+        let request = RemoteInstalledPluginsCacheRefreshRequest {
+            generation: manager.remote_installed_plugins_generation(),
+            service_config: RemotePluginServiceConfig::new(
+                "https://example.com".to_string(),
+                test_http_client_factory(),
+            ),
+            auth: None,
+            notify: RemoteInstalledPluginsCacheRefreshNotify::AfterSuccessfulRefresh,
+            on_effective_plugins_changed: Some(Arc::new(move |_| {
+                count.fetch_add(1, Ordering::SeqCst);
+            })),
+            change: EffectivePluginsChange::default(),
+        };
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let old_manager = Arc::clone(&manager);
+        let old_request = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            resume_rx.await.unwrap();
+            // Exercise the exact production post-fetch commit, with A's source
+            // result held at the async boundary until B has reset and published.
+            old_manager.complete_remote_installed_plugins_cache_refresh(request, outcome);
+        });
+        started_rx.await.unwrap();
+        assert!(manager.clear_remote_installed_plugins_cache());
+        let current_callback_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let current_count = Arc::clone(&current_callback_count);
+        let callback_manager = Arc::downgrade(&manager);
+        manager.complete_remote_installed_plugins_cache_refresh(
+            RemoteInstalledPluginsCacheRefreshRequest {
+                generation: manager.remote_installed_plugins_generation(),
+                service_config: RemotePluginServiceConfig::new(
+                    "https://example.com".to_string(),
+                    test_http_client_factory(),
+                ),
+                auth: None,
+                notify: RemoteInstalledPluginsCacheRefreshNotify::AfterSuccessfulRefresh,
+                on_effective_plugins_changed: Some(Arc::new(move |_| {
+                    // Pin the check-act boundary too: reset cannot finish
+                    // between the generation check and callback invocation.
+                    assert!(
+                        callback_manager
+                            .upgrade()
+                            .unwrap()
+                            .remote_installed_plugins_cache_refresh_state
+                            .try_write()
+                            .is_err()
+                    );
+                    current_count.fetch_add(1, Ordering::SeqCst);
+                })),
+                change: EffectivePluginsChange::default(),
+            },
+            Ok(vec![remote_installed_plugin("account-b")]),
+        );
+        resume_tx.send(()).unwrap();
+        old_request.await.unwrap();
+        assert_eq!(
+            *manager.remote_installed_plugins_cache.read().unwrap(),
+            Some(vec![remote_installed_plugin("account-b")])
+        );
+        assert_eq!(callback_count.load(Ordering::SeqCst), 0);
+        assert_eq!(current_callback_count.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[test]
+fn account_reset_drops_pending_refresh_and_rejects_late_bundle_callback() {
+    let tmp = TempDir::new().unwrap();
+    let manager = Arc::new(test_plugins_manager(tmp.path().to_path_buf()));
+    let old_generation = manager.remote_installed_plugins_generation();
+    // A running fetch owns the loop while bundle-sync completions enqueue work.
+    manager
+        .remote_installed_plugins_cache_refresh_state
+        .write()
+        .unwrap()
+        .in_flight = true;
+    let request = |generation| RemoteInstalledPluginsCacheRefreshRequest {
+        generation,
+        service_config: RemotePluginServiceConfig::new(
+            "https://example.com".to_string(),
+            test_http_client_factory(),
+        ),
+        auth: None,
+        notify: RemoteInstalledPluginsCacheRefreshNotify::AfterSuccessfulRefresh,
+        on_effective_plugins_changed: None,
+        change: EffectivePluginsChange::default(),
+    };
+    manager.schedule_remote_installed_plugins_cache_refresh(request(old_generation.clone()));
+    // An empty cache must still advance the generation and discard queued work.
+    assert!(!manager.clear_remote_installed_plugins_cache());
+    assert!(
+        manager
+            .remote_installed_plugins_cache_refresh_state
+            .read()
+            .unwrap()
+            .requested
+            .is_none()
+    );
+    let new_generation = manager.remote_installed_plugins_generation();
+    manager.schedule_remote_installed_plugins_cache_refresh(request(new_generation.clone()));
+    // This is the same scheduling entry used by a late bundle-sync callback.
+    manager.schedule_remote_installed_plugins_cache_refresh(request(old_generation));
+    let state = manager
+        .remote_installed_plugins_cache_refresh_state
+        .read()
+        .unwrap();
+    assert!(
+        state
+            .requested
+            .as_ref()
+            .unwrap()
+            .generation
+            .is_current(&new_generation)
+    );
+}
+
+#[tokio::test]
+async fn account_reset_rejects_synchronous_remote_marketplace_result_in_flight() {
+    let tmp = TempDir::new().unwrap();
+    let manager = Arc::new(test_plugins_manager(tmp.path().to_path_buf()));
+    let server = MockServer::start().await;
+    let reset_manager = Arc::clone(&manager);
+    Mock::given(method("GET"))
+        .and(path("/backend-api/ps/plugins/installed"))
+        .respond_with(move |_: &wiremock::Request| {
+            // The request has captured A's generation and is waiting on HTTP.
+            // Finish reset and install B's cache before returning A's response.
+            reset_manager.clear_remote_installed_plugins_cache();
+            reset_manager
+                .write_remote_installed_plugins_cache(vec![remote_installed_plugin("account-b")]);
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "plugins": [], "pagination": {"next_page_token": null}
+            }))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut config = load_config(tmp.path(), tmp.path()).await;
+    config.chatgpt_base_url = format!("{}/backend-api", server.uri());
+    let callbacks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let callback_count = Arc::clone(&callbacks);
+    let result = manager
+        .build_and_cache_remote_installed_plugin_marketplaces(
+            &config,
+            Some(&CodexAuth::create_dummy_chatgpt_auth_for_testing()),
+            &[REMOTE_GLOBAL_MARKETPLACE_NAME],
+            Some(Arc::new(move |_| {
+                callback_count.fetch_add(1, Ordering::SeqCst);
+            })),
+        )
+        .await;
+    assert!(matches!(result, Err(RemotePluginCatalogError::AuthChanged)));
+    assert_eq!(
+        *manager.remote_installed_plugins_cache.read().unwrap(),
+        Some(vec![remote_installed_plugin("account-b")])
+    );
+    assert_eq!(callbacks.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn account_reset_waits_for_filesystem_commits_and_retry_preserves_the_wait() {
+    let tmp = TempDir::new().unwrap();
+    let manager = test_plugins_manager(tmp.path().to_path_buf());
+    let generation = crate::remote::RemotePluginBundleSyncGeneration::capture(tmp.path());
+    let lease = generation.begin_commit().unwrap();
+    let reset = manager.reset_remote_installed_plugins();
+    tokio::pin!(reset);
+    tokio::select! {
+        biased;
+        result = &mut reset => panic!("reset completed with live filesystem commit: {result:?}"),
+        _ = std::future::ready(()) => {}
+    }
+    assert!(generation.begin_commit().is_none());
+    tokio::time::advance(Duration::from_secs(10)).await;
+    assert_eq!(
+        reset.await.unwrap_err().kind(),
+        std::io::ErrorKind::TimedOut
+    );
+    let retry = manager.reset_remote_installed_plugins();
+    tokio::pin!(retry);
+    tokio::select! {
+        biased;
+        result = &mut retry => panic!("retry forgot earlier retired commit: {result:?}"),
+        _ = std::future::ready(()) => {}
+    }
+    drop(lease);
+    retry.await.unwrap();
 }
 
 #[test]

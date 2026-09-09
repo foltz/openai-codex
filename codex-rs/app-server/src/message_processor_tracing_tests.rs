@@ -125,8 +125,11 @@ struct TracingHarness {
 
 impl TracingHarness {
     async fn new() -> Result<Self> {
+        Self::with_codex_home(TempDir::new()?).await
+    }
+
+    async fn with_codex_home(codex_home: TempDir) -> Result<Self> {
         let server = create_mock_responses_server_repeating_assistant("Done").await;
-        let codex_home = TempDir::new()?;
         let config = Arc::new(build_test_config(codex_home.path(), &server.uri()).await?);
         let (processor, outgoing_rx) = build_test_processor(config).await;
         let tracing = init_test_tracing();
@@ -730,7 +733,14 @@ fn managed_transition_dispatch_paths_refuse_before_authorization_without_reservi
     run_current_thread_test_with_stack(
         "managed_transition_dispatch_paths_refuse_before_authorization_without_reserving_state",
         async {
-            let mut harness = TracingHarness::new().await?;
+            let codex_home = TempDir::new()?;
+            app_test_support::write_chatgpt_auth(
+                codex_home.path(),
+                app_test_support::ChatGptAuthFixture::new("prior-access-token")
+                    .account_id("authorization-test-account"),
+                codex_config::types::AuthCredentialsStoreMode::File,
+            )?;
+            let mut harness = TracingHarness::with_codex_home(codex_home).await?;
             let process_instance_id = harness
                 .processor
                 .managed_transition_coordinator
@@ -743,7 +753,16 @@ fn managed_transition_dispatch_paths_refuse_before_authorization_without_reservi
                 intent: ManagedTransitionIntent::AdoptManagedAuth,
                 expected_auth_revision: 0,
                 expected_transition_revision: 0,
-                expected_auth_fingerprint: None,
+                expected_auth_fingerprint: Some(
+                    codex_login::AuthManager::managed_account_fingerprint(
+                        "authorization-test-account",
+                    ),
+                ),
+                intended_result_auth_fingerprint: Some(
+                    codex_login::AuthManager::managed_account_fingerprint(
+                        "authorization-test-account",
+                    ),
+                ),
             };
             let start: StartManagedTransitionResponse = harness
                 .request(
@@ -829,11 +848,26 @@ fn managed_transition_dispatch_paths_refuse_before_authorization_without_reservi
 /// (`managed_transition_dispatch_paths_refuse_before_authorization_without_reserving_state`).
 #[test]
 #[serial(app_server_tracing)]
-fn managed_transition_adoption_resets_plugins_manager_auth_mode_for_the_new_account() -> Result<()> {
+fn managed_transition_adoption_resets_plugins_manager_auth_mode_for_the_new_account() -> Result<()>
+{
     run_current_thread_test_with_stack(
         "managed_transition_adoption_resets_plugins_manager_auth_mode_for_the_new_account",
         async {
-            let harness = TracingHarness::new().await?;
+            let codex_home = TempDir::new()?;
+            app_test_support::write_chatgpt_auth(
+                codex_home.path(),
+                app_test_support::ChatGptAuthFixture::new("prior-access-token")
+                    .account_id("prior-managed-account"),
+                codex_config::types::AuthCredentialsStoreMode::File,
+            )?;
+            let harness = TracingHarness::with_codex_home(codex_home).await?;
+            // A stale plugin projection is repaired by the actual reset,
+            // independently of the eligible managed account in AuthManager.
+            harness
+                .processor
+                .thread_manager_for_tests()
+                .plugins_manager()
+                .set_auth_mode(None);
             assert_eq!(
                 harness
                     .processor
@@ -856,10 +890,14 @@ fn managed_transition_adoption_resets_plugins_manager_auth_mode_for_the_new_acco
                 intent: ManagedTransitionIntent::AdoptManagedAuth,
                 expected_auth_revision: 0,
                 expected_transition_revision: 0,
-                // No auth is installed at harness startup (the mock config
-                // helper writes only `config.toml`, never `auth.json`), so
-                // the coordinator's own initial fingerprint is `None`.
-                expected_auth_fingerprint: None,
+                expected_auth_fingerprint: Some(
+                    codex_login::AuthManager::managed_account_fingerprint("prior-managed-account"),
+                ),
+                intended_result_auth_fingerprint: Some(
+                    codex_login::AuthManager::managed_account_fingerprint(
+                        "managed-adoption-account",
+                    ),
+                ),
             };
 
             // A real managed account lands on disk before Adopting reads
@@ -881,7 +919,10 @@ fn managed_transition_adoption_resets_plugins_manager_auth_mode_for_the_new_acco
             let StartManagedTransitionResponse::Accepted { status } = status else {
                 panic!("expected the real production coordinator to accept and complete adoption");
             };
-            assert_eq!(status.phase, codex_app_server_protocol::ManagedTransitionPhase::Succeeded);
+            assert_eq!(
+                status.phase,
+                codex_app_server_protocol::ManagedTransitionPhase::Succeeded
+            );
 
             assert_eq!(
                 harness

@@ -1,4 +1,5 @@
 mod auth;
+mod auth_cycle;
 mod client_tracker;
 mod clients;
 mod desired_state;
@@ -104,6 +105,7 @@ pub(super) struct QueuedServerEnvelope {
 
 #[derive(Clone)]
 pub struct RemoteControlHandle {
+    auth_cycle_reset: auth_cycle::AuthCycleReset,
     policy: RemoteControlPolicy,
     desired_state_tx: Arc<watch::Sender<RemoteControlDesiredState>>,
     desired_state_rpc_lock: Arc<Semaphore>,
@@ -234,6 +236,13 @@ impl fmt::Display for RemoteControlEnableError {
 impl Error for RemoteControlEnableError {}
 
 impl RemoteControlHandle {
+    /// Retire all connections and queued client work from the previous auth
+    /// cycle before acknowledging an account transition. Desired enablement
+    /// and pairing are preserved; the supervisor reconnects using current auth.
+    pub async fn reset_auth_cycle(&self) -> io::Result<()> {
+        self.auth_cycle_reset.reset().await
+    }
+
     pub fn ensure_remote_control_allowed(&self) -> Result<(), RemoteControlDisabledByRequirements> {
         match self.policy {
             RemoteControlPolicy::Allowed => Ok(()),
@@ -1004,6 +1013,9 @@ pub async fn start_remote_control(
     let installation_id_for_log = installation_id.clone();
     let server_name_for_log = server_name.clone();
     let shutdown_token_for_log = shutdown_token.clone();
+    let (auth_cycle_reset, auth_cycle_completed_tx) = auth_cycle::AuthCycleReset::new();
+    let mut auth_cycle_requested_rx = auth_cycle_reset.requested.subscribe();
+    let mut auth_changed_rx = auth_manager.auth_change_receiver();
     let join_handle = tokio::spawn(async move {
         info!(
             remote_control_url = %remote_control_url_for_log,
@@ -1012,28 +1024,95 @@ pub async fn start_remote_control(
             ?desired_state,
             "app-server remote control websocket task started"
         );
-        let websocket_task = RemoteControlWebsocket::new(
-            websocket::RemoteControlWebsocketConfig {
-                remote_control_url,
-                installation_id,
-                remote_control_target,
-                server_name,
-            },
-            state_db,
-            auth_manager,
-            RemoteControlChannels {
-                transport_event_tx,
-                status_publisher,
-                current_enrollment: websocket_current_enrollment,
-                pairing_persistence_key: websocket_pairing_persistence_key,
-                desired_state_persistence_lock: websocket_desired_state_persistence_lock,
-            },
-            shutdown_token,
-            websocket_desired_state_tx,
-        )
-        .run(app_server_client_name_rx);
+        // Retain the sender across catch_unwind: normal completion proves there
+        // can be no later auth cycle, while panic must still fail closed.
+        let terminal_auth_cycle_completed_tx = auth_cycle_completed_tx.clone();
+        let websocket_task = async move {
+            // Resolve this once: restarting an auth cycle must not lose the
+            // client's persistence key or consume the initialization receiver twice.
+            let client_name = if let Some(mut client_name_rx) = app_server_client_name_rx {
+                loop {
+                    tokio::select! {
+                        _ = shutdown_token.cancelled() => return true,
+                        name = &mut client_name_rx => match name {
+                            Ok(name) => break Some(name),
+                            Err(_) => return true,
+                        },
+                        changed = auth_cycle_requested_rx.changed() => {
+                            if changed.is_err() { return true; }
+                            // No runtime has started yet, hence no old transport exists.
+                            auth_cycle_completed_tx.send_replace(*auth_cycle_requested_rx.borrow_and_update());
+                        }
+                    }
+                }
+            } else {
+                None
+            };
+            loop {
+                // Both channels are sampled only after the old runtime has been
+                // joined. A request racing this point remains unseen and cancels
+                // the next cycle before it can be acknowledged.
+                auth_cycle_completed_tx.send_replace(*auth_cycle_requested_rx.borrow_and_update());
+                auth_changed_rx.borrow_and_update();
+                if shutdown_token.is_cancelled() {
+                    return true;
+                }
+                let cycle_shutdown = shutdown_token.child_token();
+                let client_name_rx = client_name.as_ref().map(|name| {
+                    let (tx, rx) = oneshot::channel();
+                    let _ = tx.send(name.clone());
+                    rx
+                });
+                let runtime = RemoteControlWebsocket::new(
+                    websocket::RemoteControlWebsocketConfig {
+                        remote_control_url: remote_control_url.clone(),
+                        installation_id: installation_id.clone(),
+                        remote_control_target: remote_control_target.clone(),
+                        server_name: server_name.clone(),
+                    },
+                    state_db.clone(),
+                    auth_manager.clone(),
+                    RemoteControlChannels {
+                        transport_event_tx: transport_event_tx.clone(),
+                        status_publisher: status_publisher.clone(),
+                        current_enrollment: websocket_current_enrollment.clone(),
+                        pairing_persistence_key: websocket_pairing_persistence_key.clone(),
+                        desired_state_persistence_lock: websocket_desired_state_persistence_lock
+                            .clone(),
+                    },
+                    cycle_shutdown.clone(),
+                    websocket_desired_state_tx.clone(),
+                )
+                .run(client_name_rx);
+                tokio::pin!(runtime);
+                tokio::select! {
+                    biased;
+                    _ = shutdown_token.cancelled() => {
+                        cycle_shutdown.cancel();
+                        return runtime.await;
+                    }
+                    _ = auth_cycle_requested_rx.changed() => {}
+                    _ = auth_changed_rx.changed() => {}
+                    cleanup_succeeded = &mut runtime => return cleanup_succeeded,
+                }
+                cycle_shutdown.cancel();
+                // Dropping a run future would abort its JoinSets without proving
+                // worker exit. Await its structured shutdown before acknowledging.
+                if !runtime.await {
+                    return false;
+                }
+            }
+        };
         match AssertUnwindSafe(websocket_task).catch_unwind().await {
-            Ok(()) => {
+            Ok(cleanup_succeeded) => {
+                // Only proved cleanup covers future reset requests. A bounded
+                // but incomplete shutdown closes the acknowledgement channel
+                // without publishing terminal success, so reset fails closed.
+                if cleanup_succeeded {
+                    terminal_auth_cycle_completed_tx.send_replace(u64::MAX);
+                } else {
+                    warn!("remote control stopped with undelivered connection cleanup");
+                }
                 let shutdown_requested = shutdown_token_for_log.is_cancelled();
                 if shutdown_requested {
                     info!(
@@ -1068,6 +1147,7 @@ pub async fn start_remote_control(
     Ok((
         join_handle,
         RemoteControlHandle {
+            auth_cycle_reset,
             policy,
             desired_state_tx,
             desired_state_rpc_lock,

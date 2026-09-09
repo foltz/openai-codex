@@ -185,13 +185,15 @@ mod tests {
         let start = ClientRequest::ManagedTransitionStart {
             request_id: codex_app_server_protocol::RequestId::Integer(1),
             params: codex_app_server_protocol::StartManagedTransitionParams {
-                contract_version: codex_app_server_protocol::MANAGED_AUTH_TRANSITION_CONTRACT_VERSION,
+                contract_version:
+                    codex_app_server_protocol::MANAGED_AUTH_TRANSITION_CONTRACT_VERSION,
                 transition_id: "t".to_owned(),
                 process_instance_id: "p".to_owned(),
                 intent: codex_app_server_protocol::ManagedTransitionIntent::AdoptManagedAuth,
                 expected_auth_revision: 0,
                 expected_transition_revision: 0,
                 expected_auth_fingerprint: None,
+                intended_result_auth_fingerprint: Some("intended-account".to_owned()),
             },
         };
         assert_eq!(classify(&start), AccountDependency::Independent);

@@ -103,6 +103,11 @@ use tracing::warn;
 
 mod shutdown;
 pub use shutdown::InProcessHost;
+pub use shutdown::ProcessorCleanupExecution;
+pub use shutdown::ProcessorCleanupProgress;
+pub use shutdown::RuntimeShutdownReport;
+pub use shutdown::TaskObservation;
+pub use shutdown::TaskTermination;
 
 const IN_PROCESS_CONNECTION_ID: ConnectionId = ConnectionId(0);
 // Covers both bounded runtime drains plus the analytics client's 25-second best-effort flush.

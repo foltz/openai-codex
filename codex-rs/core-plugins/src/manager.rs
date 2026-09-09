@@ -2627,12 +2627,13 @@ impl PluginsManager {
         }
         let on_effective_plugins_changed =
             on_effective_plugins_changed.map(|on_effective_plugins_changed| {
-                let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+                let Ok(_runtime) = tokio::runtime::Handle::try_current() else {
                     return on_effective_plugins_changed;
                 };
+                let task_registry = self.task_registry.clone();
                 let callback: EffectivePluginsChangedCallback = Arc::new(move |change| {
                     let on_effective_plugins_changed = Arc::clone(&on_effective_plugins_changed);
-                    runtime.spawn(async move {
+                    let _ = task_registry.spawn(async move {
                         on_effective_plugins_changed(change);
                     });
                 });

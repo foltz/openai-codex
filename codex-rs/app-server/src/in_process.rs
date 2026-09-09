@@ -95,14 +95,20 @@ pub use codex_rollout::StateDbHandle;
 pub use codex_state::log_db::LogDbLayer;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+#[cfg(test)]
 use tokio::time::timeout;
+use tokio::time::timeout_at;
 use toml::Value as TomlValue;
 use tracing::warn;
 
+mod shutdown;
+pub use shutdown::InProcessHost;
+
 const IN_PROCESS_CONNECTION_ID: ConnectionId = ConnectionId(0);
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 // Covers both bounded runtime drains plus the analytics client's 25-second best-effort flush.
 const SHUTDOWN_ACK_TIMEOUT: Duration = Duration::from_secs(35);
+#[cfg(test)]
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Default bounded channel capacity for in-process runtime queues.
 pub const DEFAULT_IN_PROCESS_CHANNEL_CAPACITY: usize = CHANNEL_CAPACITY;
 
@@ -280,7 +286,8 @@ impl InProcessClientSender {
 pub struct InProcessClientHandle {
     client: InProcessClientSender,
     event_rx: mpsc::Receiver<InProcessServerEvent>,
-    runtime_handle: tokio::task::JoinHandle<()>,
+    runtime_handle: Arc<shutdown::EmbeddedTaskOwner>,
+    _custody: Arc<shutdown::RuntimeCustody>,
     #[cfg(test)]
     _test_codex_home: Option<tempfile::TempDir>,
 }
@@ -339,8 +346,9 @@ impl InProcessClientHandle {
     /// Shutdown is bounded by internal timeouts and may abort background tasks
     /// if graceful drain does not complete in time.
     pub async fn shutdown(self) -> IoResult<()> {
-        let mut runtime_handle = self.runtime_handle;
+        let runtime_handle = self.runtime_handle;
         let (done_tx, done_rx) = oneshot::channel();
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_ACK_TIMEOUT;
 
         if self
             .client
@@ -349,12 +357,22 @@ impl InProcessClientHandle {
             .await
             .is_ok()
         {
-            let _ = timeout(SHUTDOWN_ACK_TIMEOUT, done_rx).await;
+            if timeout_at(deadline, done_rx).await.is_err() {
+                return Err(IoError::new(
+                    ErrorKind::TimedOut,
+                    "in-process app-server shutdown acknowledgement timed out",
+                ));
+            }
         }
 
-        if let Err(_elapsed) = timeout(SHUTDOWN_TIMEOUT, &mut runtime_handle).await {
-            runtime_handle.abort();
-            let _ = runtime_handle.await;
+        if timeout_at(deadline, runtime_handle.join()).await.is_err() {
+            // The retained host/custody owns the original join and cleanup
+            // receipts. A caller deadline is an incomplete observation, never
+            // permission to abort the task that owns those receipts.
+            return Err(IoError::new(
+                ErrorKind::TimedOut,
+                "in-process app-server runtime shutdown timed out",
+            ));
         }
         Ok(())
     }
@@ -369,7 +387,25 @@ impl InProcessClientHandle {
 /// This function sends `initialize` followed by `initialized` before returning
 /// the handle, so callers receive a ready-to-use runtime. If initialize fails,
 /// the runtime is shut down and an `InvalidData` error is returned.
-pub async fn start(mut args: InProcessStartArgs) -> IoResult<InProcessClientHandle> {
+#[deprecated(note = "use start_in_host with host custody that survives startup and shutdown")]
+pub async fn start(args: InProcessStartArgs) -> IoResult<InProcessClientHandle> {
+    start_with_custody(args, Arc::new(shutdown::RuntimeCustody::default())).await
+}
+
+/// Starts with custody reserved in the caller's host before the first await.
+/// The host must be retained across startup cancellation and incomplete
+/// shutdown. The returned client also retains its exact runtime slot.
+pub async fn start_in_host(
+    host: &InProcessHost,
+    args: InProcessStartArgs,
+) -> IoResult<InProcessClientHandle> {
+    start_with_custody(args, host.reserve()?).await
+}
+
+async fn start_with_custody(
+    mut args: InProcessStartArgs,
+    custody: Arc<shutdown::RuntimeCustody>,
+) -> IoResult<InProcessClientHandle> {
     if let Ok(Some(err)) = check_execpolicy_for_warnings(&args.config.config_layer_stack).await {
         let (path, range) = crate::exec_policy_warning_location(&err);
         args.config_warnings.push(ConfigWarningNotification {
@@ -380,7 +416,7 @@ pub async fn start(mut args: InProcessStartArgs) -> IoResult<InProcessClientHand
         });
     }
     let initialize = args.initialize.clone();
-    let client = start_uninitialized(args).await?;
+    let client = start_uninitialized(args, custody).await?;
 
     let initialize_response = client
         .request(ClientRequest::Initialize {
@@ -419,7 +455,10 @@ async fn run_outbound_router(
     }
 }
 
-async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClientHandle> {
+async fn start_uninitialized(
+    args: InProcessStartArgs,
+    custody: Arc<shutdown::RuntimeCustody>,
+) -> IoResult<InProcessClientHandle> {
     args.config.auth_config().validate()?;
     let channel_capacity = args.channel_capacity.max(1);
     let installation_id = resolve_installation_id(&args.config.codex_home).await?;
@@ -430,7 +469,8 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
     let (client_tx, mut client_rx) = mpsc::channel::<InProcessClientMessage>(channel_capacity);
     let (event_tx, event_rx) = mpsc::channel::<InProcessServerEvent>(channel_capacity);
 
-    let runtime_handle = tokio::spawn(async move {
+    let runtime_ticket = shutdown::RuntimeCustodyTicket(Arc::downgrade(&custody));
+    let runtime_handle = custody.spawn(shutdown::RuntimeTask::Runtime, async move {
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<OutgoingEnvelope>(channel_capacity);
         let analytics_events_client =
             analytics_events_client_from_config(Arc::clone(&auth_manager), args.config.as_ref());
@@ -457,11 +497,14 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
             ),
         );
         let (outbound_shutdown_tx, outbound_shutdown_rx) = oneshot::channel();
-        let mut outbound_handle = tokio::spawn(run_outbound_router(
+        let Ok(outbound_handle) = runtime_ticket.spawn(shutdown::RuntimeTask::Outbound, run_outbound_router(
             outgoing_rx,
             outbound_connections,
             outbound_shutdown_rx,
-        ));
+        )) else {
+            warn!("in-process outbound task custody unavailable");
+            return;
+        };
 
         let processor_outgoing = Arc::clone(&outgoing_message_sender);
         let config_manager = ConfigManager::new(
@@ -474,31 +517,45 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
             args.thread_config_loader,
         );
         let (processor_tx, mut processor_rx) = mpsc::channel::<ProcessorCommand>(channel_capacity);
-        let mut processor_handle = tokio::spawn(async move {
-            let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
-                outgoing: Arc::clone(&processor_outgoing),
-                analytics_events_client,
-                arg0_paths: args.arg0_paths,
-                config: args.config,
-                config_manager,
-                environment_manager: args.environment_manager,
-                feedback: args.feedback,
-                log_db: args.log_db,
-                state_db: args.state_db,
-                config_warnings: args.config_warnings,
-                session_source: args.session_source,
-                user_verification: Arc::new(crate::user_verification::Service::new(Arc::clone(
-                    &auth_manager,
-                ))),
-                auth_manager,
-                installation_id,
-                code_mode_session_provider: None,
-                rpc_transport: AppServerRpcTransport::InProcess,
-                remote_control_handle: None,
-                plugin_startup_tasks: Some(PluginStartupConfig::Current),
-            }));
-            let mut thread_created_rx = processor.thread_created_receiver();
-            let session = Arc::new(ConnectionSessionState::in_process());
+        // Establish custody before the processor task can be polled. The
+        // enclosing runtime retains these owners independently of that task's
+        // join; the host shutdown controller will retain the enclosing owner.
+        let processor_owner = Arc::new(MessageProcessor::new(MessageProcessorArgs {
+            outgoing: Arc::clone(&processor_outgoing),
+            analytics_events_client,
+            arg0_paths: args.arg0_paths,
+            config: args.config,
+            config_manager,
+            environment_manager: args.environment_manager,
+            feedback: args.feedback,
+            log_db: args.log_db,
+            state_db: args.state_db,
+            config_warnings: args.config_warnings,
+            session_source: args.session_source,
+            user_verification: Arc::new(crate::user_verification::Service::new(Arc::clone(
+                &auth_manager,
+            ))),
+            auth_manager,
+            installation_id,
+            code_mode_session_provider: None,
+            rpc_transport: AppServerRpcTransport::InProcess,
+            remote_control_handle: None,
+            plugin_startup_tasks: Some(PluginStartupConfig::Current),
+        }));
+        let session_owner = Arc::new(ConnectionSessionState::in_process());
+        let processor_cleanup_owner = Arc::new(shutdown::ProcessorCleanupOwner::new(
+            Arc::clone(&processor_owner),
+            Arc::clone(&session_owner),
+        ));
+        if runtime_ticket.attach_cleanup(Arc::clone(&processor_cleanup_owner)).is_err() {
+            warn!("in-process processor cleanup custody unavailable");
+            return;
+        }
+        let processor_cleanup = Arc::clone(&processor_cleanup_owner);
+        let processor = Arc::clone(&processor_owner);
+        let session = Arc::clone(&session_owner);
+        let mut thread_created_rx = processor.thread_created_receiver();
+        let Ok(processor_handle) = runtime_ticket.spawn(shutdown::RuntimeTask::Processor, async move {
             let mut listen_for_threads = true;
 
             loop {
@@ -568,15 +625,13 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                 }
             }
 
-            processor.clear_runtime_references();
-            processor.cancel_active_login().await;
-            processor
-                .connection_closed(IN_PROCESS_CONNECTION_ID, &session)
-                .await;
-            processor.clear_all_thread_listeners().await;
-            processor.drain_background_tasks().await;
-            processor.shutdown_threads().await;
-        });
+            if processor_cleanup.drive().await == shutdown::ProcessorCleanupExecution::Panicked {
+                warn!("in-process processor cleanup panicked");
+            }
+        }) else {
+            warn!("in-process processor task custody unavailable");
+            return;
+        };
         let mut pending_request_responses =
             HashMap::<RequestId, oneshot::Sender<PendingClientRequestResponse>>::new();
         let mut shutdown_ack = None;
@@ -769,27 +824,31 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
             )));
         }
 
-        if let Err(_elapsed) = timeout(SHUTDOWN_TIMEOUT, &mut processor_handle).await {
-            processor_handle.abort();
-            let _ = processor_handle.await;
-        }
+        // The cleanup owner is retained independently of this task. Do not
+        // abort it on a nested timer: a joined processor is not a cleanup
+        // receipt, and aborting here would destroy the only cleanup driver.
+        let _ = processor_handle.join().await;
         let _ = outbound_shutdown_tx.send(());
-        if let Err(_elapsed) = timeout(SHUTDOWN_TIMEOUT, &mut outbound_handle).await {
-            outbound_handle.abort();
-            let _ = outbound_handle.await;
-        }
+        let _ = outbound_handle.join().await;
 
         analytics_events_flush_client.flush().await;
+
+        // Keep processor/session custody through the complete runtime tail,
+        // including an observed processor abort. This is not cleanup proof.
+        drop(processor_cleanup_owner);
+        drop(session_owner);
+        drop(processor_owner);
 
         if let Some(done_tx) = shutdown_ack {
             let _ = done_tx.send(());
         }
-    });
+    })?;
 
     Ok(InProcessClientHandle {
         client: InProcessClientSender { client_tx },
         event_rx,
         runtime_handle,
+        _custody: custody,
         #[cfg(test)]
         _test_codex_home: None,
     })
@@ -832,10 +891,10 @@ mod tests {
         }
     }
 
-    async fn start_test_client_with_capacity(
+    pub(super) async fn test_start_args(
         session_source: SessionSource,
         channel_capacity: usize,
-    ) -> InProcessClientHandle {
+    ) -> (InProcessStartArgs, TempDir) {
         let codex_home = TempDir::new().expect("temp dir");
         let config = Arc::new(build_test_config(codex_home.path()).await);
         let state_db = codex_rollout::state_db::try_init(config.as_ref())
@@ -866,6 +925,14 @@ mod tests {
             },
             channel_capacity,
         };
+        (args, codex_home)
+    }
+
+    async fn start_test_client_with_capacity(
+        session_source: SessionSource,
+        channel_capacity: usize,
+    ) -> InProcessClientHandle {
+        let (args, codex_home) = test_start_args(session_source, channel_capacity).await;
         let mut client = start(args).await.expect("in-process runtime should start");
         client._test_codex_home = Some(codex_home);
         client
@@ -993,7 +1060,8 @@ mod tests {
         let client = InProcessClientHandle {
             client: InProcessClientSender { client_tx },
             event_rx,
-            runtime_handle,
+            runtime_handle: Arc::new(shutdown::EmbeddedTaskOwner::from_handle(runtime_handle)),
+            _custody: Arc::new(shutdown::RuntimeCustody::default()),
             _test_codex_home: None,
         };
 

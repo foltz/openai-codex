@@ -9,6 +9,7 @@ workspace = true
 
 [dependencies]
 base64 = { workspace = true }
+bytes = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 codex-agent-identity = { workspace = true }
 codex-http-client = { workspace = true }
@@ -20,7 +21,11 @@ codex-protocol = { workspace = true }
 codex-secrets = { workspace = true }
 codex-terminal-detection = { workspace = true }
 codex-utils-template = { workspace = true }
+futures = { workspace = true }
 http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true, features = ["http1", "server"] }
+hyper-util = { workspace = true, features = ["tokio"] }
 once_cell = { workspace = true }
 os_info = { workspace = true }
 rand = { workspace = true }
@@ -28,7 +33,6 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
-tiny_http = { workspace = true }
 tokio = { workspace = true, features = [
     "io-std",
     "macros",
@@ -37,6 +41,7 @@ tokio = { workspace = true, features = [
     "signal",
 ] }
 tracing = { workspace = true }
+tokio-util = { workspace = true }
 url = { workspace = true }
 urlencoding = { workspace = true }
 webbrowser = { workspace = true }

@@ -11,7 +11,6 @@
 //! This module therefore keeps the user-facing error path and the structured-log path separate.
 //! Returned `io::Error` values still carry the detail needed by CLI/browser callers, while
 //! structured logs only emit explicitly reviewed fields plus redacted URL/error values.
-use std::io::Cursor;
 use std::io::Read;
 use std::io::Write;
 use std::io::{self};
@@ -21,6 +20,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::Mutex;
+use std::sync::Weak;
 use std::thread;
 use std::time::Duration;
 
@@ -47,14 +48,27 @@ use codex_protocol::auth::AuthMode;
 use codex_utils_template::Template;
 use rand::RngCore;
 use serde_json::Value as JsonValue;
-use tiny_http::Header;
-use tiny_http::Request;
-use tiny_http::Response;
-use tiny_http::Server;
-use tiny_http::StatusCode;
+use http::HeaderName;
+use http::HeaderValue;
+use http::StatusCode;
+use http_body_util::Full;
+use futures::FutureExt;
+use futures::future::BoxFuture;
+use futures::future::Shared;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
+
+mod callback_join;
+mod http_server;
+mod retirement;
+#[cfg(test)]
+#[path = "server/persistence_tests.rs"]
+mod persistence_tests;
+pub use retirement::LoginRetirement;
+pub use retirement::LoginRetirementReport;
+pub use retirement::LoginHttpReport;
+pub use retirement::LoginWorkerOutcome;
 
 pub(super) const DEFAULT_ISSUER: &str = "https://auth.openai.com";
 const DEFAULT_PORT: u16 = 1455;
@@ -64,6 +78,70 @@ static LOGIN_ERROR_PAGE_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
     Template::parse(include_str!("assets/error.html"))
         .unwrap_or_else(|err| panic!("login error page template must parse: {err}"))
 });
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PersistenceOutcome {
+    Joined,
+    Failed,
+    Panicked,
+    Cancelled,
+}
+
+#[derive(Default)]
+struct PersistenceState {
+    closed: bool,
+    work: Vec<Shared<BoxFuture<'static, PersistenceOutcome>>>,
+}
+
+#[derive(Default)]
+struct PersistenceRegistry(Mutex<PersistenceState>);
+
+impl PersistenceRegistry {
+    fn close(&self) {
+        if let Ok(mut state) = self.0.lock() {
+            state.closed = true;
+        }
+    }
+
+    fn spawn<F>(&self, operation: F) -> io::Result<Shared<BoxFuture<'static, PersistenceOutcome>>>
+    where
+        F: FnOnce() -> io::Result<()> + Send + 'static,
+    {
+        let mut state = self
+            .0
+            .lock()
+            .map_err(|_| io::Error::other("login persistence custody unavailable"))?;
+        if state.closed {
+            return Err(io::Error::other("login persistence admission closed"));
+        }
+        let handle = tokio::task::spawn_blocking(operation);
+        let work = async move {
+            match handle.await {
+                Ok(Ok(())) => PersistenceOutcome::Joined,
+                Ok(Err(_)) => PersistenceOutcome::Failed,
+                Err(error) if error.is_cancelled() => PersistenceOutcome::Cancelled,
+                Err(_) => PersistenceOutcome::Panicked,
+            }
+        }
+        .boxed()
+        .shared();
+        state.work.push(work.clone());
+        Ok(work)
+    }
+
+    async fn wait(&self) -> PersistenceOutcome {
+        let work = self
+            .0
+            .lock()
+            .map(|state| state.work.clone())
+            .unwrap_or_default();
+        futures::future::join_all(work)
+            .await
+            .into_iter()
+            .find(|outcome| !matches!(outcome, PersistenceOutcome::Joined))
+            .unwrap_or(PersistenceOutcome::Joined)
+    }
+}
 
 /// Options for launching the local login callback server.
 #[derive(Debug, Clone)]
@@ -113,7 +191,6 @@ impl ServerOptions {
 pub struct LoginServer {
     pub auth_url: String,
     pub actual_port: u16,
-    server_handle: tokio::task::JoinHandle<io::Result<LoginCallbackResult>>,
     shutdown_handle: ShutdownHandle,
 }
 
@@ -127,9 +204,15 @@ impl LoginServer {
 
     /// Waits for login to finish and returns allowlisted callback metadata.
     pub async fn block_until_done_with_callback_result(self) -> io::Result<LoginCallbackResult> {
-        self.server_handle
-            .await
-            .map_err(|err| io::Error::other(format!("login server thread panicked: {err:?}")))?
+        let callback = self.shutdown_handle.callback.take_result().await;
+        // Preserve the legacy login-result policy for response errors. The
+        // response owner retains failure independently for typed retirement.
+        self.shutdown_handle.http.close();
+        let http = self.shutdown_handle.http.wait().await;
+        if http.unavailable {
+            return Err(io::Error::other("login HTTP server retirement unavailable"));
+        }
+        callback
     }
 
     /// Requests shutdown of the callback server.
@@ -144,14 +227,19 @@ impl LoginServer {
 }
 
 /// Handle used to signal the login server loop to exit.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ShutdownHandle {
     shutdown_notify: Arc<tokio::sync::Notify>,
+    callback: Arc<callback_join::CallbackJoin>,
+    http: Arc<http_server::Server>,
+    persistence: Arc<PersistenceRegistry>,
+    retirement: Arc<retirement::RetirementSlot>,
 }
 
 impl ShutdownHandle {
     /// Signals the login loop to terminate.
     pub fn shutdown(&self) {
+        self.http.close();
         self.shutdown_notify.notify_one();
     }
 }
@@ -161,17 +249,13 @@ pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
     let pkce = generate_pkce();
     let state = opts.force_state.clone().unwrap_or_else(generate_state);
 
-    let server = bind_server(opts.port)?;
-    let actual_port = match server.server_addr().to_ip() {
-        Some(addr) => addr.port(),
-        None => {
-            return Err(io::Error::new(
-                io::ErrorKind::AddrInUse,
-                "Unable to determine the server port",
-            ));
-        }
-    };
-    let server = Arc::new(server);
+    let listener = bind_server(opts.port)?;
+    let actual_port = listener.local_addr()?.port();
+    listener.set_nonblocking(true)?;
+    let listener = tokio::net::TcpListener::from_std(listener)?;
+    let (http, mut rx) = http_server::Server::start(listener)?;
+    let http = Arc::new(http);
+    let persistence = Arc::new(PersistenceRegistry::default());
 
     let redirect_uri = format!("http://localhost:{actual_port}/auth/callback");
     let auth_url = build_authorize_url(
@@ -187,28 +271,11 @@ pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
         let _ = webbrowser::open(&auth_url);
     }
 
-    // Map blocking reads from server.recv() to an async channel.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Request>(16);
-    let _server_handle = {
-        let server = server.clone();
-        thread::spawn(move || -> io::Result<()> {
-            while let Ok(request) = server.recv() {
-                match tx.blocking_send(request) {
-                    Ok(()) => {}
-                    Err(error) => {
-                        eprintln!("Failed to send request to channel: {error}");
-                        return Err(io::Error::other("Failed to send request to channel"));
-                    }
-                }
-            }
-            Ok(())
-        })
-    };
-
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
     let server_handle = {
         let shutdown_notify = shutdown_notify.clone();
-        let server = server;
+        let http = Arc::clone(&http);
+        let persistence = Arc::downgrade(&persistence);
         tokio::spawn(async move {
             let mut callback_result = LoginCallbackResult::default();
             let result = loop {
@@ -221,7 +288,7 @@ pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
                             break Err(io::Error::other("Login was not completed"));
                         };
 
-                        let url_raw = req.url().to_string();
+                        let url_raw = req.url.clone();
                         let response =
                             process_request(
                                 &url_raw,
@@ -230,56 +297,36 @@ pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
                                 &pkce,
                                 actual_port,
                                 &state,
+                                &persistence,
                             )
                             .await;
 
                         let exit_result = match response {
                             HandledRequest::Response(response) => {
-                                let _ = tokio::task::spawn_blocking(move || req.respond(response)).await;
+                                let _ = req.respond(response).await;
                                 None
                             }
                             HandledRequest::RedirectWithHeader { header, result } => {
                                 callback_result = result;
-                                let redirect = Response::empty(302).with_header(header);
-                                let _ = tokio::task::spawn_blocking(move || req.respond(redirect)).await;
+                                let redirect = response_with_headers(StatusCode::FOUND, vec![header], Vec::new());
+                                let _ = req.respond(redirect).await;
                                 None
                             }
-                            HandledRequest::ResponseAndExit {
-                                headers,
-                                body,
-                                result,
-                            } => {
-                                let _ = tokio::task::spawn_blocking(move || {
-                                    send_response_with_disconnect(
-                                        req,
-                                        StatusCode(200),
-                                        headers,
-                                        body,
-                                    )
+                            HandledRequest::ResponseAndExit { response, result } => {
+                                Some(match req.respond(response).await {
+                                    Ok(()) => result.map(|()| callback_result),
+                                    Err(err) => Err(err),
                                 })
-                                .await;
-                                Some(result.map(|()| callback_result))
                             }
                             HandledRequest::RedirectAndExit { header, result } => {
-                                match tokio::task::spawn_blocking(move || {
-                                    send_response_with_disconnect(
-                                        req,
-                                        StatusCode(302),
-                                        vec![header],
-                                        Vec::new(),
-                                    )
+                                Some(match req.respond(response_with_headers(
+                                    StatusCode::FOUND,
+                                    vec![header],
+                                    Vec::new(),
+                                )).await {
+                                    Ok(()) => Ok(result),
+                                    Err(err) => Err(err),
                                 })
-                                .await
-                                {
-                                    Ok(Ok(())) => {}
-                                    Ok(Err(err)) => {
-                                        warn!("failed to send hosted login redirect: {err}");
-                                    }
-                                    Err(err) => {
-                                        warn!("hosted login redirect task failed: {err}");
-                                    }
-                                }
-                                Some(Ok(result))
                             }
                         };
 
@@ -290,9 +337,10 @@ pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
                 }
             };
 
-            // Ensure that the server is unblocked so the thread dedicated to
-            // running `server.recv()` in a loop exits cleanly.
-            server.unblock();
+            http.close();
+            if let Some(persistence) = persistence.upgrade() {
+                persistence.close();
+            }
             result
         })
     };
@@ -300,25 +348,29 @@ pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
     Ok(LoginServer {
         auth_url,
         actual_port,
-        server_handle,
-        shutdown_handle: ShutdownHandle { shutdown_notify },
+        shutdown_handle: ShutdownHandle {
+            shutdown_notify,
+            callback: Arc::new(callback_join::CallbackJoin::new(server_handle)),
+            http,
+            persistence,
+            retirement: Arc::new(retirement::RetirementSlot::default()),
+        },
     })
 }
 
 /// Internal callback handling outcome.
 enum HandledRequest {
-    Response(Response<Cursor<Vec<u8>>>),
+    Response(http_server::Response),
     RedirectWithHeader {
-        header: Header,
+        header: (HeaderName, HeaderValue),
         result: LoginCallbackResult,
     },
     RedirectAndExit {
-        header: Header,
+        header: (HeaderName, HeaderValue),
         result: LoginCallbackResult,
     },
     ResponseAndExit {
-        headers: Vec<Header>,
-        body: Vec<u8>,
+        response: http_server::Response,
         result: io::Result<()>,
     },
 }
@@ -330,14 +382,17 @@ async fn process_request(
     pkce: &PkceCodes,
     actual_port: u16,
     state: &str,
+    persistence: &Weak<PersistenceRegistry>,
 ) -> HandledRequest {
     let parsed_url = match url::Url::parse(&format!("http://localhost{url_raw}")) {
         Ok(u) => u,
         Err(e) => {
             eprintln!("URL parse error: {e}");
-            return HandledRequest::Response(
-                Response::from_string("Bad Request").with_status_code(400),
-            );
+                return HandledRequest::Response(response_with_headers(
+                    StatusCode::BAD_REQUEST,
+                    Vec::new(),
+                    b"Bad Request".to_vec(),
+                ));
         }
     };
     let path = parsed_url.path().to_string();
@@ -369,9 +424,11 @@ async fn process_request(
                     has_error,
                     "login callback state mismatch"
                 );
-                return HandledRequest::Response(
-                    Response::from_string("State mismatch").with_status_code(400),
-                );
+                return HandledRequest::Response(response_with_headers(
+                    StatusCode::BAD_REQUEST,
+                    Vec::new(),
+                    b"State mismatch".to_vec(),
+                ));
             }
             if let Some(error_code) = params.get("error") {
                 let error_description = params.get("error_description").map(String::as_str);
@@ -434,7 +491,7 @@ async fn process_request(
                     )
                     .await
                     .ok();
-                    if let Err(err) = persist_tokens_async(
+                    if let Err(err) = persist_tokens_for_login(
                         &opts.codex_home,
                         api_key.clone(),
                         tokens.id_token.clone(),
@@ -442,6 +499,7 @@ async fn process_request(
                         tokens.refresh_token.clone(),
                         opts.cli_auth_credentials_store_mode,
                         opts.auth_keyring_backend_kind,
+                        persistence,
                     )
                     .await
                     {
@@ -465,14 +523,14 @@ async fn process_request(
                     let url = match &redirect {
                         LoginSuccessRedirect::Local(url) | LoginSuccessRedirect::Hosted(url) => url,
                     };
-                    match tiny_http::Header::from_bytes(&b"Location"[..], url.as_bytes()) {
+                    match HeaderValue::from_str(url) {
                         Ok(header) => match redirect {
                             LoginSuccessRedirect::Local(_) => HandledRequest::RedirectWithHeader {
-                                header,
+                                header: (http::header::LOCATION, header),
                                 result: callback_result,
                             },
                             LoginSuccessRedirect::Hosted(_) => HandledRequest::RedirectAndExit {
-                                header,
+                                header: (http::header::LOCATION, header),
                                 result: callback_result,
                             },
                         },
@@ -506,71 +564,45 @@ async fn process_request(
                 include_str!("assets/success_legacy.html")
             };
             HandledRequest::ResponseAndExit {
-                headers: match Header::from_bytes(
-                    &b"Content-Type"[..],
-                    &b"text/html; charset=utf-8"[..],
-                ) {
-                    Ok(header) => vec![header],
-                    Err(_) => Vec::new(),
-                },
-                body: body.as_bytes().to_vec(),
+                response: response_with_headers(
+                    StatusCode::OK,
+                    vec![(
+                        http::header::CONTENT_TYPE,
+                        HeaderValue::from_static("text/html; charset=utf-8"),
+                    )],
+                    body.as_bytes().to_vec(),
+                ),
                 result: Ok(()),
             }
         }
         "/cancel" => HandledRequest::ResponseAndExit {
-            headers: Vec::new(),
-            body: b"Login cancelled".to_vec(),
+            response: response_with_headers(
+                StatusCode::OK,
+                Vec::new(),
+                b"Login cancelled".to_vec(),
+            ),
             result: Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "Login cancelled",
             )),
         },
-        _ => HandledRequest::Response(Response::from_string("Not Found").with_status_code(404)),
+        _ => HandledRequest::Response(response_with_headers(
+            StatusCode::NOT_FOUND,
+            Vec::new(),
+            b"Not Found".to_vec(),
+        )),
     }
 }
 
-/// tiny_http filters `Connection` headers out of `Response` objects, so using
-/// `req.respond` never informs the client (or the library) that a keep-alive
-/// socket should be closed. That leaves the per-connection worker parked in a
-/// loop waiting for more requests, which in turn causes the next login attempt
-/// to hang on the old connection. This helper bypasses tiny_http’s response
-/// machinery: it extracts the raw writer, prints the HTTP response manually,
-/// and always appends `Connection: close`, ensuring the socket is closed from
-/// the server side. Ideally, tiny_http would provide an API to control
-/// server-side connection persistence, but it does not.
-fn send_response_with_disconnect(
-    req: Request,
+fn response_with_headers(
     status: StatusCode,
-    mut headers: Vec<Header>,
+    headers: Vec<(HeaderName, HeaderValue)>,
     body: Vec<u8>,
-) -> io::Result<()> {
-    let mut writer = req.into_writer();
-    let reason = status.default_reason_phrase();
-    write!(writer, "HTTP/1.1 {} {}\r\n", status.0, reason)?;
-    headers.retain(|h| !h.field.equiv("Connection"));
-    if let Ok(close_header) = Header::from_bytes(&b"Connection"[..], &b"close"[..]) {
-        headers.push(close_header);
-    }
-
-    let content_length_value = format!("{}", body.len());
-    if let Ok(content_length_header) =
-        Header::from_bytes(&b"Content-Length"[..], content_length_value.as_bytes())
-    {
-        headers.push(content_length_header);
-    }
-
-    for header in headers {
-        write!(
-            writer,
-            "{}: {}\r\n",
-            header.field.as_str(),
-            header.value.as_str()
-        )?;
-    }
-
-    writer.write_all(b"\r\n")?;
-    writer.write_all(&body)?;
-    writer.flush()
+) -> http_server::Response {
+    let mut response = http::Response::new(Full::new(bytes::Bytes::from(body)));
+    *response.status_mut() = status;
+    response.headers_mut().extend(headers);
+    response
 }
 
 fn build_authorize_url(
@@ -634,7 +666,7 @@ fn send_cancel_request(port: u16) -> io::Result<()> {
     Ok(())
 }
 
-fn bind_server(port: u16) -> io::Result<Server> {
+fn bind_server(port: u16) -> io::Result<std::net::TcpListener> {
     let preferred_bind_address = format!("127.0.0.1:{port}");
     let fallback_bind_address = format!("127.0.0.1:{FALLBACK_PORT}");
     let mut bind_address = preferred_bind_address.clone();
@@ -645,14 +677,11 @@ fn bind_server(port: u16) -> io::Result<Server> {
     const RETRY_DELAY: Duration = Duration::from_millis(200);
 
     loop {
-        match Server::http(&bind_address) {
-            Ok(server) => return Ok(server),
+        match std::net::TcpListener::bind(&bind_address) {
+            Ok(listener) => return Ok(listener),
             Err(err) => {
                 attempts += 1;
-                let is_addr_in_use = err
-                    .downcast_ref::<io::Error>()
-                    .map(|io_err| io_err.kind() == io::ErrorKind::AddrInUse)
-                    .unwrap_or(false);
+                let is_addr_in_use = err.kind() == io::ErrorKind::AddrInUse;
 
                 // If the address is in use, there may be another instance of the login server
                 // running. Attempt to cancel it and retry before falling back.
@@ -892,39 +921,91 @@ pub(crate) async fn persist_tokens_async(
     auth_credentials_store_mode: AuthCredentialsStoreMode,
     keyring_backend_kind: AuthKeyringBackendKind,
 ) -> io::Result<()> {
-    // Reuse existing synchronous logic but run it off the async runtime.
     let codex_home = codex_home.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let mut tokens = TokenData {
-            id_token: parse_chatgpt_jwt_claims(&id_token).map_err(io::Error::other)?,
+        persist_tokens_blocking(
+            &codex_home,
+            api_key,
+            id_token,
             access_token,
             refresh_token,
-            account_id: None,
-        };
-        if let Some(acc) = jwt_auth_claims(&id_token)
-            .get("chatgpt_account_id")
-            .and_then(|v| v.as_str())
-        {
-            tokens.account_id = Some(acc.to_string());
-        }
-        let auth = AuthDotJson {
-            auth_mode: Some(AuthMode::Chatgpt),
-            openai_api_key: api_key,
-            tokens: Some(tokens),
-            last_refresh: Some(Utc::now()),
-            agent_identity: None,
-            personal_access_token: None,
-            bedrock_api_key: None,
-        };
-        save_auth(
-            &codex_home,
-            &auth,
             auth_credentials_store_mode,
             keyring_backend_kind,
         )
     })
     .await
     .map_err(|e| io::Error::other(format!("persist task failed: {e}")))?
+}
+
+async fn persist_tokens_for_login(
+    codex_home: &Path,
+    api_key: Option<String>,
+    id_token: String,
+    access_token: String,
+    refresh_token: String,
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
+    keyring_backend_kind: AuthKeyringBackendKind,
+    registry: &Weak<PersistenceRegistry>,
+) -> io::Result<()> {
+    let registry = registry
+        .upgrade()
+        .ok_or_else(|| io::Error::other("login persistence custody unavailable"))?;
+    let codex_home = codex_home.to_path_buf();
+    let work = registry.spawn(move || {
+        persist_tokens_blocking(
+            &codex_home,
+            api_key,
+            id_token,
+            access_token,
+            refresh_token,
+            auth_credentials_store_mode,
+            keyring_backend_kind,
+        )
+    })?;
+    match work.await {
+        PersistenceOutcome::Joined => Ok(()),
+        PersistenceOutcome::Failed => Err(io::Error::other("credential persistence failed")),
+        PersistenceOutcome::Cancelled => Err(io::Error::other("credential persistence cancelled")),
+        PersistenceOutcome::Panicked => Err(io::Error::other("credential persistence panicked")),
+    }
+}
+
+fn persist_tokens_blocking(
+    codex_home: &Path,
+    api_key: Option<String>,
+    id_token: String,
+    access_token: String,
+    refresh_token: String,
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
+    keyring_backend_kind: AuthKeyringBackendKind,
+) -> io::Result<()> {
+    let mut tokens = TokenData {
+        id_token: parse_chatgpt_jwt_claims(&id_token).map_err(io::Error::other)?,
+        access_token,
+        refresh_token,
+        account_id: None,
+    };
+    if let Some(acc) = jwt_auth_claims(&id_token)
+        .get("chatgpt_account_id")
+        .and_then(|v| v.as_str())
+    {
+        tokens.account_id = Some(acc.to_string());
+    }
+    let auth = AuthDotJson {
+        auth_mode: Some(AuthMode::Chatgpt),
+        openai_api_key: api_key,
+        tokens: Some(tokens),
+        last_refresh: Some(Utc::now()),
+        agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
+    };
+    save_auth(
+        codex_home,
+        &auth,
+        auth_credentials_store_mode,
+        keyring_backend_kind,
+    )
 }
 
 /// Validates the ID token against an optional workspace restriction.
@@ -972,14 +1053,16 @@ fn login_error_response(
     error_code: Option<&str>,
     error_description: Option<&str>,
 ) -> HandledRequest {
-    let mut headers = Vec::new();
-    if let Ok(header) = Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]) {
-        headers.push(header);
-    }
     let body = render_login_error_page(message, error_code, error_description);
     HandledRequest::ResponseAndExit {
-        headers,
-        body,
+        response: response_with_headers(
+            StatusCode::OK,
+            vec![(
+                http::header::CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            )],
+            body,
+        ),
         result: Err(io::Error::new(kind, message.to_string())),
     }
 }

@@ -414,7 +414,6 @@ use codex_login::login_with_api_key;
 use codex_login::login_with_bedrock_api_key;
 use codex_login::oauth_client_id;
 use codex_login::request_device_code;
-use codex_login::run_login_server;
 use codex_mcp::McpRuntimeContext;
 use codex_mcp::McpServerStatusSnapshot;
 use codex_mcp::McpSnapshotDetail;
@@ -518,7 +517,6 @@ use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tokio_util::sync::DropGuard;
-use tokio_util::task::TaskTracker;
 use toml::Value as TomlValue;
 use tracing::Instrument;
 use tracing::error;
@@ -557,8 +555,12 @@ mod token_usage_replay;
 mod turn_processor;
 mod windows_sandbox_processor;
 
+pub(crate) use account_processor::AccountLoginReport;
+pub(crate) use account_processor::AccountLoginShutdown;
 pub(crate) use account_processor::AccountRequestProcessor;
 pub(crate) use apps_processor::AppsRequestProcessor;
+pub(crate) use apps_processor::AppsRuntimeDrain;
+pub(crate) use apps_processor::AppsShutdown;
 pub(crate) use catalog_processor::CatalogRequestProcessor;
 pub(crate) use command_exec_processor::CommandExecRequestProcessor;
 pub(crate) use config_processor::ConfigRequestProcessor;
@@ -575,7 +577,13 @@ pub(crate) use process_exec_processor::ProcessExecRequestProcessor;
 pub(crate) use remote_control_processor::RemoteControlRequestProcessor;
 pub(crate) use search::SearchRequestProcessor;
 pub(crate) use thread_goal_processor::ThreadGoalRequestProcessor;
+pub(crate) use thread_processor::ProcessorThreadRetirement;
+pub(crate) use thread_processor::ProcessorThreadShutdown;
 pub(crate) use thread_processor::ThreadRequestProcessor;
+#[cfg(test)]
+pub(crate) use thread_processor::ThreadShutdownOwner;
+#[cfg(test)]
+pub(crate) use thread_processor::thread_shutdown_fixture;
 pub(crate) use turn_processor::TurnRequestProcessor;
 pub(crate) use windows_sandbox_processor::WindowsSandboxRequestProcessor;
 

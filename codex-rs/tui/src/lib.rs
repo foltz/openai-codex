@@ -32,6 +32,7 @@ use codex_app_server_client::AppServerClient;
 use codex_app_server_client::DEFAULT_IN_PROCESS_CHANNEL_CAPACITY;
 use codex_app_server_client::InProcessAppServerClient;
 use codex_app_server_client::InProcessClientStartArgs;
+use codex_app_server_client::InProcessHost;
 use codex_app_server_client::RemoteAppServerClient;
 use codex_app_server_client::RemoteAppServerConnectArgs;
 pub use codex_app_server_client::RemoteAppServerEndpoint;
@@ -287,6 +288,7 @@ async fn start_embedded_app_server(
     log_db: Option<log_db::LogDbLayer>,
     state_db: Option<StateDbHandle>,
     environment_manager: Arc<EnvironmentManager>,
+    host: Arc<InProcessHost>,
 ) -> color_eyre::Result<InProcessAppServerClient> {
     start_embedded_app_server_with(
         arg0_paths,
@@ -299,7 +301,7 @@ async fn start_embedded_app_server(
         log_db,
         state_db,
         environment_manager,
-        InProcessAppServerClient::start,
+        move |args| InProcessAppServerClient::start_in_host(Arc::clone(&host), args),
     )
     .await
 }
@@ -522,6 +524,7 @@ async fn start_app_server(
     log_db: Option<log_db::LogDbLayer>,
     state_db: &mut Option<StateDbHandle>,
     environment_manager: Arc<EnvironmentManager>,
+    embedded_host: Option<Arc<InProcessHost>>,
 ) -> color_eyre::Result<AppServerClient> {
     let connection = if matches!(target, AppServerTarget::Embedded) {
         None
@@ -564,6 +567,9 @@ async fn start_app_server(
         log_db,
         state_db.clone(),
         environment_manager,
+        embedded_host.ok_or_else(|| {
+            color_eyre::eyre::eyre!("embedded app-server host was not retained")
+        })?,
     )
     .await
     .map(AppServerClient::InProcess)
@@ -577,6 +583,7 @@ pub(crate) async fn start_app_server_for_picker(
 ) -> color_eyre::Result<AppServerSession> {
     let mut target = target.clone();
     let mut state_db = state_db;
+    let embedded_host = Some(Arc::new(InProcessHost::default()));
     let app_server = start_app_server(
         &mut target,
         Arg0DispatchPaths::default(),
@@ -589,6 +596,7 @@ pub(crate) async fn start_app_server_for_picker(
         /*log_db*/ None,
         &mut state_db,
         environment_manager,
+        embedded_host,
     )
     .await?;
     Ok(
@@ -615,6 +623,7 @@ pub(crate) async fn start_embedded_app_server_for_picker(
         /*log_db*/ None,
         &mut state_db,
         Arc::new(EnvironmentManager::default_for_tests()),
+        Some(Arc::new(InProcessHost::default())),
     )
     .await?;
     Ok(
@@ -1144,6 +1153,8 @@ async fn run_ratatui_app(
     // Initialize high-fidelity session event logging if enabled.
     session_log::maybe_init(&initial_config);
 
+    // Retain host custody before cancellable startup, including daemon fallback.
+    let embedded_host = Some(Arc::new(InProcessHost::default()));
     let startup_app_server = startup_draft
         .run_until(
             &mut tui,
@@ -1159,6 +1170,7 @@ async fn run_ratatui_app(
                 log_db.clone(),
                 &mut state_db,
                 environment_manager.clone(),
+                embedded_host,
             ),
         )
         .await;
@@ -1721,6 +1733,7 @@ async fn run_ratatui_app(
                     log_db.clone(),
                     &mut state_db,
                     environment_manager.clone(),
+                    Some(Arc::new(InProcessHost::default())),
                 ),
             )
             .await
@@ -1804,6 +1817,7 @@ async fn run_ratatui_app(
                     log_db.clone(),
                     &mut state_db,
                     environment_manager.clone(),
+                    Some(Arc::new(InProcessHost::default())),
                 )
                 .await?;
                 app_server = AppServerSession::new(client, app_server_target.thread_params_mode())
@@ -2594,6 +2608,7 @@ requires_openai_auth = {requires_openai_auth}
             /*log_db*/ None,
             state_db,
             Arc::new(EnvironmentManager::default_for_tests()),
+            Arc::new(InProcessHost::default()),
         )
         .await
     }

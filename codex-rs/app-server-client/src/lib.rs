@@ -310,6 +310,10 @@ pub struct InProcessAppServerClient {
     command_tx: mpsc::Sender<ClientCommand>,
     event_rx: mpsc::UnboundedReceiver<InProcessServerEvent>,
     worker_handle: tokio::task::JoinHandle<()>,
+    // Keep the caller-provided host alive for the entire facade lifetime. The
+    // worker also captures this host so a bounded shutdown observer may drop
+    // its JoinHandle without discarding the runtime custody.
+    _host: Arc<InProcessHost>,
 }
 
 #[derive(Clone)]
@@ -359,11 +363,12 @@ impl InProcessAppServerClient {
         // unbounded; commands and the embedded runtime stay bounded and events remain ordered.
         let (event_tx, event_rx) = mpsc::unbounded_channel::<InProcessServerEvent>();
 
+        let worker_host = Arc::clone(&host);
         let worker_handle = tokio::spawn(async move {
             // Keep the host alive if the caller's bounded observer returns
             // incomplete and drops its JoinHandle. The worker owns the same
             // low-level client/host pair and remains the durable observer.
-            let _host = host;
+            let _host = worker_host;
             let mut event_stream_enabled = true;
             loop {
                 tokio::select! {
@@ -462,6 +467,7 @@ impl InProcessAppServerClient {
             command_tx,
             event_rx,
             worker_handle,
+            _host: host,
         })
     }
 
@@ -624,6 +630,7 @@ impl InProcessAppServerClient {
             command_tx,
             event_rx,
             worker_handle,
+            _host,
         } = self;
         let mut worker_handle = worker_handle;
         // Stop forwarding caller-facing events before asking the worker to shut down.
@@ -2060,6 +2067,7 @@ mod tests {
             command_tx,
             event_rx,
             worker_handle,
+            _host: Arc::new(InProcessHost::default()),
         };
 
         let event = timeout(Duration::from_secs(2), client.next_event())
@@ -2167,6 +2175,7 @@ mod tests {
             command_tx,
             event_rx,
             worker_handle,
+            _host: Arc::new(InProcessHost::default()),
         };
 
         client.shutdown().await.expect("shutdown should complete");

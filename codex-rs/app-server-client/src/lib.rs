@@ -29,6 +29,7 @@ use std::time::Duration;
 
 pub use codex_app_server::app_server_control_socket_path;
 pub use codex_app_server::in_process::DEFAULT_IN_PROCESS_CHANNEL_CAPACITY;
+pub use codex_app_server::in_process::InProcessHost;
 pub use codex_app_server::in_process::InProcessServerEvent;
 use codex_app_server::in_process::InProcessStartArgs;
 use codex_app_server::in_process::LogDbLayer;
@@ -327,10 +328,24 @@ impl InProcessAppServerClient {
     ///
     /// The returned client is ready for requests and ordered event consumption.
     /// Request queues remain bounded without blocking on unread notifications.
+    #[deprecated(note = "use start_in_host with host custody retained by the embedding caller")]
     pub async fn start(args: InProcessClientStartArgs) -> IoResult<Self> {
+        let host = Arc::new(InProcessHost::default());
+        Self::start_in_host(host, args).await
+    }
+
+    /// Starts an embedded client with custody supplied before the first
+    /// cancellable await. The caller must retain the host through startup and
+    /// any incomplete shutdown report; the worker also retains it while the
+    /// facade is alive so a timed-out observer cannot discard runtime custody.
+    pub async fn start_in_host(
+        host: Arc<InProcessHost>,
+        args: InProcessClientStartArgs,
+    ) -> IoResult<Self> {
         let channel_capacity = args.channel_capacity.max(1);
         let mut handle =
-            codex_app_server::in_process::start(args.into_runtime_start_args()).await?;
+            codex_app_server::in_process::start_in_host(&host, args.into_runtime_start_args())
+                .await?;
         let request_sender = handle.sender();
         let (command_tx, mut command_rx) = mpsc::channel::<ClientCommand>(channel_capacity);
         // e9996ec62a preserved transcript events by awaiting a bounded queue, but that can
@@ -340,6 +355,10 @@ impl InProcessAppServerClient {
         let (event_tx, event_rx) = mpsc::unbounded_channel::<InProcessServerEvent>();
 
         let worker_handle = tokio::spawn(async move {
+            // Keep the host alive if the caller's bounded observer returns
+            // incomplete and drops its JoinHandle. The worker owns the same
+            // low-level client/host pair and remains the durable observer.
+            let _host = host;
             let mut event_stream_enabled = true;
             loop {
                 tokio::select! {
@@ -592,8 +611,9 @@ impl InProcessAppServerClient {
 
     /// Shuts down worker and in-process runtime with bounded wait.
     ///
-    /// If graceful shutdown exceeds timeout, the worker task is aborted to
-    /// avoid leaking background tasks in embedding callers.
+    /// If graceful shutdown exceeds the bound, returns an incomplete I/O
+    /// error. The worker is deliberately not aborted: its host-owned runtime
+    /// and cleanup receipts remain observable after this caller returns.
     pub async fn shutdown(self) -> IoResult<()> {
         let Self {
             command_tx,
@@ -618,9 +638,14 @@ impl InProcessAppServerClient {
             })??;
         }
 
-        if let Err(_elapsed) = timeout(IN_PROCESS_SHUTDOWN_TIMEOUT, &mut worker_handle).await {
-            worker_handle.abort();
-            let _ = worker_handle.await;
+        if timeout(IN_PROCESS_SHUTDOWN_TIMEOUT, &mut worker_handle)
+            .await
+            .is_err()
+        {
+            return Err(IoError::new(
+                ErrorKind::TimedOut,
+                "in-process app-server worker shutdown timed out",
+            ));
         }
         Ok(())
     }

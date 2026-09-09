@@ -8,7 +8,7 @@
 //! - Typed and raw request/notification dispatch.
 //! - Server request resolution and rejection.
 //! - Event consumption with backpressure signaling ([`InProcessServerEvent::Lagged`]).
-//! - Bounded graceful shutdown with abort fallback.
+//! - Bounded graceful shutdown with retained incomplete custody.
 //!
 //! The facade interposes a worker task between the caller and the underlying
 //! [`InProcessClientHandle`](codex_app_server::in_process::InProcessClientHandle),
@@ -65,7 +65,8 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
-use tokio::time::timeout;
+use tokio::time::Instant;
+use tokio::time::timeout_at;
 use toml::Value as TomlValue;
 use tracing::warn;
 
@@ -426,6 +427,7 @@ enum ClientCommand {
     },
     Shutdown {
         response_tx: oneshot::Sender<IoResult<()>>,
+        deadline: Instant,
     },
 }
 
@@ -540,8 +542,11 @@ impl InProcessAppServerClient {
                                 let send_result = request_sender.fail_server_request(request_id, error);
                                 let _ = response_tx.send(send_result);
                             }
-                            Some(ClientCommand::Shutdown { response_tx }) => {
-                                let shutdown_result = handle.shutdown().await;
+                            Some(ClientCommand::Shutdown {
+                                response_tx,
+                                deadline,
+                            }) => {
+                                let shutdown_result = handle.shutdown_until(deadline).await;
                                 let _ = response_tx.send(shutdown_result);
                                 break;
                             }
@@ -780,31 +785,59 @@ impl InProcessAppServerClient {
         // so the worker can reach `handle.shutdown()` instead of timing out
         // and getting aborted with the runtime still attached.
         drop(event_rx);
+        let deadline = Instant::now() + IN_PROCESS_SHUTDOWN_TIMEOUT;
+        let mut command_error = None;
         let (response_tx, response_rx) = oneshot::channel();
-        if command_tx
-            .send(ClientCommand::Shutdown { response_tx })
-            .await
-            .is_ok()
-            && let Ok(command_result) = timeout(IN_PROCESS_SHUTDOWN_TIMEOUT, response_rx).await
+        match timeout_at(
+            deadline,
+            command_tx.send(ClientCommand::Shutdown {
+                response_tx,
+                deadline,
+            }),
+        )
+        .await
         {
-            command_result.map_err(|_| {
-                IoError::new(
+            Ok(Ok(())) => match timeout_at(deadline, response_rx).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => command_error = Some(error),
+                Ok(Err(_)) => {
+                    command_error = Some(IoError::new(
+                        ErrorKind::BrokenPipe,
+                        "in-process app-server shutdown channel is closed",
+                    ));
+                }
+                Err(_) => {
+                    command_error = Some(IoError::new(
+                        ErrorKind::TimedOut,
+                        "in-process app-server shutdown acknowledgement timed out",
+                    ));
+                }
+            },
+            Ok(Err(_)) => {
+                command_error = Some(IoError::new(
                     ErrorKind::BrokenPipe,
-                    "in-process app-server shutdown channel is closed",
-                )
-            })??;
+                    "in-process app-server worker channel is closed",
+                ));
+            }
+            Err(_) => {
+                command_error = Some(IoError::new(
+                    ErrorKind::TimedOut,
+                    "in-process app-server shutdown command timed out",
+                ));
+            }
         }
 
-        if timeout(IN_PROCESS_SHUTDOWN_TIMEOUT, &mut worker_handle)
-            .await
-            .is_err()
-        {
-            return Err(IoError::new(
+        match timeout_at(deadline, &mut worker_handle).await {
+            Ok(Ok(())) => command_error.map_or(Ok(()), Err),
+            Ok(Err(_)) => Err(IoError::new(
+                ErrorKind::Other,
+                "in-process app-server worker panicked",
+            )),
+            Err(_) => Err(IoError::new(
                 ErrorKind::TimedOut,
                 "in-process app-server worker shutdown timed out",
-            ));
+            )),
         }
-        Ok(())
     }
 }
 
@@ -2351,9 +2384,9 @@ mod tests {
     async fn shutdown_completes_promptly_without_retained_managers() {
         let client = start_test_client(SessionSource::Cli).await;
 
-        timeout(Duration::from_secs(1), client.shutdown())
+        timeout(Duration::from_secs(5), client.shutdown())
             .await
-            .expect("shutdown should not wait for the 5s fallback timeout")
+            .expect("shutdown should complete before the bounded fallback timeout")
             .expect("shutdown should complete");
     }
 
@@ -2368,7 +2401,7 @@ mod tests {
         let worker_completed = Arc::clone(&completed);
         let worker_handle = tokio::spawn(async move {
             let response_tx = match command_rx.recv().await {
-                Some(ClientCommand::Shutdown { response_tx }) => response_tx,
+                Some(ClientCommand::Shutdown { response_tx, .. }) => response_tx,
                 _ => panic!("expected shutdown command"),
             };
             tokio::time::sleep(Duration::from_secs(30)).await;

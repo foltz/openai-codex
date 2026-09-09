@@ -161,7 +161,8 @@ fn retention_refusal_reason(error: RetentionAuthorityError) -> ThreadRetentionRe
         RetentionAuthorityError::IneligiblePrincipal => {
             ThreadRetentionRefusalReason::IneligiblePrincipal
         }
-        RetentionAuthorityError::AuthorityUnavailable => {
+        RetentionAuthorityError::AuthorityUnavailable
+        | RetentionAuthorityError::LifecycleClosed => {
             ThreadRetentionRefusalReason::AuthorityUnavailable
         }
         // Self-retention is an ineligible authorization shape, not a separate
@@ -169,6 +170,35 @@ fn retention_refusal_reason(error: RetentionAuthorityError) -> ThreadRetentionRe
         // kernel makes the structural invariant explicit.
         RetentionAuthorityError::SelfRetention => ThreadRetentionRefusalReason::IneligiblePrincipal,
         RetentionAuthorityError::UnknownThread => ThreadRetentionRefusalReason::UnknownThread,
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProcessorBackgroundShutdown {
+    pub models: crate::models_refresh_worker::ModelsRefreshShutdown,
+    pub thread_starts: crate::processor_task_retirement::ProcessorTaskDrain,
+    pub apps: crate::request_processors::AppsShutdown,
+    pub skills: crate::skills_watcher::SkillsWatcherShutdown,
+}
+
+impl ProcessorBackgroundShutdown {
+    pub(crate) fn is_clean(&self) -> bool {
+        matches!(
+            self.models,
+            crate::models_refresh_worker::ModelsRefreshShutdown::Joined
+        ) && self.thread_starts.is_clean()
+            && self.apps.tasks.is_clean()
+            && !self.apps.runtimes.unavailable
+            && self
+                .apps
+                .runtimes
+                .reports
+                .iter()
+                .all(codex_mcp::RuntimeTerminationReport::is_complete)
+            && matches!(
+                self.skills,
+                crate::skills_watcher::SkillsWatcherShutdown::Joined
+            )
     }
 }
 
@@ -180,6 +210,7 @@ pub(crate) struct MessageProcessor {
     turn_cost_worker: Option<TurnCostWorker>,
     skills_watcher: Arc<SkillsWatcher>,
     account_processor: Arc<AccountRequestProcessor>,
+    account_tasks: crate::processor_task_retirement::ProcessorTasks,
     apps_processor: AppsRequestProcessor,
     catalog_processor: CatalogRequestProcessor,
     command_exec_processor: CommandExecRequestProcessor,
@@ -504,6 +535,9 @@ impl MessageProcessor {
                 config_processor.clone(),
                 request_serialization_queues.clone(),
             );
+        // Account tasks capture processor clones, so their strong census must
+        // remain outside that cloneable object.
+        let account_tasks = crate::processor_task_retirement::ProcessorTasks::default();
         let account_processor = AccountRequestProcessor::new(
             auth_manager.clone(),
             Arc::clone(&thread_manager),
@@ -511,6 +545,7 @@ impl MessageProcessor {
             Arc::clone(&config),
             config_manager.clone(),
             applied_mcp_config_identity.clone(),
+            account_tasks.ticket(),
         );
         let apps_processor = AppsRequestProcessor::new(
             auth_manager.clone(),
@@ -684,6 +719,7 @@ impl MessageProcessor {
             turn_cost_worker,
             skills_watcher,
             account_processor,
+            account_tasks,
             apps_processor,
             catalog_processor,
             command_exec_processor,
@@ -1035,8 +1071,38 @@ impl MessageProcessor {
         self.thread_processor.drain_background_tasks().await;
     }
 
+    /// Independent terminal observations under one caller-owned deadline.
+    /// Request dispatch must already be stopped before taking this census.
+    /// Each task family has its own census. None substitutes for the separate
+    /// thread/runtime and connection-close cleanup receipts.
+    pub(crate) async fn drain_background_tasks_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> ProcessorBackgroundShutdown {
+        let (models, thread_starts, apps, skills) = tokio::join!(
+            self.models_refresh_worker.shutdown_until(deadline),
+            self.thread_processor.drain_background_tasks_until(deadline),
+            self.apps_processor.shutdown_until(deadline),
+            self.skills_watcher.shutdown_until(deadline),
+        );
+        ProcessorBackgroundShutdown {
+            models,
+            thread_starts,
+            apps,
+            skills,
+        }
+    }
+
     pub(crate) async fn cancel_active_login(&self) {
         self.account_processor.cancel_active_login().await;
+    }
+
+    pub(crate) fn begin_login_shutdown(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> std::io::Result<crate::request_processors::AccountLoginShutdown> {
+        self.account_processor
+            .begin_login_shutdown(deadline, &self.account_tasks)
     }
 
     pub(crate) async fn clear_all_thread_listeners(&self) {
@@ -1045,6 +1111,17 @@ impl MessageProcessor {
 
     pub(crate) async fn shutdown_threads(&self) {
         self.thread_processor.shutdown_threads().await;
+    }
+
+    /// Establish permanent thread shutdown custody before the host's first wait.
+    pub(crate) fn begin_thread_shutdown(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<
+        crate::request_processors::ProcessorThreadRetirement,
+        codex_core::ThreadManagerRetirementError,
+    > {
+        self.thread_processor.begin_thread_shutdown(deadline)
     }
 
     pub(crate) async fn connection_closed(

@@ -17,6 +17,8 @@ use tokio::time::Instant;
 use super::IN_PROCESS_CONNECTION_ID;
 use crate::message_processor::ConnectionSessionState;
 use crate::message_processor::MessageProcessor;
+use crate::request_processors::AccountLoginReport;
+use crate::request_processors::ProcessorThreadShutdown;
 
 /// Host custody must outlive every embedded client started in it, including
 /// startup failures and incomplete shutdown. Dropping this host is not a
@@ -215,7 +217,29 @@ impl RuntimeShutdownReport {
     /// APIs return result-bearing resource receipts, this predicate remains
     /// false for the legacy `ReturnedUnverified` outcome.
     pub fn is_proven_complete(&self) -> bool {
-        false
+        matches!(
+            (
+                &self.runtime,
+                &self.processor,
+                &self.outbound,
+                &self.cleanup
+            ),
+            (
+                TaskObservation::Terminated(TaskTermination::Normal),
+                TaskObservation::Terminated(TaskTermination::Normal),
+                TaskObservation::Terminated(TaskTermination::Normal),
+                Some((
+                    TaskObservation::Terminated(TaskTermination::Normal),
+                    ProcessorCleanupProgress::Observed(
+                        ProcessorCleanupExecution::ReturnedWithEvidence {
+                            background_clean: true,
+                            login_clean: true,
+                            threads_clean: true,
+                        },
+                    ),
+                )),
+            )
+        )
     }
 }
 
@@ -260,6 +284,11 @@ impl RuntimeCustodyTicket {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessorCleanupExecution {
     ReturnedUnverified,
+    ReturnedWithEvidence {
+        background_clean: bool,
+        login_clean: bool,
+        threads_clean: bool,
+    },
     Panicked,
 }
 
@@ -293,7 +322,7 @@ impl ProcessorCleanupDriver {
                 tokio::select! {
                     biased;
                     _ = tokio::time::sleep_until(deadline) => ProcessorCleanupProgress::TimedOut,
-                    result = driven_cleanup.drive() => ProcessorCleanupProgress::Observed(result),
+                    result = driven_cleanup.drive_with_evidence(deadline) => ProcessorCleanupProgress::Observed(result),
                 }
             };
             progress_tx.send_replace(observed);
@@ -329,6 +358,7 @@ pub(super) struct ProcessorCleanupOwner {
     // or panic. Keep resource custody independent of that execution receipt.
     // Neither current outcome proves cleanup, so neither may clear this owner.
     custody: Option<(Arc<MessageProcessor>, Arc<ConnectionSessionState>)>,
+    subordinate: Option<Arc<MessageProcessor>>,
 }
 
 impl ProcessorCleanupOwner {
@@ -337,17 +367,17 @@ impl ProcessorCleanupOwner {
         session: Arc<ConnectionSessionState>,
     ) -> Self {
         let custody = (Arc::clone(&processor), Arc::clone(&session));
+        let cleanup_processor = Arc::clone(&processor);
         let mut owner = Self::from_cleanup(async move {
-            processor.clear_runtime_references();
-            processor.cancel_active_login().await;
-            processor
+            cleanup_processor.clear_runtime_references();
+            cleanup_processor.cancel_active_login().await;
+            cleanup_processor
                 .connection_closed(IN_PROCESS_CONNECTION_ID, &session)
                 .await;
-            processor.clear_all_thread_listeners().await;
-            processor.drain_background_tasks().await;
-            processor.shutdown_threads().await;
+            cleanup_processor.clear_all_thread_listeners().await;
         });
         owner.custody = Some(custody);
+        owner.subordinate = Some(processor);
         owner
     }
 
@@ -363,6 +393,7 @@ impl ProcessorCleanupOwner {
         Self {
             completion,
             custody: None,
+            subordinate: None,
         }
     }
 
@@ -371,6 +402,45 @@ impl ProcessorCleanupOwner {
     /// deadline; cancelling either observer preserves this original future.
     pub(super) async fn drive(&self) -> ProcessorCleanupExecution {
         self.completion.clone().await
+    }
+
+    async fn drive_with_evidence(&self, deadline: Instant) -> ProcessorCleanupExecution {
+        let base = self.drive().await;
+        let base_ok = !matches!(base, ProcessorCleanupExecution::Panicked);
+        let Some(processor) = self.subordinate.as_ref() else {
+            return base;
+        };
+
+        let login = processor.begin_login_shutdown(deadline).ok();
+        let threads = processor.begin_thread_shutdown(deadline).ok();
+        let (background, login, threads) = tokio::join!(
+            AssertUnwindSafe(processor.drain_background_tasks_until(deadline)).catch_unwind(),
+            async {
+                match login {
+                    Some(login) => AssertUnwindSafe(login.wait()).catch_unwind().await,
+                    None => Ok(AccountLoginReport {
+                        tasks: Default::default(),
+                        browsers: Err(()),
+                        admission_unavailable: true,
+                    }),
+                }
+            },
+            async {
+                match threads {
+                    Some(threads) => AssertUnwindSafe(threads.wait()).catch_unwind().await,
+                    None => Ok(ProcessorThreadShutdown {
+                        panicked: true,
+                        ..Default::default()
+                    }),
+                }
+            },
+        );
+
+        ProcessorCleanupExecution::ReturnedWithEvidence {
+            background_clean: base_ok && background.is_ok_and(|report| report.is_clean()),
+            login_clean: base_ok && login.is_ok_and(|report| report.is_clean()),
+            threads_clean: base_ok && threads.is_ok_and(|report| report.is_complete()),
+        }
     }
 }
 

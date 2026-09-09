@@ -132,13 +132,11 @@ impl LoginRetirement {
             } else {
                 LoginWorkerOutcome::Joined
             };
-            self.attempt
-                .progress
-                .send_modify(|report| {
-                    report.response = Some(response);
-                    report.receiver = http.acceptor;
-                    report.http = Some(http);
-                });
+            self.attempt.progress.send_modify(|report| {
+                report.response = Some(response);
+                report.receiver = http.acceptor;
+                report.http = Some(http);
+            });
             let persistence = match self.handle.persistence.wait().await {
                 super::PersistenceOutcome::Joined => LoginWorkerOutcome::Joined,
                 super::PersistenceOutcome::Failed => LoginWorkerOutcome::Failed,
@@ -158,6 +156,24 @@ impl LoginRetirement {
                 *self.attempt.progress.borrow()
             }
         }
+    }
+}
+
+impl LoginRetirementReport {
+    pub fn is_complete(&self) -> bool {
+        !self.deadline_expired
+            && matches!(self.callback, Some(LoginWorkerOutcome::Joined))
+            && matches!(self.response, Some(LoginWorkerOutcome::Joined))
+            && matches!(self.receiver, Some(LoginWorkerOutcome::Joined))
+            && self.http.is_some_and(|http| {
+                !http.unavailable
+                    && matches!(http.acceptor, Some(LoginWorkerOutcome::Joined))
+                    && http.interrupted == 0
+                    && http.failed == 0
+                    && http.cancelled == 0
+                    && http.panicked == 0
+            })
+            && matches!(self.persistence, Some(LoginWorkerOutcome::Joined))
     }
 }
 

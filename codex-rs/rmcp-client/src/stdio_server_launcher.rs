@@ -847,6 +847,10 @@ impl ExecutorStdioServerLauncher {
 }
 
 #[cfg(test)]
+#[path = "stdio_server_launcher_tests.rs"]
+mod executor_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use codex_protocol::config_types::EnvironmentVariablePattern;

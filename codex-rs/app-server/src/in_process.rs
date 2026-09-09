@@ -348,6 +348,7 @@ impl InProcessClientHandle {
     /// custody continues to own the original joins and cleanup receipts.
     pub async fn shutdown(self) -> IoResult<()> {
         let runtime_handle = self.runtime_handle;
+        let custody = self._custody;
         let (done_tx, done_rx) = oneshot::channel();
         let deadline = tokio::time::Instant::now() + SHUTDOWN_ACK_TIMEOUT;
 
@@ -359,6 +360,7 @@ impl InProcessClientHandle {
             .is_ok()
         {
             if timeout_at(deadline, done_rx).await.is_err() {
+                let _ = custody.observe_until(deadline).await;
                 return Err(IoError::new(
                     ErrorKind::TimedOut,
                     "in-process app-server shutdown acknowledgement timed out",
@@ -366,7 +368,11 @@ impl InProcessClientHandle {
             }
         }
 
-        if timeout_at(deadline, runtime_handle.join()).await.is_err() {
+        let (runtime_result, _cleanup_report) = tokio::join!(
+            timeout_at(deadline, runtime_handle.join()),
+            custody.observe_until(deadline),
+        );
+        if runtime_result.is_err() {
             // The retained host/custody owns the original join and cleanup
             // receipts. A caller deadline is an incomplete observation, never
             // permission to abort the task that owns those receipts.
@@ -552,7 +558,6 @@ async fn start_uninitialized(
             warn!("in-process processor cleanup custody unavailable");
             return;
         }
-        let processor_cleanup = Arc::clone(&processor_cleanup_owner);
         let processor = Arc::clone(&processor_owner);
         let session = Arc::clone(&session_owner);
         let mut thread_created_rx = processor.thread_created_receiver();
@@ -626,9 +631,10 @@ async fn start_uninitialized(
                 }
             }
 
-            if processor_cleanup.drive().await == shutdown::ProcessorCleanupExecution::Panicked {
-                warn!("in-process processor cleanup panicked");
-            }
+            // Cleanup is driven by the retained host observer, which binds
+            // the original shutdown deadline before polling its Shared
+            // future. The processor task's own join is not cleanup evidence
+            // and must not mint a second budget here.
         }) else {
             warn!("in-process processor task custody unavailable");
             return;

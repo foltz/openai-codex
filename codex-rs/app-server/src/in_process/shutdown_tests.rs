@@ -41,6 +41,10 @@ async fn cancelling_public_start_after_runtime_birth_preserves_host_custody() {
             .await,
         TaskObservation::Terminated(TaskTermination::Normal)
     );
+    let reports = host
+        .observe_until(Instant::now() + Duration::from_secs(10))
+        .await;
+    assert_eq!(reports.len(), 1);
     let (processor, outbound, cleanup) = {
         let state = host.state.lock().unwrap();
         assert_eq!(state.runtimes.len(), 1);

@@ -20,6 +20,7 @@ use crate::legacy_core::config::resolve_profile_v2_config_path;
 use crate::named_session_lookup::NamedSessionCandidates;
 use crate::named_session_lookup::SessionCollection;
 use crate::named_session_lookup::SessionNameLookupMode;
+use codex_app_server_client::InProcessHost;
 use codex_app_server_protocol::Thread as AppServerThread;
 use codex_arg0::Arg0DispatchPaths;
 use codex_cloud_config::cloud_config_bundle_loader_for_storage;
@@ -390,6 +391,8 @@ async fn start_app_server_for_archive_command(
     let state_db = super::init_state_db_for_app_server_target(&config, &app_server_target)
         .await
         .wrap_err("failed to initialize state database")?;
+    let embedded_host = matches!(&app_server_target, super::AppServerTarget::Embedded)
+        .then(|| Arc::new(InProcessHost::default()));
     let app_server = super::start_app_server(
         &app_server_target,
         arg0_paths,
@@ -402,6 +405,7 @@ async fn start_app_server_for_archive_command(
         /*log_db*/ None,
         state_db,
         environment_manager,
+        embedded_host,
     )
     .await?;
     Ok(

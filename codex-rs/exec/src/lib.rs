@@ -18,6 +18,7 @@ use codex_app_server_client::EnvironmentManager;
 use codex_app_server_client::ExecServerRuntimePaths;
 use codex_app_server_client::InProcessAppServerClient;
 use codex_app_server_client::InProcessClientStartArgs;
+use codex_app_server_client::InProcessHost;
 use codex_app_server_client::InProcessServerEvent;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ConfigWarningNotification;
@@ -798,7 +799,10 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
     }
 
     let mut request_ids = RequestIdSequencer::new();
-    let mut client = InProcessAppServerClient::start(in_process_start_args)
+    // Keep host custody outside the startup future so cancellation before the
+    // facade is returned cannot discard the runtime owner.
+    let embedded_host = std::sync::Arc::new(InProcessHost::default());
+    let mut client = InProcessAppServerClient::start_in_host(embedded_host, in_process_start_args)
         .await
         .map_err(|err| {
             anyhow::anyhow!("failed to initialize in-process app-server client: {err}")

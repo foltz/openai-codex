@@ -77,6 +77,10 @@ impl InProcessHost {
     /// current legacy processor cleanup is deliberately reported as
     /// `ReturnedUnverified` and therefore cannot be promoted to host Complete.
     pub async fn observe_until(&self, deadline: Instant) -> Vec<RuntimeShutdownReport> {
+        // Registration closure is synchronous and idempotent. Do it here as
+        // well as at explicit shutdown call sites so a direct observer cannot
+        // snapshot a population while a new runtime is still being born.
+        let _ = self.close_registration();
         let runtimes = match self.state.lock() {
             Ok(state) => state.runtimes.iter().map(Arc::clone).collect::<Vec<_>>(),
             Err(poisoned) => poisoned
@@ -86,12 +90,23 @@ impl InProcessHost {
                 .map(Arc::clone)
                 .collect::<Vec<_>>(),
         };
-        futures::future::join_all(
+        let reports = futures::future::join_all(
             runtimes
                 .iter()
                 .map(|runtime| runtime.observe_until(deadline)),
         )
-        .await
+        .await;
+        // Only the exact positive predicate releases a host slot. Timeout,
+        // cancellation, join failure, and legacy unverified cleanup retain
+        // their original custody for replay or explicit process supersession.
+        if let Ok(mut state) = self.state.lock() {
+            state.runtimes.retain(|candidate| {
+                !runtimes.iter().zip(&reports).any(|(runtime, report)| {
+                    Arc::ptr_eq(candidate, runtime) && report.is_proven_complete()
+                })
+            });
+        }
+        reports
     }
 }
 

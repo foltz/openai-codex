@@ -380,6 +380,7 @@ async fn background_drain_timeout_retains_work_and_reobserves_completion() -> Re
                 terminal: true,
                 ..Default::default()
             },
+            auxiliary_tasks: ThreadStartDrain::default(),
         }
     );
     assert!(weak_resource.upgrade().is_some());
@@ -417,6 +418,7 @@ async fn background_drain_timeout_retains_work_and_reobserves_completion() -> Re
             terminal: true,
             ..Default::default()
         },
+        auxiliary_tasks: ThreadStartDrain::default(),
     };
     assert_eq!((first, second), (expected.clone(), expected));
     assert!(weak_resource.upgrade().is_none());

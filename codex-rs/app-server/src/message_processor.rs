@@ -20,6 +20,7 @@ use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::ConnectionRequestId;
 use crate::outgoing_message::OutgoingMessageSender;
 use crate::outgoing_message::RequestContext;
+use crate::processor_task_retirement::ProcessorTasks;
 use crate::request_processors::AccountRequestProcessor;
 use crate::request_processors::AppsRequestProcessor;
 use crate::request_processors::CatalogRequestProcessor;
@@ -142,6 +143,7 @@ pub(crate) struct ProcessorBackgroundShutdown {
     pub apps: crate::request_processors::AppsShutdown,
     pub skills: crate::skills_watcher::SkillsWatcherShutdown,
     pub plugins: codex_core_plugins::PluginTaskDrain,
+    pub auxiliary_tasks: crate::processor_task_retirement::ProcessorTaskDrain,
 }
 
 impl ProcessorBackgroundShutdown {
@@ -163,6 +165,7 @@ impl ProcessorBackgroundShutdown {
                 crate::skills_watcher::SkillsWatcherShutdown::Joined
             )
             && self.plugins.is_clean()
+            && self.auxiliary_tasks.is_clean()
     }
 }
 
@@ -194,6 +197,7 @@ pub(crate) struct MessageProcessor {
     turn_processor: TurnRequestProcessor,
     windows_sandbox_processor: WindowsSandboxRequestProcessor,
     request_serialization_queues: RequestSerializationQueues,
+    auxiliary_tasks: ProcessorTasks,
 }
 
 #[derive(Debug)]
@@ -400,6 +404,7 @@ impl MessageProcessor {
         );
         let goal_service = Arc::new(GoalService::new());
         let applied_mcp_config_identity = AppliedMcpConfigIdentity::from_startup_config(&config);
+        let auxiliary_tasks = ProcessorTasks::default();
         let thread_manager = Arc::new_cyclic(|thread_manager| {
             let manager = ThreadManager::new(
                 config.as_ref(),
@@ -549,6 +554,7 @@ impl MessageProcessor {
             outgoing.clone(),
             config_manager.clone(),
             applied_mcp_config_identity,
+            auxiliary_tasks.clone(),
         );
         let plugin_processor = PluginRequestProcessor::new(
             auth_manager.clone(),
@@ -558,6 +564,7 @@ impl MessageProcessor {
             config_manager.clone(),
             workspace_settings_cache,
             on_effective_plugins_changed,
+            auxiliary_tasks.clone(),
         );
         let remote_control_processor = RemoteControlRequestProcessor::new(remote_control_handle);
         let search_processor = SearchRequestProcessor::new(outgoing.clone());
@@ -665,6 +672,7 @@ impl MessageProcessor {
             turn_processor,
             windows_sandbox_processor,
             request_serialization_queues,
+            auxiliary_tasks,
         }
     }
 
@@ -673,6 +681,7 @@ impl MessageProcessor {
         self.apps_processor.shutdown();
         self.models_refresh_worker.shutdown();
         self.skills_watcher.shutdown();
+        let _ = self.auxiliary_tasks.close_registration();
     }
 
     pub(crate) async fn process_request(
@@ -951,12 +960,13 @@ impl MessageProcessor {
         deadline: tokio::time::Instant,
     ) -> ProcessorBackgroundShutdown {
         let plugins_manager = self.thread_manager.plugins_manager();
-        let (models, thread_starts, apps, skills, plugins) = tokio::join!(
+        let (models, thread_starts, apps, skills, plugins, auxiliary_tasks) = tokio::join!(
             self.models_refresh_worker.shutdown_until(deadline),
             self.thread_processor.drain_background_tasks_until(deadline),
             self.apps_processor.shutdown_until(deadline),
             self.skills_watcher.shutdown_until(deadline),
             plugins_manager.shutdown_until(deadline),
+            self.auxiliary_tasks.shutdown_until(deadline),
         );
         ProcessorBackgroundShutdown {
             models,
@@ -964,6 +974,7 @@ impl MessageProcessor {
             apps,
             skills,
             plugins,
+            auxiliary_tasks,
         }
     }
 

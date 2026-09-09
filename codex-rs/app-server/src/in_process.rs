@@ -352,10 +352,24 @@ impl InProcessClientHandle {
     /// exhausted this returns a timed-out I/O error while the retained host
     /// custody continues to own the original joins and cleanup receipts.
     pub async fn shutdown(self) -> IoResult<()> {
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_ACK_TIMEOUT;
+        self.shutdown_until(deadline).await
+    }
+
+    /// Same shutdown operation with a caller-provided absolute deadline. The
+    /// facade uses this to avoid stacking a second acknowledgement/join budget
+    /// around the runtime's own retained cleanup observation.
+    pub async fn shutdown_until(self, deadline: tokio::time::Instant) -> IoResult<()> {
         let runtime_handle = self.runtime_handle;
         let custody = self._custody;
+        if tokio::time::Instant::now() >= deadline {
+            let _ = custody.observe_until(deadline).await;
+            return Err(IoError::new(
+                ErrorKind::TimedOut,
+                "in-process app-server shutdown deadline elapsed before submission",
+            ));
+        }
         let (done_tx, done_rx) = oneshot::channel();
-        let deadline = tokio::time::Instant::now() + SHUTDOWN_ACK_TIMEOUT;
 
         if self
             .client

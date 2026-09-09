@@ -48,7 +48,7 @@ impl InProcessHost {
 
     /// Freeze runtime and nested task births under the same locks used by
     /// registration. This is only admission closure, never a shutdown receipt.
-    pub(super) fn close_registration(&self) -> io::Result<()> {
+    pub fn close_registration(&self) -> io::Result<()> {
         let (mut state, mut unavailable) = match self.state.lock() {
             Ok(state) => (state, false),
             Err(poisoned) => (poisoned.into_inner(), true),
@@ -74,7 +74,7 @@ impl InProcessHost {
     /// one caller-owned absolute deadline. A report is evidence only: the
     /// current legacy processor cleanup is deliberately reported as
     /// `ReturnedUnverified` and therefore cannot be promoted to host Complete.
-    pub(super) async fn observe_until(&self, deadline: Instant) -> Vec<RuntimeShutdownReport> {
+    pub async fn observe_until(&self, deadline: Instant) -> Vec<RuntimeShutdownReport> {
         let runtimes = match self.state.lock() {
             Ok(state) => state.runtimes.iter().map(Arc::clone).collect::<Vec<_>>(),
             Err(poisoned) => poisoned
@@ -203,7 +203,7 @@ impl RuntimeCustody {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct RuntimeShutdownReport {
+pub struct RuntimeShutdownReport {
     pub runtime: TaskObservation,
     pub processor: TaskObservation,
     pub outbound: TaskObservation,
@@ -214,7 +214,7 @@ impl RuntimeShutdownReport {
     /// A task join is never enough for Complete. Until the processor cleanup
     /// APIs return result-bearing resource receipts, this predicate remains
     /// false for the legacy `ReturnedUnverified` outcome.
-    pub(super) fn is_proven_complete(&self) -> bool {
+    pub fn is_proven_complete(&self) -> bool {
         false
     }
 }
@@ -258,13 +258,13 @@ impl RuntimeCustodyTicket {
 /// Execution evidence only: the legacy cleanup calls do not yet return all
 /// required resource receipts, so even ReturnedUnverified is not retirement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ProcessorCleanupExecution {
+pub enum ProcessorCleanupExecution {
     ReturnedUnverified,
     Panicked,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ProcessorCleanupProgress {
+pub enum ProcessorCleanupProgress {
     Pending,
     Observed(ProcessorCleanupExecution),
     TimedOut,
@@ -376,14 +376,14 @@ impl ProcessorCleanupOwner {
 
 /// Terminal evidence about one task, independent of resource cleanup results.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum TaskTermination {
+pub enum TaskTermination {
     Normal,
     Cancelled,
     Panicked,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum TaskObservation {
+pub enum TaskObservation {
     Terminated(TaskTermination),
     TimedOut,
 }

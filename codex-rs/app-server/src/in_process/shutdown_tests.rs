@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 
 #[tokio::test]
-async fn cancelling_public_start_after_runtime_birth_preserves_host_custody() {
+async fn cancelling_public_start_after_runtime_birth_compacts_after_evidence() {
     let (args, _home) =
         super::super::tests::test_start_args(codex_protocol::protocol::SessionSource::Cli, 1).await;
     let host = InProcessHost::default();
@@ -41,6 +41,18 @@ async fn cancelling_public_start_after_runtime_birth_preserves_host_custody() {
             .await,
         TaskObservation::Terminated(TaskTermination::Normal)
     );
+    // Capture resource identities before host compaction. The host must retain
+    // these roots while startup is being cancelled; once the complete report
+    // is proven, it may release the slot and the resources.
+    let (weak_processor, weak_session) = {
+        let state = host.state.lock().unwrap();
+        let owners = state.runtimes[0].owners.lock().unwrap();
+        let cleanup = owners.cleanup.as_ref().expect("real cleanup was retained");
+        let (processor, session) = cleanup.custody.as_ref().unwrap();
+        (Arc::downgrade(processor), Arc::downgrade(session))
+    };
+    assert!(weak_processor.upgrade().is_some());
+    assert!(weak_session.upgrade().is_some());
     let reports = host
         .observe_until(Instant::now() + Duration::from_secs(10))
         .await;
@@ -54,53 +66,7 @@ async fn cancelling_public_start_after_runtime_birth_preserves_host_custody() {
             ),
         ))
     ));
-    let (processor, outbound, cleanup) = {
-        let state = host.state.lock().unwrap();
-        assert_eq!(state.runtimes.len(), 1);
-        let owners = state.runtimes[0].owners.lock().unwrap();
-        (
-            Arc::clone(
-                owners
-                    .processor
-                    .as_ref()
-                    .expect("real processor was registered"),
-            ),
-            Arc::clone(
-                owners
-                    .outbound
-                    .as_ref()
-                    .expect("real outbound was registered"),
-            ),
-            Arc::clone(owners.cleanup.as_ref().expect("real cleanup was retained")),
-        )
-    };
-    let deadline = Instant::now() + Duration::from_secs(5);
-    assert_eq!(
-        processor.observe_until(deadline).await,
-        TaskObservation::Terminated(TaskTermination::Normal)
-    );
-    assert_eq!(
-        outbound.observe_until(deadline).await,
-        TaskObservation::Terminated(TaskTermination::Normal)
-    );
-    // Do not drive cleanup to make the test pass: the ordinary EOF path must
-    // already have completed the exact retained original.
-    assert_eq!(
-        cleanup.completion.peek(),
-        Some(&ProcessorCleanupExecution::ReturnedUnverified)
-    );
-    // All three tasks have joined and the future has returned, but this is
-    // still unverified cleanup. Its resource roots must outlive the future's
-    // captures and remain in host custody, not just a cached diagnostic.
-    let (processor_resource, session_resource) = cleanup.custody.as_ref().unwrap();
-    let weak_processor = Arc::downgrade(processor_resource);
-    let weak_session = Arc::downgrade(session_resource);
-    drop(cleanup);
-    assert!(weak_processor.upgrade().is_some());
-    assert!(weak_session.upgrade().is_some());
-    // Deliberate final-root destruction is only a cycle probe, not a supported
-    // successful shutdown disposition for a surviving embedding host.
-    drop(host);
+    assert!(host.state.lock().unwrap().runtimes.is_empty());
     assert!(weak_processor.upgrade().is_none());
     assert!(weak_session.upgrade().is_none());
 }
@@ -234,6 +200,39 @@ async fn host_observation_keeps_join_and_cleanup_evidence_separate() {
         ))
     );
     assert!(!report.is_proven_complete());
+}
+
+#[tokio::test]
+async fn host_compacts_only_a_proven_complete_runtime() {
+    let host = InProcessHost::default();
+    let custody = host.reserve().unwrap();
+    let ticket = RuntimeCustodyTicket(Arc::downgrade(&custody));
+    let completion = async {
+        ProcessorCleanupExecution::ReturnedWithEvidence {
+            background_clean: true,
+            login_clean: true,
+            threads_clean: true,
+        }
+    }
+    .boxed()
+    .shared();
+    ticket
+        .attach_cleanup(Arc::new(ProcessorCleanupOwner {
+            completion,
+            custody: None,
+            subordinate: None,
+        }))
+        .unwrap();
+    custody
+        .spawn(RuntimeTask::Runtime, async {})
+        .expect("runtime join should be registered");
+
+    let reports = host
+        .observe_until(Instant::now() + Duration::from_secs(5))
+        .await;
+    assert_eq!(reports.len(), 1);
+    assert!(reports[0].is_proven_complete());
+    assert!(host.state.lock().unwrap().runtimes.is_empty());
 }
 
 #[tokio::test]

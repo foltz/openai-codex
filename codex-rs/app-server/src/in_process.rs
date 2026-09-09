@@ -326,8 +326,9 @@ impl InProcessClientHandle {
 
     /// Requests runtime shutdown and waits for worker termination.
     ///
-    /// Shutdown is bounded by internal timeouts and may abort background tasks
-    /// if graceful drain does not complete in time.
+    /// Shutdown uses one absolute observation deadline. If the deadline is
+    /// exhausted this returns a timed-out I/O error while the retained host
+    /// custody continues to own the original joins and cleanup receipts.
     pub async fn shutdown(self) -> IoResult<()> {
         let runtime_handle = self.runtime_handle;
         let (done_tx, done_rx) = oneshot::channel();

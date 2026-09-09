@@ -280,6 +280,151 @@ async fn build_test_processor(
     (processor, outgoing_rx)
 }
 
+#[tokio::test]
+async fn processor_login_shutdown_facade_binds_first_deadline() -> Result<()> {
+    let home = TempDir::new()?;
+    let config = Arc::new(build_test_config(home.path(), "http://127.0.0.1:1").await?);
+    let (processor, _outgoing) = build_test_processor(config).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    drop(processor.begin_login_shutdown(deadline)?);
+    let ticket = processor.begin_login_shutdown(deadline + std::time::Duration::from_secs(60))?;
+    assert_eq!(ticket.deadline(), deadline);
+    let report = ticket.wait().await;
+    assert!(report.tasks.is_clean());
+    assert_eq!(report.browsers, Ok(Vec::new()));
+    assert!(!report.admission_unavailable);
+    // Independently clean the fixture's other worker populations. The login
+    // report is not a claim about them or a substitute for host retirement.
+    processor.drain_background_tasks_until(deadline).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn processor_thread_shutdown_facade_retains_first_attempt() -> Result<()> {
+    let home = TempDir::new()?;
+    let config = Arc::new(build_test_config(home.path(), "http://127.0.0.1:1").await?);
+    let (processor, _outgoing) = build_test_processor(config).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    drop(processor.begin_thread_shutdown(deadline).unwrap());
+    let ticket = processor
+        .begin_thread_shutdown(deadline + std::time::Duration::from_secs(20))
+        .unwrap();
+    assert_eq!(ticket.deadline(), deadline);
+    let report = ticket.wait().await;
+    assert!(report.is_complete(), "{report:?}");
+    assert_eq!(ticket.wait().await, report);
+    // This proves only the thread limb. Independently stop fixture workers;
+    // the thread receipt must not be mistaken for all-processor cleanup.
+    processor.drain_background_tasks_until(deadline).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn background_drain_timeout_retains_work_and_reobserves_completion() -> Result<()> {
+    use super::ProcessorBackgroundShutdown;
+    use crate::models_refresh_worker::ModelsRefreshShutdown;
+    use crate::processor_task_retirement::ProcessorTaskDrain as ThreadStartDrain;
+    use crate::request_processors::AppsRuntimeDrain;
+    use crate::request_processors::AppsShutdown;
+    use tokio::time::Instant;
+
+    let home = TempDir::new()?;
+    let config = Arc::new(build_test_config(home.path(), "http://127.0.0.1:1").await?);
+    let (processor, _outgoing) = build_test_processor(config).await;
+    assert_eq!(
+        processor
+            .models_refresh_worker
+            .shutdown_until(Instant::now() + std::time::Duration::from_secs(5))
+            .await,
+        ModelsRefreshShutdown::Joined
+    );
+    let resource = Arc::new(());
+    let weak_resource = Arc::downgrade(&resource);
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let task = processor
+        .thread_processor
+        .background_tasks_for_test()
+        .spawn(async move {
+            let _resource = resource;
+            entered_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+        })
+        .unwrap();
+    entered_rx.await?;
+    let mut observer = Box::pin(
+        processor
+            .drain_background_tasks_until(Instant::now() + std::time::Duration::from_millis(10)),
+    );
+    assert!(futures::poll!(observer.as_mut()).is_pending());
+    drop(observer);
+    assert_eq!(
+        processor
+            .drain_background_tasks_until(Instant::now() + std::time::Duration::from_millis(10))
+            .await,
+        ProcessorBackgroundShutdown {
+            models: ModelsRefreshShutdown::Joined,
+            thread_starts: ThreadStartDrain::default(),
+            apps: AppsShutdown {
+                tasks: ThreadStartDrain {
+                    terminal: true,
+                    ..Default::default()
+                },
+                runtimes: AppsRuntimeDrain {
+                    unavailable: false,
+                    reports: Vec::new()
+                },
+            },
+            skills: crate::skills_watcher::SkillsWatcherShutdown::Joined,
+            plugins: codex_core_plugins::PluginTaskDrain {
+                terminal: true,
+                ..Default::default()
+            },
+        }
+    );
+    assert!(weak_resource.upgrade().is_some());
+    assert_eq!(
+        processor.thread_processor.background_tasks_for_test().len(),
+        1
+    );
+    release_tx.send(()).unwrap();
+    // A later observer may normalize a completed join, but cannot extend the
+    // expired attempt to wait for work. Settle the actual task first.
+    let _ = task.await;
+    let deadline = Instant::now() + std::time::Duration::from_secs(1);
+    let (first, second) = tokio::join!(
+        processor.drain_background_tasks_until(deadline),
+        processor.drain_background_tasks_until(deadline),
+    );
+    let expected = ProcessorBackgroundShutdown {
+        models: ModelsRefreshShutdown::Joined,
+        thread_starts: ThreadStartDrain {
+            terminal: true,
+            ..Default::default()
+        },
+        apps: AppsShutdown {
+            tasks: ThreadStartDrain {
+                terminal: true,
+                ..Default::default()
+            },
+            runtimes: AppsRuntimeDrain {
+                unavailable: false,
+                reports: Vec::new(),
+            },
+        },
+        skills: crate::skills_watcher::SkillsWatcherShutdown::Joined,
+        plugins: codex_core_plugins::PluginTaskDrain {
+            terminal: true,
+            ..Default::default()
+        },
+    };
+    assert_eq!((first, second), (expected.clone(), expected));
+    assert!(weak_resource.upgrade().is_none());
+    processor.clear_runtime_references();
+    processor.shutdown_threads().await;
+    Ok(())
+}
+
 fn run_current_thread_test_with_stack<F>(name: &str, future: F) -> Result<()>
 where
     F: Future<Output = Result<()>> + Send + 'static,

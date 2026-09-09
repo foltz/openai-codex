@@ -179,6 +179,7 @@ pub(crate) struct ProcessorBackgroundShutdown {
     pub thread_starts: crate::processor_task_retirement::ProcessorTaskDrain,
     pub apps: crate::request_processors::AppsShutdown,
     pub skills: crate::skills_watcher::SkillsWatcherShutdown,
+    pub plugins: codex_core_plugins::PluginTaskDrain,
 }
 
 impl ProcessorBackgroundShutdown {
@@ -199,6 +200,7 @@ impl ProcessorBackgroundShutdown {
                 self.skills,
                 crate::skills_watcher::SkillsWatcherShutdown::Joined
             )
+            && self.plugins.is_clean()
     }
 }
 
@@ -206,6 +208,7 @@ pub(crate) struct MessageProcessor {
     pub(crate) turn_admission: TurnAdmission,
     user_verification: Arc<crate::user_verification::Service>,
     outgoing: Arc<OutgoingMessageSender>,
+    thread_manager: Arc<ThreadManager>,
     models_refresh_worker: ModelsRefreshWorker,
     turn_cost_worker: Option<TurnCostWorker>,
     skills_watcher: Arc<SkillsWatcher>,
@@ -715,6 +718,7 @@ impl MessageProcessor {
             turn_admission,
             user_verification,
             outgoing,
+            thread_manager,
             models_refresh_worker,
             turn_cost_worker,
             skills_watcher,
@@ -1079,17 +1083,20 @@ impl MessageProcessor {
         &self,
         deadline: tokio::time::Instant,
     ) -> ProcessorBackgroundShutdown {
-        let (models, thread_starts, apps, skills) = tokio::join!(
+        let plugins_manager = self.thread_manager.plugins_manager();
+        let (models, thread_starts, apps, skills, plugins) = tokio::join!(
             self.models_refresh_worker.shutdown_until(deadline),
             self.thread_processor.drain_background_tasks_until(deadline),
             self.apps_processor.shutdown_until(deadline),
             self.skills_watcher.shutdown_until(deadline),
+            plugins_manager.shutdown_until(deadline),
         );
         ProcessorBackgroundShutdown {
             models,
             thread_starts,
             apps,
             skills,
+            plugins,
         }
     }
 

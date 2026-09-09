@@ -547,6 +547,7 @@ pub struct PluginsManager {
     auth_manager: Arc<AuthManager>,
     analytics_events_client: RwLock<Option<AnalyticsEventsClient>>,
     plugin_install_source: PluginInstallSource,
+    task_registry: crate::PluginTaskRegistry,
 }
 
 #[derive(Clone)]
@@ -685,7 +686,14 @@ impl PluginsManager {
             auth_manager,
             analytics_events_client: RwLock::new(None),
             plugin_install_source: PluginInstallSource::Manual,
+            task_registry: crate::PluginTaskRegistry::default(),
         }
+    }
+
+    /// Closes plugin worker admission and observes every worker started by
+    /// this manager under the caller's original absolute deadline.
+    pub async fn shutdown_until(&self, deadline: tokio::time::Instant) -> crate::PluginTaskDrain {
+        self.task_registry.shutdown_until(deadline).await
     }
 
     pub fn with_plugin_install_source(mut self, source: PluginInstallSource) -> Self {
@@ -1499,7 +1507,7 @@ impl PluginsManager {
 
         let manager = Arc::clone(self);
         let config = config.clone();
-        tokio::spawn(async move {
+        let _ = self.task_registry.spawn(async move {
             manager
                 .recommended_plugins_mode_for_config(&config, auth.as_ref())
                 .await;
@@ -2794,9 +2802,9 @@ impl PluginsManager {
                 let config = config.clone();
                 let on_effective_plugins_changed = on_effective_plugins_changed.clone();
                 let runtime = tokio::runtime::Handle::current();
-                if let Err(err) = std::thread::Builder::new()
-                    .name("plugins-marketplace-auto-upgrade".to_string())
-                    .spawn(move || {
+                if self
+                    .task_registry
+                    .spawn_thread(move || {
                         let outcome = manager.upgrade_configured_marketplaces_for_config_with_mode(
                             &config,
                             /*marketplace_name*/ None,
@@ -2834,19 +2842,20 @@ impl PluginsManager {
                         };
                         state.in_flight = false;
                     })
+                    .is_err()
                 {
                     let mut state = match self.configured_marketplace_upgrade_state.write() {
                         Ok(state) => state,
                         Err(err) => err.into_inner(),
                     };
                     state.in_flight = false;
-                    warn!("failed to start configured marketplace auto-upgrade task: {err}");
+                    warn!("failed to admit configured marketplace auto-upgrade task");
                 }
             }
             let config_for_remote_sync = config.clone();
             let manager = Arc::clone(self);
             let on_effective_plugins_changed = on_effective_plugins_changed.clone();
-            tokio::spawn(async move {
+            let _ = self.task_registry.spawn(async move {
                 let auth = manager.auth_manager.auth().await;
                 manager.maybe_start_remote_plugin_caches_refresh(
                     &config_for_remote_sync,
@@ -2878,7 +2887,7 @@ impl PluginsManager {
 
             let config_for_featured_plugins = config.clone();
             let manager = Arc::clone(self);
-            tokio::spawn(async move {
+            let _ = self.task_registry.spawn(async move {
                 let auth = manager.auth_manager.auth().await;
                 if let Err(err) = manager
                     .featured_plugin_ids_for_config(&config_for_featured_plugins, auth.as_ref())
@@ -3101,7 +3110,7 @@ impl PluginsManager {
         }
 
         let manager = Arc::clone(self);
-        tokio::spawn(async move {
+        let _ = self.task_registry.spawn(async move {
             manager
                 .run_remote_installed_plugins_cache_refresh_loop()
                 .await;
@@ -3149,7 +3158,7 @@ impl PluginsManager {
         }
 
         let manager = Arc::clone(self);
-        tokio::spawn(async move {
+        let _ = self.task_registry.spawn(async move {
             manager.run_remote_catalog_cache_refresh_loop().await;
         });
     }
@@ -3223,9 +3232,10 @@ impl PluginsManager {
         }
 
         let manager = Arc::clone(self);
-        if let Err(err) = std::thread::Builder::new()
-            .name("plugins-non-curated-cache-refresh".to_string())
-            .spawn(move || manager.run_non_curated_plugin_cache_refresh_loop())
+        if self
+            .task_registry
+            .spawn_thread(move || manager.run_non_curated_plugin_cache_refresh_loop())
+            .is_err()
         {
             let mut state = match self.non_curated_cache_refresh_state.write() {
                 Ok(state) => state,
@@ -3237,7 +3247,7 @@ impl PluginsManager {
                 .send_modify(|completion| {
                     completion.sequence = completion.sequence.wrapping_add(1);
                 });
-            warn!("failed to start non-curated plugin cache refresh task: {err}");
+            warn!("failed to admit non-curated plugin cache refresh task");
         }
     }
 
@@ -3264,9 +3274,9 @@ impl PluginsManager {
             });
         let manager = Arc::clone(self);
         let codex_home = self.codex_home.clone();
-        if let Err(err) = std::thread::Builder::new()
-            .name("plugins-curated-repo-sync".to_string())
-            .spawn(move || {
+        if self
+            .task_registry
+            .spawn_thread(move || {
                 match sync_openai_plugins_repo(codex_home.as_path(), http_client_factory) {
                     Ok(curated_plugin_version) => {
                         let configured_curated_plugin_ids =
@@ -3295,9 +3305,10 @@ impl PluginsManager {
                     }
                 }
             })
+            .is_err()
         {
             CURATED_REPO_SYNC_STARTED.store(false, Ordering::SeqCst);
-            warn!("failed to start curated plugins repo sync task: {err}");
+            warn!("failed to start curated plugins repo sync task");
         }
     }
 

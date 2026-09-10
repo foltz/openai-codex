@@ -22,6 +22,11 @@ impl AccountLoginReport {
             && self.tasks.is_clean()
             && self.browsers.as_ref().is_ok_and(|reports| {
                 reports.iter().all(|report| {
+                    // `None` is the explicit BrowserLogins construction
+                    // outcome for an attempt that produced no server and
+                    // therefore no resources to retire. It is distinct from
+                    // an unavailable collection or a lost retirement report,
+                    // both of which remain unclean above.
                     report
                         .as_ref()
                         .is_none_or(LoginRetirementReport::is_complete)

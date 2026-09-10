@@ -37,10 +37,13 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::RwLock;
 use std::sync::Weak;
 use std::time::Duration;
 use tracing::debug;
+
+#[cfg(test)]
+#[path = "client_shutdown_tests.rs"]
+mod shutdown_tests;
 
 const ENV_ATTRIBUTE: &str = "env";
 const METER_NAME: &str = "codex";
@@ -274,25 +277,35 @@ impl MetricsClientInner {
             .collect())
     }
 
-    fn shutdown(&self) -> Result<()> {
+    pub(super) fn shutdown(&self) -> Result<()> {
         debug!("flushing OTEL metrics");
-        self.meter_provider
+        let flushed = self
+            .meter_provider
             .force_flush()
-            .map_err(|source| MetricsError::ProviderShutdown { source })?;
-        self.meter_provider
+            .map_err(|source| MetricsError::ProviderShutdown { source });
+        // Flush failure must not skip the separate exporter-stop obligation.
+        // Evaluate both operations before preserving the first failure.
+        let stopped = self
+            .meter_provider
             .shutdown()
-            .map_err(|source| MetricsError::ProviderShutdown { source })?;
-        Ok(())
+            .map_err(|source| MetricsError::ProviderShutdown { source });
+        flushed.and(stopped)
     }
 }
 
 /// OpenTelemetry metrics client used by Codex.
 #[derive(Clone, Debug)]
+pub(super) enum MetricsOriginal {
+    Standalone(Arc<MetricsClientInner>),
+    Routed(Arc<super::owner::MetricsOwner>),
+}
+
+#[derive(Clone, Debug)]
 pub struct MetricsClient {
     // Keep the original provider so its owner only shuts down its own exporter.
-    pub(super) inner: Arc<MetricsClientInner>,
+    pub(super) inner: MetricsOriginal,
     // Installed clients share this slot, so existing clones follow account changes.
-    pub(super) active: Option<Arc<RwLock<Arc<MetricsClientInner>>>>,
+    pub(super) active: Option<Arc<super::route::MetricsRoute>>,
 }
 
 impl MetricsClient {
@@ -343,7 +356,7 @@ impl MetricsClient {
         };
 
         Ok(Self {
-            inner: Arc::new(MetricsClientInner {
+            inner: MetricsOriginal::Standalone(Arc::new(MetricsClientInner {
                 meter_provider,
                 meter,
                 counters: Mutex::new(HashMap::new()),
@@ -353,25 +366,36 @@ impl MetricsClient {
                 runtime_reader,
                 runtime_only_metrics,
                 default_tags,
-            }),
+            })),
             active: None,
         })
     }
 
-    pub(super) fn active_inner(&self) -> Arc<MetricsClientInner> {
+    fn with_active_inner<T>(
+        &self,
+        operation: impl FnOnce(&MetricsClientInner) -> Result<T>,
+    ) -> Result<T> {
         match &self.active {
-            Some(active) => active
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone(),
-            None => Arc::clone(&self.inner),
+            Some(active) => active.with_inner(operation),
+            None => match &self.inner {
+                MetricsOriginal::Standalone(inner) => operation(inner),
+                MetricsOriginal::Routed(_) => Err(MetricsError::RoutingUnavailable),
+            },
+        }
+    }
+
+    pub(super) fn original_inner(&self) -> Result<Arc<MetricsClientInner>> {
+        match &self.inner {
+            MetricsOriginal::Standalone(inner) => Ok(Arc::clone(inner)),
+            MetricsOriginal::Routed(owner) => {
+                owner.inner().map_err(|_| MetricsError::RoutingUnavailable)
+            }
         }
     }
 
     /// Send a single counter increment.
     pub fn counter(&self, name: &str, inc: i64, tags: &[(&str, &str)]) -> Result<()> {
-        self.active_inner()
-            .counter(name, /*description*/ None, inc, tags)
+        self.with_active_inner(|inner| inner.counter(name, /*description*/ None, inc, tags))
     }
 
     /// Send a single counter increment with an instrument description.
@@ -382,19 +406,17 @@ impl MetricsClient {
         inc: i64,
         tags: &[(&str, &str)],
     ) -> Result<()> {
-        self.active_inner()
-            .counter(name, Some(description), inc, tags)
+        self.with_active_inner(|inner| inner.counter(name, Some(description), inc, tags))
     }
 
     /// Send a single histogram sample.
     pub fn histogram(&self, name: &str, value: i64, tags: &[(&str, &str)]) -> Result<()> {
-        self.active_inner().histogram(name, value, tags)
+        self.with_active_inner(|inner| inner.histogram(name, value, tags))
     }
 
     /// Send a single gauge measurement.
     pub fn gauge(&self, name: &str, value: i64, tags: &[(&str, &str)]) -> Result<()> {
-        self.active_inner()
-            .gauge(name, /*description*/ None, value, tags)
+        self.with_active_inner(|inner| inner.gauge(name, /*description*/ None, value, tags))
     }
 
     /// Send a single gauge measurement with an instrument description.
@@ -405,8 +427,7 @@ impl MetricsClient {
         value: i64,
         tags: &[(&str, &str)],
     ) -> Result<()> {
-        self.active_inner()
-            .gauge(name, Some(description), value, tags)
+        self.with_active_inner(|inner| inner.gauge(name, Some(description), value, tags))
     }
 
     /// Register a gauge callback that reports the current value on every collection.
@@ -417,8 +438,9 @@ impl MetricsClient {
         observe: impl Fn() -> i64 + Send + Sync + 'static,
         tags: &[(&str, &str)],
     ) -> Result<()> {
-        self.active_inner()
-            .register_observable_gauge(name, description, observe, tags)
+        self.with_active_inner(|inner| {
+            inner.register_observable_gauge(name, description, observe, tags)
+        })
     }
 
     /// Record a duration in milliseconds using a histogram.
@@ -428,14 +450,16 @@ impl MetricsClient {
         duration: Duration,
         tags: &[(&str, &str)],
     ) -> Result<()> {
-        self.active_inner().duration_histogram(
-            name,
-            duration.as_millis().min(i64::MAX as u128) as f64,
-            MILLISECOND_DURATION_UNIT,
-            MILLISECOND_DURATION_DESCRIPTION,
-            MILLISECOND_DURATION_BOUNDARIES,
-            tags,
-        )
+        self.with_active_inner(|inner| {
+            inner.duration_histogram(
+                name,
+                duration.as_millis().min(i64::MAX as u128) as f64,
+                MILLISECOND_DURATION_UNIT,
+                MILLISECOND_DURATION_DESCRIPTION,
+                MILLISECOND_DURATION_BOUNDARIES,
+                tags,
+            )
+        })
     }
 
     /// Record a duration supplied as fractional milliseconds using a histogram.
@@ -445,14 +469,16 @@ impl MetricsClient {
         duration_ms: f64,
         tags: &[(&str, &str)],
     ) -> Result<()> {
-        self.active_inner().duration_histogram(
-            name,
-            duration_ms,
-            MILLISECOND_DURATION_UNIT,
-            MILLISECOND_DURATION_DESCRIPTION,
-            MILLISECOND_DURATION_BOUNDARIES,
-            tags,
-        )
+        self.with_active_inner(|inner| {
+            inner.duration_histogram(
+                name,
+                duration_ms,
+                MILLISECOND_DURATION_UNIT,
+                MILLISECOND_DURATION_DESCRIPTION,
+                MILLISECOND_DURATION_BOUNDARIES,
+                tags,
+            )
+        })
     }
 
     /// Record a duration in seconds using a histogram with an instrument description.
@@ -463,14 +489,16 @@ impl MetricsClient {
         duration: Duration,
         tags: &[(&str, &str)],
     ) -> Result<()> {
-        self.active_inner().duration_histogram(
-            name,
-            duration.as_secs_f64(),
-            SECOND_DURATION_UNIT,
-            description,
-            SECOND_DURATION_BOUNDARIES,
-            tags,
-        )
+        self.with_active_inner(|inner| {
+            inner.duration_histogram(
+                name,
+                duration.as_secs_f64(),
+                SECOND_DURATION_UNIT,
+                description,
+                SECOND_DURATION_BOUNDARIES,
+                tags,
+            )
+        })
     }
 
     pub fn start_timer(
@@ -483,20 +511,43 @@ impl MetricsClient {
 
     /// Collect a runtime metrics snapshot without shutting down the provider.
     pub fn snapshot(&self) -> Result<ResourceMetrics> {
-        let inner = self.active_inner();
-        let Some(reader) = &inner.runtime_reader else {
-            return Err(MetricsError::RuntimeSnapshotUnavailable);
-        };
-        let mut snapshot = ResourceMetrics::default();
-        reader
-            .collect(&mut snapshot)
-            .map_err(|source| MetricsError::RuntimeSnapshotCollect { source })?;
-        Ok(snapshot)
+        self.with_active_inner(|inner| {
+            let Some(reader) = &inner.runtime_reader else {
+                return Err(MetricsError::RuntimeSnapshotUnavailable);
+            };
+            let mut snapshot = ResourceMetrics::default();
+            reader
+                .collect(&mut snapshot)
+                .map_err(|source| MetricsError::RuntimeSnapshotCollect { source })?;
+            Ok(snapshot)
+        })
     }
 
     /// Flush metrics and stop the underlying OTEL meter provider.
+    pub(crate) fn shutdown_for_provider(&self) -> Result<()> {
+        match &self.inner {
+            MetricsOriginal::Standalone(inner) => inner.shutdown(),
+            MetricsOriginal::Routed(owner) => owner
+                .attempt()
+                .map_err(|_| MetricsError::RoutingUnavailable)?
+                .run_observing()
+                .map_err(|_| MetricsError::ProviderShutdown {
+                    source: opentelemetry_sdk::error::OTelSdkError::InternalFailure(
+                        "metrics owner shutdown failed".to_owned(),
+                    ),
+                }),
+        }
+    }
+
+    /// Flush metrics and stop this handle's original OTEL meter provider.
     pub fn shutdown(&self) -> Result<()> {
-        self.inner.shutdown()
+        match &self.inner {
+            MetricsOriginal::Standalone(inner) => inner.shutdown(),
+            MetricsOriginal::Routed(owner) => owner
+                .attempt()
+                .map_err(|_| MetricsError::RoutingUnavailable)?
+                .shutdown_public(),
+        }
     }
 }
 

@@ -551,6 +551,7 @@ async fn start_uninitialized(
         // enclosing runtime retains these owners independently of that task's
         // join; the host shutdown controller will retain the enclosing owner.
         let processor_owner = Arc::new(MessageProcessor::new(MessageProcessorArgs {
+            telemetry_reset: crate::otel_reset_control::TelemetryResetControl::default(),
             outgoing: Arc::clone(&processor_outgoing),
             analytics_events_client,
             arg0_paths: args.arg0_paths,

@@ -232,17 +232,19 @@ impl ThreadState {
         conversation: &Arc<CodexThread>,
         watch_registration: WatchRegistration,
         thread_settings_baseline: ThreadSettings,
-    ) -> (mpsc::UnboundedReceiver<ThreadListenerCommand>, u64) {
-        if let Some(previous) = self.cancel_tx.replace(cancel_tx) {
-            let _ = previous.send(());
-        }
+    ) -> (
+        mpsc::UnboundedReceiver<ThreadListenerCommand>,
+        u64,
+        Option<oneshot::Sender<()>>,
+    ) {
+        let previous = self.cancel_tx.replace(cancel_tx);
         self.listener_generation = self.listener_generation.wrapping_add(1);
         self.last_thread_settings = Some(thread_settings_baseline);
         let (listener_command_tx, listener_command_rx) = mpsc::unbounded_channel();
         self.listener_command_tx = Some(listener_command_tx);
         self.listener_thread = Some(Arc::downgrade(conversation));
         self.watch_registration = watch_registration;
-        (listener_command_rx, self.listener_generation)
+        (listener_command_rx, self.listener_generation, previous)
     }
 
     pub(crate) fn clear_listener(&mut self) {

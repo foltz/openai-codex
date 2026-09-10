@@ -1537,13 +1537,23 @@ impl TestAppServer {
         &mut self,
         make_request: impl FnOnce(RequestId) -> ClientRequest,
     ) -> anyhow::Result<T> {
+        self.request_with_trace(make_request, None).await
+    }
+
+    /// Sends an actual JSON-RPC trace carrier through the standalone transport.
+    pub async fn request_with_trace<T: DeserializeOwned>(
+        &mut self,
+        make_request: impl FnOnce(RequestId) -> ClientRequest,
+        trace: Option<codex_protocol::protocol::W3cTraceContext>,
+    ) -> anyhow::Result<T> {
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let request = make_request(RequestId::Integer(request_id));
         ensure!(
             request.id() == &RequestId::Integer(request_id),
             "typed request must use the supplied request ID"
         );
-        let request = serde_json::from_value::<JSONRPCRequest>(serde_json::to_value(request)?)?;
+        let mut request = serde_json::from_value::<JSONRPCRequest>(serde_json::to_value(request)?)?;
+        request.trace = trace;
         self.send_jsonrpc_message(JSONRPCMessage::Request(request))
             .await?;
         tokio::time::timeout(DEFAULT_REQUEST_TIMEOUT, self.read_response(request_id)).await?

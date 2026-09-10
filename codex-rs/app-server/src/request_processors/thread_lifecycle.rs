@@ -282,21 +282,33 @@ pub(super) async fn ensure_listener_task_running(
         if thread_state.listener_matches(&conversation) {
             return Ok(());
         }
-        let (listener_command_rx, listener_generation) = thread_state.set_listener(
-            cancel_tx,
-            &conversation,
-            watch_registration,
-            thread_settings_baseline,
-        );
+        let (listener_command_rx, listener_generation, previous_cancel_tx) = thread_state
+            .set_listener(
+                cancel_tx,
+                &conversation,
+                watch_registration,
+                thread_settings_baseline,
+            );
         let Some(listener_command_tx) = thread_state.listener_command_tx() else {
             tracing::warn!(
                 "thread listener command sender missing immediately after listener registration"
             );
+            if let Some(previous_cancel_tx) = previous_cancel_tx {
+                let _ = previous_cancel_tx.send(());
+            }
             return Ok(());
         };
         listener_task_context
+            .thread_watch_manager
+            .register_listener_generation(&conversation_id.to_string(), listener_generation);
+        listener_task_context
             .thread_state_manager
             .register_listener_command_tx(conversation_id, listener_command_tx);
+        // Publish the successor generation before allowing the predecessor to
+        // run its release guard.
+        if let Some(previous_cancel_tx) = previous_cancel_tx {
+            let _ = previous_cancel_tx.send(());
+        }
         (listener_command_rx, listener_generation)
     };
     let ListenerTaskContext {
@@ -311,7 +323,13 @@ pub(super) async fn ensure_listener_task_running(
         ..
     } = listener_task_context;
     let outgoing_for_task = Arc::clone(&outgoing);
+    let permit_release_guard = ListenerPermitReleaseGuard::new(
+        thread_watch_manager.clone(),
+        conversation_id.to_string(),
+        listener_generation,
+    );
     tokio::spawn(async move {
+        let _permit_release_guard = permit_release_guard;
         loop {
             tokio::select! {
                 biased;
@@ -341,6 +359,8 @@ pub(super) async fn ensure_listener_task_running(
                         Ok(event) => event,
                         Err(err) => {
                             tracing::warn!("thread.next_event() failed with: {err}");
+                            thread_watch_manager
+                                .note_thread_event_stream_closed(&conversation_id.to_string());
                             break;
                         }
                     };
@@ -433,6 +453,39 @@ pub(super) async fn ensure_listener_task_running(
 impl UnloadingState {
     fn retention_snapshot(&self) -> RetentionSnapshot {
         *self.retention_rx.borrow()
+    }
+}
+
+/// The listener task owns the final release fallback for transferred account
+/// work. A named guard covers every loop exit, including future select arms or
+/// task cancellation; generation matching leaves ownership to a successor.
+struct ListenerPermitReleaseGuard {
+    thread_watch_manager: ThreadWatchManager,
+    conversation_id: String,
+    listener_generation: u64,
+}
+
+impl ListenerPermitReleaseGuard {
+    fn new(
+        thread_watch_manager: ThreadWatchManager,
+        conversation_id: String,
+        listener_generation: u64,
+    ) -> Self {
+        Self {
+            thread_watch_manager,
+            conversation_id,
+            listener_generation,
+        }
+    }
+}
+
+impl Drop for ListenerPermitReleaseGuard {
+    fn drop(&mut self) {
+        self.thread_watch_manager
+            .release_account_work_permits_for_listener_generation(
+                &self.conversation_id,
+                self.listener_generation,
+            );
     }
 }
 

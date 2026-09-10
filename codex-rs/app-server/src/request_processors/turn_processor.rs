@@ -138,6 +138,44 @@ struct ThreadSettingsBuildParams {
     personality: Option<Personality>,
 }
 
+/// Owns a permit handoff until the submitted turn receives its opaque ID.
+/// Cancellation while the submission future is pending means no submission
+/// was acknowledged, so dropping this guard releases the exact pending entry
+/// instead of stranding it in the thread registry.
+struct PendingAccountWorkPermit {
+    thread_watch_manager: ThreadWatchManager,
+    thread_id: String,
+    key: Option<u64>,
+}
+
+impl PendingAccountWorkPermit {
+    fn new(thread_watch_manager: ThreadWatchManager, thread_id: String, key: u64) -> Self {
+        Self {
+            thread_watch_manager,
+            thread_id,
+            key: Some(key),
+        }
+    }
+
+    fn bind(&mut self, turn_id: String) {
+        let Some(key) = self.key.take() else {
+            return;
+        };
+        self.thread_watch_manager
+            .bind_account_work_permit(&self.thread_id, key, turn_id);
+    }
+}
+
+impl Drop for PendingAccountWorkPermit {
+    fn drop(&mut self) {
+        let Some(key) = self.key.take() else {
+            return;
+        };
+        self.thread_watch_manager
+            .release_pending_account_work_permit(&self.thread_id, key);
+    }
+}
+
 impl TurnRequestProcessor {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -179,12 +217,31 @@ impl TurnRequestProcessor {
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        self.turn_start_with_account_work_permit(
+            request_id,
+            params,
+            app_server_client_name,
+            app_server_client_version,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn turn_start_with_account_work_permit(
+        &self,
+        request_id: ConnectionRequestId,
+        params: TurnStartParams,
+        app_server_client_name: Option<String>,
+        app_server_client_version: Option<String>,
+        account_work_permit: Option<crate::managed_transition::AccountWorkPermitGuard>,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
         validate_user_input_image_urls(&params.input)?;
         self.turn_start_inner(
             request_id,
             params,
             app_server_client_name,
             app_server_client_version,
+            account_work_permit,
         )
         .await
         .map(|response| Some(response.into()))
@@ -477,6 +534,7 @@ impl TurnRequestProcessor {
         params: TurnStartParams,
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
+        mut account_work_permit: Option<crate::managed_transition::AccountWorkPermitGuard>,
     ) -> Result<TurnStartResponse, JSONRPCErrorError> {
         let (thread_id, thread) =
             self.load_thread(&params.thread_id)
@@ -562,18 +620,47 @@ impl TurnRequestProcessor {
             additional_context,
             thread_settings,
         };
-        let turn_id = thread
+
+        // Resolve the trace context before transferring the permit. Once the
+        // permit is retained by the submitted turn, no further cancellable
+        // await may occur before the enqueue itself or a cancellation could
+        // leave a permit with no terminal event to release it.
+        let request_trace_context = self.request_trace_context(&request_id).await;
+
+        // `submit_user_input` only enqueues the operation and returns its
+        // submission id. Transfer the permit before awaiting that enqueue so
+        // the core turn's terminal event, rather than the RPC handler's
+        // return, owns the account-work lifetime.
+        let mut pending_account_work_permit = if turn_has_input {
+            account_work_permit.take().map(|permit| {
+                let thread_id = thread_id.to_string();
+                let key = self
+                    .thread_watch_manager
+                    .retain_account_work_permit(&thread_id, permit);
+                PendingAccountWorkPermit::new(self.thread_watch_manager.clone(), thread_id, key)
+            })
+        } else {
+            None
+        };
+        let turn_id = match thread
             .submit_user_input_with_client_user_message_id(
                 turn_op,
-                self.request_trace_context(&request_id).await,
+                request_trace_context,
                 client_user_message_id,
             )
             .await
-            .map_err(|err| {
+        {
+            Ok(turn_id) => turn_id,
+            Err(err) => {
                 let error = internal_error(format!("failed to start turn: {err}"));
                 self.track_error_response(&request_id, &error, /*error_type*/ None);
-                error
-            })?;
+                return Err(error);
+            }
+        };
+
+        if let Some(pending_account_work_permit) = &mut pending_account_work_permit {
+            pending_account_work_permit.bind(turn_id.clone());
+        }
 
         if turn_has_input {
             let config_snapshot = thread.config_snapshot().await;
@@ -1510,4 +1597,46 @@ fn xcode_26_4_mcp_elicitations_auto_deny(
     // TODO: Remove this compatibility hack once Xcode 26.4 ages out.
     client_name == Some("Xcode")
         && client_version.is_some_and(|version| version.starts_with("26.4"))
+}
+
+#[cfg(test)]
+mod account_work_permit_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn pending_account_work_permit_releases_when_submission_is_cancelled() {
+        let coordinator = crate::managed_transition::ManagedTransitionCoordinator::new();
+        let permit = coordinator
+            .try_acquire_account_work_permit()
+            .expect("the barrier starts open");
+        let manager = ThreadWatchManager::new();
+        let thread_id = "thread-under-test".to_string();
+        let key = manager.retain_account_work_permit(&thread_id, permit);
+
+        let pending = PendingAccountWorkPermit::new(manager, thread_id, key);
+        drop(pending);
+
+        assert_eq!(coordinator.account_work_permits().admitted_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn pending_account_work_permit_disarms_after_turn_binding() {
+        let coordinator = crate::managed_transition::ManagedTransitionCoordinator::new();
+        let permit = coordinator
+            .try_acquire_account_work_permit()
+            .expect("the barrier starts open");
+        let manager = ThreadWatchManager::new();
+        let thread_id = "thread-under-test".to_string();
+        let key = manager.retain_account_work_permit(&thread_id, permit);
+
+        let mut pending = PendingAccountWorkPermit::new(manager.clone(), thread_id.clone(), key);
+        pending.bind("turn-1".to_string());
+        drop(pending);
+
+        assert_eq!(coordinator.account_work_permits().admitted_count(), 1);
+        manager
+            .note_turn_completed(&thread_id, "turn-1", false)
+            .await;
+        assert_eq!(coordinator.account_work_permits().admitted_count(), 0);
+    }
 }

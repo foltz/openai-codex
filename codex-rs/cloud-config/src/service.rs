@@ -72,6 +72,10 @@ enum UnauthorizedRecoveryAction {
 }
 
 pub(crate) struct CloudConfigBundleService<C> {
+    pub(crate) publication: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) generation: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) expected_generation: u64,
+    pub(crate) strict_cache_publication: bool,
     auth_manager: Arc<AuthManager>,
     client: Arc<C>,
     cache: CloudConfigBundleCache,
@@ -82,6 +86,10 @@ pub(crate) struct CloudConfigBundleService<C> {
 impl<C> Clone for CloudConfigBundleService<C> {
     fn clone(&self) -> Self {
         Self {
+            publication: self.publication.clone(),
+            generation: self.generation.clone(),
+            expected_generation: self.expected_generation,
+            strict_cache_publication: self.strict_cache_publication,
             auth_manager: Arc::clone(&self.auth_manager),
             client: Arc::clone(&self.client),
             cache: self.cache.clone(),
@@ -103,6 +111,10 @@ where
     ) -> Self {
         let codex_home = AbsolutePathBuf::resolve_path_against_base(codex_home, "/");
         Self {
+            publication: Arc::new(tokio::sync::Mutex::new(())),
+            generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            expected_generation: 0,
+            strict_cache_publication: false,
             auth_manager,
             client,
             cache: CloudConfigBundleCache::new(codex_home.clone()),
@@ -318,15 +330,47 @@ where
         }
 
         let (chatgpt_user_id, account_id) = auth_identity(auth);
-        if let Err(err) = self
-            .cache
-            .save(chatgpt_user_id, account_id, bundle.clone())
-            .await
-        {
-            tracing::warn!(
-                error = %err,
-                "Failed to write cloud config bundle cache"
-            );
+        let cache = self.cache.clone();
+        let publication = self.publication.clone();
+        let generation = self.generation.clone();
+        let expected_generation = self.expected_generation;
+        let saved_bundle = bundle.clone();
+        // The task owns the publication lease across real filesystem completion.
+        // Dropping this await (including the service timeout) cannot release it.
+        #[expect(
+            clippy::await_holding_invalid_type,
+            reason = "publication lease intentionally spans actual cache I/O so reset cannot acknowledge an unfinished write"
+        )]
+        let publication_result = tokio::spawn(async move {
+            let _lease = publication.lock().await;
+            if generation.load(std::sync::atomic::Ordering::Acquire) != expected_generation {
+                return Err(());
+            }
+            cache
+                .save(chatgpt_user_id, account_id, saved_bundle)
+                .await
+                .map_err(|_| ())
+        })
+        .await
+        .map_err(|_| {
+            CloudConfigBundleLoadError::new(
+                CloudConfigBundleLoadErrorCode::Internal,
+                None,
+                "cloud cache publication task failed",
+            )
+        })?;
+        if publication_result.is_err() {
+            if self.strict_cache_publication
+                || self.generation.load(std::sync::atomic::Ordering::Acquire)
+                    != self.expected_generation
+            {
+                return Err(CloudConfigBundleLoadError::new(
+                    CloudConfigBundleLoadErrorCode::Internal,
+                    None,
+                    "cloud cache publication refused or failed",
+                ));
+            }
+            tracing::warn!("Failed to write cloud config bundle cache");
         }
 
         emit_fetch_final_metric(

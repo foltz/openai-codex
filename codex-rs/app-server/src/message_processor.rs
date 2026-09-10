@@ -4,10 +4,13 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 
+use crate::account_dependency::AccountDependency;
+use crate::account_dependency::classify;
 use crate::attestation::app_server_attestation_provider;
 use crate::config_manager::ConfigManager;
 use crate::connection_rpc_gate::ConnectionRpcGate;
 use crate::current_time::app_server_time_provider;
+use crate::error_code::account_transition_in_progress;
 use crate::error_code::invalid_request;
 use crate::extensions::ThreadExtensionDependencies;
 use crate::extensions::app_server_extension_event_sink;
@@ -84,7 +87,9 @@ use codex_exec_server::EnvironmentManager;
 use codex_feedback::CodexFeedback;
 use codex_goal_extension::GoalService;
 use codex_home::CodexHomeUserInstructionsProvider;
+use codex_http_client::HttpClientFactory;
 use codex_login::AuthManager;
+use codex_models_manager::manager::SharedModelsManager;
 use codex_protocol::ThreadId;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::protocol::SessionSource;
@@ -172,8 +177,10 @@ impl ProcessorBackgroundShutdown {
 pub(crate) struct MessageProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     thread_manager: Arc<ThreadManager>,
-    models_refresh_worker: ModelsRefreshWorker,
+    models_refresh_worker: Arc<Mutex<ModelsRefreshWorker>>,
     skills_watcher: Arc<SkillsWatcher>,
+    #[cfg(test)]
+    thread_manager_for_tests: Arc<ThreadManager>,
     account_processor: AccountRequestProcessor,
     apps_processor: AppsRequestProcessor,
     catalog_processor: CatalogRequestProcessor,
@@ -186,6 +193,7 @@ pub(crate) struct MessageProcessor {
     fs_processor: FsRequestProcessor,
     git_processor: GitRequestProcessor,
     initialize_processor: InitializeRequestProcessor,
+    managed_transition_coordinator: crate::managed_transition::ManagedTransitionCoordinator,
     marketplace_processor: MarketplaceRequestProcessor,
     mcp_processor: McpRequestProcessor,
     plugin_processor: PluginRequestProcessor,
@@ -301,6 +309,15 @@ impl ConnectionSessionState {
         crate::transport::trusted_interactive(self.interactive_client_requested(), self.provenance)
     }
 
+    /// Issue 05's caller-authorization leg is narrower than the general
+    /// trusted-interactive predicate.
+    pub(crate) fn managed_transition_caller_authorized(&self) -> bool {
+        crate::transport::managed_transition_caller_authorized(
+            self.interactive_client_requested(),
+            self.provenance,
+        )
+    }
+
     /// A retention principal is minted by the server and released only for a
     /// positively established local/executable provenance. Client-provided
     /// initialization fields intentionally do not participate in this check.
@@ -336,7 +353,113 @@ impl ConnectionSessionState {
     }
 }
 
+/// Production wiring for the managed-auth reset inventory. The inventory is
+/// intentionally owned by the processor so the coordinator observes the same
+/// thread, plugin, model, telemetry, and config resources as ordinary requests.
+struct ProductionResetInventory {
+    telemetry_reset: crate::otel_reset_control::TelemetryResetControl,
+    config_manager: ConfigManager,
+    chatgpt_base_url: String,
+    thread_manager: Arc<ThreadManager>,
+    models_refresh_worker: Arc<Mutex<ModelsRefreshWorker>>,
+    models_manager: SharedModelsManager,
+    http_client_factory: HttpClientFactory,
+    auth_manager: Arc<AuthManager>,
+    remote_control_handle: Option<RemoteControlHandle>,
+}
+
+const RESET_THREAD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+impl crate::managed_transition::ResetInventory for ProductionResetInventory {
+    fn reset_all(&self) -> crate::managed_transition::ResetInventoryFuture<'_> {
+        use crate::managed_transition::ResetInventoryError;
+        Box::pin(async move {
+            let telemetry_generation = *self.auth_manager.auth_change_receiver().borrow();
+            if let Some(handle) = &self.remote_control_handle {
+                handle
+                    .reset_auth_cycle()
+                    .await
+                    .map_err(|_| ResetInventoryError::RemoteControlUnavailable)?;
+            }
+            let shutdown_report = self
+                .thread_manager
+                .shutdown_all_threads_bounded(RESET_THREAD_SHUTDOWN_TIMEOUT)
+                .await;
+            if !shutdown_report.submit_failed.is_empty() || !shutdown_report.timed_out.is_empty() {
+                return Err(ResetInventoryError::ThreadsIncomplete {
+                    submit_failed: shutdown_report.submit_failed.len(),
+                    timed_out: shutdown_report.timed_out.len(),
+                });
+            }
+            self.thread_manager.invalidate_mcp_runtimes().await;
+            tokio::time::timeout(
+                RESET_THREAD_SHUTDOWN_TIMEOUT,
+                self.config_manager.reset_managed_cloud_config(
+                    Arc::clone(&self.auth_manager),
+                    self.chatgpt_base_url.clone(),
+                    self.http_client_factory.clone(),
+                ),
+            )
+            .await
+            .map_err(|_| ResetInventoryError::CloudConfigTimedOut)??;
+            let reset_config = tokio::time::timeout(
+                RESET_THREAD_SHUTDOWN_TIMEOUT,
+                self.config_manager.load_managed_reset_config(),
+            )
+            .await
+            .map_err(|_| ResetInventoryError::ConfigLoadTimedOut)??;
+            codex_login::default_client::try_set_default_client_residency_requirement(
+                reset_config.enforce_residency.value(),
+            )
+            .map_err(|_| ResetInventoryError::ResidencyUnavailable)?;
+            self.telemetry_reset
+                .reset_until(
+                    telemetry_generation,
+                    Arc::new(reset_config),
+                    tokio::time::Instant::now() + RESET_THREAD_SHUTDOWN_TIMEOUT,
+                )
+                .await
+                .map_err(ResetInventoryError::Telemetry)?;
+            self.thread_manager
+                .plugins_manager()
+                .set_auth_mode(self.auth_manager.get_api_auth_mode());
+            self.thread_manager
+                .plugins_manager()
+                .clear_recommended_plugins_cache();
+            self.thread_manager
+                .plugins_manager()
+                .reset_remote_installed_plugins()
+                .await
+                .map_err(|_| ResetInventoryError::PluginRetirementUnavailable)?;
+            let old_worker = {
+                let mut worker = self.models_refresh_worker.lock().await;
+                std::mem::replace(
+                    &mut *worker,
+                    crate::models_refresh_worker::spawn(
+                        &self.models_manager,
+                        self.http_client_factory.clone(),
+                    ),
+                )
+            };
+            old_worker.shutdown();
+            tokio::time::timeout(
+                RESET_THREAD_SHUTDOWN_TIMEOUT,
+                self.models_manager
+                    .reset_for_managed_auth(self.http_client_factory.clone()),
+            )
+            .await
+            .map_err(|_| ResetInventoryError::ModelCatalogTimedOut)?
+            .map_err(|error| {
+                tracing::warn!(outcome = ?error, "managed model catalog reset refused");
+                ResetInventoryError::ModelCatalogUnavailable
+            })?;
+            Ok(())
+        })
+    }
+}
+
 pub(crate) struct MessageProcessorArgs {
+    pub(crate) telemetry_reset: crate::otel_reset_control::TelemetryResetControl,
     pub(crate) outgoing: Arc<OutgoingMessageSender>,
     pub(crate) analytics_events_client: AnalyticsEventsClient,
     pub(crate) arg0_paths: Arg0DispatchPaths,
@@ -361,6 +484,7 @@ impl MessageProcessor {
     /// `Sender` so handlers can enqueue messages to be written to stdout.
     pub(crate) fn new(args: MessageProcessorArgs) -> Self {
         let MessageProcessorArgs {
+            telemetry_reset,
             outgoing,
             analytics_events_client,
             arg0_paths,
@@ -457,8 +581,10 @@ impl MessageProcessor {
                 .with_runtime_config_change_listener(Arc::new(applied_mcp_config_identity.clone()))
         });
         let models_manager = thread_manager.get_models_manager();
-        let models_refresh_worker =
-            crate::models_refresh_worker::spawn(&models_manager, config.http_client_factory());
+        let models_refresh_worker = Arc::new(Mutex::new(crate::models_refresh_worker::spawn(
+            &models_manager,
+            config.http_client_factory(),
+        )));
         thread_manager
             .plugins_manager()
             .set_analytics_events_client(analytics_events_client.clone());
@@ -483,6 +609,32 @@ impl MessageProcessor {
             applied_mcp_config_identity.clone(),
             analytics_events_client.clone(),
         );
+        let managed_transition_control_socket_endpoint =
+            crate::transport::app_server_control_socket_path(&config.codex_home)
+                .map(|path| path.display().to_string())
+                .unwrap_or_default();
+        let reset_inventory: Arc<dyn crate::managed_transition::ResetInventory> =
+            Arc::new(ProductionResetInventory {
+                telemetry_reset,
+                config_manager: config_manager.clone(),
+                chatgpt_base_url: config.chatgpt_base_url.clone(),
+                thread_manager: Arc::clone(&thread_manager),
+                models_refresh_worker: Arc::clone(&models_refresh_worker),
+                models_manager: models_manager.clone(),
+                http_client_factory: config.http_client_factory(),
+                auth_manager: Arc::clone(&auth_manager),
+                remote_control_handle: remote_control_handle.clone(),
+            });
+        let managed_transition_coordinator =
+            crate::managed_transition::ManagedTransitionCoordinator::with_adoption_and_account_projection(
+                crate::managed_transition::AuthoritativeAuthState::from_auth_manager(&auth_manager),
+                Arc::new(crate::managed_transition::ProcessTargetEvidenceSource::new(
+                    managed_transition_control_socket_endpoint,
+                )),
+                Arc::clone(&auth_manager),
+                reset_inventory,
+                Arc::clone(&outgoing),
+            );
         let on_effective_plugins_changed =
             crate::effective_plugin_change::effective_plugins_changed_callback(
                 auth_manager.clone(),
@@ -491,6 +643,7 @@ impl MessageProcessor {
                 config_processor.clone(),
                 request_serialization_queues.clone(),
                 auxiliary_tasks.clone(),
+                managed_transition_coordinator.account_work_permits(),
             );
         let account_processor = AccountRequestProcessor::new(
             auth_manager.clone(),
@@ -647,9 +800,11 @@ impl MessageProcessor {
 
         Self {
             outgoing,
-            thread_manager,
+            thread_manager: Arc::clone(&thread_manager),
             models_refresh_worker,
             skills_watcher,
+            #[cfg(test)]
+            thread_manager_for_tests: Arc::clone(&thread_manager),
             account_processor,
             apps_processor,
             catalog_processor,
@@ -662,6 +817,7 @@ impl MessageProcessor {
             fs_processor,
             git_processor,
             initialize_processor,
+            managed_transition_coordinator,
             marketplace_processor,
             mcp_processor,
             plugin_processor,
@@ -680,9 +836,16 @@ impl MessageProcessor {
     pub(crate) fn clear_runtime_references(&self) {
         self.account_processor.clear_external_auth();
         self.apps_processor.shutdown();
-        self.models_refresh_worker.shutdown();
+        if let Ok(worker) = self.models_refresh_worker.try_lock() {
+            worker.shutdown();
+        }
         self.skills_watcher.shutdown();
         let _ = self.auxiliary_tasks.close_registration();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn thread_manager_for_tests(&self) -> &Arc<ThreadManager> {
+        &self.thread_manager_for_tests
     }
 
     pub(crate) async fn process_request(
@@ -948,8 +1111,16 @@ impl MessageProcessor {
     }
 
     pub(crate) async fn drain_background_tasks(&self) {
-        self.models_refresh_worker.shutdown();
+        self.models_refresh_worker.lock().await.shutdown();
         self.thread_processor.drain_background_tasks().await;
+    }
+
+    async fn shutdown_models_refresh_worker_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> crate::models_refresh_worker::ModelsRefreshShutdown {
+        let worker = self.models_refresh_worker.lock().await;
+        worker.shutdown_until(deadline).await
     }
 
     /// Independent terminal observations under one caller-owned deadline.
@@ -962,7 +1133,7 @@ impl MessageProcessor {
     ) -> ProcessorBackgroundShutdown {
         let plugins_manager = self.thread_manager.plugins_manager();
         let (models, thread_starts, apps, skills, plugins, auxiliary_tasks) = tokio::join!(
-            self.models_refresh_worker.shutdown_until(deadline),
+            self.shutdown_models_refresh_worker_until(deadline),
             self.thread_processor.drain_background_tasks_until(deadline),
             self.apps_processor.shutdown_until(deadline),
             self.skills_watcher.shutdown_until(deadline),
@@ -1119,9 +1290,18 @@ impl MessageProcessor {
         {
             return Err(invalid_request(experimental_required_message(reason)));
         }
+        let account_work_permit = match classify(&codex_request) {
+            AccountDependency::Permit => Some(
+                self.managed_transition_coordinator
+                    .try_acquire_account_work_permit()
+                    .ok_or_else(account_transition_in_progress)?,
+            ),
+            AccountDependency::Independent => None,
+        };
         let connection_id = connection_request_id.connection_id;
         let retention_principal = session.retention_principal();
         let retention_acquire_authority = session.retention_acquire_authority();
+        let managed_transition_caller_authorized = session.managed_transition_caller_authorized();
         self.initialize_processor.track_initialized_request(
             connection_id,
             connection_request_id.request_id.clone(),
@@ -1150,6 +1330,8 @@ impl MessageProcessor {
                         client_mcp_extensions,
                         retention_principal,
                         retention_acquire_authority,
+                        managed_transition_caller_authorized,
+                        account_work_permit,
                     )
                     .await;
                 if let Err(error) = result {
@@ -1182,6 +1364,8 @@ impl MessageProcessor {
         client_mcp_extensions: ClientMcpExtensions,
         retention_principal: Option<RetentionPrincipalId>,
         retention_acquire_authority: RetentionAcquireAuthority,
+        managed_transition_caller_authorized: bool,
+        account_work_permit: Option<crate::managed_transition::AccountWorkPermitGuard>,
     ) -> Result<(), JSONRPCErrorError> {
         let connection_id = connection_request_id.connection_id;
         let request_id = ConnectionRequestId {
@@ -1614,11 +1798,12 @@ impl MessageProcessor {
             }
             ClientRequest::TurnStart { params, .. } => {
                 self.turn_processor
-                    .turn_start(
+                    .turn_start_with_account_work_permit(
                         request_id.clone(),
                         params,
                         app_server_client_name.clone(),
                         client_version.clone(),
+                        account_work_permit,
                     )
                     .await
             }
@@ -1706,6 +1891,24 @@ impl MessageProcessor {
             ClientRequest::CancelLoginAccount { params, .. } => {
                 self.account_processor.cancel_login_account(params).await
             }
+            ClientRequest::ManagedTransitionStart { params, .. } => Ok(Some(
+                self.managed_transition_coordinator
+                    .start_dispatch(params, managed_transition_caller_authorized)
+                    .await
+                    .into(),
+            )),
+            ClientRequest::ManagedTransitionRead { params, .. } => Ok(Some(
+                self.managed_transition_coordinator
+                    .read_dispatch(params, managed_transition_caller_authorized)
+                    .await
+                    .into(),
+            )),
+            ClientRequest::ManagedTransitionCancel { params, .. } => Ok(Some(
+                self.managed_transition_coordinator
+                    .cancel_dispatch(params, managed_transition_caller_authorized)
+                    .await
+                    .into(),
+            )),
             ClientRequest::GetAccount { params, .. } => {
                 self.account_processor.get_account(params).await
             }

@@ -13,10 +13,9 @@ use crate::transport::AppServerTransport;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::JSONRPCRequest;
-use codex_otel::set_parent_from_context;
-use codex_otel::set_parent_from_w3c_trace_context;
+use codex_otel::context_from_w3c_trace_context;
+use codex_otel::span_with_parent_context;
 use codex_otel::traceparent_context_from_env;
-use codex_protocol::protocol::W3cTraceContext;
 use tracing::Span;
 use tracing::field;
 use tracing::info_span;
@@ -29,27 +28,35 @@ pub(crate) fn request_span(
 ) -> Span {
     let initialize_client_info = initialize_client_info(request);
     let method = request.method.as_str();
-    let span = app_server_request_span_template(
-        method,
-        transport_name(transport),
-        &request.id,
-        connection_id,
-    );
+    let parent_trace = request
+        .trace
+        .as_ref()
+        .filter(|trace| trace.traceparent.is_some());
+    let parent = match parent_trace {
+        Some(trace) => {
+            let context = context_from_w3c_trace_context(trace);
+            if context.is_none() {
+                tracing::warn!(rpc_method = method, rpc_request_id = %request.id,
+                    "ignoring invalid inbound request trace carrier");
+            }
+            context
+        }
+        None => traceparent_context_from_env(),
+    };
+    let span = span_with_parent_context(parent, || {
+        app_server_request_span_template(
+            method,
+            transport_name(transport),
+            &request.id,
+            connection_id,
+        )
+    });
 
     record_client_info(
         &span,
         client_name(initialize_client_info.as_ref(), session),
         client_version(initialize_client_info.as_ref(), session),
     );
-
-    let parent_trace = request.trace.as_ref().and_then(|trace| {
-        trace.traceparent.as_ref()?;
-        Some(W3cTraceContext {
-            traceparent: trace.traceparent.clone(),
-            tracestate: trace.tracestate.clone(),
-        })
-    });
-    attach_parent_context(&span, method, &request.id, parent_trace.as_ref());
 
     span
 }
@@ -65,7 +72,9 @@ pub(crate) fn typed_request_span(
     session: &ConnectionSessionState,
 ) -> Span {
     let method = request.method_name();
-    let span = app_server_request_span_template(method, "in-process", request.id(), connection_id);
+    let span = span_with_parent_context(traceparent_context_from_env(), || {
+        app_server_request_span_template(method, "in-process", request.id(), connection_id)
+    });
 
     let client_info = initialize_client_info_from_typed_request(request);
     record_client_info(
@@ -78,7 +87,6 @@ pub(crate) fn typed_request_span(
             .or(session.client_version()),
     );
 
-    attach_parent_context(&span, method, request.id(), /*parent_trace*/ None);
     span
 }
 
@@ -119,25 +127,6 @@ fn record_client_info(span: &Span, client_name: Option<&str>, client_version: Op
     }
     if let Some(client_version) = client_version {
         span.record("app_server.client_version", client_version);
-    }
-}
-
-fn attach_parent_context(
-    span: &Span,
-    method: &str,
-    request_id: &impl std::fmt::Display,
-    parent_trace: Option<&W3cTraceContext>,
-) {
-    if let Some(trace) = parent_trace {
-        if !set_parent_from_w3c_trace_context(span, trace) {
-            tracing::warn!(
-                rpc_method = method,
-                rpc_request_id = %request_id,
-                "ignoring invalid inbound request trace carrier"
-            );
-        }
-    } else if let Some(context) = traceparent_context_from_env() {
-        set_parent_from_context(span, context);
     }
 }
 

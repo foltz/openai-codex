@@ -57,18 +57,28 @@ impl ThreadManager {
             let _task = task;
             let startup = Arc::new(SessionStartup::default());
             tokio::pin!(until);
-            // Drop initialization before cleanup; startup still owns any unfinished acquisition.
+            // Finish cancellation inside the retained constructor before cleanup.
+            // Dropping only its observer would leave acquisition locks held.
             let result = {
                 let start = manager.start_thread_inner(
                     options,
                     /*forked_from_thread_id*/ None,
                     Some(Arc::clone(&startup)),
                 );
+                tokio::pin!(start);
                 tokio::select! {
                     biased;
-                    _ = &mut until => Err(CodexErr::TurnAborted),
-                    _ = abandoned.cancelled() => Err(CodexErr::TurnAborted),
-                    result = start => result,
+                    _ = &mut until => {
+                        startup.stop.cancel();
+                        let _ = start.await;
+                        Err(CodexErr::TurnAborted)
+                    },
+                    _ = abandoned.cancelled() => {
+                        startup.stop.cancel();
+                        let _ = start.await;
+                        Err(CodexErr::TurnAborted)
+                    },
+                    result = &mut start => result,
                 }
             };
             // The lifetime task must not keep the manager and its parent threads alive.

@@ -426,6 +426,9 @@ async fn start_if_idle(
 
     let turn_state = {
         let mut active_turn = session.active_turn.lock().await;
+        if session.task_admission_closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(CodexErr::Fatal("thread task admission is closed".to_string()));
+        }
         if active_turn.is_some() {
             return Ok(TurnInputSubmission::NotSubmitted {
                 reason: NotSubmittedReason::NotIdle,
@@ -506,7 +509,7 @@ async fn start_if_idle(
     }
     session
         .start_task(turn_context, task_input, RegularTask::new())
-        .await;
+        .await?;
     Ok(TurnInputSubmission::Started {
         turn_id: submission_id,
     })

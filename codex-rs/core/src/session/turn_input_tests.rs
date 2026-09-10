@@ -109,6 +109,48 @@ async fn submit_steer_only(
 }
 
 #[tokio::test]
+async fn retired_session_cannot_report_started_for_new_turn_input() {
+    let (session, _) = make_session_and_context().await;
+    let session = Arc::new(session);
+    session.close_task_admission().await;
+    let error = handle(
+        &session,
+        TurnInputRequest::new(SubmittedTurnInput::UserInput {
+            content: vec![UserInput::Text {
+                text: "must not start".to_string(),
+                text_elements: Vec::new(),
+            }],
+            client_id: None,
+        }),
+        TurnInputMode::StartIfIdle,
+        "retired-input".to_string(),
+    )
+    .await
+    .expect_err("closed task admission must refuse, not report Started");
+    assert!(error.to_string().contains("thread task admission is closed"));
+    assert!(session.active_turn.lock().await.is_none());
+}
+
+#[tokio::test]
+async fn task_start_reports_retirement_refusal_to_its_caller() {
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    session.close_task_admission().await;
+    session
+        .start_task(
+            Arc::new(turn),
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: true,
+            },
+        )
+        .await
+        .expect_err("a refused task start must not look successful");
+    assert!(session.active_turn.lock().await.is_none());
+}
+
+#[tokio::test]
 #[expect(
     clippy::await_holding_invalid_type,
     reason = "simulate an in-flight realtime append while checking input admission"

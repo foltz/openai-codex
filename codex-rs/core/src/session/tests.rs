@@ -604,14 +604,16 @@ async fn regular_turn_emits_turn_started_with_trace_id_without_waiting_for_start
         Some("00000000000000000000000000000011")
     );
     let (_tx, startup_prewarm_rx) = tokio::sync::oneshot::channel::<()>();
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     let handle = tokio::spawn(async move {
         let _ = startup_prewarm_rx.await;
-        Ok(test_model_client_session())
+        let _ = result_tx.send(Ok(test_model_client_session()));
     });
 
     sess.set_session_startup_prewarm(
         crate::session_startup_prewarm::SessionStartupPrewarmHandle::new(
-            handle,
+            sess.task_joins.register(handle),
+            result_rx,
             std::time::Instant::now(),
             crate::client::WEBSOCKET_CONNECT_TIMEOUT,
         ),
@@ -760,14 +762,16 @@ async fn request_mcp_server_elicitation_waits_for_user_response(source: SessionS
 async fn interrupting_regular_turn_waiting_on_startup_prewarm_emits_turn_aborted() {
     let (sess, tc, rx) = make_session_and_context_with_rx().await;
     let (_tx, startup_prewarm_rx) = tokio::sync::oneshot::channel::<()>();
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     let handle = tokio::spawn(async move {
         let _ = startup_prewarm_rx.await;
-        Ok(test_model_client_session())
+        let _ = result_tx.send(Ok(test_model_client_session()));
     });
 
     sess.set_session_startup_prewarm(
         crate::session_startup_prewarm::SessionStartupPrewarmHandle::new(
-            handle,
+            sess.task_joins.register(handle),
+            result_rx,
             std::time::Instant::now(),
             crate::client::WEBSOCKET_CONNECT_TIMEOUT,
         ),
@@ -816,6 +820,66 @@ async fn interrupting_regular_turn_waiting_on_startup_prewarm_emits_turn_aborted
     assert!(started_at.is_some());
     assert!(completed_at.is_some());
     assert!(duration_ms.is_some());
+}
+
+#[tokio::test]
+async fn startup_prewarm_ready_result_is_consumed_once_with_join_retained() {
+    let (session, _) = make_session_and_context().await;
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _ = result_tx.send(Ok(test_model_client_session()));
+        // A ready value is deliberately not the end of this task. The
+        // current-thread executor cannot process its abort until we yield.
+        std::future::pending::<()>().await;
+    });
+    let task_exit = task.abort_handle();
+    session
+        .set_session_startup_prewarm(
+            crate::session_startup_prewarm::SessionStartupPrewarmHandle::new(
+                session.task_joins.register(task),
+                result_rx,
+                std::time::Instant::now(),
+                Duration::from_secs(3),
+            ),
+        )
+        .await;
+    let cancel = CancellationToken::new();
+    assert!(matches!(
+        session
+            .consume_startup_prewarm_for_regular_turn(&cancel)
+            .await,
+        crate::session_startup_prewarm::SessionStartupPrewarmResolution::Ready(_)
+    ));
+    assert!(
+        !task_exit.is_finished(),
+        "result consumption is not task exit"
+    );
+    assert_eq!(
+        session
+            .task_joins
+            .shutdown_until(tokio::time::Instant::now())
+            .await,
+        crate::tasks::TaskJoinOutcome::TimedOut,
+        "an unobserved join cannot become success from a consumed result"
+    );
+    assert!(matches!(
+        session
+            .consume_startup_prewarm_for_regular_turn(&cancel)
+            .await,
+        crate::session_startup_prewarm::SessionStartupPrewarmResolution::Unavailable {
+            status: "not_scheduled",
+            ..
+        }
+    ));
+    session.close_task_admission().await;
+    assert_eq!(
+        session
+            .task_joins
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(3))
+            .await,
+        crate::tasks::TaskJoinOutcome::Complete { panicked: false }
+    );
+    assert!(task_exit.is_finished());
 }
 
 fn test_model_client_session() -> crate::client::ModelClientSession {
@@ -6024,6 +6088,7 @@ async fn session_new_fails_when_zsh_fork_enabled_without_packaged_zsh() {
         /*deferred_clear_session_start*/ None,
         /*runtime_config_change_listener*/ None,
         /*runtime_config_change_gate*/ None,
+        /*startup_custody*/ None,
     )
     .await;
 
@@ -6318,6 +6383,9 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         conversation: Arc::new(RealtimeConversationManager::new()),
         realtime_history: None,
         active_turn: Mutex::new(None),
+        task_admission_closed: std::sync::atomic::AtomicBool::new(false),
+        task_joins: Default::default(),
+        cleanup_owner: Default::default(),
         async_hook_results,
         input_queue: super::input_queue::InputQueue::new(),
         services,
@@ -6536,6 +6604,7 @@ async fn make_session_with_config_and_listener_and_rx(
         /*deferred_clear_session_start*/ None,
         runtime_config_change_listener,
         runtime_config_change_gate,
+        /*startup_custody*/ None,
     )
     .await?;
 
@@ -6678,6 +6747,7 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         /*deferred_clear_session_start*/ None,
         /*runtime_config_change_listener*/ None,
         /*runtime_config_change_gate*/ None,
+        /*startup_custody*/ None,
     )
     .await?;
 
@@ -7443,7 +7513,7 @@ async fn submit_with_trace_captures_current_span_trace_context() {
     let (tx_sub, rx_sub) = async_channel::bounded(1);
     let (_tx_event, rx_event) = async_channel::unbounded();
     let io = SessionIo {
-        tx_sub,
+        tx_sub: tx_sub.into(),
         rx_event,
         agent_status: watch::channel(AgentStatus::PendingInit).1,
         session_loop_termination: completed_session_loop_termination(),
@@ -8153,7 +8223,7 @@ async fn submission_loop_channel_close_runs_full_thread_teardown() {
     let (tx_sub, rx_sub) = async_channel::bounded(1);
     drop(tx_sub);
     let session = Arc::new(session);
-    submission_loop(session, Arc::clone(&turn_context.config), rx_sub).await;
+    submission_loop(session, Arc::clone(&turn_context.config), rx_sub, None).await;
 
     assert_eq!(1, calls.load(std::sync::atomic::Ordering::SeqCst));
     assert_eq!(
@@ -8238,7 +8308,13 @@ async fn submission_loop_channel_close_aborts_active_turn_before_thread_stop_lif
 
     let (tx_sub, rx_sub) = async_channel::bounded(1);
     drop(tx_sub);
-    submission_loop(Arc::clone(&session), session.get_config().await, rx_sub).await;
+    submission_loop(
+        Arc::clone(&session),
+        session.get_config().await,
+        rx_sub,
+        None,
+    )
+    .await;
 
     assert_eq!(
         vec!["turn_abort", "thread_stop"],
@@ -8246,6 +8322,190 @@ async fn submission_loop_channel_close_aborts_active_turn_before_thread_stop_lif
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     );
+}
+
+#[tokio::test]
+async fn closing_task_admission_during_preparation_prevents_final_install() {
+    struct PausedTurnStart {
+        entered: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
+    }
+    impl codex_extension_api::TurnLifecycleContributor for PausedTurnStart {
+        fn on_turn_start<'a>(
+            &'a self,
+            _input: codex_extension_api::TurnStartInput<'a>,
+        ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+            Box::pin(async move {
+                self.entered.add_permits(1);
+                self.release
+                    .acquire()
+                    .await
+                    .expect("release preparation")
+                    .forget();
+            })
+        }
+    }
+    let (mut session, context) = make_session_and_context().await;
+    let pause = Arc::new(PausedTurnStart {
+        entered: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::<crate::config::Config>::new();
+    builder.turn_lifecycle_contributor(pause.clone());
+    session.services.extensions = Arc::new(builder.build());
+    let session = Arc::new(session);
+    let starting = Arc::clone(&session);
+    let start = tokio::spawn(async move {
+        starting
+            .spawn_task(
+                Arc::new(context),
+                Vec::new(),
+                NeverEndingTask {
+                    kind: TaskKind::Regular,
+                    listen_to_cancellation_token: false,
+                },
+            )
+            .await;
+    });
+    pause
+        .entered
+        .acquire()
+        .await
+        .expect("preparation entered")
+        .forget();
+    {
+        let active = session.active_turn.lock().await;
+        assert!(
+            active.as_ref().is_some_and(|turn| turn.task.is_none()),
+            "must pass early gate and reserve before closing admission"
+        );
+    }
+    session.close_task_admission().await;
+    assert!(session.active_turn.lock().await.is_none());
+    pause.release.add_permits(1);
+    start.await.expect("start returned");
+    assert!(
+        session.active_turn.lock().await.is_none(),
+        "late final install must refuse without residue"
+    );
+}
+
+#[tokio::test]
+async fn closed_task_admission_prevents_direct_and_mailbox_task_creation() {
+    let (session, context, _events) = make_session_and_context_with_rx().await;
+    *session.active_turn.lock().await = Some(ActiveTurn::default());
+    session.close_task_admission().await;
+    assert!(session.active_turn.lock().await.is_none());
+    session
+        .spawn_task(Arc::clone(&context), Vec::new(), CompletingTask)
+        .await;
+    assert!(session.active_turn.lock().await.is_none());
+    session
+        .input_queue
+        .enqueue_mailbox_communication(
+            InterAgentCommunication::new(
+                AgentPath::root(),
+                AgentPath::root(),
+                Vec::new(),
+                "pending shutdown mail".to_string(),
+                /*trigger_turn*/ true,
+            ),
+            /*parent_turn_id*/ None,
+        )
+        .await;
+    session.maybe_start_turn_for_pending_work().await;
+    assert!(session.active_turn.lock().await.is_none());
+    assert!(session.input_queue.has_pending_mailbox_items().await);
+}
+
+#[tokio::test]
+async fn mcp_prewarm_shutdown_retains_join_after_observer_cancellation() {
+    let (session, _context) = make_session_and_context().await;
+    let (release, released) = tokio::sync::oneshot::channel();
+    let worker = tokio::spawn(async move {
+        released.await.expect("release worker");
+    });
+    *session.mcp_prewarm_task.lock().expect("worker owner") =
+        Some(session_loop_termination_from_handle(worker));
+    {
+        let observer = session.stop_mcp_prewarm_worker();
+        tokio::pin!(observer);
+        assert!(futures::poll!(observer.as_mut()).is_pending());
+        assert!(session.mcp_prewarm_shutdown.is_cancelled());
+    }
+    let observer = session.stop_mcp_prewarm_worker();
+    tokio::pin!(observer);
+    assert!(futures::poll!(observer.as_mut()).is_pending());
+    release.send(()).expect("worker still owned");
+    assert_eq!(observer.await, SessionLoopOutcome::Normal);
+    assert_eq!(
+        session.stop_mcp_prewarm_worker().await,
+        SessionLoopOutcome::Normal
+    );
+}
+
+#[tokio::test]
+async fn session_loop_abort_and_multiple_observers_refer_to_the_same_task() {
+    let completion =
+        session_loop_termination_from_handle(tokio::spawn(std::future::pending::<()>()));
+    {
+        let observer = completion.clone();
+        tokio::pin!(observer);
+        assert!(futures::poll!(observer.as_mut()).is_pending());
+    }
+    completion.request_abort();
+    let (first, second) = tokio::join!(completion.clone(), completion.clone());
+    assert_eq!(
+        (first, second),
+        (SessionLoopOutcome::Cancelled, SessionLoopOutcome::Cancelled)
+    );
+    completion.request_abort();
+    assert_eq!(completion.await, SessionLoopOutcome::Cancelled);
+}
+
+#[tokio::test]
+async fn session_loop_outcome_retains_normal_cancelled_and_panicked_results() {
+    let normal = session_loop_termination_from_handle(tokio::spawn(async {}));
+    assert_eq!(normal.clone().await, SessionLoopOutcome::Normal);
+    assert_eq!(normal.await, SessionLoopOutcome::Normal);
+
+    let cancelled = tokio::spawn(std::future::pending::<()>());
+    cancelled.abort();
+    let cancelled = session_loop_termination_from_handle(cancelled);
+    assert_eq!(cancelled.clone().await, SessionLoopOutcome::Cancelled);
+    assert_eq!(cancelled.await, SessionLoopOutcome::Cancelled);
+
+    let panicked = session_loop_termination_from_handle(tokio::spawn(async {
+        panic!("session loop failure fixture");
+    }));
+    assert_eq!(panicked.clone().await, SessionLoopOutcome::Panicked);
+    assert_eq!(panicked.await, SessionLoopOutcome::Panicked);
+}
+
+#[tokio::test]
+async fn shutdown_and_wait_refuses_cancelled_or_panicked_loop() {
+    let cancelled = tokio::spawn(std::future::pending::<()>());
+    cancelled.abort();
+    let panicked = tokio::spawn(async { panic!("session loop failure fixture") });
+    for handle in [cancelled, panicked] {
+        let (tx_sub, rx_sub) = async_channel::bounded(1);
+        drop(rx_sub);
+        let (_tx_event, rx_event) = async_channel::unbounded();
+        let io = SessionIo {
+            tx_sub: tx_sub.into(),
+            rx_event,
+            agent_status: watch::channel(AgentStatus::PendingInit).1,
+            session_loop_termination: session_loop_termination_from_handle(handle),
+        };
+        let error = io
+            .shutdown_and_wait()
+            .await
+            .expect_err("failed loop must refuse");
+        assert!(matches!(
+            error.details(),
+            CodexErrorDetails::InternalAgentDied
+        ));
+    }
 }
 
 #[tokio::test]
@@ -8259,7 +8519,7 @@ async fn shutdown_and_wait_allows_multiple_waiters() {
         tokio::time::sleep(StdDuration::from_millis(50)).await;
     });
     let io = Arc::new(SessionIo {
-        tx_sub,
+        tx_sub: tx_sub.into(),
         rx_event,
         agent_status: watch::channel(AgentStatus::PendingInit).1,
         session_loop_termination: session_loop_termination_from_handle(session_loop_handle),
@@ -8295,7 +8555,7 @@ async fn shutdown_and_wait_waits_when_shutdown_is_already_in_progress() {
         let _ = shutdown_complete_rx.await;
     });
     let io = Arc::new(SessionIo {
-        tx_sub,
+        tx_sub: tx_sub.into(),
         rx_event,
         agent_status: watch::channel(AgentStatus::PendingInit).1,
         session_loop_termination: session_loop_termination_from_handle(session_loop_handle),
@@ -8596,6 +8856,9 @@ where
         conversation: Arc::new(RealtimeConversationManager::new()),
         realtime_history: None,
         active_turn: Mutex::new(None),
+        task_admission_closed: std::sync::atomic::AtomicBool::new(false),
+        task_joins: Default::default(),
+        cleanup_owner: Default::default(),
         async_hook_results,
         input_queue: super::input_queue::InputQueue::new(),
         services,
@@ -10874,6 +11137,48 @@ async fn recv_terminal_event(
     })
     .await
     .expect("terminal event should be delivered")
+}
+
+#[tokio::test]
+async fn deadline_bound_cleanup_joins_an_installed_session_task() {
+    let (session, turn_context) = make_session_and_context().await;
+    let session = Arc::new(session);
+    session
+        .spawn_task(
+            Arc::new(turn_context),
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: false,
+            },
+        )
+        .await;
+    assert!(
+        session
+            .active_turn
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|turn| turn.task.is_some())
+    );
+    let owner = session.cleanup_owner();
+    owner
+        .bind_deadline(tokio::time::Instant::now() + Duration::from_secs(3))
+        .expect("bind");
+    assert_eq!(
+        owner.observe(Arc::clone(&session)).await,
+        super::retirement::CleanupExecution::Finished {
+            persistence_failed: false
+        }
+    );
+    assert!(session.active_turn.lock().await.is_none());
+    assert_eq!(
+        session
+            .task_joins
+            .shutdown_until(tokio::time::Instant::now())
+            .await,
+        crate::tasks::TaskJoinOutcome::Complete { panicked: false }
+    );
 }
 
 #[derive(Clone, Copy)]

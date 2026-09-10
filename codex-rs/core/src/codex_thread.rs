@@ -80,6 +80,14 @@ use codex_rollout::state_db::StateDbHandle;
 
 static LIVE_THREADS: Gauge = Gauge::new("core.threads.live");
 
+mod retirement;
+pub use retirement::ThreadCleanupOutcome;
+pub use retirement::ThreadLoopOutcome;
+pub use retirement::ThreadRetirement;
+pub use retirement::ThreadRetirementError;
+pub use retirement::ThreadRetirementReport;
+pub use retirement::ThreadShutdownOutcome;
+
 #[derive(Clone, Debug)]
 pub struct ThreadConfigSnapshot {
     pub model: String,
@@ -182,6 +190,7 @@ pub struct GuardianRootSnapshot {
 }
 
 pub struct CodexThread {
+    retirement: std::sync::Mutex<Option<ThreadRetirement>>,
     pub(crate) session: Arc<Session>,
     pub(crate) io: SessionIo,
     // Registration source controls live access and lifecycle hooks. Managed Guardian
@@ -218,6 +227,7 @@ impl CodexThread {
         session_source: SessionSource,
     ) -> Self {
         Self {
+            retirement: std::sync::Mutex::new(None),
             session,
             io,
             session_source,

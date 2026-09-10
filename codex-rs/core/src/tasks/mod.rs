@@ -1,6 +1,7 @@
 mod compact;
 mod lifecycle;
 mod regular;
+mod retirement;
 mod review;
 mod user_shell;
 
@@ -15,7 +16,6 @@ use tokio::select;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
 use tracing::Span;
 use tracing::field;
@@ -58,9 +58,13 @@ use codex_thread_store::PersistContext;
 
 use codex_features::Feature;
 use codex_protocol::error::CodexErrorDetails;
+use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 pub(crate) use compact::CompactTask;
 pub(crate) use regular::RegularTask;
+pub(crate) use retirement::TaskAbortHandle;
+pub(crate) use retirement::TaskJoinOutcome;
+pub(crate) use retirement::TaskJoinRegistry;
 pub(crate) use review::ReviewTask;
 pub(crate) use user_shell::UserShellCommandMode;
 pub(crate) use user_shell::UserShellCommandTask;
@@ -267,6 +271,21 @@ where
 }
 
 impl Session {
+    /// Permanently stop task admission before retirement takes the active task.
+    pub(crate) async fn close_task_admission(&self) {
+        let reservation = {
+            let mut active = self.active_turn.lock().await;
+            self.task_admission_closed
+                .store(true, std::sync::atomic::Ordering::Release);
+            if active.as_ref().is_some_and(|turn| turn.task.is_none()) {
+                active.take()
+            } else {
+                None
+            }
+        };
+        drop(reservation);
+    }
+
     pub async fn spawn_task<T: SessionTask>(
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
@@ -275,7 +294,7 @@ impl Session {
     ) {
         self.abort_all_tasks(TurnAbortReason::Replaced).await;
         self.clear_connector_selection().await;
-        self.start_task(turn_context, input, task).await;
+        let _ = self.start_task(turn_context, input, task).await;
     }
 
     #[expect(
@@ -287,7 +306,7 @@ impl Session {
         turn_context: Arc<TurnContext>,
         input: Vec<TurnInput>,
         task: T,
-    ) {
+    ) -> CodexResult<()> {
         self.activate_plugin_selection(&turn_context).await;
         // Inherited or recovered roots are applied before task start. Otherwise this
         // task owns its turn, including background work. Later mail cannot change it.
@@ -313,6 +332,12 @@ impl Session {
         let (pending_items, _) = self.input_queue.drain_mailbox_input_items().await;
         let turn_state = {
             let mut active = self.active_turn.lock().await;
+            if self
+                .task_admission_closed
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(CodexErr::Fatal("thread task admission is closed".to_string()));
+            }
             self.record_started_turn(&turn_context.sub_id).await;
             let turn = active.get_or_insert_with(ActiveTurn::default);
             debug_assert!(turn.task.is_none());
@@ -330,6 +355,12 @@ impl Session {
         .await;
 
         let mut active = self.active_turn.lock().await;
+        if self
+            .task_admission_closed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(CodexErr::Fatal("thread task admission is closed".to_string()));
+        }
         let turn = active.get_or_insert_with(ActiveTurn::default);
         debug_assert!(turn.task.is_none());
         let agent_execution_guard = self.services.agent_control.execution_guard(
@@ -400,13 +431,14 @@ impl Session {
             }
             .instrument(task_span),
         );
+        let handle = self.task_joins.register(handle);
         let timer = turn_context
             .session_telemetry
             .start_timer(TURN_E2E_DURATION_METRIC, &[])
             .ok();
         let running_task = RunningTask {
             done,
-            handle: AbortOnDropHandle::new(handle),
+            handle,
             kind: task_kind,
             task,
             cancellation_token,
@@ -416,6 +448,7 @@ impl Session {
             _timer: timer,
         };
         turn.task = Some(running_task);
+        Ok(())
     }
 
     /// Returns whether an extension has marked this thread as durably asleep.
@@ -460,7 +493,11 @@ impl Session {
 
         let turn_state = {
             let mut active_turn = self.active_turn.lock().await;
-            if active_turn.is_some() {
+            if self
+                .task_admission_closed
+                .load(std::sync::atomic::Ordering::Acquire)
+                || active_turn.is_some()
+            {
                 return;
             }
             let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
@@ -528,7 +565,7 @@ impl Session {
         self.input_queue
             .extend_pending_input_for_turn_state(turn_state.as_ref(), input)
             .await;
-        self.start_task(turn_context, Vec::new(), RegularTask::new())
+        let _ = self.start_task(turn_context, Vec::new(), RegularTask::new())
             .await;
     }
 

@@ -84,10 +84,16 @@ pub(crate) struct Session {
     pub(super) mcp_elicitation_lifecycle_handle: OnceLock<codex_mcp::ElicitationLifecycle>,
     pub(super) mcp_prewarm_tx: async_channel::Sender<()>,
     pub(super) mcp_prewarm_shutdown: CancellationToken,
-    pub(super) mcp_prewarm_task: std::sync::Mutex<Option<JoinHandle<()>>>,
+    // Retain the original join future when a shutdown observer is cancelled.
+    pub(super) mcp_prewarm_task: std::sync::Mutex<Option<SessionLoopTermination>>,
     pub(crate) conversation: Arc<RealtimeConversationManager>,
     pub(crate) realtime_history: Option<Mutex<crate::realtime_history::RealtimeHistoryState>>,
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
+    // Writes and final task-admission checks are serialized by active_turn.
+    pub(crate) task_admission_closed: std::sync::atomic::AtomicBool,
+    pub(crate) task_joins: crate::tasks::TaskJoinRegistry,
+    pub(super) cleanup_owner:
+        std::sync::Mutex<std::sync::Weak<super::retirement::SessionCleanupOwner>>,
     pub(crate) async_hook_results: async_channel::Receiver<HookCompletedEvent>,
     pub(crate) input_queue: InputQueue,
     pub(crate) services: SessionServices,
@@ -791,6 +797,7 @@ impl Session {
         deferred_clear_session_start: Option<super::DeferredClearSessionStart>,
         runtime_config_change_listener: Option<Arc<dyn crate::RuntimeConfigChangeListener>>,
         runtime_config_change_gate: Option<crate::RuntimeConfigChangeGate>,
+        startup_custody: Option<&super::startup_custody::SessionStartupCustody>,
     ) -> anyhow::Result<Arc<Self>> {
         debug!(
             "Configuring session: model={}; provider={:?}",
@@ -1787,6 +1794,9 @@ impl Session {
                     && services.live_thread.is_some())
                 .then(|| Mutex::new(Default::default())),
                 active_turn: Mutex::new(None),
+                task_admission_closed: std::sync::atomic::AtomicBool::new(false),
+                task_joins: Default::default(),
+                cleanup_owner: Default::default(),
                 async_hook_results,
                 input_queue: InputQueue::new(),
                 services,
@@ -1797,6 +1807,9 @@ impl Session {
             });
             if let Some(startup) = &startup {
                 let _ = startup.session.set(Arc::clone(&sess));
+            }
+            if let Some(custody) = startup_custody {
+                custody.retain(&sess);
             }
             if let Some(network_policy_decider_session) = network_policy_decider_session {
                 let mut guard = network_policy_decider_session.write().await;

@@ -2,6 +2,8 @@ mod managed;
 mod shared_instructions;
 
 use crate::CodexAppsToolsCache;
+mod retirement;
+mod shutdown;
 use crate::agent::LocalAgentControl;
 use crate::agents_md_manager::SessionInstructions;
 use crate::attestation::AttestationProvider;
@@ -99,6 +101,9 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_git_discovery::GitRootDiscovery;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
+pub use shutdown::ThreadManagerRetirement;
+pub use shutdown::ThreadManagerRetirementError;
+pub use shutdown::ThreadManagerRetirementReport;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -235,6 +240,8 @@ enum ShutdownOutcome {
 /// them in memory.
 pub struct ThreadManager {
     state: Arc<ThreadManagerState>,
+    constructions: retirement::ThreadConstructions,
+    shutdown: std::sync::Mutex<Option<ThreadManagerRetirement>>,
     _test_codex_home_guard: Option<TempCodexHomeGuard>,
 }
 
@@ -400,6 +407,7 @@ pub(crate) struct ResumeThreadWithHistoryOptions {
 /// `Arc` reference that can be downgraded to by `LocalAgentControl` while preventing every single
 /// function to require an `Arc<&Self>`.
 pub(crate) struct ThreadManagerState {
+    constructions: retirement::ConstructionTicket,
     threads: Arc<RwLock<HashMap<ThreadId, Arc<CodexThread>>>>,
     shared_thread_instructions: shared_instructions::SharedThreadInstructionsProviders,
     thread_created_tx: broadcast::Sender<ThreadId>,
@@ -562,8 +570,10 @@ impl ThreadManager {
             } else {
                 Arc::new(DisabledCodeModeSessionProvider)
             };
+        let constructions = retirement::ThreadConstructions::default();
         Self {
             state: Arc::new(ThreadManagerState {
+                constructions: constructions.ticket(),
                 threads: Arc::new(RwLock::new(HashMap::new())),
                 shared_thread_instructions: Default::default(),
                 thread_created_tx,
@@ -592,6 +602,8 @@ impl ThreadManager {
                 ops_log: should_use_test_thread_manager_behavior()
                     .then(|| Arc::new(std::sync::Mutex::new(Vec::new()))),
             }),
+            constructions,
+            shutdown: Default::default(),
             _test_codex_home_guard: None,
         }
     }
@@ -738,8 +750,10 @@ impl ThreadManager {
             state_db.clone(),
         ));
         let agent_graph_store = local_agent_graph_store_from_state_db(state_db.as_ref());
+        let constructions = retirement::ThreadConstructions::default();
         Self {
             state: Arc::new(ThreadManagerState {
+                constructions: constructions.ticket(),
                 threads: Arc::new(RwLock::new(HashMap::new())),
                 shared_thread_instructions: Default::default(),
                 thread_created_tx,
@@ -771,6 +785,8 @@ impl ThreadManager {
                 ops_log: should_use_test_thread_manager_behavior()
                     .then(|| Arc::new(std::sync::Mutex::new(Vec::new()))),
             }),
+            constructions,
+            shutdown: Default::default(),
             _test_codex_home_guard: None,
         }
     }
@@ -1434,6 +1450,15 @@ impl ThreadManager {
         }
     }
 
+    /// Removes only the exact runtime observed by a KCF retirement transaction.
+    pub async fn remove_thread_if_same(
+        &self,
+        thread_id: &ThreadId,
+        expected: &Arc<CodexThread>,
+    ) -> Option<Arc<CodexThread>> {
+        self.remove_thread_if_matches(thread_id, expected).await
+    }
+
     /// Tries to shut down all tracked threads concurrently within the provided timeout.
     /// Threads that complete shutdown are removed from the manager; incomplete shutdowns
     /// remain tracked so callers can retry or inspect them later.
@@ -1455,22 +1480,20 @@ impl ThreadManager {
                     Ok(Err(_)) => ShutdownOutcome::SubmitFailed,
                     Err(_) => ShutdownOutcome::TimedOut,
                 };
-                (thread_id, outcome)
+                (thread_id, thread, outcome)
             })
             .collect::<FuturesUnordered<_>>();
         let mut report = ThreadShutdownReport::default();
 
-        while let Some((thread_id, outcome)) = shutdowns.next().await {
+        while let Some((thread_id, thread, outcome)) = shutdowns.next().await {
             match outcome {
-                ShutdownOutcome::Complete => report.completed.push(thread_id),
+                ShutdownOutcome::Complete => {
+                    self.remove_thread_if_same(&thread_id, &thread).await;
+                    report.completed.push(thread_id);
+                }
                 ShutdownOutcome::SubmitFailed => report.submit_failed.push(thread_id),
                 ShutdownOutcome::TimedOut => report.timed_out.push(thread_id),
             }
-        }
-
-        let mut tracked_threads = self.state.threads.write().await;
-        for thread_id in &report.completed {
-            tracked_threads.remove(thread_id);
         }
 
         report
@@ -1937,7 +1960,7 @@ impl ThreadManagerState {
 
     /// Spawn a new thread with no history using a provided config.
     pub(crate) async fn spawn_new_thread(
-        &self,
+        self: &Arc<Self>,
         config: Config,
         agent_control: LocalAgentControl,
     ) -> CodexResult<NewThread> {
@@ -1959,7 +1982,7 @@ impl ThreadManagerState {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn spawn_new_thread_with_source(
-        &self,
+        self: &Arc<Self>,
         config: Config,
         agent_control: LocalAgentControl,
         session_source: SessionSource,
@@ -1992,7 +2015,7 @@ impl ThreadManagerState {
     }
 
     pub(crate) async fn resume_thread_with_history_with_source(
-        &self,
+        self: &Arc<Self>,
         options: ResumeThreadWithHistoryOptions,
     ) -> CodexResult<NewThread> {
         let ResumeThreadWithHistoryOptions {
@@ -2036,7 +2059,7 @@ impl ThreadManagerState {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn fork_thread_with_source(
-        &self,
+        self: &Arc<Self>,
         config: Config,
         initial_history: InitialHistory,
         history_mode: Option<ThreadHistoryMode>,
@@ -2084,7 +2107,30 @@ impl ThreadManagerState {
     }
 
     /// Spawn a new thread with optional history and register it with the manager.
-    async fn spawn_thread(&self, request: ThreadSpawnRequest) -> CodexResult<NewThread> {
+    async fn spawn_thread(self: &Arc<Self>, request: ThreadSpawnRequest) -> CodexResult<NewThread> {
+        let state = Arc::clone(self);
+        let stop = request.startup.as_ref().map(|startup| startup.stop.clone());
+        self.constructions
+            .register(move |custody, publication| async move {
+                let start = state.spawn_thread_owned(request, custody, publication);
+                match stop {
+                    Some(stop) => tokio::select! {
+                        biased;
+                        _ = stop.cancelled() => Err(CodexErr::TurnAborted),
+                        result = start => result,
+                    },
+                    None => start.await,
+                }
+            })?
+            .await
+    }
+
+    async fn spawn_thread_owned(
+        &self,
+        request: ThreadSpawnRequest,
+        custody: Arc<crate::session::startup_custody::SessionStartupCustody>,
+        publication: retirement::ConstructionPublication,
+    ) -> CodexResult<NewThread> {
         let ThreadSpawnRequest {
             startup,
             options,
@@ -2266,7 +2312,7 @@ impl ThreadManagerState {
         };
         let attachment_source =
             forked_from_thread_id.filter(|_| matches!(&initial_history, InitialHistory::Forked(_)));
-        let (session, io) = Session::spawn(SessionSpawnArgs {
+        let (session, io) = Session::spawn_with_custody(SessionSpawnArgs {
             startup,
             config,
             allow_provider_model_fallback,
@@ -2329,7 +2375,7 @@ impl ThreadManagerState {
             deferred_clear_session_start,
             runtime_config_change_listener: self.runtime_config_change_listener.clone(),
             runtime_config_change_gate: self.runtime_config_change_gate.clone(),
-        })
+        }, Some(Arc::clone(&custody)))
         .await?;
         if let Some(source_thread_id) = attachment_source
             && session.live_thread().is_some()
@@ -2358,8 +2404,9 @@ impl ThreadManagerState {
             session.services.mcp_runtime.enable_full_access_form_input();
         }
         let new_thread = self
-            .finalize_thread_spawn(session, io, tracked_session_source)
+            .finalize_thread_spawn(session, io, tracked_session_source, publication)
             .await?;
+        custody.published();
         new_thread.thread.emit_thread_ready_lifecycle().await;
         if source_changed_during_startup.load(Ordering::Acquire) {
             new_thread.thread.session.request_mcp_runtime_refresh();
@@ -2375,6 +2422,7 @@ impl ThreadManagerState {
         session: Arc<Session>,
         io: SessionIo,
         session_source: SessionSource,
+        publication: retirement::ConstructionPublication,
     ) -> CodexResult<NewThread> {
         let thread_id = session.thread_id();
         let event = io.next_event().await?;
@@ -2391,19 +2439,23 @@ impl ThreadManagerState {
         {
             let mut threads = self.threads.write().await;
             if let std::collections::hash_map::Entry::Vacant(e) = threads.entry(thread_id) {
-                let thread = Arc::new(CodexThread::new(
-                    session,
-                    io,
-                    ThreadStartupMetadata::from(&session_configured),
-                    session_configured.rollout_path.clone(),
-                    session_source,
-                ));
-                e.insert(thread.clone());
-                return Ok(NewThread {
-                    thread_id,
-                    thread,
-                    session_configured,
-                });
+                return publication.publish(|| {
+                    let thread = Arc::new(CodexThread::new(
+                        session,
+                        io,
+                        ThreadStartupMetadata::from(&session_configured),
+                        session_configured.rollout_path.clone(),
+                        session_source,
+                    ));
+                    self.constructions.publish_thread(Arc::clone(&thread), || {
+                        e.insert(Arc::clone(&thread));
+                        NewThread {
+                            thread_id,
+                            thread,
+                            session_configured,
+                        }
+                    })
+                })?;
             }
         }
 

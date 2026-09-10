@@ -167,7 +167,7 @@ pub(crate) fn forward_session_io(io: Arc<SessionIo>, cancel_token: CancellationT
 
     // Forward public events from the sub-agent to the consumer.
     let caller_io = SessionIo {
-        tx_sub: tx_ops,
+        tx_sub: tx_ops.into(),
         rx_event: rx_sub,
         agent_status: io.agent_status.clone(),
         session_loop_termination: io.session_loop_termination.clone(),
@@ -178,8 +178,9 @@ pub(crate) fn forward_session_io(io: Arc<SessionIo>, cancel_token: CancellationT
     });
 
     // Forward ops from the caller to the sub-agent.
+    let submissions = caller_io.tx_sub.dispatch_control();
     tokio::spawn(async move {
-        forward_ops(io, rx_ops, cancel_token_ops).await;
+        forward_ops(io, rx_ops, cancel_token_ops, Some(submissions)).await;
     });
 
     caller_io
@@ -284,7 +285,7 @@ pub(crate) async fn run_codex_thread_one_shot(
         session,
         SessionIo {
             rx_event: rx_bridge,
-            tx_sub: tx_closed,
+            tx_sub: tx_closed.into(),
             agent_status,
             session_loop_termination,
         },
@@ -369,12 +370,16 @@ async fn forward_ops(
     io: Arc<SessionIo>,
     rx_ops: Receiver<Submission>,
     cancel_token_ops: CancellationToken,
+    submissions: Option<crate::session::SubmissionDispatch>,
 ) {
     loop {
         let submission = match rx_ops.recv().or_cancel(&cancel_token_ops).await {
             Ok(Ok(submission)) => submission,
             Ok(Err(_)) | Err(_) => break,
         };
+        let _dispatch = submissions
+            .as_ref()
+            .map(crate::session::SubmissionDispatch::begin);
         let _ = io.submit_with_id(submission).await;
     }
 }

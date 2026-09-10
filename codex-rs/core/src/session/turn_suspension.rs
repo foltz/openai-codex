@@ -73,16 +73,16 @@ pub(super) async fn suspend_turn_and_shutdown(
     task.turn_context
         .turn_metadata_state
         .cancel_git_enrichment_task();
-    let mut task_handle = task.handle.detach();
+    let task_handle = task.handle;
     match tokio::time::timeout(
         Duration::from_millis(crate::tasks::GRACEFULL_INTERRUPTION_TIMEOUT_MS),
-        &mut task_handle,
+        task_handle.wait(),
     )
     .await
     {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            warn!(thread_id = %session.thread_id, %error, "suspended turn task exited abnormally");
+        Ok(true) => {}
+        Ok(false) => {
+            warn!(thread_id = %session.thread_id, "suspended turn task exited abnormally");
         }
         Err(_) => {
             warn!(
@@ -90,9 +90,10 @@ pub(super) async fn suspend_turn_and_shutdown(
                 "suspended turn task did not stop gracefully; aborting it"
             );
             task_handle.abort();
-            let _ = task_handle.await;
+            let _ = task_handle.wait().await;
         }
     }
+    task_handle.detach();
     // Pending accepted input and interactive waiters live only in this process. Handoff
     // intentionally drops that state; persisting or replaying it needs a separate protocol.
     session.input_queue.clear_pending(&turn).await;
@@ -100,7 +101,16 @@ pub(super) async fn suspend_turn_and_shutdown(
     // Stop all producers before flushing their final history and closing its writer.
     // If either persistence step fails, do not report success: the current worker
     // retains ownership until worker-failure recovery can take responsibility.
-    handlers::shutdown_session_runtime(session).await;
+    if let Some(failure) = handlers::shutdown_session_runtime(
+        session,
+        super::retirement::CleanupMode::Legacy,
+    )
+    .await
+    {
+        return Err(CodexErr::Fatal(format!(
+            "runtime cleanup after root turn suspension failed: {failure:?}"
+        )));
+    }
     live_thread.flush().await.map_err(|error| {
         CodexErr::Fatal(format!("flush after root turn suspension failed: {error}"))
     })?;

@@ -24,7 +24,7 @@ impl AccountLoginReport {
                 reports.iter().all(|report| {
                     report
                         .as_ref()
-                        .is_some_and(LoginRetirementReport::is_complete)
+                        .is_none_or(LoginRetirementReport::is_complete)
                 })
             })
     }

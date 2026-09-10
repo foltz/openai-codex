@@ -3,6 +3,32 @@ use codex_login::LoginWorkerOutcome;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[test]
+fn missing_browser_resources_do_not_block_clean_account_shutdown() {
+    let report = AccountLoginReport {
+        tasks: ProcessorTaskDrain {
+            terminal: true,
+            ..Default::default()
+        },
+        browsers: Ok(vec![None]),
+        admission_unavailable: false,
+    };
+    assert!(report.is_clean());
+}
+
+#[test]
+fn unavailable_browser_admission_still_blocks_clean_account_shutdown() {
+    let report = AccountLoginReport {
+        tasks: ProcessorTaskDrain {
+            terminal: true,
+            ..Default::default()
+        },
+        browsers: Ok(vec![None]),
+        admission_unavailable: true,
+    };
+    assert!(!report.is_clean());
+}
+
 #[tokio::test]
 async fn held_completion_task_does_not_starve_real_browser_retirement() {
     let home = tempfile::tempdir().unwrap();

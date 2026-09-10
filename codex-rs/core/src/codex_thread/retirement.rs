@@ -42,6 +42,7 @@ pub enum ThreadCleanupOutcome {
     TaskJoinFailed,
     ConversationShutdownFailed,
     CodeModeShutdownFailed,
+    GuardianFailed,
 }
 
 /// Independent facts needed by the lifecycle owner; no fallback emits a
@@ -296,6 +297,7 @@ impl ThreadRetirement {
                     CleanupExecution::CodeModeShutdownFailed => {
                         ThreadCleanupOutcome::CodeModeShutdownFailed
                     }
+                    CleanupExecution::GuardianFailed => ThreadCleanupOutcome::GuardianFailed,
                 },
             }
         }

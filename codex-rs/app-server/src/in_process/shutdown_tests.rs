@@ -53,19 +53,21 @@ async fn cancelling_public_start_after_runtime_birth_compacts_after_evidence() {
     };
     assert!(weak_processor.upgrade().is_some());
     assert!(weak_session.upgrade().is_some());
-    let reports = host
-        .observe_until(Instant::now() + Duration::from_secs(10))
-        .await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let reports = host.observe_until(deadline).await;
     assert_eq!(reports.len(), 1);
-    assert!(matches!(
-        reports[0].cleanup,
-        Some((
-            TaskObservation::Terminated(TaskTermination::Normal),
-            ProcessorCleanupProgress::Observed(
-                ProcessorCleanupExecution::ReturnedWithEvidence { .. }
-            ),
-        ))
-    ));
+    assert!(
+        matches!(
+            reports[0].cleanup,
+            Some((
+                TaskObservation::Terminated(TaskTermination::Normal),
+                ProcessorCleanupProgress::Observed(
+                    ProcessorCleanupExecution::ReturnedWithEvidence { .. }
+                ),
+            ))
+        ),
+        "cleanup evidence was incomplete: {reports:#?}"
+    );
     assert!(host.state.lock().unwrap().runtimes.is_empty());
     assert!(weak_processor.upgrade().is_none());
     assert!(weak_session.upgrade().is_none());

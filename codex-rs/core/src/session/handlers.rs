@@ -642,7 +642,15 @@ async fn shutdown_session_runtime(
             failure.get_or_insert(super::retirement::CleanupExecution::McpFailed);
         }
     }
-    sess.guardian_review_session.shutdown().await;
+    let guardian = match mode {
+        super::retirement::CleanupMode::Legacy => sess.guardian_review_session.shutdown().await,
+        super::retirement::CleanupMode::DeadlineBound(deadline) => {
+            sess.guardian_review_session.shutdown_until(deadline).await
+        }
+    };
+    if !guardian.is_clean() {
+        failure.get_or_insert(super::retirement::CleanupExecution::GuardianFailed);
+    }
 
     crate::hook_runtime::run_session_end_hooks(sess).await;
     failure
@@ -677,11 +685,38 @@ pub(super) async fn cleanup_session(
         &[],
     );
     emit_thread_stop_lifecycle(sess.as_ref()).await;
-    let persistence_failed = if let Some(live_thread) = sess.live_thread()
-        && let Err(error) = live_thread.shutdown().await
-    {
-        warn!("failed to shutdown thread persistence: {error}");
-        true
+    let persistence_failed = if let Some(live_thread) = sess.live_thread() {
+        let failed_initialization = sess
+            .failed_initialization_persistence
+            .load(std::sync::atomic::Ordering::Acquire);
+        let result = if failed_initialization {
+            live_thread.discard().await
+        } else {
+            live_thread.shutdown().await
+        };
+        if result.is_err() {
+            let persistence_operation = if failed_initialization {
+                "discard_failed_initialization"
+            } else {
+                "shutdown"
+            };
+            if failed_initialization {
+                warn!(
+                    persistence_operation,
+                    thread_id = %sess.thread_id,
+                    "failed initialization persistence disposal incomplete"
+                );
+            } else {
+                warn!(
+                    persistence_operation,
+                    thread_id = %sess.thread_id,
+                    "thread persistence disposal incomplete"
+                );
+            }
+            true
+        } else {
+            false
+        }
     } else {
         false
     };
@@ -701,6 +736,7 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
         | super::retirement::CleanupExecution::TaskJoinFailed
         | super::retirement::CleanupExecution::ConversationShutdownFailed
         | super::retirement::CleanupExecution::CodeModeShutdownFailed
+        | super::retirement::CleanupExecution::GuardianFailed
         | super::retirement::CleanupExecution::AuthorityUnavailable => {
             warn!(
                 ?cleanup,

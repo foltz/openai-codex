@@ -119,6 +119,20 @@ enum RetentionAcquireAuthority {
     Eligible(RetentionPrincipalId),
 }
 
+fn retention_principal_or_refusal(
+    authority: RetentionAcquireAuthority,
+) -> Result<RetentionPrincipalId, ThreadRetentionRefusalReason> {
+    match authority {
+        RetentionAcquireAuthority::Ineligible => {
+            Err(ThreadRetentionRefusalReason::IneligiblePrincipal)
+        }
+        RetentionAcquireAuthority::Unavailable => {
+            Err(ThreadRetentionRefusalReason::AuthorityUnavailable)
+        }
+        RetentionAcquireAuthority::Eligible(principal) => Ok(principal),
+    }
+}
+
 fn deserialize_client_request(request: JSONRPCRequest) -> Result<ClientRequest, JSONRPCErrorError> {
     ClientRequest::try_from(request)
         .map_err(|err| invalid_request(format!("Invalid request: {err}")))
@@ -1019,18 +1033,9 @@ impl MessageProcessor {
         params: ThreadRetentionAcquireParams,
         authority: RetentionAcquireAuthority,
     ) -> Result<ThreadRetentionAcquireResponse, JSONRPCErrorError> {
-        let principal = match authority {
-            RetentionAcquireAuthority::Ineligible => {
-                return Ok(ThreadRetentionAcquireResponse::Refused {
-                    reason: ThreadRetentionRefusalReason::IneligiblePrincipal,
-                });
-            }
-            RetentionAcquireAuthority::Unavailable => {
-                return Ok(ThreadRetentionAcquireResponse::Refused {
-                    reason: ThreadRetentionRefusalReason::AuthorityUnavailable,
-                });
-            }
-            RetentionAcquireAuthority::Eligible(principal) => principal,
+        let principal = match retention_principal_or_refusal(authority) {
+            Ok(principal) => principal,
+            Err(reason) => return Ok(ThreadRetentionAcquireResponse::Refused { reason }),
         };
         let Ok(thread_id) = ThreadId::from_string(&params.thread_id) else {
             return Ok(ThreadRetentionAcquireResponse::Refused {
@@ -1061,12 +1066,11 @@ impl MessageProcessor {
     async fn thread_retention_release(
         &self,
         params: ThreadRetentionReleaseParams,
-        principal: Option<RetentionPrincipalId>,
+        authority: RetentionAcquireAuthority,
     ) -> Result<ThreadRetentionReleaseResponse, JSONRPCErrorError> {
-        let Some(principal) = principal else {
-            return Ok(ThreadRetentionReleaseResponse::Refused {
-                reason: ThreadRetentionRefusalReason::IneligiblePrincipal,
-            });
+        let principal = match retention_principal_or_refusal(authority) {
+            Ok(principal) => principal,
+            Err(reason) => return Ok(ThreadRetentionReleaseResponse::Refused { reason }),
         };
         let Ok(thread_id) = ThreadId::from_string(&params.thread_id) else {
             return Ok(ThreadRetentionReleaseResponse::Refused {
@@ -1299,7 +1303,6 @@ impl MessageProcessor {
             AccountDependency::Independent => None,
         };
         let connection_id = connection_request_id.connection_id;
-        let retention_principal = session.retention_principal();
         let retention_acquire_authority = session.retention_acquire_authority();
         let managed_transition_caller_authorized = session.managed_transition_caller_authorized();
         self.initialize_processor.track_initialized_request(
@@ -1328,7 +1331,6 @@ impl MessageProcessor {
                         app_server_client_name,
                         client_version,
                         client_mcp_extensions,
-                        retention_principal,
                         retention_acquire_authority,
                         managed_transition_caller_authorized,
                         account_work_permit,
@@ -1362,7 +1364,6 @@ impl MessageProcessor {
         app_server_client_name: Option<String>,
         client_version: Option<String>,
         client_mcp_extensions: ClientMcpExtensions,
-        retention_principal: Option<RetentionPrincipalId>,
         retention_acquire_authority: RetentionAcquireAuthority,
         managed_transition_caller_authorized: bool,
         account_work_permit: Option<crate::managed_transition::AccountWorkPermitGuard>,
@@ -1553,7 +1554,7 @@ impl MessageProcessor {
                 .await
                 .map(|response| Some(response.into())),
             ClientRequest::ThreadRetentionRelease { params, .. } => self
-                .thread_retention_release(params, retention_principal)
+                .thread_retention_release(params, retention_acquire_authority)
                 .await
                 .map(|response| Some(response.into())),
             ClientRequest::ThreadResume { params, .. } => {
@@ -2027,8 +2028,10 @@ mod retention_authority_tests {
     use super::ConnectionSessionState;
     use super::InitializedConnectionSessionState;
     use super::RetentionAcquireAuthority;
+    use super::retention_principal_or_refusal;
     use crate::thread_state::RetentionPrincipalId;
     use crate::transport::ConnectionProvenance;
+    use codex_app_server_protocol::ThreadRetentionRefusalReason;
     use std::collections::HashSet;
 
     #[test]
@@ -2054,5 +2057,9 @@ mod retention_authority_tests {
             RetentionAcquireAuthority::Unavailable
         ));
         assert_eq!(session.retention_principal(), None);
+        assert_eq!(
+            retention_principal_or_refusal(session.retention_acquire_authority()),
+            Err(ThreadRetentionRefusalReason::AuthorityUnavailable)
+        );
     }
 }

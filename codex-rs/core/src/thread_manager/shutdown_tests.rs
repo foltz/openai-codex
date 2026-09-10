@@ -1,4 +1,7 @@
 use super::*;
+use crate::ThreadCleanupOutcome;
+use crate::ThreadLoopOutcome;
+use crate::ThreadShutdownOutcome;
 use crate::config::Config;
 use crate::config::ConfigBuilder;
 use crate::thread_manager::StartThreadOptions;
@@ -10,6 +13,52 @@ fn previously_completed_runtime_requires_normal_session_loop() {
     assert!(RuntimeOutcome::PreviouslyCompleted(SessionLoopOutcome::Normal).is_complete());
     assert!(!RuntimeOutcome::PreviouslyCompleted(SessionLoopOutcome::Cancelled).is_complete());
     assert!(!RuntimeOutcome::PreviouslyCompleted(SessionLoopOutcome::Panicked).is_complete());
+}
+
+#[test]
+fn runtime_retirement_requires_all_three_positive_receipts() {
+    for ordinary in [
+        ThreadShutdownOutcome::Complete,
+        ThreadShutdownOutcome::SubmitFailed,
+        ThreadShutdownOutcome::TimedOut,
+    ] {
+        for session_loop in [
+            ThreadLoopOutcome::Normal,
+            ThreadLoopOutcome::Cancelled,
+            ThreadLoopOutcome::Panicked,
+            ThreadLoopOutcome::TimedOut,
+        ] {
+            for cleanup in [
+                ThreadCleanupOutcome::Finished {
+                    persistence_failed: false,
+                },
+                ThreadCleanupOutcome::Finished {
+                    persistence_failed: true,
+                },
+                ThreadCleanupOutcome::Panicked,
+                ThreadCleanupOutcome::TimedOut,
+                ThreadCleanupOutcome::AuthorityUnavailable,
+                ThreadCleanupOutcome::McpFailed,
+                ThreadCleanupOutcome::TaskJoinFailed,
+                ThreadCleanupOutcome::ConversationShutdownFailed,
+                ThreadCleanupOutcome::CodeModeShutdownFailed,
+                ThreadCleanupOutcome::GuardianFailed,
+            ] {
+                let outcome = RuntimeOutcome::Retirement(ThreadRetirementReport {
+                    ordinary,
+                    session_loop,
+                    cleanup,
+                });
+                let expected = ordinary == ThreadShutdownOutcome::Complete
+                    && session_loop == ThreadLoopOutcome::Normal
+                    && cleanup
+                        == ThreadCleanupOutcome::Finished {
+                            persistence_failed: false,
+                        };
+                assert_eq!(outcome.is_complete(), expected, "{outcome:?}");
+            }
+        }
+    }
 }
 
 async fn manager() -> (tempfile::TempDir, ThreadManager, Config) {

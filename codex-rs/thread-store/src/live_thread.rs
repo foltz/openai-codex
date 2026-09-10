@@ -40,6 +40,11 @@ pub struct LiveThread {
     persistence_telemetry: RolloutPersistenceTelemetry,
 }
 
+pub struct InheritedModelContextInitError {
+    pub error: ThreadStoreError,
+    pub live_thread: Option<LiveThread>,
+}
+
 /// Owns a live thread while session initialization is still fallible.
 ///
 /// If initialization returns early after persistence has been opened, dropping this guard discards
@@ -113,32 +118,69 @@ impl LiveThread {
     /// projection can distinguish inherited context from the child's own records immediately.
     pub async fn create_with_inherited_model_context(
         thread_store: Arc<dyn ThreadStore>,
-        mut params: CreateThreadParams,
+        params: CreateThreadParams,
         inherited_model_context: &[RolloutItem],
     ) -> ThreadStoreResult<Self> {
+        match Self::create_with_inherited_model_context_retaining_on_error(
+            thread_store,
+            params,
+            inherited_model_context,
+        )
+        .await
+        {
+            Ok(live_thread) => Ok(live_thread),
+            Err(failure) => {
+                if let Some(live_thread) = failure.live_thread
+                    && let Err(discard_err) = live_thread.discard().await
+                {
+                    warn!(
+                        "failed to discard thread persistence after inherited context append failed: {discard_err}"
+                    );
+                }
+                Err(failure.error)
+            }
+        }
+    }
+
+    /// Custody-aware construction preserves the opened live thread when the
+    /// inherited prefix fails, allowing its caller to own disposal evidence.
+    pub async fn create_with_inherited_model_context_retaining_on_error(
+        thread_store: Arc<dyn ThreadStore>,
+        mut params: CreateThreadParams,
+        inherited_model_context: &[RolloutItem],
+    ) -> Result<Self, InheritedModelContextInitError> {
         let persisted_prefix_item_count =
             persisted_rollout_items(inherited_model_context, params.history_mode).len();
         params.subagent_history_start_ordinal = Some(
             u64::try_from(persisted_prefix_item_count)
-                .map_err(|_| ThreadStoreError::Internal {
-                    message: "inherited model context is too large".to_string(),
+                .map_err(|_| InheritedModelContextInitError {
+                    error: ThreadStoreError::Internal {
+                        message: "inherited model context is too large".to_string(),
+                    },
+                    live_thread: None,
                 })?
                 .checked_add(1)
-                .ok_or_else(|| ThreadStoreError::Internal {
-                    message: "inherited model context is too large".to_string(),
+                .ok_or_else(|| InheritedModelContextInitError {
+                    error: ThreadStoreError::Internal {
+                        message: "inherited model context is too large".to_string(),
+                    },
+                    live_thread: None,
                 })?,
         );
-        let live_thread = Self::create(thread_store, params).await?;
-        if let Err(err) = live_thread
+        let live_thread = Self::create(thread_store, params).await.map_err(|error| {
+            InheritedModelContextInitError {
+                error,
+                live_thread: None,
+            }
+        })?;
+        if let Err(error) = live_thread
             .persist_appended_items(inherited_model_context)
             .await
         {
-            if let Err(discard_err) = live_thread.discard().await {
-                warn!(
-                    "failed to discard thread persistence after inherited context append failed: {discard_err}"
-                );
-            }
-            return Err(err);
+            return Err(InheritedModelContextInitError {
+                error,
+                live_thread: Some(live_thread),
+            });
         }
         Ok(live_thread)
     }

@@ -5,8 +5,6 @@
 
 use super::ThreadManager;
 use super::retirement::ConstructionDrain;
-use crate::ThreadCleanupOutcome;
-use crate::ThreadLoopOutcome;
 use crate::ThreadRetirementError;
 use crate::ThreadRetirementReport;
 use crate::session::SessionLoopOutcome;
@@ -46,13 +44,9 @@ impl RuntimeOutcome {
             Self::PreviouslyCompleted(outcome) => {
                 matches!(outcome, SessionLoopOutcome::Normal)
             }
-            Self::Retirement(report) => {
-                report.session_loop != ThreadLoopOutcome::TimedOut
-                    && report.cleanup
-                        == ThreadCleanupOutcome::Finished {
-                            persistence_failed: false,
-                        }
-            }
+            // Manager shutdown does not turn an ordinary failure or an
+            // abnormal loop exit into successful thread retirement.
+            Self::Retirement(report) => report.is_complete(),
             Self::Refused(_) => false,
         }
     }

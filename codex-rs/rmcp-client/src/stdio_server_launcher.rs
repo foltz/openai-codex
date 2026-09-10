@@ -151,7 +151,9 @@ impl Transport<RoleClient> for StdioServerTransport {
         self.process.terminate().await?;
         match &mut self.inner {
             StdioServerTransportInner::LocalLegacy(transport) => transport.close().await,
-            StdioServerTransportInner::LocalModern(transport) => transport.close().await,
+            StdioServerTransportInner::LocalModern(transport) => {
+                transport.close_after_terminal_observation().await
+            }
             StdioServerTransportInner::Executor(transport) => {
                 transport.mark_closed_after_terminal_observation();
                 Ok(())
@@ -620,7 +622,9 @@ impl StdioServerProcessHandle {
     }
 }
 
-async fn await_executor_process_close(events: &mut ExecProcessEventReceiver) -> io::Result<()> {
+pub(super) async fn await_executor_process_close(
+    events: &mut ExecProcessEventReceiver,
+) -> io::Result<()> {
     loop {
         if executor_event_proves_close(events.recv().await)? {
             return Ok(());

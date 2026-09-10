@@ -62,6 +62,9 @@ pub(crate) struct Session {
     pub(crate) task_joins: crate::tasks::TaskJoinRegistry,
     pub(super) cleanup_owner:
         std::sync::Mutex<std::sync::Weak<super::retirement::SessionCleanupOwner>>,
+    // While construction remains fallible, retained startup cleanup must discard
+    // the live writer instead of materializing it through normal shutdown.
+    pub(super) failed_initialization_persistence: std::sync::atomic::AtomicBool,
     pub(crate) async_hook_results: async_channel::Receiver<HookCompletedEvent>,
     pub(crate) pending_user_message_admissions:
         crate::user_message_admission::PendingUserMessageAdmissions,
@@ -563,6 +566,12 @@ async fn warm_plugins_and_skills_for_session_init(
 }
 
 impl Session {
+    #[cfg(test)]
+    pub(crate) fn failed_initialization_persistence_for_test(&self) -> bool {
+        self.failed_initialization_persistence
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Returns the concrete identity for this thread.
     pub(crate) fn thread_id(&self) -> ThreadId {
         self.thread_id
@@ -813,12 +822,32 @@ impl Session {
                             && matches!(&fork_persistence, ForkPersistence::Copied)
                             && let InitialHistory::Forked(items) = &initial_history
                         {
-                            LiveThread::create_with_inherited_model_context(
-                                Arc::clone(&thread_store),
-                                params,
-                                items,
-                            )
-                            .await?
+                            if let Some(custody) = startup_custody {
+                                match LiveThread::create_with_inherited_model_context_retaining_on_error(
+                                    Arc::clone(&thread_store),
+                                    params,
+                                    items,
+                                )
+                                .await
+                                {
+                                    Ok(live_thread) => live_thread,
+                                    Err(failure) => {
+                                        if let Some(live_thread) = failure.live_thread {
+                                            custody.retain_persistence(thread_id, live_thread);
+                                            #[cfg(test)]
+                                            custody.wait_after_persistence_for_test().await;
+                                        }
+                                        return Err(failure.error.into());
+                                    }
+                                }
+                            } else {
+                                LiveThread::create_with_inherited_model_context(
+                                    Arc::clone(&thread_store),
+                                    params,
+                                    items,
+                                )
+                                .await?
+                            }
                         } else {
                             LiveThread::create(Arc::clone(&thread_store), params).await?
                         }
@@ -847,6 +876,11 @@ impl Session {
                         .await?
                     }
                 };
+                if let Some(custody) = startup_custody {
+                    custody.retain_persistence(thread_id, live_thread.clone());
+                    #[cfg(test)]
+                    custody.wait_after_persistence_for_test().await;
+                }
                 Ok(Some(live_thread))
             }
         }
@@ -912,13 +946,18 @@ impl Session {
         let (thread_persistence_result, state_db_ctx, (auth, mcp_projection)) =
             tokio::join!(thread_persistence_fut, state_db_fut, auth_and_mcp_fut);
 
-        let mut live_thread_init =
-            LiveThreadInitGuard::new(thread_persistence_result.map_err(|e| {
-                error!("failed to initialize thread persistence: {e:#}");
-                e
-            })?);
+        let live_thread = thread_persistence_result.map_err(|e| {
+            error!("failed to initialize thread persistence: {e:#}");
+            e
+        })?;
+        let mut live_thread_init = LiveThreadInitGuard::new(
+            startup_custody
+                .is_none()
+                .then(|| live_thread.clone())
+                .flatten(),
+        );
         let session_result: anyhow::Result<Arc<Self>> = async {
-            let rollout_path = if let Some(live_thread) = live_thread_init.as_ref() {
+            let rollout_path = if let Some(live_thread) = live_thread.as_ref() {
                 live_thread.local_rollout_path().await?
             } else {
                 None
@@ -1120,7 +1159,7 @@ impl Session {
                 otel.name = "session_init.plugin_skill_warmup",
             ));
             let thread_name_lookup =
-                thread_title_from_thread_store(live_thread_init.as_ref(), &thread_store, thread_id)
+                thread_title_from_thread_store(live_thread.as_ref(), &thread_store, thread_id)
                     .instrument(info_span!(
                         "session_init.thread_name_lookup",
                         otel.name = "session_init.thread_name_lookup",
@@ -1303,7 +1342,7 @@ impl Session {
                 managed_network_requirements_configured,
                 network_approval: Arc::clone(&network_approval),
                 state_db: state_db_ctx.clone(),
-                live_thread: live_thread_init.as_ref().cloned(),
+                live_thread: live_thread.clone(),
                 thread_store: Arc::clone(&thread_store),
                 attestation_provider: attestation_provider.clone(),
                 time_provider,
@@ -1366,6 +1405,7 @@ impl Session {
                 task_admission_closed: std::sync::atomic::AtomicBool::new(false),
                 task_joins: Default::default(),
                 cleanup_owner: Default::default(),
+                failed_initialization_persistence: std::sync::atomic::AtomicBool::new(false),
                 async_hook_results,
                 pending_user_message_admissions: Default::default(),
                 input_queue: InputQueue::new(),
@@ -1376,7 +1416,17 @@ impl Session {
                 next_internal_sub_id: AtomicU64::new(0),
             });
             if let Some(custody) = startup_custody {
-                custody.retain(&sess);
+                if !custody.retain(&sess) {
+                    return Err(anyhow::anyhow!("startup persistence custody mismatch"));
+                }
+                sess.failed_initialization_persistence
+                    .store(true, std::sync::atomic::Ordering::Release);
+                // Transfer pre-Session persistence custody to the retained
+                // Session cleanup. The detached-drop guard only owns the
+                // legacy no-custody path.
+                live_thread_init.commit();
+                #[cfg(test)]
+                custody.wait_after_retain_for_test().await;
             }
             if let Some(network_policy_decider_session) = network_policy_decider_session {
                 let mut guard = network_policy_decider_session.write().await;
@@ -1495,6 +1545,10 @@ impl Session {
         .await;
         match session_result {
             Ok(sess) => {
+                // The original successful initialization boundary transfers
+                // persistence back to normal session shutdown.
+                sess.failed_initialization_persistence
+                    .store(false, std::sync::atomic::Ordering::Release);
                 live_thread_init.commit();
                 if deferred_clear_session_start.is_none() {
                     crate::hook_runtime::run_pending_session_start_hooks_eager(&sess).await;

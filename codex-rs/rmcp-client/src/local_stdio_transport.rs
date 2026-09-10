@@ -147,6 +147,14 @@ impl LocalStdioTransport {
         self.stdin.lock().await.take();
     }
 
+    /// Finish transport shutdown after the process handle has already proved
+    /// terminal exit. The process-level retirement bound owns the deadline;
+    /// this path only closes stdin and consumes the retained observation.
+    pub(super) async fn close_after_terminal_observation(&self) -> io::Result<()> {
+        self.close_input().await;
+        self.exit_observer.clone().wait().await
+    }
+
     async fn receive_message(&mut self) -> Option<RxJsonRpcMessage<RoleClient>> {
         loop {
             let bytes = match self.stdout.fill_buf().await {
@@ -305,13 +313,10 @@ impl Transport<RoleClient> for LocalStdioTransport {
         .await
         {
             Ok(result) => result,
-            Err(_) => {
-                self.exit_observer.abort();
-                Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "local MCP exit timed out",
-                ))
-            }
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "local MCP exit timed out",
+            )),
         }
     }
 }
@@ -378,6 +383,46 @@ mod tests {
             .await
             .expect("child should exit promptly")
             .expect("observer should report terminal exit");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn direct_modern_close_timeout_preserves_the_exit_observer() {
+        let directory = tempfile::tempdir().expect("test gate directory");
+        let gate = directory.path().join("exit");
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                "while [ ! -e \"$1\" ]; do sleep 0.01; done",
+                "test-child",
+            ])
+            .arg(&gate)
+            .kill_on_drop(true);
+        let (mut transport, _) = LocalStdioTransport::spawn(command, "test-server".to_string())
+            .expect("spawn test child");
+        let mut observer = transport.exit_observer();
+        let supervisor = observer.supervisor.abort_handle.clone();
+
+        assert_eq!(
+            transport
+                .close()
+                .await
+                .expect_err("live child must time out")
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(
+            !supervisor.is_finished(),
+            "a direct timeout must retain the sole terminal observer"
+        );
+
+        std::fs::write(gate, b"exit").expect("release owned child");
+        tokio::time::resume();
+        tokio::time::timeout(std::time::Duration::from_secs(5), observer.wait())
+            .await
+            .expect("child exit observation completes")
+            .expect("real child exit remains observable after timeout");
+        observer.wait().await.expect("terminal receipt replays");
     }
 
     #[tokio::test]

@@ -89,7 +89,6 @@ pub(crate) struct Report {
     pub(crate) unavailable: bool,
 }
 
-#[derive(Clone)]
 struct JoinOwner {
     receipt: Shared<BoxFuture<'static, WorkerOutcome>>,
     abort: AbortHandle,
@@ -118,8 +117,12 @@ impl Drop for JoinOwner {
     fn drop(&mut self) {
         // A cancelled OAuth flow may drop its observer before it can await the
         // server report.  Abort is only a last-resort signal here; a normal
-        // flow always awaits the same receipts before returning.
-        self.abort.abort();
+        // flow always awaits the same receipts before returning.  In
+        // particular, dropping a receipt observer must not abort a task that
+        // another owner is still observing.
+        if self.receipt.peek().is_none() {
+            self.abort.abort();
+        }
     }
 }
 
@@ -189,19 +192,23 @@ impl Server {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             (
-                state.acceptor.clone(),
-                state.connections.clone(),
+                state.acceptor.as_ref().map(|owner| owner.receipt.clone()),
+                state
+                    .connections
+                    .iter()
+                    .map(|owner| owner.receipt.clone())
+                    .collect::<Vec<_>>(),
                 state.closed,
             )
         };
         let (acceptor, _) = tokio::join!(
             async {
                 match acceptor {
-                    Some(owner) => owner.receipt.clone().await,
+                    Some(receipt) => receipt.await,
                     None => WorkerOutcome::Failed,
                 }
             },
-            futures::future::join_all(connections.into_iter().map(|owner| owner.receipt.clone()),),
+            futures::future::join_all(connections),
         );
         let mut state = self
             .state
@@ -366,6 +373,63 @@ mod tests {
         assert_eq!(report.connections.joined, 1);
         assert_eq!(report.connections.failed, 0);
         assert_eq!(report.connections.interrupted, 0);
+        assert!(!report.unavailable);
+    }
+
+    #[tokio::test]
+    async fn waiting_does_not_abort_a_connection_still_being_observed() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind callback listener");
+        let address = listener.local_addr().expect("callback listener address");
+        let (server, mut requests) = Server::start(listener).expect("start callback server");
+
+        let client = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(address)
+                .await
+                .expect("connect callback listener");
+            stream
+                .write_all(
+                    b"GET /callback?id=2 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("write callback request");
+            let mut response = Vec::new();
+            stream
+                .read_to_end(&mut response)
+                .await
+                .expect("read callback response");
+            response
+        });
+
+        let request = requests.recv().await.expect("receive callback request");
+        assert_eq!(request.url, "/callback?id=2");
+
+        // Mark the acceptor closed without cancelling admitted connections.
+        // The observer must keep the connection owner alive while it waits;
+        // otherwise dropping a temporary owner aborts the very task whose
+        // receipt it is meant to observe.
+        server
+            .state
+            .lock()
+            .expect("callback state should not be poisoned")
+            .closed = true;
+        let mut report = Box::pin(server.wait());
+        assert!(futures::poll!(report.as_mut()).is_pending());
+
+        request
+            .respond(http::Response::new(Full::new(Bytes::from_static(b"ok"))))
+            .await
+            .expect("response should be written before acknowledgement");
+        let response = client.await.expect("client task should join");
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+        assert!(response.ends_with(b"ok"));
+
+        server.shutdown.cancel();
+        let report = report.await;
+        assert_eq!(report.acceptor, WorkerOutcome::Joined);
+        assert_eq!(report.connections.joined, 1);
+        assert_eq!(report.connections.cancelled, 0);
         assert!(!report.unavailable);
     }
 }

@@ -1186,11 +1186,12 @@ impl SessionIo {
         }
         match session_loop_termination.clone().await {
             SessionLoopOutcome::Normal => match session_loop_termination.cleanup_completed() {
-                // Synthetic/session fixtures without a retained cleanup owner
-                // predate the result-bearing owner and retain their legacy
-                // behavior. Production sessions always attach the owner at
-                // loop birth, so a missing or non-clean receipt cannot be
-                // normalized to success there.
+                // Synthetic fixtures and non-session workers (for example the
+                // MCP prewarm worker) have no session teardown owner and
+                // retain their legacy join-only behavior. The production
+                // submission loop attaches its owner at loop birth, so its
+                // missing or non-clean receipt cannot be normalized to
+                // success.
                 None => Ok(()),
                 Some(retirement::CleanupExecution::Finished {
                     persistence_failed: false,

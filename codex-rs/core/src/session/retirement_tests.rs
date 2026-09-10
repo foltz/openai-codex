@@ -28,13 +28,14 @@ async fn exact_thread_fixture_with(
     configure(&mut session);
     let session = Arc::new(session);
     let owner = session.cleanup_owner();
+    let loop_cleanup_owner = Arc::clone(&owner);
     let (tx_sub, rx_sub) = async_channel::bounded(1);
     let tx_sub = super::super::SubmissionSender::from(tx_sub);
     let submissions = tx_sub.dispatch_control();
     let loop_session = Arc::clone(&session);
     let config = Arc::clone(&turn.config);
     let task = tokio::spawn(async move {
-        let _owner = owner;
+        let _owner = loop_cleanup_owner;
         match mode {
             ThreadLoopFixture::Ordinary => {
                 super::super::handlers::submission_loop(
@@ -56,11 +57,13 @@ async fn exact_thread_fixture_with(
     if matches!(mode, ThreadLoopFixture::Cancelled) {
         task.abort();
     }
+    let mut termination = super::super::session_loop_termination_from_handle(task);
+    termination.cleanup_owner = Some(owner);
     let io = super::super::SessionIo {
         tx_sub,
         rx_event,
         agent_status: tokio::sync::watch::channel(crate::agent::AgentStatus::PendingInit).1,
-        session_loop_termination: super::super::session_loop_termination_from_handle(task),
+        session_loop_termination: termination,
     };
     let configured = codex_protocol::protocol::SessionConfiguredEvent {
         session_id: session.session_id(),
@@ -419,6 +422,30 @@ async fn failed_common_api_receipt_never_projects_shutdown_complete() {
             ));
         }
     }
+}
+
+#[tokio::test]
+async fn normal_loop_join_with_failed_cleanup_receipt_is_not_ok() {
+    let thread = exact_thread_fixture(ThreadLoopFixture::Gone).await;
+    let owner = thread
+        .io
+        .session_loop_termination
+        .cleanup_owner
+        .as_ref()
+        .expect("production loop retains cleanup owner")
+        .clone();
+    owner.state.lock().expect("owner").completion = Some(
+        futures::future::ready(CleanupExecution::ConversationShutdownFailed)
+            .boxed()
+            .shared(),
+    );
+    owner.observe(Arc::clone(&thread.session)).await;
+    assert_eq!(
+        thread.io.session_loop_termination.cleanup_completed(),
+        Some(CleanupExecution::ConversationShutdownFailed)
+    );
+
+    assert!(thread.io.shutdown_and_wait().await.is_err());
 }
 
 #[tokio::test]

@@ -199,6 +199,8 @@ pub enum StartManagedTransitionResponse {
 pub struct ReadManagedTransitionParams {
     #[serde(deserialize_with = "deserialize_contract_version")]
     pub contract_version: u8,
+    /// An empty id requests the current CAS baseline when no transition owns
+    /// the barrier. A nonempty id reads that exact active or completed record.
     pub transition_id: String,
     pub process_instance_id: String,
 }

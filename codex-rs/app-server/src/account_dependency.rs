@@ -85,6 +85,8 @@ pub(crate) fn classify(request: &ClientRequest) -> AccountDependency {
         | ClientRequest::AppsRead { .. }
         | ClientRequest::AppsList { .. }
         | ClientRequest::AppsInstalled { .. }
+        | ClientRequest::LoginAccount { .. }
+        | ClientRequest::LogoutAccount { .. }
         | ClientRequest::SkillsList { .. }
         | ClientRequest::SkillsExtraRootsSet { .. }
         | ClientRequest::SkillsConfigWrite { .. }
@@ -130,8 +132,6 @@ pub(crate) fn classify(request: &ClientRequest) -> AccountDependency {
         | ClientRequest::GetWorkspaceMessages { .. }
         | ClientRequest::GitDiffToRemote { .. }
         | ClientRequest::Initialize { .. }
-        | ClientRequest::LoginAccount { .. }
-        | ClientRequest::LogoutAccount { .. }
         | ClientRequest::ManagedTransitionCancel { .. }
         | ClientRequest::ManagedTransitionRead { .. }
         | ClientRequest::ManagedTransitionStart { .. }
@@ -206,5 +206,23 @@ mod tests {
             params: Default::default(),
         };
         assert_eq!(classify(&turn_start), AccountDependency::Permit);
+    }
+
+    #[test]
+    fn credential_mutations_are_permit_gated() {
+        let login = ClientRequest::LoginAccount {
+            request_id: codex_app_server_protocol::RequestId::Integer(2),
+            params: codex_app_server_protocol::LoginAccountParams::Chatgpt {
+                codex_streamlined_login: false,
+                use_hosted_login_success_page: false,
+                app_brand: None,
+            },
+        };
+        let logout = ClientRequest::LogoutAccount {
+            request_id: codex_app_server_protocol::RequestId::Integer(3),
+            params: None,
+        };
+        assert_eq!(classify(&login), AccountDependency::Permit);
+        assert_eq!(classify(&logout), AccountDependency::Permit);
     }
 }

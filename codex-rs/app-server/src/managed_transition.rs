@@ -1350,6 +1350,26 @@ impl ManagedTransitionCoordinator {
                 true,
             ));
         }
+        // The repository-owned writer-first command uses an empty transition
+        // id to obtain the current CAS baseline before it has an id to read.
+        // A live transition or pre-install quarantine must be observed as a
+        // refusal rather than exposing a baseline that would let the writer
+        // run while the barrier already has an owner.
+        if envelope.transition_id.is_empty() {
+            if state.active.is_some()
+                || state.completed.values().any(|record| {
+                    record.phase == ManagedTransitionPhase::Quarantined && !record.reset_pending
+                })
+            {
+                return Err(refusal(
+                    &state,
+                    &envelope,
+                    ManagedTransitionRefusalKind::ConcurrentTransition,
+                    true,
+                ));
+            }
+            return Ok(current_status(&state));
+        }
         if let Some(record) = state
             .active
             .as_ref()
@@ -1391,9 +1411,6 @@ impl ManagedTransitionCoordinator {
     ) -> Result<ManagedTransitionStatus, ManagedTransitionRefusal> {
         let mut state = self.state.lock().await;
         let envelope = TransitionEnvelope::cancel(params);
-        if !state.auth_authority_available {
-            return Err(authoritative_auth_unavailable(&state, &envelope));
-        }
         if envelope.process_instance_id != state.process_instance_id {
             return Err(refusal(
                 &state,
@@ -1455,11 +1472,20 @@ impl ManagedTransitionCoordinator {
                     .values()
                     .any(|other| other.phase == ManagedTransitionPhase::Quarantined);
             if no_other_owner {
+                // An authority failure before credential installation may be
+                // explicitly cancelled. This is the only recovery from the
+                // sticky authority latch; post-install quarantines remain
+                // reset_pending and are refused above.
+                state.auth_authority_available = true;
                 self.account_work_permits.reopen();
                 self.account_work_permits.wake_waiters();
             }
             drop(state);
             return Ok(status);
+        }
+
+        if !state.auth_authority_available {
+            return Err(authoritative_auth_unavailable(&state, &envelope));
         }
 
         let Some(record) = state.active.take() else {
@@ -1732,7 +1758,7 @@ impl ManagedTransitionCoordinator {
                 &state,
                 transition_id,
                 ManagedTransitionRefusalKind::AuthoritativeAuthUnavailable,
-                true,
+                state.auth_authority_available,
             ));
         }
         let Some(record) = state.active.take() else {
@@ -1863,7 +1889,7 @@ impl ManagedTransitionCoordinator {
                         &state,
                         transition_id,
                         ManagedTransitionRefusalKind::AuthoritativeAuthUnavailable,
-                        true,
+                        state.auth_authority_available,
                     ))
                 }
             };
@@ -2059,8 +2085,25 @@ fn authoritative_auth_unavailable(
         state,
         envelope,
         ManagedTransitionRefusalKind::AuthoritativeAuthUnavailable,
-        true,
+        state.auth_authority_available,
     )
+}
+
+fn current_status(state: &CoordinatorState) -> ManagedTransitionStatus {
+    ManagedTransitionStatus {
+        process_instance_id: state.process_instance_id.clone(),
+        transition_id: None,
+        intent: None,
+        phase: ManagedTransitionPhase::Idle,
+        retryable: false,
+        prior_auth_revision: state.auth_revision,
+        auth_revision: state.auth_revision,
+        prior_transition_revision: state.transition_revision,
+        transition_revision: state.transition_revision,
+        prior_auth_fingerprint: state.auth_fingerprint.clone(),
+        result_auth_fingerprint: state.auth_fingerprint.clone(),
+        refusal: None,
+    }
 }
 
 fn status_for(record: &TransitionRecord) -> ManagedTransitionStatus {
@@ -2236,6 +2279,88 @@ mod tests {
         assert_eq!(cancelled.phase, ManagedTransitionPhase::Cancelled);
         assert_eq!(cancelled.transition_revision, 2);
         assert!(cancelled.retryable);
+    }
+
+    #[tokio::test]
+    async fn empty_read_returns_current_cas_baseline_only_when_unowned() {
+        let coordinator = ManagedTransitionCoordinator::new();
+        let process_id = coordinator.process_instance_id().await;
+        let current = coordinator
+            .read(ReadManagedTransitionParams {
+                contract_version: MANAGED_AUTH_TRANSITION_CONTRACT_VERSION,
+                transition_id: String::new(),
+                process_instance_id: process_id.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(current.phase, ManagedTransitionPhase::Idle);
+        assert_eq!(current.transition_id, None);
+        assert_eq!(current.auth_revision, 0);
+        assert_eq!(current.transition_revision, 0);
+
+        coordinator
+            .admit(request(process_id.clone(), "transition-a"))
+            .await
+            .unwrap();
+        assert_eq!(
+            coordinator
+                .read(ReadManagedTransitionParams {
+                    contract_version: MANAGED_AUTH_TRANSITION_CONTRACT_VERSION,
+                    transition_id: String::new(),
+                    process_instance_id: process_id.clone(),
+                })
+                .await
+                .unwrap_err()
+                .kind,
+            ManagedTransitionRefusalKind::ConcurrentTransition
+        );
+
+        coordinator
+            .cancel(cancel_request(process_id.clone(), "transition-a"))
+            .await
+            .unwrap();
+        let after_cancel = coordinator
+            .read(ReadManagedTransitionParams {
+                contract_version: MANAGED_AUTH_TRANSITION_CONTRACT_VERSION,
+                transition_id: String::new(),
+                process_instance_id: process_id,
+            })
+            .await
+            .unwrap();
+        assert_eq!(after_cancel.phase, ManagedTransitionPhase::Idle);
+        assert_eq!(after_cancel.transition_revision, 2);
+    }
+
+    #[tokio::test]
+    async fn authority_quarantine_can_be_explicitly_cancelled_before_install() {
+        let coordinator = ManagedTransitionCoordinator::new();
+        let process_id = coordinator.process_instance_id().await;
+        coordinator
+            .admit(request(process_id.clone(), "authority-failure"))
+            .await
+            .unwrap();
+        let quarantined = coordinator
+            .advance("authority-failure", ManagedTransitionPhase::Quarantined)
+            .await
+            .unwrap();
+        assert_eq!(quarantined.phase, ManagedTransitionPhase::Quarantined);
+        coordinator.state.lock().await.auth_authority_available = false;
+
+        let refused = coordinator
+            .read(read_request(process_id.clone(), "authority-failure"))
+            .await
+            .unwrap_err();
+        assert!(!refused.retryable);
+        let cancelled = coordinator
+            .cancel(cancel_request(process_id.clone(), "authority-failure"))
+            .await
+            .unwrap();
+        assert_eq!(cancelled.phase, ManagedTransitionPhase::Cancelled);
+        assert!(
+            coordinator.state.lock().await.auth_authority_available,
+            "explicit cancellation restores admission after pre-install authority failure"
+        );
+        assert!(coordinator.try_acquire_account_work_permit().is_some());
     }
 
     #[tokio::test]

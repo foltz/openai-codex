@@ -343,10 +343,7 @@ async fn retire_attempt(attempt: Arc<Attempt>, deadline: Instant) -> PhysicalRet
             // stuck. The independent ticket is safe to retry after cancellation.
             let process_close = async {
                 match process {
-                    Some(process) => tokio::time::timeout_at(deadline, process.terminate())
-                        .await
-                        .map_err(|_| ())
-                        .and_then(|result| result.map_err(|_| ())),
+                    Some(process) => process.terminate_until(deadline).await.map_err(|_| ()),
                     None => Ok(()),
                 }
             };

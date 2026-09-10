@@ -980,12 +980,13 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
     // low-level runtime retains only a weak ticket until the facade returns;
     // passing the sole Arc by value would let startup cancellation detach the
     // just-born runtime before the facade can install its worker clone.
-    let mut client =
+    let client_result =
         InProcessAppServerClient::start_in_host(Arc::clone(&embedded_host), in_process_start_args)
-            .await
-            .map_err(|err| {
-                anyhow::anyhow!("failed to initialize in-process app-server client: {err}")
-            })?;
+            .await;
+    drop(embedded_host);
+    let mut client = client_result.map_err(|err| {
+        anyhow::anyhow!("failed to initialize in-process app-server client: {err}")
+    })?;
 
     // Resolve resume and fork through existing app-server thread lifecycle APIs.
     let (primary_thread_id, fallback_session_configured) = if let Some(ExecCommand::Resume(args)) =

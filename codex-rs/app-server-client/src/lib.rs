@@ -342,7 +342,9 @@ impl InProcessAppServerClient {
     #[deprecated(note = "use start_in_host with host custody retained by the embedding caller")]
     pub async fn start(args: InProcessClientStartArgs) -> IoResult<Self> {
         let host = Arc::new(InProcessHost::default());
-        Self::start_in_host(host, args).await
+        let result = Self::start_in_host(Arc::clone(&host), args).await;
+        drop(host);
+        result
     }
 
     /// Starts an embedded client with custody supplied before the first

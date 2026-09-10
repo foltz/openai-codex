@@ -599,6 +599,7 @@ pub(crate) async fn start_app_server_for_picker(
         embedded_host.clone(),
     )
     .await?;
+    drop(embedded_host);
     Ok(
         AppServerSession::new(app_server, target.thread_params_mode())
             .with_local_codex_home(&config.codex_home),
@@ -1174,6 +1175,7 @@ async fn run_ratatui_app(
             ),
         )
         .await;
+    drop(embedded_host);
     launch_telemetry.record(&app_server_target, matches!(&startup_app_server, Ok(Ok(_))));
     let app_server_session = match startup_app_server {
         Ok(Ok(app_server)) => {

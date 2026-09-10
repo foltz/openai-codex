@@ -59,6 +59,7 @@ use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
 use tokio::process::Command;
 use tokio::sync::broadcast;
+use tokio::time::Instant;
 use tracing::info;
 use tracing::warn;
 
@@ -551,10 +552,21 @@ impl StdioServerProcessHandle {
         reason = "the async attempt lock serializes bounded termination observations, not shared runtime state"
     )]
     pub(crate) async fn terminate(&self) -> io::Result<()> {
+        self.terminate_until(tokio::time::Instant::now() + PROCESS_RETIREMENT_TIMEOUT)
+            .await
+    }
+
+    /// Terminates and observes the process using the caller's absolute
+    /// deadline. Retirements with an existing bound must not mint a nested
+    /// three-second budget here.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the async attempt lock serializes bounded termination observations, not shared runtime state"
+    )]
+    pub(crate) async fn terminate_until(&self, deadline: Instant) -> io::Result<()> {
         if self.inner.terminal_observed.load(Ordering::Acquire) {
             return Ok(());
         }
-        let deadline = tokio::time::Instant::now() + PROCESS_RETIREMENT_TIMEOUT;
         let _attempt = tokio::time::timeout_at(deadline, self.inner.termination_lock.lock())
             .await
             .map_err(|_| {

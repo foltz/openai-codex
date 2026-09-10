@@ -1191,10 +1191,10 @@ impl MessageProcessor {
             rpc_gate,
             async move {
                 // Held across the whole handling future, including every
-                // retry/prewarm/effect inside it, and released exactly once
-                // on drop regardless of which terminal path this future
-                // exits through (`CODEX-I05-S03-R009`).
-                let _account_work_permit = account_work_permit;
+                // retry/prewarm/effect inside it. `turn/start` transfers it
+                // to the submitted turn's terminal-event bookkeeping before
+                // returning; every other request releases it when this
+                // future exits (`CODEX-I05-S03-R009`).
                 let processor_for_request = Arc::clone(&processor);
                 let result = processor_for_request
                     .handle_initialized_client_request(
@@ -1205,6 +1205,7 @@ impl MessageProcessor {
                         client_version,
                         client_mcp_extensions,
                         managed_transition_caller_authorized,
+                        account_work_permit,
                     )
                     .await;
                 if let Err(error) = result {
@@ -1236,6 +1237,7 @@ impl MessageProcessor {
         client_version: Option<String>,
         client_mcp_extensions: ClientMcpExtensions,
         managed_transition_caller_authorized: bool,
+        account_work_permit: Option<crate::managed_transition::AccountWorkPermitGuard>,
     ) -> Result<(), JSONRPCErrorError> {
         let connection_id = connection_request_id.connection_id;
         let request_id = ConnectionRequestId {
@@ -1660,11 +1662,12 @@ impl MessageProcessor {
             }
             ClientRequest::TurnStart { params, .. } => {
                 self.turn_processor
-                    .turn_start(
+                    .turn_start_with_account_work_permit(
                         request_id.clone(),
                         params,
                         app_server_client_name.clone(),
                         client_version.clone(),
+                        account_work_permit,
                     )
                     .await
             }

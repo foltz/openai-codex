@@ -144,7 +144,7 @@ impl AccountWorkPermits {
         }
     }
 
-    fn admitted_count(&self) -> u64 {
+    pub(crate) fn admitted_count(&self) -> u64 {
         self.inner.state.load(Ordering::Acquire) & ACCOUNT_WORK_COUNT_MASK
     }
 

@@ -2,9 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
 use tracing::info;
 use tracing::instrument;
@@ -24,7 +22,8 @@ use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::BaseInstructions;
 
 pub(crate) struct SessionStartupPrewarmHandle {
-    task: AbortOnDropHandle<CodexResult<ModelClientSession>>,
+    task: crate::tasks::TaskAbortHandle,
+    result: tokio::sync::oneshot::Receiver<CodexResult<ModelClientSession>>,
     started_at: Instant,
     timeout: Duration,
 }
@@ -40,12 +39,14 @@ pub(crate) enum SessionStartupPrewarmResolution {
 
 impl SessionStartupPrewarmHandle {
     pub(crate) fn new(
-        task: JoinHandle<CodexResult<ModelClientSession>>,
+        task: crate::tasks::TaskAbortHandle,
+        result: tokio::sync::oneshot::Receiver<CodexResult<ModelClientSession>>,
         started_at: Instant,
         timeout: Duration,
     ) -> Self {
         Self {
-            task: AbortOnDropHandle::new(task),
+            task,
+            result,
             started_at,
             timeout,
         }
@@ -53,7 +54,9 @@ impl SessionStartupPrewarmHandle {
 
     pub(crate) async fn abort(self) {
         self.task.abort();
-        let _ = self.task.await;
+        if !self.task.wait().await {
+            warn!("startup websocket prewarm task panicked");
+        }
     }
 
     #[instrument(name = "startup_prewarm.resolve", level = "trace", skip_all)]
@@ -64,7 +67,8 @@ impl SessionStartupPrewarmHandle {
     ) -> SessionStartupPrewarmResolution {
         let resolve_started_at = Instant::now();
         let Self {
-            mut task,
+            task,
+            mut result,
             started_at,
             timeout,
         } = self;
@@ -72,11 +76,11 @@ impl SessionStartupPrewarmHandle {
         let remaining = timeout.saturating_sub(age_at_first_turn);
 
         let resolution = if task.is_finished() {
-            Self::resolution_from_join_result(task.await, started_at)
+            Self::resolution_from_join_result(result.await, started_at)
         } else {
             match tokio::select! {
                 _ = cancellation_token.cancelled() => None,
-                result = tokio::time::timeout(remaining, &mut task) => Some(result),
+                result = tokio::time::timeout(remaining, &mut result) => Some(result),
             } {
                 Some(Ok(result)) => Self::resolution_from_join_result(result, started_at),
                 Some(Err(_elapsed)) => {
@@ -156,7 +160,10 @@ impl SessionStartupPrewarmHandle {
     }
 
     fn resolution_from_join_result(
-        result: std::result::Result<CodexResult<ModelClientSession>, tokio::task::JoinError>,
+        result: std::result::Result<
+            CodexResult<ModelClientSession>,
+            tokio::sync::oneshot::error::RecvError,
+        >,
         started_at: Instant,
     ) -> SessionStartupPrewarmResolution {
         match result {
@@ -182,16 +189,34 @@ impl SessionStartupPrewarmHandle {
 }
 
 impl Session {
+    /// Register auxiliary startup work under the same permanent admission gate
+    /// as turn tasks. The join remains observable after its driver is dropped.
+    pub(crate) async fn spawn_startup_auxiliary(
+        &self,
+        work: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        let active_turn = self.active_turn.lock().await;
+        if self
+            .task_admission_closed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            drop(active_turn);
+            return;
+        }
+        self.task_joins.register(tokio::spawn(work)).detach();
+    }
+
     pub(crate) async fn schedule_startup_prewarm(self: &Arc<Self>, base_instructions: String) {
         if !self.services.model_client.responses_websocket_enabled() {
             // Without websocket prewarm, resolve auth once so Agent Identity bootstrap can
             // register or engage this session's bearer fallback before the first user request.
             let model_client = self.services.model_client.clone();
-            tokio::spawn(async move {
+            self.spawn_startup_auxiliary(async move {
                 if let Err(err) = model_client.prewarm_auth().await {
                     warn!("startup auth prewarm failed: {err:#}");
                 }
-            });
+            })
+            .await;
             return;
         }
 
@@ -199,6 +224,15 @@ impl Session {
         let websocket_connect_timeout = self.provider().await.websocket_connect_timeout();
         let started_at = Instant::now();
         let startup_prewarm_session = Arc::clone(self);
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let active_turn = self.active_turn.lock().await;
+        if self
+            .task_admission_closed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            drop(active_turn);
+            return;
+        }
         let startup_prewarm = tokio::spawn(
             async move {
                 let result =
@@ -215,7 +249,7 @@ impl Session {
                     started_at.elapsed(),
                     &[("status", status)],
                 );
-                result
+                let _ = result_tx.send(result);
             }
             .instrument(trace_span!(
                 "startup_prewarm",
@@ -223,8 +257,11 @@ impl Session {
                 thread.id = %self.thread_id(),
             )),
         );
+        let task = self.task_joins.register(startup_prewarm);
+        drop(active_turn);
         self.set_session_startup_prewarm(SessionStartupPrewarmHandle::new(
-            startup_prewarm,
+            task,
+            result_rx,
             started_at,
             websocket_connect_timeout,
         ))
@@ -263,15 +300,17 @@ async fn schedule_startup_prewarm_inner(
     if routes_approval_to_guardian(&startup_turn_context) {
         let guardian_session = Arc::clone(&session);
         let guardian_parent_turn = Arc::clone(&startup_turn_context);
-        drop(tokio::spawn(async move {
-            if let Err(err) = guardian_session
-                .guardian_review_session
-                .initialize(Arc::clone(&guardian_session), guardian_parent_turn)
-                .await
-            {
-                warn!("failed to initialize guardian review session: {err:#}");
-            }
-        }));
+        session
+            .spawn_startup_auxiliary(async move {
+                if let Err(err) = guardian_session
+                    .guardian_review_session
+                    .initialize(Arc::clone(&guardian_session), guardian_parent_turn)
+                    .await
+                {
+                    warn!("failed to initialize guardian review session: {err:#}");
+                }
+            })
+            .await;
     }
     let startup_cancellation_token = CancellationToken::new();
     let built_tools_started_at = Instant::now();

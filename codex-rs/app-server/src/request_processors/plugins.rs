@@ -2,6 +2,7 @@ use super::apps_processor::APP_READ_MAX_IDS;
 use super::*;
 use crate::error_code::internal_error;
 use crate::error_code::invalid_request;
+use crate::processor_task_retirement::ProcessorTasks;
 use codex_analytics::PluginInstallSource;
 use codex_app_server_protocol::PluginAvailability;
 use codex_app_server_protocol::PluginInstallPolicy;
@@ -56,6 +57,7 @@ pub(crate) struct PluginRequestProcessor {
     workspace_settings_cache: Arc<workspace_settings::WorkspaceSettingsCache>,
     on_effective_plugins_changed:
         Arc<dyn Fn(codex_core_plugins::EffectivePluginsChange) + Send + Sync>,
+    tasks: ProcessorTasks,
 }
 
 fn plugin_skills_to_info(
@@ -403,6 +405,7 @@ impl PluginRequestProcessor {
         on_effective_plugins_changed: Arc<
             dyn Fn(codex_core_plugins::EffectivePluginsChange) + Send + Sync,
         >,
+        tasks: ProcessorTasks,
     ) -> Self {
         Self {
             auth_manager,
@@ -412,6 +415,7 @@ impl PluginRequestProcessor {
             config_manager,
             workspace_settings_cache,
             on_effective_plugins_changed,
+            tasks,
         }
     }
 
@@ -1987,7 +1991,7 @@ impl PluginRequestProcessor {
             let thread_manager = Arc::clone(&self.thread_manager);
             let http_client = Arc::clone(&http_client);
 
-            tokio::spawn(async move {
+            if let Err(err) = self.tasks.spawn(async move {
                 let oauth_client_id = server.oauth_client_id();
                 let first_attempt = perform_oauth_login_silent(
                     &oauth_credential_name,
@@ -2045,7 +2049,9 @@ impl PluginRequestProcessor {
                     },
                 );
                 outgoing.send_server_notification(notification).await;
-            });
+            }) {
+                warn!(?err, "plugin OAuth task admission closed during shutdown");
+            }
         }
     }
 

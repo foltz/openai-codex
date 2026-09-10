@@ -91,6 +91,7 @@ impl McpConnectionSet {
         prefix_mcp_tool_names: bool,
     ) -> Self {
         Self {
+            retirement: crate::runtime_retirement::RuntimeRetirementRegistry::default(),
             servers: HashMap::new(),
             protocol_mode: crate::McpProtocolMode::Legacy,
             required_servers: Vec::new(),
@@ -112,6 +113,11 @@ impl McpConnectionSet {
     }
 
     fn insert_test_client(&mut self, name: impl Into<String>, client: AsyncManagedClient) {
+        // These fixtures bypass production construction, so explicitly register
+        // their cancellation owner rather than relying on a snapshot sweep.
+        self.retirement
+            .register_connection(client.cancel_token.clone())
+            .expect("open fixture registry");
         let name = name.into();
         self.servers.insert(
             name,
@@ -2744,6 +2750,16 @@ async fn shutdown_continues_after_caller_is_aborted() {
         &permission_profile,
         /*prefix_mcp_tool_names*/ true,
     );
+    let startup_observer = blocking_client.clone();
+    let startup = manager
+        .retirement
+        .task_ticket()
+        .register(move || async move {
+            let _ = startup_observer.await;
+            crate::runtime_retirement::RuntimeTaskOutcome::Complete
+        })
+        .expect("register startup before polling");
+    tokio::spawn(startup);
     manager.insert_test_client(
         CODEX_APPS_MCP_SERVER_NAME.to_string(),
         AsyncManagedClient {
@@ -2758,23 +2774,24 @@ async fn shutdown_continues_after_caller_is_aborted() {
         },
     );
     let manager = Arc::new(manager);
-    let shutdown_task = tokio::spawn({
-        let manager = Arc::clone(&manager);
-        async move { manager.shutdown().await }
-    });
-
-    started_rx.await.expect("client shutdown should start");
-    shutdown_task.abort();
-    let shutdown_error = shutdown_task
-        .await
-        .expect_err("caller shutdown task should be aborted");
-    assert!(shutdown_error.is_cancelled());
+    started_rx.await.expect("registered startup should start");
+    let mut shutdown = Box::pin(manager.shutdown());
+    assert!(futures::poll!(shutdown.as_mut()).is_pending());
+    drop(shutdown);
     release.notify_one();
 
     tokio::time::timeout(Duration::from_secs(1), completed_rx)
         .await
         .expect("client shutdown should survive caller cancellation")
         .expect("client shutdown completion sender should stay alive");
+    let report = manager
+        .retirement
+        .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await;
+    assert!(
+        report.is_complete(),
+        "the retained original must be observable after cancellation"
+    );
 }
 
 #[tokio::test]
@@ -3832,6 +3849,297 @@ fn reusable_server_config(url: &str) -> McpServerConfig {
         oauth_resource: None,
         tools: HashMap::new(),
     }
+}
+
+// These retirement proofs use the real runtime/connection/client/stdio construction
+// chain. In particular, do not replace them with insert_test_client: that bypasses
+// the reservation whose completeness these tests need to establish.
+#[cfg(unix)]
+fn retirement_stdio_config(marker: &std::path::Path, generation: &str) -> McpServerConfig {
+    let mut config = reusable_server_config("unused");
+    config.transport = McpServerTransportConfig::Stdio {
+        command: "/bin/sh".to_string(),
+        args: vec![
+            "-c".to_string(),
+            r#"
+printf '%s\n' "$$" >> "$1"
+while IFS= read -r request; do
+    id=$(printf '%s' "$request" | /usr/bin/sed -n 's/.*"id": *\([^,}]*\).*/\1/p')
+    [ -n "$id" ] || continue
+    case "$request" in
+        *'"initialize"'*) result='{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"retirement-proof","version":"1"}}' ;;
+        *'"tools/list"'*) result='{"tools":[{"name":"proof","description":"retirement proof","inputSchema":{"type":"object"}}]}' ;;
+        *) result='{}' ;;
+    esac
+    printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$result"
+done
+"#
+            .to_string(),
+            generation.to_string(),
+            marker.display().to_string(),
+        ],
+        env: None,
+        env_vars: Vec::new(),
+        cwd: None,
+    };
+    config.startup_timeout_sec = Some(Duration::from_secs(5));
+    config
+}
+
+#[cfg(unix)]
+fn retirement_runtime_input(
+    home: &std::path::Path,
+    config: McpServerConfig,
+    context: McpRuntimeContext,
+    cache: McpToolCatalogCache,
+    policy: McpStartupPolicy,
+) -> McpRuntimeInput {
+    McpRuntimeInput {
+        startup_policy: policy,
+        config: Arc::new(crate::mcp::tests::test_mcp_config(home.to_path_buf())),
+        plugins_available: false,
+        ready_selected_capability_roots: Vec::new(),
+        mcp_servers: HashMap::from([("docs".to_string(), EffectiveMcpServer::configured(config))]),
+        submit_id: "retirement-proof".to_string(),
+        tx_event: None,
+        startup_cancellation_token: CancellationToken::new(),
+        runtime_context: context,
+        codex_apps_tools_cache: ConnectorRuntimeManager::default(),
+        tool_catalog_cache: cache,
+        codex_apps_tools_cache_key: ConnectorRuntimeContextKey::personal(None, None),
+        client_mcp_extensions: ClientMcpExtensions::default(),
+        auth: None,
+        codex_apps_auth_manager: None,
+        elicitation_reviewer: None,
+        elicitation_lifecycle: None,
+        canonical_thread_id: None,
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn external_runtime_retirement_outlives_real_runtime_and_binding() -> anyhow::Result<()> {
+    let home = tempdir()?;
+    let marker = home.path().join("external-custody-pid");
+    let context = McpRuntimeContext::new(
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        home.path().to_path_buf(),
+    );
+    let control = crate::McpRuntimeRetirement::default();
+    let runtime = crate::McpRuntime::new_in_retirement(
+        retirement_runtime_input(
+            home.path(),
+            retirement_stdio_config(&marker, "external"),
+            context,
+            McpToolCatalogCache::default(),
+            McpStartupPolicy::Eager,
+        ),
+        control.clone(),
+    )
+    .await;
+    let binding = runtime
+        .current_binding_with_required_servers(&["docs".to_string()])
+        .await
+        .expect("real initialized binding");
+    assert_eq!(binding.tools().len(), 1);
+    let pid: u32 = std::fs::read_to_string(&marker)?.trim().parse()?;
+    drop(binding);
+    drop(runtime);
+    let alive = || -> std::io::Result<bool> {
+        Ok(std::process::Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?
+            .success())
+    };
+    assert!(
+        alive()?,
+        "must not pass by dropping and killing the child before observing retirement"
+    );
+    assert!(!control.is_retired());
+    let report = control
+        .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(5))
+        .await;
+    assert!(report.is_complete(), "{report:?}");
+    assert_eq!(report.connections.len(), 1);
+    assert_eq!(
+        report.connections[0].1.attempts,
+        vec![(0, codex_rmcp_client::PhysicalRetirementOutcome::Complete)]
+    );
+    assert!(!alive()?);
+    assert!(control.is_retired());
+    assert_eq!(
+        control.shutdown_until(tokio::time::Instant::now()).await,
+        report
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_retirement_keeps_superseded_real_stdio_and_deduplicates_reuse()
+-> anyhow::Result<()> {
+    let home = tempdir()?;
+    let marker = home.path().join("launched-pids");
+    let context = McpRuntimeContext::new(
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        home.path().to_path_buf(),
+    );
+    let cache = McpToolCatalogCache::default();
+    let config_a = retirement_stdio_config(&marker, "generation-a");
+    let input = |config| {
+        retirement_runtime_input(
+            home.path(),
+            config,
+            context.clone(),
+            cache.clone(),
+            McpStartupPolicy::Eager,
+        )
+    };
+    let runtime = crate::runtime::McpRuntime::new(input(config_a.clone())).await;
+    let required = ["docs".to_string()];
+    let original = runtime
+        .current_binding_with_required_servers(&required)
+        .await
+        .expect("published binding");
+    assert_eq!(
+        original.tools().len(),
+        1,
+        "must complete a real handshake and tools request"
+    );
+    runtime.replace(input(config_a)).await;
+    let reused = runtime
+        .current_binding_with_required_servers(&required)
+        .await
+        .expect("reused binding");
+    assert_eq!(reused.tools().len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(&marker)?.lines().count(),
+        1,
+        "exact reuse must not launch another process"
+    );
+
+    runtime
+        .replace(input(retirement_stdio_config(&marker, "generation-b")))
+        .await;
+    let replacement = runtime
+        .current_binding_with_required_servers(&required)
+        .await
+        .expect("replacement binding");
+    assert_eq!(replacement.tools().len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(&marker)?.lines().count(),
+        2,
+        "incompatible identity must create a second physical owner"
+    );
+    // Keep both old bindings alive: latest-set shutdown alone would miss A.
+    let report = runtime
+        .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(10))
+        .await;
+    assert!(report.is_complete(), "{report:?}");
+    assert_eq!(
+        report.connections.len(),
+        2,
+        "A must remain owned and exact reuse must not reserve another owner"
+    );
+    for (index, (owner, physical)) in report.connections.iter().enumerate() {
+        assert_eq!(*owner, index);
+        assert_eq!(
+            physical.attempts,
+            vec![(0, codex_rmcp_client::PhysicalRetirementOutcome::Complete)]
+        );
+    }
+    for pid in std::fs::read_to_string(&marker)?.lines() {
+        let pid: u32 = pid.parse()?;
+        assert!(
+            !std::process::Command::new("/bin/kill")
+                .args(["-0", &pid.to_string()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()?
+                .success(),
+            "retirement reported complete while launched process {pid} remains alive"
+        );
+    }
+    assert_eq!(
+        runtime
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await,
+        report
+    );
+    drop((original, reused, replacement));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_retirement_skips_real_dormant_stdio_without_launching() -> anyhow::Result<()> {
+    let home = tempdir()?;
+    let marker = home.path().join("must-not-launch");
+    let context = McpRuntimeContext::new(
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        home.path().to_path_buf(),
+    );
+    let config = retirement_stdio_config(&marker, "dormant");
+    let cache = McpToolCatalogCache::default();
+    let runtime_config = crate::mcp::tests::test_mcp_config(home.path().to_path_buf());
+    let environment = context
+        .resolve_server_environment("docs", &config)
+        .expect("local environment");
+    let cached = cache
+        .context(
+            "docs",
+            &config,
+            &context,
+            environment.as_ref(),
+            &runtime_config.client_elicitation_capability,
+            &ClientMcpExtensions::default(),
+        )
+        .expect("cacheable stdio server");
+    cached.publish_if_newest(cached.begin_fetch(), &[create_test_tool("docs", "proof")]);
+    let runtime = crate::runtime::McpRuntime::empty(true);
+    runtime
+        .replace(retirement_runtime_input(
+            home.path(),
+            config,
+            context,
+            cache,
+            McpStartupPolicy::LazyWhenCached,
+        ))
+        .await;
+    let report = runtime
+        .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(5))
+        .await;
+    assert!(report.is_complete(), "{report:?}");
+    assert_eq!(
+        report.connections.len(),
+        1,
+        "dormant connection is still registered"
+    );
+    assert!(
+        report.connections[0].1.attempts.is_empty(),
+        "no physical attempt may be admitted by shutdown"
+    );
+    assert!(
+        report
+            .tasks
+            .iter()
+            .any(|(_, outcome)| *outcome == crate::runtime_retirement::RuntimeTaskOutcome::Skipped),
+        "{report:?}"
+    );
+    assert!(
+        !marker.exists(),
+        "retirement must not execute the dormant factory"
+    );
+    assert_eq!(
+        runtime
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await,
+        report
+    );
+    assert!(!marker.exists());
+    Ok(())
 }
 
 fn reusable_server_runtime_context() -> McpRuntimeContext {

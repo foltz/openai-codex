@@ -21,6 +21,9 @@ pub use runtime::McpRuntimeContext;
 pub use runtime::McpRuntimeInput;
 pub use runtime::McpStartupPolicy;
 pub use runtime::SandboxState;
+pub use runtime_retirement::McpRuntimeRetirement;
+pub use runtime_retirement::RuntimeTaskOutcome;
+pub use runtime_retirement::RuntimeTerminationReport;
 pub use tool_catalog_cache::McpToolCatalogCache;
 pub use tools::ToolInfo;
 
@@ -103,6 +106,7 @@ mod plugin_config;
 mod resource_client;
 pub(crate) mod rmcp_client;
 pub(crate) mod runtime;
+mod runtime_retirement;
 pub(crate) mod server;
 mod tool_catalog_cache;
 pub(crate) mod tools;

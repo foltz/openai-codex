@@ -1,6 +1,7 @@
 mod compact;
 mod lifecycle;
 mod regular;
+mod retirement;
 mod review;
 mod user_shell;
 
@@ -14,7 +15,6 @@ use futures::future::BoxFuture;
 use tokio::select;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
 use tracing::Span;
 use tracing::field;
@@ -58,6 +58,9 @@ use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::ContentItem;
 pub(crate) use compact::CompactTask;
 pub(crate) use regular::RegularTask;
+pub(crate) use retirement::TaskAbortHandle;
+pub(crate) use retirement::TaskJoinOutcome;
+pub(crate) use retirement::TaskJoinRegistry;
 pub(crate) use review::ReviewTask;
 pub(crate) use user_shell::UserShellCommandMode;
 pub(crate) use user_shell::UserShellCommandTask;
@@ -276,6 +279,21 @@ where
 }
 
 impl Session {
+    /// Permanently stop task admission before retirement takes the active task.
+    pub(crate) async fn close_task_admission(&self) {
+        let reservation = {
+            let mut active = self.active_turn.lock().await;
+            self.task_admission_closed
+                .store(true, std::sync::atomic::Ordering::Release);
+            if active.as_ref().is_some_and(|turn| turn.task.is_none()) {
+                active.take()
+            } else {
+                None
+            }
+        };
+        drop(reservation);
+    }
+
     pub async fn spawn_task<T: SessionTask>(
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
@@ -335,6 +353,12 @@ impl Session {
         }
         let turn_state = {
             let mut active = self.active_turn.lock().await;
+            if self
+                .task_admission_closed
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return;
+            }
             let turn = active.get_or_insert_with(ActiveTurn::default);
             debug_assert!(turn.task.is_none());
             Arc::clone(&turn.turn_state)
@@ -347,6 +371,12 @@ impl Session {
             .await;
 
         let mut active = self.active_turn.lock().await;
+        if self
+            .task_admission_closed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
         let turn = active.get_or_insert_with(ActiveTurn::default);
         debug_assert!(turn.task.is_none());
         let agent_execution_guard = self.services.agent_control.execution_guard(
@@ -411,13 +441,14 @@ impl Session {
             }
             .instrument(task_span),
         );
+        let handle = self.task_joins.register(handle);
         let timer = turn_context
             .session_telemetry
             .start_timer(TURN_E2E_DURATION_METRIC, &[])
             .ok();
         let running_task = RunningTask {
             done,
-            handle: AbortOnDropHandle::new(handle),
+            handle,
             kind: task_kind,
             task,
             input_persisted,
@@ -472,7 +503,11 @@ impl Session {
 
         {
             let mut active_turn = self.active_turn.lock().await;
-            if active_turn.is_some() {
+            if self
+                .task_admission_closed
+                .load(std::sync::atomic::Ordering::Acquire)
+                || active_turn.is_some()
+            {
                 return;
             }
             *active_turn = Some(ActiveTurn::default());

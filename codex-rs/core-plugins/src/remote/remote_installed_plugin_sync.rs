@@ -12,6 +12,7 @@ use super::RemotePluginShareDiscoverability;
 use super::ensure_chatgpt_auth;
 use super::fetch_installed_plugins;
 use super::remote_plugin_canonical_marketplace_name;
+use crate::PluginTaskRegistry;
 use crate::store::PLUGINS_CACHE_DIR;
 use crate::store::PluginStore;
 use crate::store::PluginStoreError;
@@ -88,6 +89,7 @@ pub(crate) fn maybe_start_remote_installed_plugin_bundle_sync(
     codex_home: PathBuf,
     config: RemotePluginServiceConfig,
     auth: Option<CodexAuth>,
+    task_registry: PluginTaskRegistry,
     on_local_cache_changed: Option<
         Arc<dyn Fn(RemoteInstalledPluginBundleSyncOutcome) + Send + Sync + 'static>,
     >,
@@ -102,7 +104,8 @@ pub(crate) fn maybe_start_remote_installed_plugin_bundle_sync(
         return;
     }
 
-    tokio::spawn(async move {
+    let key_for_task = key.clone();
+    let admitted = task_registry.spawn(async move {
         let result =
             sync_remote_installed_plugin_bundles_once(codex_home, &config, Some(&auth)).await;
         match result {
@@ -126,8 +129,14 @@ pub(crate) fn maybe_start_remote_installed_plugin_bundle_sync(
                 );
             }
         }
-        clear_remote_installed_plugin_bundle_sync_in_flight(&key);
+        clear_remote_installed_plugin_bundle_sync_in_flight(&key_for_task);
     });
+    if admitted.is_err() {
+        // The manager is already closing, so there is no task to clear this
+        // admission marker. Release it synchronously instead of leaving a
+        // stale in-flight bit that would suppress future work forever.
+        clear_remote_installed_plugin_bundle_sync_in_flight(&key);
+    }
 }
 
 pub async fn sync_remote_installed_plugin_bundles_once(

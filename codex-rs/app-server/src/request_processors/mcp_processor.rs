@@ -1,6 +1,7 @@
 use super::*;
 use crate::mcp_config_identity::AppliedMcpConfigIdentity;
 use crate::mcp_config_identity::McpConfigIdentity;
+use crate::processor_task_retirement::ProcessorTasks;
 use codex_core::McpManager;
 use codex_mcp::McpServerSource;
 
@@ -13,6 +14,7 @@ pub(crate) struct McpRequestProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     config_manager: ConfigManager,
     applied_mcp_config_identity: AppliedMcpConfigIdentity,
+    tasks: ProcessorTasks,
 }
 
 impl McpRequestProcessor {
@@ -22,6 +24,7 @@ impl McpRequestProcessor {
         outgoing: Arc<OutgoingMessageSender>,
         config_manager: ConfigManager,
         applied_mcp_config_identity: AppliedMcpConfigIdentity,
+        tasks: ProcessorTasks,
     ) -> Self {
         Self {
             auth_manager,
@@ -29,6 +32,7 @@ impl McpRequestProcessor {
             outgoing,
             config_manager,
             applied_mcp_config_identity,
+            tasks,
         }
     }
 
@@ -258,25 +262,28 @@ impl McpRequestProcessor {
         let outgoing = Arc::clone(&self.outgoing);
         let thread_manager = Arc::clone(&self.thread_manager);
 
-        tokio::spawn(async move {
-            let (success, error) = match handle.wait().await {
-                Ok(()) => (true, None),
-                Err(err) => (false, Some(err.to_string())),
-            };
-            if success {
-                thread_manager.invalidate_mcp_runtimes().await;
-            }
+        let _ = self
+            .tasks
+            .spawn(async move {
+                let (success, error) = match handle.wait().await {
+                    Ok(()) => (true, None),
+                    Err(err) => (false, Some(err.to_string())),
+                };
+                if success {
+                    thread_manager.invalidate_mcp_runtimes().await;
+                }
 
-            let notification = ServerNotification::McpServerOauthLoginCompleted(
-                McpServerOauthLoginCompletedNotification {
-                    name: notification_name,
-                    thread_id: notification_thread_id,
-                    success,
-                    error,
-                },
-            );
-            outgoing.send_server_notification(notification).await;
-        });
+                let notification = ServerNotification::McpServerOauthLoginCompleted(
+                    McpServerOauthLoginCompletedNotification {
+                        name: notification_name,
+                        thread_id: notification_thread_id,
+                        success,
+                        error,
+                    },
+                );
+                outgoing.send_server_notification(notification).await;
+            })
+            .map_err(|err| internal_error(format!("MCP OAuth task admission failed: {err:?}")))?;
 
         Ok(McpServerOauthLoginResponse { authorization_url })
     }
@@ -316,18 +323,21 @@ impl McpRequestProcessor {
             }
         };
 
-        tokio::spawn(async move {
-            Self::list_mcp_server_status_task(
-                outgoing,
-                request,
-                params,
-                mcp_config,
-                auth,
-                runtime_context,
-                mcp_manager,
-            )
-            .await;
-        });
+        let _ = self
+            .tasks
+            .spawn(async move {
+                Self::list_mcp_server_status_task(
+                    outgoing,
+                    request,
+                    params,
+                    mcp_config,
+                    auth,
+                    runtime_context,
+                    mcp_manager,
+                )
+                .await;
+            })
+            .map_err(|err| internal_error(format!("MCP status task admission failed: {err:?}")))?;
         Ok(())
     }
 
@@ -465,10 +475,15 @@ impl McpRequestProcessor {
             let (_, thread) = self.load_thread(&thread_id).await?;
             let request_id = request_id.clone();
 
-            tokio::spawn(async move {
-                let result = thread.read_mcp_resource(&server, &uri).await;
-                Self::send_mcp_resource_read_response(outgoing, request_id, result).await;
-            });
+            let _ = self
+                .tasks
+                .spawn(async move {
+                    let result = thread.read_mcp_resource(&server, &uri).await;
+                    Self::send_mcp_resource_read_response(outgoing, request_id, result).await;
+                })
+                .map_err(|err| {
+                    internal_error(format!("MCP resource task admission failed: {err:?}"))
+                })?;
             return Ok(());
         }
 
@@ -486,20 +501,25 @@ impl McpRequestProcessor {
             McpRuntimeContext::new(Arc::clone(&environment_manager), config.cwd.to_path_buf());
         let request_id = request_id.clone();
 
-        tokio::spawn(async move {
-            let result = read_mcp_resource_without_thread(
-                &mcp_config,
-                auth.as_ref(),
-                runtime_context,
-                codex_apps_tools_cache,
-                tool_catalog_cache,
-                &server,
-                &uri,
-            )
-            .await
-            .and_then(|result| serde_json::to_value(result).map_err(anyhow::Error::from));
-            Self::send_mcp_resource_read_response(outgoing, request_id, result).await;
-        });
+        let _ = self
+            .tasks
+            .spawn(async move {
+                let result = read_mcp_resource_without_thread(
+                    &mcp_config,
+                    auth.as_ref(),
+                    runtime_context,
+                    codex_apps_tools_cache,
+                    tool_catalog_cache,
+                    &server,
+                    &uri,
+                )
+                .await
+                .and_then(|result| serde_json::to_value(result).map_err(anyhow::Error::from));
+                Self::send_mcp_resource_read_response(outgoing, request_id, result).await;
+            })
+            .map_err(|err| {
+                internal_error(format!("MCP resource task admission failed: {err:?}"))
+            })?;
         Ok(())
     }
 
@@ -531,14 +551,17 @@ impl McpRequestProcessor {
         let meta = with_mcp_tool_call_thread_id_meta(params.meta, &thread_id);
         let request_id = request_id.clone();
 
-        tokio::spawn(async move {
-            let result = thread
-                .call_mcp_tool(&params.server, &params.tool, params.arguments, meta)
-                .await
-                .map(McpServerToolCallResponse::from)
-                .map_err(|error| internal_error(format!("{error:#}")));
-            outgoing.send_result(request_id, result).await;
-        });
+        let _ = self
+            .tasks
+            .spawn(async move {
+                let result = thread
+                    .call_mcp_tool(&params.server, &params.tool, params.arguments, meta)
+                    .await
+                    .map(McpServerToolCallResponse::from)
+                    .map_err(|error| internal_error(format!("{error:#}")));
+                outgoing.send_result(request_id, result).await;
+            })
+            .map_err(|err| internal_error(format!("MCP tool task admission failed: {err:?}")))?;
         Ok(())
     }
 }

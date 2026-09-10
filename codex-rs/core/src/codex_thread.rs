@@ -69,6 +69,14 @@ use codex_rollout::state_db::StateDbHandle;
 
 static LIVE_THREADS: Gauge = Gauge::new("core.threads.live");
 
+mod retirement;
+pub use retirement::ThreadCleanupOutcome;
+pub use retirement::ThreadLoopOutcome;
+pub use retirement::ThreadRetirement;
+pub use retirement::ThreadRetirementError;
+pub use retirement::ThreadRetirementReport;
+pub use retirement::ThreadShutdownOutcome;
+
 #[derive(Clone, Debug)]
 pub struct ThreadConfigSnapshot {
     pub model: String,
@@ -195,6 +203,7 @@ pub struct CodexThreadSettingsOverrides {
 }
 
 pub struct CodexThread {
+    retirement: std::sync::Mutex<Option<ThreadRetirement>>,
     pub(crate) session: Arc<Session>,
     pub(crate) io: SessionIo,
     pub(crate) session_source: SessionSource,
@@ -229,6 +238,7 @@ impl CodexThread {
         session_source: SessionSource,
     ) -> Self {
         Self {
+            retirement: std::sync::Mutex::new(None),
             session,
             io,
             session_source,
@@ -421,7 +431,7 @@ impl CodexThread {
             biased;
             result = admission => result
                 .unwrap_or(Err(UserMessageAdmissionError::TaskEndedBeforePersistence)),
-            () = self.io.session_loop_termination.clone() => {
+            _ = self.io.session_loop_termination.clone() => {
                 Err(UserMessageAdmissionError::TaskEndedBeforePersistence)
             },
         }

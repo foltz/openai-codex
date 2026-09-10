@@ -231,6 +231,22 @@ pub fn terminate_process_group(process_group_id: u32) -> io::Result<bool> {
     signal_process_group_id(process_group_id as libc::pid_t, libc::SIGTERM)
 }
 
+/// Observe whether an owned Unix process group still has members without
+/// delivering a signal. Permission/query failures are not absence evidence.
+#[cfg(unix)]
+pub fn process_group_exists(process_group_id: u32) -> io::Result<bool> {
+    let pgid = libc::pid_t::try_from(process_group_id)
+        .ok()
+        .filter(|pgid| *pgid > 0)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid process group ID"))?;
+    match signal_process_group_id(pgid, 0) {
+        // This is positive presence evidence, not a request to fall back
+        // to best-effort member signalling/enumeration.
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok(true),
+        result => result,
+    }
+}
+
 #[cfg(target_os = "macos")]
 /// Retry a denied SIGTERM against the exact group's individual members.
 pub fn terminate_process_group_with_member_fallback(process_group_id: u32) -> io::Result<bool> {

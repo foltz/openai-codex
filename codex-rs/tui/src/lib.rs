@@ -28,6 +28,7 @@ use codex_app_server_client::AppServerClient;
 use codex_app_server_client::DEFAULT_IN_PROCESS_CHANNEL_CAPACITY;
 use codex_app_server_client::InProcessAppServerClient;
 use codex_app_server_client::InProcessClientStartArgs;
+use codex_app_server_client::InProcessHost;
 use codex_app_server_client::RemoteAppServerClient;
 use codex_app_server_client::RemoteAppServerConnectArgs;
 pub use codex_app_server_client::RemoteAppServerEndpoint;
@@ -246,6 +247,7 @@ async fn start_embedded_app_server(
     log_db: Option<log_db::LogDbLayer>,
     state_db: Option<StateDbHandle>,
     environment_manager: Arc<EnvironmentManager>,
+    host: Arc<InProcessHost>,
 ) -> color_eyre::Result<InProcessAppServerClient> {
     start_embedded_app_server_with(
         arg0_paths,
@@ -258,7 +260,7 @@ async fn start_embedded_app_server(
         log_db,
         state_db,
         environment_manager,
-        InProcessAppServerClient::start,
+        move |args| InProcessAppServerClient::start_in_host(Arc::clone(&host), args),
     )
     .await
 }
@@ -469,6 +471,7 @@ async fn start_app_server(
     log_db: Option<log_db::LogDbLayer>,
     state_db: Option<StateDbHandle>,
     environment_manager: Arc<EnvironmentManager>,
+    embedded_host: Option<Arc<InProcessHost>>,
 ) -> color_eyre::Result<AppServerClient> {
     match target {
         AppServerTarget::Embedded => start_embedded_app_server(
@@ -482,6 +485,9 @@ async fn start_app_server(
             log_db,
             state_db,
             environment_manager,
+            embedded_host.ok_or_else(|| {
+                color_eyre::eyre::eyre!("embedded app-server host was not retained")
+            })?,
         )
         .await
         .map(AppServerClient::InProcess),
@@ -497,7 +503,9 @@ pub(crate) async fn start_app_server_for_picker(
     state_db: Option<StateDbHandle>,
     environment_manager: Arc<EnvironmentManager>,
 ) -> color_eyre::Result<AppServerSession> {
-    let app_server = start_app_server(
+    let embedded_host =
+        matches!(target, AppServerTarget::Embedded).then(|| Arc::new(InProcessHost::default()));
+    let app_server_result = start_app_server(
         target,
         Arg0DispatchPaths::default(),
         config.clone(),
@@ -509,8 +517,11 @@ pub(crate) async fn start_app_server_for_picker(
         /*log_db*/ None,
         state_db,
         environment_manager,
+        embedded_host.clone(),
     )
-    .await?;
+    .await;
+    drop(embedded_host);
+    let app_server = app_server_result?;
     Ok(AppServerSession::new(
         app_server,
         target.thread_params_mode(),
@@ -1326,7 +1337,12 @@ async fn run_ratatui_app(
     // Initialize high-fidelity session event logging if enabled.
     session_log::maybe_init(&initial_config);
 
-    let app_server_session = match start_app_server(
+    // Establish host custody before the first cancellable startup await. The
+    // returned client keeps a clone, while this local owner covers startup
+    // cancellation before the facade has been constructed.
+    let embedded_host = matches!(&app_server_target, AppServerTarget::Embedded)
+        .then(|| Arc::new(InProcessHost::default()));
+    let app_server_result = start_app_server(
         &app_server_target,
         arg0_paths.clone(),
         initial_config.clone(),
@@ -1338,9 +1354,11 @@ async fn run_ratatui_app(
         log_db.clone(),
         state_db.clone(),
         environment_manager.clone(),
+        embedded_host.clone(),
     )
-    .await
-    {
+    .await;
+    drop(embedded_host);
+    let app_server_session = match app_server_result {
         Ok(app_server) => AppServerSession::new(app_server, app_server_target.thread_params_mode()),
         Err(err) => {
             terminal_restore_guard.restore_silently();
@@ -1689,31 +1707,37 @@ async fn run_ratatui_app(
     tui.set_alt_screen_enabled(use_alt_screen);
     let mut app_server = match app_server {
         Some(app_server) => app_server,
-        None => match start_app_server(
-            &app_server_target,
-            arg0_paths,
-            config.clone(),
-            cli_kv_overrides.clone(),
-            loader_overrides.clone(),
-            strict_config,
-            cloud_config_bundle.clone(),
-            feedback.clone(),
-            log_db.clone(),
-            state_db.clone(),
-            environment_manager.clone(),
-        )
-        .await
-        {
-            Ok(app_server) => {
-                AppServerSession::new(app_server, app_server_target.thread_params_mode())
-                    .with_remote_cwd_override(remote_cwd_override.clone())
+        None => {
+            let embedded_host = matches!(&app_server_target, AppServerTarget::Embedded)
+                .then(|| Arc::new(InProcessHost::default()));
+            let app_server_result = start_app_server(
+                &app_server_target,
+                arg0_paths,
+                config.clone(),
+                cli_kv_overrides.clone(),
+                loader_overrides.clone(),
+                strict_config,
+                cloud_config_bundle.clone(),
+                feedback.clone(),
+                log_db.clone(),
+                state_db.clone(),
+                environment_manager.clone(),
+                embedded_host.clone(),
+            )
+            .await;
+            drop(embedded_host);
+            match app_server_result {
+                Ok(app_server) => {
+                    AppServerSession::new(app_server, app_server_target.thread_params_mode())
+                        .with_remote_cwd_override(remote_cwd_override.clone())
+                }
+                Err(err) => {
+                    terminal_restore_guard.restore_silently();
+                    session_log::log_session_end();
+                    return Err(err);
+                }
             }
-            Err(err) => {
-                terminal_restore_guard.restore_silently();
-                session_log::log_session_end();
-                return Err(err);
-            }
-        },
+        }
     };
 
     // Persistent app-server resumes may attach to an already-running thread,
@@ -2169,6 +2193,7 @@ mod tests {
             /*log_db*/ None,
             state_db,
             Arc::new(EnvironmentManager::default_for_tests()),
+            Arc::new(InProcessHost::default()),
         )
         .await
     }

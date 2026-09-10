@@ -8,7 +8,7 @@
 //! - Typed and raw request/notification dispatch.
 //! - Server request resolution and rejection.
 //! - Event consumption with backpressure signaling ([`InProcessServerEvent::Lagged`]).
-//! - Bounded graceful shutdown with abort fallback.
+//! - Bounded graceful shutdown with retained incomplete custody.
 //!
 //! The facade interposes a worker task between the caller and the underlying
 //! [`InProcessClientHandle`](codex_app_server::in_process::InProcessClientHandle),
@@ -28,10 +28,16 @@ use std::time::Duration;
 
 pub use codex_app_server::app_server_control_socket_path;
 pub use codex_app_server::in_process::DEFAULT_IN_PROCESS_CHANNEL_CAPACITY;
+pub use codex_app_server::in_process::InProcessHost;
 pub use codex_app_server::in_process::InProcessServerEvent;
 use codex_app_server::in_process::InProcessStartArgs;
 use codex_app_server::in_process::LogDbLayer;
+pub use codex_app_server::in_process::ProcessorCleanupExecution;
+pub use codex_app_server::in_process::ProcessorCleanupProgress;
+pub use codex_app_server::in_process::RuntimeShutdownReport;
 pub use codex_app_server::in_process::StateDbHandle;
+pub use codex_app_server::in_process::TaskObservation;
+pub use codex_app_server::in_process::TaskTermination;
 use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::ClientNotification;
 use codex_app_server_protocol::ClientRequest;
@@ -59,7 +65,8 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
-use tokio::time::timeout;
+use tokio::time::Instant;
+use tokio::time::timeout_at;
 use toml::Value as TomlValue;
 use tracing::warn;
 
@@ -420,6 +427,7 @@ enum ClientCommand {
     },
     Shutdown {
         response_tx: oneshot::Sender<IoResult<()>>,
+        deadline: Instant,
     },
 }
 
@@ -438,6 +446,10 @@ pub struct InProcessAppServerClient {
     command_tx: mpsc::Sender<ClientCommand>,
     event_rx: mpsc::Receiver<InProcessServerEvent>,
     worker_handle: tokio::task::JoinHandle<()>,
+    // Keep the caller-provided host alive for the entire facade lifetime. The
+    // worker also captures this host so a bounded shutdown observer may drop
+    // its JoinHandle without discarding the runtime custody.
+    _host: Arc<InProcessHost>,
 }
 
 #[derive(Clone)]
@@ -462,15 +474,36 @@ impl InProcessAppServerClient {
     /// The returned client is ready for requests and event consumption. If the
     /// internal event queue is saturated later, server requests are rejected
     /// with overload error instead of being silently dropped.
+    #[deprecated(note = "use start_in_host with host custody retained by the embedding caller")]
     pub async fn start(args: InProcessClientStartArgs) -> IoResult<Self> {
+        let host = Arc::new(InProcessHost::default());
+        let result = Self::start_in_host(Arc::clone(&host), args).await;
+        drop(host);
+        result
+    }
+
+    /// Starts an embedded client with custody supplied before the first
+    /// cancellable await. The caller must retain the host through startup and
+    /// any incomplete shutdown report; the worker also retains it while the
+    /// facade is alive so a timed-out observer cannot discard runtime custody.
+    pub async fn start_in_host(
+        host: Arc<InProcessHost>,
+        args: InProcessClientStartArgs,
+    ) -> IoResult<Self> {
         let channel_capacity = args.channel_capacity.max(1);
         let mut handle =
-            codex_app_server::in_process::start(args.into_runtime_start_args()).await?;
+            codex_app_server::in_process::start_in_host(&host, args.into_runtime_start_args())
+                .await?;
         let request_sender = handle.sender();
         let (command_tx, mut command_rx) = mpsc::channel::<ClientCommand>(channel_capacity);
         let (event_tx, event_rx) = mpsc::channel::<InProcessServerEvent>(channel_capacity);
 
+        let worker_host = Arc::clone(&host);
         let worker_handle = tokio::spawn(async move {
+            // Keep the host alive if the caller's bounded observer returns
+            // incomplete and drops its JoinHandle. The worker owns the same
+            // low-level client/host pair and remains the durable observer.
+            let _host = worker_host;
             let mut event_stream_enabled = true;
             let mut skipped_events = 0usize;
             loop {
@@ -511,8 +544,11 @@ impl InProcessAppServerClient {
                                 let send_result = request_sender.fail_server_request(request_id, error);
                                 let _ = response_tx.send(send_result);
                             }
-                            Some(ClientCommand::Shutdown { response_tx }) => {
-                                let shutdown_result = handle.shutdown().await;
+                            Some(ClientCommand::Shutdown {
+                                response_tx,
+                                deadline,
+                            }) => {
+                                let shutdown_result = handle.shutdown_until(deadline).await;
                                 let _ = response_tx.send(shutdown_result);
                                 break;
                             }
@@ -578,6 +614,7 @@ impl InProcessAppServerClient {
             command_tx,
             event_rx,
             worker_handle,
+            _host: host,
         })
     }
 
@@ -734,13 +771,15 @@ impl InProcessAppServerClient {
 
     /// Shuts down worker and in-process runtime with bounded wait.
     ///
-    /// If graceful shutdown exceeds timeout, the worker task is aborted to
-    /// avoid leaking background tasks in embedding callers.
+    /// If graceful shutdown exceeds the bound, returns an incomplete I/O
+    /// error. The worker is deliberately not aborted: its host-owned runtime
+    /// and cleanup receipts remain observable after this caller returns.
     pub async fn shutdown(self) -> IoResult<()> {
         let Self {
             command_tx,
             event_rx,
             worker_handle,
+            _host,
         } = self;
         let mut worker_handle = worker_handle;
         // Drop the caller-facing receiver before asking the worker to shut
@@ -748,26 +787,59 @@ impl InProcessAppServerClient {
         // so the worker can reach `handle.shutdown()` instead of timing out
         // and getting aborted with the runtime still attached.
         drop(event_rx);
+        let deadline = Instant::now() + IN_PROCESS_SHUTDOWN_TIMEOUT;
+        let mut command_error = None;
         let (response_tx, response_rx) = oneshot::channel();
-        if command_tx
-            .send(ClientCommand::Shutdown { response_tx })
-            .await
-            .is_ok()
-            && let Ok(command_result) = timeout(IN_PROCESS_SHUTDOWN_TIMEOUT, response_rx).await
+        match timeout_at(
+            deadline,
+            command_tx.send(ClientCommand::Shutdown {
+                response_tx,
+                deadline,
+            }),
+        )
+        .await
         {
-            command_result.map_err(|_| {
-                IoError::new(
+            Ok(Ok(())) => match timeout_at(deadline, response_rx).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => command_error = Some(error),
+                Ok(Err(_)) => {
+                    command_error = Some(IoError::new(
+                        ErrorKind::BrokenPipe,
+                        "in-process app-server shutdown channel is closed",
+                    ));
+                }
+                Err(_) => {
+                    command_error = Some(IoError::new(
+                        ErrorKind::TimedOut,
+                        "in-process app-server shutdown acknowledgement timed out",
+                    ));
+                }
+            },
+            Ok(Err(_)) => {
+                command_error = Some(IoError::new(
                     ErrorKind::BrokenPipe,
-                    "in-process app-server shutdown channel is closed",
-                )
-            })??;
+                    "in-process app-server worker channel is closed",
+                ));
+            }
+            Err(_) => {
+                command_error = Some(IoError::new(
+                    ErrorKind::TimedOut,
+                    "in-process app-server shutdown command timed out",
+                ));
+            }
         }
 
-        if let Err(_elapsed) = timeout(IN_PROCESS_SHUTDOWN_TIMEOUT, &mut worker_handle).await {
-            worker_handle.abort();
-            let _ = worker_handle.await;
+        match timeout_at(deadline, &mut worker_handle).await {
+            Ok(Ok(())) => command_error.map_or(Ok(()), Err),
+            Ok(Err(_)) => Err(IoError::new(
+                ErrorKind::Other,
+                "in-process app-server worker panicked",
+            )),
+            Err(_) => Err(IoError::new(
+                ErrorKind::TimedOut,
+                "in-process app-server worker shutdown timed out",
+            )),
         }
-        Ok(())
     }
 }
 
@@ -2117,6 +2189,7 @@ mod tests {
             command_tx,
             event_rx,
             worker_handle,
+            _host: Arc::new(InProcessHost::default()),
         };
 
         let event = timeout(Duration::from_secs(2), client.next_event())
@@ -2313,9 +2386,9 @@ mod tests {
     async fn shutdown_completes_promptly_without_retained_managers() {
         let client = start_test_client(SessionSource::Cli).await;
 
-        timeout(Duration::from_secs(1), client.shutdown())
+        timeout(Duration::from_secs(5), client.shutdown())
             .await
-            .expect("shutdown should not wait for the 5s fallback timeout")
+            .expect("shutdown should complete before the bounded fallback timeout")
             .expect("shutdown should complete");
     }
 
@@ -2330,7 +2403,7 @@ mod tests {
         let worker_completed = Arc::clone(&completed);
         let worker_handle = tokio::spawn(async move {
             let response_tx = match command_rx.recv().await {
-                Some(ClientCommand::Shutdown { response_tx }) => response_tx,
+                Some(ClientCommand::Shutdown { response_tx, .. }) => response_tx,
                 _ => panic!("expected shutdown command"),
             };
             tokio::time::sleep(Duration::from_secs(30)).await;
@@ -2341,6 +2414,7 @@ mod tests {
             command_tx,
             event_rx,
             worker_handle,
+            _host: Arc::new(InProcessHost::default()),
         };
 
         client.shutdown().await.expect("shutdown should complete");

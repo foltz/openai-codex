@@ -10,6 +10,7 @@ use tracing::Instrument;
 use tracing::debug_span;
 use tracing::info_span;
 
+use crate::session::SessionLoopOutcome;
 use crate::session::SteerInputError;
 use crate::session::TurnInput;
 use crate::session::session::Session;
@@ -584,12 +585,33 @@ pub async fn set_thread_memory_mode(sess: &Arc<Session>, sub_id: String, mode: T
     }
 }
 
-async fn shutdown_session_runtime(sess: &Arc<Session>) {
+async fn shutdown_session_runtime(
+    sess: &Arc<Session>,
+    mode: super::retirement::CleanupMode,
+) -> Option<super::retirement::CleanupExecution> {
+    let mut failure = None;
+    sess.close_task_admission().await;
     if let Some(startup_prewarm) = sess.take_session_startup_prewarm().await {
         startup_prewarm.abort().await;
     }
-    let _ = sess.conversation.shutdown().await;
+    if let Err(error) = sess.conversation.shutdown().await {
+        warn!("failed to shutdown realtime conversation: {error}");
+        failure = Some(super::retirement::CleanupExecution::ConversationShutdownFailed);
+    }
     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+    if let super::retirement::CleanupMode::Legacy = mode {
+        let task_result = sess
+            .task_joins
+            .shutdown_until(tokio::time::Instant::now() + std::time::Duration::from_secs(30))
+            .await;
+        if !matches!(task_result, crate::tasks::TaskJoinOutcome::Complete { .. }) {
+            failure.get_or_insert(super::retirement::CleanupExecution::TaskJoinFailed);
+            warn!(
+                ?task_result,
+                "session task joins were not observed during legacy cleanup"
+            );
+        }
+    }
     sess.hooks().shutdown().await;
     sess.async_hook_results.close();
     while sess.async_hook_results.try_recv().is_ok() {}
@@ -599,16 +621,32 @@ async fn shutdown_session_runtime(sess: &Arc<Session>) {
         .await;
     if let Err(err) = sess.services.code_mode_service.shutdown().await {
         warn!("failed to shutdown code mode session: {err}");
+        failure.get_or_insert(super::retirement::CleanupExecution::CodeModeShutdownFailed);
     }
-    sess.stop_mcp_prewarm_worker().await;
-    {
+    let prewarm_outcome = sess.stop_mcp_prewarm_worker().await;
+    if prewarm_outcome != SessionLoopOutcome::Normal {
+        warn!(?prewarm_outcome, "MCP prewarm worker stopped unexpectedly");
+    }
+    if let super::retirement::CleanupMode::Legacy = mode {
         let _refresh = sess.mcp_refresh.acquire().await;
         sess.mcp_refresh.close();
-        sess.services.mcp_runtime.shutdown().await;
+        let report = sess
+            .services
+            .mcp_runtime
+            .shutdown_until(tokio::time::Instant::now() + std::time::Duration::from_secs(30))
+            .await;
+        if !report.is_complete() {
+            warn!(
+                ?report,
+                "MCP runtime retirement was not acknowledged during legacy cleanup"
+            );
+            failure.get_or_insert(super::retirement::CleanupExecution::McpFailed);
+        }
     }
     sess.guardian_review_session.shutdown().await;
 
     crate::hook_runtime::run_session_end_hooks(sess).await;
+    failure
 }
 
 async fn emit_thread_stop_lifecycle(sess: &Session) {
@@ -622,8 +660,11 @@ async fn emit_thread_stop_lifecycle(sess: &Session) {
     }
 }
 
-pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
-    shutdown_session_runtime(sess).await;
+pub(super) async fn cleanup_session(
+    sess: &Arc<Session>,
+    mode: super::retirement::CleanupMode,
+) -> super::retirement::CleanupExecution {
+    let failure = shutdown_session_runtime(sess, mode).await;
     info!("Shutting down Codex instance");
     let history = sess.clone_history().await;
     let turn_count = history
@@ -636,15 +677,42 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
         i64::try_from(turn_count).unwrap_or(0),
         &[],
     );
-
     emit_thread_stop_lifecycle(sess.as_ref()).await;
+    let persistence_failed = if let Some(live_thread) = sess.live_thread()
+        && let Err(error) = live_thread.shutdown().await
+    {
+        warn!("failed to shutdown thread persistence: {error}");
+        true
+    } else {
+        false
+    };
+    failure.unwrap_or(super::retirement::CleanupExecution::Finished { persistence_failed })
+}
 
+pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
+    let cleanup = sess.cleanup_owner().observe(Arc::clone(sess)).await;
+    let persistence_failed = match cleanup {
+        super::retirement::CleanupExecution::Finished { persistence_failed } => persistence_failed,
+        super::retirement::CleanupExecution::Panicked => {
+            // Preserve panic disposition independently of the sticky receipt.
+            std::panic::resume_unwind(Box::new("session cleanup panicked"));
+        }
+        super::retirement::CleanupExecution::TimedOut
+        | super::retirement::CleanupExecution::McpFailed
+        | super::retirement::CleanupExecution::TaskJoinFailed
+        | super::retirement::CleanupExecution::ConversationShutdownFailed
+        | super::retirement::CleanupExecution::CodeModeShutdownFailed
+        | super::retirement::CleanupExecution::AuthorityUnavailable => {
+            warn!(
+                ?cleanup,
+                "session cleanup not observed; withholding ShutdownComplete"
+            );
+            return true;
+        }
+    };
     // Gracefully flush and shutdown thread persistence on session end so tests
     // that inspect durable state do not race with the background writer.
-    if let Some(live_thread) = sess.live_thread()
-        && let Err(e) = live_thread.shutdown().await
-    {
-        warn!("failed to shutdown thread persistence: {e}");
+    if persistence_failed {
         let event = Event {
             id: sub_id.clone(),
             msg: EventMsg::Error(ErrorEvent {
@@ -707,10 +775,15 @@ pub(super) async fn submission_loop(
     sess: Arc<Session>,
     config: Arc<Config>,
     rx_sub: Receiver<Submission>,
+    submissions: Option<super::submission::SubmissionDispatch>,
 ) {
     // To break out of this loop, send Op::Shutdown.
+    let _cleanup_owner = sess.cleanup_owner();
     let mut shutdown_received = false;
     while let Ok(sub) = rx_sub.recv().await {
+        let _dispatch = submissions
+            .as_ref()
+            .map(super::submission::SubmissionDispatch::begin);
         debug!(?sub, "Submission");
         let dispatch_span = submission_dispatch_span(&sub);
         let should_exit = async {
@@ -864,12 +937,19 @@ pub(super) async fn submission_loop(
     // If the submission loop exits because the channel closed without an
     // explicit shutdown op, still run session teardown.
     if !shutdown_received {
-        shutdown_session_runtime(&sess).await;
-        emit_thread_stop_lifecycle(sess.as_ref()).await;
-        if let Some(live_thread) = sess.live_thread()
-            && let Err(err) = live_thread.shutdown().await
+        let cleanup = sess.cleanup_owner().observe(Arc::clone(&sess)).await;
+        if cleanup == super::retirement::CleanupExecution::Panicked {
+            std::panic::resume_unwind(Box::new("session cleanup panicked"));
+        }
+        if cleanup
+            != (super::retirement::CleanupExecution::Finished {
+                persistence_failed: false,
+            })
         {
-            warn!("failed to shutdown thread persistence after submission channel closed: {err}");
+            warn!(
+                ?cleanup,
+                "session cleanup failed after submission channel closed"
+            );
         }
     }
     debug!("Agent loop exited");

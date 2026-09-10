@@ -27,7 +27,6 @@ use std::sync::atomic::Ordering;
 use std::thread::sleep;
 #[cfg(unix)]
 use std::thread::spawn;
-#[cfg(unix)]
 use std::time::Duration;
 
 use anyhow::Result;
@@ -37,6 +36,8 @@ use codex_exec_server::ExecBackend;
 use codex_exec_server::ExecEnvPolicy;
 use codex_exec_server::ExecParams;
 use codex_exec_server::ExecProcess;
+use codex_exec_server::ExecProcessEvent;
+use codex_exec_server::ExecProcessEventReceiver;
 use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
 use codex_utils_path_uri::LegacyAppPathString;
 use codex_utils_path_uri::PathUri;
@@ -54,14 +55,17 @@ use rmcp::service::RoleClient;
 use rmcp::service::RxJsonRpcMessage;
 use rmcp::service::TxJsonRpcMessage;
 use rmcp::transport::Transport;
-use rmcp::transport::child_process::TokioChildProcess;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
 use tokio::process::Command;
+use tokio::sync::broadcast;
+use tokio::time::Instant;
 use tracing::info;
 use tracing::warn;
 
 use crate::executor_process_transport::ExecutorProcessTransport;
+use crate::local_stdio_transport::LegacyLocalStdioTransport;
+use crate::local_stdio_transport::LocalProcessExitObserver;
 use crate::local_stdio_transport::LocalStdioTransport;
 use crate::program_resolver;
 use crate::protocol_mode::McpProtocolMode;
@@ -107,7 +111,7 @@ pub struct StdioServerTransport {
 }
 
 enum StdioServerTransportInner {
-    LocalLegacy(TokioChildProcess),
+    LocalLegacy(LegacyLocalStdioTransport),
     LocalModern(LocalStdioTransport),
     Executor(ExecutorProcessTransport),
 }
@@ -141,11 +145,17 @@ impl Transport<RoleClient> for StdioServerTransport {
     }
 
     async fn close(&mut self) -> std::result::Result<(), Self::Error> {
+        // Preserve termination-first ordering: a sender can hold the input
+        // mutex while blocked on a child that no longer reads its pipe.
+        // Waiting for that mutex before terminating would bypass the deadline.
         self.process.terminate().await?;
         match &mut self.inner {
             StdioServerTransportInner::LocalLegacy(transport) => transport.close().await,
             StdioServerTransportInner::LocalModern(transport) => transport.close().await,
-            StdioServerTransportInner::Executor(transport) => transport.close().await,
+            StdioServerTransportInner::Executor(transport) => {
+                transport.mark_closed_after_terminal_observation();
+                Ok(())
+            }
         }
     }
 }
@@ -222,6 +232,8 @@ impl StdioServerLauncher for LocalStdioServerLauncher {
 #[cfg(unix)]
 const PROCESS_GROUP_TERM_GRACE_PERIOD: Duration = Duration::from_secs(2);
 
+pub(super) const PROCESS_RETIREMENT_TIMEOUT: Duration = Duration::from_secs(3);
+
 #[cfg(unix)]
 struct LocalProcessTerminator {
     process_group_id: u32,
@@ -244,11 +256,15 @@ pub(crate) struct StdioServerProcessHandle {
 struct StdioServerProcessHandleInner {
     program_name: String,
     kind: StdioServerProcessKind,
-    terminated: AtomicBool,
+    terminal_observed: AtomicBool,
+    termination_lock: tokio::sync::Mutex<()>,
 }
 
 enum StdioServerProcessKind {
-    Local(Option<LocalProcessTerminator>),
+    Local {
+        terminator: Option<LocalProcessTerminator>,
+        exit_observer: LocalProcessExitObserver,
+    },
     Executor(Arc<dyn ExecProcess>),
 }
 
@@ -311,40 +327,43 @@ impl LocalStdioServerLauncher {
             StdioServerTransportInner,
             Option<tokio::process::ChildStderr>,
             Option<u32>,
+            LocalProcessExitObserver,
         )> {
             match protocol_mode {
                 McpProtocolMode::Legacy => {
-                    let (transport, stderr) = TokioChildProcess::builder(command)
-                        .stderr(Stdio::piped())
-                        .spawn()?;
+                    let (transport, stderr) = LegacyLocalStdioTransport::spawn(command)?;
                     let process_id = transport.id();
+                    let exit_observer = transport.exit_observer();
                     Ok((
                         StdioServerTransportInner::LocalLegacy(transport),
                         stderr,
                         process_id,
+                        exit_observer,
                     ))
                 }
                 McpProtocolMode::V20260728 => {
                     let (transport, stderr) =
                         LocalStdioTransport::spawn(command, program_name.clone())?;
                     let process_id = transport.id();
+                    let exit_observer = transport.exit_observer();
                     Ok((
                         StdioServerTransportInner::LocalModern(transport),
                         stderr,
                         process_id,
+                        exit_observer,
                     ))
                 }
             }
         };
-        let (transport, stderr, process_id) = spawn_transport(command)?;
+        let (transport, stderr, process_id, exit_observer) = spawn_transport(command)?;
         #[cfg(windows)]
-        let (transport, stderr, process_id, job) = match job {
+        let (transport, stderr, process_id, exit_observer, job) = match job {
             Some(job) => match process_id
                 .ok_or_else(|| io::Error::other("missing suspended MCP server process id"))
                 .and_then(|process_id| job.assign_and_resume_process(process_id))
             {
-                Ok(true) => (transport, stderr, process_id, Some(job)),
-                Ok(false) => (transport, stderr, process_id, None),
+                Ok(true) => (transport, stderr, process_id, exit_observer, Some(job)),
+                Ok(false) => (transport, stderr, process_id, exit_observer, None),
                 Err(error) => {
                     warn!(
                         "Windows MCP process job containment failed; retrying without it: {error}"
@@ -352,11 +371,12 @@ impl LocalStdioServerLauncher {
                     drop(stderr);
                     drop(transport);
                     drop(job);
-                    let (transport, stderr, process_id) = spawn_transport(build_command())?;
-                    (transport, stderr, process_id, None)
+                    let (transport, stderr, process_id, exit_observer) =
+                        spawn_transport(build_command())?;
+                    (transport, stderr, process_id, exit_observer, None)
                 }
             },
-            None => (transport, stderr, process_id, None),
+            None => (transport, stderr, process_id, exit_observer, None),
         };
         #[cfg(windows)]
         let terminator = match job {
@@ -373,7 +393,8 @@ impl LocalStdioServerLauncher {
         };
         #[cfg(not(windows))]
         let terminator = process_id.map(LocalProcessTerminator::new);
-        let process = StdioServerProcessHandle::local(program_name.clone(), terminator);
+        let process =
+            StdioServerProcessHandle::local(program_name.clone(), terminator, exit_observer);
 
         if let Some(stderr) = stderr {
             tokio::spawn(async move {
@@ -401,6 +422,51 @@ impl LocalStdioServerLauncher {
 }
 
 impl LocalProcessTerminator {
+    /// Unlike Drop's best-effort signal, explicit retirement observes the
+    /// complete existing process-group/job obligation before returning.
+    async fn terminate_and_observe(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            terminate_process_group(self.process_group_id)?;
+            let escalation_at = tokio::time::Instant::now() + PROCESS_GROUP_TERM_GRACE_PERIOD;
+            let mut escalated = false;
+            while codex_utils_pty::process_group::process_group_exists(self.process_group_id)? {
+                if !escalated && tokio::time::Instant::now() >= escalation_at {
+                    kill_process_group(self.process_group_id)?;
+                    escalated = true;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Ok(())
+        }
+        #[cfg(windows)]
+        {
+            match self {
+                Self::Job(job) => {
+                    job.terminate()?;
+                    while job.has_active_processes()? {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Ok(())
+                }
+                Self::Process(handle) => {
+                    codex_utils_pty::JobObject::terminate_process_handle(handle)?;
+                    Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "MCP process lacks job-level terminal evidence",
+                    ))
+                }
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "MCP process-group observation is unsupported",
+            ))
+        }
+    }
+
     #[cfg(not(windows))]
     fn new(process_group_id: u32) -> Self {
         #[cfg(unix)]
@@ -452,12 +518,20 @@ impl LocalProcessTerminator {
 }
 
 impl StdioServerProcessHandle {
-    fn local(program_name: String, terminator: Option<LocalProcessTerminator>) -> Self {
+    fn local(
+        program_name: String,
+        terminator: Option<LocalProcessTerminator>,
+        exit_observer: LocalProcessExitObserver,
+    ) -> Self {
         Self {
             inner: Arc::new(StdioServerProcessHandleInner {
                 program_name,
-                kind: StdioServerProcessKind::Local(terminator),
-                terminated: AtomicBool::new(false),
+                kind: StdioServerProcessKind::Local {
+                    terminator,
+                    exit_observer,
+                },
+                terminal_observed: AtomicBool::new(false),
+                termination_lock: tokio::sync::Mutex::new(()),
             }),
         }
     }
@@ -467,44 +541,132 @@ impl StdioServerProcessHandle {
             inner: Arc::new(StdioServerProcessHandleInner {
                 program_name,
                 kind: StdioServerProcessKind::Executor(process),
-                terminated: AtomicBool::new(false),
+                terminal_observed: AtomicBool::new(false),
+                termination_lock: tokio::sync::Mutex::new(()),
             }),
         }
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the async attempt lock serializes bounded termination observations, not shared runtime state"
+    )]
     pub(crate) async fn terminate(&self) -> io::Result<()> {
-        if self.inner.terminated.swap(true, Ordering::AcqRel) {
+        self.terminate_until(tokio::time::Instant::now() + PROCESS_RETIREMENT_TIMEOUT)
+            .await
+    }
+
+    /// Terminates and observes the process using the caller's absolute
+    /// deadline. Retirements with an existing bound must not mint a nested
+    /// three-second budget here.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the async attempt lock serializes bounded termination observations, not shared runtime state"
+    )]
+    pub(crate) async fn terminate_until(&self, deadline: Instant) -> io::Result<()> {
+        if self.inner.terminal_observed.load(Ordering::Acquire) {
             return Ok(());
         }
-
+        let _attempt = tokio::time::timeout_at(deadline, self.inner.termination_lock.lock())
+            .await
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "MCP retirement lock timed out")
+            })?;
+        if self.inner.terminal_observed.load(Ordering::Acquire) {
+            return Ok(());
+        }
         match &self.inner.kind {
-            StdioServerProcessKind::Local(Some(terminator)) => {
-                terminator.terminate();
+            StdioServerProcessKind::Local {
+                terminator,
+                exit_observer,
+            } => {
+                let Some(terminator) = terminator else {
+                    exit_observer.abort();
+                    return Err(io::Error::other(
+                        "local MCP process has no process-group terminal evidence",
+                    ));
+                };
+                let mut exit_observer = exit_observer.clone();
+                tokio::time::timeout_at(deadline, async {
+                    tokio::try_join!(exit_observer.wait(), terminator.terminate_and_observe())?;
+                    Ok::<(), io::Error>(())
+                })
+                .await
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::TimedOut, "local MCP exit timed out")
+                })??;
+                self.inner.terminal_observed.store(true, Ordering::Release);
                 Ok(())
             }
-            StdioServerProcessKind::Local(None) => Ok(()),
-            StdioServerProcessKind::Executor(process) => match process.terminate().await {
-                Ok(()) => Ok(()),
-                Err(error) => {
-                    self.inner.terminated.store(false, Ordering::Release);
-                    Err(io::Error::other(error))
-                }
-            },
+            StdioServerProcessKind::Executor(process) => {
+                // Subscribe before the request so a quickly-closing process is
+                // observed through replay rather than mistaken request acceptance.
+                let mut events = process.subscribe_events();
+                // A previous cancelled/failed attempt is not terminal proof.
+                // Resend the idempotent request; successful observation is
+                // retained by this handle independently of bounded replay.
+                tokio::time::timeout_at(deadline, async {
+                    process.terminate().await.map_err(io::Error::other)?;
+                    await_executor_process_close(&mut events).await
+                })
+                .await
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::TimedOut, "executor MCP close timed out")
+                })??;
+                self.inner.terminal_observed.store(true, Ordering::Release);
+                Ok(())
+            }
         }
+    }
+}
+
+async fn await_executor_process_close(events: &mut ExecProcessEventReceiver) -> io::Result<()> {
+    loop {
+        if executor_event_proves_close(events.recv().await)? {
+            return Ok(());
+        }
+    }
+}
+
+fn executor_event_proves_close(
+    event: Result<ExecProcessEvent, broadcast::error::RecvError>,
+) -> io::Result<bool> {
+    match event {
+        Ok(ExecProcessEvent::Closed { .. }) => Ok(true),
+        // Exit alone does not prove the output stream has finished. Wait
+        // for Closed so stdout cannot still contain an MCP response.
+        Ok(ExecProcessEvent::Exited { .. } | ExecProcessEvent::Output(_)) => Ok(false),
+        Ok(ExecProcessEvent::Failed(message)) => Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            format!("executor MCP event stream failed before close: {message}"),
+        )),
+        Err(broadcast::error::RecvError::Lagged(count)) => Err(io::Error::other(format!(
+            "executor MCP event stream lagged by {count} events before close"
+        ))),
+        Err(broadcast::error::RecvError::Closed) => Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "executor MCP event stream closed before process close",
+        )),
     }
 }
 
 impl Drop for StdioServerProcessHandleInner {
     fn drop(&mut self) {
-        if self.terminated.swap(true, Ordering::AcqRel) {
+        if self.terminal_observed.load(Ordering::Acquire) {
             return;
         }
 
         match &self.kind {
-            StdioServerProcessKind::Local(Some(terminator)) => {
+            StdioServerProcessKind::Local {
+                terminator: Some(terminator),
+                ..
+            } => {
                 terminator.terminate();
             }
-            StdioServerProcessKind::Local(None) => {}
+            StdioServerProcessKind::Local {
+                terminator: None,
+                exit_observer,
+            } => exit_observer.abort(),
             StdioServerProcessKind::Executor(process) => {
                 let process = Arc::clone(process);
                 let program_name = self.program_name.clone();
@@ -690,11 +852,231 @@ impl ExecutorStdioServerLauncher {
 }
 
 #[cfg(test)]
+#[path = "stdio_server_launcher_tests.rs"]
+mod executor_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use codex_protocol::config_types::EnvironmentVariablePattern;
     use codex_protocol::config_types::ShellEnvironmentPolicy;
     use codex_protocol::shell_environment;
+
+    struct NeverClosedProcess {
+        id: codex_exec_server::ProcessId,
+        requests: std::sync::atomic::AtomicUsize,
+        pending_request: bool,
+    }
+
+    impl ExecProcess for NeverClosedProcess {
+        fn process_id(&self) -> &codex_exec_server::ProcessId {
+            &self.id
+        }
+        fn subscribe_wake(&self) -> tokio::sync::watch::Receiver<u64> {
+            tokio::sync::watch::channel(0).1
+        }
+        fn subscribe_events(&self) -> ExecProcessEventReceiver {
+            ExecProcessEventReceiver::empty()
+        }
+        fn read(
+            &self,
+            _: Option<u64>,
+            _: Option<usize>,
+            _: Option<u64>,
+        ) -> codex_exec_server::ExecProcessFuture<'_, codex_exec_server::ReadResponse> {
+            Box::pin(async { unreachable!("retirement observes events, not output reads") })
+        }
+        fn write(
+            &self,
+            _: Vec<u8>,
+        ) -> codex_exec_server::ExecProcessFuture<'_, codex_exec_server::WriteResponse> {
+            Box::pin(async { unreachable!("retirement never writes input") })
+        }
+        fn signal(
+            &self,
+            _: codex_exec_server::ProcessSignal,
+        ) -> codex_exec_server::ExecProcessFuture<'_, ()> {
+            Box::pin(async { unreachable!("retirement uses terminate") })
+        }
+        fn terminate(&self) -> codex_exec_server::ExecProcessFuture<'_, ()> {
+            self.requests.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async {
+                if self.pending_request {
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn executor_request_and_terminal_wait_are_bounded_and_timeout_is_retryable() {
+        for pending_request in [false, true] {
+            let process = Arc::new(NeverClosedProcess {
+                id: "never-closed".into(),
+                requests: std::sync::atomic::AtomicUsize::new(0),
+                pending_request,
+            });
+            let handle = StdioServerProcessHandle::executor("test".to_owned(), process.clone());
+            for attempt in 1..=2 {
+                let start = tokio::time::Instant::now();
+                assert_eq!(
+                    handle.terminate().await.unwrap_err().kind(),
+                    io::ErrorKind::TimedOut
+                );
+                assert_eq!(start.elapsed(), PROCESS_RETIREMENT_TIMEOUT);
+                assert_eq!(process.requests.load(Ordering::Relaxed), attempt);
+                assert!(!handle.inner.terminal_observed.load(Ordering::Acquire));
+            }
+        }
+    }
+
+    #[test]
+    fn executor_terminal_evidence_never_accepts_exit_failure_or_lost_events() {
+        assert!(executor_event_proves_close(Ok(ExecProcessEvent::Closed { seq: 2 })).unwrap());
+        assert!(
+            !executor_event_proves_close(Ok(ExecProcessEvent::Exited {
+                seq: 1,
+                exit_code: 0,
+                sandbox_denied: None
+            }))
+            .unwrap()
+        );
+        for event in [
+            Ok(ExecProcessEvent::Failed("lost transport".to_owned())),
+            Err(broadcast::error::RecvError::Lagged(1)),
+            Err(broadcast::error::RecvError::Closed),
+        ] {
+            assert!(executor_event_proves_close(event).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_close_terminates_before_waiting_for_a_pipe_blocked_sender() {
+        for protocol_mode in [McpProtocolMode::Legacy, McpProtocolMode::V20260728] {
+            let home = tempfile::tempdir().unwrap();
+            let launcher = LocalStdioServerLauncher::new(home.path().to_path_buf());
+            let command = StdioServerCommand::new(
+                "sleep".into(),
+                vec!["30".into()],
+                None,
+                Vec::new(),
+                None,
+                protocol_mode,
+            );
+            let mut transport = launcher.launch(command).await.unwrap();
+            let message: TxJsonRpcMessage<RoleClient> = serde_json::from_value(serde_json::json!({
+                "jsonrpc":"2.0", "id":1, "method":"ping",
+                "params":{"_meta":{"padding":"x".repeat(1024 * 1024)}}
+            }))
+            .unwrap();
+            assert!(serde_json::to_vec(&message).unwrap().len() > 1024 * 1024);
+            let mut sender = tokio::spawn(transport.send(message));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), &mut sender)
+                    .await
+                    .is_err(),
+                "the child must actually leave the pipe writer blocked"
+            );
+            let closed = tokio::time::timeout(
+                PROCESS_RETIREMENT_TIMEOUT + Duration::from_secs(1),
+                transport.close(),
+            )
+            .await;
+            // Cleanup also runs when the old close-input-first regression is
+            // reintroduced, so this negative control cannot strand its child.
+            transport.process_handle().terminate().await.unwrap();
+            sender
+                .await
+                .unwrap()
+                .expect_err("the dead child's pipe must reject the pending write");
+            assert!(
+                closed.is_ok(),
+                "input lock acquisition must not precede bounded process termination"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn missing_local_group_terminator_never_claims_retirement() {
+        let mut command = tokio::process::Command::new("sleep");
+        command.arg("30").kill_on_drop(true);
+        let (transport, _) = LocalStdioTransport::spawn(command, "test".to_owned()).unwrap();
+        let handle =
+            StdioServerProcessHandle::local("test".to_owned(), None, transport.exit_observer());
+        for _ in 0..2 {
+            assert!(handle.terminate().await.is_err());
+            assert!(!handle.inner.terminal_observed.load(Ordering::Acquire));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_retirement_waits_for_term_ignoring_descendant_and_is_repeatable() {
+        for protocol_mode in [McpProtocolMode::Legacy, McpProtocolMode::V20260728] {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("descendant-ready");
+            let launcher = LocalStdioServerLauncher::new(dir.path().to_path_buf());
+            let command = StdioServerCommand::new(
+                "sh".into(),
+                vec![
+                    "-c".into(),
+                    "(trap '' TERM; printf ready > \"$1\"; exec sleep 30) & wait".into(),
+                    "--".into(),
+                    marker.as_os_str().to_owned(),
+                ],
+                None,
+                Vec::new(),
+                None,
+                protocol_mode,
+            );
+            let mut transport = launcher.launch(command).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !marker.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("descendant ready before retirement");
+            let process = transport.process_handle();
+            let started = tokio::time::Instant::now();
+            let (first, second) = tokio::join!(process.terminate(), process.terminate());
+            first.expect("direct child and group exit observed");
+            second.expect("concurrent waiter shares terminal proof");
+            assert!(started.elapsed() >= PROCESS_GROUP_TERM_GRACE_PERIOD);
+            process
+                .terminate()
+                .await
+                .expect("repeated terminal fact retained");
+            transport.close().await.unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn each_local_protocol_mode_waits_for_terminal_exit_on_close() {
+        for protocol_mode in [McpProtocolMode::Legacy, McpProtocolMode::V20260728] {
+            let launcher = LocalStdioServerLauncher::new(
+                std::env::current_dir().expect("current directory for test launcher"),
+            );
+            let command = StdioServerCommand::new(
+                "sh".into(),
+                vec!["-c".into(), "sleep 30".into()],
+                None,
+                Vec::new(),
+                None,
+                protocol_mode,
+            );
+            let mut transport = launcher.launch(command).await.expect("launch test child");
+
+            tokio::time::timeout(Duration::from_secs(2), transport.close())
+                .await
+                .expect("termination should complete promptly")
+                .expect("close should report the child terminal observation");
+        }
+    }
 
     #[test]
     fn remote_env_policy_uses_core_env_without_remote_source_vars() {

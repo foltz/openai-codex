@@ -94,6 +94,7 @@ pub struct McpRuntimeInput {
 /// Publication replaces the latest state atomically. Existing bindings retain
 /// their exact connections and configuration for as long as they are needed.
 pub struct McpRuntime {
+    retirement: crate::runtime_retirement::RuntimeRetirementRegistry,
     current: ArcSwap<PublishedMcpRuntime>,
     reconnect_pending: AtomicBool,
     elicitation_router: ElicitationRequestRouter,
@@ -169,6 +170,7 @@ impl McpRuntime {
     /// runtime handle before its full MCP inputs are available.
     pub fn empty(prefix_mcp_tool_names: bool) -> Self {
         Self {
+            retirement: crate::runtime_retirement::RuntimeRetirementRegistry::default(),
             current: ArcSwap::from_pointee(PublishedMcpRuntime {
                 connections: Arc::new(McpConnectionSet::empty(prefix_mcp_tool_names)),
                 config: None,
@@ -185,6 +187,18 @@ impl McpRuntime {
 
     pub async fn new(input: McpRuntimeInput) -> Self {
         let runtime = Self::empty(input.config.prefix_mcp_tool_names);
+        runtime.replace(input).await;
+        runtime
+    }
+
+    /// Attach external custody before the first startup await. The caller must
+    /// retain the supplied owner until its exact retirement report is complete.
+    pub async fn new_in_retirement(
+        input: McpRuntimeInput,
+        retirement: crate::McpRuntimeRetirement,
+    ) -> Self {
+        let mut runtime = Self::empty(input.config.prefix_mcp_tool_names);
+        runtime.retirement = retirement.registry;
         runtime.replace(input).await;
         runtime
     }
@@ -218,11 +232,12 @@ impl McpRuntime {
         let plugins_available = input.plugins_available;
         let ready_selected_capability_roots = input.ready_selected_capability_roots.clone();
         let connections = Arc::new(
-            McpConnectionSet::new(
+            McpConnectionSet::new_with_retirement(
                 previous,
                 publication_gate,
                 input,
                 self.elicitation_router.clone(),
+                self.retirement.clone(),
             )
             .await,
         );
@@ -447,7 +462,21 @@ impl McpRuntime {
     }
 
     pub async fn shutdown(&self) {
-        self.latest_connections().shutdown().await;
+        let report = self
+            .shutdown_until(tokio::time::Instant::now() + std::time::Duration::from_secs(30))
+            .await;
+        if !report.is_complete() {
+            tracing::warn!(?report, "MCP runtime retirement was not acknowledged");
+        }
+    }
+
+    /// Freeze all generations and observe every admitted owner under one budget.
+    /// A timeout retains unfinished ownership for a subsequent observation.
+    pub async fn shutdown_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> crate::RuntimeTerminationReport {
+        self.retirement.shutdown_until(deadline).await
     }
 }
 

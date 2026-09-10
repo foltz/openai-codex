@@ -863,6 +863,60 @@ async fn shutdown_all_threads_bounded_submits_shutdown_to_every_thread() {
 }
 
 #[tokio::test]
+async fn exact_runtime_removal_preserves_same_id_replacement() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let old = manager
+        .start_thread(StartThreadOptions::new(config.clone()))
+        .await
+        .unwrap();
+    let replacement = manager
+        .start_thread(StartThreadOptions::new(config))
+        .await
+        .unwrap();
+    // Simulate publication winning after a retirement snapshot. The tested
+    // identity is the manager slot's Arc, not an ID carried inside the runtime.
+    manager
+        .state
+        .threads
+        .write()
+        .await
+        .insert(old.thread_id, Arc::clone(&replacement.thread));
+    assert!(
+        manager
+            .remove_thread_if_same(&old.thread_id, &old.thread)
+            .await
+            .is_none()
+    );
+    assert!(Arc::ptr_eq(
+        &manager.get_thread(old.thread_id).await.unwrap(),
+        &replacement.thread
+    ));
+    let removed = manager
+        .remove_thread_if_same(&old.thread_id, &replacement.thread)
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&removed, &replacement.thread));
+    assert!(
+        manager
+            .remove_thread_if_same(&old.thread_id, &replacement.thread)
+            .await
+            .is_none()
+    );
+    old.thread.shutdown_and_wait().await.unwrap();
+    replacement.thread.shutdown_and_wait().await.unwrap();
+}
+
+#[tokio::test]
 async fn code_mode_session_provider_is_shared_across_threads() {
     let temp_dir = tempdir().expect("tempdir");
     let mut config = test_config().await;

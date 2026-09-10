@@ -533,6 +533,18 @@ client_request_definitions! {
         serialization: global_shared_read("thread-attachment"),
         response: v2::ThreadAttachmentListResponse,
     },
+    #[experimental("thread/retention/acquire")]
+    ThreadRetentionAcquire => "thread/retention/acquire" {
+        params: v2::ThreadRetentionAcquireParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadRetentionAcquireResponse,
+    },
+    #[experimental("thread/retention/release")]
+    ThreadRetentionRelease => "thread/retention/release" {
+        params: v2::ThreadRetentionReleaseParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadRetentionReleaseResponse,
+    },
     #[experimental("thread/increment_elicitation")]
     /// Increment the thread-local out-of-band elicitation counter.
     ///

@@ -3,6 +3,8 @@ use super::thread_fork_goal::inherit_thread_goal_snapshot;
 use super::turn_processor::can_accept_direct_input;
 use super::*;
 use crate::error_code::method_not_found;
+use crate::processor_task_retirement::ProcessorTaskDrain;
+use crate::processor_task_retirement::ProcessorTasks;
 use codex_app_server_protocol::SelectedCapabilityRoot;
 use codex_app_server_protocol::ThreadAttachmentListParams;
 use codex_app_server_protocol::ThreadSection;
@@ -16,6 +18,14 @@ use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
 use codex_protocol::protocol::ThreadHistoryMode;
+
+mod shutdown;
+pub(crate) use shutdown::ProcessorThreadRetirement;
+pub(crate) use shutdown::ProcessorThreadShutdown;
+#[cfg(test)]
+pub(crate) use shutdown::ThreadShutdownOwner;
+#[cfg(test)]
+pub(crate) use shutdown::tests::fixture as thread_shutdown_fixture;
 
 pub(super) const THREAD_LIST_DEFAULT_LIMIT: usize = 25;
 pub(super) const THREAD_LIST_MAX_LIMIT: usize = 100;
@@ -429,7 +439,8 @@ pub(crate) struct ThreadRequestProcessor {
     pub(super) thread_goal_processor: ThreadGoalRequestProcessor,
     pub(super) state_db: Option<StateDbHandle>,
     pub(super) log_db: Option<LogDbLayer>,
-    pub(super) background_tasks: TaskTracker,
+    pub(super) background_tasks: ProcessorTasks,
+    thread_shutdown: shutdown::ThreadShutdownOwner,
     pub(super) skills_watcher: Arc<SkillsWatcher>,
     pub(super) initial_config_warnings: Arc<Vec<ConfigWarningNotification>>,
 }
@@ -480,7 +491,8 @@ impl ThreadRequestProcessor {
             thread_goal_processor,
             state_db,
             log_db,
-            background_tasks: TaskTracker::new(),
+            background_tasks: ProcessorTasks::default(),
+            thread_shutdown: shutdown::ThreadShutdownOwner::default(),
             skills_watcher,
             initial_config_warnings: Arc::new(initial_config_warnings),
         }
@@ -1152,19 +1164,34 @@ impl ThreadRequestProcessor {
                 outgoing.send_error(error_request_id, error).await;
             }
         };
-        self.background_tasks
-            .spawn(thread_start_task.instrument(request_context.span()));
+        let _receipt = self
+            .background_tasks
+            .spawn(thread_start_task.instrument(request_context.span()))
+            .map_err(|_| internal_error("background thread-start admission unavailable"))?;
         Ok(())
     }
 
     pub(crate) async fn drain_background_tasks(&self) {
-        self.background_tasks.close();
-        if tokio::time::timeout(Duration::from_secs(10), self.background_tasks.wait())
+        if !self
+            .drain_background_tasks_until(tokio::time::Instant::now() + Duration::from_secs(10))
             .await
-            .is_err()
+            .is_clean()
         {
-            warn!("timed out waiting for background tasks to shut down; proceeding");
+            warn!("background thread-start shutdown was not clean; proceeding");
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn background_tasks_for_test(&self) -> &ProcessorTasks {
+        &self.background_tasks
+    }
+
+    /// Closes task birth and observes retained joins under the first deadline.
+    pub(crate) async fn drain_background_tasks_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> ProcessorTaskDrain {
+        self.background_tasks.shutdown_until(deadline).await
     }
 
     pub(crate) async fn clear_all_thread_listeners(&self) {
@@ -1172,16 +1199,37 @@ impl ThreadRequestProcessor {
     }
 
     pub(crate) async fn shutdown_threads(&self) {
-        let report = self
-            .thread_manager
-            .shutdown_all_threads_bounded(Duration::from_secs(10))
-            .await;
+        let (report, retirements) = tokio::join!(
+            self.thread_manager
+                .shutdown_all_threads_bounded(Duration::from_secs(10)),
+            self.thread_state_manager.drain_retirement_tickets(),
+        );
+        for (claim, retirement) in retirements {
+            if matches!(
+                retirement.session_loop,
+                codex_core::ThreadLoopOutcome::TimedOut
+            ) || !matches!(
+                retirement.cleanup,
+                codex_core::ThreadCleanupOutcome::Finished { .. }
+            ) {
+                warn!(thread_id = %claim.thread_id, ?retirement, "committed thread retirement remains incomplete");
+            }
+        }
         for thread_id in report.submit_failed {
             warn!("failed to submit Shutdown to thread {thread_id}");
         }
         for thread_id in report.timed_out {
             warn!("timed out waiting for thread {thread_id} to shut down");
         }
+    }
+
+    /// Permanent host shutdown; not a reusable account-transition reset.
+    pub(crate) fn begin_thread_shutdown(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<ProcessorThreadRetirement, codex_core::ThreadManagerRetirementError> {
+        self.thread_shutdown
+            .begin(&self.thread_manager, &self.thread_state_manager, deadline)
     }
 
     async fn request_trace_context(

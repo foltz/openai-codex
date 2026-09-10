@@ -114,6 +114,7 @@ mod models;
 mod models_refresh_worker;
 mod otel_reloader;
 mod outgoing_message;
+mod processor_task_retirement;
 mod request_processors;
 mod request_serialization;
 mod server_request_error;
@@ -1085,6 +1086,9 @@ pub async fn run_main_with_transport_options(
                                                     connection_state
                                                         .session
                                                         .trusted_interactive(),
+                                                    connection_state
+                                                        .session
+                                                        .retention_principal(),
                                                 )
                                                 .await;
                                             connection_state

@@ -1,5 +1,6 @@
 use super::*;
 use crate::extensions::send_thread_warning;
+use crate::thread_state::RetentionSnapshot;
 use codex_extension_api::ThreadIdleCause;
 use codex_protocol::config_types::MultiAgentMode;
 
@@ -36,8 +37,8 @@ pub(super) struct ListenerTaskContext {
 
 struct UnloadingState {
     delay: Duration,
-    has_subscribers_rx: watch::Receiver<bool>,
-    has_subscribers: (bool, Instant),
+    retention_rx: watch::Receiver<RetentionSnapshot>,
+    retention: (bool, Instant),
     thread_status_rx: watch::Receiver<ThreadStatus>,
     is_active: (bool, Instant),
 }
@@ -48,41 +49,48 @@ impl UnloadingState {
         thread_id: ThreadId,
         delay: Duration,
     ) -> Option<Self> {
-        let has_subscribers_rx = listener_task_context
+        let retention_rx = listener_task_context
             .thread_state_manager
-            .subscribe_to_has_connections(thread_id)
+            .subscribe_to_retention(thread_id)
             .await?;
         let thread_status_rx = listener_task_context
             .thread_watch_manager
             .subscribe(thread_id)
             .await?;
-        let has_subscribers = (*has_subscribers_rx.borrow(), Instant::now());
+        let retention = {
+            let snapshot = *retention_rx.borrow();
+            (snapshot.granted, snapshot.unretained_since.into())
+        };
         let is_active = (
             matches!(*thread_status_rx.borrow(), ThreadStatus::Active { .. }),
             Instant::now(),
         );
         Some(Self {
             delay,
-            has_subscribers_rx,
-            has_subscribers,
+            retention_rx,
+            retention,
             thread_status_rx,
             is_active,
         })
     }
 
     fn unloading_target(&self) -> Option<Instant> {
-        match (self.has_subscribers, self.is_active) {
-            ((false, has_no_subscribers_since), (false, is_inactive_since)) => {
-                Some(std::cmp::max(has_no_subscribers_since, is_inactive_since) + self.delay)
+        let retention = *self.retention_rx.borrow();
+        if retention.retiring {
+            return None;
+        }
+        match (self.retention, self.is_active) {
+            ((false, unretained_since), (false, is_inactive_since)) => {
+                Some(std::cmp::max(unretained_since, is_inactive_since) + self.delay)
             }
             _ => None,
         }
     }
 
     fn sync_receiver_values(&mut self) {
-        let has_subscribers = *self.has_subscribers_rx.borrow();
-        if self.has_subscribers.0 != has_subscribers {
-            self.has_subscribers = (has_subscribers, Instant::now());
+        let retention = *self.retention_rx.borrow();
+        if self.retention != (retention.granted, retention.unretained_since.into()) {
+            self.retention = (retention.granted, retention.unretained_since.into());
         }
 
         let is_active = matches!(*self.thread_status_rx.borrow(), ThreadStatus::Active { .. });
@@ -121,7 +129,7 @@ impl UnloadingState {
             };
             tokio::select! {
                 _ = unloading_sleep => return true,
-                changed = self.has_subscribers_rx.changed() => {
+                changed = self.retention_rx.changed() => {
                     if changed.is_err() {
                         return false;
                     }
@@ -395,7 +403,8 @@ pub(super) async fn ensure_listener_task_running(
                         }
                         pending_thread_unloads.insert(conversation_id);
                     }
-                    unload_thread_without_subscribers(
+                    let retention = unloading_state.retention_snapshot();
+                    unload_idle_unretained_thread(
                         thread_manager.clone(),
                         outgoing_for_task.clone(),
                         pending_thread_unloads.clone(),
@@ -403,6 +412,8 @@ pub(super) async fn ensure_listener_task_running(
                         thread_watch_manager.clone(),
                         conversation_id,
                         conversation.clone(),
+                        listener_generation,
+                        retention,
                     )
                     .await;
                     break;
@@ -419,6 +430,12 @@ pub(super) async fn ensure_listener_task_running(
     Ok(())
 }
 
+impl UnloadingState {
+    fn retention_snapshot(&self) -> RetentionSnapshot {
+        *self.retention_rx.borrow()
+    }
+}
+
 pub(super) async fn wait_for_thread_shutdown(thread: &Arc<CodexThread>) -> ThreadShutdownResult {
     match tokio::time::timeout(Duration::from_secs(10), thread.shutdown_and_wait()).await {
         Ok(Ok(())) => ThreadShutdownResult::Complete,
@@ -427,7 +444,7 @@ pub(super) async fn wait_for_thread_shutdown(thread: &Arc<CodexThread>) -> Threa
     }
 }
 
-pub(super) async fn unload_thread_without_subscribers(
+pub(super) async fn unload_idle_unretained_thread(
     thread_manager: Arc<ThreadManager>,
     outgoing: Arc<OutgoingMessageSender>,
     pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
@@ -435,48 +452,66 @@ pub(super) async fn unload_thread_without_subscribers(
     thread_watch_manager: ThreadWatchManager,
     thread_id: ThreadId,
     thread: Arc<CodexThread>,
+    listener_generation: u64,
+    expected_retention: RetentionSnapshot,
 ) {
-    info!("thread {thread_id} has no subscribers and is idle; shutting down");
+    info!("thread {thread_id} has no retention grant and is idle; shutting down");
 
     // Any pending app-server -> client requests for this thread can no longer be
     // answered; cancel their callbacks before shutdown/unload.
     outgoing
         .cancel_requests_for_thread(thread_id, /*error*/ None)
         .await;
-    thread_state_manager.remove_thread_state(thread_id).await;
-
-    tokio::spawn(async move {
-        match wait_for_thread_shutdown(&thread).await {
-            ThreadShutdownResult::Complete => {
-                if thread_manager.remove_thread(&thread_id).await.is_none() {
-                    info!("thread {thread_id} was already removed before teardown finalized");
-                    thread_watch_manager
-                        .remove_thread(&thread_id.to_string())
-                        .await;
-                    pending_thread_unloads.lock().await.remove(&thread_id);
-                    return;
-                }
-                thread_watch_manager
-                    .remove_thread(&thread_id.to_string())
-                    .await;
-                let notification = ThreadClosedNotification {
-                    thread_id: thread_id.to_string(),
-                };
-                outgoing
-                    .send_server_notification(ServerNotification::ThreadClosed(notification))
-                    .await;
-                pending_thread_unloads.lock().await.remove(&thread_id);
-            }
-            ThreadShutdownResult::SubmitFailed => {
-                pending_thread_unloads.lock().await.remove(&thread_id);
-                warn!("failed to submit Shutdown to thread {thread_id}");
-            }
-            ThreadShutdownResult::TimedOut => {
-                pending_thread_unloads.lock().await.remove(&thread_id);
-                warn!("thread {thread_id} shutdown timed out; leaving thread loaded");
-            }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let ticket = match thread_state_manager
+        .claim_thread_retirement(
+            thread_id,
+            expected_retention,
+            &thread,
+            listener_generation,
+            deadline.into(),
+        )
+        .await
+    {
+        Ok((claim, ticket)) => (claim, ticket),
+        Err(error) => {
+            pending_thread_unloads.lock().await.remove(&thread_id);
+            tracing::debug!(thread_id = %thread_id, ?error, "idle thread retirement was refused");
+            return;
         }
-    });
+    };
+    let (claim, ticket) = ticket;
+    let report = ticket.wait().await;
+    if !report_is_complete(&report) {
+        pending_thread_unloads.lock().await.remove(&thread_id);
+        warn!(thread_id = %thread_id, ?report, "idle thread retirement remains incomplete");
+        return;
+    }
+    thread_state_manager
+        .record_retirement_report(claim, report)
+        .await;
+    let removed = thread_manager
+        .remove_thread_if_same(&thread_id, &thread)
+        .await;
+    if removed.is_none() {
+        info!("thread {thread_id} was already removed before teardown finalized");
+    } else {
+        thread_state_manager.remove_thread_state(thread_id).await;
+    }
+    thread_watch_manager
+        .remove_thread(&thread_id.to_string())
+        .await;
+    let notification = ThreadClosedNotification {
+        thread_id: thread_id.to_string(),
+    };
+    outgoing
+        .send_server_notification(ServerNotification::ThreadClosed(notification))
+        .await;
+    pending_thread_unloads.lock().await.remove(&thread_id);
+}
+
+fn report_is_complete(report: &codex_core::ThreadRetirementReport) -> bool {
+    report.is_complete()
 }
 
 #[allow(clippy::too_many_arguments)]

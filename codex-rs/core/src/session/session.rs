@@ -53,9 +53,15 @@ pub(crate) struct Session {
     pub(super) mcp_elicitation_lifecycle_handle: OnceLock<codex_mcp::ElicitationLifecycle>,
     pub(super) mcp_prewarm_tx: async_channel::Sender<()>,
     pub(super) mcp_prewarm_shutdown: CancellationToken,
-    pub(super) mcp_prewarm_task: std::sync::Mutex<Option<JoinHandle<()>>>,
+    // Retain the original join future when a shutdown observer is cancelled.
+    pub(super) mcp_prewarm_task: std::sync::Mutex<Option<SessionLoopTermination>>,
     pub(crate) conversation: Arc<RealtimeConversationManager>,
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
+    // Writes and final task-admission checks are serialized by active_turn.
+    pub(crate) task_admission_closed: std::sync::atomic::AtomicBool,
+    pub(crate) task_joins: crate::tasks::TaskJoinRegistry,
+    pub(super) cleanup_owner:
+        std::sync::Mutex<std::sync::Weak<super::retirement::SessionCleanupOwner>>,
     pub(crate) async_hook_results: async_channel::Receiver<HookCompletedEvent>,
     pub(crate) pending_user_message_admissions:
         crate::user_message_admission::PendingUserMessageAdmissions,
@@ -632,6 +638,7 @@ impl Session {
         deferred_clear_session_start: Option<super::DeferredClearSessionStart>,
         runtime_config_change_listener: Option<Arc<dyn crate::RuntimeConfigChangeListener>>,
         runtime_config_change_gate: Option<crate::RuntimeConfigChangeGate>,
+        startup_custody: Option<&super::startup_custody::SessionStartupCustody>,
     ) -> anyhow::Result<Arc<Self>> {
         debug!(
             "Configuring session: model={}; provider={:?}",
@@ -1356,6 +1363,9 @@ impl Session {
                 mcp_prewarm_task: std::sync::Mutex::new(None),
                 conversation: Arc::new(RealtimeConversationManager::new()),
                 active_turn: Mutex::new(None),
+                task_admission_closed: std::sync::atomic::AtomicBool::new(false),
+                task_joins: Default::default(),
+                cleanup_owner: Default::default(),
                 async_hook_results,
                 pending_user_message_admissions: Default::default(),
                 input_queue: InputQueue::new(),
@@ -1365,6 +1375,9 @@ impl Session {
                 fork_persistence,
                 next_internal_sub_id: AtomicU64::new(0),
             });
+            if let Some(custody) = startup_custody {
+                custody.retain(&sess);
+            }
             if let Some(network_policy_decider_session) = network_policy_decider_session {
                 let mut guard = network_policy_decider_session.write().await;
                 *guard = Arc::downgrade(&sess);

@@ -386,17 +386,39 @@ impl InProcessClientHandle {
             ));
         }
 
-        let (runtime_result, _cleanup_report) = tokio::join!(
+        let (runtime_result, cleanup_report) = tokio::join!(
             timeout_at(deadline, runtime_handle.join()),
             custody.observe_until(deadline),
         );
-        if runtime_result.is_err() {
-            // The retained host/custody owns the original join and cleanup
-            // receipts. A caller deadline is an incomplete observation, never
-            // permission to abort the task that owns those receipts.
+        match runtime_result {
+            Err(_) => {
+                // The retained host/custody owns the original join and
+                // cleanup receipts. A caller deadline is an incomplete
+                // observation, never permission to abort the task that owns
+                // those receipts.
+                return Err(IoError::new(
+                    ErrorKind::TimedOut,
+                    "in-process app-server runtime shutdown timed out",
+                ));
+            }
+            Ok(TaskTermination::Cancelled) => {
+                return Err(IoError::new(
+                    ErrorKind::Other,
+                    "in-process app-server runtime shutdown was cancelled",
+                ));
+            }
+            Ok(TaskTermination::Panicked) => {
+                return Err(IoError::new(
+                    ErrorKind::Other,
+                    "in-process app-server runtime shutdown panicked",
+                ));
+            }
+            Ok(TaskTermination::Normal) => {}
+        }
+        if !cleanup_report.is_proven_complete() {
             return Err(IoError::new(
-                ErrorKind::TimedOut,
-                "in-process app-server runtime shutdown timed out",
+                ErrorKind::Other,
+                "in-process app-server cleanup completion was not proven",
             ));
         }
         Ok(())
@@ -1090,10 +1112,11 @@ mod tests {
             _test_codex_home: None,
         };
 
-        client
+        let error = client
             .shutdown()
             .await
-            .expect("in-process runtime should shutdown cleanly");
+            .expect_err("a runtime join without cleanup evidence is incomplete");
+        assert_eq!(error.kind(), ErrorKind::Other);
         assert!(completed.load(Ordering::Acquire));
     }
 

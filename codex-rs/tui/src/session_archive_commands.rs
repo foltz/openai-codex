@@ -393,7 +393,7 @@ async fn start_app_server_for_archive_command(
         .wrap_err("failed to initialize state database")?;
     let embedded_host = matches!(&app_server_target, super::AppServerTarget::Embedded)
         .then(|| Arc::new(InProcessHost::default()));
-    let app_server = super::start_app_server(
+    let app_server_result = super::start_app_server(
         &app_server_target,
         arg0_paths,
         config,
@@ -407,7 +407,9 @@ async fn start_app_server_for_archive_command(
         environment_manager,
         embedded_host.clone(),
     )
-    .await?;
+    .await;
+    drop(embedded_host);
+    let app_server = app_server_result?;
     Ok(
         AppServerSession::new(app_server, app_server_target.thread_params_mode())
             .with_remote_cwd_override(remote_cwd_override),

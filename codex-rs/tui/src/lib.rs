@@ -505,7 +505,7 @@ pub(crate) async fn start_app_server_for_picker(
 ) -> color_eyre::Result<AppServerSession> {
     let embedded_host =
         matches!(target, AppServerTarget::Embedded).then(|| Arc::new(InProcessHost::default()));
-    let app_server = start_app_server(
+    let app_server_result = start_app_server(
         target,
         Arg0DispatchPaths::default(),
         config.clone(),
@@ -520,6 +520,8 @@ pub(crate) async fn start_app_server_for_picker(
         embedded_host.clone(),
     )
     .await?;
+    drop(embedded_host);
+    let app_server = app_server_result;
     Ok(AppServerSession::new(
         app_server,
         target.thread_params_mode(),
@@ -1340,7 +1342,7 @@ async fn run_ratatui_app(
     // cancellation before the facade has been constructed.
     let embedded_host = matches!(&app_server_target, AppServerTarget::Embedded)
         .then(|| Arc::new(InProcessHost::default()));
-    let app_server_session = match start_app_server(
+    let app_server_result = start_app_server(
         &app_server_target,
         arg0_paths.clone(),
         initial_config.clone(),
@@ -1354,8 +1356,9 @@ async fn run_ratatui_app(
         environment_manager.clone(),
         embedded_host.clone(),
     )
-    .await
-    {
+    .await;
+    drop(embedded_host);
+    let app_server_session = match app_server_result {
         Ok(app_server) => AppServerSession::new(app_server, app_server_target.thread_params_mode()),
         Err(err) => {
             terminal_restore_guard.restore_silently();
@@ -1707,7 +1710,7 @@ async fn run_ratatui_app(
         None => {
             let embedded_host = matches!(&app_server_target, AppServerTarget::Embedded)
                 .then(|| Arc::new(InProcessHost::default()));
-            match start_app_server(
+            let app_server_result = start_app_server(
                 &app_server_target,
                 arg0_paths,
                 config.clone(),
@@ -1721,8 +1724,9 @@ async fn run_ratatui_app(
                 environment_manager.clone(),
                 embedded_host.clone(),
             )
-            .await
-            {
+            .await;
+            drop(embedded_host);
+            match app_server_result {
                 Ok(app_server) => {
                     AppServerSession::new(app_server, app_server_target.thread_params_mode())
                         .with_remote_cwd_override(remote_cwd_override.clone())

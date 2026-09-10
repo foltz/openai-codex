@@ -596,7 +596,7 @@ pub(crate) async fn start_app_server_for_picker(
         /*log_db*/ None,
         &mut state_db,
         environment_manager,
-        embedded_host,
+        embedded_host.clone(),
     )
     .await?;
     Ok(
@@ -1170,7 +1170,7 @@ async fn run_ratatui_app(
                 log_db.clone(),
                 &mut state_db,
                 environment_manager.clone(),
-                embedded_host,
+                embedded_host.clone(),
             ),
         )
         .await;

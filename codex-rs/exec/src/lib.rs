@@ -156,6 +156,7 @@ use std::io::IsTerminal;
 use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use supports_color::Stream;
 use tokio::sync::mpsc;
 use tracing::Instrument;
@@ -975,11 +976,16 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
     // Keep host custody outside the startup future so cancellation before the
     // facade is returned cannot discard the runtime owner.
     let embedded_host = std::sync::Arc::new(InProcessHost::default());
-    let mut client = InProcessAppServerClient::start_in_host(embedded_host, in_process_start_args)
-        .await
-        .map_err(|err| {
-            anyhow::anyhow!("failed to initialize in-process app-server client: {err}")
-        })?;
+    // Keep the caller's host root outside the cancellable startup future. The
+    // low-level runtime retains only a weak ticket until the facade returns;
+    // passing the sole Arc by value would let startup cancellation detach the
+    // just-born runtime before the facade can install its worker clone.
+    let mut client =
+        InProcessAppServerClient::start_in_host(Arc::clone(&embedded_host), in_process_start_args)
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!("failed to initialize in-process app-server client: {err}")
+            })?;
 
     // Resolve resume and fork through existing app-server thread lifecycle APIs.
     let (primary_thread_id, fallback_session_configured) = if let Some(ExecCommand::Resume(args)) =

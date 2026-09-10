@@ -9,6 +9,7 @@ use futures::future::Shared;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex;
+use tokio::runtime::Handle;
 use tokio::time::Instant;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,12 +78,32 @@ impl PluginTaskRegistry {
         &self,
         future: impl Future<Output = ()> + Send + 'static,
     ) -> Result<Receipt, ()> {
+        self.spawn_with(future, tokio::spawn)
+    }
+
+    /// Spawn on an explicitly retained runtime. This is required when the
+    /// caller is an OS thread: `tokio::runtime::Handle::try_current()` cannot
+    /// recover an ambient runtime there, but the runtime that owns the
+    /// registry can still admit and retain the task's join receipt.
+    pub(crate) fn spawn_on(
+        &self,
+        runtime: &Handle,
+        future: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<Receipt, ()> {
+        self.spawn_with(future, |future| runtime.spawn(future))
+    }
+
+    fn spawn_with<F, S>(&self, future: F, spawn: S) -> Result<Receipt, ()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+        S: FnOnce(F) -> tokio::task::JoinHandle<()>,
+    {
         let mut state = self.state.lock().map_err(|_| ())?;
         if state.closed {
             return Err(());
         }
         state.compact();
-        let task = tokio::spawn(future);
+        let task = spawn(future);
         let receipt = async move {
             match task.await {
                 Ok(()) => JoinOutcome::Joined,
@@ -256,5 +277,28 @@ mod tests {
             .await;
         assert!(report.is_clean());
         assert!(finished.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn explicit_runtime_spawn_is_usable_from_an_os_thread() {
+        let registry = PluginTaskRegistry::default();
+        let runtime = Handle::current();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let thread_registry = registry.clone();
+        let thread = std::thread::spawn(move || {
+            let _ = thread_registry
+                .spawn_on(&runtime, async move {
+                    let _ = finished_tx.send(());
+                })
+                .expect("explicit runtime should admit the task");
+        });
+        thread.join().expect("OS callback thread should return");
+        finished_rx
+            .await
+            .expect("task should run on supplied runtime");
+        let report = registry
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await;
+        assert!(report.is_clean());
     }
 }

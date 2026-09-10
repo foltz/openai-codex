@@ -464,6 +464,13 @@ impl SessionLoopTermination {
             abort.abort();
         }
     }
+
+    /// A normal loop join is not enough to certify teardown. The loop owns
+    /// the cleanup observer, so expose its retained receipt separately for
+    /// callers that classify the legacy shutdown result.
+    pub(crate) fn cleanup_completed(&self) -> Option<retirement::CleanupExecution> {
+        self.cleanup_owner.as_ref()?.completed()
+    }
 }
 
 impl std::future::Future for SessionLoopTermination {
@@ -1023,8 +1030,19 @@ impl SessionIo {
             Err(err) if matches!(err.details(), CodexErrorDetails::InternalAgentDied) => {}
             Err(err) => return Err(err),
         }
-        match session_loop_termination.await {
-            SessionLoopOutcome::Normal => Ok(()),
+        match session_loop_termination.clone().await {
+            SessionLoopOutcome::Normal => match session_loop_termination.cleanup_completed() {
+                // Synthetic/session fixtures without a retained cleanup owner
+                // predate the result-bearing owner and retain their legacy
+                // behavior. Production sessions always attach the owner at
+                // loop birth, so a missing or non-clean receipt cannot be
+                // normalized to success there.
+                None => Ok(()),
+                Some(retirement::CleanupExecution::Finished {
+                    persistence_failed: false,
+                }) => Ok(()),
+                Some(_) => Err(CodexErr::InternalAgentDied),
+            },
             SessionLoopOutcome::Cancelled | SessionLoopOutcome::Panicked => {
                 Err(CodexErr::InternalAgentDied)
             }

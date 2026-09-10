@@ -50,6 +50,11 @@ const JSON_V1_ALLOWLIST: &[&str] = &["InitializeParams", "InitializeResponse"];
 const EXPERIMENTAL_CLIENT_METHOD_DEPENDENCY_TYPES: &[&str] = &[
     "EnvironmentShellInfo",
     "EnvironmentStatusKind",
+    "ManagedTransitionIntent",
+    "ManagedTransitionPhase",
+    "ManagedTransitionRefusal",
+    "ManagedTransitionRefusalKind",
+    "ManagedTransitionStatus",
     "RemoteControlClient",
     "RemoteControlClientsListOrder",
     "ThreadBackgroundTerminal",
@@ -2686,6 +2691,58 @@ mod tests {
             optional_nullable_offenders.is_empty(),
             "Generated TypeScript has optional nullable fields outside *Params types (disallowed '?: T | null'):\n{optional_nullable_offenders:?}"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn stable_exports_filter_managed_transition_dependency_types() -> Result<()> {
+        let output_dir = tempfile::tempdir()?;
+        let typescript_dir = output_dir.path().join("typescript");
+        let json_dir = output_dir.path().join("json");
+        generate_ts_with_options(
+            &typescript_dir,
+            /*prettier*/ None,
+            GenerateTsOptions::default(),
+        )?;
+        generate_json_with_experimental(&json_dir, /*experimental_api*/ false)?;
+
+        for type_name in [
+            "ManagedTransitionIntent",
+            "ManagedTransitionPhase",
+            "ManagedTransitionRefusal",
+            "ManagedTransitionRefusalKind",
+            "ManagedTransitionStatus",
+        ] {
+            assert!(
+                !typescript_dir
+                    .join("v2")
+                    .join(format!("{type_name}.ts"))
+                    .exists()
+            );
+            assert!(
+                !json_dir
+                    .join("v2")
+                    .join(format!("{type_name}.json"))
+                    .exists()
+            );
+        }
+
+        let stable_typescript_index =
+            fs::read_to_string(typescript_dir.join("v2").join("index.ts"))?;
+        assert!(!stable_typescript_index.contains("ManagedTransition"));
+
+        let stable_json_bundle =
+            fs::read_to_string(json_dir.join("codex_app_server_protocol.v2.schemas.json"))?;
+        for type_name in [
+            "ManagedTransitionIntent",
+            "ManagedTransitionPhase",
+            "ManagedTransitionRefusal",
+            "ManagedTransitionRefusalKind",
+            "ManagedTransitionStatus",
+        ] {
+            assert!(!stable_json_bundle.contains(type_name));
+        }
 
         Ok(())
     }

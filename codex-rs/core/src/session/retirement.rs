@@ -134,7 +134,7 @@ impl SessionCleanupOwner {
                     .shared()
                 });
                 state.task_completion = tasks.clone();
-                let mode = if mcp.is_some() {
+                let mode = if state.deadline.is_some() {
                     CleanupMode::DeadlineBound
                 } else {
                     CleanupMode::Legacy

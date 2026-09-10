@@ -94,6 +94,9 @@ pub(crate) struct Session {
     pub(crate) task_joins: crate::tasks::TaskJoinRegistry,
     pub(super) cleanup_owner:
         std::sync::Mutex<std::sync::Weak<super::retirement::SessionCleanupOwner>>,
+    // While construction remains fallible, retained startup cleanup must discard
+    // the live writer instead of materializing it through normal shutdown.
+    pub(super) failed_initialization_persistence: std::sync::atomic::AtomicBool,
     pub(crate) async_hook_results: async_channel::Receiver<HookCompletedEvent>,
     pub(crate) input_queue: InputQueue,
     pub(crate) services: SessionServices,
@@ -663,6 +666,12 @@ impl Session {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn failed_initialization_persistence_for_test(&self) -> bool {
+        self.failed_initialization_persistence
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Returns the concrete identity for this thread.
     pub(crate) fn thread_id(&self) -> ThreadId {
         self.thread_id
@@ -1015,8 +1024,20 @@ impl Session {
                 Ok::<_, anyhow::Error>((None, LiveThreadInitGuard::new(/*live_thread*/ None)))
             } else {
                 let mut local_guard = LiveThreadInitGuard::default();
-                let mut managed_guard = match &startup {
-                    Some(startup) => Some(startup.persistence.lock().await),
+                let retained_guard = match (startup_custody, &startup) {
+                    (Some(custody), startup) => {
+                        let guard = startup.as_ref().map_or_else(
+                            || Arc::new(Mutex::new(LiveThreadInitGuard::default())),
+                            |startup| Arc::clone(&startup.persistence),
+                        );
+                        custody.retain_persistence_guard(thread_id, Arc::clone(&guard));
+                        Some(guard)
+                    }
+                    (None, Some(startup)) => Some(Arc::clone(&startup.persistence)),
+                    (None, None) => None,
+                };
+                let mut managed_guard = match &retained_guard {
+                    Some(guard) => Some(guard.lock().await),
                     None => None,
                 };
                 let guard = managed_guard.as_deref_mut().unwrap_or(&mut local_guard);
@@ -1106,6 +1127,11 @@ impl Session {
                             .await?
                     }
                 };
+                drop(managed_guard);
+                #[cfg(test)]
+                if let Some(custody) = startup_custody {
+                    custody.wait_after_persistence_for_test().await;
+                }
                 Ok((Some(live_thread), local_guard))
             }
         }
@@ -1797,6 +1823,7 @@ impl Session {
                 task_admission_closed: std::sync::atomic::AtomicBool::new(false),
                 task_joins: Default::default(),
                 cleanup_owner: Default::default(),
+                failed_initialization_persistence: std::sync::atomic::AtomicBool::new(false),
                 async_hook_results,
                 input_queue: InputQueue::new(),
                 services,
@@ -1809,7 +1836,17 @@ impl Session {
                 let _ = startup.session.set(Arc::clone(&sess));
             }
             if let Some(custody) = startup_custody {
-                custody.retain(&sess);
+                if !custody.retain(&sess) {
+                    return Err(anyhow::anyhow!("startup persistence custody mismatch"));
+                }
+                sess.failed_initialization_persistence
+                    .store(true, std::sync::atomic::Ordering::Release);
+                // Transfer pre-Session persistence custody to the retained
+                // Session cleanup. The detached-drop guard only owns the
+                // legacy no-custody path.
+                live_thread_init.commit();
+                #[cfg(test)]
+                custody.wait_after_retain_for_test().await;
             }
             if let Some(network_policy_decider_session) = network_policy_decider_session {
                 let mut guard = network_policy_decider_session.write().await;
@@ -1939,6 +1976,10 @@ impl Session {
         .await;
         match session_result {
             Ok(sess) => {
+                // The original successful initialization boundary transfers
+                // persistence back to normal session shutdown.
+                sess.failed_initialization_persistence
+                    .store(false, std::sync::atomic::Ordering::Release);
                 live_thread_init.commit();
                 if deferred_clear_session_start.is_none() {
                     crate::hook_runtime::run_pending_session_start_hooks_eager(&sess).await;

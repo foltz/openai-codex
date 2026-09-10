@@ -210,6 +210,27 @@ async fn real_executor_concurrent_and_repeated_retirement_retains_terminal_proof
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_executor_transport_close_waits_for_closed_proof() -> anyhow::Result<()> {
+    let (process, mut evidence) = start_live_executor_process().await?;
+    let counted = Arc::new(CountedRealProcess {
+        process,
+        subscriptions: AtomicUsize::new(0),
+        terminations: AtomicUsize::new(0),
+        observations_unavailable: AtomicBool::new(false),
+    });
+    let mut transport =
+        ExecutorProcessTransport::new(counted.clone(), "real-executor-fixture".to_owned());
+
+    transport.close().await?;
+    terminal_sequence(&mut evidence).await?;
+    drop(transport);
+
+    assert_eq!(counted.subscriptions.load(Ordering::Relaxed), 2);
+    assert_eq!(counted.terminations.load(Ordering::Relaxed), 1);
+    Ok(())
+}
+
 #[cfg(unix)]
 struct GatedLocalLauncher {
     launcher: LocalStdioServerLauncher,

@@ -117,7 +117,7 @@ impl PluginTaskRegistry {
         Ok(receipt)
     }
 
-    pub(crate) fn spawn_thread<F>(&self, thread: F) -> Result<Receipt, ()>
+    pub(crate) fn spawn_thread<F>(&self, name: &'static str, thread: F) -> Result<Receipt, ()>
     where
         F: FnOnce() + Send + 'static,
     {
@@ -129,7 +129,10 @@ impl PluginTaskRegistry {
             return Err(());
         }
         state.compact();
-        let handle = std::thread::Builder::new().spawn(thread).map_err(|_| ())?;
+        let handle = std::thread::Builder::new()
+            .name(name.to_owned())
+            .spawn(thread)
+            .map_err(|_| ())?;
         let task = tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || handle.join()).await;
             if !matches!(result, Ok(Ok(()))) {
@@ -208,7 +211,11 @@ mod tests {
                 })
                 .is_err()
         );
-        assert!(registry.spawn_thread(|| {}).is_err());
+        assert!(
+            registry
+                .spawn_thread("rejected-plugin-worker", || {})
+                .is_err()
+        );
         assert!(!started.load(Ordering::SeqCst));
         let report = registry
             .shutdown_until(Instant::now() + Duration::from_millis(20))
@@ -267,7 +274,7 @@ mod tests {
         let finished_for_thread = Arc::clone(&finished);
         drop(
             registry
-                .spawn_thread(move || {
+                .spawn_thread("observed-plugin-worker", move || {
                     finished_for_thread.store(true, Ordering::SeqCst);
                 })
                 .expect("thread admission"),
@@ -277,6 +284,34 @@ mod tests {
             .await;
         assert!(report.is_clean());
         assert!(finished.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn os_thread_receives_its_attribution_name() {
+        let registry = PluginTaskRegistry::default();
+        let (name_tx, name_rx) = std::sync::mpsc::channel();
+        drop(
+            registry
+                .spawn_thread("plugins-worker-attribution-test", move || {
+                    name_tx
+                        .send(std::thread::current().name().map(str::to_owned))
+                        .expect("thread name receiver should remain live");
+                })
+                .expect("thread admission"),
+        );
+
+        assert_eq!(
+            name_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("worker should report its name"),
+            Some("plugins-worker-attribution-test".to_owned())
+        );
+        assert!(
+            registry
+                .shutdown_until(Instant::now() + Duration::from_secs(1))
+                .await
+                .is_clean()
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

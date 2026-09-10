@@ -991,6 +991,7 @@ mod tests {
     use super::append_query_param;
     use super::callback_id_from_server_url;
     use super::callback_path_from_redirect_uri;
+    use super::local_redirect_uri;
     use super::parse_oauth_callback;
     use super::perform_oauth_login;
     use super::perform_oauth_login_silent;
@@ -998,6 +999,14 @@ mod tests {
     use super::start_authorization;
     use crate::oauth::stored_oauth_credentials;
     use crate::oauth::test_support::TempCodexHome;
+
+    #[test]
+    fn local_redirect_uri_formats_ipv6_socket_address_once() {
+        let uri = local_redirect_uri("[::1]:49152".parse().unwrap()).unwrap();
+
+        assert_eq!(uri, "http://[::1]:49152/callback");
+        assert_eq!(Url::parse(&uri).unwrap().port(), Some(49152));
+    }
 
     #[derive(Default)]
     struct RecordingHttpClient {

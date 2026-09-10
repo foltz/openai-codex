@@ -24,10 +24,12 @@ pub enum LoginWorkerOutcome {
     Cancelled,
     Panicked,
     Failed,
+    Unavailable,
 }
 
-/// Evidence for the three Codex-owned workers only. This report does not
-/// establish termination of tiny_http's private accept/connection workers.
+/// Evidence for the owned callback, response, receiver, Hyper HTTP acceptor
+/// and connections, and persistence workers. This is retirement evidence,
+/// not an OAuth success result.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct LoginRetirementReport {
     pub callback: Option<LoginWorkerOutcome>,
@@ -142,6 +144,7 @@ impl LoginRetirement {
                 super::PersistenceOutcome::Failed => LoginWorkerOutcome::Failed,
                 super::PersistenceOutcome::Cancelled => LoginWorkerOutcome::Cancelled,
                 super::PersistenceOutcome::Panicked => LoginWorkerOutcome::Panicked,
+                super::PersistenceOutcome::Unavailable => LoginWorkerOutcome::Unavailable,
             };
             self.attempt
                 .progress

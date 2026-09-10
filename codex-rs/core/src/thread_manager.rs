@@ -2112,6 +2112,9 @@ impl ThreadManagerState {
         let stop = request.startup.as_ref().map(|startup| startup.stop.clone());
         self.constructions
             .register(move |custody, publication| async move {
+                if let Some(startup) = request.startup.as_ref() {
+                    let _ = startup.custody.set(Arc::clone(&custody));
+                }
                 let start = state.spawn_thread_owned(request, custody, publication);
                 match stop {
                     Some(stop) => tokio::select! {

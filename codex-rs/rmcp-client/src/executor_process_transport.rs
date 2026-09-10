@@ -276,8 +276,19 @@ impl Transport<RoleClient> for ExecutorProcessTransport {
     }
 
     async fn close(&mut self) -> std::result::Result<(), Self::Error> {
-        self.process.terminate().await.map_err(io::Error::other)?;
-        self.terminated = true;
+        // Subscribe before requesting termination so fast closure is consumed
+        // from retained replay rather than confused with request acceptance.
+        let mut events = self.process.subscribe_events();
+        tokio::time::timeout(
+            super::stdio_server_launcher::PROCESS_RETIREMENT_TIMEOUT,
+            async {
+                self.process.terminate().await.map_err(io::Error::other)?;
+                super::stdio_server_launcher::await_executor_process_close(&mut events).await
+            },
+        )
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "executor MCP close timed out"))??;
+        self.mark_closed_after_terminal_observation();
         Ok(())
     }
 }

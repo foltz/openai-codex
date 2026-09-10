@@ -4598,7 +4598,7 @@ fn success_flag_true_with_no_error_and_content_used() {
     assert_eq!(expected, got);
 }
 
-async fn open_thread_persistence(session: &mut Session) -> PathBuf {
+pub(super) async fn open_thread_persistence(session: &mut Session) -> PathBuf {
     let config = session.get_config().await;
     let live_thread = LiveThread::create(
         Arc::clone(&session.services.thread_store),
@@ -6386,6 +6386,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         task_admission_closed: std::sync::atomic::AtomicBool::new(false),
         task_joins: Default::default(),
         cleanup_owner: Default::default(),
+        failed_initialization_persistence: std::sync::atomic::AtomicBool::new(false),
         async_hook_results,
         input_queue: super::input_queue::InputQueue::new(),
         services,
@@ -8859,6 +8860,7 @@ where
         task_admission_closed: std::sync::atomic::AtomicBool::new(false),
         task_joins: Default::default(),
         cleanup_owner: Default::default(),
+        failed_initialization_persistence: std::sync::atomic::AtomicBool::new(false),
         async_hook_results,
         input_queue: super::input_queue::InputQueue::new(),
         services,

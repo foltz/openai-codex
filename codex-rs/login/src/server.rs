@@ -102,6 +102,7 @@ enum PersistenceOutcome {
     Failed,
     Panicked,
     Cancelled,
+    Unavailable,
 }
 
 #[derive(Default)]
@@ -147,11 +148,10 @@ impl PersistenceRegistry {
     }
 
     async fn wait(&self) -> PersistenceOutcome {
-        let work = self
-            .0
-            .lock()
-            .map(|state| state.work.clone())
-            .unwrap_or_default();
+        let work = match self.0.lock() {
+            Ok(state) if state.closed => state.work.clone(),
+            Ok(_) | Err(_) => return PersistenceOutcome::Unavailable,
+        };
         futures::future::join_all(work)
             .await
             .into_iter()
@@ -918,6 +918,9 @@ async fn persist_tokens_for_login(
         PersistenceOutcome::Failed => Err(io::Error::other("credential persistence failed")),
         PersistenceOutcome::Cancelled => Err(io::Error::other("credential persistence cancelled")),
         PersistenceOutcome::Panicked => Err(io::Error::other("credential persistence panicked")),
+        PersistenceOutcome::Unavailable => Err(io::Error::other(
+            "credential persistence custody unavailable",
+        )),
     }
 }
 

@@ -23,6 +23,8 @@ use codex_feedback::CodexFeedback;
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
 use tempfile::TempDir;
+use tokio::time::Duration;
+use tokio::time::timeout;
 use uuid::Uuid;
 
 async fn start_in_process_client(
@@ -70,9 +72,29 @@ async fn start_in_process_client(
     Ok(client)
 }
 
+async fn drain_pending_events(client: &mut in_process::InProcessClientHandle) -> Result<()> {
+    loop {
+        match timeout(Duration::from_millis(10), client.next_event()).await {
+            Ok(Some(_)) => {}
+            Ok(None) => anyhow::bail!("in-process event stream closed while draining"),
+            Err(_) => return Ok(()),
+        }
+    }
+}
+
+async fn assert_no_retention_event(client: &mut in_process::InProcessClientHandle) -> Result<()> {
+    assert!(
+        timeout(Duration::from_millis(50), client.next_event())
+            .await
+            .is_err(),
+        "retention transition must not publish an app-server event"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn retention_carrier_is_exact_and_uses_opaque_idempotent_handles() -> Result<()> {
-    let client = start_in_process_client(true).await?;
+    let mut client = start_in_process_client(true).await?;
 
     let started = client
         .request(ClientRequest::ThreadStart {
@@ -85,6 +107,7 @@ async fn retention_carrier_is_exact_and_uses_opaque_idempotent_handles() -> Resu
         .await?
         .map_err(|err| anyhow::anyhow!("thread/start should succeed: {err:?}"))?;
     let started: ThreadStartResponse = serde_json::from_value(started)?;
+    drain_pending_events(&mut client).await?;
 
     let acquire = |request_id| ClientRequest::ThreadRetentionAcquire {
         request_id: RequestId::Integer(request_id),
@@ -101,6 +124,7 @@ async fn retention_carrier_is_exact_and_uses_opaque_idempotent_handles() -> Resu
     let ThreadRetentionAcquireResponse::Acquired { grant_id } = first else {
         anyhow::bail!("first retention acquire must mint a grant");
     };
+    assert_no_retention_event(&mut client).await?;
     let second: ThreadRetentionAcquireResponse = serde_json::from_value(
         client
             .request(acquire(3))
@@ -155,6 +179,7 @@ async fn retention_carrier_is_exact_and_uses_opaque_idempotent_handles() -> Resu
             .map_err(|err| anyhow::anyhow!("retention release should succeed: {err:?}"))?,
     )?;
     assert_eq!(released, ThreadRetentionReleaseResponse::Released {});
+    assert_no_retention_event(&mut client).await?;
     let spent: ThreadRetentionReleaseResponse = serde_json::from_value(
         client
             .request(release(7, grant_id))

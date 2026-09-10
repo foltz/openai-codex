@@ -148,6 +148,17 @@ impl LocalStdioTransport {
     pub(super) fn exit_observer(&self) -> LocalProcessExitObserver {
         self.exit_observer.clone()
     }
+
+    /// The process owner has already proved exit under its absolute deadline.
+    /// Close either framing mode and consume the retained terminal observation
+    /// without introducing a second relative process timeout.
+    pub(super) async fn close_after_terminal_observation(&mut self) -> io::Result<()> {
+        match &mut self.transport {
+            StdioTransport::Legacy(transport) => transport.close().await?,
+            StdioTransport::V20260728(transport) => transport.close().await?,
+        }
+        self.exit_observer.clone().wait().await
+    }
 }
 
 impl Transport<RoleClient> for LocalStdioTransport {
@@ -181,10 +192,10 @@ impl Transport<RoleClient> for LocalStdioTransport {
             exit_observer.wait(),
         ).await {
             Ok(result) => result,
-            Err(_) => {
-                self.exit_observer.abort();
-                Err(io::Error::new(io::ErrorKind::TimedOut, "local MCP exit timed out"))
-            }
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "local MCP exit timed out",
+            )),
         }
     }
 }

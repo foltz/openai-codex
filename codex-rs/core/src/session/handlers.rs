@@ -380,11 +380,38 @@ pub(super) async fn cleanup_session(
         i64::try_from(turn_count).unwrap_or(0),
         &[],
     );
-    let persistence_failed = if let Some(live_thread) = sess.live_thread()
-        && let Err(error) = live_thread.shutdown().await
-    {
-        warn!("failed to shutdown thread persistence: {error}");
-        true
+    let persistence_failed = if let Some(live_thread) = sess.live_thread() {
+        let failed_initialization = sess
+            .failed_initialization_persistence
+            .load(std::sync::atomic::Ordering::Acquire);
+        let result = if failed_initialization {
+            live_thread.discard().await
+        } else {
+            live_thread.shutdown().await
+        };
+        if result.is_err() {
+            let persistence_operation = if failed_initialization {
+                "discard_failed_initialization"
+            } else {
+                "shutdown"
+            };
+            if failed_initialization {
+                warn!(
+                    persistence_operation,
+                    thread_id = %sess.thread_id,
+                    "failed initialization persistence disposal incomplete"
+                );
+            } else {
+                warn!(
+                    persistence_operation,
+                    thread_id = %sess.thread_id,
+                    "thread persistence disposal incomplete"
+                );
+            }
+            true
+        } else {
+            false
+        }
     } else {
         false
     };

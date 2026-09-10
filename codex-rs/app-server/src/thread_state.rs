@@ -69,6 +69,30 @@ pub(crate) struct RetentionPrincipalId {
     owner: RetentionPrincipalOwner,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum RetentionAction {
+    Acquired,
+    Released,
+    Unsubscribed,
+    Cleared,
+    ConnectionClosed,
+    ThreadRemoved,
+}
+
+fn record_retention_action(
+    thread_id: ThreadId,
+    principal: RetentionPrincipalId,
+    action: RetentionAction,
+) {
+    tracing::info!(
+        thread_id = %thread_id,
+        retention_principal_id = %principal.id,
+        retention_principal_owner = ?principal.owner(),
+        retention_action = ?action,
+        "thread retention authority changed"
+    );
+}
+
 impl RetentionPrincipalId {
     pub(crate) fn unclassified() -> Self {
         Self {
@@ -1164,12 +1188,22 @@ mod tests {
             )
             .await;
         manager.thread_state(thread_id).await;
-        assert!(matches!(
-            manager.acquire_retention(thread_id, principal).await,
-            Ok(RetentionAcquireOutcome::Acquired { .. })
-        ));
+        let RetentionAcquireOutcome::Acquired { grant_id } = manager
+            .acquire_retention(thread_id, principal)
+            .await
+            .expect("acquire should succeed")
+        else {
+            panic!("first acquire must mint a grant");
+        };
 
         manager.remove_thread_state(thread_id).await;
+        assert_eq!(
+            manager
+                .release_retention(thread_id, principal, &grant_id)
+                .await,
+            Ok(RetentionReleaseOutcome::NotHeld),
+            "a removed thread has no active grant"
+        );
         manager.thread_state(thread_id).await;
         assert!(
             matches!(
@@ -1177,6 +1211,52 @@ mod tests {
                 Ok(RetentionAcquireOutcome::Acquired { .. })
             ),
             "a reused thread id must not inherit a removed thread's grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_thread_with_stale_grant_index_fails_closed() {
+        let manager = ThreadStateManager::new();
+        let thread_id = ThreadId::new();
+        let principal = RetentionPrincipalId::connection_owned();
+        let grant_id = RetentionGrantId::new();
+        manager
+            .connection_initialized(
+                ConnectionId(1),
+                ConnectionCapabilities {
+                    retention_principal: Some(principal),
+                    ..ConnectionCapabilities::default()
+                },
+            )
+            .await;
+        {
+            let mut state = manager.state.lock().await;
+            state
+                .retention_grants_by_thread
+                .entry(thread_id)
+                .or_default()
+                .insert(principal, grant_id.clone());
+            state
+                .retention_threads_by_principal
+                .entry(principal)
+                .or_default()
+                .insert(thread_id);
+        }
+
+        assert_eq!(
+            manager
+                .release_retention(thread_id, principal, &grant_id)
+                .await,
+            Err(RetentionAuthorityError::AuthorityUnavailable)
+        );
+        let state = manager.state.lock().await;
+        assert_eq!(
+            state
+                .retention_grants_by_thread
+                .get(&thread_id)
+                .and_then(|grants| grants.get(&principal)),
+            Some(&grant_id),
+            "fail-closed release must not mutate stale custody"
         );
     }
 
@@ -1229,6 +1309,51 @@ mod tests {
         manager.remove_connection(connection).await;
         assert_eq!(
             manager.acquire_retention(thread_id, principal).await,
+            Err(RetentionAuthorityError::IneligiblePrincipal)
+        );
+    }
+
+    #[tokio::test]
+    async fn abrupt_disconnect_revokes_retention_indexes_before_retiring_authority() {
+        let manager = ThreadStateManager::new();
+        let thread_id = ThreadId::new();
+        let connection = ConnectionId(1);
+        let principal = RetentionPrincipalId::connection_owned();
+        manager
+            .connection_initialized(
+                connection,
+                ConnectionCapabilities {
+                    retention_principal: Some(principal),
+                    ..ConnectionCapabilities::default()
+                },
+            )
+            .await;
+        manager
+            .try_ensure_connection_subscribed(thread_id, connection, false)
+            .await
+            .expect("connection should subscribe");
+        let RetentionAcquireOutcome::Acquired { grant_id } = manager
+            .acquire_retention(thread_id, principal)
+            .await
+            .expect("acquire should succeed")
+        else {
+            panic!("first acquire must mint a grant");
+        };
+
+        manager.remove_connection(connection).await;
+
+        let state = manager.state.lock().await;
+        assert!(!state.retention_grants_by_thread.contains_key(&thread_id));
+        assert!(
+            !state
+                .retention_threads_by_principal
+                .contains_key(&principal)
+        );
+        drop(state);
+        assert_eq!(
+            manager
+                .release_retention(thread_id, principal, &grant_id)
+                .await,
             Err(RetentionAuthorityError::IneligiblePrincipal)
         );
     }
@@ -1409,6 +1534,7 @@ impl ThreadStateManagerInner {
         &mut self,
         thread_id: ThreadId,
         principal: RetentionPrincipalId,
+        action: RetentionAction,
     ) -> bool {
         let removed = self
             .retention_grants_by_thread
@@ -1428,6 +1554,9 @@ impl ThreadStateManagerInner {
             }
         }
         self.publish_retention(thread_id);
+        if removed.is_some() {
+            record_retention_action(thread_id, principal, action);
+        }
         removed.is_some()
     }
 
@@ -1438,9 +1567,16 @@ impl ThreadStateManagerInner {
             .unwrap_or_default();
         for thread_id in thread_ids {
             if let Some(grants) = self.retention_grants_by_thread.get_mut(&thread_id) {
-                grants.remove(&principal);
+                let removed = grants.remove(&principal);
                 if grants.is_empty() {
                     self.retention_grants_by_thread.remove(&thread_id);
+                }
+                if removed.is_some() {
+                    record_retention_action(
+                        thread_id,
+                        principal,
+                        RetentionAction::ConnectionClosed,
+                    );
                 }
             }
             self.publish_retention(thread_id);
@@ -1460,6 +1596,7 @@ impl ThreadStateManagerInner {
             if remove_principal_index {
                 self.retention_threads_by_principal.remove(&principal);
             }
+            record_retention_action(thread_id, principal, RetentionAction::ThreadRemoved);
         }
         self.publish_retention(thread_id);
     }
@@ -1652,6 +1789,7 @@ impl ThreadStateManager {
             .or_default()
             .insert(thread_id);
         state.publish_retention(thread_id);
+        record_retention_action(thread_id, principal, RetentionAction::Acquired);
         Ok(RetentionAcquireOutcome::Acquired { grant_id })
     }
 
@@ -1675,7 +1813,19 @@ impl ThreadStateManager {
             RetentionPrincipalOwner::ConnectionOwned | RetentionPrincipalOwner::ThreadOwned(_) => {}
         }
         if !state.threads.contains_key(&thread_id) {
-            return Err(RetentionAuthorityError::UnknownThread);
+            let stale_grant = state
+                .retention_grants_by_thread
+                .get(&thread_id)
+                .is_some_and(|grants| grants.contains_key(&principal))
+                || state
+                    .retention_threads_by_principal
+                    .get(&principal)
+                    .is_some_and(|thread_ids| thread_ids.contains(&thread_id));
+            return if stale_grant {
+                Err(RetentionAuthorityError::AuthorityUnavailable)
+            } else {
+                Ok(RetentionReleaseOutcome::NotHeld)
+            };
         }
         let Some(active_grant_id) = state
             .retention_grants_by_thread
@@ -1688,7 +1838,7 @@ impl ThreadStateManager {
         if active_grant_id != *grant_id {
             return Ok(RetentionReleaseOutcome::GrantMismatch);
         }
-        state.revoke_retention_grant(thread_id, principal);
+        state.revoke_retention_grant(thread_id, principal, RetentionAction::Released);
         Ok(RetentionReleaseOutcome::Released)
     }
 
@@ -2010,7 +2160,7 @@ impl ThreadStateManager {
                 .get(&connection_id)
                 .and_then(|capabilities| capabilities.retention_principal)
             {
-                state.revoke_retention_grant(thread_id, principal);
+                state.revoke_retention_grant(thread_id, principal, RetentionAction::Unsubscribed);
             }
             let changes = trusted_interactive
                 .then(|| state.remove_interactive_subscription(thread_id))
@@ -2082,7 +2232,11 @@ impl ThreadStateManager {
             // in this same mutex transaction; the successor never inherits
             // the predecessor's exact grant.
             if let Some(principal) = retention_principal {
-                state.revoke_retention_grant(predecessor_thread_id, principal);
+                state.revoke_retention_grant(
+                    predecessor_thread_id,
+                    principal,
+                    RetentionAction::Cleared,
+                );
             }
 
             let changes = if trusted_interactive {

@@ -445,6 +445,32 @@ impl SessionRetirementIo {
             .map_err(|_| CodexErr::InternalAgentDied)?;
         Ok(())
     }
+
+    pub(crate) async fn shutdown_and_wait(&self) -> CodexResult<()> {
+        match self.submit_shutdown().await {
+            Ok(()) => {}
+            Err(err) if matches!(err.details(), CodexErrorDetails::InternalAgentDied) => {}
+            Err(err) => return Err(err),
+        }
+        match self.session_loop_termination.clone().await {
+            SessionLoopOutcome::Normal => match self.session_loop_termination.cleanup_completed() {
+                // Synthetic fixtures and non-session workers (for example the
+                // MCP prewarm worker) have no session teardown owner and
+                // retain their legacy join-only behavior. The production
+                // submission loop attaches its owner at loop birth, so its
+                // missing or non-clean receipt cannot be normalized to
+                // success.
+                None => Ok(()),
+                Some(retirement::CleanupExecution::Finished {
+                    persistence_failed: false,
+                }) => Ok(()),
+                Some(_) => Err(CodexErr::InternalAgentDied),
+            },
+            SessionLoopOutcome::Cancelled | SessionLoopOutcome::Panicked => {
+                Err(CodexErr::InternalAgentDied)
+            }
+        }
+    }
 }
 
 /// Observed loop outcome, not a receipt for session resource cleanup.
@@ -1178,30 +1204,7 @@ impl SessionIo {
     }
 
     pub(crate) async fn shutdown_and_wait(&self) -> CodexResult<()> {
-        let session_loop_termination = self.session_loop_termination.clone();
-        match self.submit(Op::Shutdown).await {
-            Ok(_) => {}
-            Err(err) if matches!(err.details(), CodexErrorDetails::InternalAgentDied) => {}
-            Err(err) => return Err(err),
-        }
-        match session_loop_termination.clone().await {
-            SessionLoopOutcome::Normal => match session_loop_termination.cleanup_completed() {
-                // Synthetic fixtures and non-session workers (for example the
-                // MCP prewarm worker) have no session teardown owner and
-                // retain their legacy join-only behavior. The production
-                // submission loop attaches its owner at loop birth, so its
-                // missing or non-clean receipt cannot be normalized to
-                // success.
-                None => Ok(()),
-                Some(retirement::CleanupExecution::Finished {
-                    persistence_failed: false,
-                }) => Ok(()),
-                Some(_) => Err(CodexErr::InternalAgentDied),
-            },
-            SessionLoopOutcome::Cancelled | SessionLoopOutcome::Panicked => {
-                Err(CodexErr::InternalAgentDied)
-            }
-        }
+        self.retirement_io().shutdown_and_wait().await
     }
 
     pub(crate) async fn next_event(&self) -> CodexResult<Event> {

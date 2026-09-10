@@ -48,6 +48,7 @@ mod app_cmd;
 mod desktop_app;
 mod doctor;
 mod exec_server_telemetry;
+mod managed_auth_cmd;
 mod marketplace_cmd;
 mod mcp_cmd;
 mod migrate_rollouts;
@@ -138,6 +139,10 @@ enum Subcommand {
 
     /// Remove stored authentication credentials.
     Logout(LogoutCommand),
+
+    /// Internal same-image managed-auth protocol client used by repository-owned wrappers.
+    #[clap(hide = true, name = "__managed-auth-transition")]
+    ManagedAuthTransition(managed_auth_cmd::ManagedAuthCommand),
 
     /// Manage external MCP servers for Codex.
     Mcp(McpCli),
@@ -1377,6 +1382,9 @@ async fn cli_main(
             );
             run_logout(logout_cli.config_overrides).await;
         }
+        Some(Subcommand::ManagedAuthTransition(command)) => {
+            managed_auth_cmd::run(command).await?;
+        }
         Some(Subcommand::Completion(completion_cli)) => {
             reject_remote_mode_for_subcommand(
                 root_remote.as_deref(),
@@ -2192,6 +2200,7 @@ fn unsupported_subcommand_name_for_strict_config(
         Some(Subcommand::App(_)) => Some("app"),
         Some(Subcommand::Login(_)) => Some("login"),
         Some(Subcommand::Logout(_)) => Some("logout"),
+        Some(Subcommand::ManagedAuthTransition(_)) => None,
         Some(Subcommand::Completion(_)) => Some("completion"),
         Some(Subcommand::Update) => Some("update"),
         Some(Subcommand::Cloud(_)) => Some("cloud"),

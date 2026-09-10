@@ -918,7 +918,7 @@ pub(crate) async fn apply_bespoke_event_handling(
         }
         EventMsg::Error(ev) => {
             thread_watch_manager
-                .note_system_error(&conversation_id.to_string())
+                .note_system_error(&conversation_id.to_string(), &event_turn_id)
                 .await;
 
             let message = ev.message.clone();

@@ -29,6 +29,7 @@ pub(crate) struct ThreadWatchManager {
     /// permit here keeps the managed-transition drain closed until the core
     /// turn emits a terminal event.
     account_work_permits: Arc<StdMutex<HashMap<String, AccountWorkPermitThreadState>>>,
+    listener_generations: Arc<StdMutex<HashMap<String, u64>>>,
     next_account_work_permit_key: Arc<AtomicU64>,
 }
 
@@ -102,6 +103,7 @@ impl ThreadWatchManager {
             outgoing: None,
             running_turn_count_tx,
             account_work_permits: Arc::new(StdMutex::new(HashMap::new())),
+            listener_generations: Arc::new(StdMutex::new(HashMap::new())),
             next_account_work_permit_key: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -113,6 +115,7 @@ impl ThreadWatchManager {
             outgoing: Some(outgoing),
             running_turn_count_tx,
             account_work_permits: Arc::new(StdMutex::new(HashMap::new())),
+            listener_generations: Arc::new(StdMutex::new(HashMap::new())),
             next_account_work_permit_key: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -135,8 +138,49 @@ impl ThreadWatchManager {
 
     pub(crate) async fn remove_thread(&self, thread_id: &str) {
         let thread_id = thread_id.to_string();
-        self.mutate_and_publish(move |state| state.remove_thread(&thread_id))
+        self.mutate_and_publish(|state| state.remove_thread(&thread_id))
             .await;
+        self.listener_generations
+            .lock()
+            .expect("listener generation registry lock poisoned")
+            .remove(&thread_id);
+        self.release_account_work_permits(&thread_id);
+    }
+
+    /// Record which listener task currently owns the thread-level fallback
+    /// release. This is called while the ThreadState lock is held, before a
+    /// superseded listener can observe its cancellation.
+    pub(crate) fn register_listener_generation(&self, thread_id: &str, generation: u64) {
+        self.listener_generations
+            .lock()
+            .expect("listener generation registry lock poisoned")
+            .insert(thread_id.to_string(), generation);
+    }
+
+    /// Release permits when the listener task that still owns this generation
+    /// ends. A superseded listener must not release permits transferred to its
+    /// replacement.
+    pub(crate) fn release_account_work_permits_for_listener_generation(
+        &self,
+        thread_id: &str,
+        generation: u64,
+    ) {
+        let owns_generation = {
+            let mut generations = self
+                .listener_generations
+                .lock()
+                .expect("listener generation registry lock poisoned");
+            if generations.get(thread_id).copied() == Some(generation) {
+                generations.remove(thread_id);
+                true
+            } else {
+                false
+            }
+        };
+        if !owns_generation {
+            return;
+        }
+        self.release_account_work_permits(thread_id);
     }
 
     pub(crate) async fn loaded_status_for_thread(&self, thread_id: &str) -> ThreadStatus {
@@ -296,7 +340,7 @@ impl ThreadWatchManager {
         self.release_account_work_permits(thread_id);
     }
 
-    pub(crate) async fn note_system_error(&self, thread_id: &str) {
+    pub(crate) async fn note_system_error(&self, thread_id: &str, turn_id: &str) {
         self.update_runtime_for_thread(thread_id, |runtime| {
             runtime.running = false;
             runtime.pending_permission_requests = 0;
@@ -304,7 +348,7 @@ impl ThreadWatchManager {
             runtime.has_system_error = true;
         })
         .await;
-        self.release_account_work_permits(thread_id);
+        self.release_account_work_permit_for_turn(thread_id, turn_id);
     }
 
     async fn clear_active_state(&self, thread_id: &str, turn_id: &str) {
@@ -786,7 +830,9 @@ mod tests {
         manager.upsert_thread(INTERACTIVE_THREAD_ID).await;
 
         manager.note_turn_started(INTERACTIVE_THREAD_ID).await;
-        manager.note_system_error(INTERACTIVE_THREAD_ID).await;
+        manager
+            .note_system_error(INTERACTIVE_THREAD_ID, "turn-1")
+            .await;
 
         assert_eq!(
             manager
@@ -920,6 +966,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn superseded_listener_does_not_release_replacement_permit() {
+        let coordinator = crate::managed_transition::ManagedTransitionCoordinator::new();
+        let first_permit = coordinator
+            .try_acquire_account_work_permit()
+            .expect("the barrier starts open");
+        let second_permit = coordinator
+            .try_acquire_account_work_permit()
+            .expect("the barrier admits the replacement turn");
+        let manager = ThreadWatchManager::new();
+        manager.retain_account_work_permit(INTERACTIVE_THREAD_ID, first_permit);
+        manager.retain_account_work_permit(INTERACTIVE_THREAD_ID, second_permit);
+
+        manager.register_listener_generation(INTERACTIVE_THREAD_ID, 1);
+        manager.register_listener_generation(INTERACTIVE_THREAD_ID, 2);
+        manager.release_account_work_permits_for_listener_generation(INTERACTIVE_THREAD_ID, 1);
+        assert_eq!(
+            coordinator.account_work_permits().admitted_count(),
+            2,
+            "a superseded listener must leave replacement-owned permits intact"
+        );
+
+        manager.release_account_work_permits_for_listener_generation(INTERACTIVE_THREAD_ID, 2);
+        assert_eq!(coordinator.account_work_permits().admitted_count(), 0);
+    }
+
+    #[tokio::test]
     async fn stale_terminal_event_does_not_release_a_newer_turn_permit() {
         let coordinator = crate::managed_transition::ManagedTransitionCoordinator::new();
         let first_permit = coordinator
@@ -944,6 +1016,30 @@ mod tests {
         );
         manager
             .note_turn_completed(INTERACTIVE_THREAD_ID, "turn-2", false)
+            .await;
+        assert_eq!(coordinator.account_work_permits().admitted_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn unrelated_system_error_does_not_release_turn_permit() {
+        let coordinator = crate::managed_transition::ManagedTransitionCoordinator::new();
+        let permit = coordinator
+            .try_acquire_account_work_permit()
+            .expect("the barrier starts open");
+        let manager = ThreadWatchManager::new();
+        let key = manager.retain_account_work_permit(INTERACTIVE_THREAD_ID, permit);
+        manager.bind_account_work_permit(INTERACTIVE_THREAD_ID, key, "turn-1".to_string());
+
+        manager
+            .note_system_error(INTERACTIVE_THREAD_ID, "other-turn")
+            .await;
+        assert_eq!(
+            coordinator.account_work_permits().admitted_count(),
+            1,
+            "an unrelated error event must not release the active turn"
+        );
+        manager
+            .note_system_error(INTERACTIVE_THREAD_ID, "turn-1")
             .await;
         assert_eq!(coordinator.account_work_permits().admitted_count(), 0);
     }

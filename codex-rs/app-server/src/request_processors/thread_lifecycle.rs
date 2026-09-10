@@ -287,6 +287,9 @@ pub(super) async fn ensure_listener_task_running(
             return Ok(());
         };
         listener_task_context
+            .thread_watch_manager
+            .register_listener_generation(&conversation_id.to_string(), listener_generation);
+        listener_task_context
             .thread_state_manager
             .register_listener_command_tx(conversation_id, listener_command_tx);
         (listener_command_rx, listener_generation)
@@ -303,7 +306,13 @@ pub(super) async fn ensure_listener_task_running(
         ..
     } = listener_task_context;
     let outgoing_for_task = Arc::clone(&outgoing);
+    let permit_release_guard = ListenerPermitReleaseGuard::new(
+        thread_watch_manager.clone(),
+        conversation_id.to_string(),
+        listener_generation,
+    );
     tokio::spawn(async move {
+        let _permit_release_guard = permit_release_guard;
         loop {
             tokio::select! {
                 biased;
@@ -419,6 +428,41 @@ pub(super) async fn ensure_listener_task_running(
         }
     });
     Ok(())
+}
+
+/// The listener task is the last observer of a thread's core event stream.
+/// Release permits only if this task is still the current listener: a listener
+/// cancelled by replacement must leave ownership to its successor, while any
+/// task that actually ends without a terminal event must release its thread's
+/// transferred work even if a new select arm is added later.
+struct ListenerPermitReleaseGuard {
+    thread_watch_manager: ThreadWatchManager,
+    conversation_id: String,
+    listener_generation: u64,
+}
+
+impl ListenerPermitReleaseGuard {
+    fn new(
+        thread_watch_manager: ThreadWatchManager,
+        conversation_id: String,
+        listener_generation: u64,
+    ) -> Self {
+        Self {
+            thread_watch_manager,
+            conversation_id,
+            listener_generation,
+        }
+    }
+}
+
+impl Drop for ListenerPermitReleaseGuard {
+    fn drop(&mut self) {
+        self.thread_watch_manager
+            .release_account_work_permits_for_listener_generation(
+                &self.conversation_id,
+                self.listener_generation,
+            );
+    }
 }
 
 pub(super) async fn wait_for_thread_shutdown(thread: &Arc<CodexThread>) -> ThreadShutdownResult {

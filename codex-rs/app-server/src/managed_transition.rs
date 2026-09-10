@@ -751,7 +751,11 @@ impl ManagedTransitionCoordinator {
         envelope: &TransitionEnvelope,
         target_evidence_matches: bool,
     ) -> Result<bool, ManagedTransitionRefusal> {
-        if !state.auth_authority_available {
+        // A pending reset is the one narrowly-scoped recovery owner that may
+        // proceed after terminal authority verification latched the
+        // coordinator unavailable. All ordinary admissions remain refused
+        // until that exact owner completes.
+        if !state.auth_authority_available && state.pending_reset.is_none() {
             return Err(authoritative_auth_unavailable(state, envelope));
         }
 
@@ -1352,11 +1356,12 @@ impl ManagedTransitionCoordinator {
         }
         // The repository-owned writer-first command uses an empty transition
         // id to obtain the current CAS baseline before it has an id to read.
-        // A live transition or pre-install quarantine must be observed as a
+        // A live transition, pending reset, or pre-install quarantine must be observed as a
         // refusal rather than exposing a baseline that would let the writer
         // run while the barrier already has an owner.
         if envelope.transition_id.is_empty() {
             if state.active.is_some()
+                || state.pending_reset.is_some()
                 || state.completed.values().any(|record| {
                     record.phase == ManagedTransitionPhase::Quarantined && !record.reset_pending
                 })
@@ -1436,7 +1441,7 @@ impl ManagedTransitionCoordinator {
                     &state,
                     &envelope,
                     ManagedTransitionRefusalKind::LateCancellation,
-                    true,
+                    state.auth_authority_available,
                 ));
             }
             state.transition_revision += 1;
@@ -1484,7 +1489,7 @@ impl ManagedTransitionCoordinator {
             return Ok(status);
         }
 
-        if !state.auth_authority_available {
+        if !state.auth_authority_available && state.pending_reset.is_none() {
             return Err(authoritative_auth_unavailable(&state, &envelope));
         }
 
@@ -1753,7 +1758,7 @@ impl ManagedTransitionCoordinator {
                 false,
             ));
         }
-        if !state.auth_authority_available {
+        if !state.auth_authority_available && state.pending_reset.is_none() {
             return Err(refusal_for_transition_id(
                 &state,
                 transition_id,
@@ -1964,8 +1969,18 @@ impl ManagedTransitionCoordinator {
         // reset, revalidate it, and finish it. The old quarantined record stays
         // immutable history. Pre-install cancellation has its own guarded
         // reopen path; it cannot discharge an installed pending reset.
+        let recovering_authority_latch = next_phase == ManagedTransitionPhase::Succeeded
+            && state.pending_reset.is_some()
+            && !state.auth_authority_available;
         if next_phase == ManagedTransitionPhase::Succeeded {
             state.pending_reset = None;
+            if recovering_authority_latch {
+                // A successful exact pending-reset recovery proves the
+                // authority that was unavailable at quarantine is usable
+                // again. Ordinary success cannot reach this branch with the
+                // latch cleared because admission remains refused.
+                state.auth_authority_available = true;
+            }
             if let Some((reserved, notification)) = projection {
                 reserved.publish(notification);
             }
@@ -2323,12 +2338,63 @@ mod tests {
             .read(ReadManagedTransitionParams {
                 contract_version: MANAGED_AUTH_TRANSITION_CONTRACT_VERSION,
                 transition_id: String::new(),
-                process_instance_id: process_id,
+                process_instance_id: process_id.clone(),
             })
             .await
             .unwrap();
         assert_eq!(after_cancel.phase, ManagedTransitionPhase::Idle);
         assert_eq!(after_cancel.transition_revision, 2);
+    }
+
+    #[tokio::test]
+    async fn empty_read_refuses_pending_reset_owner_without_active_record() {
+        let coordinator = ManagedTransitionCoordinator::new();
+        let process_id = coordinator.process_instance_id().await;
+        coordinator.state.lock().await.pending_reset = Some(PendingResetRecovery {
+            owner_transition_id: "pending-reset".to_owned(),
+            intent: ManagedTransitionIntent::AdoptManagedAuth,
+            auth_fingerprint: None,
+            auth_revision: 0,
+        });
+
+        let refusal = coordinator
+            .read(ReadManagedTransitionParams {
+                contract_version: MANAGED_AUTH_TRANSITION_CONTRACT_VERSION,
+                transition_id: String::new(),
+                process_instance_id: process_id,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refusal.kind,
+            ManagedTransitionRefusalKind::ConcurrentTransition
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_reset_admission_can_cross_a_latched_authority_only_for_matching_recovery() {
+        let coordinator = ManagedTransitionCoordinator::new();
+        let process_id = coordinator.process_instance_id().await;
+        let current_fingerprint = account_fingerprint("account-b");
+        {
+            let mut state = coordinator.state.lock().await;
+            state.auth_authority_available = false;
+            state.auth_fingerprint = Some(current_fingerprint.clone());
+            state.pending_reset = Some(PendingResetRecovery {
+                owner_transition_id: "original".to_owned(),
+                intent: ManagedTransitionIntent::AdoptManagedAuth,
+                auth_fingerprint: Some(current_fingerprint.clone()),
+                auth_revision: 0,
+            });
+        }
+
+        let mut recovery = request(process_id, "recovery");
+        recovery.expected_auth_fingerprint = Some(current_fingerprint);
+        assert_eq!(
+            coordinator.admit(recovery).await.unwrap().phase,
+            ManagedTransitionPhase::Admitted
+        );
+        assert!(coordinator.try_acquire_account_work_permit().is_none());
     }
 
     #[tokio::test]
@@ -4048,6 +4114,11 @@ mod tests {
                 winner
             );
 
+            // Model the terminal authority-verification failure that leaves
+            // this installed result quarantined: only a request matching the
+            // pending owner's intent and fingerprint may enter recovery while
+            // ordinary new work remains blocked.
+            coordinator.state.lock().await.auth_authority_available = false;
             resets.fails.store(false, Ordering::SeqCst);
             let mut third =
                 request_at_revision(process.clone(), "final-retry", failed.transition_revision);
@@ -4055,6 +4126,27 @@ mod tests {
             third.expected_auth_revision = failed.auth_revision;
             third.expected_auth_fingerprint = failed.result_auth_fingerprint.clone();
             third.intended_result_auth_fingerprint = failed.result_auth_fingerprint.clone();
+            let mut ordinary = third.clone();
+            ordinary.transition_id = "ordinary-while-authority-unavailable".to_owned();
+            ordinary.intent = match intent {
+                ManagedTransitionIntent::AdoptManagedAuth => {
+                    ManagedTransitionIntent::AdoptManagedLogout
+                }
+                ManagedTransitionIntent::AdoptManagedLogout => {
+                    ManagedTransitionIntent::AdoptManagedAuth
+                }
+            };
+            ordinary.intended_result_auth_fingerprint = match ordinary.intent {
+                ManagedTransitionIntent::AdoptManagedAuth => {
+                    Some(account_fingerprint("ordinary-account"))
+                }
+                ManagedTransitionIntent::AdoptManagedLogout => None,
+            };
+            assert_eq!(
+                coordinator.admit(ordinary).await.unwrap_err().kind,
+                ManagedTransitionRefusalKind::StaleAuthFingerprint,
+                "a cleared authority latch admits only a matching pending-reset recovery"
+            );
             let StartManagedTransitionResponse::Accepted { status: success } =
                 coordinator.start_dispatch(third, true).await
             else {
@@ -4063,7 +4155,13 @@ mod tests {
             assert_eq!(success.phase, ManagedTransitionPhase::Succeeded);
             assert_eq!(success.auth_revision, original.auth_revision);
             assert_eq!(resets.calls.load(Ordering::SeqCst), 3);
-            assert!(coordinator.state.lock().await.pending_reset.is_none());
+            let state = coordinator.state.lock().await;
+            assert!(state.pending_reset.is_none());
+            assert!(
+                state.auth_authority_available,
+                "successful pending-reset recovery must restore the authority latch"
+            );
+            drop(state);
             assert!(coordinator.try_acquire_account_work_permit().is_some());
             assert_eq!(
                 coordinator

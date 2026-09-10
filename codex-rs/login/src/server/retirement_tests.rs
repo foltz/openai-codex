@@ -1,6 +1,7 @@
 use super::*;
 use pretty_assertions::assert_eq;
-use std::io::{Read, Write};
+use std::io::Read;
+use std::io::Write;
 use std::net::TcpStream;
 use std::time::Duration;
 
@@ -94,7 +95,11 @@ async fn production_cancel_response_is_delivered_before_login_finishes() {
     .await
     .unwrap();
     assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
-    assert!(response.to_ascii_lowercase().contains("connection: close\r\n"));
+    assert!(
+        response
+            .to_ascii_lowercase()
+            .contains("connection: close\r\n")
+    );
     assert!(response.ends_with("Login cancelled"));
     assert!(server.block_until_done().await.is_err());
 }

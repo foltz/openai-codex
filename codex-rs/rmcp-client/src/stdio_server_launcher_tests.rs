@@ -7,6 +7,8 @@ use codex_exec_server::ReadResponse;
 use codex_exec_server::WriteResponse;
 use pretty_assertions::assert_eq;
 use std::io::Write;
+#[cfg(unix)]
+use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 
 const READY: &str = "executor-retirement-fixture-ready";
@@ -205,5 +207,221 @@ async fn real_executor_concurrent_and_repeated_retirement_retains_terminal_proof
         ),
         (1, 1)
     );
+    Ok(())
+}
+
+#[cfg(unix)]
+struct GatedLocalLauncher {
+    launcher: LocalStdioServerLauncher,
+    entered: Mutex<Option<tokio::sync::oneshot::Sender<StdioServerProcessHandle>>>,
+    gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    launches: AtomicUsize,
+}
+
+#[cfg(unix)]
+impl private::Sealed for GatedLocalLauncher {}
+
+#[cfg(unix)]
+impl StdioServerLauncher for GatedLocalLauncher {
+    fn launch(
+        &self,
+        command: StdioServerCommand,
+    ) -> BoxFuture<'static, io::Result<StdioServerTransport>> {
+        self.launches.fetch_add(1, Ordering::Relaxed);
+        let launched = self.launcher.launch(command);
+        let entered = self.entered.lock().unwrap().take();
+        let gate = self.gate.lock().unwrap().take();
+        async move {
+            let transport = launched.await?;
+            if let Some(entered) = entered {
+                entered
+                    .send(transport.process_handle())
+                    .map_err(|_| io::Error::other("launch observer gone"))?;
+            }
+            if let Some(gate) = gate {
+                gate.await
+                    .map_err(|_| io::Error::other("launch gate dropped"))?;
+            }
+            Ok(transport)
+        }
+        .boxed()
+    }
+}
+
+#[cfg(unix)]
+fn local_group(handle: &StdioServerProcessHandle) -> u32 {
+    let StdioServerProcessKind::Local {
+        terminator: Some(terminator),
+        ..
+    } = &handle.inner.kind
+    else {
+        panic!("real local launcher must own its process group")
+    };
+    terminator.process_group_id
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_stdio_constructor_keeps_launched_child_in_external_retirement_registry()
+-> anyhow::Result<()> {
+    use crate::retirement::PhysicalRetirementOutcome;
+    use crate::retirement::PhysicalRetirementReport;
+    use crate::retirement::RmcpClientRetirement;
+    use crate::rmcp_client::RmcpClient;
+    for mode in [McpProtocolMode::Legacy, McpProtocolMode::V20260728] {
+        let home = tempfile::tempdir()?;
+        let registry = RmcpClientRetirement::default();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let launcher = Arc::new(GatedLocalLauncher {
+            launcher: LocalStdioServerLauncher::new(home.path().to_path_buf()),
+            entered: Mutex::new(Some(entered_tx)),
+            gate: Mutex::new(Some(release_rx)),
+            launches: AtomicUsize::new(0),
+        });
+        let launch = launcher.clone();
+        let owner = registry.clone();
+        let env = (mode == McpProtocolMode::V20260728).then(|| {
+            HashMap::from([(
+                OsString::from("CODEX_MCP_PROTOCOL_VERSION"),
+                OsString::from("2026-07-28"),
+            )])
+        });
+        let observer = tokio::spawn(async move {
+            RmcpClient::new_stdio_client_in_retirement(
+                "sh".into(),
+                vec!["-c".into(), "exec sleep 30".into()],
+                env,
+                &[],
+                /*cwd*/ None,
+                launch,
+                mode,
+                owner,
+            )
+            .await
+        });
+        let process = tokio::time::timeout(Duration::from_secs(5), entered_rx).await??;
+        let group = local_group(&process);
+        assert!(codex_utils_pty::process_group::process_group_exists(group)?);
+        observer.abort();
+        assert!(
+            observer
+                .await
+                .err()
+                .is_some_and(|error| error.is_cancelled())
+        );
+        release_tx.send(()).unwrap();
+        let report = registry
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(10))
+            .await;
+        let group_gone_before_cleanup =
+            !codex_utils_pty::process_group::process_group_exists(group)?;
+        let terminal_before_cleanup = process.inner.terminal_observed.load(Ordering::Acquire);
+        // Cleanup is independent of the assertion, so a regression cannot
+        // strand the fixture process merely because the report is wrong.
+        let cleanup = process.terminate().await;
+        assert_eq!(
+            report,
+            PhysicalRetirementReport {
+                attempts: vec![(0, PhysicalRetirementOutcome::Complete)]
+            }
+        );
+        cleanup?;
+        assert!(
+            group_gone_before_cleanup && terminal_before_cleanup,
+            "registry must prove group exit before independent cleanup"
+        );
+        assert!(!codex_utils_pty::process_group::process_group_exists(
+            group
+        )?);
+        assert_eq!(launcher.launches.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            registry
+                .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(1))
+                .await,
+            report
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_real_stdio_handshake_has_one_attempt_and_retires_child_group() -> anyhow::Result<()>
+{
+    use crate::retirement::PhysicalRetirementOutcome;
+    use crate::retirement::PhysicalRetirementReport;
+    use crate::retirement::RmcpClientRetirement;
+    use crate::rmcp_client::RmcpClient;
+    use rmcp::model::ClientCapabilities;
+    use rmcp::model::Implementation;
+    use rmcp::model::InitializeRequestParams;
+    for mode in [McpProtocolMode::Legacy, McpProtocolMode::V20260728] {
+        let home = tempfile::tempdir()?;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let launcher = Arc::new(GatedLocalLauncher {
+            launcher: LocalStdioServerLauncher::new(home.path().to_path_buf()),
+            entered: Mutex::new(Some(entered_tx)),
+            gate: Mutex::new(None),
+            launches: AtomicUsize::new(0),
+        });
+        let env = (mode == McpProtocolMode::V20260728).then(|| {
+            HashMap::from([(
+                OsString::from("CODEX_MCP_PROTOCOL_VERSION"),
+                OsString::from("2026-07-28"),
+            )])
+        });
+        let client = RmcpClient::new_stdio_client_in_retirement(
+            "sh".into(),
+            vec!["-c".into(), "IFS= read -r request; exit 7".into()],
+            env,
+            &[],
+            /*cwd*/ None,
+            launcher.clone(),
+            mode,
+            RmcpClientRetirement::default(),
+        )
+        .await?;
+        let process = entered_rx.await?;
+        let group = local_group(&process);
+        assert!(codex_utils_pty::process_group::process_group_exists(group)?);
+        let initialized = client
+            .initialize(
+                InitializeRequestParams::new(
+                    ClientCapabilities::default(),
+                    Implementation::new("retirement-test", "1"),
+                ),
+                Some(Duration::from_secs(5)),
+                Box::new(|_, _| async { anyhow::bail!("unexpected elicitation") }.boxed()),
+            )
+            .await;
+        let report = client
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(10))
+            .await;
+        let group_gone_before_cleanup =
+            !codex_utils_pty::process_group::process_group_exists(group)?;
+        let terminal_before_cleanup = process.inner.terminal_observed.load(Ordering::Acquire);
+        let cleanup = process.terminate().await;
+        assert!(initialized.is_err());
+        assert!(
+            group_gone_before_cleanup && terminal_before_cleanup,
+            "client retirement must prove group exit before independent cleanup"
+        );
+        assert_eq!(
+            report,
+            PhysicalRetirementReport {
+                attempts: vec![(0, PhysicalRetirementOutcome::Complete)]
+            }
+        );
+        cleanup?;
+        assert!(!codex_utils_pty::process_group::process_group_exists(
+            group
+        )?);
+        assert_eq!(
+            launcher.launches.load(Ordering::Relaxed),
+            1,
+            "stdio handshake failure must not relaunch"
+        );
+    }
     Ok(())
 }

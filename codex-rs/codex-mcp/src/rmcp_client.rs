@@ -181,6 +181,7 @@ struct CodexAppsStartupStatusContext {
 }
 
 pub(crate) struct CodexAppsStartupReconnect {
+    retirement_ticket: Option<crate::runtime_retirement::RuntimeTaskTicket>,
     factory: Arc<dyn Fn() -> ManagedClientFuture + Send + Sync>,
     state: StdMutex<CodexAppsStartupReconnectState>,
     startup_status_context: Option<CodexAppsStartupStatusContext>,
@@ -190,6 +191,7 @@ impl CodexAppsStartupReconnect {
     pub(crate) fn new(factory: Arc<dyn Fn() -> ManagedClientFuture + Send + Sync>) -> Self {
         Self {
             factory,
+            retirement_ticket: None,
             state: StdMutex::new(CodexAppsStartupReconnectState::default()),
             startup_status_context: None,
         }
@@ -206,6 +208,14 @@ impl CodexAppsStartupReconnect {
             server_name,
             tx_event,
         });
+        self
+    }
+
+    fn with_retirement_ticket(
+        mut self,
+        ticket: crate::runtime_retirement::RuntimeTaskTicket,
+    ) -> Self {
+        self.retirement_ticket = Some(ticket);
         self
     }
 
@@ -236,7 +246,7 @@ impl CodexAppsStartupReconnect {
         }
 
         let reconnect = Arc::clone(self);
-        tokio::spawn(async move {
+        let task = async move {
             let result = (reconnect.factory)().await;
             let startup_status_context = reconnect.startup_status_context.clone();
             let recovered = {
@@ -280,7 +290,17 @@ impl CodexAppsStartupReconnect {
                     })
                     .await;
             }
-        });
+            crate::runtime_retirement::RuntimeTaskOutcome::Complete
+        };
+        if let Some(ticket) = &self.retirement_ticket {
+            if let Ok(task) = ticket.register(move || task) {
+                tokio::spawn(task);
+            }
+        } else {
+            // Synthetic reconnect fixtures have no physical runtime owner.
+            #[cfg(test)]
+            tokio::spawn(task);
+        }
     }
 }
 
@@ -293,6 +313,7 @@ fn codex_apps_reconnect_backoff(consecutive_failures: u32) -> Duration {
 
 #[derive(Clone)]
 struct ManagedClientStartup {
+    retirement: codex_rmcp_client::RmcpClientRetirement,
     server_name: String,
     server: EffectiveMcpServer,
     store_mode: OAuthCredentialsStoreMode,
@@ -324,6 +345,7 @@ impl ManagedClientStartup {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         let Self {
+            retirement,
             server_name,
             server,
             store_mode,
@@ -375,6 +397,7 @@ impl ManagedClientStartup {
                         resolved_environment,
                         runtime_auth_provider,
                         protocol_mode,
+                        retirement,
                     ),
                 )
                 .await
@@ -490,6 +513,8 @@ impl AsyncManagedClient {
         protocol_mode: McpProtocolMode,
         catalog_item_limit: usize,
         canonical_thread_id: Option<String>,
+        retirement: codex_rmcp_client::RmcpClientRetirement,
+        retirement_ticket: crate::runtime_retirement::RuntimeTaskTicket,
     ) -> Self {
         let is_codex_apps_mcp_server = server_name == CODEX_APPS_MCP_SERVER_NAME;
         let reconnect_server_name = server_name.clone();
@@ -504,6 +529,7 @@ impl AsyncManagedClient {
         let startup_complete = Arc::new(AtomicBool::new(false));
         let server_capabilities = Arc::new(StdMutex::new(None));
         let startup = Arc::new(ManagedClientStartup {
+            retirement,
             server_name,
             server,
             store_mode,
@@ -531,6 +557,7 @@ impl AsyncManagedClient {
             let startup = Arc::clone(&startup);
             Arc::new(
                 CodexAppsStartupReconnect::new(Arc::new(move || startup.start()))
+                    .with_retirement_ticket(retirement_ticket)
                     .with_startup_status_context(
                         startup_submit_id,
                         reconnect_server_name,
@@ -1349,6 +1376,7 @@ pub(crate) async fn make_rmcp_client(
     resolved_environment: std::result::Result<Option<Arc<Environment>>, String>,
     runtime_auth_provider: Option<SharedAuthProvider>,
     protocol_mode: McpProtocolMode,
+    retirement: codex_rmcp_client::RmcpClientRetirement,
 ) -> Result<RmcpClient, StartupOutcomeError> {
     let config = server.config().clone();
     if matches!(config.auth, McpServerAuth::EmaAuth) {
@@ -1404,7 +1432,7 @@ pub(crate) async fn make_rmcp_client(
             };
 
             let cwd = cwd.map(codex_utils_path_uri::LegacyAppPathString::into_string);
-            RmcpClient::new_stdio_client_with_protocol_mode(
+            RmcpClient::new_stdio_client_in_retirement(
                 command_os,
                 args_os,
                 env_os,
@@ -1412,6 +1440,7 @@ pub(crate) async fn make_rmcp_client(
                 cwd,
                 launcher,
                 protocol_mode,
+                retirement,
             )
             .await
             .map_err(|err| StartupOutcomeError::from(anyhow!(err)))
@@ -1465,7 +1494,7 @@ pub(crate) async fn make_rmcp_client(
             } else {
                 StreamableHttpRedirectMode::Legacy
             };
-            RmcpClient::new_streamable_http_client_with_protocol_mode_and_redirect_mode(
+            RmcpClient::new_streamable_http_client_in_retirement(
                 oauth_credential_name.as_ref(),
                 &url,
                 resolved_bearer_token,
@@ -1478,6 +1507,7 @@ pub(crate) async fn make_rmcp_client(
                 protocol_mode,
                 redirect_mode,
                 oauth_refresh_mode,
+                retirement,
             )
             .await
             .map_err(StartupOutcomeError::from)

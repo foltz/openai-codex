@@ -313,20 +313,26 @@ pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
                                 None
                             }
                             HandledRequest::ResponseAndExit { response, result } => {
-                                Some(match req.respond(response).await {
-                                    Ok(()) => result.map(|()| callback_result),
-                                    Err(err) => Err(err),
-                                })
+                                // Response delivery is a separate HTTP-retirement
+                                // limb. The request owner records a failed write in
+                                // its typed report; it must not overwrite a login
+                                // result that may already include persisted
+                                // credentials.
+                                let _ = req.respond(response).await;
+                                Some(result.map(|()| callback_result))
                             }
                             HandledRequest::RedirectAndExit { header, result } => {
-                                Some(match req.respond(response_with_headers(
-                                    StatusCode::FOUND,
-                                    vec![header],
-                                    Vec::new(),
-                                )).await {
-                                    Ok(()) => Ok(result),
-                                    Err(err) => Err(err),
-                                })
+                                // Keep redirect/login classification independent
+                                // from the response-flush receipt, which is
+                                // retained by the HTTP owner above.
+                                let _ = req
+                                    .respond(response_with_headers(
+                                        StatusCode::FOUND,
+                                        vec![header],
+                                        Vec::new(),
+                                    ))
+                                    .await;
+                                Some(Ok(result))
                             }
                         };
 

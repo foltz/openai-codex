@@ -4,7 +4,6 @@ use crate::realtime_conversation::handle_speech as handle_realtime_conversation_
 use crate::realtime_conversation::handle_start as handle_realtime_conversation_start;
 use crate::realtime_conversation::handle_text as handle_realtime_conversation_text;
 use async_channel::Receiver;
-use codex_otel::set_parent_from_w3c_trace_context;
 use codex_protocol::protocol::Submission;
 use tracing::Instrument;
 use tracing::debug_span;
@@ -918,7 +917,17 @@ Approved action:
 pub(super) fn submission_dispatch_span(sub: &Submission) -> tracing::Span {
     let op_name = sub.op.kind();
     let span_name = format!("op.dispatch.{op_name}");
-    let dispatch_span = match &sub.op {
+    let parent = sub
+        .trace
+        .as_ref()
+        .and_then(codex_otel::context_from_w3c_trace_context);
+    if sub.trace.is_some() && parent.is_none() {
+        warn!(
+            submission.id = sub.id.as_str(),
+            "ignoring invalid submission trace carrier"
+        );
+    }
+    codex_otel::span_with_parent_context(parent, || match &sub.op {
         Op::RealtimeConversationAudio(_) => {
             debug_span!(
                 "submission_dispatch",
@@ -933,14 +942,5 @@ pub(super) fn submission_dispatch_span(sub: &Submission) -> tracing::Span {
             submission.id = sub.id.as_str(),
             codex.op = op_name
         ),
-    };
-    if let Some(trace) = sub.trace.as_ref()
-        && !set_parent_from_w3c_trace_context(&dispatch_span, trace)
-    {
-        warn!(
-            submission.id = sub.id.as_str(),
-            "ignoring invalid submission trace carrier"
-        );
-    }
-    dispatch_span
+    })
 }

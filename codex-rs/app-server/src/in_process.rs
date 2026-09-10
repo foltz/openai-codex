@@ -459,6 +459,7 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
         let (processor_tx, mut processor_rx) = mpsc::channel::<ProcessorCommand>(channel_capacity);
         let mut processor_handle = tokio::spawn(async move {
             let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
+                telemetry_reset: crate::otel_reset_control::TelemetryResetControl::default(),
                 outgoing: Arc::clone(&processor_outgoing),
                 analytics_events_client,
                 arg0_paths: args.arg0_paths,
@@ -872,12 +873,20 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::print_stderr,
+        reason = "fixed test-only phase markers retained by nextest on timeout"
+    )]
     async fn in_process_start_uses_requested_session_source_for_thread_start() {
         for (requested_source, expected_source) in [
             (SessionSource::Cli, ApiSessionSource::Cli),
             (SessionSource::Exec, ApiSessionSource::Exec),
         ] {
+            // Nextest preserves these markers on timeout. Do not replace the
+            // existing deadline with per-phase budgets just to diagnose it.
+            eprintln!("session-source fixture {expected_source:?}: starting client");
             let client = start_test_client(requested_source).await;
+            eprintln!("session-source fixture {expected_source:?}: requesting thread/start");
             let response = client
                 .request(ClientRequest::ThreadStart {
                     request_id: RequestId::Integer(2),
@@ -892,10 +901,12 @@ mod tests {
             let parsed: ThreadStartResponse =
                 serde_json::from_value(response).expect("thread/start response should parse");
             assert_eq!(parsed.thread.source, expected_source);
+            eprintln!("session-source fixture {expected_source:?}: shutting down client");
             client
                 .shutdown()
                 .await
                 .expect("in-process runtime should shutdown cleanly");
+            eprintln!("session-source fixture {expected_source:?}: lifecycle complete");
         }
     }
 

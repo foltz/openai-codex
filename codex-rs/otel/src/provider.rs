@@ -1,7 +1,6 @@
 use crate::config::OtelExporter;
 use crate::config::OtelHttpProtocol;
 use crate::config::OtelSettings;
-use crate::config::StatsigMetricsSettings;
 use crate::metrics::MetricsClient;
 use crate::metrics::MetricsConfig;
 use crate::targets::is_log_export_target;
@@ -42,8 +41,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::io;
 use std::mem::ManuallyDrop;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
+use std::sync::Mutex;
 use std::time::Duration;
 use tracing::debug;
 use tracing_subscriber::Layer;
@@ -63,12 +61,27 @@ pub struct OtelProvider {
     pub tracer_provider: Option<SdkTracerProvider>,
     pub tracer: Option<Tracer>,
     pub metrics: Option<MetricsClient>,
-    shutdown_started: AtomicBool,
+    pub(crate) trace_receipt: Option<crate::trace_exporter_retirement::ExporterReceipt>,
+    pub(crate) log_receipt: Option<crate::trace_exporter_retirement::ExporterReceipt>,
+    shutdown_result: Mutex<Option<Result<(), OtelShutdownError>>>,
+}
+
+/// Fixed exporter-shutdown failure categories, without backend diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum OtelShutdownError {
+    #[error("telemetry shutdown state unavailable")]
+    StateUnavailable,
+    #[error("trace exporter shutdown failed")]
+    Traces,
+    #[error("metrics exporter shutdown failed")]
+    Metrics,
+    #[error("log exporter shutdown failed")]
+    Logs,
 }
 
 struct ShutdownWorker {
     provider: ManuallyDrop<OtelProvider>,
-    completed_tx: tokio::sync::oneshot::Sender<()>,
+    completed_tx: tokio::sync::oneshot::Sender<Result<(), OtelShutdownError>>,
 }
 
 #[derive(Debug)]
@@ -87,19 +100,41 @@ impl opentelemetry::trace::Tracer for GlobalTracer {
 impl OtelProvider {
     /// Flushes and shuts down configured exporters at most once.
     pub fn shutdown(&self) {
-        if self.shutdown_started.swap(/*val*/ true, Ordering::AcqRel) {
-            return;
-        }
+        let _ = self.shutdown_checked();
+    }
 
+    /// Synchronously stop every configured exporter, retaining the first
+    /// failure for all later observers. Run on a blocking worker, not an async
+    /// executor thread. A returned error never skips the remaining exporters;
+    /// an exporter panic interrupts shutdown and poisons its retained state.
+    pub fn shutdown_checked(&self) -> Result<(), OtelShutdownError> {
+        let mut completed = self
+            .shutdown_result
+            .lock()
+            .map_err(|_| OtelShutdownError::StateUnavailable)?;
+        if let Some(result) = *completed {
+            return result;
+        }
+        let mut result = Ok(());
         if let Some(tracer_provider) = &self.tracer_provider {
-            let _ = tracer_provider.shutdown();
+            result = result.and(
+                tracer_provider
+                    .shutdown()
+                    .map_err(|_| OtelShutdownError::Traces),
+            );
         }
         if let Some(metrics) = &self.metrics {
-            let _ = metrics.shutdown();
+            result = result.and(
+                metrics
+                    .shutdown_for_provider()
+                    .map_err(|_| OtelShutdownError::Metrics),
+            );
         }
         if let Some(logger) = &self.logger {
-            let _ = logger.shutdown();
+            result = result.and(logger.shutdown().map_err(|_| OtelShutdownError::Logs));
         }
+        *completed = Some(result);
+        result
     }
 
     /// Shuts down exporters on a detached thread within an external time budget.
@@ -109,9 +144,9 @@ impl OtelProvider {
                 .name("codex-otel-shutdown".to_string())
                 .spawn(move || {
                     let provider = ManuallyDrop::into_inner(worker.provider);
-                    provider.shutdown();
+                    let result = provider.shutdown_checked();
                     drop(provider);
-                    let _ = worker.completed_tx.send(());
+                    let _ = worker.completed_tx.send(result);
                 })
         })
         .await
@@ -135,7 +170,7 @@ impl OtelProvider {
         let _shutdown_worker = spawn(worker)?;
 
         match tokio::time::timeout(timeout, completed_rx).await {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(result)) => result.map_err(io::Error::other),
             Ok(Err(_)) => Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "telemetry shutdown worker stopped before completing",
@@ -148,83 +183,116 @@ impl OtelProvider {
     }
 
     pub fn from(settings: &OtelSettings) -> Result<Option<Self>, Box<dyn Error>> {
+        let crate::PreparedOtelProvider {
+            mut provider,
+            tracestate,
+            statsig,
+        } = Self::prepare(settings).map_err(crate::OtelPreparationError::into_legacy_error)?;
+        crate::trace_context::set_tracestate_entries(tracestate)?;
+        if let Some(tracer_provider) = provider.as_ref().and_then(|p| p.tracer_provider.clone()) {
+            global::set_tracer_provider(tracer_provider);
+            global::set_text_map_propagator(TraceContextPropagator::new());
+        } else {
+            // Disabled traces must not leave the preceding account's provider
+            // installed for newly created global spans.
+            global::set_tracer_provider(opentelemetry::trace::noop::NoopTracerProvider::new());
+        }
+        if let Some(metrics) = provider.as_mut().and_then(|p| p.metrics.as_mut()) {
+            *metrics = crate::metrics::install_global_with_settings(metrics.clone(), statsig)?;
+        } else {
+            crate::metrics::disable_global()?;
+        }
+        Ok(provider)
+    }
+
+    // Construction must not publish any process-global route. The managed
+    // reloader needs to retain a candidate before attempting logger publication.
+    pub(crate) fn build_unpublished(
+        settings: &OtelSettings,
+    ) -> Result<Option<Self>, crate::OtelPreparationError> {
         let log_enabled = !matches!(settings.exporter, OtelExporter::None);
         let trace_enabled = !matches!(settings.trace_exporter, OtelExporter::None);
         let metric_exporter = crate::config::resolve_exporter(&settings.metrics_exporter);
         let metrics_enabled = !matches!(metric_exporter, OtelExporter::None);
 
         if !log_enabled && !trace_enabled && !metrics_enabled {
-            // Tracestate propagation is process-global; clear it when these
-            // settings do not install an active provider.
-            crate::trace_context::set_tracestate_entries(BTreeMap::new())?;
             debug!("No OTEL exporter enabled in settings.");
             return Ok(None);
         }
 
-        // Provider setup installs process-global OTEL state that cannot be
-        // rolled back. Validate trace metadata before any setup path can
-        // mutate those globals, and keep span attribute checks aligned with
-        // config loading when traces are exported.
+        // Validate before constructing exporters, which may start SDK workers.
         if trace_enabled {
-            crate::config::validate_span_attributes(&settings.span_attributes)?;
+            crate::config::validate_span_attributes(&settings.span_attributes)
+                .map_err(crate::OtelPreparationError::before_resources)?;
         }
-        crate::trace_context::validate_tracestate_entries(&settings.tracestate)?;
+        crate::trace_context::validate_tracestate_entries(&settings.tracestate)
+            .map_err(crate::OtelPreparationError::before_resources)?;
 
-        let mut metrics = if matches!(metric_exporter, OtelExporter::None) {
-            None
-        } else {
-            let mut config = MetricsConfig::otlp(
-                settings.environment.clone(),
-                settings.service_name.clone(),
-                settings.service_version.clone(),
-                settings.metrics_exporter.clone(),
-            );
-            if settings.runtime_metrics {
-                config = config.with_runtime_reader();
-            }
-            Some(MetricsClient::new(config)?)
+        // Install each successful sub-owner immediately. A later constructor
+        // error transfers this partial value rather than dropping SDK workers
+        // before the managed reloader can retain their terminal observations.
+        let mut provider = Self {
+            logger: None,
+            tracer_provider: None,
+            tracer: None,
+            metrics: None,
+            trace_receipt: None,
+            log_receipt: None,
+            shutdown_result: Mutex::new(None),
         };
+        let construction = (|| -> Result<(), Box<dyn Error>> {
+            provider.metrics = if matches!(metric_exporter, OtelExporter::None) {
+                None
+            } else {
+                let mut config = MetricsConfig::otlp(
+                    settings.environment.clone(),
+                    settings.service_name.clone(),
+                    settings.service_version.clone(),
+                    settings.metrics_exporter.clone(),
+                );
+                if settings.runtime_metrics {
+                    config = config.with_runtime_reader();
+                }
+                Some(MetricsClient::new(config)?)
+            };
 
-        let log_resource = make_resource(settings, ResourceKind::Logs);
-        let trace_resource = make_resource(settings, ResourceKind::Traces);
-        let logger = log_enabled
-            .then(|| build_logger(&log_resource, &settings.exporter))
-            .transpose()?;
+            let log_resource = make_resource(settings, ResourceKind::Logs);
+            let trace_resource = make_resource(settings, ResourceKind::Traces);
+            let (logger, log_receipt) = log_enabled
+                .then(|| build_logger(&log_resource, &settings.exporter))
+                .transpose()?
+                .map(|(provider, receipt)| (Some(provider), receipt))
+                .unwrap_or_default();
+            provider.logger = logger;
+            provider.log_receipt = log_receipt;
 
-        let tracer_provider = trace_enabled
-            .then(|| {
-                build_tracer_provider(
-                    &trace_resource,
-                    &settings.trace_exporter,
-                    settings.span_attributes.clone(),
-                )
-            })
-            .transpose()?;
+            let (tracer_provider, trace_receipt) = trace_enabled
+                .then(|| {
+                    build_tracer_provider(
+                        &trace_resource,
+                        &settings.trace_exporter,
+                        settings.span_attributes.clone(),
+                    )
+                })
+                .transpose()?
+                .map(|(provider, receipt)| (Some(provider), receipt))
+                .unwrap_or_default();
 
-        let tracer = tracer_provider
-            .as_ref()
-            .map(|provider| provider.tracer(settings.service_name.clone()));
+            provider.tracer = tracer_provider
+                .as_ref()
+                .map(|provider| provider.tracer(settings.service_name.clone()));
 
-        crate::trace_context::set_tracestate_entries(settings.tracestate.clone())?;
-        if let Some(provider) = tracer_provider.clone() {
-            global::set_tracer_provider(provider);
-            global::set_text_map_propagator(TraceContextPropagator::new());
+            provider.tracer_provider = tracer_provider;
+            provider.trace_receipt = trace_receipt;
+            Ok(())
+        })();
+        match construction {
+            Ok(()) => Ok(Some(provider)),
+            Err(source) => Err(crate::OtelPreparationError {
+                source,
+                provider: Some(provider),
+            }),
         }
-        if let Some(metrics) = metrics.as_mut() {
-            *metrics = crate::metrics::install_global(metrics.clone());
-            if matches!(settings.metrics_exporter, OtelExporter::Statsig) {
-                crate::metrics::install_global_statsig_settings(StatsigMetricsSettings {
-                    environment: settings.environment.clone(),
-                });
-            }
-        }
-        Ok(Some(Self {
-            logger,
-            tracer_provider,
-            tracer,
-            metrics,
-            shutdown_started: AtomicBool::default(),
-        }))
     }
 
     pub fn logger_layer<S>(&self) -> Option<impl Layer<S> + Send + Sync>
@@ -379,11 +447,18 @@ impl SpanProcessor for SpanAttributesProcessor {
 fn build_logger(
     resource: &Resource,
     exporter: &OtelExporter,
-) -> Result<SdkLoggerProvider, Box<dyn Error>> {
+) -> Result<
+    (
+        SdkLoggerProvider,
+        Option<crate::trace_exporter_retirement::ExporterReceipt>,
+    ),
+    Box<dyn Error>,
+> {
     let mut builder = SdkLoggerProvider::builder().with_resource(resource.clone());
+    let receipt;
 
     match crate::config::resolve_exporter(exporter) {
-        OtelExporter::None => return Ok(builder.build()),
+        OtelExporter::None => return Ok((builder.build(), None)),
         OtelExporter::Statsig => unreachable!("statsig exporter should be resolved"),
         OtelExporter::OtlpGrpc {
             endpoint,
@@ -410,6 +485,9 @@ fn build_logger(
                 .with_tls_config(tls_config)
                 .build()?;
 
+            let (exporter, evidence) =
+                crate::trace_exporter_retirement::AcknowledgedExporter::new(exporter);
+            receipt = evidence;
             builder = builder.with_batch_exporter(exporter);
         }
         OtelExporter::OtlpHttp {
@@ -438,20 +516,34 @@ fn build_logger(
 
             let exporter = exporter_builder.build()?;
 
+            let (exporter, evidence) =
+                crate::trace_exporter_retirement::AcknowledgedExporter::new(exporter);
+            receipt = evidence;
             builder = builder.with_batch_exporter(exporter);
         }
     }
 
-    Ok(builder.build())
+    Ok((builder.build(), Some(receipt)))
 }
 
 fn build_tracer_provider(
     resource: &Resource,
     exporter: &OtelExporter,
     span_attributes: BTreeMap<String, String>,
-) -> Result<SdkTracerProvider, Box<dyn Error>> {
+) -> Result<
+    (
+        SdkTracerProvider,
+        Option<crate::trace_exporter_retirement::ExporterReceipt>,
+    ),
+    Box<dyn Error>,
+> {
     let span_exporter = match crate::config::resolve_exporter(exporter) {
-        OtelExporter::None => return Ok(tracer_provider_builder(resource, span_attributes).build()),
+        OtelExporter::None => {
+            return Ok((
+                tracer_provider_builder(resource, span_attributes).build(),
+                None,
+            ));
+        }
         OtelExporter::Statsig => unreachable!("statsig exporter should be resolved"),
         OtelExporter::OtlpGrpc {
             endpoint,
@@ -504,13 +596,18 @@ fn build_tracer_provider(
                 )?;
                 exporter_builder = exporter_builder.with_http_client(client);
 
-                let processor =
-                    TokioBatchSpanProcessor::builder(exporter_builder.build()?, runtime::Tokio)
-                        .build();
+                let (exporter, receipt) =
+                    crate::trace_exporter_retirement::AcknowledgedExporter::new(
+                        exporter_builder.build()?,
+                    );
+                let processor = TokioBatchSpanProcessor::builder(exporter, runtime::Tokio).build();
 
-                return Ok(tracer_provider_builder(resource, span_attributes)
-                    .with_span_processor(processor)
-                    .build());
+                return Ok((
+                    tracer_provider_builder(resource, span_attributes)
+                        .with_span_processor(processor)
+                        .build(),
+                    Some(receipt),
+                ));
             }
 
             let protocol = match protocol {
@@ -534,11 +631,16 @@ fn build_tracer_provider(
         }
     };
 
+    let (span_exporter, receipt) =
+        crate::trace_exporter_retirement::AcknowledgedExporter::new(span_exporter);
     let processor = BatchSpanProcessor::builder(span_exporter).build();
 
-    Ok(tracer_provider_builder(resource, span_attributes)
-        .with_span_processor(processor)
-        .build())
+    Ok((
+        tracer_provider_builder(resource, span_attributes)
+            .with_span_processor(processor)
+            .build(),
+        Some(receipt),
+    ))
 }
 
 #[cfg(test)]
@@ -628,7 +730,7 @@ mod tests {
                 "codex-test",
                 env!("CARGO_PKG_VERSION"),
                 InMemoryMetricExporter::default(),
-            ))?);
+            ))?)?;
         let cached = crate::metrics::global().expect("initial global metrics client");
 
         let exporter = InMemoryMetricExporter::default();
@@ -638,7 +740,7 @@ mod tests {
                 "codex-test",
                 env!("CARGO_PKG_VERSION"),
                 exporter.clone(),
-            ))?);
+            ))?)?;
         cached.counter("codex.after_transition", /*inc*/ 1, &[])?;
         initial.shutdown()?;
         replacement.shutdown()?;

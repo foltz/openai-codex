@@ -119,14 +119,19 @@ impl RemotePluginBundleSyncGeneration {
     }
     pub(crate) fn capture(codex_home: &Path) -> Self {
         let authority = bundle_sync_authority(codex_home);
-        let state = authority.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         Self {
             state: Arc::clone(&authority),
             generation: Arc::clone(&state.generation),
         }
     }
     pub(crate) fn begin_commit(&self) -> Option<RemotePluginBundleCommitLease> {
-        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !Arc::ptr_eq(&state.generation, &self.generation) {
             return None;
         }
@@ -146,7 +151,9 @@ impl Drop for RemotePluginBundleCommitLease {
 fn bundle_sync_authority(codex_home: &Path) -> Arc<Mutex<BundleSyncState>> {
     let authorities =
         REMOTE_INSTALLED_PLUGIN_BUNDLE_SYNC_AUTHORITIES.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut authorities = authorities.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut authorities = authorities
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     Arc::clone(
         authorities
             .entry(RemoteInstalledPluginBundleSyncKey {
@@ -168,7 +175,9 @@ fn bundle_sync_authority(codex_home: &Path) -> Arc<Mutex<BundleSyncState>> {
 /// reset attempts, so retry cannot forget a still-running retired commit.
 pub(crate) fn retire_remote_plugin_bundle_sync(codex_home: &Path) -> watch::Receiver<usize> {
     let authority = bundle_sync_authority(codex_home);
-    let mut state = authority.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut state = authority
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let retired = state.active_commits.subscribe();
     state.generation.send_replace(true);
     state.generation = Arc::new(watch::channel(false).0);
@@ -189,7 +198,9 @@ pub(crate) fn maybe_start_remote_installed_plugin_bundle_sync(
     };
     let authority = bundle_sync_authority(&codex_home);
     {
-        let mut state = authority.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.requested = Some(BundleSyncRequest {
             codex_home,
             config,
@@ -208,7 +219,9 @@ pub(crate) fn maybe_start_remote_installed_plugin_bundle_sync(
     tokio::spawn(async move {
         loop {
             let request = {
-                let mut state = authority.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut state = authority
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let Some(request) = state.requested.take() else {
                     state.running = false;
                     return;

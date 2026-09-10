@@ -32,6 +32,114 @@ const WORKSPACE_ID_SECOND_ALLOWED: &str = "123e4567-e89b-42d3-a456-426614174001"
 const WORKSPACE_ID_DISALLOWED: &str = "123e4567-e89b-42d3-a456-426614174002";
 
 #[tokio::test]
+async fn managed_account_projection_is_exact_guarded_and_credential_free() {
+    let home = tempdir().unwrap();
+    write_managed_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".to_owned()),
+            chatgpt_account_id: Some("projection-account".to_owned()),
+        },
+        home.path(),
+    )
+    .unwrap();
+    let manager = AuthManager::new(
+        home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+        None,
+        None,
+        AuthKeyringBackendKind::default(),
+        crate::test_support::transport_default_auth_route_config(),
+    )
+    .await;
+    let fingerprint = AuthManager::managed_account_fingerprint("projection-account");
+    let revision = *manager.auth_change_receiver().borrow();
+    let projected = manager
+        .with_managed_account_projection(Some(&fingerprint), |mode, plan| {
+            assert!(
+                manager.inner.try_write().is_err(),
+                "cache guard must span the callback"
+            );
+            assert!(
+                manager.external_auth.try_write().is_err(),
+                "external authority stays fenced"
+            );
+            (mode, plan)
+        })
+        .unwrap();
+    assert_eq!(
+        projected,
+        (Some(AuthMode::Chatgpt), Some(AccountPlanType::Pro))
+    );
+    assert_eq!(*manager.auth_change_receiver().borrow(), revision);
+    let terminal = manager
+        .prepare_managed_terminal_commit(Some(&fingerprint))
+        .await
+        .unwrap();
+    let storage = create_auth_storage(
+        home.path().to_path_buf(),
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
+    );
+    let mut raw = storage.load().unwrap().unwrap();
+    let competing_writer = storage.lock_managed_source().unwrap();
+    assert!(matches!(
+        manager.with_managed_terminal_projection(&terminal, |_, _| panic!(
+            "contended source must not publish"
+        )),
+        Err(ManagedTerminalVerificationError::SourceUnavailable(
+            ManagedAuthStorageError::ReadFailed(ManagedAuthStorageFailure::CoordinationContended)
+        ))
+    ));
+    drop(competing_writer);
+    // Contention did not consume the proof or obscure the cached authority;
+    // the same unchanged precondition can be checked after the writer leaves.
+    assert_eq!(
+        manager
+            .with_managed_terminal_projection(&terminal, |mode, plan| {
+                assert!(manager.inner.try_write().is_err());
+                assert!(manager.external_auth.try_write().is_err());
+                assert!(
+                    storage.save(&raw).is_err(),
+                    "cooperating writer must be excluded through callback"
+                );
+                (mode, plan)
+            })
+            .unwrap(),
+        (Some(AuthMode::Chatgpt), Some(AccountPlanType::Pro))
+    );
+    raw.tokens.as_mut().unwrap().access_token = "replaced-after-final-verification".to_owned();
+    storage.save(&raw).unwrap();
+    assert!(matches!(
+        manager.with_managed_terminal_projection(&terminal, |_, _| panic!(
+            "changed durable source must not publish"
+        )),
+        Err(ManagedTerminalVerificationError::SourceChanged)
+    ));
+    assert!(matches!(
+        manager.with_managed_account_projection(Some("wrong"), |_, _| {
+            panic!("mismatched cache must not publish")
+        }),
+        Err(ManagedAdoptionVerificationError::IntendedResultMismatch)
+    ));
+    manager.inner.write().unwrap().auth = None;
+    assert_eq!(
+        manager
+            .with_managed_account_projection(None, |mode, plan| (mode, plan))
+            .unwrap(),
+        (None, None)
+    );
+    manager.inner.write().unwrap().initial_load_failed = true;
+    assert!(matches!(
+        manager.with_managed_account_projection(None, |_, _| {
+            panic!("unavailable authority must not publish absence")
+        }),
+        Err(ManagedAdoptionVerificationError::CacheUnavailable)
+    ));
+}
+
+#[tokio::test]
 async fn refresh_without_id_token() {
     let codex_home = tempdir().unwrap();
     let fake_jwt = write_auth_file(
@@ -2634,6 +2742,20 @@ fn authoritative_cached_auth_distinguishes_initial_failure_from_logged_out() {
     let manager =
         AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
     assert!(manager.authoritative_auth_cached().is_ok());
+    let expected = manager
+        .authoritative_auth_cached()
+        .unwrap()
+        .and_then(|auth| auth.get_account_id())
+        .as_deref()
+        .map(AuthManager::managed_account_fingerprint);
+    assert_eq!(
+        manager.authoritative_managed_auth_fingerprint(),
+        Ok(expected)
+    );
+    manager.set_cached_auth(None);
+    assert_eq!(manager.authoritative_managed_auth_fingerprint(), Ok(None));
+    manager.set_cached_auth(Some(CodexAuth::from_api_key("excluded-secret")));
+    assert_eq!(manager.authoritative_managed_auth_fingerprint(), Ok(None));
     manager
         .inner
         .write()
@@ -2641,6 +2763,10 @@ fn authoritative_cached_auth_distinguishes_initial_failure_from_logged_out() {
         .initial_load_failed = true;
     assert_eq!(
         manager.authoritative_auth_cached(),
+        Err(AuthoritativeAuthUnavailable::InitialLoadFailed)
+    );
+    assert_eq!(
+        manager.authoritative_managed_auth_fingerprint(),
         Err(AuthoritativeAuthUnavailable::InitialLoadFailed)
     );
 }
@@ -2663,6 +2789,10 @@ fn authoritative_cached_auth_reports_cache_lock_unavailable_when_poisoned() {
         manager.authoritative_auth_cached(),
         Err(AuthoritativeAuthUnavailable::CacheLockUnavailable),
         "a poisoned cache lock must fail closed as unavailable, never as logged-out"
+    );
+    assert_eq!(
+        manager.authoritative_managed_auth_fingerprint(),
+        Err(AuthoritativeAuthUnavailable::CacheLockUnavailable)
     );
 }
 
@@ -2837,10 +2967,119 @@ async fn install_managed_logout_clears_the_cache_and_publishes_a_revision() {
         revisions.has_changed().unwrap_or(false),
         "logout must publish an auth-change signal like any other adoption"
     );
+    assert!(manager.is_managed_auth_change(*revisions.borrow()));
     assert!(
         get_auth_file(codex_home.path()).exists(),
         "managed logout must never touch the durable store -- the writer boundary is separately owned"
     );
+}
+
+#[tokio::test]
+async fn managed_auth_origin_precedes_notification_and_does_not_tag_ordinary_changes() {
+    let home = tempdir().unwrap();
+    let write_account = |account: &str| {
+        write_managed_auth_file(
+            AuthFileParams {
+                openai_api_key: None,
+                chatgpt_plan_type: Some("pro".to_owned()),
+                chatgpt_account_id: Some(account.to_owned()),
+            },
+            home.path(),
+        )
+        .unwrap();
+    };
+    write_account("origin-a");
+    let manager = AuthManager::new(
+        home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+        /*forced_chatgpt_workspace_id*/ None,
+        /*chatgpt_base_url*/ None,
+        AuthKeyringBackendKind::default(),
+        crate::test_support::transport_default_auth_route_config(),
+    )
+    .await;
+    let mut changes = manager.auth_change_receiver();
+    assert!(!manager.is_managed_auth_change(*changes.borrow()));
+    let before = manager
+        .capture_managed_adoption_precondition(Some(&AuthManager::managed_account_fingerprint(
+            "origin-a",
+        )))
+        .unwrap();
+    write_account("origin-b");
+    let intended = AuthManager::managed_account_fingerprint("origin-b");
+    let prepared = manager
+        .prepare_managed_adoption(Some(&intended), &before)
+        .await
+        .unwrap();
+    assert!(matches!(
+        manager.install_prepared_managed_adoption(&prepared, &before),
+        ManagedAdoptionInstallOutcome::Installed { .. }
+    ));
+    changes.changed().await.unwrap();
+    let managed = *changes.borrow_and_update();
+    assert!(manager.is_managed_auth_change(managed));
+
+    // Equal-auth adoption remains silent and commands must not require a new
+    // watch notification or an origin tag as admission authority.
+    let same = manager
+        .capture_managed_adoption_precondition(Some(&intended))
+        .unwrap();
+    let prepared = manager
+        .prepare_managed_adoption(Some(&intended), &same)
+        .await
+        .unwrap();
+    assert!(matches!(
+        manager.install_prepared_managed_adoption(&prepared, &same),
+        ManagedAdoptionInstallOutcome::Installed { .. }
+    ));
+    assert!(!changes.has_changed().unwrap());
+    assert_eq!(*changes.borrow(), managed);
+
+    write_account("origin-c");
+    // reload's legacy bool uses CodexAuth equality; the watch uses the richer
+    // auths_equal_for_refresh comparison. Observe the actual revision below.
+    manager.reload().await;
+    let ordinary = *changes.borrow_and_update();
+    assert!(ordinary > managed);
+    assert!(!manager.is_managed_auth_change(ordinary));
+
+    let before = manager
+        .capture_managed_adoption_precondition(Some(&AuthManager::managed_account_fingerprint(
+            "origin-c",
+        )))
+        .unwrap();
+    write_account("origin-d");
+    let prepared = manager
+        .prepare_managed_adoption(
+            Some(&AuthManager::managed_account_fingerprint("origin-d")),
+            &before,
+        )
+        .await
+        .unwrap();
+    write_account("origin-e");
+    assert!(matches!(
+        manager.install_prepared_managed_adoption(&prepared, &before),
+        ManagedAdoptionInstallOutcome::SourceChanged
+    ));
+    assert_eq!(*changes.borrow(), ordinary);
+    assert!(!manager.is_managed_auth_change(ordinary));
+
+    assert!(matches!(
+        manager.install_managed_logout(manager.auth_cached(), &before),
+        ManagedAdoptionInstallOutcome::LoggedOut
+    ));
+    let logout = *changes.borrow();
+    assert!(logout > ordinary);
+    assert!(manager.is_managed_auth_change(logout));
+    assert!(!manager.is_managed_auth_change(managed));
+    // Coalescing this managed logout with a newer ordinary reload still leaves
+    // the latest notification classified as ordinary.
+    manager.reload().await;
+    changes.changed().await.unwrap();
+    let latest = *changes.borrow_and_update();
+    assert!(latest > logout);
+    assert!(!manager.is_managed_auth_change(latest));
 }
 
 /// R014's manager-owned CAS: installing must refuse rather than
@@ -2963,6 +3202,34 @@ async fn prepared_managed_candidate_refuses_changed_source_and_installs_only_onc
         .unwrap();
     write_account("prepared-b");
     let original_b = std::fs::read(get_auth_file(home.path())).unwrap();
+    let abandoned = manager
+        .prepare_managed_adoption(
+            Some(&AuthManager::managed_account_fingerprint("prepared-b")),
+            &precondition,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        manager
+            .prepared_managed_adoptions
+            .lock()
+            .unwrap()
+            .candidates
+            .len(),
+        1
+    );
+    // The handle has no strong credential owner: only AuthManager owns the
+    // store, and dropping a capability eagerly removes its private candidate.
+    assert_eq!(Arc::strong_count(&manager.prepared_managed_adoptions), 1);
+    drop(abandoned);
+    assert!(
+        manager
+            .prepared_managed_adoptions
+            .lock()
+            .unwrap()
+            .candidates
+            .is_empty()
+    );
     let prepared = manager
         .prepare_managed_adoption(
             Some(&AuthManager::managed_account_fingerprint("prepared-b")),
@@ -2970,6 +3237,20 @@ async fn prepared_managed_candidate_refuses_changed_source_and_installs_only_onc
         )
         .await
         .unwrap();
+    let wrong_manager = AuthManager::from_auth_for_testing(manager.auth_cached().unwrap());
+    assert!(matches!(
+        wrong_manager.install_prepared_managed_adoption(&prepared, &precondition),
+        ManagedAdoptionInstallOutcome::IntendedResultMismatch
+    ));
+    assert_eq!(
+        manager
+            .prepared_managed_adoptions
+            .lock()
+            .unwrap()
+            .candidates
+            .len(),
+        1
+    );
     let revision = *manager.auth_change_receiver().borrow();
     write_account("unexpected-c");
     assert!(matches!(
@@ -3012,10 +3293,32 @@ async fn prepared_managed_candidate_refuses_changed_source_and_installs_only_onc
         )
         .await
         .unwrap();
-    assert!(matches!(
-        manager.install_prepared_managed_adoption(&prepared, &precondition),
-        ManagedAdoptionInstallOutcome::Installed(_)
-    ));
+    let outcomes = std::thread::scope(|scope| {
+        let first =
+            scope.spawn(|| manager.install_prepared_managed_adoption(&prepared, &precondition));
+        let second =
+            scope.spawn(|| manager.install_prepared_managed_adoption(&prepared, &precondition));
+        [first.join().unwrap(), second.join().unwrap()]
+    });
+    assert_eq!(outcomes.iter().filter(|outcome| matches!(outcome, ManagedAdoptionInstallOutcome::Installed { fingerprint } if fingerprint == &AuthManager::managed_account_fingerprint("prepared-b"))).count(), 1);
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(
+                outcome,
+                ManagedAdoptionInstallOutcome::IntendedResultMismatch
+            ))
+            .count(),
+        1
+    );
+    assert!(
+        manager
+            .prepared_managed_adoptions
+            .lock()
+            .unwrap()
+            .candidates
+            .is_empty()
+    );
     assert_eq!(
         manager.auth_cached().unwrap().get_account_id().as_deref(),
         Some("prepared-b")
@@ -3092,7 +3395,47 @@ async fn managed_recovery_verifies_durable_and_cached_result_without_installing(
 async fn managed_adoption_outcomes_never_debug_print_credential_material() {
     let secret = "sk-must-never-appear-in-debug-output";
     let source_outcome = ManagedAdoptionSourceOutcome::Available(CodexAuth::from_api_key(secret));
-    let install_outcome = ManagedAdoptionInstallOutcome::Installed(CodexAuth::from_api_key(secret));
+    let install_outcome = ManagedAdoptionInstallOutcome::Installed {
+        fingerprint: AuthManager::managed_account_fingerprint("opaque-account"),
+    };
     assert!(!format!("{source_outcome:?}").contains(secret));
     assert!(!format!("{install_outcome:?}").contains(secret));
+}
+
+#[test]
+fn prepared_handle_cannot_keep_credentials_alive_after_manager_drop() {
+    let manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("secret-sentinel"));
+    let handle = PreparedManagedAdoption {
+        id: 7,
+        store: Arc::downgrade(&manager.prepared_managed_adoptions),
+    };
+    assert_eq!(Arc::strong_count(&manager.prepared_managed_adoptions), 1);
+    drop(manager);
+    assert!(handle.store.upgrade().is_none());
+    assert!(!format!("{handle:?}").contains("secret-sentinel"));
+}
+
+#[test]
+fn poisoned_prepared_store_is_terminal_and_never_rearmed() {
+    let manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("secret-sentinel"));
+    let handle = PreparedManagedAdoption {
+        id: 1,
+        store: Arc::downgrade(&manager.prepared_managed_adoptions),
+    };
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = manager.prepared_managed_adoptions.lock().unwrap();
+        panic!("intentional prepared-store poison");
+    }));
+    let precondition = ManagedAdoptionPrecondition {
+        revision: 0,
+        fingerprint: String::new(),
+    };
+    for _ in 0..2 {
+        assert!(matches!(
+            manager.install_prepared_managed_adoption(&handle, &precondition),
+            ManagedAdoptionInstallOutcome::CacheLockUnavailable
+        ));
+    }
+    drop(handle);
+    assert!(manager.prepared_managed_adoptions.is_poisoned());
 }

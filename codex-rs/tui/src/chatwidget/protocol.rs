@@ -194,6 +194,7 @@ impl ChatWidget {
             ServerNotification::ServerRequestResolved(_)
             | ServerNotification::ThreadAttachmentChanged(_)
             | ServerNotification::AccountUpdated(_)
+            | ServerNotification::ManagedTransitionStatusUpdated(_)
             | ServerNotification::AccountRateLimitsUpdated(_)
             | ServerNotification::ThreadStarted(_)
             | ServerNotification::ThreadClearEnded(_)

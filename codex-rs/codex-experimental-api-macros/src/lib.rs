@@ -160,6 +160,7 @@ fn derive_for_struct(input: &DeriveInput, data: &DataStruct) -> TokenStream {
 fn derive_for_enum(input: &DeriveInput, data: &DataEnum) -> TokenStream {
     let name = &input.ident;
     let mut match_arms = Vec::new();
+    let mut registrations = Vec::new();
 
     for variant in &data.variants {
         let variant_name = &variant.ident;
@@ -170,6 +171,22 @@ fn derive_for_enum(input: &DeriveInput, data: &DataEnum) -> TokenStream {
         };
         let reason = experimental_reason(&variant.attrs);
         if let Some(reason) = reason {
+            if matches!(variant.fields, Fields::Unit) {
+                let serialized = match serialized_unit_variant(input, variant) {
+                    Ok(name) => LitStr::new(&name, variant_name.span()),
+                    Err(error) => return error.to_compile_error().into(),
+                };
+                let type_name = LitStr::new(&name.to_string(), name.span());
+                registrations.push(quote! {
+                    inventory::submit! {
+                        crate::experimental_api::ExperimentalUnitVariant {
+                            type_name: #type_name,
+                            serialized_name: #serialized,
+                            reason: #reason,
+                        }
+                    }
+                });
+            }
             match_arms.push(quote! {
                 #pattern => Some(#reason),
             });
@@ -181,6 +198,7 @@ fn derive_for_enum(input: &DeriveInput, data: &DataEnum) -> TokenStream {
     }
 
     let expanded = quote! {
+        #(#registrations)*
         impl crate::experimental_api::ExperimentalApi for #name {
             fn experimental_reason(&self) -> Option<&'static str> {
                 match self {
@@ -190,6 +208,80 @@ fn derive_for_enum(input: &DeriveInput, data: &DataEnum) -> TokenStream {
         }
     };
     expanded.into()
+}
+
+fn serialized_unit_variant(input: &DeriveInput, variant: &syn::Variant) -> syn::Result<String> {
+    fn setting(attrs: &[Attribute], key: &str) -> syn::Result<Option<String>> {
+        let mut result = None;
+        for attr in attrs.iter().filter(|attr| attr.path().is_ident("serde")) {
+            attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident(key) {
+                    if meta.input.peek(syn::Token![=]) {
+                        result = Some(meta.value()?.parse::<LitStr>()?.value());
+                    } else {
+                        meta.parse_nested_meta(|nested| {
+                            let value = nested.value()?.parse::<LitStr>()?;
+                            if nested.path.is_ident("serialize") {
+                                result = Some(value.value());
+                            }
+                            Ok(())
+                        })?;
+                    }
+                } else if meta.input.peek(syn::Token![=]) {
+                    let _: syn::Expr = meta.value()?.parse()?;
+                } else if meta.input.peek(syn::token::Paren) {
+                    let content;
+                    syn::parenthesized!(content in meta.input);
+                    let _: proc_macro2::TokenStream = content.parse()?;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(result)
+    }
+    if let Some(rename) = setting(&variant.attrs, "rename")? {
+        return Ok(rename);
+    }
+    let name = variant
+        .ident
+        .to_string()
+        .trim_start_matches("r#")
+        .to_owned();
+    let Some(rule) = setting(&input.attrs, "rename_all")? else {
+        return Ok(name);
+    };
+    let snake = || {
+        let mut result = String::new();
+        for (index, ch) in name.char_indices() {
+            if index > 0 && ch.is_uppercase() {
+                result.push('_');
+            }
+            result.push(ch.to_ascii_lowercase());
+        }
+        result
+    };
+    Ok(match rule.as_str() {
+        "PascalCase" => name,
+        "camelCase" => {
+            let mut chars = name.chars();
+            chars
+                .next()
+                .map(|first| first.to_ascii_lowercase().to_string() + chars.as_str())
+                .unwrap_or_default()
+        }
+        "lowercase" => name.to_ascii_lowercase(),
+        "UPPERCASE" => name.to_ascii_uppercase(),
+        "snake_case" => snake(),
+        "SCREAMING_SNAKE_CASE" => snake().to_ascii_uppercase(),
+        "kebab-case" => snake().replace('_', "-"),
+        "SCREAMING-KEBAB-CASE" => snake().to_ascii_uppercase().replace('_', "-"),
+        _ => {
+            return Err(syn::Error::new_spanned(
+                &input.ident,
+                "unsupported experimental unit-variant serde rename rule",
+            ));
+        }
+    })
 }
 
 fn experimental_reason(attrs: &[Attribute]) -> Option<LitStr> {

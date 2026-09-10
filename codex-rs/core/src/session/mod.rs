@@ -82,6 +82,7 @@ use codex_network_proxy::NetworkProxyAuditMetadata;
 use codex_network_proxy::normalize_host;
 use codex_otel::current_span_trace_id;
 use codex_otel::current_span_w3c_trace_context;
+#[cfg(test)]
 use codex_otel::set_parent_from_w3c_trace_context;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
@@ -515,10 +516,12 @@ impl Session {
             }
             None => None,
         };
-        let thread_spawn_span = info_span!("thread_spawn", otel.name = "thread_spawn");
-        if let Some(trace) = parent_trace.as_ref() {
-            let _ = set_parent_from_w3c_trace_context(&thread_spawn_span, trace);
-        }
+        let thread_spawn_span = codex_otel::span_with_parent_context(
+            parent_trace
+                .as_ref()
+                .and_then(codex_otel::context_from_w3c_trace_context),
+            || info_span!("thread_spawn", otel.name = "thread_spawn"),
+        );
         Self::spawn_internal(SessionSpawnArgs {
             parent_trace,
             ..args

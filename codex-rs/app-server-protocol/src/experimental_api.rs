@@ -21,6 +21,23 @@ pub struct ExperimentalField {
 
 inventory::collect!(ExperimentalField);
 
+/// A named enum's experimental string-literal unit variant. Payload variants
+/// retain runtime gating but are not part of this projection capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExperimentalUnitVariant {
+    pub type_name: &'static str,
+    pub serialized_name: &'static str,
+    pub reason: &'static str,
+}
+
+inventory::collect!(ExperimentalUnitVariant);
+
+pub fn experimental_unit_variants() -> Vec<&'static ExperimentalUnitVariant> {
+    inventory::iter::<ExperimentalUnitVariant>
+        .into_iter()
+        .collect()
+}
+
 /// Returns all experimental fields registered across the protocol types.
 pub fn experimental_fields() -> Vec<&'static ExperimentalField> {
     inventory::iter::<ExperimentalField>.into_iter().collect()
@@ -62,6 +79,46 @@ mod tests {
     use super::ExperimentalApi as ExperimentalApiTrait;
     use codex_experimental_api_macros::ExperimentalApi;
     use pretty_assertions::assert_eq;
+
+    #[allow(dead_code)]
+    #[derive(serde::Serialize, ExperimentalApi)]
+    #[serde(rename_all = "camelCase")]
+    enum RenamedUnitProjection {
+        Stable,
+        #[experimental("test/camel")]
+        FutureVariant,
+        #[serde(rename(serialize = "explicit-variant", deserialize = "input-variant"))]
+        #[experimental("test/explicit")]
+        ExplicitVariant,
+    }
+
+    #[test]
+    fn derives_unit_projection_names_from_serialization_rules_only() {
+        let variants = super::experimental_unit_variants();
+        let names: std::collections::BTreeSet<_> = variants
+            .iter()
+            .filter(|variant| variant.type_name == "RenamedUnitProjection")
+            .map(|variant| variant.serialized_name)
+            .collect();
+        assert_eq!(
+            names,
+            ["explicit-variant", "futureVariant"].into_iter().collect()
+        );
+        assert_eq!(
+            serde_json::to_value(RenamedUnitProjection::FutureVariant).unwrap(),
+            "futureVariant"
+        );
+        assert_eq!(
+            serde_json::to_value(RenamedUnitProjection::ExplicitVariant).unwrap(),
+            "explicit-variant"
+        );
+        let shape_names: Vec<_> = variants
+            .iter()
+            .filter(|variant| variant.type_name == "EnumVariantShapes")
+            .map(|variant| variant.serialized_name)
+            .collect();
+        assert_eq!(shape_names, vec!["Unit"]);
+    }
 
     #[allow(dead_code)]
     #[derive(ExperimentalApi)]

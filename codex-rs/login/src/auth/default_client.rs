@@ -97,11 +97,31 @@ pub fn set_default_originator(value: String) -> Result<(), SetOriginatorError> {
 }
 
 pub fn set_default_client_residency_requirement(enforce_residency: Option<ResidencyRequirement>) {
-    let Ok(mut guard) = REQUIREMENTS_RESIDENCY.write() else {
+    if try_set_default_client_residency_requirement(enforce_residency).is_err() {
         tracing::warn!("Failed to acquire requirements residency lock");
-        return;
-    };
+    }
+}
+
+/// Residency publication could not acquire authoritative routing state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("residency routing state unavailable")]
+pub struct ResidencyRequirementUnavailable;
+
+/// Publish the account's routing requirement, refusing rather than retaining
+/// stale routing state silently when the state lock is poisoned.
+pub fn try_set_default_client_residency_requirement(
+    enforce_residency: Option<ResidencyRequirement>,
+) -> Result<(), ResidencyRequirementUnavailable> {
+    replace_residency_requirement(&REQUIREMENTS_RESIDENCY, enforce_residency)
+}
+
+fn replace_residency_requirement(
+    state: &RwLock<Option<ResidencyRequirement>>,
+    enforce_residency: Option<ResidencyRequirement>,
+) -> Result<(), ResidencyRequirementUnavailable> {
+    let mut guard = state.write().map_err(|_| ResidencyRequirementUnavailable)?;
     *guard = enforce_residency;
+    Ok(())
 }
 
 pub fn originator() -> Originator {

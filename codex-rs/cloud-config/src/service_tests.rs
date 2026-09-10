@@ -24,6 +24,7 @@ use codex_login::auth::ExternalAuthRefreshContext;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::collections::VecDeque;
+use std::future::Future;
 use std::future::pending;
 use std::path::Path;
 use std::sync::RwLock;
@@ -34,6 +35,85 @@ use tempfile::tempdir;
 fn write_auth_json(codex_home: &Path, value: serde_json::Value) -> std::io::Result<()> {
     std::fs::write(codex_home.join("auth.json"), serde_json::to_string(&value)?)?;
     Ok(())
+}
+
+#[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "test holds publication until an old-generation write is queued and invalidated"
+)]
+async fn retired_generation_cannot_publish_a_queued_cache_write() {
+    let home = tempdir().expect("home");
+    let auth =
+        auth_manager_with_plan_and_identity("enterprise", Some("user-a"), Some("account-a")).await;
+    let service = Arc::new(CloudConfigBundleService::new(
+        auth.clone(),
+        Arc::new(StaticBundleClient::new(test_bundle())),
+        home.path().to_path_buf(),
+        Duration::from_secs(5),
+    ));
+    let lease = service.publication.lock().await;
+    let captured_auth = auth.auth().await.expect("auth");
+    let worker_service = service.clone();
+    let mut publish = Box::pin(async move {
+        worker_service
+            .validate_and_cache_remote_bundle(&captured_auth, "startup", 1, test_bundle())
+            .await
+    });
+    std::future::poll_fn(|cx| {
+        assert!(publish.as_mut().poll(cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    service.generation.fetch_add(1, Ordering::AcqRel);
+    drop(lease);
+    assert!(publish.await.is_err());
+    assert!(
+        !home
+            .path()
+            .join(CLOUD_CONFIG_BUNDLE_CACHE_FILENAME)
+            .exists()
+    );
+}
+
+#[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "test holds publication while cancelling the caller to prove retained write ownership"
+)]
+async fn cancelled_publication_caller_does_not_release_write_ownership() {
+    let home = tempdir().expect("home");
+    let auth =
+        auth_manager_with_plan_and_identity("enterprise", Some("user-a"), Some("account-a")).await;
+    let service = Arc::new(CloudConfigBundleService::new(
+        auth.clone(),
+        Arc::new(StaticBundleClient::new(test_bundle())),
+        home.path().to_path_buf(),
+        Duration::from_secs(5),
+    ));
+    let lease = service.publication.lock().await;
+    let captured_auth = auth.auth().await.expect("auth");
+    let worker_service = service.clone();
+    let mut publish = Box::pin(async move {
+        worker_service
+            .validate_and_cache_remote_bundle(&captured_auth, "startup", 1, test_bundle())
+            .await
+    });
+    std::future::poll_fn(|cx| {
+        assert!(publish.as_mut().poll(cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    // Run the spawned writer far enough to queue its lease before cancellation.
+    tokio::task::yield_now().await;
+    drop(publish);
+    drop(lease);
+    let _retirement_barrier = service.publication.lock().await;
+    assert!(
+        home.path()
+            .join(CLOUD_CONFIG_BUNDLE_CACHE_FILENAME)
+            .exists()
+    );
 }
 
 fn create_test_cache(codex_home: &Path) -> CloudConfigBundleCache {

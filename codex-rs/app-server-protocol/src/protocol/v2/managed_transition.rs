@@ -1,5 +1,6 @@
 use crate::JsonSchema;
 use crate::TS;
+use codex_experimental_api_macros::ExperimentalApi;
 use serde::Deserialize;
 use serde::Serialize;
 use serde::de::Error as _;
@@ -84,7 +85,11 @@ impl ManagedTransitionPhase {
 }
 
 /// Typed, secret-safe reasons for a transition request to be refused.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+// The same vocabulary carries terminal quarantine causes in status.refusal.
+// New causes are experimental; existing stable type exports remain unchanged.
+#[derive(
+    Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS, ExperimentalApi,
+)]
 #[serde(rename_all = "camelCase")]
 #[ts(rename_all = "camelCase", export_to = "v2/")]
 pub enum ManagedTransitionRefusalKind {
@@ -99,6 +104,18 @@ pub enum ManagedTransitionRefusalKind {
     LateCancellation,
     AuthorizationNotAdmitted,
     AuthoritativeAuthUnavailable,
+    #[experimental("managedAccountTransitionTerminalCauses")]
+    DrainTimedOut,
+    #[experimental("managedAccountTransitionTerminalCauses")]
+    TargetChanged,
+    #[experimental("managedAccountTransitionTerminalCauses")]
+    AuthSourceChanged,
+    #[experimental("managedAccountTransitionTerminalCauses")]
+    ResetFailed,
+    #[experimental("managedAccountTransitionTerminalCauses")]
+    AuthInstallFailed,
+    #[experimental("managedAccountTransitionTerminalCauses")]
+    IntendedResultMismatch,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]

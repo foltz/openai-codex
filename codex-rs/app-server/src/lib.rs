@@ -115,6 +115,7 @@ mod message_processor;
 mod models;
 mod models_refresh_worker;
 mod otel_reloader;
+mod otel_reset_control;
 mod outgoing_message;
 mod request_processors;
 mod request_serialization;
@@ -578,20 +579,58 @@ pub async fn run_main_with_transport_options(
     .map(Arc::new)
     .map_err(std::io::Error::other)?;
 
-    let otel = codex_core::otel_init::build_provider(
-        &config,
-        env!("CARGO_PKG_VERSION"),
-        Some(OTEL_SERVICE_NAME),
-        default_analytics_enabled,
-    )
-    .map_err(|e| {
-        std::io::Error::new(
-            ErrorKind::InvalidData,
-            format!("error loading otel config: {e}"),
+    let mut prepared_otel = Some(
+        codex_core::otel_init::prepare_provider(
+            &config,
+            env!("CARGO_PKG_VERSION"),
+            Some(OTEL_SERVICE_NAME),
+            default_analytics_enabled,
         )
-    })?;
-    codex_core::otel_init::record_process_start(otel.as_ref(), OTEL_SERVICE_NAME);
-    codex_core::otel_init::install_sqlite_telemetry(otel.as_ref(), OTEL_SERVICE_NAME);
+        .map_err(|e| {
+            std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!("error loading otel config: {e}"),
+            )
+        })?,
+    );
+    let feedback = CodexFeedback::new();
+
+    // Install a simple subscriber so `tracing` output is visible. Users can
+    // control the log level with `RUST_LOG` and switch to JSON logs with
+    // `LOG_FORMAT=json`.
+    let stderr_fmt: StderrLogLayer = match log_format_from_env() {
+        LogFormat::Json => tracing_subscriber::fmt::layer()
+            .json()
+            .with_writer(std::io::stderr)
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
+            .with_filter(EnvFilter::from_default_env())
+            .boxed(),
+        LogFormat::Default => tracing_subscriber::fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
+            .with_filter(EnvFilter::from_default_env())
+            .boxed(),
+    };
+
+    let feedback_layer = feedback.logger_layer();
+    let feedback_metadata_layer = feedback.metadata_layer();
+    let (log_db_layer, log_db_reload) =
+        tracing_subscriber::reload::Layer::new(None::<log_db::LogDbLayer>);
+    let log_db_layer = log_db_layer.with_filter(log_db::default_filter());
+    let (otel_layers, otel_routes) = codex_otel::ManagedTelemetryRoutes::layers();
+    tracing_subscriber::registry()
+        .with(stderr_fmt)
+        .with(feedback_layer)
+        .with(feedback_metadata_layer)
+        .with(log_db_layer)
+        .with(otel_layers)
+        .try_init()
+        .map_err(|_| std::io::Error::other("app-server tracing subscriber unavailable"))?;
+    let otel = otel_routes
+        .publish(&mut prepared_otel)
+        .map_err(|_| std::io::Error::other("initial telemetry publication unavailable"))?;
+    codex_core::otel_init::record_process_start(otel.provider.as_ref(), OTEL_SERVICE_NAME);
+    codex_core::otel_init::install_sqlite_telemetry(otel.provider.as_ref(), OTEL_SERVICE_NAME);
     let unix_socket_startup_lock = match &transport {
         AppServerTransport::UnixSocket { socket_path } => {
             let startup_lock_path = app_server_startup_lock_path(&codex_home)?;
@@ -646,39 +685,10 @@ pub async fn run_main_with_transport_options(
         });
     }
 
-    let feedback = CodexFeedback::new();
-
-    // Install a simple subscriber so `tracing` output is visible. Users can
-    // control the log level with `RUST_LOG` and switch to JSON logs with
-    // `LOG_FORMAT=json`.
-    let stderr_fmt: StderrLogLayer = match log_format_from_env() {
-        LogFormat::Json => tracing_subscriber::fmt::layer()
-            .json()
-            .with_writer(std::io::stderr)
-            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
-            .with_filter(EnvFilter::from_default_env())
-            .boxed(),
-        LogFormat::Default => tracing_subscriber::fmt::layer()
-            .with_writer(std::io::stderr)
-            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
-            .with_filter(EnvFilter::from_default_env())
-            .boxed(),
-    };
-
-    let feedback_layer = feedback.logger_layer();
-    let feedback_metadata_layer = feedback.metadata_layer();
     let log_db = state_db.clone().map(log_db::start);
-    let log_db_layer = log_db
-        .clone()
-        .map(|layer| layer.with_filter(log_db::default_filter()));
-    let (otel_layers, otel_logger_reload_handle) = otel_reloader::layers(otel.as_ref());
-    let _ = tracing_subscriber::registry()
-        .with(stderr_fmt)
-        .with(feedback_layer)
-        .with(feedback_metadata_layer)
-        .with(log_db_layer)
-        .with(otel_layers)
-        .try_init();
+    log_db_reload
+        .reload(log_db.clone())
+        .map_err(|_| std::io::Error::other("database logging subscriber unavailable"))?;
     for warning in &config_warnings {
         match &warning.details {
             Some(details) => error!("{} {}", warning.summary, details),
@@ -818,9 +828,9 @@ pub async fn run_main_with_transport_options(
     }
     transport_accept_handles.push(remote_control_accept_handle);
 
-    let otel_reloader_handle = otel_reloader::spawn(
+    let (telemetry_reset, otel_reloader_handle) = otel_reloader::spawn_managed(
         otel,
-        otel_logger_reload_handle,
+        otel_routes,
         config_manager.clone(),
         Arc::clone(&auth_manager),
         default_analytics_enabled,
@@ -893,6 +903,7 @@ pub async fn run_main_with_transport_options(
         let initialize_notification_sender = outgoing_message_sender.clone();
         let outbound_control_tx = outbound_control_tx;
         let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
+            telemetry_reset,
             outgoing: outgoing_message_sender,
             analytics_events_client,
             arg0_paths,
@@ -1193,7 +1204,14 @@ pub async fn run_main_with_transport_options(
     let _ = outbound_handle.await;
 
     transport_shutdown_token.cancel();
-    let _ = otel_reloader_handle.await;
+    // Retain incomplete exporter ownership through the rest of standalone
+    // shutdown. A task join is not itself a successful retirement receipt.
+    let otel_shutdown_owner = otel_reloader_handle.await;
+    if let Ok(owner) = &otel_shutdown_owner
+        && let Some(Err(outcome)) = owner.shutdown_result
+    {
+        warn!(?outcome, "standalone telemetry retirement incomplete");
+    }
     for handle in transport_accept_handles {
         let _ = handle.await;
     }

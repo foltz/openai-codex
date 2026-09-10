@@ -266,6 +266,7 @@ impl ConnectionSessionState {
 }
 
 pub(crate) struct MessageProcessorArgs {
+    pub(crate) telemetry_reset: crate::otel_reset_control::TelemetryResetControl,
     pub(crate) outgoing: Arc<OutgoingMessageSender>,
     pub(crate) analytics_events_client: AnalyticsEventsClient,
     pub(crate) arg0_paths: Arg0DispatchPaths,
@@ -331,6 +332,9 @@ pub(crate) struct MessageProcessorArgs {
 ///   in `thread_manager.rs`) -- already torn down as part of
 ///   `shutdown_all_threads_bounded` above, not a separate surface.
 struct ProductionResetInventory {
+    telemetry_reset: crate::otel_reset_control::TelemetryResetControl,
+    config_manager: ConfigManager,
+    chatgpt_base_url: String,
     thread_manager: Arc<ThreadManager>,
     models_refresh_worker: Arc<StdMutex<ModelsRefreshWorker>>,
     models_manager: SharedModelsManager,
@@ -347,11 +351,14 @@ const RESET_THREAD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl crate::managed_transition::ResetInventory for ProductionResetInventory {
     fn reset_all(&self) -> crate::managed_transition::ResetInventoryFuture<'_> {
+        use crate::managed_transition::ResetInventoryError;
         Box::pin(async move {
+            let telemetry_generation = *self.auth_manager.auth_change_receiver().borrow();
             if let Some(handle) = &self.remote_control_handle {
-                handle.reset_auth_cycle().await.map_err(|_| {
-                    "remote control auth-cycle retirement was not acknowledged".to_owned()
-                })?;
+                handle
+                    .reset_auth_cycle()
+                    .await
+                    .map_err(|_| ResetInventoryError::RemoteControlUnavailable)?;
             }
             // Result-bearing: a thread that didn't fully shut down can
             // still hold the prior account's provider/session/MCP state,
@@ -362,13 +369,41 @@ impl crate::managed_transition::ResetInventory for ProductionResetInventory {
                 .shutdown_all_threads_bounded(RESET_THREAD_SHUTDOWN_TIMEOUT)
                 .await;
             if !shutdown_report.submit_failed.is_empty() || !shutdown_report.timed_out.is_empty() {
-                return Err(format!(
-                    "thread shutdown incomplete: {} submit-failed, {} timed out",
-                    shutdown_report.submit_failed.len(),
-                    shutdown_report.timed_out.len()
-                ));
+                return Err(ResetInventoryError::ThreadsIncomplete {
+                    submit_failed: shutdown_report.submit_failed.len(),
+                    timed_out: shutdown_report.timed_out.len(),
+                });
             }
             self.thread_manager.invalidate_mcp_runtimes().await;
+            tokio::time::timeout(
+                RESET_THREAD_SHUTDOWN_TIMEOUT,
+                self.config_manager.reset_managed_cloud_config(
+                    Arc::clone(&self.auth_manager),
+                    self.chatgpt_base_url.clone(),
+                    self.http_client_factory.clone(),
+                ),
+            )
+            .await
+            .map_err(|_| ResetInventoryError::CloudConfigTimedOut)??;
+            let reset_config = tokio::time::timeout(
+                RESET_THREAD_SHUTDOWN_TIMEOUT,
+                self.config_manager.load_managed_reset_config(),
+            )
+            .await
+            .map_err(|_| ResetInventoryError::ConfigLoadTimedOut)??;
+            codex_login::default_client::try_set_default_client_residency_requirement(
+                reset_config.enforce_residency.value(),
+            )
+            .map_err(|_| ResetInventoryError::ResidencyUnavailable)?;
+
+            self.telemetry_reset
+                .reset_until(
+                    telemetry_generation,
+                    Arc::new(reset_config),
+                    tokio::time::Instant::now() + RESET_THREAD_SHUTDOWN_TIMEOUT,
+                )
+                .await
+                .map_err(ResetInventoryError::Telemetry)?;
 
             // Mirrors `account_processor.rs`'s own established
             // account-change reset for the ordinary (non-managed)
@@ -392,7 +427,7 @@ impl crate::managed_transition::ResetInventory for ProductionResetInventory {
                 .plugins_manager()
                 .reset_remote_installed_plugins()
                 .await
-                .map_err(|_| "plugin bundle retirement was not acknowledged".to_owned())?;
+                .map_err(|_| ResetInventoryError::PluginRetirementUnavailable)?;
 
             // Swap in a freshly spawned worker rather than calling terminal
             // `shutdown()` with no successor: the process must keep
@@ -405,7 +440,7 @@ impl crate::managed_transition::ResetInventory for ProductionResetInventory {
                 let mut worker = self
                     .models_refresh_worker
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    .map_err(|_| ResetInventoryError::ModelsWorkerUnavailable)?;
                 std::mem::replace(
                     &mut *worker,
                     crate::models_refresh_worker::spawn(
@@ -429,10 +464,10 @@ impl crate::managed_transition::ResetInventory for ProductionResetInventory {
                     .reset_for_managed_auth(self.http_client_factory.clone()),
             )
             .await
-            .map_err(|_| "model catalog reset timed out".to_owned())?
+            .map_err(|_| ResetInventoryError::ModelCatalogTimedOut)?
             .map_err(|error| {
                 tracing::warn!(outcome = ?error, "managed model catalog reset refused");
-                "model catalog reset was not acknowledged".to_owned()
+                ResetInventoryError::ModelCatalogUnavailable
             })?;
 
             Ok(())
@@ -445,6 +480,7 @@ impl MessageProcessor {
     /// `Sender` so handlers can enqueue messages to be written to stdout.
     pub(crate) fn new(args: MessageProcessorArgs) -> Self {
         let MessageProcessorArgs {
+            telemetry_reset,
             outgoing,
             analytics_events_client,
             arg0_paths,
@@ -568,14 +604,6 @@ impl MessageProcessor {
             applied_mcp_config_identity.clone(),
             analytics_events_client.clone(),
         );
-        let on_effective_plugins_changed =
-            crate::effective_plugin_change::effective_plugins_changed_callback(
-                auth_manager.clone(),
-                Arc::clone(&thread_manager),
-                config_manager.clone(),
-                config_processor.clone(),
-                request_serialization_queues.clone(),
-            );
         let account_processor = AccountRequestProcessor::new(
             auth_manager.clone(),
             Arc::clone(&thread_manager),
@@ -634,6 +662,9 @@ impl MessageProcessor {
                 .unwrap_or_default();
         let reset_inventory: Arc<dyn crate::managed_transition::ResetInventory> =
             Arc::new(ProductionResetInventory {
+                telemetry_reset,
+                config_manager: config_manager.clone(),
+                chatgpt_base_url: config.chatgpt_base_url.clone(),
                 thread_manager: Arc::clone(&thread_manager),
                 models_refresh_worker: Arc::clone(&models_refresh_worker),
                 models_manager: models_manager.clone(),
@@ -641,13 +672,23 @@ impl MessageProcessor {
                 auth_manager: Arc::clone(&auth_manager),
                 remote_control_handle: remote_control_handle.clone(),
             });
-        let managed_transition_coordinator = crate::managed_transition::ManagedTransitionCoordinator::from_authoritative_auth_state_target_evidence_and_adoption(
+        let managed_transition_coordinator = crate::managed_transition::ManagedTransitionCoordinator::with_adoption_and_account_projection(
                 crate::managed_transition::AuthoritativeAuthState::from_auth_manager(&auth_manager),
                 std::sync::Arc::new(crate::managed_transition::ProcessTargetEvidenceSource::new(
                     managed_transition_control_socket_endpoint,
                 )),
                 Arc::clone(&auth_manager),
                 reset_inventory,
+                Arc::clone(&outgoing),
+            );
+        let on_effective_plugins_changed =
+            crate::effective_plugin_change::effective_plugins_changed_callback(
+                auth_manager.clone(),
+                Arc::clone(&thread_manager),
+                config_manager.clone(),
+                config_processor.clone(),
+                request_serialization_queues.clone(),
+                managed_transition_coordinator.account_work_permits(),
             );
         let marketplace_processor = MarketplaceRequestProcessor::new(
             Arc::clone(&config),

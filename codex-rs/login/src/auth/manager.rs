@@ -1724,7 +1724,7 @@ pub enum AuthoritativeAuthUnavailable {
 /// material in `Debug` output (see the manual `Debug` impl below) --
 /// variants distinguish *why*, not the underlying error text or the
 /// wrapped [`CodexAuth`]'s own contents.
-pub enum ManagedAdoptionSourceOutcome {
+enum ManagedAdoptionSourceOutcome {
     /// The intended account's auth was read, parsed, passed every
     /// configured restriction, is persisted managed ChatGPT mode
     /// specifically, and the stable account identity is present.
@@ -1775,7 +1775,9 @@ impl std::fmt::Debug for ManagedAdoptionSourceOutcome {
 /// Distinguishes managed-auth-transition install outcomes (Issue 05 Slice
 /// 4, R014, R064). Never carries credential material in `Debug` output.
 pub enum ManagedAdoptionInstallOutcome {
-    Installed(CodexAuth),
+    Installed {
+        fingerprint: String,
+    },
     /// A deliberate managed logout was installed: the cache now holds no
     /// auth (R001's "deliberate logged-out state").
     LoggedOut,
@@ -1797,9 +1799,9 @@ pub enum ManagedAdoptionInstallOutcome {
 impl std::fmt::Debug for ManagedAdoptionInstallOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Installed(auth) => f
-                .debug_tuple("Installed")
-                .field(&auth.api_auth_mode())
+            Self::Installed { fingerprint } => f
+                .debug_struct("Installed")
+                .field("fingerprint", fingerprint)
                 .finish(),
             Self::LoggedOut => write!(f, "LoggedOut"),
             Self::CacheLockUnavailable => write!(f, "CacheLockUnavailable"),
@@ -1837,19 +1839,60 @@ pub struct ManagedAdoptionPrecondition {
     fingerprint: String,
 }
 
-/// A one-use, manager-owned parsed candidate. Only safe identity metadata is
-/// visible to the coordinator; Debug never inspects the credential payload.
+/// Opaque, credential-free evidence for a synchronous final source/cache
+/// transaction. The manager retains no parsed auth in this value.
+pub struct ManagedTerminalPrecondition {
+    preimage: super::storage::ManagedAuthStoragePreimage,
+    revision: u64,
+    fingerprint: Option<String>,
+    manager: std::sync::Weak<Mutex<PreparedManagedAdoptionStore>>,
+}
+
+/// Fixed terminal-fence failures, separate from account identity mismatch.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ManagedTerminalVerificationError {
+    SourceChanged,
+    SourceUnavailable(ManagedAuthStorageError),
+    Authority(ManagedAdoptionVerificationError),
+}
+
+/// A one-use identifier, not ownership of a credential-bearing candidate.
+/// Only AuthManager strongly owns the private store. Dropping an abandoned
+/// identifier removes its candidate while the manager is still alive.
 pub struct PreparedManagedAdoption {
-    candidate: std::sync::Mutex<Option<Option<CodexAuth>>>,
+    id: u64,
+    store: std::sync::Weak<Mutex<PreparedManagedAdoptionStore>>,
+}
+
+struct PreparedManagedAdoptionCandidate {
+    candidate: Option<CodexAuth>,
     preimage: super::storage::ManagedAuthStoragePreimage,
     intended_fingerprint: Option<String>,
+}
+
+#[derive(Default)]
+struct PreparedManagedAdoptionStore {
+    next_id: u64,
+    candidates: std::collections::HashMap<u64, PreparedManagedAdoptionCandidate>,
 }
 
 impl Debug for PreparedManagedAdoption {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PreparedManagedAdoption")
-            .field("logout", &self.intended_fingerprint.is_none())
+            .field("id", &self.id)
             .finish_non_exhaustive()
+    }
+}
+
+impl Drop for PreparedManagedAdoption {
+    fn drop(&mut self) {
+        if let Some(store) = self.store.upgrade()
+            && let Ok(mut store) = store.lock()
+        {
+            store.candidates.remove(&self.id);
+        }
+        // Poison is terminal: no path clears it or makes remaining candidates
+        // usable. A poisoned store is destroyed with its owning AuthManager.
     }
 }
 
@@ -2087,9 +2130,13 @@ impl UnauthorizedRecovery {
 /// `reload()` is called explicitly. This matches the design goal of avoiding
 /// different parts of the program seeing inconsistent auth data mid‑run.
 pub struct AuthManager {
+    prepared_managed_adoptions: Arc<Mutex<PreparedManagedAdoptionStore>>,
     codex_home: PathBuf,
     inner: RwLock<CachedAuth>,
     auth_change_tx: watch::Sender<u64>,
+    // Zero is the initial, unnotified revision. Auth revisions are monotonic
+    // (the existing revision counter must not wrap).
+    last_managed_auth_generation: AtomicU64,
     enable_codex_api_key_env: bool,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
     keyring_backend_kind: AuthKeyringBackendKind,
@@ -2220,6 +2267,8 @@ impl AuthManager {
                 permanent_refresh_failure: None,
             }),
             auth_change_tx,
+            last_managed_auth_generation: AtomicU64::new(0),
+            prepared_managed_adoptions: Arc::default(),
             enable_codex_api_key_env,
             auth_credentials_store_mode,
             keyring_backend_kind,
@@ -2249,6 +2298,8 @@ impl AuthManager {
             codex_home: PathBuf::from("non-existent"),
             inner: RwLock::new(cached),
             auth_change_tx,
+            last_managed_auth_generation: AtomicU64::new(0),
+            prepared_managed_adoptions: Arc::default(),
             enable_codex_api_key_env: false,
             auth_credentials_store_mode: AuthCredentialsStoreMode::File,
             keyring_backend_kind: AuthKeyringBackendKind::default(),
@@ -2277,6 +2328,8 @@ impl AuthManager {
             codex_home,
             inner: RwLock::new(cached),
             auth_change_tx,
+            last_managed_auth_generation: AtomicU64::new(0),
+            prepared_managed_adoptions: Arc::default(),
             enable_codex_api_key_env: false,
             auth_credentials_store_mode: AuthCredentialsStoreMode::File,
             keyring_backend_kind: AuthKeyringBackendKind::default(),
@@ -2309,6 +2362,8 @@ impl AuthManager {
             codex_home: PathBuf::from("non-existent"),
             inner: RwLock::new(cached),
             auth_change_tx,
+            last_managed_auth_generation: AtomicU64::new(0),
+            prepared_managed_adoptions: Arc::default(),
             enable_codex_api_key_env: false,
             auth_credentials_store_mode: AuthCredentialsStoreMode::File,
             keyring_backend_kind: AuthKeyringBackendKind::default(),
@@ -2339,6 +2394,8 @@ impl AuthManager {
                 permanent_refresh_failure: None,
             }),
             auth_change_tx,
+            last_managed_auth_generation: AtomicU64::new(0),
+            prepared_managed_adoptions: Arc::default(),
             enable_codex_api_key_env: false,
             auth_credentials_store_mode: AuthCredentialsStoreMode::File,
             keyring_backend_kind: AuthKeyringBackendKind::default(),
@@ -2386,6 +2443,27 @@ impl AuthManager {
         Ok(cached.auth.clone())
     }
 
+    /// Credential-free startup identity with the same availability semantics
+    /// as `authoritative_auth_cached`. Mode eligibility is a separate check;
+    /// this snapshot does not turn an unsupported mode into unavailable auth.
+    pub fn authoritative_managed_auth_fingerprint(
+        &self,
+    ) -> Result<Option<String>, AuthoritativeAuthUnavailable> {
+        let cached = self
+            .inner
+            .read()
+            .map_err(|_| AuthoritativeAuthUnavailable::CacheLockUnavailable)?;
+        if cached.initial_load_failed {
+            return Err(AuthoritativeAuthUnavailable::InitialLoadFailed);
+        }
+        Ok(cached
+            .auth
+            .as_ref()
+            .and_then(CodexAuth::get_account_id)
+            .as_deref()
+            .map(Self::managed_account_fingerprint))
+    }
+
     /// Eligibility of the current cached authority, without refreshing or
     /// reading a new durable result. Unavailable state is never logout.
     pub fn managed_transition_eligible(&self) -> Result<bool, AuthoritativeAuthUnavailable> {
@@ -2403,6 +2481,13 @@ impl AuthManager {
     /// Subscribes to cached auth changes that can affect request recovery.
     pub fn auth_change_receiver(&self) -> watch::Receiver<u64> {
         self.auth_change_tx.subscribe()
+    }
+
+    /// Classifies a notified generation's managed origin, not caller authority.
+    /// Managed reset owns publication for these generations; ordinary watchers
+    /// must not race it. Callers must separately validate the current revision.
+    pub fn is_managed_auth_change(&self, generation: u64) -> bool {
+        generation != 0 && self.last_managed_auth_generation.load(Ordering::Acquire) == generation
     }
 
     pub fn refresh_failure_for_auth(&self, auth: &CodexAuth) -> Option<RefreshTokenFailedError> {
@@ -2659,7 +2744,7 @@ impl AuthManager {
     /// (`CodexAuth::Chatgpt`) can ever resolve to `Available`; every other
     /// mode -- including external auth authority resolved successfully --
     /// is `IneligibleAuthMode`, per R002/R044/R045's exact scope.
-    pub async fn read_managed_adoption_source(&self) -> ManagedAdoptionSourceOutcome {
+    async fn read_managed_adoption_source(&self) -> ManagedAdoptionSourceOutcome {
         use ManagedAdoptionSourceOutcome as Outcome;
         use ManagedAdoptionVerificationError as Error;
         match self.read_managed_adoption_snapshot().await {
@@ -2795,7 +2880,7 @@ impl AuthManager {
     /// refusing rather than overwriting an unrelated concurrent change
     /// (an ordinary non-managed login/logout, or a token refresh) that
     /// landed during the read. Holds the lock for no `.await`.
-    pub fn install_managed_adoption(
+    fn install_managed_adoption(
         &self,
         new_auth: CodexAuth,
         expected_previous: Option<CodexAuth>,
@@ -2828,25 +2913,32 @@ impl AuthManager {
         {
             return ManagedAdoptionInstallOutcome::CurrentAuthIneligible;
         }
+        let installed_fingerprint = new_auth
+            .get_account_id()
+            .as_deref()
+            .map(Self::managed_account_fingerprint);
         if !matches!(&new_auth, CodexAuth::Chatgpt(_))
-            || new_auth
-                .get_account_id()
-                .as_deref()
-                .map(Self::managed_account_fingerprint)
-                .as_deref()
-                != Some(intended_fingerprint)
+            || installed_fingerprint.as_deref() != Some(intended_fingerprint)
         {
             return ManagedAdoptionInstallOutcome::IntendedResultMismatch;
         }
+        let Some(fingerprint) = installed_fingerprint else {
+            return ManagedAdoptionInstallOutcome::IntendedResultMismatch;
+        };
         let auth_changed_for_refresh = !Self::auths_equal_for_refresh(previous, Some(&new_auth));
         if auth_changed_for_refresh {
             guard.permanent_refresh_failure = None;
         }
-        guard.auth = Some(new_auth.clone());
+        guard.auth = Some(new_auth);
         if auth_changed_for_refresh {
-            self.auth_change_tx.send_modify(|revision| *revision += 1);
+            self.auth_change_tx.send_modify(|revision| {
+                *revision += 1;
+                // Store before send_modify releases the watch value/notifies.
+                self.last_managed_auth_generation
+                    .store(*revision, Ordering::Release);
+            });
         }
-        ManagedAdoptionInstallOutcome::Installed(new_auth)
+        ManagedAdoptionInstallOutcome::Installed { fingerprint }
     }
 
     /// Token-free equality fingerprint shared by managed admission and install.
@@ -2865,11 +2957,23 @@ impl AuthManager {
         &self,
         intended_fingerprint: Option<&str>,
     ) -> Result<(), ManagedAdoptionVerificationError> {
+        self.prepare_managed_terminal_commit(intended_fingerprint)
+            .await
+            .map(|_| ())
+    }
+
+    /// Read and validate the final durable/cache result without retaining any
+    /// synchronous guard across await. The returned evidence must be consumed
+    /// by `with_managed_terminal_projection`, not treated as a final receipt.
+    pub async fn prepare_managed_terminal_commit(
+        &self,
+        intended_fingerprint: Option<&str>,
+    ) -> Result<ManagedTerminalPrecondition, ManagedAdoptionVerificationError> {
         use ManagedAdoptionVerificationError as Error;
         let revision = *self.auth_change_tx.borrow();
-        let source = self.read_managed_adoption_source().await;
-        let expected = match source {
-            ManagedAdoptionSourceOutcome::Available(auth) => {
+        let (expected, preimage) = self.read_managed_adoption_snapshot().await?;
+        match &expected {
+            Some(auth) => {
                 if auth
                     .get_account_id()
                     .as_deref()
@@ -2879,28 +2983,10 @@ impl AuthManager {
                 {
                     return Err(Error::IntendedResultMismatch);
                 }
-                Some(auth)
             }
-            ManagedAdoptionSourceOutcome::Absent if intended_fingerprint.is_none() => None,
-            ManagedAdoptionSourceOutcome::Absent => return Err(Error::IntendedResultMismatch),
-            ManagedAdoptionSourceOutcome::ExternalResolutionFailed => {
-                return Err(Error::ExternalResolutionFailed);
-            }
-            ManagedAdoptionSourceOutcome::BackendIoFailed => return Err(Error::BackendIoFailed),
-            ManagedAdoptionSourceOutcome::ParseFailed => return Err(Error::ParseFailed),
-            ManagedAdoptionSourceOutcome::StorageFailed(error) => {
-                return Err(Error::StorageFailed(error));
-            }
-            ManagedAdoptionSourceOutcome::RestrictionRejected => {
-                return Err(Error::RestrictionRejected);
-            }
-            ManagedAdoptionSourceOutcome::MissingStableIdentity => {
-                return Err(Error::MissingStableIdentity);
-            }
-            ManagedAdoptionSourceOutcome::IneligibleAuthMode => {
-                return Err(Error::IneligibleAuthMode);
-            }
-        };
+            None if intended_fingerprint.is_none() => {}
+            None => return Err(Error::IntendedResultMismatch),
+        }
         let external = self
             .external_auth
             .read()
@@ -2917,7 +3003,52 @@ impl AuthManager {
         {
             return Err(Error::CacheChangedConcurrently);
         }
-        Ok(())
+        Ok(ManagedTerminalPrecondition {
+            preimage,
+            revision,
+            fingerprint: intended_fingerprint.map(str::to_owned),
+            manager: Arc::downgrade(&self.prepared_managed_adoptions),
+        })
+    }
+
+    /// Linearizes the final commit against supported repository-owned durable
+    /// writers. Source -> external -> cache locks remain held through callback;
+    /// no callback await, manager reentry, or uncooperative OS-write exclusion
+    /// is permitted/claimed. The token is bound to this exact manager.
+    pub fn with_managed_terminal_projection<T>(
+        &self,
+        precondition: &ManagedTerminalPrecondition,
+        commit: impl FnOnce(Option<AuthMode>, Option<AccountPlanType>) -> T,
+    ) -> Result<T, ManagedTerminalVerificationError> {
+        use ManagedAdoptionVerificationError as Error;
+        use ManagedTerminalVerificationError as Terminal;
+        if !std::sync::Weak::ptr_eq(
+            &precondition.manager,
+            &Arc::downgrade(&self.prepared_managed_adoptions),
+        ) {
+            return Err(Terminal::Authority(Error::CacheChangedConcurrently));
+        }
+        let storage = create_auth_storage(
+            self.codex_home.clone(),
+            self.auth_credentials_store_mode,
+            self.keyring_backend_kind,
+        );
+        let source = storage
+            .lock_managed_source()
+            .map_err(Terminal::SourceUnavailable)?;
+        if !source
+            .verify_managed_preimage(&precondition.preimage)
+            .map_err(Terminal::SourceUnavailable)?
+        {
+            return Err(Terminal::SourceChanged);
+        }
+        self.with_managed_account_projection(precondition.fingerprint.as_deref(), |mode, plan| {
+            if precondition.revision != *self.auth_change_tx.borrow() {
+                return Err(Terminal::Authority(Error::CacheChangedConcurrently));
+            }
+            Ok(commit(mode, plan))
+        })
+        .map_err(Terminal::Authority)?
     }
 
     /// Checks the authoritative cache without a reload or any mutation. A
@@ -2940,6 +3071,18 @@ impl AuthManager {
         &self,
         intended_fingerprint: Option<&str>,
         commit: impl FnOnce() -> T,
+    ) -> Result<T, ManagedAdoptionVerificationError> {
+        self.with_managed_account_projection(intended_fingerprint, |_, _| commit())
+    }
+
+    /// Supplies only the account-facing mode and plan from the exact verified
+    /// cache while its terminal commit guard remains held. No credential or
+    /// raw identity crosses this seam. The callback must not await or reenter
+    /// AuthManager; it may synchronously commit an already-reserved projection.
+    pub fn with_managed_account_projection<T>(
+        &self,
+        intended_fingerprint: Option<&str>,
+        commit: impl FnOnce(Option<AuthMode>, Option<AccountPlanType>) -> T,
     ) -> Result<T, ManagedAdoptionVerificationError> {
         use ManagedAdoptionVerificationError as Error;
         let external = self
@@ -2967,7 +3110,10 @@ impl AuthManager {
         if !matches {
             return Err(Error::IntendedResultMismatch);
         }
-        Ok(commit())
+        Ok(commit(
+            cached.auth.as_ref().map(CodexAuth::api_auth_mode),
+            cached.auth.as_ref().and_then(CodexAuth::account_plan_type),
+        ))
     }
 
     /// Capture current eligible managed identity/revision before admission.
@@ -3026,10 +3172,26 @@ impl AuthManager {
             return Err(ManagedAdoptionVerificationError::IntendedResultMismatch);
         }
         self.validate_managed_adoption_precondition(precondition)?;
+        let mut store = self
+            .prepared_managed_adoptions
+            .lock()
+            .map_err(|_| ManagedAdoptionVerificationError::CacheUnavailable)?;
+        let id = store
+            .next_id
+            .checked_add(1)
+            .ok_or(ManagedAdoptionVerificationError::CacheUnavailable)?;
+        store.next_id = id;
+        store.candidates.insert(
+            id,
+            PreparedManagedAdoptionCandidate {
+                candidate,
+                preimage,
+                intended_fingerprint: intended_fingerprint.map(str::to_owned),
+            },
+        );
         Ok(PreparedManagedAdoption {
-            candidate: std::sync::Mutex::new(Some(candidate)),
-            preimage,
-            intended_fingerprint: intended_fingerprint.map(str::to_owned),
+            id,
+            store: Arc::downgrade(&self.prepared_managed_adoptions),
         })
     }
 
@@ -3041,11 +3203,17 @@ impl AuthManager {
         prepared: &PreparedManagedAdoption,
         precondition: &ManagedAdoptionPrecondition,
     ) -> ManagedAdoptionInstallOutcome {
-        // Every attempt consumes the capability, including failed preimage
-        // checks. A repaired source requires a fresh, independently prepared
-        // candidate rather than rearming a failed operation.
-        let candidate = match prepared.candidate.lock() {
-            Ok(mut candidate) => candidate.take(),
+        if !std::sync::Weak::ptr_eq(
+            &prepared.store,
+            &Arc::downgrade(&self.prepared_managed_adoptions),
+        ) {
+            return ManagedAdoptionInstallOutcome::IntendedResultMismatch;
+        }
+        // An attempt that can access the store burns the candidate BEFORE all
+        // source/cache checks. Poison is terminal and never cleared: it cannot
+        // burn the entry, but can never make it installable again either.
+        let candidate = match self.prepared_managed_adoptions.lock() {
+            Ok(mut store) => store.candidates.remove(&prepared.id),
             Err(_) => return ManagedAdoptionInstallOutcome::CacheLockUnavailable,
         };
         let Some(candidate) = candidate else {
@@ -3063,13 +3231,16 @@ impl AuthManager {
             Ok(guard) => guard,
             Err(error) => return ManagedAdoptionInstallOutcome::SourceReadFailed(error),
         };
-        match source_transaction.verify_managed_preimage(&prepared.preimage) {
+        match source_transaction.verify_managed_preimage(&candidate.preimage) {
             Ok(true) => {}
             Ok(false) => return ManagedAdoptionInstallOutcome::SourceChanged,
             Err(error) => return ManagedAdoptionInstallOutcome::SourceReadFailed(error),
         }
         let previous = self.auth_cached();
-        match (candidate, prepared.intended_fingerprint.as_deref()) {
+        match (
+            candidate.candidate,
+            candidate.intended_fingerprint.as_deref(),
+        ) {
             (Some(auth), Some(intended)) => {
                 self.install_managed_adoption(auth, previous, intended, precondition)
             }
@@ -3084,7 +3255,7 @@ impl AuthManager {
     /// not a failure. Same concurrent-change CAS contract as
     /// [`Self::install_managed_adoption`]; never touches the durable
     /// store (the writer boundary remains separately owned, R066-R068).
-    pub fn install_managed_logout(
+    fn install_managed_logout(
         &self,
         expected_previous: Option<CodexAuth>,
         precondition: &ManagedAdoptionPrecondition,
@@ -3121,7 +3292,11 @@ impl AuthManager {
         }
         guard.auth = None;
         if auth_changed_for_refresh {
-            self.auth_change_tx.send_modify(|revision| *revision += 1);
+            self.auth_change_tx.send_modify(|revision| {
+                *revision += 1;
+                self.last_managed_auth_generation
+                    .store(*revision, Ordering::Release);
+            });
         }
         ManagedAdoptionInstallOutcome::LoggedOut
     }

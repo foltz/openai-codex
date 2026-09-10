@@ -63,11 +63,13 @@ async fn managed_transition_server_process_helper() -> Result<()> {
 struct Server {
     process: Child,
     peer: Peer,
+    _executable_directory: TempDir,
 }
 
 struct Peer {
     socket: WebSocketStream<tokio::net::UnixStream>,
     next_id: i64,
+    account_events_before_response: Vec<Value>,
 }
 
 impl std::ops::Deref for Server {
@@ -85,11 +87,33 @@ impl std::ops::DerefMut for Server {
 
 impl Server {
     async fn start(home: &Path, socket_path: &Path) -> Result<Self> {
-        let mut process = Command::new(std::env::current_exe()?)
+        let started = std::time::Instant::now();
+        eprintln!("managed-process: spawn begin");
+        // Keep the real signed executable and inode, but avoid asking macOS
+        // code discovery to enumerate the entire Cargo dependency directory.
+        // Same-filesystem placement makes hard-link identity mandatory; there
+        // is no copy or weaker provenance fallback.
+        let executable = std::env::current_exe()?;
+        let executable_directory = tempfile::Builder::new()
+            .prefix("managed-process-")
+            .tempdir_in(executable.parent().context("test executable parent")?)?;
+        let helper = executable_directory.path().join("managed-process-helper");
+        std::fs::hard_link(&executable, &helper)?;
+        use std::os::unix::fs::MetadataExt;
+        let original = std::fs::metadata(&executable)?;
+        let linked = std::fs::metadata(&helper)?;
+        ensure!(
+            (original.dev(), original.ino()) == (linked.dev(), linked.ino()),
+            "helper must retain the exact executable file identity"
+        );
+        let mut process = Command::new(helper)
             .args(["--ignored", "--exact", "suite::v2::managed_transition::process_proofs::managed_transition_server_process_helper", "--nocapture"])
             .env("CODEX_HOME", home)
             .env(CHILD_SOCKET, socket_path)
             .env("KESTREL_CODEX_MANAGED_PROFILE", "disposable-regression")
+            // Keep fixture metrics for explicit reset flushes; do not inherit
+            // an ambient short interval that consumes them before the proof.
+            .env("OTEL_METRIC_EXPORT_INTERVAL", "3600000")
             .env_remove("OPENAI_API_KEY")
             .env_remove("CODEX_API_KEY")
             .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::inherit())
@@ -106,13 +130,28 @@ impl Server {
             }
         })
         .await??;
+        eprintln!(
+            "managed-process: socket ready after {:?}",
+            started.elapsed()
+        );
         let peer = Peer::initialize(stream).await?;
-        Ok(Self { process, peer })
+        eprintln!("managed-process: initialized after {:?}", started.elapsed());
+        Ok(Self {
+            process,
+            peer,
+            _executable_directory: executable_directory,
+        })
     }
 
     async fn kill(mut self) -> Result<()> {
+        let started = std::time::Instant::now();
+        eprintln!("managed-process: kill/join begin");
         self.process.kill().await?;
         self.process.wait().await?;
+        eprintln!(
+            "managed-process: kill/join complete after {:?}",
+            started.elapsed()
+        );
         Ok(())
     }
 }
@@ -124,7 +163,11 @@ impl Peer {
 
     async fn initialize(stream: tokio::net::UnixStream) -> Result<Self> {
         let (socket, _) = client_async("ws://localhost/rpc", stream).await?;
-        let mut server = Self { socket, next_id: 1 };
+        let mut server = Self {
+            socket,
+            next_id: 1,
+            account_events_before_response: Vec::new(),
+        };
         server.request("initialize", json!({"clientInfo":{"name":"codex-tui","version":"test"},"capabilities":{"experimentalApi":true,"interactiveClient":true}})).await?;
         server
             .socket
@@ -138,6 +181,9 @@ impl Peer {
     }
 
     async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        let started = std::time::Instant::now();
+        eprintln!("managed-process: request {method} begin");
+        self.account_events_before_response.clear();
         let id = self.next_id;
         self.next_id += 1;
         self.socket
@@ -151,7 +197,17 @@ impl Peer {
             while let Some(message) = self.socket.next().await {
                 if let Message::Text(text) = message? {
                     let value: Value = serde_json::from_str(&text)?;
+                    if matches!(
+                        value["method"].as_str(),
+                        Some("account/updated" | "account/login/completed")
+                    ) {
+                        self.account_events_before_response.push(value.clone());
+                    }
                     if value["id"] == id {
+                        eprintln!(
+                            "managed-process: request {method} response after {:?}",
+                            started.elapsed()
+                        );
                         return value
                             .get("result")
                             .cloned()
@@ -373,8 +429,27 @@ async fn persistent_server_adopts_b_and_restart_refuses_prior_instance() -> Resu
     let started = server.request("thread/start", json!({})).await?;
     let thread_id = started["thread"]["id"].clone();
     server.turn(&thread_id).await?;
-    write_account(&home, "account-b", "fixture-token-b")?;
+    write_chatgpt_auth(
+        &home,
+        ChatGptAuthFixture::new("fixture-token-b")
+            .account_id("account-b")
+            .plan_type("pro"),
+        AuthCredentialsStoreMode::File,
+    )?;
     let result = server.adopt(&prior, "adopt-b", "account-b").await?;
+    assert_eq!(
+        server.account_events_before_response.len(),
+        1,
+        "exactly one account event must precede the Start response"
+    );
+    assert_eq!(
+        server.account_events_before_response[0]["method"],
+        "account/updated"
+    );
+    assert_eq!(
+        server.account_events_before_response[0]["params"],
+        json!({"authMode":"chatgpt","planType":"pro"})
+    );
     ensure!(
         result["status"]["phase"] == "succeeded",
         "adoption must succeed: {result}"
@@ -648,9 +723,179 @@ async fn restart_after_failed_models_reset_reconstructs_installed_b_without_old_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn telemetry_preparation_failure_quarantines_and_restart_reconstructs_installed_b()
+-> Result<()> {
+    let temp = TempDir::new()?;
+    let home = temp.path().join("home");
+    std::fs::create_dir(&home)?;
+    let responses = mock_backend().await;
+    mock_config(&responses.uri()).write(&home)?;
+    let config_path = home.join("config.toml");
+    let working_config = std::fs::read_to_string(&config_path)?;
+    write_account(&home, "account-a", "fixture-token-a")?;
+    let mut server = Server::start(&home, &temp.path().join("first.sock")).await?;
+    let prior = server.evidence().await?;
+
+    // Valid config syntax, but actual exporter construction must read this
+    // missing certificate. This is preparation failure, not an HTTP export
+    // error masquerading as terminal exporter-shutdown evidence.
+    let missing_ca = home.join("missing-telemetry-ca.pem");
+    std::fs::write(
+        &config_path,
+        format!(
+            "{working_config}\n[otel]\ntrace_exporter = {{ otlp-http = {{ endpoint = \"https://127.0.0.1:1/traces\", protocol = \"json\", tls = {{ ca-certificate = {} }} }} }}\n",
+            serde_json::to_string(&missing_ca)?
+        ),
+    )?;
+    write_account(&home, "account-b", "fixture-token-b")?;
+    let failed = server
+        .adopt(&prior, "failed-telemetry-prepare", "account-b")
+        .await?;
+    assert_eq!(failed["status"]["phase"], "quarantined");
+    assert_eq!(failed["status"]["refusal"], "resetFailed");
+    assert_eq!(
+        failed["status"]["resultAuthFingerprint"],
+        codex_login::AuthManager::managed_account_fingerprint("account-b")
+    );
+    let replay = server
+        .adopt(&prior, "failed-telemetry-prepare", "account-b")
+        .await?;
+    assert_eq!(replay["refusal"]["kind"], "completedReplay");
+    let recorded = server
+        .request(
+            "account/managedAuthTransition/read",
+            json!({
+                "contractVersion": 1,
+                "transitionId": "failed-telemetry-prepare",
+                "processInstanceId": prior["processInstanceId"]
+            }),
+        )
+        .await?;
+    assert_eq!(recorded["status"], failed["status"]);
+    for sentinel in ["fixture-token-b", "account-b", "missing-telemetry-ca.pem"] {
+        ensure!(!failed.to_string().contains(sentinel));
+    }
+    server.kill().await?;
+
+    std::fs::write(&config_path, working_config)?;
+    let mut restarted = Server::start(&home, &temp.path().join("second.sock")).await?;
+    let current = restarted.evidence().await?;
+    ensure!(current["processInstanceId"] != prior["processInstanceId"]);
+    assert_eq!(
+        current["authFingerprint"],
+        codex_login::AuthManager::managed_account_fingerprint("account-b")
+    );
+    let stale = restarted
+        .adopt(&prior, "failed-telemetry-prepare", "account-b")
+        .await?;
+    assert_eq!(stale["refusal"]["kind"], "processMismatch");
+    let recovered = restarted
+        .adopt(&current, "retry-after-telemetry-prepare", "account-b")
+        .await?;
+    assert_eq!(recovered["status"]["phase"], "succeeded");
+    restarted.kill().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn telemetry_flush_failure_stays_quarantined_until_process_replacement() -> Result<()> {
+    let temp = TempDir::new()?;
+    let home = temp.path().join("home");
+    std::fs::create_dir(&home)?;
+    let responses = mock_backend().await;
+    let collector = wiremock::MockServer::start().await;
+    let restored = Arc::new(AtomicU8::new(0));
+    let response_mode = Arc::clone(&restored);
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/metrics"))
+        .respond_with(move |_: &wiremock::Request| {
+            if response_mode.load(Ordering::SeqCst) == 0 {
+                wiremock::ResponseTemplate::new(400).set_body_string("private-exporter-diagnostic")
+            } else {
+                wiremock::ResponseTemplate::new(200).set_body_json(json!({}))
+            }
+        })
+        .mount(&collector)
+        .await;
+    mock_config(&responses.uri())
+        .with_extra_config(&format!(
+            "[analytics]\nenabled = true\n[otel]\nmetrics_exporter = {{ otlp-http = {{ endpoint = \"{}/metrics\", protocol = \"json\" }} }}",
+            collector.uri()
+        ))
+        .write(&home)?;
+    write_account(&home, "account-a", "fixture-token-a")?;
+    let mut server = Server::start(&home, &temp.path().join("first.sock")).await?;
+    let prior = server.evidence().await?;
+    write_account(&home, "account-b", "fixture-token-b")?;
+    let failed = server
+        .adopt(&prior, "failed-metrics-flush", "account-b")
+        .await?;
+    assert_eq!(failed["status"]["phase"], "quarantined");
+    assert_eq!(failed["status"]["refusal"], "resetFailed");
+    assert_eq!(
+        failed["status"]["resultAuthFingerprint"],
+        codex_login::AuthManager::managed_account_fingerprint("account-b")
+    );
+    let rejected_requests = collector.received_requests().await.unwrap_or_default();
+    ensure!(
+        !rejected_requests.is_empty(),
+        "real metrics export must have failed"
+    );
+    ensure!(!failed.to_string().contains("private-exporter-diagnostic"));
+    // Restoring the endpoint cannot undo the SDK's consumed shutdown attempt.
+    // A fresh, fully revalidated transition must replay that sticky failure.
+    restored.store(1, Ordering::SeqCst);
+    let current = server.evidence().await?;
+    let still_failed = server
+        .adopt(&current, "retry-sticky-metrics", "account-b")
+        .await?;
+    assert_eq!(still_failed["status"]["phase"], "quarantined");
+    assert_eq!(still_failed["status"]["refusal"], "resetFailed");
+    server.kill().await?;
+
+    let before_restart = collector
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .len();
+    let mut restarted = Server::start(&home, &temp.path().join("second.sock")).await?;
+    let current = restarted.evidence().await?;
+    ensure!(current["processInstanceId"] != prior["processInstanceId"]);
+    assert_eq!(
+        current["authFingerprint"],
+        codex_login::AuthManager::managed_account_fingerprint("account-b")
+    );
+    let stale = restarted
+        .adopt(&prior, "failed-metrics-flush", "account-b")
+        .await?;
+    assert_eq!(stale["refusal"]["kind"], "processMismatch");
+    let recovered = restarted
+        .adopt(&current, "fresh-metrics-owner", "account-b")
+        .await?;
+    assert_eq!(recovered["status"]["phase"], "succeeded");
+    ensure!(
+        collector
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .len()
+            > before_restart
+    );
+    restarted.kill().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn independent_connection_cancels_draining_and_source_change_quarantines_prepared_adoption()
 -> Result<()> {
-    for cancel in [true, false] {
+    // Admitted and Draining have identical restart authority: both own only
+    // process-local prepared work, with the installed cache unchanged. The
+    // production start path moves from admit() to advance(Draining) without
+    // intervening external I/O. A competing reader may observe Admitted while
+    // its mutex acquisition delays advance, so it is not claimed unreachable;
+    // the held Draining crash below exercises the same persisted/cache/owner
+    // reconstruction state after that purely local phase/revision increment.
+    for boundary in ["cancelled", "draining", "source-changed"] {
         let temp = TempDir::new()?;
         let home = temp.path().join("home");
         std::fs::create_dir(&home)?;
@@ -715,15 +960,41 @@ async fn independent_connection_cancels_draining_and_source_change_quarantines_p
                 sleep(Duration::from_millis(10)).await;
             }
         }).await??;
-        if cancel {
-            let cancelled = observer.request("account/managedAuthTransition/cancel", json!({"contractVersion":1,"transitionId":"held-drain","processInstanceId":prior["processInstanceId"]})).await?;
-            assert_eq!(
-                cancelled["status"]["phase"], "cancelled",
-                "second-connection cancel must execute while Start is pending: {cancelled}"
-            );
-            assert_eq!(cancelled["status"]["authRevision"], prior["authRevision"]);
-            release.notify_one();
+        if boundary == "cancelled" || boundary == "draining" {
+            if boundary == "cancelled" {
+                let cancelled = observer.request("account/managedAuthTransition/cancel", json!({"contractVersion":1,"transitionId":"held-drain","processInstanceId":prior["processInstanceId"]})).await?;
+                assert_eq!(
+                    cancelled["status"]["phase"], "cancelled",
+                    "second-connection cancel must execute while Start is pending: {cancelled}"
+                );
+                assert_eq!(cancelled["status"]["authRevision"], prior["authRevision"]);
+            }
+            // In the Draining row the permit remains held until after death,
+            // proving the restart occurred before zero-drain/adoption.
             server.kill().await?;
+            release.notify_one();
+            let mut restarted = Server::start(&home, &temp.path().join("second.sock")).await?;
+            let current = restarted.evidence().await?;
+            ensure!(current["processInstanceId"] != prior["processInstanceId"]);
+            assert_eq!(
+                current["authFingerprint"],
+                codex_login::AuthManager::managed_account_fingerprint("account-b")
+            );
+            let stale = restarted.adopt(&prior, "held-drain", "account-b").await?;
+            assert_eq!(stale["refusal"]["kind"], "processMismatch");
+            let forgotten = restarted.request("account/managedAuthTransition/read", json!({"contractVersion":1,"transitionId":"held-drain","processInstanceId":current["processInstanceId"]})).await?;
+            assert_eq!(
+                forgotten["type"], "refused",
+                "{boundary} must not survive as fabricated history"
+            );
+            let retry = restarted
+                .adopt(&current, "retry-current-b", "account-b")
+                .await?;
+            assert_eq!(
+                retry["status"]["phase"], "succeeded",
+                "truthful retry after {boundary}: {retry}"
+            );
+            restarted.kill().await?;
         } else {
             // B was already parsed and bound before admission. Changing bytes
             // while real account work drains must invalidate its later install.
@@ -762,5 +1033,97 @@ async fn independent_connection_cancels_draining_and_source_change_quarantines_p
             restarted.kill().await?;
         }
     }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn managed_logout_restart_reconstructs_absence_and_refuses_ineligible_retry() -> Result<()> {
+    let temp = TempDir::new()?;
+    let home = temp.path().join("home");
+    std::fs::create_dir(&home)?;
+    let responses = mock_backend().await;
+    mock_config(&responses.uri()).write(&home)?;
+    write_account(&home, "account-a", "fixture-token-a")?;
+    let mut server = Server::start(&home, &temp.path().join("first.sock")).await?;
+    let prior = server.evidence().await?;
+    std::fs::remove_file(home.join("auth.json"))?;
+    let logged_out = server.request("account/managedAuthTransition/start", json!({
+        "contractVersion":1,"transitionId":"managed-logout","processInstanceId":prior["processInstanceId"],
+        "intent":"adoptManagedLogout","expectedAuthRevision":prior["authRevision"],
+        "expectedTransitionRevision":prior["transitionRevision"],"expectedAuthFingerprint":prior["authFingerprint"],
+        "intendedResultAuthFingerprint":null
+    })).await?;
+    assert_eq!(
+        logged_out["status"]["phase"], "succeeded",
+        "deliberate eligible managed logout must complete: {logged_out}"
+    );
+    assert_eq!(logged_out["status"]["resultAuthFingerprint"], Value::Null);
+    assert_eq!(
+        server.account_events_before_response.len(),
+        1,
+        "logout projection must precede its Start response, without login-completed"
+    );
+    assert_eq!(
+        server.account_events_before_response[0]["method"],
+        "account/updated"
+    );
+    assert_eq!(
+        server.account_events_before_response[0]["params"],
+        json!({"authMode":null,"planType":null})
+    );
+    ensure!(logged_out["status"]["authRevision"].as_u64() > prior["authRevision"].as_u64());
+    server.kill().await?;
+
+    let mut restarted = Server::start(&home, &temp.path().join("second.sock")).await?;
+    let absent = restarted.evidence().await?;
+    ensure!(absent["processInstanceId"] != prior["processInstanceId"]);
+    assert_eq!(absent["authFingerprint"], Value::Null);
+    let stale = restarted.request("account/managedAuthTransition/read", json!({"contractVersion":1,"transitionId":"managed-logout","processInstanceId":prior["processInstanceId"]})).await?;
+    assert_eq!(stale["refusal"]["kind"], "processMismatch");
+    let forgotten = restarted.request("account/managedAuthTransition/read", json!({"contractVersion":1,"transitionId":"managed-logout","processInstanceId":absent["processInstanceId"]})).await?;
+    assert_eq!(
+        forgotten["type"], "refused",
+        "restart must not manufacture the prior logout acknowledgement"
+    );
+    // A new ordinary transition from logged-out current state is ineligible
+    // under R002 even when a separate writer subsequently persists managed B.
+    write_account(&home, "account-b", "fixture-token-b")?;
+    let ineligible = restarted
+        .adopt(&absent, "retry-from-absent", "account-b")
+        .await?;
+    assert_eq!(ineligible["type"], "refused");
+    assert_eq!(ineligible["refusal"]["authFingerprint"], Value::Null);
+    assert_eq!(
+        ineligible["refusal"]["authRevision"],
+        absent["authRevision"]
+    );
+    assert_eq!(
+        ineligible["refusal"]["transitionRevision"],
+        absent["transitionRevision"]
+    );
+    restarted.kill().await?;
+
+    // Re-establish an eligible current state through the normal startup path;
+    // this is an explicit fresh process, not a privileged recovery shortcut.
+    write_account(&home, "account-a", "fixture-token-a")?;
+    let mut eligible = Server::start(&home, &temp.path().join("third.sock")).await?;
+    let current = eligible.evidence().await?;
+    assert_eq!(
+        current["authFingerprint"],
+        codex_login::AuthManager::managed_account_fingerprint("account-a")
+    );
+    write_account(&home, "account-b", "fixture-token-b")?;
+    let retry = eligible
+        .adopt(&current, "fresh-eligible-retry", "account-b")
+        .await?;
+    assert_eq!(
+        retry["status"]["phase"], "succeeded",
+        "eligible retry must run real adoption/reset: {retry}"
+    );
+    assert_eq!(
+        retry["status"]["resultAuthFingerprint"],
+        codex_login::AuthManager::managed_account_fingerprint("account-b")
+    );
+    eligible.kill().await?;
     Ok(())
 }

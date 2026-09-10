@@ -151,6 +151,14 @@ pub(crate) struct RequestSerializationQueues {
 }
 
 impl RequestSerializationQueues {
+    #[cfg(test)]
+    pub(crate) async fn pending_count_for_tests(
+        &self,
+        key: &RequestSerializationQueueKey,
+    ) -> usize {
+        self.inner.lock().await.get(key).map_or(0, VecDeque::len)
+    }
+
     /// Enqueue app-owned work alongside RPCs that mutate the same serialized resource.
     pub(crate) async fn enqueue_background(
         &self,

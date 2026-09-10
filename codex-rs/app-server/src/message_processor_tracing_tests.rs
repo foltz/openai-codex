@@ -121,6 +121,20 @@ struct TracingHarness {
     outgoing_rx: mpsc::Receiver<crate::outgoing_message::OutgoingEnvelope>,
     session: Arc<ConnectionSessionState>,
     tracing: &'static TestTracing,
+    telemetry: Option<TestManagedTelemetry>,
+}
+
+enum TestTelemetry {
+    Unavailable,
+    Managed,
+}
+
+struct TestManagedTelemetry {
+    cancel: tokio_util::sync::CancellationToken,
+    task: tokio::task::JoinHandle<
+        crate::otel_reloader::ManagedReloader<tracing_subscriber::Registry>,
+    >,
+    _dispatch: tracing::Dispatch,
 }
 
 impl TracingHarness {
@@ -129,9 +143,15 @@ impl TracingHarness {
     }
 
     async fn with_codex_home(codex_home: TempDir) -> Result<Self> {
+        Self::with_telemetry(codex_home, TestTelemetry::Unavailable).await
+    }
+
+    async fn with_telemetry(codex_home: TempDir, telemetry: TestTelemetry) -> Result<Self> {
         let server = create_mock_responses_server_repeating_assistant("Done").await;
-        let config = Arc::new(build_test_config(codex_home.path(), &server.uri()).await?);
-        let (processor, outgoing_rx) = build_test_processor(config).await;
+        let mut config = build_test_config(codex_home.path(), &server.uri()).await?;
+        config.chatgpt_base_url = format!("{}/backend-api", server.uri());
+        let config = Arc::new(config);
+        let (processor, outgoing_rx, telemetry) = build_test_processor(config, telemetry).await;
         let tracing = init_test_tracing();
         tracing.exporter.reset();
         tracing::callsite::rebuild_interest_cache();
@@ -142,6 +162,7 @@ impl TracingHarness {
             outgoing_rx,
             session: Arc::new(ConnectionSessionState::new()),
             tracing,
+            telemetry,
         };
 
         let _: InitializeResponse = harness
@@ -175,6 +196,14 @@ impl TracingHarness {
     async fn shutdown(self) {
         self.processor.shutdown_threads().await;
         self.processor.drain_background_tasks().await;
+        if let Some(telemetry) = self.telemetry {
+            telemetry.cancel.cancel();
+            let owner = tokio::time::timeout(std::time::Duration::from_secs(30), telemetry.task)
+                .await
+                .expect("telemetry owner shutdown deadline")
+                .expect("telemetry owner join");
+            assert_eq!(owner.shutdown_result, Some(Ok(())));
+        }
     }
 
     async fn request<T>(&mut self, request: ClientRequest, trace: Option<W3cTraceContext>) -> T
@@ -240,9 +269,11 @@ async fn build_test_config(codex_home: &Path, server_uri: &str) -> Result<Config
 
 async fn build_test_processor(
     config: Arc<Config>,
+    telemetry: TestTelemetry,
 ) -> (
     Arc<MessageProcessor>,
     mpsc::Receiver<crate::outgoing_message::OutgoingEnvelope>,
+    Option<TestManagedTelemetry>,
 ) {
     let (outgoing_tx, outgoing_rx) = mpsc::channel(16);
     let auth_manager =
@@ -258,11 +289,51 @@ async fn build_test_processor(
     );
     let analytics_events_client =
         analytics_events_client_from_config(Arc::clone(&auth_manager), config.as_ref());
+    let (telemetry_reset, telemetry) = match telemetry {
+        TestTelemetry::Unavailable => (
+            crate::otel_reset_control::TelemetryResetControl::default(),
+            None,
+        ),
+        TestTelemetry::Managed => {
+            let (layers, routes) = codex_otel::ManagedTelemetryRoutes::layers();
+            let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(layers));
+            let mut candidate = Some(
+                codex_core::otel_init::prepare_provider(
+                    &config,
+                    "test",
+                    Some(crate::OTEL_SERVICE_NAME),
+                    false,
+                )
+                .expect("prepare actual telemetry provider"),
+            );
+            let initial = routes
+                .publish(&mut candidate)
+                .expect("publish actual telemetry routes");
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let (control, task) = crate::otel_reloader::spawn_managed(
+                initial,
+                routes,
+                config_manager.clone(),
+                Arc::clone(&auth_manager),
+                false,
+                cancel.clone(),
+            );
+            (
+                control,
+                Some(TestManagedTelemetry {
+                    cancel,
+                    task,
+                    _dispatch: dispatch,
+                }),
+            )
+        }
+    };
     let outgoing = Arc::new(OutgoingMessageSender::new(
         outgoing_tx,
         analytics_events_client.clone(),
     ));
     let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
+        telemetry_reset,
         outgoing,
         analytics_events_client,
         arg0_paths: Arg0DispatchPaths::default(),
@@ -281,7 +352,7 @@ async fn build_test_processor(
         remote_control_handle: None,
         plugin_startup_tasks: crate::PluginStartupTasks::Start,
     }));
-    (processor, outgoing_rx)
+    (processor, outgoing_rx, telemetry)
 }
 
 fn run_current_thread_test_with_stack<F>(name: &str, future: F) -> Result<()>
@@ -860,7 +931,32 @@ fn managed_transition_adoption_resets_plugins_manager_auth_mode_for_the_new_acco
                     .account_id("prior-managed-account"),
                 codex_config::types::AuthCredentialsStoreMode::File,
             )?;
-            let harness = TracingHarness::with_codex_home(codex_home).await?;
+            let harness =
+                TracingHarness::with_telemetry(codex_home, TestTelemetry::Managed).await?;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/backend-api/wham/config/bundle"))
+                .and(wiremock::matchers::header(
+                    "authorization",
+                    "Bearer access-token",
+                ))
+                .and(wiremock::matchers::header(
+                    "chatgpt-account-id",
+                    "managed-adoption-account",
+                ))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})),
+                )
+                .expect(1)
+                .mount(&harness._server)
+                .await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/v1/models"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"models": []})),
+                )
+                .mount(&harness._server)
+                .await;
             // A stale plugin projection is repaired by the actual reset,
             // independently of the eligible managed account in AuthManager.
             harness
@@ -906,7 +1002,8 @@ fn managed_transition_adoption_resets_plugins_manager_auth_mode_for_the_new_acco
             app_test_support::write_chatgpt_auth(
                 harness._codex_home.path(),
                 app_test_support::ChatGptAuthFixture::new("access-token")
-                    .account_id("managed-adoption-account"),
+                    .account_id("managed-adoption-account")
+                    .plan_type("business"),
                 codex_config::types::AuthCredentialsStoreMode::File,
             )
             .expect("write real chatgpt auth.json for adoption");
@@ -919,6 +1016,7 @@ fn managed_transition_adoption_resets_plugins_manager_auth_mode_for_the_new_acco
             let StartManagedTransitionResponse::Accepted { status } = status else {
                 panic!("expected the real production coordinator to accept and complete adoption");
             };
+            harness._server.verify().await;
             assert_eq!(
                 status.phase,
                 codex_app_server_protocol::ManagedTransitionPhase::Succeeded

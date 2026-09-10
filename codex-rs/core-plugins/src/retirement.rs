@@ -111,7 +111,7 @@ impl PluginTaskRegistry {
         let handle = std::thread::Builder::new().spawn(thread).map_err(|_| ())?;
         let task = tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || handle.join()).await;
-            if result.is_err() || result.expect("checked above").is_err() {
+            if !matches!(result, Ok(Ok(()))) {
                 // The wrapper itself is the retained receipt. A panic in the
                 // OS thread is terminal but diagnostic-worthy, never clean.
                 panic!("plugin worker thread failed");
@@ -170,7 +170,8 @@ impl PluginTaskRegistry {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
     use tokio::time::Duration;
 
     #[tokio::test(flavor = "current_thread")]
@@ -198,11 +199,13 @@ mod tests {
     async fn timed_out_task_is_retained_and_replayed_until_joined() {
         let registry = PluginTaskRegistry::default();
         let (release, wait) = tokio::sync::oneshot::channel::<()>();
-        let _ = registry
-            .spawn(async move {
-                let _ = wait.await;
-            })
-            .expect("task admission");
+        drop(
+            registry
+                .spawn(async move {
+                    let _ = wait.await;
+                })
+                .expect("task admission"),
+        );
 
         let first = registry
             .shutdown_until(Instant::now() + Duration::from_millis(5))
@@ -221,11 +224,13 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn panic_is_terminal_but_not_clean() {
         let registry = PluginTaskRegistry::default();
-        let _ = registry
-            .spawn(async {
-                panic!("plugin worker test panic");
-            })
-            .expect("task admission");
+        drop(
+            registry
+                .spawn(async {
+                    panic!("plugin worker test panic");
+                })
+                .expect("task admission"),
+        );
         let report = registry
             .shutdown_until(Instant::now() + Duration::from_secs(1))
             .await;
@@ -239,11 +244,13 @@ mod tests {
         let registry = PluginTaskRegistry::default();
         let finished = Arc::new(AtomicBool::new(false));
         let finished_for_thread = Arc::clone(&finished);
-        let _ = registry
-            .spawn_thread(move || {
-                finished_for_thread.store(true, Ordering::SeqCst);
-            })
-            .expect("thread admission");
+        drop(
+            registry
+                .spawn_thread(move || {
+                    finished_for_thread.store(true, Ordering::SeqCst);
+                })
+                .expect("thread admission"),
+        );
         let report = registry
             .shutdown_until(Instant::now() + Duration::from_secs(1))
             .await;

@@ -582,6 +582,7 @@ pub(crate) use account_processor::AccountLoginReport;
 pub(crate) use account_processor::AccountLoginShutdown;
 pub(crate) use account_processor::AccountRequestProcessor;
 pub(crate) use apps_processor::AppsRequestProcessor;
+#[cfg(test)]
 pub(crate) use apps_processor::AppsRuntimeDrain;
 pub(crate) use apps_processor::AppsShutdown;
 pub(crate) use catalog_processor::CatalogRequestProcessor;

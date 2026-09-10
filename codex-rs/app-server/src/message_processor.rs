@@ -542,6 +542,7 @@ impl MessageProcessor {
                 config_manager.clone(),
                 config_processor.clone(),
                 request_serialization_queues.clone(),
+                auxiliary_tasks.clone(),
             );
         // Account tasks capture processor clones, so their strong census must
         // remain outside that cloneable object.

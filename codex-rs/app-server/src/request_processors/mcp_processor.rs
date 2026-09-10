@@ -290,7 +290,7 @@ impl McpRequestProcessor {
 
         let _ = self
             .tasks
-            .spawn_unverified(async move {
+            .spawn(async move {
                 let (success, error) = match handle.wait().await {
                     Ok(()) => (true, None),
                     Err(err) => (false, Some(err.to_string())),

@@ -5,7 +5,6 @@ use crate::analytics_utils::analytics_events_client_from_config;
 use crate::config_manager::ConfigManager;
 use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::OutgoingMessageSender;
-use crate::plugin_config_reload::PluginStartupConfig;
 use crate::transport::AppServerTransport;
 use anyhow::Result;
 use app_test_support::create_mock_responses_server_repeating_assistant;
@@ -275,7 +274,10 @@ async fn build_test_processor(
         code_mode_session_provider: None,
         rpc_transport: AppServerRpcTransport::Stdio,
         remote_control_handle: None,
-        plugin_startup_tasks: Some(PluginStartupConfig::Current),
+        // Keep this retirement fixture deterministic: startup plugin refresh
+        // workers are exercised by their own ownership tests and would add an
+        // unrelated admitted population to the background-drain assertion.
+        plugin_startup_tasks: None,
     }));
     (processor, outgoing_rx)
 }
@@ -380,7 +382,10 @@ async fn background_drain_timeout_retains_work_and_reobserves_completion() -> Re
                 terminal: true,
                 ..Default::default()
             },
-            auxiliary_tasks: ThreadStartDrain::default(),
+            auxiliary_tasks: ThreadStartDrain {
+                terminal: true,
+                ..Default::default()
+            },
         }
     );
     assert!(weak_resource.upgrade().is_some());
@@ -418,7 +423,10 @@ async fn background_drain_timeout_retains_work_and_reobserves_completion() -> Re
             terminal: true,
             ..Default::default()
         },
-        auxiliary_tasks: ThreadStartDrain::default(),
+        auxiliary_tasks: ThreadStartDrain {
+            terminal: true,
+            ..Default::default()
+        },
     };
     assert_eq!((first, second), (expected.clone(), expected));
     assert!(weak_resource.upgrade().is_none());

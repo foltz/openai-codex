@@ -377,14 +377,13 @@ impl InProcessClientHandle {
             .send(InProcessClientMessage::Shutdown { done_tx })
             .await
             .is_ok()
+            && timeout_at(deadline, done_rx).await.is_err()
         {
-            if timeout_at(deadline, done_rx).await.is_err() {
-                let _ = custody.observe_until(deadline).await;
-                return Err(IoError::new(
-                    ErrorKind::TimedOut,
-                    "in-process app-server shutdown acknowledgement timed out",
-                ));
-            }
+            let _ = custody.observe_until(deadline).await;
+            return Err(IoError::new(
+                ErrorKind::TimedOut,
+                "in-process app-server shutdown acknowledgement timed out",
+            ));
         }
 
         let (runtime_result, _cleanup_report) = tokio::join!(

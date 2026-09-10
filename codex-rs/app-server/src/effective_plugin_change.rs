@@ -14,6 +14,7 @@ use serde_json::json;
 use tracing::warn;
 
 use crate::config_manager::ConfigManager;
+use crate::processor_task_retirement::ProcessorTasks;
 use crate::request_processors::ConfigRequestProcessor;
 use crate::request_serialization::RequestSerializationAccess;
 use crate::request_serialization::RequestSerializationQueueKey;
@@ -26,16 +27,19 @@ pub(crate) fn effective_plugins_changed_callback(
     config_manager: ConfigManager,
     config_processor: ConfigRequestProcessor,
     request_serialization_queues: RequestSerializationQueues,
+    tasks: ProcessorTasks,
 ) -> Arc<dyn Fn(EffectivePluginsChange) + Send + Sync> {
     Arc::new(move |change| {
         thread_manager.plugins_manager().clear_cache();
         thread_manager.skills_service().clear_cache();
 
         let refresh_thread_manager = Arc::clone(&thread_manager);
-        tokio::spawn(async move {
+        if let Err(err) = tasks.spawn_unverified(async move {
             refresh_thread_manager.invalidate_mcp_runtimes().await;
             refresh_thread_manager.refresh_hook_runtimes().await;
-        });
+        }) {
+            warn!(?err, "effective-plugin refresh task admission closed");
+        }
 
         if change.materialized_remote_plugins.is_empty() {
             return;
@@ -46,7 +50,7 @@ pub(crate) fn effective_plugins_changed_callback(
         let trust_config_manager = config_manager.clone();
         let trust_config_processor = config_processor.clone();
         let trust_request_serialization_queues = request_serialization_queues.clone();
-        tokio::spawn(async move {
+        if let Err(err) = tasks.spawn_unverified(async move {
             trust_request_serialization_queues
                 .enqueue_background(
                     RequestSerializationQueueKey::Global("config"),
@@ -66,7 +70,9 @@ pub(crate) fn effective_plugins_changed_callback(
                     },
                 )
                 .await;
-        });
+        }) {
+            warn!(?err, "effective-plugin trust task admission closed");
+        }
     })
 }
 

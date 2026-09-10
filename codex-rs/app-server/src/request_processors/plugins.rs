@@ -1890,7 +1890,7 @@ impl PluginRequestProcessor {
             let http_client = Arc::clone(&http_client);
             let global_callback_url = config.mcp_oauth_callback_url.clone();
 
-            if let Err(err) = self.tasks.spawn_unverified(async move {
+            if let Err(err) = self.tasks.spawn(async move {
                 let oauth_client_id = server.oauth_client_id();
                 let first_attempt = perform_oauth_login_silent(
                     &oauth_credential_name,

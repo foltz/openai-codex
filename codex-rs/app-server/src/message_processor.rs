@@ -490,6 +490,7 @@ impl MessageProcessor {
                 config_manager.clone(),
                 config_processor.clone(),
                 request_serialization_queues.clone(),
+                auxiliary_tasks.clone(),
             );
         let account_processor = AccountRequestProcessor::new(
             auth_manager.clone(),

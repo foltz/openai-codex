@@ -1,9 +1,28 @@
 use super::*;
 use crate::app_info::app_info_to_api;
+use crate::processor_task_retirement::ProcessorTaskDrain;
+use crate::processor_task_retirement::ProcessorTaskTicket;
+use crate::processor_task_retirement::ProcessorTasks;
 use codex_connectors::AppToolPolicyEvaluator;
 
 mod installed;
 mod read;
+mod retirement;
+pub(crate) use retirement::AppsRuntimeDrain;
+use retirement::AppsRuntimeOwners;
+use retirement::AppsRuntimeTicket;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AppsShutdown {
+    pub tasks: ProcessorTaskDrain,
+    pub runtimes: AppsRuntimeDrain,
+}
+
+struct AppsWorkTicket {
+    tasks: ProcessorTaskTicket,
+    runtimes: AppsRuntimeTicket,
+    shutdown: CancellationToken,
+}
 
 pub(super) use read::APP_READ_MAX_IDS;
 
@@ -15,6 +34,8 @@ pub(crate) struct AppsRequestProcessor {
     workspace_settings_cache: Arc<workspace_settings::WorkspaceSettingsCache>,
     shutdown_token: CancellationToken,
     _shutdown_drop_guard: DropGuard,
+    tasks: ProcessorTasks,
+    runtimes: AppsRuntimeOwners,
 }
 
 impl AppsRequestProcessor {
@@ -35,6 +56,8 @@ impl AppsRequestProcessor {
             workspace_settings_cache,
             shutdown_token,
             _shutdown_drop_guard: shutdown_drop_guard,
+            tasks: ProcessorTasks::default(),
+            runtimes: AppsRuntimeOwners::default(),
         }
     }
 
@@ -104,26 +127,54 @@ impl AppsRequestProcessor {
         let mcp_manager = self.thread_manager.mcp_manager();
         let plugins_manager = self.thread_manager.plugins_manager();
         let shutdown_token = self.shutdown_token.child_token();
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = shutdown_token.cancelled() => {}
-                _ = Self::apps_list_task(
-                    outgoing,
-                    request,
-                    params,
-                    config,
-                    environment_manager,
-                    mcp_manager,
-                    plugins_manager,
-                    installed_start,
-                ) => {}
-            }
-        });
+        let work = AppsWorkTicket {
+            tasks: self.tasks.ticket(),
+            runtimes: self.runtimes.ticket(),
+            shutdown: shutdown_token.clone(),
+        };
+        let _receipt = self
+            .tasks
+            .spawn(async move {
+                tokio::select! {
+                    biased;
+                    _ = shutdown_token.cancelled() => {}
+                    _ = Self::apps_list_task(
+                        outgoing,
+                        request,
+                        params,
+                        config,
+                        environment_manager,
+                        mcp_manager,
+                        plugins_manager,
+                        installed_start,
+                    work,
+                    ) => {}
+                }
+            })
+            .map_err(|_| internal_error("app-list task admission unavailable"))?;
         Ok(None)
     }
 
     pub(crate) fn shutdown(&self) {
+        self.runtimes.close();
+        let _ = self.tasks.close_registration();
         self.shutdown_token.cancel();
+    }
+
+    pub(crate) async fn shutdown_until(&self, deadline: tokio::time::Instant) -> AppsShutdown {
+        self.shutdown();
+        let (tasks, runtimes) = tokio::join!(
+            self.tasks.shutdown_until(deadline),
+            self.runtimes.shutdown_until(deadline)
+        );
+        // Task completion releases any pending runtime/transport values held
+        // by discovery. Reconcile actual runtime proof with the SAME bound.
+        let runtimes = if tasks.terminal {
+            self.runtimes.shutdown_until(deadline).await
+        } else {
+            runtimes
+        };
+        AppsShutdown { tasks, runtimes }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -136,6 +187,7 @@ impl AppsRequestProcessor {
         mcp_manager: Arc<McpManager>,
         plugins_manager: Arc<PluginsManager>,
         installed_start: Instant,
+        work: AppsWorkTicket,
     ) {
         let reload = params.force_refetch;
         let retry_params = params.clone();
@@ -150,6 +202,7 @@ impl AppsRequestProcessor {
             environment_manager,
             mcp_manager,
             plugins_manager,
+            &work,
         )
         .await;
         if result.is_ok() {
@@ -172,6 +225,7 @@ impl AppsRequestProcessor {
                 retry_environment_manager,
                 retry_mcp_manager,
                 retry_plugins_manager,
+                &work,
             )
             .await
             {
@@ -187,6 +241,7 @@ impl AppsRequestProcessor {
         environment_manager: Arc<EnvironmentManager>,
         mcp_manager: Arc<McpManager>,
         plugins_manager: Arc<PluginsManager>,
+        work: &AppsWorkTicket,
     ) -> Result<(AppsListResponse, bool), JSONRPCErrorError> {
         let AppsListParams {
             cursor,
@@ -220,30 +275,47 @@ impl AppsRequestProcessor {
 
         let accessible_config = config.clone();
         let accessible_tx = tx.clone();
-        tokio::spawn(async move {
-            let result = connectors::list_accessible_connectors_from_mcp_tools_with_mcp_manager(
-                &accessible_config,
-                force_refetch,
-                Arc::clone(&environment_manager),
-                mcp_manager,
-            )
-            .await
-            .map_err(|err| format!("failed to load accessible apps: {err}"));
-            let _ = accessible_tx.send(AppListLoadResult::Accessible(result));
-        });
+        let retirement = work
+            .runtimes
+            .reserve()
+            .map_err(|_| internal_error("app-list runtime admission unavailable"))?;
+        let shutdown = work.shutdown.clone();
+        // Cancellation is safe only because external runtime custody was
+        // registered above, before this task or its constructor can run.
+        let _accessible_receipt = work
+            .tasks
+            .spawn(async move {
+                let result = tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => return,
+                    result = codex_core::connectors::list_accessible_connectors_in_retirement(
+                        &accessible_config,
+                        force_refetch,
+                        Arc::clone(&environment_manager),
+                        mcp_manager,
+                        retirement,
+                    ) => result,
+                }
+                .map_err(|err| format!("failed to load accessible apps: {err}"));
+                let _ = accessible_tx.send(AppListLoadResult::Accessible(result));
+            })
+            .map_err(|_| internal_error("app-list task admission unavailable"))?;
 
         let all_config = config.clone();
         let all_plugin_apps = plugin_apps.clone();
-        tokio::spawn(async move {
-            let result = connectors::list_all_connectors_with_options(
-                &all_config,
-                force_refetch,
-                &all_plugin_apps,
-            )
-            .await
-            .map_err(|err| format!("failed to list apps: {err}"));
-            let _ = tx.send(AppListLoadResult::Directory(result));
-        });
+        let _directory_receipt = work
+            .tasks
+            .spawn(async move {
+                let result = connectors::list_all_connectors_with_options(
+                    &all_config,
+                    force_refetch,
+                    &all_plugin_apps,
+                )
+                .await
+                .map_err(|err| format!("failed to list apps: {err}"));
+                let _ = tx.send(AppListLoadResult::Directory(result));
+            })
+            .map_err(|_| internal_error("app-list task admission unavailable"))?;
 
         let app_list_deadline = tokio::time::Instant::now() + APP_LIST_LOAD_TIMEOUT;
         let mut accessible_loaded = false;

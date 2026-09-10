@@ -92,12 +92,12 @@ pub(crate) fn trusted_interactive(
 
 #[cfg(test)]
 mod provenance_tests {
-    use crate::message_processor::InitializedConnectionSessionState;
     use super::ConnectionOrigin;
     use super::ConnectionProvenance;
     use super::ConnectionState;
     use super::trusted_interactive;
     use super::trusted_interactive_provenance;
+    use crate::message_processor::InitializedConnectionSessionState;
     use crate::thread_state::RetentionPrincipalOwner;
     use codex_app_server_transport::PeerExecutableIdentity;
     use codex_protocol::mcp::ClientMcpExtensions;
@@ -137,12 +137,10 @@ mod provenance_tests {
     fn normal_transport_construction_marks_a_verified_peer_connection_owned() {
         let connection = ConnectionState::new(
             ConnectionOrigin::WebSocket,
-            ConnectionProvenance::UnixPeerExecutable(
-                PeerExecutableIdentity::FileIdentity {
-                    device: 1,
-                    inode: 2,
-                },
-            ),
+            ConnectionProvenance::UnixPeerExecutable(PeerExecutableIdentity::FileIdentity {
+                device: 1,
+                inode: 2,
+            }),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(RwLock::new(HashSet::new())),
@@ -164,7 +162,7 @@ mod provenance_tests {
             connection
                 .session
                 .retention_principal()
-                .map(|principal| principal.owner()),
+                .map(super::super::thread_state::RetentionPrincipalId::owner),
             Some(RetentionPrincipalOwner::ConnectionOwned),
             "the normal transport seam must classify its server-minted principal explicitly"
         );

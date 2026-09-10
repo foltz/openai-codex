@@ -39,6 +39,9 @@ use uuid::Uuid;
 
 type PendingInterruptQueue = Vec<ConnectionRequestId>;
 
+mod retirement;
+pub(crate) use retirement::RetentionSnapshot;
+
 /// A server-minted, process-local identity for one eligible connection.
 ///
 /// This deliberately cannot be constructed from a `ConnectionId`: connection
@@ -141,6 +144,7 @@ pub(crate) enum RetentionAuthorityError {
     AuthorityUnavailable,
     UnknownThread,
     SelfRetention,
+    LifecycleClosed,
 }
 
 pub(crate) struct PendingThreadResumeRequest {
@@ -1030,7 +1034,9 @@ mod tests {
         );
         let handle = RetentionGrantId::from_wire(&Uuid::now_v7().to_string());
         assert_eq!(
-            manager.release_retention(thread_id, principal, &handle).await,
+            manager
+                .release_retention(thread_id, principal, &handle)
+                .await,
             Err(RetentionAuthorityError::AuthorityUnavailable)
         );
         assert_eq!(
@@ -1250,6 +1256,8 @@ impl ThreadEntry {
 
 #[derive(Default)]
 struct ThreadStateManagerInner {
+    retirement_claims_closed: bool,
+    lifecycle: HashMap<ThreadId, retirement::RetentionLifecycle>,
     live_connections: HashMap<ConnectionId, ConnectionCapabilities>,
     threads: HashMap<ThreadId, ThreadEntry>,
     thread_ids_by_connection: HashMap<ConnectionId, HashSet<ThreadId>>,
@@ -1275,6 +1283,19 @@ pub(crate) enum ConnectionSubscriptionError {
 }
 
 impl ThreadStateManagerInner {
+    fn ensure_thread_entry(&mut self, thread_id: ThreadId) -> &mut ThreadEntry {
+        match self.threads.entry(thread_id) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let thread = ThreadEntry::default();
+                self.lifecycle.entry(thread_id).or_insert_with(|| {
+                    retirement::RetentionLifecycle::new(Arc::downgrade(&thread.state))
+                });
+                entry.insert(thread)
+            }
+        }
+    }
+
     fn retention_principal_is_live(&self, principal: RetentionPrincipalId) -> bool {
         self.live_connections
             .values()
@@ -1303,6 +1324,7 @@ impl ThreadStateManagerInner {
                 self.retention_threads_by_principal.remove(&principal);
             }
         }
+        self.publish_retention(thread_id);
         removed.is_some()
     }
 
@@ -1318,6 +1340,7 @@ impl ThreadStateManagerInner {
                     self.retention_grants_by_thread.remove(&thread_id);
                 }
             }
+            self.publish_retention(thread_id);
         }
     }
 
@@ -1335,6 +1358,7 @@ impl ThreadStateManagerInner {
                 self.retention_threads_by_principal.remove(&principal);
             }
         }
+        self.publish_retention(thread_id);
     }
 
     fn add_interactive_attachment(&mut self, thread_id: ThreadId) -> ThreadAttachmentEntry {
@@ -1494,6 +1518,14 @@ impl ThreadStateManager {
             return Err(RetentionAuthorityError::UnknownThread);
         }
 
+        let record = state
+            .lifecycle
+            .get(&thread_id)
+            .ok_or(RetentionAuthorityError::AuthorityUnavailable)?;
+        if record.is_retiring() {
+            return Err(RetentionAuthorityError::LifecycleClosed);
+        }
+
         let grants = state
             .retention_grants_by_thread
             .entry(thread_id)
@@ -1511,6 +1543,7 @@ impl ThreadStateManager {
             .entry(principal)
             .or_default()
             .insert(thread_id);
+        state.publish_retention(thread_id);
         Ok(RetentionAcquireOutcome::Acquired { grant_id })
     }
 
@@ -1703,9 +1736,7 @@ impl ThreadStateManager {
         let mut has_connections = {
             let mut state = self.state.lock().await;
             state
-                .threads
-                .entry(thread_id)
-                .or_default()
+                .ensure_thread_entry(thread_id)
                 .has_connections_watcher
                 .subscribe()
         };
@@ -1727,7 +1758,7 @@ impl ThreadStateManager {
 
     pub(crate) async fn thread_state(&self, thread_id: ThreadId) -> Arc<Mutex<ThreadState>> {
         let mut state = self.state.lock().await;
-        state.threads.entry(thread_id).or_default().state.clone()
+        state.ensure_thread_entry(thread_id).state.clone()
     }
 
     pub(crate) fn current_listener_command_tx(
@@ -1767,6 +1798,13 @@ impl ThreadStateManager {
                 .remove(&thread_id)
                 .map(|thread_entry| thread_entry.state);
             state.revoke_all_retention_for_thread(thread_id);
+            if state
+                .lifecycle
+                .get(&thread_id)
+                .is_some_and(|record| !record.is_retiring() || record.has_complete_report())
+            {
+                state.lifecycle.remove(&thread_id);
+            }
             state.thread_ids_by_connection.retain(|_, thread_ids| {
                 thread_ids.remove(&thread_id);
                 !thread_ids.is_empty()
@@ -1924,7 +1962,7 @@ impl ThreadStateManager {
             } else {
                 return false;
             }
-            let successor = state.threads.entry(successor_thread_id).or_default();
+            let successor = state.ensure_thread_entry(successor_thread_id);
             successor.connection_ids.insert(connection_id);
             successor.update_has_connections();
 
@@ -2013,7 +2051,7 @@ impl ThreadStateManager {
                 .or_default()
                 .insert(thread_id);
             let thread_state = {
-                let thread_entry = state.threads.entry(thread_id).or_default();
+                let thread_entry = state.ensure_thread_entry(thread_id);
                 thread_entry.connection_ids.insert(connection_id);
                 thread_entry.update_has_connections();
                 thread_entry.state.clone()
@@ -2057,7 +2095,7 @@ impl ThreadStateManager {
                 .or_default()
                 .insert(thread_id);
             {
-                let thread_entry = state.threads.entry(thread_id).or_default();
+                let thread_entry = state.ensure_thread_entry(thread_id);
                 thread_entry.connection_ids.insert(connection_id);
                 thread_entry.update_has_connections();
             }

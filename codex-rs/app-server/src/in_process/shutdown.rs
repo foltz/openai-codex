@@ -250,6 +250,7 @@ impl RuntimeShutdownReport {
                             background_clean: true,
                             login_clean: true,
                             threads_clean: true,
+                            connection_clean: true,
                         },
                     ),
                 )),
@@ -303,6 +304,7 @@ pub enum ProcessorCleanupExecution {
         background_clean: bool,
         login_clean: bool,
         threads_clean: bool,
+        connection_clean: bool,
     },
     Panicked,
 }
@@ -428,7 +430,17 @@ impl ProcessorCleanupOwner {
 
         let login = processor.begin_login_shutdown(deadline).ok();
         let threads = processor.begin_thread_shutdown(deadline).ok();
-        let (background, login, threads) = tokio::join!(
+        let connection = async {
+            let Some((_, session)) = self.custody.as_ref() else {
+                return None;
+            };
+            Some(
+                AssertUnwindSafe(session.rpc_gate.shutdown_with_evidence())
+                    .catch_unwind()
+                    .await,
+            )
+        };
+        let (background, login, threads, connection) = tokio::join!(
             AssertUnwindSafe(processor.drain_background_tasks_until(deadline)).catch_unwind(),
             async {
                 match login {
@@ -449,12 +461,19 @@ impl ProcessorCleanupOwner {
                     }),
                 }
             },
+            connection,
         );
 
         ProcessorCleanupExecution::ReturnedWithEvidence {
             background_clean: base_ok && background.is_ok_and(|report| report.is_clean()),
             login_clean: base_ok && login.is_ok_and(|report| report.is_clean()),
             threads_clean: base_ok && threads.is_ok_and(|report| report.is_complete()),
+            connection_clean: base_ok
+                && connection.is_some_and(|result| {
+                    result.is_ok_and(
+                        super::super::connection_rpc_gate::ConnectionRpcShutdown::is_clean,
+                    )
+                }),
         }
     }
 }

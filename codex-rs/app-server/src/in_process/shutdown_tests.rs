@@ -212,6 +212,7 @@ async fn host_compacts_only_a_proven_complete_runtime() {
             background_clean: true,
             login_clean: true,
             threads_clean: true,
+            connection_clean: true,
         }
     }
     .boxed()

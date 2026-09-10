@@ -1578,7 +1578,7 @@ impl PluginsManager {
         };
         let manager = Arc::clone(self);
         let config = config.clone();
-        tokio::spawn(async move {
+        let admitted = self.task_registry.spawn(async move {
             let _permit = permit;
             let result = manager
                 .reconcile_remote_installed_plugins_after_acquiring_gate(&config, Some(&auth))
@@ -1615,6 +1615,10 @@ impl PluginsManager {
                 }
             }
         });
+        if let Err(error) = admitted {
+            // Rejected admission drops the future and releases its owned permit.
+            warn!(?error, "remote installed plugin bundle sync admission closed");
+        }
     }
 
     /// Acquires the cache-root gate shared by full installed-bundle sync, reconciliation, and

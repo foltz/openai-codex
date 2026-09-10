@@ -10,7 +10,10 @@ use codex_app_server_protocol::ThreadStatus;
 use codex_app_server_protocol::ThreadStatusChangedNotification;
 use codex_protocol::ThreadId;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+use std::sync::atomic::AtomicU64;
 use tokio::sync::Mutex;
 #[cfg(test)]
 use tokio::sync::mpsc;
@@ -25,7 +28,23 @@ pub(crate) struct ThreadWatchManager {
     /// submitted.  `turn/start` only acknowledges submission; retaining the
     /// permit here keeps the managed-transition drain closed until the core
     /// turn emits a terminal event.
-    account_work_permits: Arc<Mutex<HashMap<String, Vec<AccountWorkPermitGuard>>>>,
+    account_work_permits: Arc<StdMutex<HashMap<String, AccountWorkPermitThreadState>>>,
+    next_account_work_permit_key: Arc<AtomicU64>,
+}
+
+struct AccountWorkPermitThreadState {
+    entries: Vec<AccountWorkPermitEntry>,
+    /// A terminal event can be delivered before the submission future binds
+    /// its generated turn id. Keep those ids only while a pending handoff
+    /// exists so the subsequent bind can release the right permit without
+    /// letting a stale prior-turn event release a newer turn.
+    terminal_turn_ids: HashSet<String>,
+}
+
+struct AccountWorkPermitEntry {
+    key: u64,
+    turn_id: Option<String>,
+    permit: AccountWorkPermitGuard,
 }
 
 pub(crate) struct ThreadWatchActiveGuard {
@@ -82,7 +101,8 @@ impl ThreadWatchManager {
             state: Arc::new(Mutex::new(ThreadWatchState::default())),
             outgoing: None,
             running_turn_count_tx,
-            account_work_permits: Arc::new(Mutex::new(HashMap::new())),
+            account_work_permits: Arc::new(StdMutex::new(HashMap::new())),
+            next_account_work_permit_key: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -92,7 +112,8 @@ impl ThreadWatchManager {
             state: Arc::new(Mutex::new(ThreadWatchState::default())),
             outgoing: Some(outgoing),
             running_turn_count_tx,
-            account_work_permits: Arc::new(Mutex::new(HashMap::new())),
+            account_work_permits: Arc::new(StdMutex::new(HashMap::new())),
+            next_account_work_permit_key: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -161,46 +182,99 @@ impl ThreadWatchManager {
         .await;
     }
 
-    pub(crate) async fn note_turn_completed(&self, thread_id: &str, _failed: bool) {
-        self.clear_active_state(thread_id).await;
+    pub(crate) async fn note_turn_completed(&self, thread_id: &str, turn_id: &str, _failed: bool) {
+        self.clear_active_state(thread_id, turn_id).await;
     }
 
-    pub(crate) async fn note_turn_interrupted(&self, thread_id: &str) {
-        self.clear_active_state(thread_id).await;
+    pub(crate) async fn note_turn_interrupted(&self, thread_id: &str, turn_id: &str) {
+        self.clear_active_state(thread_id, turn_id).await;
     }
 
     /// Transfer a dispatch permit into the submitted core turn.  This must be
     /// called before submission so a very fast terminal event cannot race the
     /// handoff and release the permit before it is visible here.
-    pub(crate) async fn retain_account_work_permit(
+    pub(crate) fn retain_account_work_permit(
         &self,
         thread_id: &str,
         permit: AccountWorkPermitGuard,
-    ) {
+    ) -> u64 {
+        let key = self
+            .next_account_work_permit_key
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.account_work_permits
             .lock()
-            .await
+            .expect("account-work permit registry lock poisoned")
             .entry(thread_id.to_string())
-            .or_default()
-            .push(permit);
+            .or_insert_with(|| AccountWorkPermitThreadState {
+                entries: Vec::new(),
+                terminal_turn_ids: HashSet::new(),
+            })
+            .entries
+            .push(AccountWorkPermitEntry {
+                key,
+                turn_id: None,
+                permit,
+            });
+        key
     }
 
-    /// Undo the most recent handoff when submission itself fails.  Thread
-    /// requests are serialized by thread id, so the most recent entry is the
-    /// permit belonging to that failed submission.
-    pub(crate) async fn release_last_account_work_permit(&self, thread_id: &str) {
+    pub(crate) fn bind_account_work_permit(&self, thread_id: &str, key: u64, turn_id: String) {
         let permit = {
-            let mut permits = self.account_work_permits.lock().await;
+            let mut permits = self
+                .account_work_permits
+                .lock()
+                .expect("account-work permit registry lock poisoned");
             let Some(thread_permits) = permits.get_mut(thread_id) else {
                 return;
             };
-            let permit = thread_permits.pop();
-            if thread_permits.is_empty() {
-                permits.remove(thread_id);
+            let Some(index) = thread_permits
+                .entries
+                .iter()
+                .position(|entry| entry.key == key)
+            else {
+                return;
+            };
+            if thread_permits.terminal_turn_ids.remove(&turn_id) {
+                Some(thread_permits.entries.swap_remove(index).permit)
+            } else {
+                thread_permits.entries[index].turn_id = Some(turn_id);
+                if thread_permits
+                    .entries
+                    .iter()
+                    .all(|entry| entry.turn_id.is_some())
+                {
+                    thread_permits.terminal_turn_ids.clear();
+                }
+                None
             }
-            permit
         };
         drop(permit);
+        self.remove_empty_account_work_permit_state(thread_id);
+    }
+
+    /// Undo a handoff when submission itself fails. The key, rather than a
+    /// thread-level "last" entry, prevents an unrelated terminal event or
+    /// concurrent request from releasing this permit.
+    pub(crate) fn release_pending_account_work_permit(&self, thread_id: &str, key: u64) {
+        let permit = {
+            let mut permits = self
+                .account_work_permits
+                .lock()
+                .expect("account-work permit registry lock poisoned");
+            let Some(thread_permits) = permits.get_mut(thread_id) else {
+                return;
+            };
+            let Some(index) = thread_permits
+                .entries
+                .iter()
+                .position(|entry| entry.key == key)
+            else {
+                return;
+            };
+            thread_permits.entries.swap_remove(index).permit
+        };
+        drop(permit);
+        self.remove_empty_account_work_permit_state(thread_id);
     }
 
     pub(crate) async fn note_thread_shutdown(&self, thread_id: &str) {
@@ -211,7 +285,15 @@ impl ThreadWatchManager {
             runtime.is_loaded = false;
         })
         .await;
-        self.release_account_work_permits(thread_id).await;
+        self.release_account_work_permits(thread_id);
+    }
+
+    /// Release work transferred to a thread when its core event stream closes
+    /// before a terminal event can be observed.  The listener owns this
+    /// fallback because a dead session cannot emit `ShutdownComplete` or
+    /// `TurnComplete` anymore.
+    pub(crate) fn note_thread_event_stream_closed(&self, thread_id: &str) {
+        self.release_account_work_permits(thread_id);
     }
 
     pub(crate) async fn note_system_error(&self, thread_id: &str) {
@@ -222,25 +304,71 @@ impl ThreadWatchManager {
             runtime.has_system_error = true;
         })
         .await;
-        self.release_account_work_permits(thread_id).await;
+        self.release_account_work_permits(thread_id);
     }
 
-    async fn clear_active_state(&self, thread_id: &str) {
+    async fn clear_active_state(&self, thread_id: &str, turn_id: &str) {
         self.update_runtime_for_thread(thread_id, move |runtime| {
             runtime.running = false;
             runtime.pending_permission_requests = 0;
             runtime.pending_user_input_requests = 0;
         })
         .await;
-        self.release_account_work_permits(thread_id).await;
+        self.release_account_work_permit_for_turn(thread_id, turn_id);
     }
 
-    async fn release_account_work_permits(&self, thread_id: &str) {
+    fn release_account_work_permit_for_turn(&self, thread_id: &str, turn_id: &str) {
+        let permit = {
+            let mut permits = self
+                .account_work_permits
+                .lock()
+                .expect("account-work permit registry lock poisoned");
+            let Some(thread_permits) = permits.get_mut(thread_id) else {
+                return;
+            };
+            let Some(index) = thread_permits
+                .entries
+                .iter()
+                .position(|entry| entry.turn_id.as_deref() == Some(turn_id))
+            else {
+                if thread_permits
+                    .entries
+                    .iter()
+                    .any(|entry| entry.turn_id.is_none())
+                {
+                    thread_permits.terminal_turn_ids.insert(turn_id.to_string());
+                }
+                return;
+            };
+            thread_permits.entries.swap_remove(index).permit
+        };
+        drop(permit);
+        self.remove_empty_account_work_permit_state(thread_id);
+    }
+
+    fn release_account_work_permits(&self, thread_id: &str) {
         // Drop the guards after releasing the mutex; their Drop notifies the
         // transition drain and must never run while this bookkeeping lock is
         // held.
-        let permits = self.account_work_permits.lock().await.remove(thread_id);
+        let permits = self
+            .account_work_permits
+            .lock()
+            .expect("account-work permit registry lock poisoned")
+            .remove(thread_id);
         drop(permits);
+    }
+
+    fn remove_empty_account_work_permit_state(&self, thread_id: &str) {
+        let mut permits = self
+            .account_work_permits
+            .lock()
+            .expect("account-work permit registry lock poisoned");
+        if permits
+            .get(thread_id)
+            .is_some_and(|thread_permits| thread_permits.entries.is_empty())
+        {
+            permits.remove(thread_id);
+        }
     }
 
     pub(crate) async fn note_permission_requested(
@@ -607,7 +735,7 @@ mod tests {
         .await;
 
         manager
-            .note_turn_completed(INTERACTIVE_THREAD_ID, false)
+            .note_turn_completed(INTERACTIVE_THREAD_ID, "turn-1", false)
             .await;
         assert_eq!(
             manager
@@ -743,7 +871,7 @@ mod tests {
         assert_eq!(manager.running_turn_count().await, 1);
 
         manager
-            .note_turn_completed(INTERACTIVE_THREAD_ID, false)
+            .note_turn_completed(INTERACTIVE_THREAD_ID, "turn-1", false)
             .await;
         assert_eq!(manager.running_turn_count().await, 0);
     }
@@ -755,9 +883,8 @@ mod tests {
             .try_acquire_account_work_permit()
             .expect("the barrier starts open");
         let manager = ThreadWatchManager::new();
-        manager
-            .retain_account_work_permit(INTERACTIVE_THREAD_ID, permit)
-            .await;
+        let key = manager.retain_account_work_permit(INTERACTIVE_THREAD_ID, permit);
+        manager.bind_account_work_permit(INTERACTIVE_THREAD_ID, key, "turn-1".to_string());
 
         assert_eq!(
             coordinator.account_work_permits().admitted_count(),
@@ -765,13 +892,60 @@ mod tests {
             "submission acknowledgement must not release the transferred permit"
         );
         manager
-            .note_turn_completed(INTERACTIVE_THREAD_ID, false)
+            .note_turn_completed(INTERACTIVE_THREAD_ID, "turn-1", false)
             .await;
         assert_eq!(
             coordinator.account_work_permits().admitted_count(),
             0,
             "the terminal turn event releases the account-work permit"
         );
+    }
+
+    #[tokio::test]
+    async fn event_stream_closure_releases_transferred_account_work_permit() {
+        let coordinator = crate::managed_transition::ManagedTransitionCoordinator::new();
+        let permit = coordinator
+            .try_acquire_account_work_permit()
+            .expect("the barrier starts open");
+        let manager = ThreadWatchManager::new();
+        manager.retain_account_work_permit(INTERACTIVE_THREAD_ID, permit);
+
+        manager.note_thread_event_stream_closed(INTERACTIVE_THREAD_ID);
+
+        assert_eq!(
+            coordinator.account_work_permits().admitted_count(),
+            0,
+            "a dead core event stream must not strand the account-work permit"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_terminal_event_does_not_release_a_newer_turn_permit() {
+        let coordinator = crate::managed_transition::ManagedTransitionCoordinator::new();
+        let first_permit = coordinator
+            .try_acquire_account_work_permit()
+            .expect("the barrier starts open");
+        let second_permit = coordinator
+            .try_acquire_account_work_permit()
+            .expect("the barrier admits the second live turn");
+        let manager = ThreadWatchManager::new();
+        let first_key = manager.retain_account_work_permit(INTERACTIVE_THREAD_ID, first_permit);
+        let second_key = manager.retain_account_work_permit(INTERACTIVE_THREAD_ID, second_permit);
+        manager.bind_account_work_permit(INTERACTIVE_THREAD_ID, first_key, "turn-1".to_string());
+        manager.bind_account_work_permit(INTERACTIVE_THREAD_ID, second_key, "turn-2".to_string());
+
+        manager
+            .note_turn_completed(INTERACTIVE_THREAD_ID, "turn-1", false)
+            .await;
+        assert_eq!(
+            coordinator.account_work_permits().admitted_count(),
+            1,
+            "a prior turn's terminal event must not release the newer turn"
+        );
+        manager
+            .note_turn_completed(INTERACTIVE_THREAD_ID, "turn-2", false)
+            .await;
+        assert_eq!(coordinator.account_work_permits().admitted_count(), 0);
     }
 
     #[tokio::test]

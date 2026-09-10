@@ -333,6 +333,8 @@ pub(super) async fn ensure_listener_task_running(
                         Ok(event) => event,
                         Err(err) => {
                             tracing::warn!("thread.next_event() failed with: {err}");
+                            thread_watch_manager
+                                .note_thread_event_stream_closed(&conversation_id.to_string());
                             break;
                         }
                     };

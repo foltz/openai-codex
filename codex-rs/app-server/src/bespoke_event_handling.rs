@@ -190,7 +190,7 @@ pub(crate) async fn apply_bespoke_event_handling(
             respond_to_pending_interrupts(&thread_state, &outgoing).await;
             let turn_failed = thread_state.lock().await.turn_summary.last_error.is_some();
             thread_watch_manager
-                .note_turn_completed(&conversation_id.to_string(), turn_failed)
+                .note_turn_completed(&conversation_id.to_string(), &event_turn_id, turn_failed)
                 .await;
             handle_turn_complete(
                 conversation_id,
@@ -1100,7 +1100,7 @@ pub(crate) async fn apply_bespoke_event_handling(
             respond_to_pending_interrupts(&thread_state, &outgoing).await;
 
             thread_watch_manager
-                .note_turn_interrupted(&conversation_id.to_string())
+                .note_turn_interrupted(&conversation_id.to_string(), &event_turn_id)
                 .await;
             handle_turn_interrupted(
                 conversation_id,

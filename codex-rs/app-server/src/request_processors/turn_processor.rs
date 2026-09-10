@@ -593,13 +593,14 @@ impl TurnRequestProcessor {
         // submission id. Transfer the permit before awaiting that enqueue so
         // the core turn's terminal event, rather than the RPC handler's
         // return, owns the account-work lifetime.
-        if turn_has_input {
-            if let Some(permit) = account_work_permit.take() {
+        let account_work_permit_key = if turn_has_input {
+            account_work_permit.take().map(|permit| {
                 self.thread_watch_manager
                     .retain_account_work_permit(&thread_id.to_string(), permit)
-                    .await;
-            }
-        }
+            })
+        } else {
+            None
+        };
         let turn_id = match thread
             .submit_user_input_with_client_user_message_id(
                 turn_op,
@@ -610,18 +611,25 @@ impl TurnRequestProcessor {
         {
             Ok(turn_id) => turn_id,
             Err(err) => {
-                if turn_has_input {
+                if let Some(key) = account_work_permit_key {
                     // Submission failed after the handoff; no core turn will
                     // emit a terminal event for this permit.
                     self.thread_watch_manager
-                        .release_last_account_work_permit(&thread_id.to_string())
-                        .await;
+                        .release_pending_account_work_permit(&thread_id.to_string(), key);
                 }
                 let error = internal_error(format!("failed to start turn: {err}"));
                 self.track_error_response(&request_id, &error, /*error_type*/ None);
                 return Err(error);
             }
         };
+
+        if let Some(key) = account_work_permit_key {
+            self.thread_watch_manager.bind_account_work_permit(
+                &thread_id.to_string(),
+                key,
+                turn_id.clone(),
+            );
+        }
 
         if turn_has_input {
             let config_snapshot = thread.config_snapshot().await;

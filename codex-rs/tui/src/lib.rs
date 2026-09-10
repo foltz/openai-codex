@@ -598,8 +598,9 @@ pub(crate) async fn start_app_server_for_picker(
         environment_manager,
         embedded_host.clone(),
     )
-    .await?;
+    .await;
     drop(embedded_host);
+    let app_server = app_server?;
     Ok(
         AppServerSession::new(app_server, target.thread_params_mode())
             .with_local_codex_home(&config.codex_home),

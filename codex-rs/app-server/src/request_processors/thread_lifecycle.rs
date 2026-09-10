@@ -274,16 +274,20 @@ pub(super) async fn ensure_listener_task_running(
         if thread_state.listener_matches(&conversation) {
             return Ok(());
         }
-        let (listener_command_rx, listener_generation) = thread_state.set_listener(
-            cancel_tx,
-            &conversation,
-            watch_registration,
-            thread_settings_baseline,
-        );
+        let (listener_command_rx, listener_generation, previous_cancel_tx) = thread_state
+            .set_listener(
+                cancel_tx,
+                &conversation,
+                watch_registration,
+                thread_settings_baseline,
+            );
         let Some(listener_command_tx) = thread_state.listener_command_tx() else {
             tracing::warn!(
                 "thread listener command sender missing immediately after listener registration"
             );
+            if let Some(previous_cancel_tx) = previous_cancel_tx {
+                let _ = previous_cancel_tx.send(());
+            }
             return Ok(());
         };
         listener_task_context
@@ -292,6 +296,11 @@ pub(super) async fn ensure_listener_task_running(
         listener_task_context
             .thread_state_manager
             .register_listener_command_tx(conversation_id, listener_command_tx);
+        // Signal the predecessor only after the replacement generation is
+        // published, so its Drop guard cannot release the replacement's work.
+        if let Some(previous_cancel_tx) = previous_cancel_tx {
+            let _ = previous_cancel_tx.send(());
+        }
         (listener_command_rx, listener_generation)
     };
     let ListenerTaskContext {

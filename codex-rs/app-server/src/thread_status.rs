@@ -148,8 +148,9 @@ impl ThreadWatchManager {
     }
 
     /// Record which listener task currently owns the thread-level fallback
-    /// release. This is called while the ThreadState lock is held, before a
-    /// superseded listener can observe its cancellation.
+    /// release. The caller holds the ThreadState lock while publishing this
+    /// generation and signalling the predecessor, so the predecessor cannot
+    /// run its post-loop guard until this registry update is visible.
     pub(crate) fn register_listener_generation(&self, thread_id: &str, generation: u64) {
         self.listener_generations
             .lock()

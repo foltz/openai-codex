@@ -69,6 +69,15 @@ impl Session {
 
         let turn_state = {
             let mut active_turn = self.active_turn.lock().await;
+            if self
+                .task_admission_closed
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(TryStartTurnIfIdleError::new(
+                    TryStartTurnIfIdleRejectionReason::TaskEndedBeforePersistence,
+                    input,
+                ));
+            }
             if active_turn.is_some() {
                 return Err(TryStartTurnIfIdleError::new(
                     TryStartTurnIfIdleRejectionReason::Busy,

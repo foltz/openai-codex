@@ -204,6 +204,42 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
     environment_manager: Arc<EnvironmentManager>,
     mcp_manager: Arc<McpManager>,
 ) -> anyhow::Result<AccessibleConnectorsStatus> {
+    list_accessible_connectors_with_custody(
+        config,
+        force_refetch,
+        environment_manager,
+        mcp_manager,
+        /*retirement*/ None,
+    )
+    .await
+}
+
+/// Managed callers retain this control before polling discovery, so cancellation
+/// or a failed ordinary shutdown cannot discard the temporary runtime's owners.
+pub async fn list_accessible_connectors_in_retirement(
+    config: &Config,
+    force_refetch: bool,
+    environment_manager: Arc<EnvironmentManager>,
+    mcp_manager: Arc<McpManager>,
+    retirement: codex_mcp::McpRuntimeRetirement,
+) -> anyhow::Result<AccessibleConnectorsStatus> {
+    list_accessible_connectors_with_custody(
+        config,
+        force_refetch,
+        environment_manager,
+        mcp_manager,
+        Some(retirement),
+    )
+    .await
+}
+
+async fn list_accessible_connectors_with_custody(
+    config: &Config,
+    force_refetch: bool,
+    environment_manager: Arc<EnvironmentManager>,
+    mcp_manager: Arc<McpManager>,
+    retirement: Option<codex_mcp::McpRuntimeRetirement>,
+) -> anyhow::Result<AccessibleConnectorsStatus> {
     let auth_manager =
         AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await;
     let auth = auth_manager.auth().await;
@@ -247,7 +283,7 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
     let codex_apps_auth_manager =
         codex_mcp::host_owned_codex_apps_enabled(&mcp_config, auth.as_ref())
             .then(|| Arc::clone(&auth_manager));
-    let mcp_runtime = McpRuntime::new(McpRuntimeInput {
+    let input = McpRuntimeInput {
         startup_policy: McpStartupPolicy::Eager,
         config: Arc::clone(&mcp_config),
         plugins_available: false,
@@ -268,8 +304,11 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
         elicitation_reviewer: None,
         elicitation_lifecycle: None,
         canonical_thread_id: None,
-    })
-    .await;
+    };
+    let mcp_runtime = match retirement {
+        Some(retirement) => McpRuntime::new_in_retirement(input, retirement).await,
+        None => McpRuntime::new(input).await,
+    };
 
     let refreshed_tools = if force_refetch {
         match mcp_runtime

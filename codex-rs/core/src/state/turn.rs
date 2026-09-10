@@ -5,7 +5,6 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::AbortOnDropHandle;
 
 use codex_diagnostics::GaugeGuard;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
@@ -79,7 +78,7 @@ pub(crate) struct RunningTask {
     pub(crate) input_persisted:
         Option<oneshot::Sender<Result<(), TryStartTurnIfIdleRejectionReason>>>,
     pub(crate) cancellation_token: CancellationToken,
-    pub(crate) handle: AbortOnDropHandle<()>,
+    pub(crate) handle: crate::tasks::TaskAbortHandle,
     pub(crate) turn_context: Arc<TurnContext>,
     pub(crate) _agent_execution_guard: Option<AgentExecutionGuard>,
     pub(crate) _diagnostics_guard: GaugeGuard,

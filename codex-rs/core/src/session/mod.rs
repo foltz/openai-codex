@@ -216,6 +216,12 @@ mod mcp_prewarm;
 mod mcp_refresh;
 mod mcp_runtime;
 pub(crate) mod multi_agents;
+pub(crate) mod retirement;
+pub(crate) mod startup_custody;
+mod submission;
+pub(crate) use submission::IdleAdmissionError;
+pub(crate) use submission::SubmissionDispatch;
+use submission::SubmissionSender;
 mod review;
 mod rollout_budget;
 mod rollout_reconstruction;
@@ -396,7 +402,7 @@ use codex_utils_stream_parser::ProposedPlanSegment;
 /// submission senders be dropped to terminate the session loop. The shared
 /// completion future observes that shutdown.
 pub(crate) struct SessionIo {
-    pub(crate) tx_sub: Sender<Submission>,
+    pub(crate) tx_sub: SubmissionSender,
     pub(crate) rx_event: Receiver<Event>,
     // Last known status of the agent.
     pub(crate) agent_status: watch::Receiver<AgentStatus>,
@@ -405,7 +411,71 @@ pub(crate) struct SessionIo {
     pub(crate) session_loop_termination: SessionLoopTermination,
 }
 
-pub(crate) type SessionLoopTermination = Shared<BoxFuture<'static, ()>>;
+/// Submission/loop control only: retirement must never clone event-consumer
+/// or agent-status capabilities merely to retain its shutdown attempt.
+#[derive(Clone)]
+pub(crate) struct SessionRetirementIo {
+    pub(crate) tx_sub: SubmissionSender,
+    pub(crate) session_loop_termination: SessionLoopTermination,
+}
+
+impl SessionRetirementIo {
+    pub(crate) async fn submit_shutdown(&self) -> CodexResult<()> {
+        self.tx_sub
+            .send_shutdown(Submission {
+                id: new_submission_id(),
+                op: Op::Shutdown,
+                client_user_message_id: None,
+                trace: current_span_w3c_trace_context(),
+                parent_turn_id: None,
+            })
+            .await
+            .map_err(|_| CodexErr::InternalAgentDied)?;
+        Ok(())
+    }
+}
+
+/// Observed loop outcome, not a receipt for session resource cleanup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SessionLoopOutcome {
+    Normal,
+    Cancelled,
+    Panicked,
+}
+
+/// Couples a loop's abort capability to observation of that exact task.
+/// Aborting requests termination; only polling completion observes its outcome.
+#[derive(Clone)]
+pub(crate) struct SessionLoopTermination {
+    completion: Shared<BoxFuture<'static, SessionLoopOutcome>>,
+    abort: Option<tokio::task::AbortHandle>,
+    cleanup_owner: Option<Arc<retirement::SessionCleanupOwner>>,
+}
+
+impl SessionLoopTermination {
+    /// Normalize only the retained join. This never polls session cleanup and
+    /// is not, by itself, evidence that cleanup completed successfully.
+    pub(crate) fn observed(&self) -> Option<SessionLoopOutcome> {
+        self.completion.clone().now_or_never()
+    }
+
+    pub(crate) fn request_abort(&self) {
+        if let Some(abort) = &self.abort {
+            abort.abort();
+        }
+    }
+}
+
+impl std::future::Future for SessionLoopTermination {
+    type Output = SessionLoopOutcome;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.completion).poll(cx)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GitEnrichmentPolicy {
@@ -504,30 +574,45 @@ const CYBER_SAFETY_URL: &str = "https://developers.openai.com/codex/concepts/cyb
 impl Session {
     /// Spawn and initialize a new session.
     pub(crate) async fn spawn(args: SessionSpawnArgs) -> CodexResult<(Arc<Self>, SessionIo)> {
-        let parent_trace = match args.parent_trace {
-            Some(trace) => {
-                if codex_otel::context_from_w3c_trace_context(&trace).is_some() {
-                    Some(trace)
-                } else {
-                    warn!("ignoring invalid thread spawn trace carrier");
-                    None
-                }
-            }
-            None => None,
-        };
-        let thread_spawn_span = info_span!("thread_spawn", otel.name = "thread_spawn");
-        if let Some(trace) = parent_trace.as_ref() {
-            let _ = set_parent_from_w3c_trace_context(&thread_spawn_span, trace);
-        }
-        Self::spawn_internal(SessionSpawnArgs {
-            parent_trace,
-            ..args
-        })
-        .instrument(thread_spawn_span)
-        .await
+        Self::spawn_with_custody(args, None).await
     }
 
-    async fn spawn_internal(args: SessionSpawnArgs) -> CodexResult<(Arc<Self>, SessionIo)> {
+    pub(crate) fn spawn_with_custody(
+        args: SessionSpawnArgs,
+        custody: Option<Arc<startup_custody::SessionStartupCustody>>,
+    ) -> futures::future::BoxFuture<'static, CodexResult<(Arc<Self>, SessionIo)>> {
+        Box::pin(async move {
+            let parent_trace = match args.parent_trace {
+                Some(trace) => {
+                    if codex_otel::context_from_w3c_trace_context(&trace).is_some() {
+                        Some(trace)
+                    } else {
+                        warn!("ignoring invalid thread spawn trace carrier");
+                        None
+                    }
+                }
+                None => None,
+            };
+            let thread_spawn_span = info_span!("thread_spawn", otel.name = "thread_spawn");
+            if let Some(trace) = parent_trace.as_ref() {
+                let _ = set_parent_from_w3c_trace_context(&thread_spawn_span, trace);
+            }
+            Self::spawn_internal(
+                SessionSpawnArgs {
+                    parent_trace,
+                    ..args
+                },
+                custody,
+            )
+            .instrument(thread_spawn_span)
+            .await
+        })
+    }
+
+    async fn spawn_internal(
+        args: SessionSpawnArgs,
+        custody: Option<Arc<startup_custody::SessionStartupCustody>>,
+    ) -> CodexResult<(Arc<Self>, SessionIo)> {
         let SessionSpawnArgs {
             mut config,
             allow_provider_model_fallback,
@@ -817,6 +902,7 @@ impl Session {
             deferred_clear_session_start,
             runtime_config_change_listener,
             runtime_config_change_gate,
+            custody.as_deref(),
         ))
         .await
         .map_err(|e| {
@@ -835,23 +921,46 @@ impl Session {
 
         // This task will run until Op::Shutdown is received.
         let session_for_loop = Arc::clone(&session);
+        let cleanup_owner = session.cleanup_owner();
+        let loop_cleanup_owner = Arc::clone(&cleanup_owner);
+        let tx_sub = SubmissionSender::from(tx_sub);
+        let submissions = tx_sub.dispatch_control();
         let session_loop_handle = tokio::spawn(async move {
-            submission_loop(session_for_loop, configured_config, rx_sub)
-                .instrument(info_span!("session_loop", thread_id = %thread_id))
-                .await;
+            let _cleanup_owner = loop_cleanup_owner;
+            submission_loop(
+                session_for_loop,
+                configured_config,
+                rx_sub,
+                Some(submissions),
+            )
+            .instrument(info_span!("session_loop", thread_id = %thread_id))
+            .await;
         });
+        let mut termination = session_loop_termination_from_handle(session_loop_handle);
+        termination.cleanup_owner = Some(cleanup_owner);
         let io = SessionIo {
             tx_sub,
             rx_event,
             agent_status: agent_status_rx,
-            session_loop_termination: session_loop_termination_from_handle(session_loop_handle),
+            session_loop_termination: termination,
         };
+
+        if let Some(custody) = custody {
+            custody.attach_io(io.retirement_io());
+        }
 
         Ok((session, io))
     }
 }
 
 impl SessionIo {
+    pub(crate) fn retirement_io(&self) -> SessionRetirementIo {
+        SessionRetirementIo {
+            tx_sub: self.tx_sub.clone(),
+            session_loop_termination: self.session_loop_termination.clone(),
+        }
+    }
+
     /// Submit the `op` wrapped in a `Submission` with a unique ID.
     pub(crate) async fn submit(&self, op: Op) -> CodexResult<String> {
         self.submit_with_trace(op, /*trace*/ None, /*parent_turn_id*/ None)
@@ -914,8 +1023,12 @@ impl SessionIo {
             Err(err) if matches!(err.details(), CodexErrorDetails::InternalAgentDied) => {}
             Err(err) => return Err(err),
         }
-        session_loop_termination.await;
-        Ok(())
+        match session_loop_termination.await {
+            SessionLoopOutcome::Normal => Ok(()),
+            SessionLoopOutcome::Cancelled | SessionLoopOutcome::Panicked => {
+                Err(CodexErr::InternalAgentDied)
+            }
+        }
     }
 
     pub(crate) async fn next_event(&self) -> CodexResult<Event> {
@@ -979,17 +1092,33 @@ fn session_permission_profile_state_from_config(
 
 #[cfg(test)]
 pub(crate) fn completed_session_loop_termination() -> SessionLoopTermination {
-    futures::future::ready(()).boxed().shared()
+    SessionLoopTermination {
+        completion: futures::future::ready(SessionLoopOutcome::Normal)
+            .boxed()
+            .shared(),
+        abort: None,
+        cleanup_owner: None,
+    }
 }
 
 pub(crate) fn session_loop_termination_from_handle(
     handle: JoinHandle<()>,
 ) -> SessionLoopTermination {
-    async move {
-        let _ = handle.await;
+    let abort = handle.abort_handle();
+    let completion = async move {
+        match handle.await {
+            Ok(()) => SessionLoopOutcome::Normal,
+            Err(error) if error.is_cancelled() => SessionLoopOutcome::Cancelled,
+            Err(_) => SessionLoopOutcome::Panicked,
+        }
     }
     .boxed()
-    .shared()
+    .shared();
+    SessionLoopTermination {
+        completion,
+        abort: Some(abort),
+        cleanup_owner: None,
+    }
 }
 
 async fn thread_title_from_thread_store(
@@ -1702,6 +1831,13 @@ impl Session {
         startup_prewarm: SessionStartupPrewarmHandle,
     ) {
         let mut state = self.state.lock().await;
+        if self
+            .task_admission_closed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            drop(state);
+            return;
+        }
         state.set_session_startup_prewarm(startup_prewarm);
     }
 

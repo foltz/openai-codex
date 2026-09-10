@@ -52,24 +52,24 @@ impl Session {
         *self
             .mcp_prewarm_task
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(worker);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(session_loop_termination_from_handle(worker));
     }
 
     pub(super) fn schedule_mcp_prewarm(&self) {
         let _ = self.mcp_prewarm_tx.try_send(());
     }
 
-    pub(super) async fn stop_mcp_prewarm_worker(&self) {
+    pub(super) async fn stop_mcp_prewarm_worker(&self) -> SessionLoopOutcome {
         self.mcp_prewarm_shutdown.cancel();
         let worker = self
             .mcp_prewarm_task
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(worker) = worker
-            && let Err(error) = worker.await
-        {
-            warn!(%error, "MCP prewarm worker stopped unexpectedly");
+            .clone();
+        match worker {
+            Some(worker) => worker.await,
+            None => SessionLoopOutcome::Normal,
         }
     }
 }

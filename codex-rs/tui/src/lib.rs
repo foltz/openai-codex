@@ -517,7 +517,7 @@ pub(crate) async fn start_app_server_for_picker(
         /*log_db*/ None,
         state_db,
         environment_manager,
-        embedded_host,
+        embedded_host.clone(),
     )
     .await?;
     Ok(AppServerSession::new(
@@ -1352,7 +1352,7 @@ async fn run_ratatui_app(
         log_db.clone(),
         state_db.clone(),
         environment_manager.clone(),
-        embedded_host,
+        embedded_host.clone(),
     )
     .await
     {
@@ -1719,7 +1719,7 @@ async fn run_ratatui_app(
                 log_db.clone(),
                 state_db.clone(),
                 environment_manager.clone(),
-                embedded_host,
+                embedded_host.clone(),
             )
             .await
             {

@@ -39,7 +39,13 @@ enum RuntimeOutcome {
 impl RuntimeOutcome {
     fn is_complete(self) -> bool {
         match self {
-            Self::PreviouslyCompleted(_) => true,
+            // A previously recorded cleanup receipt still needs the exact
+            // session-loop terminal outcome. Cleanup completion alone cannot
+            // certify that the thread itself retired; a cancelled or panicked
+            // loop remains non-terminal evidence.
+            Self::PreviouslyCompleted(outcome) => {
+                matches!(outcome, SessionLoopOutcome::Normal)
+            }
             Self::Retirement(report) => {
                 report.session_loop != ThreadLoopOutcome::TimedOut
                     && report.cleanup

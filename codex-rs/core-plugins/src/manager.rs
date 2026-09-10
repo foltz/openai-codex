@@ -1156,6 +1156,7 @@ impl PluginsManager {
             self.codex_home.clone(),
             remote_plugin_service_config(config),
             auth,
+            self.task_registry.clone(),
             Some(on_local_cache_changed),
         );
     }

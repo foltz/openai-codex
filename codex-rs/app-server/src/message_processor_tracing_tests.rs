@@ -354,6 +354,8 @@ async fn build_test_processor(
         // workers are exercised by their own ownership tests and would add an
         // unrelated admitted population to the background-drain assertion.
         plugin_startup_tasks: crate::PluginStartupTasks::Skip,
+        managed_transition_control_socket_endpoint: None,
+        managed_transition_process_instance_id: None,
     }));
     (processor, outgoing_rx, telemetry)
 }

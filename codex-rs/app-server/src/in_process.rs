@@ -569,6 +569,8 @@ async fn start_uninitialized(
             rpc_transport: AppServerRpcTransport::InProcess,
             remote_control_handle: None,
             plugin_startup_tasks: crate::PluginStartupTasks::Start,
+            managed_transition_control_socket_endpoint: None,
+            managed_transition_process_instance_id: None,
         }));
         let session_owner = Arc::new(ConnectionSessionState::in_process());
         let processor_cleanup_owner = Arc::new(shutdown::ProcessorCleanupOwner::new(

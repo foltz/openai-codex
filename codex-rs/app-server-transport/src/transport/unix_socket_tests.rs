@@ -9,6 +9,7 @@ use super::app_server_control_socket_path;
 #[cfg(target_os = "macos")]
 use super::identities_match;
 use super::start_control_socket_acceptor;
+use super::start_control_socket_acceptor_with_bound_hook;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCNotification;
 use codex_core::config::find_codex_home;
@@ -158,6 +159,27 @@ async fn control_socket_acceptor_upgrades_and_forwards_websocket_text_messages_a
 
     shutdown_token.cancel();
     accept_handle.await.expect("acceptor should join");
+    assert_socket_path_removed(socket_path.as_path());
+}
+
+#[tokio::test]
+async fn failed_bound_hook_removes_socket_before_spawning_acceptor() {
+    let temp_dir = tempfile::TempDir::new().expect("temp dir");
+    let socket_path = test_socket_path(temp_dir.path());
+    let (transport_event_tx, _transport_event_rx) =
+        mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
+    let shutdown_token = CancellationToken::new();
+
+    let error = start_control_socket_acceptor_with_bound_hook(
+        socket_path.clone(),
+        transport_event_tx,
+        shutdown_token,
+        || Err(std::io::Error::other("synthetic publication failure")),
+    )
+    .await
+    .expect_err("failed hook must prevent acceptor startup");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::Other);
     assert_socket_path_removed(socket_path.as_path());
 }
 

@@ -49,6 +49,7 @@ pub use unix_socket::AppServerStartupLock;
 pub use unix_socket::acquire_app_server_startup_lock;
 pub use unix_socket::prepare_control_socket_path;
 pub use unix_socket::start_control_socket_acceptor;
+pub use unix_socket::start_control_socket_acceptor_with_bound_hook;
 pub use websocket::start_websocket_acceptor;
 
 const INTERNAL_ERROR_CODE: i64 = -32603;

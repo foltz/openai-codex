@@ -1,4 +1,5 @@
-use super::{PersistenceOutcome, PersistenceRegistry};
+use super::PersistenceOutcome;
+use super::PersistenceRegistry;
 use futures::FutureExt;
 use std::sync::Arc;
 
@@ -6,12 +7,14 @@ use std::sync::Arc;
 async fn cancelled_observer_keeps_persistence_worker_for_replay() {
     let registry = Arc::new(PersistenceRegistry::default());
     let (release, held) = tokio::sync::oneshot::channel();
-    let _ = registry
-        .spawn(move || {
-            held.blocking_recv().unwrap();
-            Ok(())
-        })
-        .unwrap();
+    drop(
+        registry
+            .spawn(move || {
+                held.blocking_recv().unwrap();
+                Ok(())
+            })
+            .unwrap(),
+    );
     registry.close();
 
     let mut first = Box::pin(registry.wait());
@@ -29,11 +32,13 @@ async fn closed_persistence_registry_refuses_new_worker() {
     registry.close();
     let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let marker = Arc::clone(&started);
-    assert!(registry
-        .spawn(move || {
-            marker.store(true, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
-        })
-        .is_err());
+    assert!(
+        registry
+            .spawn(move || {
+                marker.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+            .is_err()
+    );
     assert!(!started.load(std::sync::atomic::Ordering::SeqCst));
 }

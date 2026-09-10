@@ -46,28 +46,28 @@ use chrono::Utc;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_protocol::auth::AuthMode;
 use codex_utils_template::Template;
-use rand::RngCore;
-use serde_json::Value as JsonValue;
+use futures::FutureExt;
+use futures::future::BoxFuture;
+use futures::future::Shared;
 use http::HeaderName;
 use http::HeaderValue;
 use http::StatusCode;
 use http_body_util::Full;
-use futures::FutureExt;
-use futures::future::BoxFuture;
-use futures::future::Shared;
+use rand::RngCore;
+use serde_json::Value as JsonValue;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
 
 mod callback_join;
 mod http_server;
-mod retirement;
 #[cfg(test)]
 #[path = "server/persistence_tests.rs"]
 mod persistence_tests;
+mod retirement;
+pub use retirement::LoginHttpReport;
 pub use retirement::LoginRetirement;
 pub use retirement::LoginRetirementReport;
-pub use retirement::LoginHttpReport;
 pub use retirement::LoginWorkerOutcome;
 
 pub(super) const DEFAULT_ISSUER: &str = "https://auth.openai.com";
@@ -388,11 +388,11 @@ async fn process_request(
         Ok(u) => u,
         Err(e) => {
             eprintln!("URL parse error: {e}");
-                return HandledRequest::Response(response_with_headers(
-                    StatusCode::BAD_REQUEST,
-                    Vec::new(),
-                    b"Bad Request".to_vec(),
-                ));
+            return HandledRequest::Response(response_with_headers(
+                StatusCode::BAD_REQUEST,
+                Vec::new(),
+                b"Bad Request".to_vec(),
+            ));
         }
     };
     let path = parsed_url.path().to_string();

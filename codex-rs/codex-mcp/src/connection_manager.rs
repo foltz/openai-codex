@@ -177,6 +177,7 @@ impl McpServerView {
 
 /// A published view over a set of running MCP server connections.
 pub(crate) struct McpConnectionSet {
+    retirement: crate::runtime_retirement::RuntimeRetirementRegistry,
     servers: HashMap<String, McpServerView>,
     protocol_mode: crate::McpProtocolMode,
     required_servers: Vec<String>,
@@ -198,6 +199,26 @@ impl McpConnectionSet {
         publication_gate: McpPublicationGate,
         input: McpRuntimeInput,
         elicitation_router: ElicitationRequestRouter,
+    ) -> Self {
+        let retirement = previous
+            .map(|previous| previous.retirement.clone())
+            .unwrap_or_default();
+        Self::new_with_retirement(
+            previous,
+            publication_gate,
+            input,
+            elicitation_router,
+            retirement,
+        )
+        .await
+    }
+
+    pub(crate) async fn new_with_retirement(
+        previous: Option<&Self>,
+        publication_gate: McpPublicationGate,
+        input: McpRuntimeInput,
+        elicitation_router: ElicitationRequestRouter,
+        retirement: crate::runtime_retirement::RuntimeRetirementRegistry,
     ) -> Self {
         let McpRuntimeInput {
             startup_policy,
@@ -456,6 +477,12 @@ impl McpConnectionSet {
                 }
             }
             let cancel_token = startup_cancellation_token.child_token();
+            // Reserve before constructing even a dormant startup. The runtime
+            // retains this owner after the published set is superseded.
+            let Ok(retirement_owner) = retirement.register_connection(cancel_token.clone()) else {
+                cancel_token.cancel();
+                continue;
+            };
             let tool_catalog_cache_context = if server_name == CODEX_APPS_MCP_SERVER_NAME {
                 None
             } else if let Ok(environment) = resolved_environment.as_ref() {
@@ -490,6 +517,8 @@ impl McpConnectionSet {
                 protocol_mode,
                 catalog_item_limit,
                 connection_identity.canonical_thread_id.clone(),
+                retirement_owner.lower(),
+                retirement_owner.task_ticket(),
             );
             let defer_startup = allow_deferred_startup
                 && !configured_config.required
@@ -528,6 +557,7 @@ impl McpConnectionSet {
             let tx_event = tx_event.clone();
             let submit_id = startup_submit_id.clone();
             let publication_gate = publication_gate.clone();
+            let outcome_server_name = server_name.clone();
             let startup = async move {
                 if let Some(mut startup_receiver) = startup_receiver
                     && tokio::select! {
@@ -630,14 +660,30 @@ impl McpConnectionSet {
 
                 (server_name, outcome)
             };
+            let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+            let startup = retirement_owner.task_ticket().register(move || async move {
+                let _ = outcome_tx.send(startup.await);
+                crate::runtime_retirement::RuntimeTaskOutcome::Complete
+            });
+            if let Ok(startup) = startup {
+                // The registry retains the original future even if this driver
+                // or the initial summary is cancelled.
+                tokio::spawn(startup);
+            }
             if defer_startup {
                 // Dormant servers must not hold the initial startup summary open.
-                tokio::spawn(startup);
+                drop(outcome_rx);
             } else {
-                join_set.spawn(startup);
+                join_set.spawn(async move {
+                    outcome_rx
+                        .await
+                        .unwrap_or((outcome_server_name, Err(StartupOutcomeError::Cancelled)))
+                });
             }
         }
+        let summary_ticket = retirement.task_ticket();
         let manager = Self {
+            retirement,
             servers,
             protocol_mode,
             required_servers,
@@ -651,11 +697,11 @@ impl McpConnectionSet {
             elicitation_requests: elicitation_requests.clone(),
         };
         let summary_publication_gate = publication_gate;
-        tokio::spawn(async move {
+        let summary = summary_ticket.register(move || async move {
             let outcomes = join_set.join_all().await;
             if let Some(tx_event) = tx_event {
                 if !summary_publication_gate.wait().await {
-                    return;
+                    return crate::runtime_retirement::RuntimeTaskOutcome::Complete;
                 }
                 let mut summary = McpStartupCompleteEvent {
                     ready: reused_ready,
@@ -691,12 +737,17 @@ impl McpConnectionSet {
                     })
                     .await;
             }
+            crate::runtime_retirement::RuntimeTaskOutcome::Complete
         });
+        if let Ok(summary) = summary {
+            tokio::spawn(summary);
+        }
         manager
     }
 
     pub fn empty(prefix_mcp_tool_names: bool) -> Self {
         Self {
+            retirement: crate::runtime_retirement::RuntimeRetirementRegistry::default(),
             servers: HashMap::new(),
             protocol_mode: crate::McpProtocolMode::Legacy,
             required_servers: Vec::new(),
@@ -788,19 +839,12 @@ impl McpConnectionSet {
 
     /// Stop all MCP clients owned by this manager and terminate stdio server processes.
     pub async fn shutdown(&self) {
-        let connections = self
-            .servers
-            .values()
-            .map(|view| Arc::clone(&view.connection))
-            .collect::<Vec<_>>();
-        // Keep cleanup alive if an interrupt cancels the refresh that requested it.
-        let shutdown_task = tokio::spawn(async move {
-            for connection in connections {
-                connection.shutdown().await;
-            }
-        });
-        if let Err(error) = shutdown_task.await {
-            warn!("MCP client shutdown task failed: {error}");
+        let report = self
+            .retirement
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(30))
+            .await;
+        if !report.is_complete() {
+            warn!(?report, "MCP connection retirement was not acknowledged");
         }
     }
 

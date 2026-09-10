@@ -698,16 +698,19 @@ impl OauthLoginFlow {
         self.guard.close();
         let report = self.guard.server.wait().await;
         let dispatcher = callback_dispatcher.await;
-        if dispatcher.is_err()
-            || report.unavailable
-            || report.acceptor != crate::oauth_callback_server::WorkerOutcome::Joined
-            || report.connections.interrupted != 0
-            || report.connections.failed != 0
-            || report.connections.cancelled != 0
-            || report.connections.panicked != 0
-        {
-            return result
-                .and_then(|_| Err(anyhow!("OAuth callback server did not retire cleanly")));
+        let retirement_clean = !dispatcher.is_err()
+            && !report.unavailable
+            && report.acceptor == crate::oauth_callback_server::WorkerOutcome::Joined
+            && report.connections.interrupted == 0
+            && report.connections.failed == 0
+            && report.connections.cancelled == 0
+            && report.connections.panicked == 0;
+        if !retirement_clean && result.is_ok() {
+            // Callback-server retirement is independent evidence. Do not
+            // relabel a login whose credentials were already persisted as a
+            // failed OAuth operation merely because the browser connection
+            // closed or its cleanup report was incomplete.
+            eprintln!("OAuth callback server did not retire cleanly");
         }
         result
     }

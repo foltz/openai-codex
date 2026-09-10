@@ -5,6 +5,13 @@ use crate::thread_manager::StartThreadOptions;
 use pretty_assertions::assert_eq;
 use std::time::Duration;
 
+#[test]
+fn previously_completed_runtime_requires_normal_session_loop() {
+    assert!(RuntimeOutcome::PreviouslyCompleted(SessionLoopOutcome::Normal).is_complete());
+    assert!(!RuntimeOutcome::PreviouslyCompleted(SessionLoopOutcome::Cancelled).is_complete());
+    assert!(!RuntimeOutcome::PreviouslyCompleted(SessionLoopOutcome::Panicked).is_complete());
+}
+
 async fn manager() -> (tempfile::TempDir, ThreadManager, Config) {
     let home = tempfile::tempdir().unwrap();
     let mut config = ConfigBuilder::default()

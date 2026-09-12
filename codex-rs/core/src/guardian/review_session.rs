@@ -211,6 +211,21 @@ impl GuardianChildCleanup {
         completion
     }
 
+    fn auxiliary_receipts(&self) -> Vec<GuardianTaskReceipt> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .auxiliary
+            .clone()
+    }
+
+    fn close_auxiliary_admission(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .auxiliary_open = false;
+    }
+
     fn spawn_auxiliary<F>(&self, future: F)
     where
         F: Future<Output = GuardianTaskOutcome> + Send + 'static,
@@ -353,6 +368,49 @@ struct GuardianConstruction {
     completion: GuardianConstructionReceipt,
     startup: Arc<SessionStartupCustody>,
     child: Arc<StdMutex<Option<Arc<GuardianReviewSession>>>>,
+    retirement: StdMutex<Option<GuardianTaskReceipt>>,
+}
+
+impl GuardianConstruction {
+    fn child_is(&self, child: &Arc<GuardianReviewSession>) -> bool {
+        self.child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|owned| Arc::ptr_eq(owned, child))
+    }
+
+    fn begin_legacy_retirement(&self) -> Option<GuardianTaskReceipt> {
+        let child = self
+            .child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()?;
+        let mut retirement = self
+            .retirement
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(retirement) = retirement.as_ref() {
+            return Some(retirement.clone());
+        }
+        child.cleanup.close_auxiliary_admission();
+        let primary = child.cleanup.begin_legacy();
+        let auxiliary = child.cleanup.auxiliary_receipts();
+        let receipt = retain_guardian_task(tokio::spawn(async move {
+            if primary.await == GuardianTaskOutcome::Clean
+                && futures::future::join_all(auxiliary)
+                    .await
+                    .iter()
+                    .all(|outcome| *outcome == GuardianTaskOutcome::Clean)
+            {
+                GuardianTaskOutcome::Clean
+            } else {
+                GuardianTaskOutcome::Failed
+            }
+        }));
+        *retirement = Some(receipt.clone());
+        Some(receipt)
+    }
 }
 
 #[derive(Clone, Default)]
@@ -386,6 +444,66 @@ impl GuardianCleanupReport {
 }
 
 impl GuardianCleanupRegistry {
+    fn compact_terminal_construction(&self, construction: &Arc<GuardianConstruction>) {
+        let removed = {
+            let Ok(mut state) = self.state.lock() else {
+                return;
+            };
+            let Some(index) = state
+                .constructions
+                .iter()
+                .position(|owned| Arc::ptr_eq(owned, construction))
+            else {
+                return;
+            };
+            if construction.completion.peek() != Some(&GuardianConstructionOutcome::Returned)
+                || !construction.startup.is_empty()
+                || construction
+                    .retirement
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                    .is_none_or(|receipt| receipt.peek() != Some(&GuardianTaskOutcome::Clean))
+            {
+                return;
+            }
+            state.constructions.swap_remove(index)
+        };
+        // The last guardian owner can release Session resources. Do not run
+        // that destructor under the registry admission mutex.
+        drop(removed);
+    }
+
+    fn retire_child_in_background(&self, child: &Arc<GuardianReviewSession>) {
+        let construction = {
+            let Ok(state) = self.state.lock() else {
+                return;
+            };
+            state
+                .constructions
+                .iter()
+                .find(|construction| construction.child_is(child))
+                .cloned()
+        };
+        let Some(construction) = construction else {
+            return;
+        };
+        let Some(retirement) = construction.begin_legacy_retirement() else {
+            return;
+        };
+        let registry = self.clone();
+        // This observer does not own or retry cleanup. The construction keeps
+        // the exact primary and auxiliary receipts; the observer only releases
+        // that custody after their terminal clean result is already recorded.
+        tokio::spawn(async move {
+            if retirement.await == GuardianTaskOutcome::Clean
+                && construction.completion.clone().await == GuardianConstructionOutcome::Returned
+            {
+                registry.compact_terminal_construction(&construction);
+            }
+        });
+    }
+
     fn close_until(&self, deadline: tokio::time::Instant) -> Result<tokio::time::Instant, ()> {
         match self.state.lock() {
             Ok(mut state) => {
@@ -446,6 +564,7 @@ impl GuardianCleanupRegistry {
                 .shared(),
             startup: Arc::new(SessionStartupCustody::default()),
             child: Arc::new(StdMutex::new(Some(child))),
+            retirement: StdMutex::new(None),
         });
         self.state
             .lock()
@@ -517,6 +636,7 @@ impl GuardianCleanupRegistry {
             completion: completion.clone(),
             startup,
             child,
+            retirement: StdMutex::new(None),
         }));
         Ok(async move {
             if completion.await == GuardianConstructionOutcome::Panicked {
@@ -693,6 +813,7 @@ fn token_usage_delta(start: &TokenUsage, end: &TokenUsage) -> TokenUsage {
 
 struct EphemeralReviewCleanup {
     state: Arc<Mutex<GuardianReviewSessionState>>,
+    registry: GuardianCleanupRegistry,
     review_session: Option<Arc<GuardianReviewSession>>,
 }
 
@@ -807,8 +928,8 @@ pub(crate) fn prompt_cache_key_override_for_review_session(
 }
 
 impl GuardianReviewSession {
-    fn shutdown_in_background(self: &Arc<Self>) {
-        drop(self.cleanup.begin_legacy());
+    fn shutdown_in_background(self: &Arc<Self>, registry: &GuardianCleanupRegistry) {
+        registry.retire_child_in_background(self);
     }
 
     async fn fork_snapshot(&self) -> Option<GuardianReviewForkSnapshot> {
@@ -839,10 +960,12 @@ impl GuardianReviewSession {
 impl EphemeralReviewCleanup {
     fn new(
         state: Arc<Mutex<GuardianReviewSessionState>>,
+        registry: GuardianCleanupRegistry,
         review_session: Arc<GuardianReviewSession>,
     ) -> Self {
         Self {
             state,
+            registry,
             review_session: Some(review_session),
         }
     }
@@ -858,6 +981,7 @@ impl Drop for EphemeralReviewCleanup {
             return;
         };
         let state = Arc::clone(&self.state);
+        let registry = self.registry.clone();
         let cleanup = Arc::clone(&review_session.cleanup);
         let review_session = Arc::downgrade(&review_session);
         cleanup.spawn_auxiliary(async move {
@@ -872,7 +996,7 @@ impl Drop for EphemeralReviewCleanup {
                     .map(|index| state.ephemeral_reviews.swap_remove(index))
             };
             if let Some(review_session) = review_session {
-                drop(review_session.cleanup.begin_legacy());
+                registry.retire_child_in_background(&review_session);
             }
             GuardianTaskOutcome::Clean
         });
@@ -1109,7 +1233,7 @@ impl GuardianReviewSessionManager {
         };
 
         if let Some(review_session) = stale_trunk_to_shutdown {
-            review_session.shutdown_in_background();
+            review_session.shutdown_in_background(&self.cleanup);
         }
 
         let Some(trunk) = trunk_candidate else {
@@ -1167,7 +1291,7 @@ impl GuardianReviewSessionManager {
             (outcome, analytics_result)
         } else {
             if let Some(review_session) = self.remove_trunk_if_current(&trunk).await {
-                review_session.shutdown_in_background();
+                review_session.shutdown_in_background(&self.cleanup);
             }
             (outcome, analytics_result)
         }
@@ -1338,8 +1462,11 @@ impl GuardianReviewSessionManager {
         };
         self.register_active_ephemeral(Arc::clone(&review_session))
             .await;
-        let mut cleanup =
-            EphemeralReviewCleanup::new(Arc::clone(&self.state), Arc::clone(&review_session));
+        let mut cleanup = EphemeralReviewCleanup::new(
+            Arc::clone(&self.state),
+            self.cleanup.clone(),
+            Arc::clone(&review_session),
+        );
 
         let (outcome, _, analytics_result) = Box::pin(run_review_on_session(
             review_session.as_ref(),
@@ -1350,7 +1477,7 @@ impl GuardianReviewSessionManager {
         .await;
         if let Some(review_session) = self.take_active_ephemeral(&review_session).await {
             cleanup.disarm();
-            review_session.shutdown_in_background();
+            review_session.shutdown_in_background(&self.cleanup);
         }
         (outcome, analytics_result)
     }
@@ -2500,7 +2627,7 @@ mod tests {
             .trunk
             .take()
             .expect("constructed Guardian child");
-        removed.shutdown_in_background();
+        removed.shutdown_in_background(&manager.cleanup);
         drop(removed);
 
         assert_eq!(
@@ -2517,6 +2644,46 @@ mod tests {
         let report = manager.shutdown().await;
 
         assert!(report.is_clean(), "{report:?}");
+    }
+
+    #[tokio::test]
+    async fn background_retirement_retains_pending_child_then_compacts_terminal_child() {
+        let registry = GuardianCleanupRegistry::default();
+        let (child, release) = review_with_held_forwarding().await;
+        registry.retain_child_for_test(Arc::clone(&child));
+
+        registry.retire_child_in_background(&child);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            registry
+                .state
+                .lock()
+                .expect("cleanup registry")
+                .constructions
+                .len(),
+            1,
+            "pending forwarding work must keep the removed child in custody"
+        );
+
+        let _ = release.send(());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if registry
+                    .state
+                    .lock()
+                    .expect("cleanup registry")
+                    .constructions
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal guardian child should release registry custody");
     }
 
     #[tokio::test]

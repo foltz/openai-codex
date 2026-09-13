@@ -2862,10 +2862,10 @@ fn write_api_key_auth_file(codex_home: &Path, api_key: &str) {
 
 /// R044/R045: external auth authority (agent identity, injected tokens) is
 /// excluded from managed-auth-transition adoption regardless of what it
-/// would resolve to -- `read_managed_adoption_source` must never attempt
-/// resolution at all, let alone return `Available`.
+/// would resolve to -- the production source reader must refuse before any
+/// resolution could be treated as an adoptable managed source.
 #[tokio::test]
-async fn read_managed_adoption_source_excludes_external_auth_authority() {
+async fn managed_adoption_snapshot_excludes_external_auth_authority() {
     let codex_home = tempdir().unwrap();
     let manager = AuthManager::new(
         codex_home.path().to_path_buf(),
@@ -2884,11 +2884,10 @@ async fn read_managed_adoption_source_excludes_external_auth_authority() {
         .await
         .expect("external auth should install");
 
-    let outcome = manager.read_managed_adoption_source().await;
-    assert!(
-        matches!(outcome, ManagedAdoptionSourceOutcome::IneligibleAuthMode),
-        "external auth authority must never be treated as an adoptable managed source, got {outcome:?}"
-    );
+    assert!(matches!(
+        manager.read_managed_adoption_snapshot().await,
+        Err(ManagedAdoptionVerificationError::IneligibleAuthMode)
+    ));
 }
 
 /// R002: a persisted, non-ChatGPT mode with a stable account identity
@@ -2900,7 +2899,7 @@ async fn read_managed_adoption_source_excludes_external_auth_authority() {
 /// refuse` boundary R002 requires and would previously have been
 /// misclassified as `MissingStableIdentity` or, worse, accepted.
 #[tokio::test]
-async fn read_managed_adoption_source_excludes_persisted_non_chatgpt_mode() {
+async fn managed_adoption_snapshot_excludes_persisted_non_chatgpt_mode() {
     let codex_home = tempdir().unwrap();
     write_api_key_auth_file(codex_home.path(), "sk-persisted");
     let manager = AuthManager::new(
@@ -2914,11 +2913,10 @@ async fn read_managed_adoption_source_excludes_persisted_non_chatgpt_mode() {
     )
     .await;
 
-    let outcome = manager.read_managed_adoption_source().await;
-    assert!(
-        matches!(outcome, ManagedAdoptionSourceOutcome::IneligibleAuthMode),
-        "a persisted non-ChatGPT mode must refuse as IneligibleAuthMode, got {outcome:?}"
-    );
+    assert!(matches!(
+        manager.read_managed_adoption_snapshot().await,
+        Err(ManagedAdoptionVerificationError::IneligibleAuthMode)
+    ));
 }
 
 /// R001: deliberate managed logout is a legitimate success, not a
@@ -3355,26 +3353,26 @@ async fn managed_recovery_verifies_durable_and_cached_result_without_installing(
     .await;
     let fingerprint = AuthManager::managed_account_fingerprint("recovery-account");
     let revision = *manager.auth_change_receiver().borrow();
-    assert_eq!(
+    assert!(
         manager
-            .verify_managed_adoption_result(Some(&fingerprint))
-            .await,
-        Ok(())
+            .prepare_managed_terminal_commit(Some(&fingerprint))
+            .await
+            .is_ok()
     );
-    assert_eq!(
+    assert!(matches!(
         manager
-            .verify_managed_adoption_result(Some("wrong-result"))
+            .prepare_managed_terminal_commit(Some("wrong-result"))
             .await,
         Err(ManagedAdoptionVerificationError::IntendedResultMismatch)
-    );
+    ));
     assert_eq!(*manager.auth_change_receiver().borrow(), revision);
 
     // Durable absence alone is insufficient while the cache still holds A.
     std::fs::remove_file(get_auth_file(codex_home.path())).unwrap();
-    assert_eq!(
-        manager.verify_managed_adoption_result(None).await,
+    assert!(matches!(
+        manager.prepare_managed_terminal_commit(None).await,
         Err(ManagedAdoptionVerificationError::CacheChangedConcurrently)
-    );
+    ));
     assert_eq!(*manager.auth_change_receiver().borrow(), revision);
     let precondition = manager
         .capture_managed_adoption_precondition(Some(&fingerprint))
@@ -3384,22 +3382,19 @@ async fn managed_recovery_verifies_durable_and_cached_result_without_installing(
         ManagedAdoptionInstallOutcome::LoggedOut
     ));
     let logout_revision = *manager.auth_change_receiver().borrow();
-    assert_eq!(manager.verify_managed_adoption_result(None).await, Ok(()));
+    assert!(manager.prepare_managed_terminal_commit(None).await.is_ok());
     assert_eq!(*manager.auth_change_receiver().borrow(), logout_revision);
 }
 
-/// The credential-bearing outcome enums must never render key/token
-/// material through `{:?}` -- only the auth mode, matching the existing
-/// `CachedAuth` Debug precedent in this same file.
+/// The credential-bearing install outcome must never render key/token
+/// material through `{:?}`, matching the existing `CachedAuth` Debug
+/// precedent in this same file.
 #[tokio::test]
 async fn managed_adoption_outcomes_never_debug_print_credential_material() {
-    let secret = "sk-must-never-appear-in-debug-output";
-    let source_outcome = ManagedAdoptionSourceOutcome::Available(CodexAuth::from_api_key(secret));
     let install_outcome = ManagedAdoptionInstallOutcome::Installed {
         fingerprint: AuthManager::managed_account_fingerprint("opaque-account"),
     };
-    assert!(!format!("{source_outcome:?}").contains(secret));
-    assert!(!format!("{install_outcome:?}").contains(secret));
+    assert!(!format!("{install_outcome:?}").contains("opaque-account"));
 }
 
 #[test]

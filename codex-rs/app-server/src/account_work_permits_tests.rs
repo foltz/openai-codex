@@ -210,10 +210,10 @@ async fn real_plugin_callback_fixture(mode: CallbackFixtureMode) -> anyhow::Resu
     assert!(
         plugins
             .plugin_skill_snapshots_for_config(&plugin_input)
-            .is_some()
+            .is_none()
     );
     let skills_after_refusal = skills.snapshot_for_config(&skill_input, None).await;
-    assert!(std::ptr::eq(
+    assert!(!std::ptr::eq(
         skills_before.outcome(),
         skills_after_refusal.outcome()
     ));
@@ -227,6 +227,15 @@ async fn real_plugin_callback_fixture(mode: CallbackFixtureMode) -> anyhow::Resu
         0
     );
     permits.reopen();
+    // Re-warm both caches so the admitted callback still has a positive
+    // control for cache invalidation, independently of the refusal path.
+    plugins.plugins_for_config(&plugin_input).await;
+    assert!(
+        plugins
+            .plugin_skill_snapshots_for_config(&plugin_input)
+            .is_some()
+    );
+    let skills_before_admission = skills.snapshot_for_config(&skill_input, None).await;
     let unrelated_request = permits.try_acquire().unwrap();
     callback(change);
     // This second real callback has only invalidation work and can finish
@@ -242,7 +251,7 @@ async fn real_plugin_callback_fixture(mode: CallbackFixtureMode) -> anyhow::Resu
     );
     let skills_after_admission = skills.snapshot_for_config(&skill_input, None).await;
     assert!(!std::ptr::eq(
-        skills_before.outcome(),
+        skills_before_admission.outcome(),
         skills_after_admission.outcome()
     ));
     // Observe the actual queued request, not a guessed number of scheduler

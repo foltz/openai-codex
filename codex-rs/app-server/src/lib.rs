@@ -1254,7 +1254,13 @@ pub async fn run_main_with_transport_options(
         }
     }
     for handle in transport_accept_handles {
-        let _ = handle.await;
+        if let Err(error) = handle.await {
+            warn!(
+                cancelled = error.is_cancelled(),
+                panicked = error.is_panic(),
+                "standalone transport accept task failed"
+            );
+        }
     }
 
     Ok(())

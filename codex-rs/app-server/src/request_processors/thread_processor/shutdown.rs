@@ -4,8 +4,6 @@
 //! tickets separately retain their original classifications and deadlines.
 
 use crate::thread_state::ThreadStateManager;
-use codex_core::ThreadCleanupOutcome;
-use codex_core::ThreadLoopOutcome;
 use codex_core::ThreadManager;
 use codex_core::ThreadManagerRetirementError;
 use codex_core::ThreadManagerRetirementReport;
@@ -39,15 +37,10 @@ impl ProcessorThreadShutdown {
                     .as_ref()
                     .is_ok_and(ThreadManagerRetirementReport::is_complete)
             })
-            && self.prior.as_ref().is_some_and(|reports| {
-                reports.iter().all(|(_, _, report)| {
-                    report.session_loop != ThreadLoopOutcome::TimedOut
-                        && report.cleanup
-                            == ThreadCleanupOutcome::Finished {
-                                persistence_failed: false,
-                            }
-                })
-            })
+            && self
+                .prior
+                .as_ref()
+                .is_some_and(|reports| reports.iter().all(|(_, _, report)| report.is_complete()))
     }
 }
 

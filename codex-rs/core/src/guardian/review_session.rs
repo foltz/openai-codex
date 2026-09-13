@@ -41,6 +41,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
+use crate::codex_delegate::DelegateForwardingOutcome;
 use crate::codex_delegate::DelegateForwardingReceipts;
 use crate::codex_delegate::run_codex_thread_interactive_with_custody;
 use crate::config::Config;
@@ -301,6 +302,17 @@ impl GuardianChildCleanup {
             deadline,
         ) {
             Ok(ticket) => ticket,
+            Err(crate::codex_thread::ThreadRetirementError::LegacyCleanupStarted) => {
+                // A legacy cleanup has its own original driver and no later
+                // deadline may poll or relabel it. Replay only evidence it
+                // already recorded; otherwise preserve incomplete status.
+                return futures::future::ready(
+                    self.recorded_legacy_outcome()
+                        .unwrap_or(GuardianTaskOutcome::Failed),
+                )
+                .boxed()
+                .shared();
+            }
             Err(_) => {
                 return futures::future::ready(GuardianTaskOutcome::Failed)
                     .boxed()
@@ -326,6 +338,29 @@ impl GuardianChildCleanup {
         state.completion = Some(completion.clone());
         state.completion_phase = Some(GuardianCleanupPhase::DeadlineBound);
         completion
+    }
+
+    fn recorded_legacy_outcome(&self) -> Option<GuardianTaskOutcome> {
+        let cleanup = self.session.cleanup_owner().completed()?;
+        let session_loop = self.io.session_loop_termination.observed()?;
+        let events = self.forwarding.events.peek()?;
+        let ops = self.forwarding.ops.peek()?;
+        Some(
+            if matches!(session_loop, crate::session::SessionLoopOutcome::Normal)
+                && matches!(
+                    cleanup,
+                    crate::session::retirement::CleanupExecution::Finished {
+                        persistence_failed: false
+                    }
+                )
+                && *events == DelegateForwardingOutcome::Joined
+                && *ops == DelegateForwardingOutcome::Joined
+            {
+                GuardianTaskOutcome::Clean
+            } else {
+                GuardianTaskOutcome::Failed
+            },
+        )
     }
 }
 
@@ -2195,6 +2230,28 @@ mod tests {
 
         assert_eq!(
             cleanup.begin_bounded(tokio::time::Instant::now()).await,
+            GuardianTaskOutcome::Clean
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_observation_replays_terminal_legacy_cleanup_started_outside_guardian() {
+        let (review, _tx_event, _rx_sub) = test_review_session().await;
+        let review = Arc::new(review);
+        let cleanup_owner = review.session.cleanup_owner();
+        assert!(matches!(
+            cleanup_owner.observe(Arc::clone(&review.session)).await,
+            crate::session::retirement::CleanupExecution::Finished {
+                persistence_failed: false
+            }
+        ));
+        assert!(review.cleanup.forwarding.wait().await);
+
+        assert_eq!(
+            review
+                .cleanup
+                .begin_bounded(tokio::time::Instant::now() + Duration::from_secs(3))
+                .await,
             GuardianTaskOutcome::Clean
         );
     }

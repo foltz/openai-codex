@@ -6616,10 +6616,12 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
     initial_history: InitialHistory,
     session_source: SessionSource,
     agent_control: LocalAgentControl,
+    in_memory_store_id: Option<String>,
+    startup_custody: Option<&super::startup_custody::SessionStartupCustody>,
 ) -> anyhow::Result<(Arc<Session>, async_channel::Receiver<Event>)> {
     let codex_home = tempfile::tempdir().expect("create temp dir");
     let mut config = build_test_config(codex_home.path()).await;
-    config.ephemeral = true;
+    config.ephemeral = in_memory_store_id.is_none();
     let config = Arc::new(config);
     let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
     let models_manager = models_manager_with_provider(
@@ -6697,6 +6699,20 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         /*bundled_skills_enabled*/ true,
     ));
     let environment_manager = Arc::new(EnvironmentManager::default_for_tests());
+    let thread_store: Arc<dyn codex_thread_store::ThreadStore> = match in_memory_store_id {
+        Some(id) => codex_thread_store::InMemoryThreadStore::for_id(id),
+        None => Arc::new(codex_thread_store::LocalThreadStore::new(
+            codex_thread_store::LocalThreadStoreConfig::from_config(config.as_ref()),
+            Some(
+                codex_state::StateRuntime::init(
+                    config.sqlite.clone(),
+                    config.model_provider_id.clone(),
+                )
+                .await
+                .expect("state db should initialize"),
+            ),
+        )),
+    };
 
     let session = Session::new(
         /*startup*/ None,
@@ -6728,17 +6744,7 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         /*inherited_environments*/ None,
         /*analytics_events_client*/ None,
         crate::passthrough_image_store(),
-        Arc::new(codex_thread_store::LocalThreadStore::new(
-            codex_thread_store::LocalThreadStoreConfig::from_config(config.as_ref()),
-            Some(
-                codex_state::StateRuntime::init(
-                    config.sqlite.clone(),
-                    config.model_provider_id.clone(),
-                )
-                .await
-                .expect("state db should initialize"),
-            ),
-        )),
+        thread_store,
         codex_rollout_trace::ThreadTraceContext::disabled(),
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,
@@ -6748,7 +6754,7 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         /*deferred_clear_session_start*/ None,
         /*runtime_config_change_listener*/ None,
         /*runtime_config_change_gate*/ None,
-        /*startup_custody*/ None,
+        startup_custody,
     )
     .await?;
 
@@ -6766,6 +6772,8 @@ async fn resumed_root_session_uses_thread_id_as_session_id() {
         }),
         SessionSource::Exec,
         LocalAgentControl::default(),
+        /*in_memory_store_id*/ None,
+        /*startup_custody*/ None,
     )
     .await
     .expect("resume should succeed");
@@ -6809,6 +6817,8 @@ async fn resumed_subagent_session_restores_persisted_session_id() {
         }),
         session_source,
         LocalAgentControl::default(),
+        /*in_memory_store_id*/ None,
+        /*startup_custody*/ None,
     )
     .await
     .expect("resume should succeed");
@@ -6822,6 +6832,33 @@ async fn resumed_subagent_session_restores_persisted_session_id() {
     };
     assert_eq!(event.session_id, parent_session_id);
     assert_eq!(event.thread_id, thread_id);
+}
+
+#[tokio::test]
+async fn custody_bearing_resumed_session_supplies_history_without_loading_store_history() {
+    let thread_id = ThreadId::new();
+    let store_id = format!("session-resume-history-{}", Uuid::new_v4());
+    let store = codex_thread_store::InMemoryThreadStore::for_id(store_id.clone());
+    let custody = super::startup_custody::SessionStartupCustody::default();
+    let (session, _rx_event) = make_session_with_history_source_and_agent_control_and_rx(
+        InitialHistory::Resumed(ResumedHistory {
+            conversation_id: thread_id,
+            history: Arc::new(Vec::new()),
+            rollout_path: None,
+        }),
+        SessionSource::Exec,
+        LocalAgentControl::default(),
+        /*in_memory_store_id*/ Some(store_id.clone()),
+        /*startup_custody*/ Some(&custody),
+    )
+    .await
+    .expect("resume should succeed");
+    assert_eq!(session.thread_id(), thread_id);
+    let calls = store.calls().await;
+    assert_eq!((calls.resume_thread, calls.load_history), (1, 0));
+    drop(session);
+    drop(custody);
+    codex_thread_store::InMemoryThreadStore::remove_id(&store_id);
 }
 
 #[tokio::test]
@@ -6862,6 +6899,8 @@ async fn resumed_copied_fork_ignores_source_history_base() {
         }),
         SessionSource::Exec,
         LocalAgentControl::default(),
+        /*in_memory_store_id*/ None,
+        /*startup_custody*/ None,
     )
     .await
     .expect("resume should succeed");

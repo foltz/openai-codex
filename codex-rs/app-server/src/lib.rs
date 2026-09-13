@@ -1232,8 +1232,20 @@ pub async fn run_main_with_transport_options(
 
     drop(transport_event_tx);
 
-    let _ = processor_handle.await;
-    let _ = outbound_handle.await;
+    if let Err(error) = processor_handle.await {
+        warn!(
+            cancelled = error.is_cancelled(),
+            panicked = error.is_panic(),
+            "standalone processor task failed"
+        );
+    }
+    if let Err(error) = outbound_handle.await {
+        warn!(
+            cancelled = error.is_cancelled(),
+            panicked = error.is_panic(),
+            "standalone outbound router task failed"
+        );
+    }
 
     transport_shutdown_token.cancel();
     // Retain incomplete exporter ownership through the rest of standalone

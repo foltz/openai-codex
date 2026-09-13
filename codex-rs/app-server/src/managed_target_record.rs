@@ -50,8 +50,8 @@ impl ManagedTargetRecordSetup {
         let artifact = std::env::current_exe()?.canonicalize()?;
         let process_instance_id = Uuid::now_v7().to_string();
         // This identity names one immutable publication for the process. It
-        // is deliberately unrelated to `TargetEvidence.record_identity`,
-        // which names a fresh internal capture and changes on revalidation.
+        // is distinct from the process instance because a record publication
+        // is independently selected and immutable.
         let record_identity = Uuid::now_v7().to_string();
         let record = ManagedTargetRecord {
             profile,

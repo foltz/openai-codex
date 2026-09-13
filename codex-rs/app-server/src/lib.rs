@@ -203,6 +203,24 @@ enum ShutdownSignal {
     GracefulOnly,
 }
 
+async fn abort_startup_transports(
+    transport_shutdown_token: &CancellationToken,
+    transport_accept_handles: &mut Vec<JoinHandle<()>>,
+    managed_target_record: &mut crate::managed_target_record::ManagedTargetRecordSetup,
+) {
+    transport_shutdown_token.cancel();
+    for handle in transport_accept_handles.drain(..) {
+        handle.abort();
+        let _ = handle.await;
+    }
+    if let Err(cleanup_error) = managed_target_record.remove_after_startup_failure() {
+        error!(
+            kind = ?cleanup_error.kind(),
+            "failed to remove published managed target record after startup failure"
+        );
+    }
+}
+
 async fn shutdown_signal() -> IoResult<ShutdownSignal> {
     #[cfg(unix)]
     {
@@ -767,11 +785,12 @@ pub async fn run_main_with_transport_options(
     // the bound-hook path itself returns before spawning an acceptor on error.
     let log_db = state_db.clone().map(log_db::start);
     if log_db_reload.reload(log_db.clone()).is_err() {
-        transport_shutdown_token.cancel();
-        for handle in transport_accept_handles.drain(..) {
-            handle.abort();
-            let _ = handle.await;
-        }
+        abort_startup_transports(
+            &transport_shutdown_token,
+            &mut transport_accept_handles,
+            &mut managed_target_record,
+        )
+        .await;
         return Err(std::io::Error::other(
             "database logging subscriber unavailable",
         ));
@@ -809,7 +828,7 @@ pub async fn run_main_with_transport_options(
         ));
     }
 
-    let (remote_control_accept_handle, remote_control_handle) = start_remote_control(
+    let (remote_control_accept_handle, remote_control_handle) = match start_remote_control(
         RemoteControlStartConfig {
             remote_control_url: config.chatgpt_base_url.clone(),
             installation_id: installation_id.clone(),
@@ -822,7 +841,19 @@ pub async fn run_main_with_transport_options(
         app_server_client_name_rx,
         remote_control_startup_mode,
     )
-    .await?;
+    .await
+    {
+        Ok(handles) => handles,
+        Err(error) => {
+            abort_startup_transports(
+                &transport_shutdown_token,
+                &mut transport_accept_handles,
+                &mut managed_target_record,
+            )
+            .await;
+            return Err(error);
+        }
+    };
     if no_local_transport
         && remote_control_startup_mode == RemoteControlStartupMode::ResolvePersisted
     {

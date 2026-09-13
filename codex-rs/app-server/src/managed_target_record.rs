@@ -8,6 +8,8 @@ use std::fs::File;
 use std::io;
 use std::io::Read;
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::path::PathBuf;
 use tempfile::NamedTempFile;
@@ -22,6 +24,7 @@ pub(crate) struct ManagedTargetRecordSetup {
     pub(crate) process_instance_id: Option<String>,
     pub(crate) control_endpoint: Option<String>,
     publication: Option<ManagedTargetRecordPublication>,
+    published: Option<PublishedTargetRecord>,
 }
 
 impl ManagedTargetRecordSetup {
@@ -37,6 +40,7 @@ impl ManagedTargetRecordSetup {
                 process_instance_id: None,
                 control_endpoint,
                 publication: None,
+                published: None,
             });
         };
         let AppServerTransport::UnixSocket { socket_path } = transport else {
@@ -69,6 +73,7 @@ impl ManagedTargetRecordSetup {
                 path: record_path,
                 record,
             }),
+            published: None,
         })
     }
 
@@ -76,7 +81,19 @@ impl ManagedTargetRecordSetup {
         let Some(publication) = self.publication.take() else {
             return Ok(());
         };
-        publication.publish()
+        self.published = Some(publication.publish()?);
+        Ok(())
+    }
+
+    /// Removes only the immutable record that this process published when a
+    /// later startup step fails before the coordinator is constructed.
+    pub(crate) fn remove_after_startup_failure(&mut self) -> io::Result<()> {
+        let Some(publication) = self.published.as_ref() else {
+            return Ok(());
+        };
+        publication.remove_if_unchanged()?;
+        self.published = None;
+        Ok(())
     }
 }
 
@@ -97,8 +114,19 @@ struct ManagedTargetRecordPublication {
     record: ManagedTargetRecord,
 }
 
+#[derive(Debug)]
+struct PublishedTargetRecord {
+    path: PathBuf,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(not(unix))]
+    record_identity: String,
+}
+
 impl ManagedTargetRecordPublication {
-    fn publish(self) -> io::Result<()> {
+    fn publish(self) -> io::Result<PublishedTargetRecord> {
         let parent = self.path.parent().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "target record has no parent")
         })?;
@@ -110,7 +138,45 @@ impl ManagedTargetRecordPublication {
         // Linking a complete same-directory temporary inode publishes the
         // record atomically and refuses if the selected path already exists.
         // Dropping `temporary` removes only its private link.
-        std::fs::hard_link(temporary.path(), &self.path)
+        std::fs::hard_link(temporary.path(), &self.path)?;
+        #[cfg(unix)]
+        let metadata = std::fs::metadata(&self.path)?;
+        Ok(PublishedTargetRecord {
+            path: self.path,
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(not(unix))]
+            record_identity: self.record.record_identity,
+        })
+    }
+}
+
+impl PublishedTargetRecord {
+    fn remove_if_unchanged(&self) -> io::Result<()> {
+        let metadata = std::fs::metadata(&self.path)?;
+        #[cfg(unix)]
+        let unchanged = metadata.dev() == self.device && metadata.ino() == self.inode;
+        #[cfg(not(unix))]
+        let unchanged = {
+            let record: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&self.path)?).map_err(io::Error::other)?;
+            record
+                .get("recordIdentity")
+                .and_then(serde_json::Value::as_str)
+                == Some(self.record_identity.as_str())
+        };
+        if !unchanged {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "published target record identity changed before rollback",
+            ));
+        }
+        // Unlike no-overwrite publication, unlink cannot combine the identity
+        // check and removal atomically. Startup has already stopped acceptors;
+        // this is best-effort rollback of the record this process published.
+        std::fs::remove_file(&self.path)
     }
 }
 
@@ -229,5 +295,30 @@ mod tests {
                 .unwrap(),
             record
         );
+    }
+
+    #[test]
+    fn published_record_cleanup_removes_only_the_matching_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let artifact = directory.path().join("codex");
+        std::fs::write(&artifact, b"synthetic artifact").unwrap();
+        let record_path = directory.path().join("target.json");
+
+        let published = publication(record_path.clone(), &artifact)
+            .publish()
+            .unwrap();
+        published.remove_if_unchanged().unwrap();
+        assert!(!record_path.exists());
+
+        let published = publication(record_path.clone(), &artifact)
+            .publish()
+            .unwrap();
+        let replacement = std::fs::read(&record_path).unwrap();
+        std::fs::remove_file(&record_path).unwrap();
+        std::fs::write(&record_path, &replacement).unwrap();
+
+        let error = published.remove_if_unchanged().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read(record_path).unwrap(), replacement);
     }
 }

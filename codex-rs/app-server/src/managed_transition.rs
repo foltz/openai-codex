@@ -2748,7 +2748,7 @@ mod tests {
                 .admit(request(process_id.clone(), "transition-a"))
                 .await
                 .unwrap_err();
-            assert_eq!(refused.kind, ManagedTransitionRefusalKind::InvalidRequest);
+            assert_eq!(refused.kind, ManagedTransitionRefusalKind::TargetChanged);
 
             // Exact no-effect snapshot, same rationale as the
             // executable-identity-replacement case above.

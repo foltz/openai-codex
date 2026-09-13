@@ -2884,10 +2884,14 @@ async fn managed_adoption_snapshot_excludes_external_auth_authority() {
         .await
         .expect("external auth should install");
 
-    assert!(matches!(
-        manager.read_managed_adoption_snapshot().await,
-        Err(ManagedAdoptionVerificationError::IneligibleAuthMode)
-    ));
+    match manager.read_managed_adoption_snapshot().await {
+        Err(error) => assert_eq!(
+            error,
+            ManagedAdoptionVerificationError::IneligibleAuthMode,
+            "external auth authority must never be treated as an adoptable managed source"
+        ),
+        Ok(_) => panic!("external auth authority was treated as an adoptable managed source"),
+    }
 }
 
 /// R002: a persisted, non-ChatGPT mode with a stable account identity
@@ -2913,10 +2917,14 @@ async fn managed_adoption_snapshot_excludes_persisted_non_chatgpt_mode() {
     )
     .await;
 
-    assert!(matches!(
-        manager.read_managed_adoption_snapshot().await,
-        Err(ManagedAdoptionVerificationError::IneligibleAuthMode)
-    ));
+    match manager.read_managed_adoption_snapshot().await {
+        Err(error) => assert_eq!(
+            error,
+            ManagedAdoptionVerificationError::IneligibleAuthMode,
+            "a persisted non-ChatGPT mode must refuse as IneligibleAuthMode"
+        ),
+        Ok(_) => panic!("a persisted non-ChatGPT mode was treated as adoptable"),
+    }
 }
 
 /// R001: deliberate managed logout is a legitimate success, not a
@@ -3353,26 +3361,38 @@ async fn managed_recovery_verifies_durable_and_cached_result_without_installing(
     .await;
     let fingerprint = AuthManager::managed_account_fingerprint("recovery-account");
     let revision = *manager.auth_change_receiver().borrow();
-    assert!(
-        manager
-            .prepare_managed_terminal_commit(Some(&fingerprint))
-            .await
-            .is_ok()
-    );
-    assert!(matches!(
-        manager
-            .prepare_managed_terminal_commit(Some("wrong-result"))
-            .await,
-        Err(ManagedAdoptionVerificationError::IntendedResultMismatch)
-    ));
+    match manager
+        .prepare_managed_terminal_commit(Some(&fingerprint))
+        .await
+    {
+        Ok(_) => {}
+        Err(error) => panic!("matching durable and cached result must verify: {error:?}"),
+    }
+    match manager
+        .prepare_managed_terminal_commit(Some("wrong-result"))
+        .await
+    {
+        Err(error) => assert_eq!(
+            error,
+            ManagedAdoptionVerificationError::IntendedResultMismatch,
+            "a different intended result must be rejected"
+        ),
+        Ok(_) => panic!("a different intended result was accepted"),
+    }
     assert_eq!(*manager.auth_change_receiver().borrow(), revision);
 
     // Durable absence alone is insufficient while the cache still holds A.
     std::fs::remove_file(get_auth_file(codex_home.path())).unwrap();
-    assert!(matches!(
-        manager.prepare_managed_terminal_commit(None).await,
-        Err(ManagedAdoptionVerificationError::CacheChangedConcurrently)
-    ));
+    match manager.prepare_managed_terminal_commit(None).await {
+        Err(error) => assert_eq!(
+            error,
+            ManagedAdoptionVerificationError::CacheChangedConcurrently,
+            "durable absence must not override a stale cached account"
+        ),
+        Ok(_) => {
+            panic!("durable absence was treated as a verified logout while cache held an account")
+        }
+    }
     assert_eq!(*manager.auth_change_receiver().borrow(), revision);
     let precondition = manager
         .capture_managed_adoption_precondition(Some(&fingerprint))
@@ -3382,7 +3402,10 @@ async fn managed_recovery_verifies_durable_and_cached_result_without_installing(
         ManagedAdoptionInstallOutcome::LoggedOut
     ));
     let logout_revision = *manager.auth_change_receiver().borrow();
-    assert!(manager.prepare_managed_terminal_commit(None).await.is_ok());
+    match manager.prepare_managed_terminal_commit(None).await {
+        Ok(_) => {}
+        Err(error) => panic!("installed managed logout must verify: {error:?}"),
+    }
     assert_eq!(*manager.auth_change_receiver().borrow(), logout_revision);
 }
 

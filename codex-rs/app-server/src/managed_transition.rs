@@ -407,22 +407,16 @@ impl TargetEvidenceSource for ProcessTargetEvidenceSource {
 /// observed rather than masked by a stale snapshot.
 ///
 /// Deliberately does not derive `PartialEq`/`Eq`: the only intended
-/// comparison is [`Self::matches_target`], which excludes `record_identity`.
-/// A derived structural equality would silently disagree with that
-/// semantics (it would compare `record_identity` too, so it would always be
-/// `false` between any two captures) — see `CODEX-I05-S02` verification
-/// round 01, M2.
+/// comparison is [`Self::matches_target`]. A derived structural equality
+/// would obscure that the executable identity is unavailable evidence rather
+/// than an ordinary optional field — see `CODEX-I05-S02` verification round
+/// 01, M2.
 #[derive(Debug, Clone)]
 pub(crate) struct TargetEvidence {
     declared_profile: Option<String>,
     executable_identity: Option<codex_app_server_transport::PeerExecutableIdentity>,
     endpoint: String,
     pid: u32,
-    /// A fresh opaque identity for this specific evidence snapshot, distinct
-    /// from the coordinator's own process-instance identity: it changes on
-    /// every capture, not only on restart, so two captures within the same
-    /// process are still distinguishable records.
-    record_identity: String,
 }
 
 impl TargetEvidence {
@@ -434,14 +428,12 @@ impl TargetEvidence {
             executable_identity: source.executable_identity().ok(),
             endpoint: source.endpoint(),
             pid: source.pid(),
-            record_identity: Uuid::new_v4().to_string(),
         }
     }
 
     /// True only when every replacement-sensitive fact this capture observed
-    /// is identical to the reference capture (`record_identity` excluded --
-    /// it identifies the snapshot itself, not the target). `executable_identity`
-    /// missing on *either* side is never treated as a match: an unavailable
+    /// is identical to the reference capture. `executable_identity` missing
+    /// on *either* side is never treated as a match: an unavailable
     /// executable identity is exactly the "replaced/unreadable process"
     /// condition this check exists to catch, not evidence of consistency.
     fn matches_target(&self, reference: &TargetEvidence) -> bool {

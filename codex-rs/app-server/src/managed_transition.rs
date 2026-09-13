@@ -3750,12 +3750,22 @@ mod tests {
             // genuinely compares process identity and refuses the stale one.
             assert_eq!(
                 restarted
-                    .read(read_request(old_process_id, &transition_id))
+                    .read(read_request(old_process_id.clone(), &transition_id))
                     .await
                     .unwrap_err()
                     .kind,
                 ManagedTransitionRefusalKind::ProcessMismatch,
                 "{boundary}: old process identity must never resolve a transition after restart"
+            );
+
+            assert_eq!(
+                restarted
+                    .cancel(cancel_request(old_process_id, &transition_id))
+                    .await
+                    .unwrap_err()
+                    .kind,
+                ManagedTransitionRefusalKind::ProcessMismatch,
+                "{boundary}: old process identity must never cancel a transition after restart"
             );
 
             // No manufactured old outcome or reservation: the restarted

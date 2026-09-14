@@ -30,6 +30,28 @@ pub async fn start_control_socket_acceptor(
     transport_event_tx: mpsc::Sender<TransportEvent>,
     shutdown_token: CancellationToken,
 ) -> IoResult<JoinHandle<()>> {
+    start_control_socket_acceptor_with_bound_hook(
+        socket_path,
+        transport_event_tx,
+        shutdown_token,
+        || Ok(()),
+    )
+    .await
+}
+
+/// Starts the control socket after running one synchronous hook while the
+/// socket is bound and guarded, but before the acceptor task is spawned.
+/// A failed hook therefore removes the socket and returns without abandoning
+/// a detached acceptor owner.
+pub async fn start_control_socket_acceptor_with_bound_hook<F>(
+    socket_path: AbsolutePathBuf,
+    transport_event_tx: mpsc::Sender<TransportEvent>,
+    shutdown_token: CancellationToken,
+    after_bound: F,
+) -> IoResult<JoinHandle<()>>
+where
+    F: FnOnce() -> IoResult<()>,
+{
     // Failure to establish a daemon image must not take down the local
     // control socket. It simply leaves every daemon peer unproven.
     let running_process_identity = PeerExecutableIdentity::capture_running_process().ok();
@@ -41,6 +63,7 @@ pub async fn start_control_socket_acceptor(
         socket_path = %socket_guard.socket_path.display(),
         "app-server control socket listening"
     );
+    after_bound()?;
 
     Ok(tokio::spawn(run_control_socket_acceptor(
         listener,

@@ -1719,59 +1719,6 @@ pub enum AuthoritativeAuthUnavailable {
     CacheLockUnavailable,
 }
 
-/// Distinguishes managed-auth-transition adoption source-read outcomes
-/// (Issue 05 Slice 4, R014, R002, R044, R045). Never carries credential
-/// material in `Debug` output (see the manual `Debug` impl below) --
-/// variants distinguish *why*, not the underlying error text or the
-/// wrapped [`CodexAuth`]'s own contents.
-enum ManagedAdoptionSourceOutcome {
-    /// The intended account's auth was read, parsed, passed every
-    /// configured restriction, is persisted managed ChatGPT mode
-    /// specifically, and the stable account identity is present.
-    Available(CodexAuth),
-    /// No persisted auth exists at the authoritative source.
-    Absent,
-    /// The configured external auth resolver failed.
-    ExternalResolutionFailed,
-    /// The storage backend's read failed (file I/O, or a keyring failure
-    /// that also failed its own internal file fallback).
-    BackendIoFailed,
-    /// The persisted content could not be parsed/deserialized.
-    ParseFailed,
-    StorageFailed(ManagedAuthStorageError),
-    /// A configured allowed-login-method or workspace restriction rejected
-    /// the loaded auth.
-    RestrictionRejected,
-    /// The loaded auth lacks the stable account identity managed-auth
-    /// transition requires for fingerprinting.
-    MissingStableIdentity,
-    /// The resolved/loaded auth exists but is not persisted managed
-    /// ChatGPT mode -- external auth authority (agent identity, injected
-    /// tokens) and every other mode are excluded from managed-auth-
-    /// transition adoption by R002/R044/R045, regardless of whether they
-    /// would otherwise resolve successfully or expose a stable identity.
-    IneligibleAuthMode,
-}
-
-impl std::fmt::Debug for ManagedAdoptionSourceOutcome {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Available(auth) => f
-                .debug_tuple("Available")
-                .field(&auth.api_auth_mode())
-                .finish(),
-            Self::Absent => write!(f, "Absent"),
-            Self::ExternalResolutionFailed => write!(f, "ExternalResolutionFailed"),
-            Self::BackendIoFailed => write!(f, "BackendIoFailed"),
-            Self::ParseFailed => write!(f, "ParseFailed"),
-            Self::StorageFailed(error) => f.debug_tuple("StorageFailed").field(error).finish(),
-            Self::RestrictionRejected => write!(f, "RestrictionRejected"),
-            Self::MissingStableIdentity => write!(f, "MissingStableIdentity"),
-            Self::IneligibleAuthMode => write!(f, "IneligibleAuthMode"),
-        }
-    }
-}
-
 /// Distinguishes managed-auth-transition install outcomes (Issue 05 Slice
 /// 4, R014, R064). Never carries credential material in `Debug` output.
 pub enum ManagedAdoptionInstallOutcome {
@@ -2733,38 +2680,6 @@ impl AuthManager {
         }
     }
 
-    /// Fallibly reads and classifies the authoritative auth source for
-    /// managed-auth-transition adoption (Issue 05 Slice 4, R014, R002,
-    /// R044, R045). Unlike [`Self::load_auth`], never composes
-    /// external-resolution, file I/O, parse/deserialization,
-    /// keyring/secrets, restriction, mode-eligibility, or
-    /// missing-stable-identity outcomes through `.ok()`/`.flatten()`/a
-    /// filter -- each is a distinct, typed result. Never logs or returns
-    /// credential material. Only persisted managed ChatGPT mode
-    /// (`CodexAuth::Chatgpt`) can ever resolve to `Available`; every other
-    /// mode -- including external auth authority resolved successfully --
-    /// is `IneligibleAuthMode`, per R002/R044/R045's exact scope.
-    async fn read_managed_adoption_source(&self) -> ManagedAdoptionSourceOutcome {
-        use ManagedAdoptionSourceOutcome as Outcome;
-        use ManagedAdoptionVerificationError as Error;
-        match self.read_managed_adoption_snapshot().await {
-            Ok((Some(auth), _)) => Outcome::Available(auth),
-            Ok((None, _)) => Outcome::Absent,
-            Err(Error::ExternalResolutionFailed) => Outcome::ExternalResolutionFailed,
-            Err(Error::BackendIoFailed) => Outcome::BackendIoFailed,
-            Err(Error::ParseFailed) => Outcome::ParseFailed,
-            Err(Error::StorageFailed(error)) => Outcome::StorageFailed(error),
-            Err(Error::RestrictionRejected) => Outcome::RestrictionRejected,
-            Err(Error::MissingStableIdentity) => Outcome::MissingStableIdentity,
-            Err(Error::IneligibleAuthMode) => Outcome::IneligibleAuthMode,
-            Err(
-                Error::CacheUnavailable
-                | Error::CacheChangedConcurrently
-                | Error::IntendedResultMismatch,
-            ) => Outcome::ExternalResolutionFailed,
-        }
-    }
-
     async fn read_managed_adoption_snapshot(
         &self,
     ) -> Result<
@@ -2950,18 +2865,6 @@ impl AuthManager {
         format!("{:x}", hasher.finalize())
     }
 
-    /// Proves the same parsed durable result is already in the cache without
-    /// reinstalling it. `None` is meaningful only to a caller that holds an
-    /// existing pending-reset record for a previously installed managed logout.
-    pub async fn verify_managed_adoption_result(
-        &self,
-        intended_fingerprint: Option<&str>,
-    ) -> Result<(), ManagedAdoptionVerificationError> {
-        self.prepare_managed_terminal_commit(intended_fingerprint)
-            .await
-            .map(|_| ())
-    }
-
     /// Read and validate the final durable/cache result without retaining any
     /// synchronous guard across await. The returned evidence must be consumed
     /// by `with_managed_terminal_projection`, not treated as a final receipt.
@@ -3049,19 +2952,6 @@ impl AuthManager {
             Ok(commit(mode, plan))
         })
         .map_err(Terminal::Authority)?
-    }
-
-    /// Checks the authoritative cache without a reload or any mutation. A
-    /// missing/poisoned source is not converted to an absent account.
-    pub fn managed_cached_result_matches(
-        &self,
-        intended_fingerprint: Option<&str>,
-    ) -> Result<bool, ManagedAdoptionVerificationError> {
-        match self.with_managed_cached_result(intended_fingerprint, || ()) {
-            Ok(()) => Ok(true),
-            Err(ManagedAdoptionVerificationError::IntendedResultMismatch) => Ok(false),
-            Err(error) => Err(error),
-        }
     }
 
     /// Runs a synchronous terminal commit while the exact cache identity and

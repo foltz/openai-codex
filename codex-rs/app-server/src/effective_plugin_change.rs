@@ -32,14 +32,18 @@ pub(crate) fn effective_plugins_changed_callback(
     account_work_permits: AccountWorkPermits,
 ) -> Arc<dyn Fn(EffectivePluginsChange) + Send + Sync> {
     Arc::new(move |change| {
+        // Cache invalidation is synchronous and account-safe while the barrier
+        // is closed. It must not be dropped with the account-bound async work:
+        // reset does not otherwise re-drive this callback after reopening.
+        thread_manager.plugins_manager().clear_cache();
+        thread_manager.skills_service().clear_cache();
+
         let Some(permit) = account_work_permits.try_acquire() else {
             return;
         };
         // One admission covers every callback effect. Each actual async owner
         // retains a share, including the queued future after enqueue returns.
         let permit = Arc::new(permit);
-        thread_manager.plugins_manager().clear_cache();
-        thread_manager.skills_service().clear_cache();
 
         let refresh_thread_manager = Arc::clone(&thread_manager);
         let refresh_permit = Arc::clone(&permit);

@@ -1383,6 +1383,11 @@ async fn cli_main(
             run_logout(logout_cli.config_overrides).await;
         }
         Some(Subcommand::ManagedAuthTransition(command)) => {
+            reject_remote_mode_for_subcommand(
+                root_remote.as_deref(),
+                root_remote_auth_token_env.as_deref(),
+                "__managed-auth-transition",
+            )?;
             managed_auth_cmd::run(command).await?;
         }
         Some(Subcommand::Completion(completion_cli)) => {

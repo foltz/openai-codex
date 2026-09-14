@@ -120,83 +120,154 @@ pub(crate) async fn run(command: ManagedAuthCommand) -> Result<()> {
         expected_auth_fingerprint,
         intended_result_auth_fingerprint,
     } = command;
+    anyhow::ensure!(
+        !matches!(requested_intent, Some(ManagedAuthIntent::Logout))
+            || intended_result_auth_fingerprint.is_none(),
+        "logout does not accept --intended-result-auth-fingerprint"
+    );
+    let start_args = match action {
+        ManagedAuthAction::Start => Some((
+            requested_intent.context("--intent is required for --action start")?,
+            expected_auth_revision
+                .context("--expected-auth-revision is required for --action start")?,
+            expected_transition_revision
+                .context("--expected-transition-revision is required for --action start")?,
+        )),
+        ManagedAuthAction::Read | ManagedAuthAction::Cancel => None,
+    };
     let client = connect(socket_path).await?;
-    let result = match action {
-        ManagedAuthAction::Read => {
-            let response = client
-                .request_typed::<ReadManagedTransitionResponse>(
-                    ClientRequest::ManagedTransitionRead {
-                        request_id: request_id(action),
-                        params: ReadManagedTransitionParams {
-                            contract_version: MANAGED_AUTH_TRANSITION_CONTRACT_VERSION,
-                            transition_id,
-                            process_instance_id,
-                        },
-                    },
-                )
-                .await
-                .context("read managed-auth transition status")?;
-            print_response(response).await
-        }
-        ManagedAuthAction::Start => {
-            let requested_intent =
-                requested_intent.context("--intent is required for --action start")?;
-            let expected_auth_revision = expected_auth_revision
-                .context("--expected-auth-revision is required for --action start")?;
-            let expected_transition_revision = expected_transition_revision
-                .context("--expected-transition-revision is required for --action start")?;
-            let response = client
-                .request_typed::<StartManagedTransitionResponse>(
-                    ClientRequest::ManagedTransitionStart {
-                        request_id: request_id(action),
-                        params: StartManagedTransitionParams {
-                            contract_version: MANAGED_AUTH_TRANSITION_CONTRACT_VERSION,
-                            transition_id,
-                            process_instance_id,
-                            intent: to_intent(requested_intent),
-                            expected_auth_revision,
-                            expected_transition_revision,
-                            expected_auth_fingerprint,
-                            intended_result_auth_fingerprint: if matches!(
-                                requested_intent,
-                                ManagedAuthIntent::Logout
-                            ) {
-                                None
-                            } else {
-                                intended_result_auth_fingerprint
+    // Keep request errors inside this future so they cannot bypass shutdown.
+    let result = async {
+        match action {
+            ManagedAuthAction::Read => {
+                let response = client
+                    .request_typed::<ReadManagedTransitionResponse>(
+                        ClientRequest::ManagedTransitionRead {
+                            request_id: request_id(action),
+                            params: ReadManagedTransitionParams {
+                                contract_version: MANAGED_AUTH_TRANSITION_CONTRACT_VERSION,
+                                transition_id,
+                                process_instance_id,
                             },
                         },
-                    },
-                )
-                .await
-                .context("start managed-auth transition")?;
-            print_response(response).await
-        }
-        ManagedAuthAction::Cancel => {
-            let response = client
-                .request_typed::<CancelManagedTransitionResponse>(
-                    ClientRequest::ManagedTransitionCancel {
-                        request_id: request_id(action),
-                        params: CancelManagedTransitionParams {
-                            contract_version: MANAGED_AUTH_TRANSITION_CONTRACT_VERSION,
-                            transition_id,
-                            process_instance_id,
+                    )
+                    .await
+                    .context("read managed-auth transition status")?;
+                print_response(response).await
+            }
+            ManagedAuthAction::Start => {
+                let (requested_intent, expected_auth_revision, expected_transition_revision) =
+                    start_args.expect("start arguments were validated before connecting");
+                let response = client
+                    .request_typed::<StartManagedTransitionResponse>(
+                        ClientRequest::ManagedTransitionStart {
+                            request_id: request_id(action),
+                            params: StartManagedTransitionParams {
+                                contract_version: MANAGED_AUTH_TRANSITION_CONTRACT_VERSION,
+                                transition_id,
+                                process_instance_id,
+                                intent: to_intent(requested_intent),
+                                expected_auth_revision,
+                                expected_transition_revision,
+                                expected_auth_fingerprint,
+                                intended_result_auth_fingerprint,
+                            },
                         },
-                    },
-                )
-                .await
-                .context("cancel managed-auth transition")?;
-            print_response(response).await
+                    )
+                    .await
+                    .context("start managed-auth transition")?;
+                print_response(response).await
+            }
+            ManagedAuthAction::Cancel => {
+                let response = client
+                    .request_typed::<CancelManagedTransitionResponse>(
+                        ClientRequest::ManagedTransitionCancel {
+                            request_id: request_id(action),
+                            params: CancelManagedTransitionParams {
+                                contract_version: MANAGED_AUTH_TRANSITION_CONTRACT_VERSION,
+                                transition_id,
+                                process_instance_id,
+                            },
+                        },
+                    )
+                    .await
+                    .context("cancel managed-auth transition")?;
+                print_response(response).await
+            }
         }
-    };
-    let shutdown = client.shutdown().await;
-    shutdown.context("shutdown managed-auth protocol client")?;
-    result
+    }
+    .await;
+    let shutdown = client
+        .shutdown()
+        .await
+        .context("shutdown managed-auth protocol client");
+    // A secondary shutdown failure must not replace the request's failure.
+    result.and(shutdown)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn logout_fingerprint_is_rejected_before_connect() {
+        let error = run(ManagedAuthCommand {
+            socket_path: "not-an-absolute-socket".to_owned(),
+            action: ManagedAuthAction::Start,
+            transition_id: "test-transition".to_owned(),
+            process_instance_id: "test-process".to_owned(),
+            intent: Some(ManagedAuthIntent::Logout),
+            expected_auth_revision: Some(0),
+            expected_transition_revision: Some(0),
+            expected_auth_fingerprint: None,
+            intended_result_auth_fingerprint: Some("synthetic-fingerprint".to_owned()),
+        })
+        .await
+        .expect_err("logout fingerprint must refuse before socket validation");
+        assert_eq!(
+            error.to_string(),
+            "logout does not accept --intended-result-auth-fingerprint"
+        );
+    }
+
+    #[tokio::test]
+    async fn required_start_arguments_are_rejected_before_connect() {
+        for (intent, expected_auth_revision, expected_transition_revision, expected_error) in [
+            (
+                None,
+                Some(0),
+                Some(0),
+                "--intent is required for --action start",
+            ),
+            (
+                Some(ManagedAuthIntent::Login),
+                None,
+                Some(0),
+                "--expected-auth-revision is required for --action start",
+            ),
+            (
+                Some(ManagedAuthIntent::Login),
+                Some(0),
+                None,
+                "--expected-transition-revision is required for --action start",
+            ),
+        ] {
+            let error = run(ManagedAuthCommand {
+                socket_path: "not-an-absolute-socket".to_owned(),
+                action: ManagedAuthAction::Start,
+                transition_id: "test-transition".to_owned(),
+                process_instance_id: "test-process".to_owned(),
+                intent,
+                expected_auth_revision,
+                expected_transition_revision,
+                expected_auth_fingerprint: None,
+                intended_result_auth_fingerprint: Some("synthetic-fingerprint".to_owned()),
+            })
+            .await
+            .expect_err("required start arguments must refuse before socket validation");
+            assert_eq!(error.to_string(), expected_error);
+        }
+    }
 
     #[test]
     fn managed_intents_are_token_free_and_explicit() {

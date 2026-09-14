@@ -407,22 +407,16 @@ impl TargetEvidenceSource for ProcessTargetEvidenceSource {
 /// observed rather than masked by a stale snapshot.
 ///
 /// Deliberately does not derive `PartialEq`/`Eq`: the only intended
-/// comparison is [`Self::matches_target`], which excludes `record_identity`.
-/// A derived structural equality would silently disagree with that
-/// semantics (it would compare `record_identity` too, so it would always be
-/// `false` between any two captures) — see `CODEX-I05-S02` verification
-/// round 01, M2.
+/// comparison is [`Self::matches_target`]. A derived structural equality
+/// would obscure that the executable identity is unavailable evidence rather
+/// than an ordinary optional field — see `CODEX-I05-S02` verification round
+/// 01, M2.
 #[derive(Debug, Clone)]
 pub(crate) struct TargetEvidence {
     declared_profile: Option<String>,
     executable_identity: Option<codex_app_server_transport::PeerExecutableIdentity>,
     endpoint: String,
     pid: u32,
-    /// A fresh opaque identity for this specific evidence snapshot, distinct
-    /// from the coordinator's own process-instance identity: it changes on
-    /// every capture, not only on restart, so two captures within the same
-    /// process are still distinguishable records.
-    record_identity: String,
 }
 
 impl TargetEvidence {
@@ -434,14 +428,12 @@ impl TargetEvidence {
             executable_identity: source.executable_identity().ok(),
             endpoint: source.endpoint(),
             pid: source.pid(),
-            record_identity: Uuid::new_v4().to_string(),
         }
     }
 
     /// True only when every replacement-sensitive fact this capture observed
-    /// is identical to the reference capture (`record_identity` excluded --
-    /// it identifies the snapshot itself, not the target). `executable_identity`
-    /// missing on *either* side is never treated as a match: an unavailable
+    /// is identical to the reference capture. `executable_identity` missing
+    /// on *either* side is never treated as a match: an unavailable
     /// executable identity is exactly the "replaced/unreadable process"
     /// condition this check exists to catch, not evidence of consistency.
     fn matches_target(&self, reference: &TargetEvidence) -> bool {
@@ -540,10 +532,22 @@ impl ManagedTransitionCoordinator {
         authoritative_auth: AuthoritativeAuthState,
         target_evidence_source: Arc<dyn TargetEvidenceSource>,
     ) -> Self {
+        Self::from_authoritative_auth_state_target_evidence_and_process_instance(
+            authoritative_auth,
+            target_evidence_source,
+            Uuid::now_v7().to_string(),
+        )
+    }
+
+    fn from_authoritative_auth_state_target_evidence_and_process_instance(
+        authoritative_auth: AuthoritativeAuthState,
+        target_evidence_source: Arc<dyn TargetEvidenceSource>,
+        process_instance_id: String,
+    ) -> Self {
         let target_evidence = TargetEvidence::capture(target_evidence_source.as_ref());
         Self {
             state: Arc::new(Mutex::new(CoordinatorState {
-                process_instance_id: Uuid::now_v7().to_string(),
+                process_instance_id,
                 auth_revision: authoritative_auth.auth_revision,
                 transition_revision: 0,
                 auth_fingerprint: authoritative_auth.auth_fingerprint,
@@ -593,6 +597,30 @@ impl ManagedTransitionCoordinator {
             authoritative_auth,
             target_evidence_source,
         );
+        coordinator.adoption = Some(AdoptionDependencies {
+            auth_manager,
+            reset_inventory,
+            outgoing: Some(outgoing),
+        });
+        coordinator
+    }
+
+    /// Production constructor for a standalone server whose process identity
+    /// was selected before its optional immutable target record was published.
+    pub(crate) fn with_adoption_account_projection_and_process_instance(
+        authoritative_auth: AuthoritativeAuthState,
+        target_evidence_source: Arc<dyn TargetEvidenceSource>,
+        process_instance_id: String,
+        auth_manager: Arc<AuthManager>,
+        reset_inventory: Arc<dyn ResetInventory>,
+        outgoing: Arc<crate::outgoing_message::OutgoingMessageSender>,
+    ) -> Self {
+        let mut coordinator =
+            Self::from_authoritative_auth_state_target_evidence_and_process_instance(
+                authoritative_auth,
+                target_evidence_source,
+                process_instance_id,
+            );
         coordinator.adoption = Some(AdoptionDependencies {
             auth_manager,
             reset_inventory,
@@ -763,7 +791,7 @@ impl ManagedTransitionCoordinator {
             return Err(refusal(
                 state,
                 envelope,
-                ManagedTransitionRefusalKind::InvalidRequest,
+                ManagedTransitionRefusalKind::TargetChanged,
                 false,
             ));
         }
@@ -1188,10 +1216,7 @@ impl ManagedTransitionCoordinator {
             .await?;
         if self.account_work_permits.admitted_count() != 0 {
             return self
-                .quarantine(
-                    transition_id,
-                    ManagedTransitionRefusalKind::AuthInstallFailed,
-                )
+                .quarantine(transition_id, ManagedTransitionRefusalKind::ResetFailed)
                 .await;
         }
         if let Err(failure) = self
@@ -2516,28 +2541,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wire_admission_refuses_an_unauthorized_caller_without_mutation() {
-        let coordinator = ManagedTransitionCoordinator::new();
+    async fn unauthorized_wire_admission_returns_complete_placeholder_without_mutation() {
+        let coordinator =
+            ManagedTransitionCoordinator::from_authoritative_auth_state(AuthoritativeAuthState {
+                authority_available: true,
+                auth_revision: 41,
+                auth_fingerprint: Some(account_fingerprint("account-a")),
+            });
+        coordinator.state.lock().await.transition_revision = 7;
         let process_id = coordinator.process_instance_id().await;
+        let mut request = request_at_revision(process_id.clone(), "transition-a", 7);
+        request.expected_auth_revision = 41;
+        request.expected_auth_fingerprint = Some(account_fingerprint("account-a"));
         let refused = coordinator
-            .start_dispatch(
-                request(process_id.clone(), "transition-a"),
-                /*caller_authorized*/ false,
-            )
+            .start_dispatch(request.clone(), /*caller_authorized*/ false)
             .await;
-        let StartManagedTransitionResponse::Refused { refusal } = refused else {
-            panic!("an unauthorized wire caller must never be admitted");
-        };
         assert_eq!(
-            refusal.kind,
-            ManagedTransitionRefusalKind::AuthorizationNotAdmitted
+            refused,
+            StartManagedTransitionResponse::Refused {
+                refusal: ManagedTransitionRefusal {
+                    kind: ManagedTransitionRefusalKind::AuthorizationNotAdmitted,
+                    retryable: false,
+                    process_instance_id: String::new(),
+                    transition_id: "transition-a".to_owned(),
+                    auth_revision: 0,
+                    transition_revision: 0,
+                    auth_fingerprint: None,
+                },
+            }
         );
 
         let admitted = coordinator
-            .admit(request(process_id, "transition-a"))
+            .admit(request)
             .await
             .expect("the refused wire request must not reserve the transition id");
         assert_eq!(admitted.phase, ManagedTransitionPhase::Admitted);
+        assert_eq!(admitted.prior_auth_revision, 41);
+        assert_eq!(admitted.prior_transition_revision, 7);
     }
 
     #[tokio::test]
@@ -2663,7 +2703,7 @@ mod tests {
             .admit(request(process_id.clone(), "transition-a"))
             .await
             .unwrap_err();
-        assert_eq!(refused.kind, ManagedTransitionRefusalKind::InvalidRequest);
+        assert_eq!(refused.kind, ManagedTransitionRefusalKind::TargetChanged);
 
         // Exact no-effect snapshot: the refused attempt must not have
         // reserved the transition id or consumed a transition-revision
@@ -2708,7 +2748,7 @@ mod tests {
                 .admit(request(process_id.clone(), "transition-a"))
                 .await
                 .unwrap_err();
-            assert_eq!(refused.kind, ManagedTransitionRefusalKind::InvalidRequest);
+            assert_eq!(refused.kind, ManagedTransitionRefusalKind::TargetChanged);
 
             // Exact no-effect snapshot, same rationale as the
             // executable-identity-replacement case above.
@@ -3702,12 +3742,22 @@ mod tests {
             // genuinely compares process identity and refuses the stale one.
             assert_eq!(
                 restarted
-                    .read(read_request(old_process_id, &transition_id))
+                    .read(read_request(old_process_id.clone(), &transition_id))
                     .await
                     .unwrap_err()
                     .kind,
                 ManagedTransitionRefusalKind::ProcessMismatch,
                 "{boundary}: old process identity must never resolve a transition after restart"
+            );
+
+            assert_eq!(
+                restarted
+                    .cancel(cancel_request(old_process_id, &transition_id))
+                    .await
+                    .unwrap_err()
+                    .kind,
+                ManagedTransitionRefusalKind::ProcessMismatch,
+                "{boundary}: old process identity must never cancel a transition after restart"
             );
 
             // No manufactured old outcome or reservation: the restarted
@@ -3992,6 +4042,70 @@ mod tests {
                 }
             })
         }
+    }
+
+    #[tokio::test]
+    async fn pending_reset_recovery_reports_non_quiescent_work_as_reset_failure() {
+        let home = tempfile::TempDir::new().unwrap();
+        write_chatgpt_auth_for_intended_account(home.path(), "account-b");
+        let manager = Arc::new(real_auth_manager(home.path()).await);
+        let resets = Arc::new(RetryResetInventory {
+            fails: AtomicBool::new(false),
+            calls: AtomicU64::new(0),
+        });
+        let coordinator = ManagedTransitionCoordinator::from_authoritative_auth_state_target_evidence_and_adoption(
+            AuthoritativeAuthState::from_auth_manager(&manager),
+            Arc::new(UnsetTargetEvidenceSource),
+            Arc::clone(&manager),
+            resets.clone(),
+        );
+        let fingerprint = account_fingerprint("account-b");
+        let pending = PendingResetRecovery {
+            owner_transition_id: "original".to_owned(),
+            intent: ManagedTransitionIntent::AdoptManagedAuth,
+            auth_fingerprint: Some(fingerprint.clone()),
+            auth_revision: 0,
+        };
+        coordinator.state.lock().await.pending_reset = Some(pending);
+
+        let process = coordinator.process_instance_id().await;
+        let mut recovery = request(process, "recovery");
+        recovery.expected_auth_fingerprint = Some(fingerprint.clone());
+        recovery.intended_result_auth_fingerprint = Some(fingerprint);
+        coordinator.admit(recovery).await.unwrap();
+        coordinator
+            .advance("recovery", ManagedTransitionPhase::Draining)
+            .await
+            .unwrap();
+        let transferred_pending = coordinator
+            .state
+            .lock()
+            .await
+            .pending_reset
+            .clone()
+            .unwrap();
+        coordinator
+            .account_work_permits
+            .inner
+            .state
+            .fetch_add(1, Ordering::AcqRel);
+
+        let failed = coordinator
+            .resume_pending_reset("recovery", transferred_pending, &manager, resets.as_ref())
+            .await
+            .unwrap();
+        coordinator
+            .account_work_permits
+            .inner
+            .state
+            .fetch_sub(1, Ordering::AcqRel);
+
+        assert_eq!(failed.phase, ManagedTransitionPhase::Quarantined);
+        assert_eq!(
+            failed.refusal,
+            Some(ManagedTransitionRefusalKind::ResetFailed)
+        );
+        assert_eq!(resets.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

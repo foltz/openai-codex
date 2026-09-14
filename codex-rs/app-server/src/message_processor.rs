@@ -491,6 +491,8 @@ pub(crate) struct MessageProcessorArgs {
     pub(crate) rpc_transport: AppServerRpcTransport,
     pub(crate) remote_control_handle: Option<RemoteControlHandle>,
     pub(crate) plugin_startup_tasks: crate::PluginStartupTasks,
+    pub(crate) managed_transition_control_socket_endpoint: Option<String>,
+    pub(crate) managed_transition_process_instance_id: Option<String>,
 }
 
 impl MessageProcessor {
@@ -516,6 +518,8 @@ impl MessageProcessor {
             rpc_transport,
             remote_control_handle,
             plugin_startup_tasks,
+            managed_transition_control_socket_endpoint,
+            managed_transition_process_instance_id,
         } = args;
         let thread_state_manager = ThreadStateManager::new();
         thread_state_manager.set_attachment_notification_outgoing(outgoing.clone());
@@ -623,10 +627,12 @@ impl MessageProcessor {
             applied_mcp_config_identity.clone(),
             analytics_events_client.clone(),
         );
-        let managed_transition_control_socket_endpoint =
-            crate::transport::app_server_control_socket_path(&config.codex_home)
-                .map(|path| path.display().to_string())
-                .unwrap_or_default();
+        let managed_transition_control_socket_endpoint = managed_transition_control_socket_endpoint
+            .unwrap_or_else(|| {
+                crate::transport::app_server_control_socket_path(&config.codex_home)
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default()
+            });
         let reset_inventory: Arc<dyn crate::managed_transition::ResetInventory> =
             Arc::new(ProductionResetInventory {
                 telemetry_reset,
@@ -639,16 +645,29 @@ impl MessageProcessor {
                 auth_manager: Arc::clone(&auth_manager),
                 remote_control_handle: remote_control_handle.clone(),
             });
-        let managed_transition_coordinator =
-            crate::managed_transition::ManagedTransitionCoordinator::with_adoption_and_account_projection(
-                crate::managed_transition::AuthoritativeAuthState::from_auth_manager(&auth_manager),
-                Arc::new(crate::managed_transition::ProcessTargetEvidenceSource::new(
-                    managed_transition_control_socket_endpoint,
-                )),
+        let target_evidence_source =
+            Arc::new(crate::managed_transition::ProcessTargetEvidenceSource::new(
+                managed_transition_control_socket_endpoint,
+            ));
+        let authoritative_auth =
+            crate::managed_transition::AuthoritativeAuthState::from_auth_manager(&auth_manager);
+        let managed_transition_coordinator = match managed_transition_process_instance_id {
+            Some(process_instance_id) => crate::managed_transition::ManagedTransitionCoordinator::with_adoption_account_projection_and_process_instance(
+                authoritative_auth,
+                target_evidence_source,
+                process_instance_id,
                 Arc::clone(&auth_manager),
                 reset_inventory,
                 Arc::clone(&outgoing),
-            );
+            ),
+            None => crate::managed_transition::ManagedTransitionCoordinator::with_adoption_and_account_projection(
+                authoritative_auth,
+                target_evidence_source,
+                Arc::clone(&auth_manager),
+                reset_inventory,
+                Arc::clone(&outgoing),
+            ),
+        };
         let on_effective_plugins_changed =
             crate::effective_plugin_change::effective_plugins_changed_callback(
                 auth_manager.clone(),

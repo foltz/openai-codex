@@ -2894,14 +2894,11 @@ async fn managed_adoption_snapshot_excludes_external_auth_authority() {
     }
 }
 
-/// R002: a persisted, non-ChatGPT mode with a stable account identity
-/// (API key mode here; `AgentIdentity`/`PersonalAccessToken` share the
-/// same `get_account_id().is_some()` shape but require network-backed
-/// construction not practical in this offline test) must refuse as
-/// `IneligibleAuthMode`, not slip through because a stable identity
-/// happens to be present. This is the exact `unsupported ... modes
-/// refuse` boundary R002 requires and would previously have been
-/// misclassified as `MissingStableIdentity` or, worse, accepted.
+/// R002: a persisted, non-ChatGPT mode (API key mode here) must refuse as
+/// `IneligibleAuthMode`, rather than slipping through as an adoptable managed
+/// source. This fixture is rejected by the serialized auth-mode gate before a
+/// `CodexAuth` is constructed, so it deliberately does not model the
+/// stable-identity handling for `AgentIdentity` or `PersonalAccessToken`.
 #[tokio::test]
 async fn managed_adoption_snapshot_excludes_persisted_non_chatgpt_mode() {
     let codex_home = tempdir().unwrap();
@@ -3414,10 +3411,20 @@ async fn managed_recovery_verifies_durable_and_cached_result_without_installing(
 /// precedent in this same file.
 #[tokio::test]
 async fn managed_adoption_outcomes_never_debug_print_credential_material() {
+    let fingerprint = AuthManager::managed_account_fingerprint("opaque-account");
     let install_outcome = ManagedAdoptionInstallOutcome::Installed {
-        fingerprint: AuthManager::managed_account_fingerprint("opaque-account"),
+        fingerprint: fingerprint.clone(),
     };
-    assert!(!format!("{install_outcome:?}").contains("opaque-account"));
+    let rendered = format!("{install_outcome:?}");
+    assert_eq!(
+        rendered,
+        format!("Installed {{ fingerprint: {fingerprint:?} }}"),
+        "debug output must expose only the opaque account fingerprint"
+    );
+    assert!(
+        !rendered.contains("opaque-account"),
+        "debug output must not expose the source account identifier"
+    );
 }
 
 #[test]

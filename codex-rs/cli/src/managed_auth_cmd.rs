@@ -125,6 +125,16 @@ pub(crate) async fn run(command: ManagedAuthCommand) -> Result<()> {
             || intended_result_auth_fingerprint.is_none(),
         "logout does not accept --intended-result-auth-fingerprint"
     );
+    let start_args = match action {
+        ManagedAuthAction::Start => Some((
+            requested_intent.context("--intent is required for --action start")?,
+            expected_auth_revision
+                .context("--expected-auth-revision is required for --action start")?,
+            expected_transition_revision
+                .context("--expected-transition-revision is required for --action start")?,
+        )),
+        ManagedAuthAction::Read | ManagedAuthAction::Cancel => None,
+    };
     let client = connect(socket_path).await?;
     // Keep request errors inside this future so they cannot bypass shutdown.
     let result = async {
@@ -146,12 +156,8 @@ pub(crate) async fn run(command: ManagedAuthCommand) -> Result<()> {
                 print_response(response).await
             }
             ManagedAuthAction::Start => {
-                let requested_intent =
-                    requested_intent.context("--intent is required for --action start")?;
-                let expected_auth_revision = expected_auth_revision
-                    .context("--expected-auth-revision is required for --action start")?;
-                let expected_transition_revision = expected_transition_revision
-                    .context("--expected-transition-revision is required for --action start")?;
+                let (requested_intent, expected_auth_revision, expected_transition_revision) =
+                    start_args.expect("start arguments were validated before connecting");
                 let response = client
                     .request_typed::<StartManagedTransitionResponse>(
                         ClientRequest::ManagedTransitionStart {
@@ -222,6 +228,45 @@ mod tests {
             error.to_string(),
             "logout does not accept --intended-result-auth-fingerprint"
         );
+    }
+
+    #[tokio::test]
+    async fn required_start_arguments_are_rejected_before_connect() {
+        for (intent, expected_auth_revision, expected_transition_revision, expected_error) in [
+            (
+                None,
+                Some(0),
+                Some(0),
+                "--intent is required for --action start",
+            ),
+            (
+                Some(ManagedAuthIntent::Login),
+                None,
+                Some(0),
+                "--expected-auth-revision is required for --action start",
+            ),
+            (
+                Some(ManagedAuthIntent::Login),
+                Some(0),
+                None,
+                "--expected-transition-revision is required for --action start",
+            ),
+        ] {
+            let error = run(ManagedAuthCommand {
+                socket_path: "not-an-absolute-socket".to_owned(),
+                action: ManagedAuthAction::Start,
+                transition_id: "test-transition".to_owned(),
+                process_instance_id: "test-process".to_owned(),
+                intent,
+                expected_auth_revision,
+                expected_transition_revision,
+                expected_auth_fingerprint: None,
+                intended_result_auth_fingerprint: Some("synthetic-fingerprint".to_owned()),
+            })
+            .await
+            .expect_err("required start arguments must refuse before socket validation");
+            assert_eq!(error.to_string(), expected_error);
+        }
     }
 
     #[test]

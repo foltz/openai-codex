@@ -20,9 +20,11 @@ pub(crate) enum CleanupExecution {
     TimedOut,
     AuthorityUnavailable,
     McpFailed,
+    McpPrewarmFailed,
     TaskJoinFailed,
     ConversationShutdownFailed,
     CodeModeShutdownFailed,
+    GuardianFailed,
 }
 
 #[derive(Clone, Debug)]
@@ -34,7 +36,7 @@ enum McpCleanup {
 #[derive(Clone, Copy)]
 pub(super) enum CleanupMode {
     Legacy,
-    DeadlineBound,
+    DeadlineBound(Instant),
 }
 
 #[derive(Default)]
@@ -134,8 +136,8 @@ impl SessionCleanupOwner {
                     .shared()
                 });
                 state.task_completion = tasks.clone();
-                let mode = if mcp.is_some() {
-                    CleanupMode::DeadlineBound
+                let mode = if let Some(deadline) = state.deadline {
+                    CleanupMode::DeadlineBound(deadline)
                 } else {
                     CleanupMode::Legacy
                 };

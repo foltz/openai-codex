@@ -39,9 +39,11 @@ pub enum ThreadCleanupOutcome {
     TimedOut,
     AuthorityUnavailable,
     McpFailed,
+    McpPrewarmFailed,
     TaskJoinFailed,
     ConversationShutdownFailed,
     CodeModeShutdownFailed,
+    GuardianFailed,
 }
 
 /// Independent facts needed by the lifecycle owner; no fallback emits a
@@ -289,6 +291,7 @@ impl ThreadRetirement {
                         ThreadCleanupOutcome::AuthorityUnavailable
                     }
                     CleanupExecution::McpFailed => ThreadCleanupOutcome::McpFailed,
+                    CleanupExecution::McpPrewarmFailed => ThreadCleanupOutcome::McpPrewarmFailed,
                     CleanupExecution::TaskJoinFailed => ThreadCleanupOutcome::TaskJoinFailed,
                     CleanupExecution::ConversationShutdownFailed => {
                         ThreadCleanupOutcome::ConversationShutdownFailed
@@ -296,6 +299,7 @@ impl ThreadRetirement {
                     CleanupExecution::CodeModeShutdownFailed => {
                         ThreadCleanupOutcome::CodeModeShutdownFailed
                     }
+                    CleanupExecution::GuardianFailed => ThreadCleanupOutcome::GuardianFailed,
                 },
             }
         }

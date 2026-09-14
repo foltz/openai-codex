@@ -6724,6 +6724,46 @@ fn remote_installed_plugins_cache_refresh_coalesces_materializations() {
     );
 }
 
+#[tokio::test]
+async fn rejected_remote_cache_refresh_admission_clears_queued_work() {
+    let tmp = TempDir::new().unwrap();
+    let manager = Arc::new(test_plugins_manager(tmp.path().to_path_buf()));
+    let drain = manager.shutdown_until(tokio::time::Instant::now()).await;
+    assert!(drain.is_clean());
+    let service_config = RemotePluginServiceConfig::new(
+        "https://example.com".to_string(),
+        test_http_client_factory(),
+    );
+
+    manager.schedule_remote_installed_plugins_cache_refresh(
+        RemoteInstalledPluginsCacheRefreshRequest {
+            generation: manager.remote_installed_plugins_generation(),
+            service_config: service_config.clone(),
+            auth: None,
+            notify: RemoteInstalledPluginsCacheRefreshNotify::IfCacheChanged,
+            on_effective_plugins_changed: None,
+            change: EffectivePluginsChange::default(),
+        },
+    );
+    manager.schedule_remote_catalog_cache_refresh(RemoteCatalogCacheRefreshRequest {
+        service_config,
+        auth: None,
+        scopes: BTreeSet::from([crate::remote::RemotePluginScope::Global]),
+        mode: RemoteCatalogCacheRefreshMode::Force,
+    });
+
+    let installed = manager
+        .remote_installed_plugins_cache_refresh_state
+        .read()
+        .unwrap();
+    assert!(!installed.in_flight);
+    assert!(installed.requested.is_none());
+    drop(installed);
+    let catalog = manager.remote_catalog_cache_refresh_state.read().unwrap();
+    assert!(!catalog.in_flight);
+    assert!(catalog.requests.is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_reset_fences_late_remote_installed_success_and_auth_errors() {
     for outcome in [

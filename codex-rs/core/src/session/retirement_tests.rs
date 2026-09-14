@@ -406,6 +406,8 @@ async fn failed_common_api_receipt_never_projects_shutdown_complete() {
     for failure in [
         CleanupExecution::ConversationShutdownFailed,
         CleanupExecution::CodeModeShutdownFailed,
+        CleanupExecution::McpPrewarmFailed,
+        CleanupExecution::GuardianFailed,
     ] {
         let (session, _, events) = super::super::tests::make_session_and_context_with_rx().await;
         let owner = session.cleanup_owner();
@@ -415,6 +417,37 @@ async fn failed_common_api_receipt_never_projects_shutdown_complete() {
             Some(futures::future::ready(failure).boxed().shared());
         assert!(super::super::handlers::shutdown(&session, "shutdown".to_string()).await);
         assert_eq!(owner.observe(Arc::clone(&session)).await, failure);
+        while let Ok(event) = events.try_recv() {
+            assert!(!matches!(
+                event.msg,
+                codex_protocol::protocol::EventMsg::ShutdownComplete
+            ));
+        }
+    }
+}
+
+#[tokio::test]
+async fn cancelled_or_panicked_mcp_prewarm_never_projects_shutdown_complete() {
+    for panics in [false, true] {
+        let (session, _, events) = super::super::tests::make_session_and_context_with_rx().await;
+        let worker = if panics {
+            tokio::spawn(async { panic!("controlled MCP prewarm panic") })
+        } else {
+            let worker = tokio::spawn(std::future::pending::<()>());
+            worker.abort();
+            worker
+        };
+        *session.mcp_prewarm_task.lock().expect("worker owner") =
+            Some(super::super::session_loop_termination_from_handle(worker));
+
+        let owner = session.cleanup_owner();
+        assert_eq!(
+            owner.observe(Arc::clone(&session)).await,
+            CleanupExecution::McpPrewarmFailed,
+            "{} prewarm must become the distinct cleanup receipt",
+            if panics { "panicked" } else { "cancelled" },
+        );
+        assert!(super::super::handlers::shutdown(&session, "shutdown".to_string()).await);
         while let Ok(event) = events.try_recv() {
             assert!(!matches!(
                 event.msg,
@@ -526,14 +559,13 @@ async fn auxiliary_startup_is_joined_and_cannot_restart_after_cleanup() {
             self.0.store(true, Ordering::Release);
         }
     }
-    for mode in [CleanupMode::Legacy, CleanupMode::DeadlineBound] {
+    for deadline_bound in [false, true] {
         let (session, _) = super::super::tests::make_session_and_context().await;
         let session = Arc::new(session);
         let owner = session.cleanup_owner();
-        if let CleanupMode::DeadlineBound = mode {
-            owner
-                .bind_deadline(Instant::now() + Duration::from_secs(3))
-                .expect("bind");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        if deadline_bound {
+            owner.bind_deadline(deadline).expect("bind");
         }
         let entered = Arc::new(Notify::new());
         let worker_entered = Arc::clone(&entered);
@@ -602,6 +634,82 @@ async fn blocked_common_cleanup_does_not_starve_mcp_retirement() {
     assert_eq!(observer.await, CleanupExecution::TimedOut);
     assert!(matches!(mcp.peek(), Some(McpCleanup::Observed(report)) if report.is_complete()));
     drop(active_turn);
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_initialization_discard_remains_the_original_common_receipt_after_timeout() {
+    struct PausedStop {
+        calls: Arc<AtomicUsize>,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+    impl codex_extension_api::ThreadLifecycleContributor<crate::config::Config> for PausedStop {
+        fn on_thread_stop<'a>(
+            &'a self,
+            _input: codex_extension_api::ThreadStopInput<'a>,
+        ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.entered.notify_one();
+                self.release.notified().await;
+            })
+        }
+    }
+
+    let (mut session, _) = super::super::tests::make_session_and_context().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
+    builder.thread_lifecycle_contributor(Arc::new(PausedStop {
+        calls: Arc::clone(&calls),
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+    }));
+    session.services.extensions = Arc::new(builder.build());
+    session
+        .failed_initialization_persistence
+        .store(true, Ordering::Release);
+    let session = Arc::new(session);
+    let owner = session.cleanup_owner();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    owner.bind_deadline(deadline).expect("bind");
+    let observer_owner = Arc::clone(&owner);
+    let observer_session = Arc::clone(&session);
+    let observer = tokio::spawn(async move { observer_owner.observe(observer_session).await });
+    entered.notified().await;
+    let common = owner
+        .state
+        .lock()
+        .expect("cleanup state")
+        .common_completion
+        .clone()
+        .expect("common cleanup receipt");
+
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert_eq!(
+        observer.await.expect("cleanup observer"),
+        CleanupExecution::TimedOut
+    );
+    assert!(common.peek().is_none());
+    assert_eq!(
+        owner.bind_deadline(deadline + Duration::from_secs(30)),
+        Ok(deadline),
+        "a later observer cannot refresh the original bound"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // The production observer does not resume work after expiry. The fixture
+    // explicitly drives the retained original receipt to prove it reaches the
+    // actual failed-initialization discard path without starting cleanup twice.
+    release.notify_one();
+    assert_eq!(
+        common.await,
+        CleanupExecution::Finished {
+            persistence_failed: false
+        }
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test(start_paused = true)]

@@ -2,12 +2,15 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+use std::sync::Weak;
 use std::time::Duration;
 
 use anyhow::anyhow;
 use codex_analytics::GuardianReviewAnalyticsResult;
 use codex_analytics::GuardianReviewSessionAnalyticsParams;
 use codex_analytics::GuardianReviewSessionKind;
+use codex_extension_api::LoadedUserInstructions;
 use codex_extension_api::UserInstructions;
 use codex_history::InitialHistory;
 use codex_history::RolloutItem;
@@ -29,14 +32,18 @@ use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TokenUsage;
+use futures::FutureExt;
 use futures::future::BoxFuture;
+use futures::future::Shared;
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use crate::codex_delegate::run_codex_thread_interactive;
+use crate::codex_delegate::DelegateForwardingOutcome;
+use crate::codex_delegate::DelegateForwardingReceipts;
+use crate::codex_delegate::run_codex_thread_interactive_with_custody;
 use crate::config::Config;
 use crate::config::Constrained;
 use crate::config::ManagedFeatures;
@@ -46,7 +53,9 @@ use crate::context::ContextualUserFragment;
 use crate::context::GuardianFollowupReviewReminder;
 use crate::session::GitEnrichmentPolicy;
 use crate::session::SessionIo;
+use crate::session::SessionRetirementIo;
 use crate::session::session::Session;
+use crate::session::startup_custody::SessionStartupCustody;
 use crate::session::turn_context::TurnContext;
 use codex_config::types::McpServerConfig;
 use codex_features::Feature;
@@ -101,6 +110,7 @@ pub(crate) struct GuardianReviewSessionParams {
 pub(crate) struct GuardianReviewSessionManager {
     state: Arc<Mutex<GuardianReviewSessionState>>,
     cancellation_token: CancellationToken,
+    cleanup: GuardianCleanupRegistry,
 }
 
 #[derive(Default)]
@@ -112,10 +122,704 @@ struct GuardianReviewSessionState {
 struct GuardianReviewSession {
     session: Arc<Session>,
     io: SessionIo,
-    cancel_token: CancellationToken,
     reuse_key: GuardianReviewSessionReuseKey,
     review_lock: Semaphore,
     state: Mutex<GuardianReviewState>,
+    cleanup: Arc<GuardianChildCleanup>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GuardianTaskOutcome {
+    Clean,
+    Failed,
+    Panicked,
+}
+
+type GuardianTaskReceipt = Shared<BoxFuture<'static, GuardianTaskOutcome>>;
+
+struct GuardianChildCleanupState {
+    completion: Option<GuardianTaskReceipt>,
+    completion_phase: Option<GuardianCleanupPhase>,
+    auxiliary: Vec<GuardianTaskReceipt>,
+    auxiliary_open: bool,
+    retirement: Option<crate::codex_thread::ThreadRetirement>,
+}
+
+impl Default for GuardianChildCleanupState {
+    fn default() -> Self {
+        Self {
+            completion: None,
+            completion_phase: None,
+            auxiliary: Vec::new(),
+            auxiliary_open: true,
+            retirement: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GuardianCleanupPhase {
+    Legacy,
+    DeadlineBound,
+}
+
+struct GuardianChildCleanup {
+    session: Arc<Session>,
+    io: SessionRetirementIo,
+    cancel_token: CancellationToken,
+    forwarding: DelegateForwardingReceipts,
+    state: StdMutex<GuardianChildCleanupState>,
+}
+
+impl GuardianChildCleanup {
+    fn new(
+        session: Arc<Session>,
+        io: SessionRetirementIo,
+        cancel_token: CancellationToken,
+        forwarding: DelegateForwardingReceipts,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            session,
+            io,
+            cancel_token,
+            forwarding,
+            state: StdMutex::new(GuardianChildCleanupState::default()),
+        })
+    }
+
+    fn begin_legacy(&self) -> GuardianTaskReceipt {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(completion) = state.completion.as_ref() {
+            return completion.clone();
+        }
+        self.cancel_token.cancel();
+        let io = self.io.clone();
+        let forwarding = self.forwarding.clone();
+        let task = tokio::spawn(async move {
+            let (shutdown, forwarding) = tokio::join!(io.shutdown_and_wait(), forwarding.wait());
+            if shutdown.is_ok() && forwarding {
+                GuardianTaskOutcome::Clean
+            } else {
+                GuardianTaskOutcome::Failed
+            }
+        });
+        let completion = retain_guardian_task(task);
+        state.completion = Some(completion.clone());
+        state.completion_phase = Some(GuardianCleanupPhase::Legacy);
+        completion
+    }
+
+    fn auxiliary_receipts(&self) -> Vec<GuardianTaskReceipt> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .auxiliary
+            .clone()
+    }
+
+    fn close_auxiliary_admission(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .auxiliary_open = false;
+    }
+
+    fn spawn_auxiliary<F>(&self, future: F)
+    where
+        F: Future<Output = GuardianTaskOutcome> + Send + 'static,
+    {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.auxiliary_open {
+            return;
+        }
+        state
+            .auxiliary
+            .push(retain_guardian_task(tokio::spawn(future)));
+    }
+
+    async fn auxiliary_clean_until(&self, deadline: tokio::time::Instant) -> bool {
+        let tasks = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.auxiliary_open = false;
+            state.auxiliary.clone()
+        };
+        tokio::time::timeout_at(deadline, futures::future::join_all(tasks))
+            .await
+            .is_ok_and(|outcomes| {
+                outcomes
+                    .iter()
+                    .all(|outcome| *outcome == GuardianTaskOutcome::Clean)
+            })
+    }
+
+    async fn auxiliary_clean(&self) -> bool {
+        let tasks = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.auxiliary_open = false;
+            state.auxiliary.clone()
+        };
+        futures::future::join_all(tasks)
+            .await
+            .iter()
+            .all(|outcome| *outcome == GuardianTaskOutcome::Clean)
+    }
+
+    fn begin_bounded(&self, deadline: tokio::time::Instant) -> GuardianTaskReceipt {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(completion) = state.completion.as_ref() {
+            if state.completion_phase == Some(GuardianCleanupPhase::Legacy)
+                && completion.peek().is_none()
+            {
+                return futures::future::ready(GuardianTaskOutcome::Failed)
+                    .boxed()
+                    .shared();
+            }
+            return completion.clone();
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return futures::future::ready(GuardianTaskOutcome::Failed)
+                .boxed()
+                .shared();
+        }
+        let ticket = match crate::codex_thread::ThreadRetirement::from_session(
+            Arc::clone(&self.session),
+            self.io.clone(),
+            deadline,
+        ) {
+            Ok(ticket) => ticket,
+            Err(crate::codex_thread::ThreadRetirementError::LegacyCleanupStarted) => {
+                // A legacy cleanup has its own original driver and no later
+                // deadline may poll or relabel it. Replay only evidence it
+                // already recorded; otherwise preserve incomplete status.
+                return futures::future::ready(
+                    self.recorded_legacy_outcome()
+                        .unwrap_or(GuardianTaskOutcome::Failed),
+                )
+                .boxed()
+                .shared();
+            }
+            Err(_) => {
+                return futures::future::ready(GuardianTaskOutcome::Failed)
+                    .boxed()
+                    .shared();
+            }
+        };
+        state.retirement = Some(ticket.clone());
+        self.cancel_token.cancel();
+        let forwarding = self.forwarding.clone();
+        let task = tokio::spawn(async move {
+            let observed = tokio::time::timeout_at(deadline, async {
+                let (report, forwarding) = tokio::join!(ticket.wait(), forwarding.wait());
+                report.is_complete() && forwarding
+            })
+            .await;
+            if matches!(observed, Ok(true)) {
+                GuardianTaskOutcome::Clean
+            } else {
+                GuardianTaskOutcome::Failed
+            }
+        });
+        let completion = retain_guardian_task(task);
+        state.completion = Some(completion.clone());
+        state.completion_phase = Some(GuardianCleanupPhase::DeadlineBound);
+        completion
+    }
+
+    fn recorded_legacy_outcome(&self) -> Option<GuardianTaskOutcome> {
+        let cleanup = self.session.cleanup_owner().completed()?;
+        let session_loop = self.io.session_loop_termination.observed()?;
+        let events = self.forwarding.events.peek()?;
+        let ops = self.forwarding.ops.peek()?;
+        Some(
+            if matches!(session_loop, crate::session::SessionLoopOutcome::Normal)
+                && matches!(
+                    cleanup,
+                    crate::session::retirement::CleanupExecution::Finished {
+                        persistence_failed: false
+                    }
+                )
+                && *events == DelegateForwardingOutcome::Joined
+                && *ops == DelegateForwardingOutcome::Joined
+            {
+                GuardianTaskOutcome::Clean
+            } else {
+                GuardianTaskOutcome::Failed
+            },
+        )
+    }
+}
+
+fn retain_guardian_task(task: tokio::task::JoinHandle<GuardianTaskOutcome>) -> GuardianTaskReceipt {
+    async move {
+        match task.await {
+            Ok(outcome) => outcome,
+            Err(error) if error.is_cancelled() => GuardianTaskOutcome::Failed,
+            Err(_) => GuardianTaskOutcome::Panicked,
+        }
+    }
+    .boxed()
+    .shared()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GuardianConstructionOutcome {
+    Returned,
+    Cancelled,
+    Panicked,
+}
+
+type GuardianConstructionReceipt = Shared<BoxFuture<'static, GuardianConstructionOutcome>>;
+
+fn retain_guardian_construction(
+    task: tokio::task::JoinHandle<GuardianConstructionOutcome>,
+) -> GuardianConstructionReceipt {
+    async move {
+        match task.await {
+            Ok(outcome) => outcome,
+            Err(error) if error.is_cancelled() => GuardianConstructionOutcome::Cancelled,
+            Err(_) => GuardianConstructionOutcome::Panicked,
+        }
+    }
+    .boxed()
+    .shared()
+}
+
+struct GuardianConstruction {
+    completion: GuardianConstructionReceipt,
+    startup: Arc<SessionStartupCustody>,
+    child: Arc<StdMutex<Option<Arc<GuardianReviewSession>>>>,
+    retirement: StdMutex<Option<GuardianTaskReceipt>>,
+}
+
+impl GuardianConstruction {
+    fn child_is(&self, child: &Arc<GuardianReviewSession>) -> bool {
+        self.child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|owned| Arc::ptr_eq(owned, child))
+    }
+
+    fn begin_legacy_retirement(&self) -> Option<GuardianTaskReceipt> {
+        let child = self
+            .child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()?;
+        let mut retirement = self
+            .retirement
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(retirement) = retirement.as_ref() {
+            return Some(retirement.clone());
+        }
+        child.cleanup.close_auxiliary_admission();
+        let primary = child.cleanup.begin_legacy();
+        let auxiliary = child.cleanup.auxiliary_receipts();
+        let receipt = retain_guardian_task(tokio::spawn(async move {
+            if primary.await == GuardianTaskOutcome::Clean
+                && futures::future::join_all(auxiliary)
+                    .await
+                    .iter()
+                    .all(|outcome| *outcome == GuardianTaskOutcome::Clean)
+            {
+                GuardianTaskOutcome::Clean
+            } else {
+                GuardianTaskOutcome::Failed
+            }
+        }));
+        *retirement = Some(receipt.clone());
+        Some(receipt)
+    }
+}
+
+#[derive(Clone, Default)]
+struct GuardianCleanupRegistry {
+    state: Arc<StdMutex<GuardianCleanupRegistryState>>,
+    #[cfg(test)]
+    pause_after_retain: Arc<StdMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
+    #[cfg(test)]
+    pause_after_persistence:
+        Arc<StdMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
+}
+
+#[derive(Default)]
+struct GuardianCleanupRegistryState {
+    closed: bool,
+    deadline: Option<tokio::time::Instant>,
+    constructions: Vec<Arc<GuardianConstruction>>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct GuardianCleanupReport {
+    pub(crate) complete: bool,
+    pub(crate) panicked: bool,
+    pub(crate) unavailable: bool,
+}
+
+impl GuardianCleanupReport {
+    pub(crate) fn is_clean(&self) -> bool {
+        self.complete && !self.panicked && !self.unavailable
+    }
+}
+
+impl GuardianCleanupRegistry {
+    fn compact_terminal_construction(&self, construction: &Arc<GuardianConstruction>) {
+        let removed = {
+            let Ok(mut state) = self.state.lock() else {
+                return;
+            };
+            let Some(index) = state
+                .constructions
+                .iter()
+                .position(|owned| Arc::ptr_eq(owned, construction))
+            else {
+                return;
+            };
+            if construction.completion.peek() != Some(&GuardianConstructionOutcome::Returned)
+                || !construction.startup.is_empty()
+                || construction
+                    .retirement
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                    .is_none_or(|receipt| receipt.peek() != Some(&GuardianTaskOutcome::Clean))
+            {
+                return;
+            }
+            state.constructions.swap_remove(index)
+        };
+        // The last guardian owner can release Session resources. Do not run
+        // that destructor under the registry admission mutex.
+        drop(removed);
+    }
+
+    fn retire_child_in_background(&self, child: &Arc<GuardianReviewSession>) {
+        let construction = {
+            let Ok(state) = self.state.lock() else {
+                return;
+            };
+            state
+                .constructions
+                .iter()
+                .find(|construction| construction.child_is(child))
+                .cloned()
+        };
+        let Some(construction) = construction else {
+            return;
+        };
+        let Some(retirement) = construction.begin_legacy_retirement() else {
+            return;
+        };
+        let registry = self.clone();
+        // This observer does not own or retry cleanup. The construction keeps
+        // the exact primary and auxiliary receipts; the observer only releases
+        // that custody after their terminal clean result is already recorded.
+        tokio::spawn(async move {
+            if retirement.await == GuardianTaskOutcome::Clean
+                && construction.completion.clone().await == GuardianConstructionOutcome::Returned
+            {
+                registry.compact_terminal_construction(&construction);
+            }
+        });
+    }
+
+    fn close_until(&self, deadline: tokio::time::Instant) -> Result<tokio::time::Instant, ()> {
+        match self.state.lock() {
+            Ok(mut state) => {
+                state.closed = true;
+                Ok(*state.deadline.get_or_insert(deadline))
+            }
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                state.closed = true;
+                state.deadline.get_or_insert(deadline);
+                Err(())
+            }
+        }
+    }
+
+    fn close_legacy(&self) -> Result<(), ()> {
+        match self.state.lock() {
+            Ok(mut state) => {
+                state.closed = true;
+                Ok(())
+            }
+            Err(poisoned) => {
+                poisoned.into_inner().closed = true;
+                Err(())
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn pause_next_construction_after_retain_for_test(
+        &self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) {
+        *self
+            .pause_after_retain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((entered, release));
+    }
+
+    #[cfg(test)]
+    fn pause_next_construction_after_persistence_for_test(
+        &self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) {
+        *self
+            .pause_after_persistence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((entered, release));
+    }
+
+    #[cfg(test)]
+    fn retain_child_for_test(&self, child: Arc<GuardianReviewSession>) {
+        let construction = Arc::new(GuardianConstruction {
+            completion: futures::future::ready(GuardianConstructionOutcome::Returned)
+                .boxed()
+                .shared(),
+            startup: Arc::new(SessionStartupCustody::default()),
+            child: Arc::new(StdMutex::new(Some(child))),
+            retirement: StdMutex::new(None),
+        });
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .constructions
+            .push(construction);
+    }
+
+    fn register<F, Fut>(
+        &self,
+        factory: F,
+    ) -> anyhow::Result<BoxFuture<'static, anyhow::Result<Arc<GuardianReviewSession>>>>
+    where
+        F: FnOnce(Arc<SessionStartupCustody>) -> Fut + Send + 'static,
+        Fut: Future<Output = anyhow::Result<GuardianReviewSession>> + Send + 'static,
+    {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("guardian cleanup custody unavailable"))?;
+        if state.closed {
+            return Err(anyhow!("guardian cleanup admission closed"));
+        }
+        let startup = Arc::new(SessionStartupCustody::default());
+        #[cfg(test)]
+        if let Some((entered, release)) = self
+            .pause_after_retain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            startup.pause_after_retain_for_test(entered, release);
+        }
+        #[cfg(test)]
+        if let Some((entered, release)) = self
+            .pause_after_persistence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            startup.pause_after_persistence_for_test(entered, release);
+        }
+        let child = Arc::new(StdMutex::new(None));
+        let child_for_task = Arc::clone(&child);
+        let startup_for_task = Arc::clone(&startup);
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            match std::panic::AssertUnwindSafe(factory(Arc::clone(&startup_for_task)))
+                .catch_unwind()
+                .await
+            {
+                Ok(result) => {
+                    let result = result.map(Arc::new);
+                    if let Ok(review_session) = &result {
+                        *child_for_task
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(Arc::clone(review_session));
+                        startup_for_task.published();
+                    }
+                    let _ = result_tx.send(result);
+                    GuardianConstructionOutcome::Returned
+                }
+                Err(_) => GuardianConstructionOutcome::Panicked,
+            }
+        });
+        let completion = retain_guardian_construction(task);
+        state.constructions.push(Arc::new(GuardianConstruction {
+            completion: completion.clone(),
+            startup,
+            child,
+            retirement: StdMutex::new(None),
+        }));
+        Ok(async move {
+            if completion.await == GuardianConstructionOutcome::Panicked {
+                return Err(anyhow!("guardian construction panicked"));
+            }
+            result_rx
+                .await
+                .map_err(|_| anyhow!("guardian construction result unavailable"))?
+        }
+        .boxed())
+    }
+
+    async fn shutdown_until(&self, deadline: tokio::time::Instant) -> GuardianCleanupReport {
+        let Ok(deadline) = self.close_until(deadline) else {
+            return GuardianCleanupReport {
+                unavailable: true,
+                ..Default::default()
+            };
+        };
+        self.shutdown_closed_until(deadline).await
+    }
+
+    async fn shutdown_closed_until(&self, deadline: tokio::time::Instant) -> GuardianCleanupReport {
+        let constructions = {
+            let Ok(state) = self.state.lock() else {
+                return GuardianCleanupReport {
+                    unavailable: true,
+                    ..Default::default()
+                };
+            };
+            state.constructions.clone()
+        };
+        let outcomes = futures::future::join_all(constructions.iter().map(|construction| async {
+            let constructor =
+                tokio::time::timeout_at(deadline, construction.completion.clone()).await;
+            let Ok(constructor) = constructor else {
+                return GuardianTaskOutcome::Failed;
+            };
+            let startup = if construction.startup.is_empty() {
+                true
+            } else {
+                construction
+                    .startup
+                    .shutdown_until(deadline)
+                    .await
+                    .is_complete()
+            };
+            let child = construction
+                .child
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let child = match child {
+                Some(child) => {
+                    let (cleanup, auxiliary) = tokio::join!(
+                        tokio::time::timeout_at(deadline, child.cleanup.begin_bounded(deadline)),
+                        child.cleanup.auxiliary_clean_until(deadline),
+                    );
+                    cleanup.is_ok_and(|outcome| outcome == GuardianTaskOutcome::Clean) && auxiliary
+                }
+                None => true,
+            };
+            if constructor == GuardianConstructionOutcome::Returned && startup && child {
+                GuardianTaskOutcome::Clean
+            } else if constructor == GuardianConstructionOutcome::Panicked {
+                GuardianTaskOutcome::Panicked
+            } else {
+                GuardianTaskOutcome::Failed
+            }
+        }))
+        .await;
+        let report = GuardianCleanupReport {
+            complete: outcomes
+                .iter()
+                .all(|outcome| *outcome == GuardianTaskOutcome::Clean),
+            panicked: outcomes
+                .iter()
+                .any(|outcome| *outcome == GuardianTaskOutcome::Panicked),
+            unavailable: false,
+        };
+        if report.is_clean()
+            && let Ok(mut state) = self.state.lock()
+        {
+            state.constructions.clear();
+        }
+        report
+    }
+
+    async fn shutdown_legacy(&self) -> GuardianCleanupReport {
+        if self.close_legacy().is_err() {
+            return GuardianCleanupReport {
+                unavailable: true,
+                ..Default::default()
+            };
+        }
+        self.shutdown_closed_legacy().await
+    }
+
+    async fn shutdown_closed_legacy(&self) -> GuardianCleanupReport {
+        let constructions = {
+            let Ok(state) = self.state.lock() else {
+                return GuardianCleanupReport {
+                    unavailable: true,
+                    ..Default::default()
+                };
+            };
+            state.constructions.clone()
+        };
+        let outcomes = futures::future::join_all(constructions.iter().map(|construction| async {
+            let constructor = construction.completion.clone().await;
+            let startup = construction.startup.shutdown_legacy().await;
+            let child = construction
+                .child
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            match child {
+                Some(child) => {
+                    let (cleanup, auxiliary) = tokio::join!(
+                        child.cleanup.begin_legacy(),
+                        child.cleanup.auxiliary_clean(),
+                    );
+                    if cleanup == GuardianTaskOutcome::Clean && auxiliary {
+                        GuardianTaskOutcome::Clean
+                    } else {
+                        GuardianTaskOutcome::Failed
+                    }
+                }
+                None if constructor == GuardianConstructionOutcome::Returned && startup => {
+                    GuardianTaskOutcome::Clean
+                }
+                _ if constructor == GuardianConstructionOutcome::Panicked => {
+                    GuardianTaskOutcome::Panicked
+                }
+                _ => GuardianTaskOutcome::Failed,
+            }
+        }))
+        .await;
+        GuardianCleanupReport {
+            complete: outcomes
+                .iter()
+                .all(|outcome| *outcome == GuardianTaskOutcome::Clean),
+            panicked: outcomes
+                .iter()
+                .any(|outcome| *outcome == GuardianTaskOutcome::Panicked),
+            unavailable: false,
+        }
+    }
 }
 
 struct GuardianReviewState {
@@ -144,6 +848,7 @@ fn token_usage_delta(start: &TokenUsage, end: &TokenUsage) -> TokenUsage {
 
 struct EphemeralReviewCleanup {
     state: Arc<Mutex<GuardianReviewSessionState>>,
+    registry: GuardianCleanupRegistry,
     review_session: Option<Arc<GuardianReviewSession>>,
 }
 
@@ -258,16 +963,8 @@ pub(crate) fn prompt_cache_key_override_for_review_session(
 }
 
 impl GuardianReviewSession {
-    async fn shutdown(&self) {
-        self.cancel_token.cancel();
-        let _ = self.io.shutdown_and_wait().await;
-    }
-
-    fn shutdown_in_background(self: &Arc<Self>) {
-        let review_session = Arc::clone(self);
-        drop(tokio::spawn(async move {
-            review_session.shutdown().await;
-        }));
+    fn shutdown_in_background(self: &Arc<Self>, registry: &GuardianCleanupRegistry) {
+        registry.retire_child_in_background(self);
     }
 
     async fn fork_snapshot(&self) -> Option<GuardianReviewForkSnapshot> {
@@ -298,10 +995,12 @@ impl GuardianReviewSession {
 impl EphemeralReviewCleanup {
     fn new(
         state: Arc<Mutex<GuardianReviewSessionState>>,
+        registry: GuardianCleanupRegistry,
         review_session: Arc<GuardianReviewSession>,
     ) -> Self {
         Self {
             state,
+            registry,
             review_session: Some(review_session),
         }
     }
@@ -317,23 +1016,61 @@ impl Drop for EphemeralReviewCleanup {
             return;
         };
         let state = Arc::clone(&self.state);
-        drop(tokio::spawn(async move {
+        let registry = self.registry.clone();
+        let cleanup = Arc::clone(&review_session.cleanup);
+        let review_session = Arc::downgrade(&review_session);
+        cleanup.spawn_auxiliary(async move {
             let review_session = {
                 let mut state = state.lock().await;
                 state
                     .ephemeral_reviews
                     .iter()
-                    .position(|active_review| Arc::ptr_eq(active_review, &review_session))
+                    .position(|active_review| {
+                        Weak::ptr_eq(&Arc::downgrade(active_review), &review_session)
+                    })
                     .map(|index| state.ephemeral_reviews.swap_remove(index))
             };
             if let Some(review_session) = review_session {
-                review_session.shutdown().await;
+                registry.retire_child_in_background(&review_session);
             }
-        }));
+            GuardianTaskOutcome::Clean
+        });
     }
 }
 
 impl GuardianReviewSessionManager {
+    async fn spawn_owned(
+        &self,
+        parent_session: &Arc<Session>,
+        parent_context: GuardianReviewContext,
+        spawn_config: Config,
+        reuse_key: GuardianReviewSessionReuseKey,
+        cancel_token: CancellationToken,
+        parent_compaction: Option<ResponseItem>,
+        fork_snapshot: Option<GuardianReviewForkSnapshot>,
+    ) -> anyhow::Result<Arc<GuardianReviewSession>> {
+        let user_instructions = LoadedUserInstructions {
+            instructions: parent_session.user_instructions().await,
+            warnings: Vec::new(),
+        };
+        let parent_session = Arc::downgrade(parent_session);
+        self.cleanup
+            .register(move |startup_custody| {
+                spawn_guardian_review_session(
+                    parent_session,
+                    user_instructions,
+                    parent_context,
+                    spawn_config,
+                    reuse_key,
+                    cancel_token,
+                    parent_compaction,
+                    fork_snapshot,
+                    startup_custody,
+                )
+            })?
+            .await
+    }
+
     pub(crate) fn initialize(
         &self,
         parent_session: Arc<Session>,
@@ -357,21 +1094,22 @@ impl GuardianReviewSessionManager {
             );
             let spawn_cancel_token = self.cancellation_token.child_token();
             let spawn_cancel_guard = spawn_cancel_token.clone().drop_guard();
-            let review_session = spawn_guardian_review_session(
-                &parent_session,
-                &GuardianReviewContext::from(parent_turn),
-                spawn_config,
-                reuse_key,
-                spawn_cancel_token.clone(),
-                parent_compaction,
-                /*fork_snapshot*/ None,
-            )
-            .await?;
+            let review_session = self
+                .spawn_owned(
+                    &parent_session,
+                    GuardianReviewContext::from(parent_turn),
+                    spawn_config,
+                    reuse_key,
+                    spawn_cancel_token.clone(),
+                    parent_compaction,
+                    /*fork_snapshot*/ None,
+                )
+                .await?;
             // A first review or shutdown may win while eager initialization is in flight;
             // install only if neither has happened.
             let mut state = self.state.lock().await;
             if !spawn_cancel_token.is_cancelled() && state.trunk.is_none() {
-                state.trunk = Some(Arc::new(review_session));
+                state.trunk = Some(review_session);
                 drop(spawn_cancel_guard.disarm());
             }
             Ok(())
@@ -390,21 +1128,58 @@ impl GuardianReviewSessionManager {
         }
     }
 
-    pub(crate) async fn shutdown(&self) {
+    pub(crate) async fn shutdown(&self) -> GuardianCleanupReport {
         self.cancellation_token.cancel();
-        let (review_session, ephemeral_reviews) = {
+        if self.cleanup.close_legacy().is_err() {
+            return GuardianCleanupReport {
+                unavailable: true,
+                ..Default::default()
+            };
+        }
+        {
             let mut state = self.state.lock().await;
-            (
-                state.trunk.take(),
-                std::mem::take(&mut state.ephemeral_reviews),
-            )
+            state.trunk.take();
+            state.ephemeral_reviews.clear();
+        }
+        self.cleanup.shutdown_closed_legacy().await
+    }
+
+    pub(crate) async fn shutdown_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> GuardianCleanupReport {
+        self.cancellation_token.cancel();
+        let Ok(deadline) = self.cleanup.close_until(deadline) else {
+            return GuardianCleanupReport {
+                unavailable: true,
+                ..Default::default()
+            };
         };
-        if let Some(review_session) = review_session {
-            review_session.shutdown().await;
-        }
-        for review_session in ephemeral_reviews {
-            review_session.shutdown().await;
-        }
+        let clear_state = async {
+            if self
+                .state
+                .try_lock()
+                .is_ok_and(|state| state.trunk.is_none() && state.ephemeral_reviews.is_empty())
+            {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(deadline) => false,
+                mut state = self.state.lock() => {
+                    state.trunk.take();
+                    state.ephemeral_reviews.clear();
+                    true
+                }
+            }
+        };
+        let (mut report, state_cleared) =
+            tokio::join!(self.cleanup.shutdown_closed_until(deadline), clear_state,);
+        report.complete &= state_cleared;
+        report
     }
 
     #[expect(
@@ -458,9 +1233,9 @@ impl GuardianReviewSessionManager {
                         deadline,
                         params.external_cancel.as_ref(),
                         &spawn_cancel_token,
-                        Box::pin(spawn_guardian_review_session(
+                        Box::pin(self.spawn_owned(
                             &params.parent_session,
-                            &params.parent_context,
+                            params.parent_context.clone(),
                             params.spawn_config.clone(),
                             next_reuse_key.clone(),
                             spawn_cancel_token.clone(),
@@ -470,7 +1245,7 @@ impl GuardianReviewSessionManager {
                     )
                     .await
                     {
-                        Ok(Ok(review_session)) => Arc::new(review_session),
+                        Ok(Ok(review_session)) => review_session,
                         Ok(Err(err)) => {
                             return (
                                 GuardianReviewSessionOutcome::PromptBuildFailed(err),
@@ -493,7 +1268,7 @@ impl GuardianReviewSessionManager {
         };
 
         if let Some(review_session) = stale_trunk_to_shutdown {
-            review_session.shutdown_in_background();
+            review_session.shutdown_in_background(&self.cleanup);
         }
 
         let Some(trunk) = trunk_candidate else {
@@ -551,7 +1326,7 @@ impl GuardianReviewSessionManager {
             (outcome, analytics_result)
         } else {
             if let Some(review_session) = self.remove_trunk_if_current(&trunk).await {
-                review_session.shutdown_in_background();
+                review_session.shutdown_in_background(&self.cleanup);
             }
             (outcome, analytics_result)
         }
@@ -564,18 +1339,28 @@ impl GuardianReviewSessionManager {
             session.user_instructions().await,
             session.clone_history().await.history_version(),
         );
-        self.state.lock().await.trunk = Some(Arc::new(GuardianReviewSession {
+        let cancel_token = CancellationToken::new();
+        let cleanup = GuardianChildCleanup::new(
+            Arc::clone(&session),
+            io.retirement_io(),
+            cancel_token.clone(),
+            DelegateForwardingReceipts::completed(),
+        );
+        let review_session = Arc::new(GuardianReviewSession {
             reuse_key,
             session,
             io,
-            cancel_token: CancellationToken::new(),
             review_lock: Semaphore::new(/*permits*/ 1),
             state: Mutex::new(GuardianReviewState {
                 prior_review_count: 0,
                 last_reviewed_transcript_cursor: None,
                 last_committed_fork_snapshot: None,
             }),
-        }));
+            cleanup,
+        });
+        self.cleanup
+            .retain_child_for_test(Arc::clone(&review_session));
+        self.state.lock().await.trunk = Some(review_session);
     }
 
     #[cfg(test)]
@@ -585,22 +1370,32 @@ impl GuardianReviewSessionManager {
             session.user_instructions().await,
             session.clone_history().await.history_version(),
         );
+        let cancel_token = CancellationToken::new();
+        let cleanup = GuardianChildCleanup::new(
+            Arc::clone(&session),
+            io.retirement_io(),
+            cancel_token.clone(),
+            DelegateForwardingReceipts::completed(),
+        );
+        let review_session = Arc::new(GuardianReviewSession {
+            reuse_key,
+            session,
+            io,
+            review_lock: Semaphore::new(/*permits*/ 1),
+            state: Mutex::new(GuardianReviewState {
+                prior_review_count: 0,
+                last_reviewed_transcript_cursor: None,
+                last_committed_fork_snapshot: None,
+            }),
+            cleanup,
+        });
+        self.cleanup
+            .retain_child_for_test(Arc::clone(&review_session));
         self.state
             .lock()
             .await
             .ephemeral_reviews
-            .push(Arc::new(GuardianReviewSession {
-                reuse_key,
-                session,
-                io,
-                cancel_token: CancellationToken::new(),
-                review_lock: Semaphore::new(/*permits*/ 1),
-                state: Mutex::new(GuardianReviewState {
-                    prior_review_count: 0,
-                    last_reviewed_transcript_cursor: None,
-                    last_committed_fork_snapshot: None,
-                }),
-            }));
+            .push(review_session);
     }
 
     #[cfg(test)]
@@ -677,9 +1472,9 @@ impl GuardianReviewSessionManager {
             deadline,
             params.external_cancel.as_ref(),
             &spawn_cancel_token,
-            Box::pin(spawn_guardian_review_session(
+            Box::pin(self.spawn_owned(
                 &params.parent_session,
-                &params.parent_context,
+                params.parent_context.clone(),
                 fork_config,
                 reuse_key,
                 spawn_cancel_token.clone(),
@@ -689,7 +1484,7 @@ impl GuardianReviewSessionManager {
         )
         .await
         {
-            Ok(Ok(review_session)) => Arc::new(review_session),
+            Ok(Ok(review_session)) => review_session,
             Ok(Err(err)) => {
                 return (
                     GuardianReviewSessionOutcome::PromptBuildFailed(err),
@@ -702,8 +1497,11 @@ impl GuardianReviewSessionManager {
         };
         self.register_active_ephemeral(Arc::clone(&review_session))
             .await;
-        let mut cleanup =
-            EphemeralReviewCleanup::new(Arc::clone(&self.state), Arc::clone(&review_session));
+        let mut cleanup = EphemeralReviewCleanup::new(
+            Arc::clone(&self.state),
+            self.cleanup.clone(),
+            Arc::clone(&review_session),
+        );
 
         let (outcome, _, analytics_result) = Box::pin(run_review_on_session(
             review_session.as_ref(),
@@ -714,20 +1512,22 @@ impl GuardianReviewSessionManager {
         .await;
         if let Some(review_session) = self.take_active_ephemeral(&review_session).await {
             cleanup.disarm();
-            review_session.shutdown_in_background();
+            review_session.shutdown_in_background(&self.cleanup);
         }
         (outcome, analytics_result)
     }
 }
 
 async fn spawn_guardian_review_session(
-    parent_session: &Arc<Session>,
-    parent_context: &GuardianReviewContext,
+    parent_session: Weak<Session>,
+    user_instructions: LoadedUserInstructions,
+    parent_context: GuardianReviewContext,
     spawn_config: Config,
     reuse_key: GuardianReviewSessionReuseKey,
     cancel_token: CancellationToken,
     parent_compaction: Option<ResponseItem>,
     fork_snapshot: Option<GuardianReviewForkSnapshot>,
+    startup_custody: Arc<SessionStartupCustody>,
 ) -> anyhow::Result<GuardianReviewSession> {
     let (initial_history, prior_review_count, initial_transcript_cursor) = match fork_snapshot {
         Some(fork_snapshot) => (
@@ -742,11 +1542,18 @@ async fn spawn_guardian_review_session(
             None,
         ),
     };
-    let (session, io) = Box::pin(run_codex_thread_interactive(
+    let parent = parent_session
+        .upgrade()
+        .ok_or_else(|| anyhow!("guardian parent session is unavailable"))?;
+    let auth_manager = parent.services.auth_manager.clone();
+    let models_manager = parent.services.models_manager.clone();
+    drop(parent);
+    let (session, io, forwarding) = Box::pin(run_codex_thread_interactive_with_custody(
         spawn_config,
-        parent_session.services.auth_manager.clone(),
-        parent_session.services.models_manager.clone(),
-        Arc::clone(parent_session),
+        auth_manager,
+        models_manager,
+        parent_session,
+        user_instructions,
         Arc::clone(parent_context.turn()),
         parent_context.environments().clone(),
         cancel_token.clone(),
@@ -754,13 +1561,20 @@ async fn spawn_guardian_review_session(
         initial_history,
         GitEnrichmentPolicy::Skip,
         codex_sandboxing::WindowsSandboxProxySettingsMode::Preserve,
+        Some(startup_custody),
     ))
     .await?;
+
+    let cleanup = GuardianChildCleanup::new(
+        Arc::clone(&session),
+        io.retirement_io(),
+        cancel_token.clone(),
+        forwarding,
+    );
 
     Ok(GuardianReviewSession {
         session,
         io,
-        cancel_token,
         reuse_key,
         review_lock: Semaphore::new(/*permits*/ 1),
         state: Mutex::new(GuardianReviewState {
@@ -768,6 +1582,7 @@ async fn spawn_guardian_review_session(
             last_reviewed_transcript_cursor: initial_transcript_cursor,
             last_committed_fork_snapshot: None,
         }),
+        cleanup,
     })
 }
 
@@ -1219,6 +2034,8 @@ mod tests {
     use codex_protocol::protocol::TurnAbortReason;
     use codex_protocol::protocol::TurnAbortedEvent;
     use codex_protocol::protocol::TurnCompleteEvent;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
 
     async fn test_review_session() -> (
         GuardianReviewSession,
@@ -1235,17 +2052,24 @@ mod tests {
             session.user_instructions().await,
             session.clone_history().await.history_version(),
         );
+        let io = SessionIo {
+            tx_sub: tx_sub.into(),
+            rx_event,
+            agent_status,
+            session_loop_termination: crate::session::completed_session_loop_termination(),
+        };
+        let cancel_token = CancellationToken::new();
+        let cleanup = GuardianChildCleanup::new(
+            Arc::clone(&session),
+            io.retirement_io(),
+            cancel_token.clone(),
+            DelegateForwardingReceipts::completed(),
+        );
 
         (
             GuardianReviewSession {
                 session,
-                io: SessionIo {
-                    tx_sub: tx_sub.into(),
-                    rx_event,
-                    agent_status,
-                    session_loop_termination: crate::session::completed_session_loop_termination(),
-                },
-                cancel_token: CancellationToken::new(),
+                io,
                 reuse_key,
                 review_lock: Semaphore::new(/*permits*/ 1),
                 state: Mutex::new(GuardianReviewState {
@@ -1253,6 +2077,7 @@ mod tests {
                     last_reviewed_transcript_cursor: None,
                     last_committed_fork_snapshot: None,
                 }),
+                cleanup,
             },
             tx_event,
             rx_sub,
@@ -1335,6 +2160,589 @@ mod tests {
         }
     }
 
+    async fn review_with_held_forwarding()
+    -> (Arc<GuardianReviewSession>, tokio::sync::oneshot::Sender<()>) {
+        let (mut review_session, _tx_event, _rx_sub) = test_review_session().await;
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let events = tokio::spawn(async move {
+            let _ = release_rx.await;
+        });
+        let ops = tokio::spawn(async {});
+        review_session.cleanup = GuardianChildCleanup::new(
+            Arc::clone(&review_session.session),
+            review_session.io.retirement_io(),
+            CancellationToken::new(),
+            DelegateForwardingReceipts::from_handles(events, ops),
+        );
+        (Arc::new(review_session), release_tx)
+    }
+
+    #[tokio::test]
+    async fn bounded_observation_refuses_a_pending_legacy_cleanup_without_polling_it() {
+        let (review, release_tx) = review_with_held_forwarding().await;
+        let cleanup = Arc::clone(&review.cleanup);
+        let legacy = cleanup.begin_legacy();
+        tokio::task::yield_now().await;
+        assert!(legacy.peek().is_none());
+
+        assert_eq!(
+            cleanup
+                .begin_bounded(tokio::time::Instant::now() + Duration::from_secs(3))
+                .await,
+            GuardianTaskOutcome::Failed
+        );
+        assert!(legacy.peek().is_none());
+
+        let _ = release_tx.send(());
+        assert_eq!(legacy.await, GuardianTaskOutcome::Clean);
+    }
+
+    #[tokio::test]
+    async fn cancelled_guardian_wrappers_are_failures_without_false_panic_attribution() {
+        let task = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            GuardianTaskOutcome::Clean
+        });
+        task.abort();
+        assert_eq!(
+            retain_guardian_task(task).await,
+            GuardianTaskOutcome::Failed
+        );
+
+        let construction = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            GuardianConstructionOutcome::Returned
+        });
+        construction.abort();
+        assert_eq!(
+            retain_guardian_construction(construction).await,
+            GuardianConstructionOutcome::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_observation_replays_a_terminal_legacy_receipt() {
+        let (review, release_tx) = review_with_held_forwarding().await;
+        let cleanup = Arc::clone(&review.cleanup);
+        let legacy = cleanup.begin_legacy();
+        let _ = release_tx.send(());
+        assert_eq!(legacy.await, GuardianTaskOutcome::Clean);
+
+        assert_eq!(
+            cleanup.begin_bounded(tokio::time::Instant::now()).await,
+            GuardianTaskOutcome::Clean
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_observation_replays_terminal_legacy_cleanup_started_outside_guardian() {
+        let (review, _tx_event, _rx_sub) = test_review_session().await;
+        let review = Arc::new(review);
+        let cleanup_owner = review.session.cleanup_owner();
+        assert!(matches!(
+            cleanup_owner.observe(Arc::clone(&review.session)).await,
+            crate::session::retirement::CleanupExecution::Finished {
+                persistence_failed: false
+            }
+        ));
+        assert!(review.cleanup.forwarding.wait().await);
+
+        assert_eq!(
+            review
+                .cleanup
+                .begin_bounded(tokio::time::Instant::now() + Duration::from_secs(3))
+                .await,
+            GuardianTaskOutcome::Clean
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn multiple_children_share_one_bound_and_retain_forwarding_after_expiry() {
+        let registry = GuardianCleanupRegistry::default();
+        let (first, release_first) = review_with_held_forwarding().await;
+        let (second, release_second) = review_with_held_forwarding().await;
+        let (release_auxiliary, held_auxiliary) = tokio::sync::oneshot::channel();
+        first.cleanup.spawn_auxiliary(async move {
+            let _ = held_auxiliary.await;
+            GuardianTaskOutcome::Clean
+        });
+        registry.retain_child_for_test(Arc::clone(&first));
+        registry.retain_child_for_test(Arc::clone(&second));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let registry_for_shutdown = registry.clone();
+        let shutdown =
+            tokio::spawn(async move { registry_for_shutdown.shutdown_until(deadline).await });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        for child in [&first, &second] {
+            let state = child.cleanup.state.lock().expect("child cleanup state");
+            assert_eq!(
+                state.completion_phase,
+                Some(GuardianCleanupPhase::DeadlineBound)
+            );
+            assert_eq!(
+                state
+                    .retirement
+                    .as_ref()
+                    .expect("retirement ticket")
+                    .deadline(),
+                deadline
+            );
+        }
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let report = shutdown.await.expect("bounded guardian shutdown");
+        assert!(!report.is_clean());
+        assert!(first.cleanup.forwarding.events.peek().is_none());
+        assert!(second.cleanup.forwarding.events.peek().is_none());
+        {
+            let state = first.cleanup.state.lock().expect("child cleanup state");
+            assert!(
+                !state.auxiliary_open,
+                "primary failure must not skip auxiliary admission closure"
+            );
+            assert!(state.auxiliary[0].peek().is_none());
+        }
+        let _ = release_first.send(());
+        let _ = release_second.send(());
+        let _ = release_auxiliary.send(());
+    }
+
+    #[tokio::test]
+    async fn failed_child_cleanup_propagates_guardian_failed_to_parent_cleanup() {
+        let (parent, _turn) = crate::session::tests::make_session_and_context().await;
+        let parent = Arc::new(parent);
+        let (child, _turn) = crate::session::tests::make_session_and_context().await;
+        let child = Arc::new(child);
+        let (tx_sub, _rx_sub) = async_channel::bounded(4);
+        let (_tx_event, rx_event) = async_channel::unbounded();
+        let child_loop = tokio::spawn(async move {
+            panic!("child loop failure fixture");
+        });
+        let child_io = SessionIo {
+            tx_sub: tx_sub.into(),
+            rx_event,
+            agent_status: tokio::sync::watch::channel(AgentStatus::PendingInit).1,
+            session_loop_termination: crate::session::session_loop_termination_from_handle(
+                child_loop,
+            ),
+        };
+        parent
+            .guardian_review_session
+            .cache_for_test(child, child_io)
+            .await;
+        let owner = parent.cleanup_owner();
+        owner
+            .bind_deadline(tokio::time::Instant::now() + Duration::from_secs(3))
+            .expect("bind parent cleanup deadline");
+
+        assert_eq!(
+            owner.observe(parent).await,
+            crate::session::retirement::CleanupExecution::GuardianFailed
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_child_cleanup_with_a_normal_loop_propagates_guardian_failed() {
+        let (parent, _turn) = crate::session::tests::make_session_and_context().await;
+        let parent = Arc::new(parent);
+        let (child, _turn) = crate::session::tests::make_session_and_context().await;
+        let child = Arc::new(child);
+        assert!(matches!(
+            child
+                .task_joins
+                .shutdown_until(tokio::time::Instant::now())
+                .await,
+            crate::tasks::TaskJoinOutcome::Complete { .. }
+        ));
+        child.spawn_startup_auxiliary(async {}).await;
+        let (tx_sub, rx_sub) = async_channel::bounded::<Submission>(4);
+        let (_tx_event, rx_event) = async_channel::unbounded();
+        let child_loop = tokio::spawn(async move {
+            let shutdown = rx_sub.recv().await.expect("child shutdown submission");
+            assert_eq!(shutdown.op, Op::Shutdown);
+        });
+        let child_io = SessionIo {
+            tx_sub: tx_sub.into(),
+            rx_event,
+            agent_status: tokio::sync::watch::channel(AgentStatus::PendingInit).1,
+            session_loop_termination: crate::session::session_loop_termination_from_handle(
+                child_loop,
+            ),
+        };
+        parent
+            .guardian_review_session
+            .cache_for_test(child, child_io)
+            .await;
+        let owner = parent.cleanup_owner();
+        owner
+            .bind_deadline(tokio::time::Instant::now() + Duration::from_secs(3))
+            .expect("bind parent cleanup deadline");
+
+        assert_eq!(
+            owner.observe(parent).await,
+            crate::session::retirement::CleanupExecution::GuardianFailed
+        );
+    }
+
+    #[tokio::test]
+    async fn constructor_custody_survives_a_dropped_caller_and_close_rejects_late_birth() {
+        let registry = GuardianCleanupRegistry::default();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let caller = registry
+            .register(move |_startup_custody| async move {
+                let _ = started_tx.send(());
+                let _ = release_rx.await;
+                Err(anyhow!("test construction ended without a child"))
+            })
+            .expect("register construction");
+        drop(caller);
+        started_rx.await.expect("construction should start");
+
+        let registry_for_shutdown = registry.clone();
+        let shutdown = tokio::spawn(async move {
+            registry_for_shutdown
+                .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(3))
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_finished());
+        assert!(
+            registry
+                .register(|_startup_custody| async move {
+                    Err(anyhow!("late construction must not run"))
+                })
+                .is_err()
+        );
+
+        let _ = release_tx.send(());
+        assert!(shutdown.await.expect("shutdown task").is_clean());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manager_shutdown_closes_registry_before_waiting_for_review_state() {
+        let manager = Arc::new(GuardianReviewSessionManager::default());
+        let state_guard = manager.state.lock().await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let caller = manager
+            .cleanup
+            .register(move |_startup_custody| async move {
+                let _ = started_tx.send(());
+                let _ = release_rx.await;
+                Err(anyhow!("fixture constructor released"))
+            })
+            .expect("register construction");
+        drop(caller);
+        started_rx.await.expect("constructor started");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let manager_for_shutdown = Arc::clone(&manager);
+        let shutdown =
+            tokio::spawn(async move { manager_for_shutdown.shutdown_until(deadline).await });
+        tokio::task::yield_now().await;
+        assert!(
+            manager
+                .cleanup
+                .state
+                .lock()
+                .expect("cleanup registry")
+                .closed
+        );
+        assert!(
+            manager
+                .cleanup
+                .register(|_startup_custody| async move {
+                    Err(anyhow!("late construction must not run"))
+                })
+                .is_err(),
+            "shutdown entry must reject births before the async state wait"
+        );
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let report = shutdown.await.expect("bounded shutdown");
+        assert!(!report.is_clean());
+        drop(state_guard);
+        let _ = release_tx.send(());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manager_shutdown_replays_observed_empty_state_after_deadline() {
+        let manager = GuardianReviewSessionManager::default();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        assert!(manager.shutdown_until(deadline).await.is_clean());
+
+        tokio::time::advance(Duration::from_secs(3)).await;
+        assert!(
+            manager.shutdown_until(deadline).await.is_clean(),
+            "authoritative empty state and clean registry evidence must replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_construction_cancellation_cleans_the_session_retained_at_birth() {
+        let params = test_review_params().await;
+        // A production manager is owned by its parent Session. Keep that
+        // external root alive while testing ownership of the unpublished child.
+        let parent_root = Arc::clone(&params.parent_session);
+        let manager = Arc::new(GuardianReviewSessionManager::default());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        manager
+            .cleanup
+            .pause_next_construction_after_retain_for_test(
+                Arc::clone(&entered),
+                Arc::clone(&release),
+            );
+        let manager_for_initialize = Arc::clone(&manager);
+        let initialize = tokio::spawn(async move {
+            manager_for_initialize
+                .initialize(
+                    params.parent_session,
+                    Arc::clone(params.parent_context.turn()),
+                )
+                .await
+        });
+        entered.notified().await;
+        let construction = manager
+            .cleanup
+            .state
+            .lock()
+            .expect("cleanup registry")
+            .constructions
+            .first()
+            .cloned()
+            .expect("construction reservation");
+        assert!(
+            !construction.startup.is_empty(),
+            "Session::new must retain the child before the caller is cancelled"
+        );
+
+        initialize.abort();
+        assert!(
+            initialize
+                .await
+                .expect_err("initialize caller should be cancelled")
+                .is_cancelled()
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let manager_for_shutdown = Arc::clone(&manager);
+        let shutdown =
+            tokio::spawn(async move { manager_for_shutdown.shutdown_until(deadline).await });
+        tokio::task::yield_now().await;
+        assert!(construction.completion.peek().is_none());
+        assert!(!shutdown.is_finished());
+        release.notify_one();
+        let report = shutdown.await.expect("manager shutdown");
+        let constructor = construction.completion.peek().copied();
+
+        assert!(
+            report.is_clean(),
+            "constructor={constructor:?}, report={report:?}"
+        );
+        assert_eq!(
+            constructor,
+            Some(GuardianConstructionOutcome::Returned),
+            "manager cleanup must observe constructor terminal before startup cleanup"
+        );
+        assert!(construction.startup.is_empty());
+        drop(parent_root);
+    }
+
+    #[tokio::test]
+    async fn caller_cancellation_does_not_drop_pre_session_persistence_or_constructor() {
+        let params = test_review_params().await;
+        let parent_root = Arc::clone(&params.parent_session);
+        let manager = Arc::new(GuardianReviewSessionManager::default());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        manager
+            .cleanup
+            .pause_next_construction_after_persistence_for_test(
+                Arc::clone(&entered),
+                Arc::clone(&release),
+            );
+        let manager_for_initialize = Arc::clone(&manager);
+        let initialize = tokio::spawn(async move {
+            manager_for_initialize
+                .initialize(
+                    params.parent_session,
+                    Arc::clone(params.parent_context.turn()),
+                )
+                .await
+        });
+        entered.notified().await;
+        let construction = manager
+            .cleanup
+            .state
+            .lock()
+            .expect("cleanup registry")
+            .constructions
+            .first()
+            .cloned()
+            .expect("construction reservation");
+        assert!(construction.startup.has_pre_session_persistence_for_test());
+
+        initialize.abort();
+        assert!(
+            initialize
+                .await
+                .expect_err("initialize caller should be cancelled")
+                .is_cancelled()
+        );
+        let manager_for_shutdown = Arc::clone(&manager);
+        let shutdown = tokio::spawn(async move {
+            manager_for_shutdown
+                .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(20))
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            construction.completion.peek().is_none(),
+            "caller cancellation must not terminate the owned constructor"
+        );
+        assert!(!shutdown.is_finished());
+
+        release.notify_one();
+        let report = shutdown.await.expect("manager shutdown");
+        assert!(report.is_clean(), "{report:?}");
+        assert_eq!(
+            construction.completion.peek().copied(),
+            Some(GuardianConstructionOutcome::Returned)
+        );
+        drop(parent_root);
+    }
+
+    #[tokio::test]
+    async fn auxiliary_snapshot_closes_admission_before_reporting_clean() {
+        let (review_session, _tx_event, _rx_sub) = test_review_session().await;
+        let cleanup = Arc::clone(&review_session.cleanup);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        cleanup.spawn_auxiliary(async move {
+            let _ = release_rx.await;
+            GuardianTaskOutcome::Clean
+        });
+
+        let cleanup_for_observer = Arc::clone(&cleanup);
+        let observer = tokio::spawn(async move {
+            cleanup_for_observer
+                .auxiliary_clean_until(tokio::time::Instant::now() + Duration::from_secs(3))
+                .await
+        });
+        for _ in 0..10 {
+            if !cleanup
+                .state
+                .lock()
+                .expect("child cleanup state")
+                .auxiliary_open
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !cleanup
+                .state
+                .lock()
+                .expect("child cleanup state")
+                .auxiliary_open,
+            "observer must close admission before the late-wrapper assertion"
+        );
+        assert!(!observer.is_finished());
+
+        let late_wrapper_ran = Arc::new(AtomicBool::new(false));
+        let late_wrapper_ran_in_task = Arc::clone(&late_wrapper_ran);
+        cleanup.spawn_auxiliary(async move {
+            late_wrapper_ran_in_task.store(true, Ordering::SeqCst);
+            GuardianTaskOutcome::Clean
+        });
+        let _ = release_tx.send(());
+
+        assert!(observer.await.expect("auxiliary observer"));
+        tokio::task::yield_now().await;
+        assert!(!late_wrapper_ran.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn removed_real_guardian_child_remains_owned_through_legacy_shutdown() {
+        let params = test_review_params().await;
+        let manager = GuardianReviewSessionManager::default();
+        manager
+            .initialize(
+                Arc::clone(&params.parent_session),
+                Arc::clone(params.parent_context.turn()),
+            )
+            .await
+            .expect("initialize Guardian session");
+        let removed = manager
+            .state
+            .lock()
+            .await
+            .trunk
+            .take()
+            .expect("constructed Guardian child");
+        removed.shutdown_in_background(&manager.cleanup);
+        drop(removed);
+
+        assert_eq!(
+            manager
+                .cleanup
+                .state
+                .lock()
+                .expect("cleanup registry")
+                .constructions
+                .len(),
+            1,
+            "active-list removal must not remove cleanup custody"
+        );
+        let report = manager.shutdown().await;
+
+        assert!(report.is_clean(), "{report:?}");
+    }
+
+    #[tokio::test]
+    async fn background_retirement_retains_pending_child_then_compacts_terminal_child() {
+        let registry = GuardianCleanupRegistry::default();
+        let (child, release) = review_with_held_forwarding().await;
+        registry.retain_child_for_test(Arc::clone(&child));
+
+        registry.retire_child_in_background(&child);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            registry
+                .state
+                .lock()
+                .expect("cleanup registry")
+                .constructions
+                .len(),
+            1,
+            "pending forwarding work must keep the removed child in custody"
+        );
+
+        let _ = release.send(());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if registry
+                    .state
+                    .lock()
+                    .expect("cleanup registry")
+                    .constructions
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal guardian child should release registry custody");
+    }
+
     #[tokio::test]
     async fn spawned_guardian_session_preserves_windows_sandbox_proxy_settings() {
         let params = test_review_params().await;
@@ -1356,9 +2764,23 @@ mod tests {
             .session
             .windows_sandbox_proxy_settings_mode;
 
+        let child = manager
+            .state
+            .lock()
+            .await
+            .trunk
+            .as_ref()
+            .expect("Guardian session")
+            .session
+            .clone();
+
         assert_eq!(
             mode,
             codex_sandboxing::WindowsSandboxProxySettingsMode::Preserve
+        );
+        assert!(
+            !child.failed_initialization_persistence_for_test(),
+            "successful construction must restore normal persistence shutdown"
         );
         manager.shutdown().await;
     }

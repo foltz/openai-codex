@@ -205,6 +205,127 @@ async fn acquisition_and_retirement_claim_have_one_atomic_winner() {
     }
 }
 
+#[tokio::test]
+async fn production_claim_and_acquire_have_one_winner_in_both_lock_orders() {
+    for acquire_first in [true, false] {
+        let (_home, core, config) = crate::request_processors::thread_shutdown_fixture().await;
+        let started = core
+            .start_thread(codex_core::StartThreadOptions::new(config))
+            .await
+            .expect("real session birth");
+        let thread_id = started.thread_id;
+        let state = ThreadStateManager::new();
+        let principal = RetentionPrincipalId::connection_owned();
+        state
+            .connection_initialized(
+                ConnectionId(1),
+                ConnectionCapabilities {
+                    retention_principal: Some(principal),
+                    trusted_interactive: true,
+                    ..ConnectionCapabilities::default()
+                },
+            )
+            .await;
+        let entry = state.thread_state(thread_id).await;
+        let (cancel_tx, _cancel_rx) = tokio::sync::oneshot::channel();
+        let settings = crate::request_processors::thread_settings_from_config_snapshot(
+            &started.thread.config_snapshot().await,
+        );
+        let (_commands, generation, previous) = entry.lock().await.set_listener(
+            cancel_tx,
+            &started.thread,
+            codex_file_watcher::WatchRegistration::default(),
+            settings,
+        );
+        assert!(previous.is_none());
+        let watch = state
+            .subscribe_to_retention(thread_id)
+            .await
+            .expect("lifecycle watch");
+        let expected = *watch.borrow();
+        let deadline = Instant::now() + std::time::Duration::from_secs(20);
+
+        // Tokio's mutex queues lock requests FIFO. Poll both real operations
+        // while holding their shared authority lock to force each race order,
+        // rather than substituting the retention-only test kernel.
+        let held = state.state.lock().await;
+        let acquire = state.acquire_retention(thread_id, principal);
+        let retire = state.claim_thread_retirement(
+            thread_id,
+            expected,
+            &started.thread,
+            generation,
+            deadline,
+        );
+        tokio::pin!(acquire, retire);
+        if acquire_first {
+            assert!(futures::poll!(acquire.as_mut()).is_pending());
+            assert!(futures::poll!(retire.as_mut()).is_pending());
+        } else {
+            assert!(futures::poll!(retire.as_mut()).is_pending());
+            assert!(futures::poll!(acquire.as_mut()).is_pending());
+        }
+        drop(held);
+        let (acquired, retired) = tokio::join!(acquire, retire);
+        let ticket = match (acquired, retired) {
+            (
+                Ok(RetentionAcquireOutcome::Acquired { .. }),
+                Err(RetentionRetirementRefusal::Changed),
+            ) if acquire_first => {
+                assert!(watch.borrow().granted);
+                assert!(!watch.borrow().retiring);
+                state.remove_connection(ConnectionId(1)).await;
+                assert!(!watch.borrow().granted);
+                assert!(
+                    matches!(
+                        state
+                            .claim_thread_retirement(
+                                thread_id,
+                                expected,
+                                &started.thread,
+                                generation,
+                                deadline,
+                            )
+                            .await,
+                        Err(RetentionRetirementRefusal::Changed)
+                    ),
+                    "disconnect must not resurrect the earlier unretained snapshot"
+                );
+                let fresh = *watch.borrow();
+                state
+                    .claim_thread_retirement(
+                        thread_id,
+                        fresh,
+                        &started.thread,
+                        generation,
+                        deadline,
+                    )
+                    .await
+                    .expect("fresh unretained production claim")
+                    .1
+            }
+            (Err(RetentionAuthorityError::LifecycleClosed), Ok((_, ticket))) if !acquire_first => {
+                assert!(watch.borrow().retiring);
+                assert!(!watch.borrow().granted);
+                ticket
+            }
+            _ => panic!("production acquire and exact-thread retirement must have one winner"),
+        };
+        let report = ticket.wait().await;
+        assert!(report.is_complete(), "{report:?}");
+        assert_eq!(ticket.deadline(), deadline);
+        assert_eq!(ticket.wait().await, report);
+        assert!(
+            core.begin_shutdown(deadline)
+                .expect("manager owner")
+                .wait()
+                .await
+                .expect("manager observation")
+                .is_complete()
+        );
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn unseen_acquire_release_invalidates_the_unretained_snapshot() {
     let (manager, thread_id, principal) = fixture().await;

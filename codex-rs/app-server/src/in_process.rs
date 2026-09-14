@@ -899,7 +899,7 @@ mod tests {
     use tempfile::TempDir;
 
     async fn build_test_config(codex_home: &Path) -> Config {
-        match ConfigBuilder::default()
+        let mut config = match ConfigBuilder::default()
             .codex_home(codex_home.to_path_buf())
             .build()
             .await
@@ -911,7 +911,16 @@ mod tests {
             )
             .await
             .expect("default config should load"),
-        }
+        };
+        // These tests prove local host custody and compaction, not marketplace
+        // availability. Default plugin warmup fetches GitHub and may correctly
+        // remain incomplete past the cleanup deadline. Keep that population in
+        // the dedicated plugin retirement tests instead of depending on it here.
+        config
+            .features
+            .disable(codex_features::Feature::Plugins)
+            .expect("local lifecycle fixture can disable plugin startup");
+        config
     }
 
     pub(super) async fn test_start_args(

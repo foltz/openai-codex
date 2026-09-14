@@ -1,5 +1,9 @@
 use super::*;
 use codex_core::StartThreadOptions;
+use codex_core::ThreadCleanupOutcome;
+use codex_core::ThreadLoopOutcome;
+use codex_core::ThreadRetirementReport;
+use codex_core::ThreadShutdownOutcome;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use pretty_assertions::assert_eq;
@@ -7,6 +11,53 @@ use std::time::Duration;
 
 pub(crate) async fn fixture() -> (tempfile::TempDir, Arc<ThreadManager>, Config) {
     fixture_with_extensions(codex_extension_api::empty_extension_registry()).await
+}
+
+#[tokio::test]
+async fn processor_shutdown_prior_reports_require_canonical_retirement_completion() {
+    let (_home, manager, _config) = fixture().await;
+    let manager_report = manager
+        .begin_shutdown(Instant::now() + Duration::from_secs(20))
+        .expect("manager retirement")
+        .wait()
+        .await
+        .expect("manager report");
+    assert!(manager_report.is_complete());
+    let complete = ThreadRetirementReport {
+        ordinary: ThreadShutdownOutcome::Complete,
+        session_loop: ThreadLoopOutcome::Normal,
+        cleanup: ThreadCleanupOutcome::Finished {
+            persistence_failed: false,
+        },
+    };
+    assert!(complete.is_complete());
+    let report = |prior| ProcessorThreadShutdown {
+        manager: Some(Ok(manager_report.clone())),
+        prior: Some(vec![(ThreadId::new(), Uuid::new_v4(), prior)]),
+        ..Default::default()
+    };
+    assert!(report(complete).is_complete());
+
+    for incomplete in [
+        ThreadRetirementReport {
+            ordinary: ThreadShutdownOutcome::SubmitFailed,
+            ..complete
+        },
+        ThreadRetirementReport {
+            ordinary: ThreadShutdownOutcome::TimedOut,
+            ..complete
+        },
+        ThreadRetirementReport {
+            session_loop: ThreadLoopOutcome::Cancelled,
+            ..complete
+        },
+        ThreadRetirementReport {
+            session_loop: ThreadLoopOutcome::Panicked,
+            ..complete
+        },
+    ] {
+        assert!(!report(incomplete).is_complete(), "{incomplete:?}");
+    }
 }
 
 async fn fixture_with_extensions(

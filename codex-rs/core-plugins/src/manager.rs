@@ -2250,7 +2250,7 @@ impl PluginsManager {
                 let config = config.clone();
                 if self
                     .task_registry
-                    .spawn_thread(move || {
+                    .spawn_thread("plugins-marketplace-auto-upgrade", move || {
                         let outcome = manager.upgrade_configured_marketplaces_for_config(
                             &config, /*marketplace_name*/ None,
                         );
@@ -2497,11 +2497,23 @@ impl PluginsManager {
         }
 
         let manager = Arc::clone(self);
-        let _ = self.task_registry.spawn(async move {
-            manager
-                .run_remote_installed_plugins_cache_refresh_loop()
-                .await;
-        });
+        if self
+            .task_registry
+            .spawn(async move {
+                manager
+                    .run_remote_installed_plugins_cache_refresh_loop()
+                    .await;
+            })
+            .is_err()
+        {
+            let mut state = match self.remote_installed_plugins_cache_refresh_state.write() {
+                Ok(state) => state,
+                Err(err) => err.into_inner(),
+            };
+            state.in_flight = false;
+            state.requested = None;
+            warn!("failed to admit remote installed plugins cache refresh task");
+        }
     }
 
     fn schedule_remote_catalog_cache_refresh(
@@ -2545,9 +2557,21 @@ impl PluginsManager {
         }
 
         let manager = Arc::clone(self);
-        let _ = self.task_registry.spawn(async move {
-            manager.run_remote_catalog_cache_refresh_loop().await;
-        });
+        if self
+            .task_registry
+            .spawn(async move {
+                manager.run_remote_catalog_cache_refresh_loop().await;
+            })
+            .is_err()
+        {
+            let mut state = match self.remote_catalog_cache_refresh_state.write() {
+                Ok(state) => state,
+                Err(err) => err.into_inner(),
+            };
+            state.in_flight = false;
+            state.requests.clear();
+            warn!("failed to admit remote catalog cache refresh task");
+        }
     }
 
     fn schedule_non_curated_plugin_cache_refresh(
@@ -2685,7 +2709,9 @@ impl PluginsManager {
         let manager = Arc::clone(self);
         if self
             .task_registry
-            .spawn_thread(move || manager.run_non_curated_plugin_cache_refresh_loop())
+            .spawn_thread("plugins-non-curated-cache-refresh", move || {
+                manager.run_non_curated_plugin_cache_refresh_loop()
+            })
             .is_err()
         {
             let mut state = match self.non_curated_cache_refresh_state.write() {
@@ -2728,8 +2754,9 @@ impl PluginsManager {
         let codex_home = self.codex_home.clone();
         if self
             .task_registry
-            .spawn_thread(move || {
-                match sync_openai_plugins_repo(codex_home.as_path(), http_client_factory) {
+            .spawn_thread(
+                "plugins-curated-repo-sync",
+                move || match sync_openai_plugins_repo(codex_home.as_path(), http_client_factory) {
                     Ok(curated_plugin_version) => {
                         let configured_curated_plugin_ids =
                             configured_curated_plugin_ids_from_codex_home(codex_home.as_path());
@@ -2755,8 +2782,8 @@ impl PluginsManager {
                         CURATED_REPO_SYNC_STARTED.store(false, Ordering::SeqCst);
                         warn!("failed to sync curated plugins repo: {err}");
                     }
-                }
-            })
+                },
+            )
             .is_err()
         {
             CURATED_REPO_SYNC_STARTED.store(false, Ordering::SeqCst);

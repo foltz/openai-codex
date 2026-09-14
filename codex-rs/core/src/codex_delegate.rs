@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Weak;
 
 use async_channel::Receiver;
 use async_channel::Sender;
@@ -28,10 +29,12 @@ use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::request_user_input::RequestUserInputArgs;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_protocol::user_input::UserInput;
+use futures::FutureExt;
 use serde_json::Value;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
@@ -73,6 +76,60 @@ struct PendingMcpInvocation {
     metadata: Option<McpToolApprovalMetadata>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DelegateForwardingOutcome {
+    Joined,
+    Cancelled,
+    Panicked,
+}
+
+pub(crate) type DelegateForwardingReceipt =
+    futures::future::Shared<futures::future::BoxFuture<'static, DelegateForwardingOutcome>>;
+
+#[derive(Clone)]
+pub(crate) struct DelegateForwardingReceipts {
+    pub(crate) events: DelegateForwardingReceipt,
+    pub(crate) ops: DelegateForwardingReceipt,
+}
+
+impl DelegateForwardingReceipts {
+    pub(crate) async fn wait(&self) -> bool {
+        let (events, ops) = tokio::join!(self.events.clone(), self.ops.clone());
+        events == DelegateForwardingOutcome::Joined && ops == DelegateForwardingOutcome::Joined
+    }
+
+    #[cfg(test)]
+    pub(crate) fn completed() -> Self {
+        let receipt = futures::future::ready(DelegateForwardingOutcome::Joined)
+            .boxed()
+            .shared();
+        Self {
+            events: receipt.clone(),
+            ops: receipt,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_handles(events: JoinHandle<()>, ops: JoinHandle<()>) -> Self {
+        Self {
+            events: retain_forwarding_join(events),
+            ops: retain_forwarding_join(ops),
+        }
+    }
+}
+
+fn retain_forwarding_join(handle: JoinHandle<()>) -> DelegateForwardingReceipt {
+    async move {
+        match handle.await {
+            Ok(()) => DelegateForwardingOutcome::Joined,
+            Err(error) if error.is_cancelled() => DelegateForwardingOutcome::Cancelled,
+            Err(_) => DelegateForwardingOutcome::Panicked,
+        }
+    }
+    .boxed()
+    .shared()
+}
+
 /// Start an interactive sub-Codex thread and return its runtime and IO channels.
 ///
 /// The returned IO yields non-approval events emitted by the sub-agent.
@@ -92,83 +149,133 @@ pub(crate) async fn run_codex_thread_interactive(
     git_enrichment_policy: GitEnrichmentPolicy,
     windows_sandbox_proxy_settings_mode: codex_sandboxing::WindowsSandboxProxySettingsMode,
 ) -> Result<(Arc<Session>, SessionIo), CodexErr> {
-    let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
-    let (tx_ops, rx_ops) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
-    let conversation_history = initial_history.unwrap_or(InitialHistory::New);
-    let forked_from_thread_id = conversation_history.forked_from_id();
     let user_instructions = LoadedUserInstructions {
         instructions: parent_session.user_instructions().await,
         warnings: Vec::new(),
     };
-    let (session, io) = Box::pin(Session::spawn(SessionSpawnArgs {
+    let (session, io, _forwarding) = run_codex_thread_interactive_with_custody(
+        config,
+        auth_manager,
+        models_manager,
+        Arc::downgrade(&parent_session),
+        user_instructions,
+        parent_ctx,
+        parent_environments,
+        cancel_token,
+        subagent_source,
+        initial_history,
+        git_enrichment_policy,
+        windows_sandbox_proxy_settings_mode,
+        None,
+    )
+    .await?;
+    Ok((session, io))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_codex_thread_interactive_with_custody(
+    config: Config,
+    auth_manager: Arc<AuthManager>,
+    models_manager: SharedModelsManager,
+    parent_session: Weak<Session>,
+    user_instructions: LoadedUserInstructions,
+    parent_ctx: Arc<TurnContext>,
+    parent_environments: TurnEnvironmentSnapshot,
+    cancel_token: CancellationToken,
+    subagent_source: SubAgentSource,
+    initial_history: Option<InitialHistory>,
+    git_enrichment_policy: GitEnrichmentPolicy,
+    windows_sandbox_proxy_settings_mode: codex_sandboxing::WindowsSandboxProxySettingsMode,
+    startup_custody: Option<Arc<crate::session::startup_custody::SessionStartupCustody>>,
+) -> Result<(Arc<Session>, SessionIo, DelegateForwardingReceipts), CodexErr> {
+    let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
+    let (tx_ops, rx_ops) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
+    let conversation_history = initial_history.unwrap_or(InitialHistory::New);
+    let forked_from_thread_id = conversation_history.forked_from_id();
+    let parent = parent_session
+        .upgrade()
+        .ok_or(CodexErr::InternalAgentDied)?;
+    let parent_thread_id = parent.thread_id;
+    let analytics_events_client = parent.services.analytics_events_client.clone();
+    let spawn_args = SessionSpawnArgs {
         config,
         allow_provider_model_fallback: false,
         user_instructions,
-        installation_id: parent_session.installation_id.clone(),
+        installation_id: parent.installation_id.clone(),
         auth_manager,
         models_manager,
-        environment_manager: parent_session
-            .services
-            .turn_environments
-            .environment_manager(),
-        skills_service: Arc::clone(&parent_session.services.skills_service),
-        plugins_manager: Arc::clone(&parent_session.services.plugins_manager),
-        mcp_manager: Arc::clone(&parent_session.services.mcp_manager),
-        code_mode_session_provider: parent_session.services.code_mode_service.session_provider(),
-        extensions: Arc::clone(&parent_session.services.extensions),
+        environment_manager: parent.services.turn_environments.environment_manager(),
+        skills_service: Arc::clone(&parent.services.skills_service),
+        plugins_manager: Arc::clone(&parent.services.plugins_manager),
+        mcp_manager: Arc::clone(&parent.services.mcp_manager),
+        code_mode_session_provider: parent.services.code_mode_service.session_provider(),
+        extensions: Arc::clone(&parent.services.extensions),
         conversation_history,
         requested_history_mode: None,
         fork_persistence: ForkPersistence::Copied,
         session_source: SessionSource::SubAgent(subagent_source.clone()),
         forked_from_thread_id,
-        parent_thread_id: Some(parent_session.thread_id),
+        parent_thread_id: Some(parent_thread_id),
         thread_source: Some(ThreadSource::Subagent),
         originator: parent_ctx.originator.clone(),
-        agent_control: parent_session.services.agent_control.clone(),
+        agent_control: parent.services.agent_control.clone(),
         dynamic_tools: Vec::new(),
         metrics_service_name: None,
         user_shell_override: None,
         inherited_environments: Some(parent_environments.clone()),
-        inherited_exec_policy: Some(Arc::clone(&parent_session.services.exec_policy)),
+        inherited_exec_policy: Some(Arc::clone(&parent.services.exec_policy)),
         parent_rollout_thread_trace: codex_rollout_trace::ThreadTraceContext::disabled(),
         parent_trace: None,
         environment_selections: parent_environments.to_selections(),
         thread_extension_init: codex_extension_api::ExtensionDataInit::default(),
-        client_mcp_extensions: parent_session.services.client_mcp_extensions.clone(),
-        analytics_events_client: Some(parent_session.services.analytics_events_client.clone()),
-        thread_store: Arc::clone(&parent_session.services.thread_store),
-        attestation_provider: parent_session.services.attestation_provider.clone(),
-        external_time_provider: Some(Arc::clone(&parent_session.services.time_provider)),
+        client_mcp_extensions: parent.services.client_mcp_extensions.clone(),
+        analytics_events_client: Some(analytics_events_client.clone()),
+        thread_store: Arc::clone(&parent.services.thread_store),
+        attestation_provider: parent.services.attestation_provider.clone(),
+        external_time_provider: Some(Arc::clone(&parent.services.time_provider)),
         inherited_multi_agent_version: Some(MultiAgentVersion::Disabled),
         git_enrichment_policy,
         windows_sandbox_proxy_settings_mode,
         deferred_clear_session_start: None,
-        runtime_config_change_listener: parent_session
-            .services
-            .runtime_config_change_listener
-            .clone(),
-        runtime_config_change_gate: parent_session.services.runtime_config_change_gate.clone(),
-    }))
-    .or_cancel(&cancel_token)
-    .await??;
+        runtime_config_change_listener: parent.services.runtime_config_change_listener.clone(),
+        runtime_config_change_gate: parent.services.runtime_config_change_gate.clone(),
+    };
+    drop(parent);
+    let retain_construction = startup_custody.is_some();
+    let (session, io) = if retain_construction {
+        // The cleanup registry owns this constructor independently of its
+        // caller. Let it reach a natural terminal state so partial persistence
+        // custody is never dropped by intent cancellation.
+        Session::spawn_with_custody(spawn_args, startup_custody).await?
+    } else {
+        Box::pin(Session::spawn_with_custody(spawn_args, startup_custody))
+            .or_cancel(&cancel_token)
+            .await??
+    };
     let thread_config = session.thread_config_snapshot().await;
-    let client_metadata = parent_session.app_server_client_metadata().await;
-    emit_subagent_session_started(
-        &parent_session.services.analytics_events_client,
-        client_metadata,
-        session.session_id(),
-        session.thread_id(),
-        Some(parent_session.thread_id),
-        thread_config,
-        subagent_source,
-    );
+    if let Some(parent) = parent_session.upgrade() {
+        if let Ok(client_metadata) = parent
+            .app_server_client_metadata()
+            .or_cancel(&cancel_token)
+            .await
+        {
+            emit_subagent_session_started(
+                &analytics_events_client,
+                client_metadata,
+                session.session_id(),
+                session.thread_id(),
+                Some(parent_thread_id),
+                thread_config,
+                subagent_source,
+            );
+        }
+    }
     // Use a child token so parent cancel cascades but we can scope it to this task
     let cancel_token_events = cancel_token.child_token();
     let cancel_token_ops = cancel_token.child_token();
 
     // Forward events from the sub-agent to the consumer, filtering approvals and
     // routing them to the parent session for decisions.
-    let parent_session_clone = Arc::clone(&parent_session);
     let parent_ctx_clone = Arc::clone(&parent_ctx);
     let session_for_events = Arc::clone(&session);
     let io = Arc::new(io);
@@ -183,12 +290,12 @@ pub(crate) async fn run_codex_thread_interactive(
         session_loop_termination: io.session_loop_termination.clone(),
     };
     let io_for_events = Arc::clone(&io);
-    tokio::spawn(async move {
+    let events = tokio::spawn(async move {
         forward_events(
             io_for_events,
             session_for_events,
             tx_sub,
-            parent_session_clone,
+            parent_session,
             parent_ctx_clone,
             pending_mcp_invocations,
             cancel_token_events,
@@ -198,11 +305,18 @@ pub(crate) async fn run_codex_thread_interactive(
 
     // Forward ops from the caller to the sub-agent.
     let submissions = caller_io.tx_sub.dispatch_control();
-    tokio::spawn(async move {
+    let ops = tokio::spawn(async move {
         forward_ops(io, rx_ops, cancel_token_ops, Some(submissions)).await;
     });
 
-    Ok((session, caller_io))
+    Ok((
+        session,
+        caller_io,
+        DelegateForwardingReceipts {
+            events: retain_forwarding_join(events),
+            ops: retain_forwarding_join(ops),
+        },
+    ))
 }
 
 /// Convenience wrapper for one-time use with an initial prompt.
@@ -305,7 +419,7 @@ async fn forward_events(
     io: Arc<SessionIo>,
     session: Arc<Session>,
     tx_sub: Sender<Event>,
-    parent_session: Arc<Session>,
+    parent_session: Weak<Session>,
     parent_ctx: Arc<TurnContext>,
     pending_mcp_invocations: Arc<Mutex<HashMap<String, PendingMcpInvocation>>>,
     cancel_token: CancellationToken,
@@ -337,8 +451,12 @@ async fn forward_events(
                         id,
                         msg: EventMsg::ExecApprovalRequest(event),
                     } => {
+                        let Some(parent_session) = parent_session.upgrade() else {
+                            shutdown_delegate(&io).await;
+                            break;
+                        };
                         // Initiate approval via parent session; do not surface to consumer.
-                        handle_exec_approval(
+                        let _ = handle_exec_approval(
                             &io,
                             id,
                             &parent_session,
@@ -346,13 +464,18 @@ async fn forward_events(
                             event,
                             &cancel_token,
                         )
+                        .or_cancel(&cancel_token)
                         .await;
                     }
                     Event {
                         id,
                         msg: EventMsg::ApplyPatchApprovalRequest(event),
                     } => {
-                        handle_patch_approval(
+                        let Some(parent_session) = parent_session.upgrade() else {
+                            shutdown_delegate(&io).await;
+                            break;
+                        };
+                        let _ = handle_patch_approval(
                             &io,
                             id,
                             &parent_session,
@@ -360,26 +483,36 @@ async fn forward_events(
                             event,
                             &cancel_token,
                         )
+                        .or_cancel(&cancel_token)
                         .await;
                     }
                     Event {
                         msg: EventMsg::RequestPermissions(event),
                         ..
                     } => {
-                        handle_request_permissions(
+                        let Some(parent_session) = parent_session.upgrade() else {
+                            shutdown_delegate(&io).await;
+                            break;
+                        };
+                        let _ = handle_request_permissions(
                             &io,
                             &parent_session,
                             &parent_ctx,
                             event,
                             &cancel_token,
                         )
+                        .or_cancel(&cancel_token)
                         .await;
                     }
                     Event {
                         id,
                         msg: EventMsg::RequestUserInput(event),
                     } => {
-                        handle_request_user_input(
+                        let Some(parent_session) = parent_session.upgrade() else {
+                            shutdown_delegate(&io).await;
+                            break;
+                        };
+                        let _ = handle_request_user_input(
                             &io,
                             id,
                             &parent_session,
@@ -388,6 +521,7 @@ async fn forward_events(
                             event,
                             &cancel_token,
                         )
+                        .or_cancel(&cancel_token)
                         .await;
                     }
                     Event {

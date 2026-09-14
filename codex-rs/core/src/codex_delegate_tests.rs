@@ -83,7 +83,7 @@ async fn forward_events_filters_private_events_before_blocked_send_is_cancelled(
         Arc::clone(&io),
         Arc::clone(&session),
         tx_out.clone(),
-        session,
+        Arc::downgrade(&session),
         ctx,
         Arc::new(Mutex::new(HashMap::new())),
         cancel.clone(),

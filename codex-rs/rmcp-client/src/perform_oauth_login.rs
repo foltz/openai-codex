@@ -463,7 +463,9 @@ fn resolve_callback_port(callback_port: Option<u16>) -> Result<Option<u16>> {
 fn local_redirect_uri(addr: std::net::SocketAddr) -> Result<String> {
     Ok(match addr {
         std::net::SocketAddr::V4(addr) => format!("http://{addr}/callback"),
-        std::net::SocketAddr::V6(addr) => format!("http://[{addr}]/callback"),
+        std::net::SocketAddr::V6(addr) => {
+            format!("http://[{}]:{}/callback", addr.ip(), addr.port())
+        }
     })
 }
 
@@ -824,10 +826,19 @@ mod tests {
     use super::append_query_param;
     use super::callback_id_from_server_url;
     use super::callback_path_from_redirect_uri;
+    use super::local_redirect_uri;
     use super::parse_oauth_callback;
     use super::perform_oauth_login;
     use super::perform_oauth_login_silent;
     use super::start_authorization;
+
+    #[test]
+    fn local_redirect_uri_formats_ipv6_socket_address_once() {
+        let uri = local_redirect_uri("[::1]:49152".parse().unwrap()).unwrap();
+
+        assert_eq!(uri, "http://[::1]:49152/callback");
+        assert_eq!(Url::parse(&uri).unwrap().port(), Some(49152));
+    }
 
     #[derive(Default)]
     struct RecordingHttpClient {

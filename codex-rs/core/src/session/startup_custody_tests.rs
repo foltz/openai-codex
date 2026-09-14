@@ -59,6 +59,7 @@ fn loop_cleanup_requires_the_canonical_complete_report() {
                 ThreadCleanupOutcome::Finished {
                     persistence_failed: false,
                 },
+                ThreadCleanupOutcome::McpPrewarmFailed,
                 ThreadCleanupOutcome::TaskJoinFailed,
             ] {
                 let observed = StartupCleanup::Loop(ThreadRetirementReport {

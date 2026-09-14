@@ -39,6 +39,7 @@ pub enum ThreadCleanupOutcome {
     TimedOut,
     AuthorityUnavailable,
     McpFailed,
+    McpPrewarmFailed,
     TaskJoinFailed,
     ConversationShutdownFailed,
     CodeModeShutdownFailed,
@@ -289,6 +290,7 @@ impl ThreadRetirement {
                         ThreadCleanupOutcome::AuthorityUnavailable
                     }
                     CleanupExecution::McpFailed => ThreadCleanupOutcome::McpFailed,
+                    CleanupExecution::McpPrewarmFailed => ThreadCleanupOutcome::McpPrewarmFailed,
                     CleanupExecution::TaskJoinFailed => ThreadCleanupOutcome::TaskJoinFailed,
                     CleanupExecution::ConversationShutdownFailed => {
                         ThreadCleanupOutcome::ConversationShutdownFailed

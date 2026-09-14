@@ -406,6 +406,7 @@ async fn failed_common_api_receipt_never_projects_shutdown_complete() {
     for failure in [
         CleanupExecution::ConversationShutdownFailed,
         CleanupExecution::CodeModeShutdownFailed,
+        CleanupExecution::McpPrewarmFailed,
         CleanupExecution::GuardianFailed,
     ] {
         let (session, _, events) = super::super::tests::make_session_and_context_with_rx().await;
@@ -416,6 +417,37 @@ async fn failed_common_api_receipt_never_projects_shutdown_complete() {
             Some(futures::future::ready(failure).boxed().shared());
         assert!(super::super::handlers::shutdown(&session, "shutdown".to_string()).await);
         assert_eq!(owner.observe(Arc::clone(&session)).await, failure);
+        while let Ok(event) = events.try_recv() {
+            assert!(!matches!(
+                event.msg,
+                codex_protocol::protocol::EventMsg::ShutdownComplete
+            ));
+        }
+    }
+}
+
+#[tokio::test]
+async fn cancelled_or_panicked_mcp_prewarm_never_projects_shutdown_complete() {
+    for panics in [false, true] {
+        let (session, _, events) = super::super::tests::make_session_and_context_with_rx().await;
+        let worker = if panics {
+            tokio::spawn(async { panic!("controlled MCP prewarm panic") })
+        } else {
+            let worker = tokio::spawn(std::future::pending::<()>());
+            worker.abort();
+            worker
+        };
+        *session.mcp_prewarm_task.lock().expect("worker owner") =
+            Some(super::super::session_loop_termination_from_handle(worker));
+
+        let owner = session.cleanup_owner();
+        assert_eq!(
+            owner.observe(Arc::clone(&session)).await,
+            CleanupExecution::McpPrewarmFailed,
+            "{} prewarm must become the distinct cleanup receipt",
+            if panics { "panicked" } else { "cancelled" },
+        );
+        assert!(super::super::handlers::shutdown(&session, "shutdown".to_string()).await);
         while let Ok(event) = events.try_recv() {
             assert!(!matches!(
                 event.msg,

@@ -39,6 +39,7 @@ fn runtime_retirement_requires_all_three_positive_receipts() {
                 ThreadCleanupOutcome::TimedOut,
                 ThreadCleanupOutcome::AuthorityUnavailable,
                 ThreadCleanupOutcome::McpFailed,
+                ThreadCleanupOutcome::McpPrewarmFailed,
                 ThreadCleanupOutcome::TaskJoinFailed,
                 ThreadCleanupOutcome::ConversationShutdownFailed,
                 ThreadCleanupOutcome::CodeModeShutdownFailed,

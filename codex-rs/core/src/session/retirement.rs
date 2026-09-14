@@ -20,6 +20,7 @@ pub(crate) enum CleanupExecution {
     TimedOut,
     AuthorityUnavailable,
     McpFailed,
+    McpPrewarmFailed,
     TaskJoinFailed,
     ConversationShutdownFailed,
     CodeModeShutdownFailed,

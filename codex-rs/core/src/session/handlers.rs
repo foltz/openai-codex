@@ -625,6 +625,7 @@ async fn shutdown_session_runtime(
     let prewarm_outcome = sess.stop_mcp_prewarm_worker().await;
     if prewarm_outcome != SessionLoopOutcome::Normal {
         warn!(?prewarm_outcome, "MCP prewarm worker stopped unexpectedly");
+        failure.get_or_insert(super::retirement::CleanupExecution::McpPrewarmFailed);
     }
     if let super::retirement::CleanupMode::Legacy = mode {
         let _refresh = sess.mcp_refresh.acquire().await;
@@ -733,6 +734,7 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
         }
         super::retirement::CleanupExecution::TimedOut
         | super::retirement::CleanupExecution::McpFailed
+        | super::retirement::CleanupExecution::McpPrewarmFailed
         | super::retirement::CleanupExecution::TaskJoinFailed
         | super::retirement::CleanupExecution::ConversationShutdownFailed
         | super::retirement::CleanupExecution::CodeModeShutdownFailed

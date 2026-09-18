@@ -4222,6 +4222,7 @@ async fn set_rate_limits_retains_previous_credits() {
         originator: "test_originator".to_string(),
         dynamic_tools: Vec::new(),
         user_shell_override: None,
+        control_endpoint: None,
     };
 
     let mut state = SessionState::new(session_configuration);
@@ -4332,6 +4333,7 @@ async fn set_rate_limits_updates_plan_type_when_present() {
         originator: "test_originator".to_string(),
         dynamic_tools: Vec::new(),
         user_shell_override: None,
+        control_endpoint: None,
     };
 
     let mut state = SessionState::new(session_configuration);
@@ -4880,6 +4882,7 @@ pub(crate) async fn make_session_configuration_for_tests() -> SessionConfigurati
         originator: "test_originator".to_string(),
         dynamic_tools: Vec::new(),
         user_shell_override: None,
+        control_endpoint: None,
     }
 }
 
@@ -5677,6 +5680,7 @@ async fn session_new_fails_when_zsh_fork_enabled_without_packaged_zsh() {
         originator: "test_originator".to_string(),
         dynamic_tools: Vec::new(),
         user_shell_override: None,
+        control_endpoint: None,
     };
 
     let (tx_event, _rx_event) = async_channel::unbounded();
@@ -5823,6 +5827,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         originator: "test_originator".to_string(),
         dynamic_tools: Vec::new(),
         user_shell_override: None,
+        control_endpoint: None,
     };
     let per_turn_config =
         Session::build_per_turn_config(&session_configuration, session_configuration.cwd().clone());
@@ -6119,6 +6124,7 @@ async fn make_session_with_config_and_listener_and_rx(
         originator: "test_originator".to_string(),
         dynamic_tools: Vec::new(),
         user_shell_override: None,
+        control_endpoint: None,
     };
 
     let (tx_event, rx_event) = async_channel::unbounded();
@@ -6240,6 +6246,7 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         originator: "test_originator".to_string(),
         dynamic_tools: Vec::new(),
         user_shell_override: None,
+        control_endpoint: None,
     };
 
     let (tx_event, rx_event) = async_channel::unbounded();
@@ -8337,6 +8344,7 @@ where
         originator: "test_originator".to_string(),
         dynamic_tools,
         user_shell_override: None,
+        control_endpoint: None,
     };
     let per_turn_config =
         Session::build_per_turn_config(&session_configuration, session_configuration.cwd().clone());
@@ -9109,6 +9117,7 @@ async fn step_context_keeps_its_mcp_runtime_for_tools() -> anyhow::Result<()> {
             required: false,
             supports_parallel_tool_calls: false,
             thread_identity_eligible: false,
+            control_endpoint_eligible: false,
             omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,

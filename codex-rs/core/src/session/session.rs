@@ -136,6 +136,9 @@ pub(crate) struct SessionConfiguration {
     pub(super) originator: String,
     pub(super) dynamic_tools: Vec<DynamicToolSpec>,
     pub(super) user_shell_override: Option<shell::Shell>,
+    /// Hosting app-server's control endpoint, carried as a session-local
+    /// runtime input rather than user configuration.
+    pub(super) control_endpoint: Option<String>,
 }
 
 impl SessionConfiguration {

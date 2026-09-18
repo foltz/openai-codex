@@ -493,6 +493,7 @@ pub(crate) struct MessageProcessorArgs {
     pub(crate) plugin_startup_tasks: crate::PluginStartupTasks,
     pub(crate) managed_transition_control_socket_endpoint: Option<String>,
     pub(crate) managed_transition_process_instance_id: Option<String>,
+    pub(crate) control_endpoint: Option<String>,
 }
 
 impl MessageProcessor {
@@ -520,6 +521,7 @@ impl MessageProcessor {
             plugin_startup_tasks,
             managed_transition_control_socket_endpoint,
             managed_transition_process_instance_id,
+            control_endpoint,
         } = args;
         let thread_state_manager = ThreadStateManager::new();
         thread_state_manager.set_attachment_notification_outgoing(outgoing.clone());
@@ -780,6 +782,7 @@ impl MessageProcessor {
             log_db,
             Arc::clone(&skills_watcher),
             config_warnings,
+            control_endpoint,
         );
         let turn_processor = TurnRequestProcessor::new(
             auth_manager.clone(),

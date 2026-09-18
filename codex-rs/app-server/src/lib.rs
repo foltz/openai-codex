@@ -489,6 +489,7 @@ pub async fn run_main_with_transport_options(
     auth: AppServerWebsocketAuthSettings,
     runtime_options: AppServerRuntimeOptions,
 ) -> IoResult<()> {
+    let control_endpoint = mcp_control_endpoint_uri(&transport);
     let loader_overrides = loader_overrides_with_test_user_config_file(
         loader_overrides,
         test_user_config_file_from_env(),
@@ -981,6 +982,7 @@ pub async fn run_main_with_transport_options(
             managed_transition_process_instance_id: managed_target_record
                 .process_instance_id
                 .clone(),
+            control_endpoint,
         }));
         let mut thread_created_rx = processor.thread_created_receiver();
         let mut running_turn_count_rx = processor.subscribe_running_assistant_turn_count();
@@ -1479,14 +1481,34 @@ fn analytics_rpc_transport(transport: &AppServerTransport) -> AppServerRpcTransp
     }
 }
 
+/// Returns the URI eligible MCP providers receive for this app-server's
+/// explicitly bound Unix listener. Stdio and websocket transports do not have
+/// a filesystem control endpoint to disclose. A relative or non-Unicode Unix
+/// path remains usable by the app server itself but is deliberately not
+/// disclosed: the generic MCP contract requires an absolute `unix:///` URI.
+fn mcp_control_endpoint_uri(transport: &AppServerTransport) -> Option<String> {
+    let AppServerTransport::UnixSocket { socket_path } = transport else {
+        return None;
+    };
+    if !socket_path.is_absolute() {
+        warn!(path = %socket_path.display(), "not disclosing relative app-server control endpoint to MCP providers");
+        return None;
+    }
+    let path = socket_path.to_str()?;
+    let mut endpoint = url::Url::parse("unix:///").ok()?;
+    endpoint.set_path(path);
+    Some(endpoint.to_string())
+}
+
 #[cfg(test)]
 mod tests {
+    use super::AppServerTransport;
     use super::LogFormat;
     #[cfg(debug_assertions)]
     use super::loader_overrides_with_test_user_config_file;
+    use super::mcp_control_endpoint_uri;
     #[cfg(debug_assertions)]
     use codex_config::LoaderOverrides;
-    #[cfg(debug_assertions)]
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
 
@@ -1506,6 +1528,18 @@ mod tests {
         assert_eq!(LogFormat::from_env_value(Some("")), LogFormat::Default);
         assert_eq!(LogFormat::from_env_value(Some("text")), LogFormat::Default);
         assert_eq!(LogFormat::from_env_value(Some("jsonl")), LogFormat::Default);
+    }
+
+    #[test]
+    fn mcp_control_endpoint_uri_encodes_only_absolute_unix_listener_paths() {
+        assert_eq!(
+            mcp_control_endpoint_uri(&AppServerTransport::UnixSocket {
+                socket_path: AbsolutePathBuf::from_absolute_path("/tmp/kcf control.sock")
+                    .expect("absolute fixture path"),
+            }),
+            Some("unix:///tmp/kcf%20control.sock".to_string())
+        );
+        assert_eq!(mcp_control_endpoint_uri(&AppServerTransport::Stdio), None);
     }
 
     #[cfg(debug_assertions)]

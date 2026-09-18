@@ -33,6 +33,7 @@ pub(super) struct ListenerTaskContext {
     pub(super) fallback_model_provider: String,
     pub(super) codex_home: PathBuf,
     pub(super) skills_watcher: Arc<SkillsWatcher>,
+    pub(super) control_endpoint: Option<String>,
 }
 
 struct UnloadingState {

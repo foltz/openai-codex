@@ -1720,6 +1720,7 @@ async fn codex_apps_extension_does_not_share_host_owned_tools_cache() -> anyhow:
             elicitation_reviewer: None,
             elicitation_lifecycle: None,
             canonical_thread_id: None,
+            control_endpoint: None,
         },
         ElicitationRequestRouter::default(),
     )
@@ -3416,6 +3417,7 @@ async fn executor_owned_chatgpt_mcp_accepts_only_safe_explicit_authorization() -
                 ElicitationCapability::default(),
                 ClientMcpExtensions::default(),
                 /*canonical_thread_id*/ None,
+                /*control_endpoint*/ None,
                 /*previous_identity*/ None,
             )
         };
@@ -3474,6 +3476,7 @@ async fn executor_owned_chatgpt_mcp_accepts_only_safe_explicit_authorization() -
                 elicitation_reviewer: None,
                 elicitation_lifecycle: None,
                 canonical_thread_id: None,
+                control_endpoint: None,
             },
             ElicitationRequestRouter::default(),
         )
@@ -3522,6 +3525,7 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
                 required: false,
                 supports_parallel_tool_calls: false,
                 thread_identity_eligible: false,
+                control_endpoint_eligible: false,
                 omit_tools_from: None,
                 disabled_reason: None,
                 startup_timeout_sec: None,
@@ -3550,6 +3554,7 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
                 required: false,
                 supports_parallel_tool_calls: false,
                 thread_identity_eligible: false,
+                control_endpoint_eligible: false,
                 omit_tools_from: None,
                 disabled_reason: None,
                 startup_timeout_sec: None,
@@ -3595,6 +3600,7 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
             elicitation_reviewer: None,
             elicitation_lifecycle: None,
             canonical_thread_id: None,
+            control_endpoint: None,
         },
         ElicitationRequestRouter::default(),
     )
@@ -3668,6 +3674,7 @@ fn mcp_init_error_display_prompts_for_github_pat() {
         required: false,
         supports_parallel_tool_calls: false,
         thread_identity_eligible: false,
+        control_endpoint_eligible: false,
         omit_tools_from: None,
         disabled_reason: None,
         startup_timeout_sec: None,
@@ -3784,6 +3791,7 @@ fn mcp_init_error_display_reports_generic_errors() {
         required: false,
         supports_parallel_tool_calls: false,
         thread_identity_eligible: false,
+        control_endpoint_eligible: false,
         omit_tools_from: None,
         disabled_reason: None,
         startup_timeout_sec: None,
@@ -3837,6 +3845,7 @@ fn reusable_server_config(url: &str) -> McpServerConfig {
         required: false,
         supports_parallel_tool_calls: false,
         thread_identity_eligible: false,
+        control_endpoint_eligible: false,
         omit_tools_from: None,
         disabled_reason: None,
         startup_timeout_sec: None,
@@ -3913,6 +3922,7 @@ fn retirement_runtime_input(
         elicitation_reviewer: None,
         elicitation_lifecycle: None,
         canonical_thread_id: None,
+        control_endpoint: None,
     }
 }
 
@@ -4168,6 +4178,7 @@ fn reusable_server_identity(
         ElicitationCapability::default(),
         ClientMcpExtensions::default(),
         /*canonical_thread_id*/ None,
+        /*control_endpoint*/ None,
         /*previous_identity*/ None,
     )
 }
@@ -4239,6 +4250,7 @@ async fn reconcile_reusable_server(
             elicitation_reviewer: None,
             elicitation_lifecycle: None,
             canonical_thread_id: None,
+            control_endpoint: None,
         },
         ElicitationRequestRouter::default(),
     )
@@ -4451,6 +4463,7 @@ fn connection_identity_uses_effective_authorization_headers() {
                 ElicitationCapability::default(),
                 ClientMcpExtensions::default(),
                 /*canonical_thread_id*/ None,
+                /*control_endpoint*/ None,
                 /*previous_identity*/ None,
             )
         };
@@ -4487,6 +4500,7 @@ fn thread_identity_reuse_identity(
         ElicitationCapability::default(),
         ClientMcpExtensions::default(),
         canonical_thread_id.map(str::to_string),
+        /*control_endpoint*/ None,
         /*previous_identity*/ None,
     )
 }
@@ -4547,6 +4561,122 @@ fn eligible_server_with_unchanged_thread_id_reuses_connection() {
         before.has_same_connection_config(&after),
         "an already-live resume or compact keeps the same thread id and must not force a \
          reconnect for an eligible server"
+    );
+}
+
+/// Connection reuse must re-run the generic endpoint negotiation when a
+/// provider's explicit eligibility changes; otherwise an already-live
+/// physical MCP connection can retain a stale discovery contract.
+fn control_endpoint_reuse_identity(
+    runtime_context: &McpRuntimeContext,
+    control_endpoint_eligible: bool,
+    control_endpoint: Option<&str>,
+) -> McpServerConnectionIdentity {
+    let mut config = reusable_server_config("http://127.0.0.1:1");
+    config.control_endpoint_eligible = control_endpoint_eligible;
+    let server = EffectiveMcpServer::configured(config.clone());
+    let resolved_environment = runtime_context.resolve_server_environment("docs", &config);
+    McpServerConnectionIdentity::new(
+        "docs",
+        &server,
+        OAuthCredentialsStoreMode::default(),
+        AuthKeyringBackendKind::default(),
+        &resolved_environment,
+        runtime_context,
+        /*runtime_auth_provider*/ None,
+        /*auth*/ None,
+        /*codex_apps_cache_identity*/ None,
+        ElicitationCapability::default(),
+        ClientMcpExtensions::default(),
+        /*canonical_thread_id*/ None,
+        control_endpoint.map(str::to_string),
+        /*previous_identity*/ None,
+    )
+}
+
+#[test]
+fn control_endpoint_eligibility_toggle_does_not_reuse_connection() {
+    let runtime_context = reusable_server_runtime_context();
+    let ineligible = control_endpoint_reuse_identity(
+        &runtime_context,
+        /*control_endpoint_eligible*/ false,
+        Some("unix:///tmp/kcf-control.sock"),
+    );
+    let eligible = control_endpoint_reuse_identity(
+        &runtime_context,
+        /*control_endpoint_eligible*/ true,
+        Some("unix:///tmp/kcf-control.sock"),
+    );
+
+    assert!(!ineligible.has_same_connection_config(&eligible));
+    assert!(!eligible.has_same_connection_config(&ineligible));
+}
+
+#[test]
+fn ineligible_server_is_never_given_control_endpoint() {
+    let runtime_context = reusable_server_runtime_context();
+    let identity = control_endpoint_reuse_identity(
+        &runtime_context,
+        /*control_endpoint_eligible*/ false,
+        Some("unix:///tmp/kcf-control.sock"),
+    );
+
+    assert_eq!(identity.control_endpoint, None);
+}
+
+#[test]
+fn eligible_server_receives_control_endpoint() {
+    let runtime_context = reusable_server_runtime_context();
+    let identity = control_endpoint_reuse_identity(
+        &runtime_context,
+        /*control_endpoint_eligible*/ true,
+        Some("unix:///tmp/kcf-control.sock"),
+    );
+
+    assert_eq!(
+        identity.control_endpoint.as_deref(),
+        Some("unix:///tmp/kcf-control.sock")
+    );
+}
+
+#[test]
+fn eligible_server_with_changed_control_endpoint_does_not_reuse_connection() {
+    let runtime_context = reusable_server_runtime_context();
+    let before = control_endpoint_reuse_identity(
+        &runtime_context,
+        /*control_endpoint_eligible*/ true,
+        Some("unix:///tmp/kcf-control-a.sock"),
+    );
+    let after = control_endpoint_reuse_identity(
+        &runtime_context,
+        /*control_endpoint_eligible*/ true,
+        Some("unix:///tmp/kcf-control-b.sock"),
+    );
+
+    assert!(
+        !before.has_same_connection_config(&after),
+        "an eligible server must renegotiate discovery after its control endpoint changes"
+    );
+}
+
+#[test]
+fn ineligible_server_with_changed_control_endpoint_reuses_connection() {
+    let runtime_context = reusable_server_runtime_context();
+    let before = control_endpoint_reuse_identity(
+        &runtime_context,
+        /*control_endpoint_eligible*/ false,
+        Some("unix:///tmp/kcf-control-a.sock"),
+    );
+    let after = control_endpoint_reuse_identity(
+        &runtime_context,
+        /*control_endpoint_eligible*/ false,
+        Some("unix:///tmp/kcf-control-b.sock"),
+    );
+
+    assert!(
+        before.has_same_connection_config(&after),
+        "an ineligible server never receives endpoint discovery, so endpoint changes cannot \
+         force a reconnect"
     );
 }
 
@@ -4620,6 +4750,7 @@ async fn reconciliation_replaces_connection_when_protocol_mode_changes() {
             elicitation_reviewer: None,
             elicitation_lifecycle: None,
             canonical_thread_id: None,
+            control_endpoint: None,
         },
         ElicitationRequestRouter::default(),
     )
@@ -4679,6 +4810,7 @@ async fn reconciliation_reuses_legacy_stdio_server_when_modern_protocol_is_enabl
             elicitation_reviewer: None,
             elicitation_lifecycle: None,
             canonical_thread_id: None,
+            control_endpoint: None,
         },
         ElicitationRequestRouter::default(),
     )
@@ -4864,6 +4996,7 @@ async fn connection_identity_distinguishes_accounts_with_the_same_token() -> any
             ElicitationCapability::default(),
             ClientMcpExtensions::default(),
             /*canonical_thread_id*/ None,
+            /*control_endpoint*/ None,
             /*previous_identity*/ None,
         )
     };
@@ -4917,6 +5050,7 @@ async fn connection_identity_distinguishes_agent_account_runtime_and_task() -> a
             ElicitationCapability::default(),
             ClientMcpExtensions::default(),
             /*canonical_thread_id*/ None,
+            /*control_endpoint*/ None,
             /*previous_identity*/ None,
         )
     };

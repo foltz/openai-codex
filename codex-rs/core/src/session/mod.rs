@@ -561,6 +561,7 @@ pub(crate) struct SessionSpawnArgs {
     pub(crate) environment_selections: Vec<TurnEnvironmentSelection>,
     pub(crate) thread_extension_init: ExtensionDataInit,
     pub(crate) client_mcp_extensions: ClientMcpExtensions,
+    pub(crate) control_endpoint: Option<String>,
     pub(crate) analytics_events_client: Option<AnalyticsEventsClient>,
     pub(crate) thread_store: Arc<dyn ThreadStore>,
     pub(crate) attestation_provider: Option<Arc<dyn AttestationProvider>>,
@@ -678,6 +679,7 @@ impl Session {
             environment_selections,
             thread_extension_init,
             client_mcp_extensions,
+            control_endpoint,
             analytics_events_client,
             thread_store,
             attestation_provider,
@@ -891,6 +893,7 @@ impl Session {
             originator,
             dynamic_tools,
             user_shell_override,
+            control_endpoint,
         };
         session_configuration
             .validate_auto_review_requirement()

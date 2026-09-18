@@ -443,6 +443,7 @@ pub(crate) struct ThreadRequestProcessor {
     thread_shutdown: shutdown::ThreadShutdownOwner,
     pub(super) skills_watcher: Arc<SkillsWatcher>,
     pub(super) initial_config_warnings: Arc<Vec<ConfigWarningNotification>>,
+    pub(super) control_endpoint: Option<String>,
 }
 
 /// Outcome of trying to satisfy a resume request from an already loaded thread.
@@ -475,6 +476,7 @@ impl ThreadRequestProcessor {
         log_db: Option<LogDbLayer>,
         skills_watcher: Arc<SkillsWatcher>,
         initial_config_warnings: Vec<ConfigWarningNotification>,
+        control_endpoint: Option<String>,
     ) -> Self {
         Self {
             auth_manager,
@@ -495,6 +497,7 @@ impl ThreadRequestProcessor {
             thread_shutdown: shutdown::ThreadShutdownOwner::default(),
             skills_watcher,
             initial_config_warnings: Arc::new(initial_config_warnings),
+            control_endpoint,
         }
     }
 
@@ -1008,6 +1011,7 @@ impl ThreadRequestProcessor {
             fallback_model_provider: self.config.model_provider_id.clone(),
             codex_home: self.config.codex_home.to_path_buf(),
             skills_watcher: Arc::clone(&self.skills_watcher),
+            control_endpoint: self.control_endpoint.clone(),
         }
     }
 
@@ -1130,6 +1134,7 @@ impl ThreadRequestProcessor {
             fallback_model_provider: self.config.model_provider_id.clone(),
             codex_home: self.config.codex_home.to_path_buf(),
             skills_watcher: Arc::clone(&self.skills_watcher),
+            control_endpoint: self.control_endpoint.clone(),
         };
         let request_trace = request_context.request_trace();
         let config_manager = self.config_manager.clone();
@@ -1404,6 +1409,7 @@ impl ThreadRequestProcessor {
                 environments: Some(environments),
                 thread_extension_init,
                 client_mcp_extensions,
+                control_endpoint: listener_task_context.control_endpoint.clone(),
                 ..StartThreadOptions::new(config)
             })
             .instrument(tracing::info_span!(

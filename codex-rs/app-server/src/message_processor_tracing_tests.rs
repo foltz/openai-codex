@@ -356,6 +356,7 @@ async fn build_test_processor(
         plugin_startup_tasks: crate::PluginStartupTasks::Skip,
         managed_transition_control_socket_endpoint: None,
         managed_transition_process_instance_id: None,
+        control_endpoint: None,
     }));
     (processor, outgoing_rx, telemetry)
 }

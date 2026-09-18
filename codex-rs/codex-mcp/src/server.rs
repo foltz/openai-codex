@@ -116,6 +116,10 @@ pub(crate) struct McpServerConnectionIdentity {
     /// connection rather than reusing a stale bind; see
     /// `kcf-runtime/04-mcp-thread-identity-contract.md`.
     pub(crate) canonical_thread_id: Option<String>,
+    /// Hosting control endpoint. Eligible providers must reconnect if it
+    /// changes so a physical MCP connection cannot retain a stale endpoint.
+    pub(crate) control_endpoint: Option<String>,
+    pub(crate) control_endpoint_eligible: bool,
 }
 
 impl McpServerConnectionIdentity {
@@ -133,6 +137,7 @@ impl McpServerConnectionIdentity {
         client_elicitation_capability: ElicitationCapability,
         client_mcp_extensions: ClientMcpExtensions,
         canonical_thread_id: Option<String>,
+        control_endpoint: Option<String>,
         previous_identity: Option<&Self>,
     ) -> Self {
         let config = server.config();
@@ -229,6 +234,8 @@ impl McpServerConnectionIdentity {
             agent_plugin: server.is_agent_plugin(),
             thread_identity_eligible: config.thread_identity_eligible,
             canonical_thread_id,
+            control_endpoint,
+            control_endpoint_eligible: config.control_endpoint_eligible,
         }
     }
 
@@ -259,12 +266,14 @@ impl McpServerConnectionIdentity {
             && self.client_mcp_extensions == other.client_mcp_extensions
             && self.agent_plugin == other.agent_plugin
             && self.thread_identity_eligible == other.thread_identity_eligible
+            && self.control_endpoint_eligible == other.control_endpoint_eligible
             // Ineligible servers never bind an identity, so a thread change
             // (fork, delegate, reconstructed resume) must not force them to
             // reconnect; ordinary servers stay unaffected. Eligible servers
             // must reconnect and rebind on a thread change rather than reuse
             // a connection bound to a stale thread id.
             && (!self.thread_identity_eligible || self.canonical_thread_id == other.canonical_thread_id)
+            && (!self.control_endpoint_eligible || self.control_endpoint == other.control_endpoint)
     }
 
     pub(crate) fn oauth_credentials(&self) -> Result<Option<&StoredOAuthTokens>, &String> {

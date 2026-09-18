@@ -329,7 +329,8 @@ async fn connection(
 mod tests {
     use super::*;
     use http_body_util::Full;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
     async fn response_ack_and_server_report_observe_real_connection_retirement() {

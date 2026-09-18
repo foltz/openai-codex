@@ -189,6 +189,13 @@ pub struct McpServerConfig {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub thread_identity_eligible: bool,
 
+    /// When `true`, Codex may disclose the hosting app-server control endpoint
+    /// through the capability-gated `codex/control-endpoint` handshake.
+    /// Default `false`: no server receives the endpoint unless explicitly
+    /// opted in.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub control_endpoint_eligible: bool,
+
     /// Model-facing surfaces from which this server's tools must be omitted.
     /// `None` leaves lower-priority configuration unchanged; an empty list clears it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -319,6 +326,8 @@ pub struct RawMcpServerConfig {
     #[serde(default)]
     pub thread_identity_eligible: Option<bool>,
     #[serde(default)]
+    pub control_endpoint_eligible: Option<bool>,
+    #[serde(default)]
     pub omit_tools_from: Option<Vec<ToolExposureSurface>>,
     #[serde(default)]
     pub default_tools_approval_mode: Option<AppToolApproval>,
@@ -363,6 +372,7 @@ impl TryFrom<RawMcpServerConfig> for McpServerConfig {
             required,
             supports_parallel_tool_calls,
             thread_identity_eligible,
+            control_endpoint_eligible,
             omit_tools_from,
             default_tools_approval_mode,
             enabled_tools,
@@ -442,6 +452,7 @@ impl TryFrom<RawMcpServerConfig> for McpServerConfig {
             required: required.unwrap_or_default(),
             supports_parallel_tool_calls: supports_parallel_tool_calls.unwrap_or_default(),
             thread_identity_eligible: thread_identity_eligible.unwrap_or_default(),
+            control_endpoint_eligible: control_endpoint_eligible.unwrap_or_default(),
             omit_tools_from,
             disabled_reason: None,
             default_tools_approval_mode,

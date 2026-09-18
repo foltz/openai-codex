@@ -304,6 +304,7 @@ async fn list_accessible_connectors_with_custody(
         elicitation_reviewer: None,
         elicitation_lifecycle: None,
         canonical_thread_id: None,
+        control_endpoint: None,
     };
     let mcp_runtime = match retirement {
         Some(retirement) => McpRuntime::new_in_retirement(input, retirement).await,

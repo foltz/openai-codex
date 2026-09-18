@@ -1569,6 +1569,7 @@ impl TurnRequestProcessor {
             fallback_model_provider: self.config.model_provider_id.clone(),
             codex_home: self.config.codex_home.to_path_buf(),
             skills_watcher: Arc::clone(&self.skills_watcher),
+            control_endpoint: None,
         }
     }
 

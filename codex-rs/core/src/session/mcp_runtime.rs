@@ -20,6 +20,7 @@ pub(super) struct McpDesiredState {
     pub(super) session_source: SessionSource,
     pub(super) environments: TurnEnvironmentSnapshot,
     pub(super) windows_sandbox_level: WindowsSandboxLevel,
+    pub(super) control_endpoint: Option<String>,
 }
 
 impl McpDesiredState {
@@ -79,6 +80,7 @@ impl Session {
             session_source: session_configuration.session_source.clone(),
             environments,
             windows_sandbox_level: session_configuration.windows_sandbox_level,
+            control_endpoint: session_configuration.control_endpoint.clone(),
         }
     }
 
@@ -101,6 +103,7 @@ impl Session {
             session_source: session_configuration.session_source.clone(),
             environments: resolved_environments.clone(),
             windows_sandbox_level: session_configuration.windows_sandbox_level,
+            control_endpoint: session_configuration.control_endpoint.clone(),
         };
         self.publish_mcp_runtime(
             &desired,
@@ -197,6 +200,7 @@ impl Session {
             elicitation_reviewer,
             elicitation_lifecycle: Some(self.mcp_elicitation_lifecycle()),
             canonical_thread_id: Some(self.services.thread_extension_data.level_id().to_string()),
+            control_endpoint: desired.control_endpoint.clone(),
         }
     }
 }

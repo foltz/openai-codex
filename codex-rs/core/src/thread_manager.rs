@@ -228,6 +228,9 @@ pub struct StartThreadOptions {
     pub environments: Option<Vec<TurnEnvironmentSelection>>,
     pub thread_extension_init: ExtensionDataInit,
     pub client_mcp_extensions: ClientMcpExtensions,
+    /// Hosting app-server control endpoint for capability-gated MCP provider
+    /// negotiation. `None` for ordinary CLI and in-process callers.
+    pub control_endpoint: Option<String>,
 }
 
 impl StartThreadOptions {
@@ -245,6 +248,7 @@ impl StartThreadOptions {
             environments: None,
             thread_extension_init: ExtensionDataInit::default(),
             client_mcp_extensions: ClientMcpExtensions::default(),
+            control_endpoint: None,
         }
     }
 }
@@ -1807,6 +1811,7 @@ impl ThreadManagerState {
             environments,
             thread_extension_init,
             client_mcp_extensions,
+            control_endpoint,
         } = options;
         let session_source = session_source.unwrap_or_else(|| self.session_source.clone());
         let environments = environments.unwrap_or_else(|| {
@@ -1900,6 +1905,7 @@ impl ThreadManagerState {
                 inherited_exec_policy,
                 parent_rollout_thread_trace,
                 user_shell_override,
+                control_endpoint,
                 parent_trace,
                 environment_selections: environments,
                 thread_extension_init,

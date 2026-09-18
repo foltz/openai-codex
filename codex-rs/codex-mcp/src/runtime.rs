@@ -87,6 +87,10 @@ pub struct McpRuntimeInput {
     /// bind handshake gated by `McpServerConfig::thread_identity_eligible`;
     /// see `kcf-runtime/04-mcp-thread-identity-contract.md`.
     pub canonical_thread_id: Option<String>,
+    /// URI for the Unix control listener that owns this session, if the host
+    /// has one. Disclosed only to explicitly eligible providers through the
+    /// capability-gated `codex/control-endpoint` handshake.
+    pub control_endpoint: Option<String>,
 }
 
 /// Owns all mutable MCP state for one Codex thread.
@@ -603,6 +607,7 @@ mod tests {
             required: false,
             supports_parallel_tool_calls: false,
             thread_identity_eligible: false,
+            control_endpoint_eligible: false,
             omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,

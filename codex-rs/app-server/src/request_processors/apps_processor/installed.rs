@@ -110,6 +110,7 @@ impl AppsRequestProcessor {
                         elicitation_reviewer: None,
                         elicitation_lifecycle: None,
                         canonical_thread_id: None,
+                        control_endpoint: None,
                     })
                     .await;
 

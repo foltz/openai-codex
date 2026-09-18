@@ -112,6 +112,7 @@ async fn hosted_plugin_runtime_ps_mcp_tool_calls_use_current_auth_manager_token(
         elicitation_reviewer: None,
         elicitation_lifecycle: None,
         canonical_thread_id: None,
+        control_endpoint: None,
     })
     .await;
     // The model-provider test covers AuthManager reload behavior. Keep this

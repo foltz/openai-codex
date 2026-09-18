@@ -1665,6 +1665,7 @@ impl TurnRequestProcessor {
             thread_unload_delay: self.config.thread_unload_delay,
             skills_watcher: Arc::clone(&self.skills_watcher),
             turn_cost_worker: self.turn_cost_worker.clone(),
+            control_endpoint: None,
         }
     }
 

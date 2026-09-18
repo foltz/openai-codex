@@ -3484,6 +3484,10 @@
         "command": {
           "type": "string"
         },
+        "control_endpoint_eligible": {
+          "default": null,
+          "type": "boolean"
+        },
         "cwd": {
           "allOf": [
             {

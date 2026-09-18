@@ -105,6 +105,12 @@ const MCP_TOOL_CATALOG_CACHEABLE_PROPERTY: &str = "cacheable";
 const MCP_THREAD_IDENTITY_CAPABILITY: &str = "codex/thread-identity";
 const MCP_THREAD_IDENTITY_VERSIONS_PROPERTY: &str = "versions";
 const MCP_THREAD_IDENTITY_SUPPORTED_VERSION: i64 = 1;
+/// Capability-gated hosting app-server control endpoint disclosure. This is
+/// provider-neutral transport discovery; endpoint consumers define their own
+/// policy and never receive a thread-scoped authorization claim from Codex.
+const MCP_CONTROL_ENDPOINT_CAPABILITY: &str = "codex/control-endpoint";
+const MCP_CONTROL_ENDPOINT_VERSIONS_PROPERTY: &str = "versions";
+const MCP_CONTROL_ENDPOINT_SUPPORTED_VERSION: i64 = 1;
 pub(crate) const MCP_TOOLS_LIST_DURATION_METRIC: &str = "codex.mcp.tools.list.duration_ms";
 pub(crate) const MCP_TOOLS_FETCH_UNCACHED_DURATION_METRIC: &str =
     "codex.mcp.tools.fetch_uncached.duration_ms";
@@ -335,6 +341,7 @@ struct ManagedClientStartup {
     startup_complete: Arc<AtomicBool>,
     server_capabilities: Arc<StdMutex<Option<serde_json::Value>>>,
     canonical_thread_id: Option<String>,
+    control_endpoint: Option<String>,
 }
 
 impl ManagedClientStartup {
@@ -367,9 +374,11 @@ impl ManagedClientStartup {
             startup_complete,
             server_capabilities,
             canonical_thread_id,
+            control_endpoint,
         } = self.clone();
         let is_codex_apps_mcp_server = server_name == CODEX_APPS_MCP_SERVER_NAME;
         let thread_identity_eligible = server.config().thread_identity_eligible;
+        let control_endpoint_eligible = server.config().control_endpoint_eligible;
         let startup_timeout = server
             .config()
             .startup_timeout_sec
@@ -404,15 +413,22 @@ impl ManagedClientStartup {
                 {
                     Ok(result) => {
                         let client = result?.with_read_only_tools(server.requires_read_only_mcp_tools());
-                        let client = if thread_identity_eligible
-                            && let Some(thread_id) = canonical_thread_id.clone()
-                        {
-                            client.with_post_reconnect_hook(thread_identity_reconnect_hook(
-                                thread_id,
-                                Some(startup_timeout),
-                            ))
-                        } else {
-                            client
+                        let client = match (
+                            thread_identity_eligible
+                                .then_some(canonical_thread_id.clone())
+                                .flatten(),
+                            control_endpoint_eligible
+                                .then_some(control_endpoint.clone())
+                                .flatten(),
+                        ) {
+                            (None, None) => client,
+                            (thread_id, endpoint) => client.with_post_reconnect_hook(
+                                connection_handshake_reconnect_hook(
+                                    thread_id,
+                                    endpoint,
+                                    Some(startup_timeout),
+                                ),
+                            ),
                         };
                         Arc::new(client)
                     }
@@ -440,6 +456,9 @@ impl ManagedClientStartup {
                         server_capabilities,
                         thread_identity_eligible,
                         canonical_thread_id,
+                        control_endpoint: control_endpoint_eligible
+                            .then_some(control_endpoint)
+                            .flatten(),
                     },
                 )
                 .await
@@ -513,6 +532,7 @@ impl AsyncManagedClient {
         protocol_mode: McpProtocolMode,
         catalog_item_limit: usize,
         canonical_thread_id: Option<String>,
+        control_endpoint: Option<String>,
         retirement: codex_rmcp_client::RmcpClientRetirement,
         retirement_ticket: crate::runtime_retirement::RuntimeTaskTicket,
     ) -> Self {
@@ -551,6 +571,7 @@ impl AsyncManagedClient {
             startup_complete: Arc::clone(&startup_complete),
             server_capabilities: Arc::clone(&server_capabilities),
             canonical_thread_id,
+            control_endpoint,
         });
         let client = startup.start();
         let startup_reconnect = is_codex_apps_mcp_server.then(|| {
@@ -980,6 +1001,7 @@ async fn start_server_task(
         server_capabilities,
         thread_identity_eligible,
         canonical_thread_id,
+        control_endpoint,
     } = params;
     let send_elicitation =
         elicitation_requests.make_sender(server_name.clone(), tx_event, &client_mcp_extensions);
@@ -1023,6 +1045,9 @@ async fn start_server_task(
 
     if thread_identity_eligible && let Some(thread_id) = canonical_thread_id.as_deref() {
         bind_thread_identity(&client, &initialize_result, thread_id, startup_timeout).await?;
+    }
+    if let Some(endpoint) = control_endpoint.as_deref() {
+        bind_control_endpoint(&client, &initialize_result, endpoint, startup_timeout).await?;
     }
 
     let server_disables_tool_catalog_cache = initialize_result
@@ -1186,6 +1211,115 @@ fn thread_identity_ack_accepted(response: &ServerResult) -> bool {
     )
 }
 
+fn declares_compatible_control_endpoint(peer_info: &ServerPeerInfo) -> bool {
+    peer_info
+        .capabilities
+        .experimental
+        .as_ref()
+        .and_then(|experimental| experimental.get(MCP_CONTROL_ENDPOINT_CAPABILITY))
+        .and_then(|capability| capability.get(MCP_CONTROL_ENDPOINT_VERSIONS_PROPERTY))
+        .is_some_and(is_compatible_control_endpoint_versions)
+}
+
+fn is_compatible_control_endpoint_versions(versions: &serde_json::Value) -> bool {
+    is_compatible_thread_identity_versions(versions)
+}
+
+fn control_endpoint_params(endpoint: &str) -> serde_json::Value {
+    serde_json::json!({
+        "version": MCP_CONTROL_ENDPOINT_SUPPORTED_VERSION,
+        "endpoint": endpoint,
+    })
+}
+
+fn control_endpoint_ack_accepted(response: &ServerResult) -> bool {
+    matches!(
+        response,
+        ServerResult::CustomResult(CustomResult(value))
+            if value == &serde_json::json!({
+                "version": MCP_CONTROL_ENDPOINT_SUPPORTED_VERSION,
+                "accepted": true,
+            })
+    )
+}
+
+/// Discloses the hosting app-server Unix endpoint only when the provider
+/// explicitly declared a compatible `codex/control-endpoint` capability. A
+/// provider that declares support but rejects or malforms the acknowledgement
+/// is never admitted for tools or other provider operations.
+async fn bind_control_endpoint(
+    client: &RmcpClient,
+    initialize_result: &ServerPeerInfo,
+    endpoint: &str,
+    startup_timeout: Option<Duration>,
+) -> Result<(), StartupOutcomeError> {
+    if !declares_compatible_control_endpoint(initialize_result) {
+        return Ok(());
+    }
+    let response = client
+        .send_custom_request_with_timeout(
+            MCP_CONTROL_ENDPOINT_CAPABILITY,
+            Some(control_endpoint_params(endpoint)),
+            startup_timeout,
+        )
+        .await
+        .map_err(StartupOutcomeError::from)?;
+    if control_endpoint_ack_accepted(&response) {
+        Ok(())
+    } else {
+        Err(StartupOutcomeError::from(anyhow!(
+            "MCP server declared codex/control-endpoint but rejected or malformed the acknowledgement"
+        )))
+    }
+}
+
+fn connection_handshake_reconnect_hook(
+    canonical_thread_id: Option<String>,
+    control_endpoint: Option<String>,
+    timeout: Option<Duration>,
+) -> PostReconnectHook {
+    Box::new(move |context, peer_info| {
+        let canonical_thread_id = canonical_thread_id.clone();
+        let control_endpoint = control_endpoint.clone();
+        async move {
+            if let Some(thread_id) = canonical_thread_id.as_deref()
+                && declares_compatible_thread_identity(peer_info)
+            {
+                let response = context
+                    .send_custom_request(
+                        MCP_THREAD_IDENTITY_CAPABILITY,
+                        Some(thread_identity_bind_params(thread_id)),
+                        timeout,
+                    )
+                    .await?;
+                if !thread_identity_ack_accepted(&response) {
+                    return Err(anyhow!(
+                        "MCP server declared codex/thread-identity but rejected or malformed the recovery bind acknowledgement"
+                    ));
+                }
+            }
+            if let Some(endpoint) = control_endpoint.as_deref()
+                && declares_compatible_control_endpoint(peer_info)
+            {
+                let response = context
+                    .send_custom_request(
+                        MCP_CONTROL_ENDPOINT_CAPABILITY,
+                        Some(control_endpoint_params(endpoint)),
+                        timeout,
+                    )
+                    .await?;
+                if !control_endpoint_ack_accepted(&response) {
+                    return Err(anyhow!(
+                        "MCP server declared codex/control-endpoint but rejected or malformed the recovery acknowledgement"
+                    ));
+                }
+            }
+            Ok(())
+        }
+        .boxed()
+    })
+}
+
 /// Binds the connection-scoped `codex/thread-identity` capability if the
 /// server declared a compatible version, per
 /// `kcf-runtime/04-mcp-thread-identity-contract.md`. Only called for
@@ -1221,54 +1355,6 @@ async fn bind_thread_identity(
             "MCP server declared codex/thread-identity but rejected or malformed the bind acknowledgement"
         )))
     }
-}
-
-/// Rebinds `codex/thread-identity` after `RmcpClient` transparently
-/// recovers a Streamable HTTP session-expiry: installed as a
-/// [`codex_rmcp_client::PostReconnectHook`] on eligible connections only
-/// (see `make_rmcp_client`), so it is a complete no-op — no extra request,
-/// no extra latency — for every ordinary connection. Shares
-/// `declares_compatible_thread_identity`/`thread_identity_ack_accepted`
-/// with the startup path (`bind_thread_identity`) so the declaration
-/// grammar and acknowledgement shape are checked identically in both
-/// places; only how the request is *sent* differs, because the recovery
-/// path must operate on the specific freshly reconnected physical
-/// connection via `ReconnectContext` rather than through
-/// `RmcpClient`'s own (not-yet-`Ready`) state — see `ReconnectContext`'s
-/// doc comment in `rmcp-client` for why.
-///
-/// `timeout` is the same bounded startup timeout the initial bind uses
-/// (the server's configured `startup_timeout_sec`, or the default) — a
-/// recovering provider that never acknowledges must fail the recovery
-/// closed within a bounded window, not hold it open indefinitely.
-fn thread_identity_reconnect_hook(
-    canonical_thread_id: String,
-    timeout: Option<Duration>,
-) -> PostReconnectHook {
-    Box::new(move |context, peer_info| {
-        let canonical_thread_id = canonical_thread_id.clone();
-        async move {
-            if !declares_compatible_thread_identity(peer_info) {
-                return Ok(());
-            }
-            let response = context
-                .send_custom_request(
-                    MCP_THREAD_IDENTITY_CAPABILITY,
-                    Some(thread_identity_bind_params(&canonical_thread_id)),
-                    timeout,
-                )
-                .await?;
-            if thread_identity_ack_accepted(&response) {
-                Ok(())
-            } else {
-                Err(anyhow!(
-                    "MCP server declared codex/thread-identity but rejected or malformed the \
-                     recovery bind acknowledgement"
-                ))
-            }
-        }
-        .boxed()
-    })
 }
 
 fn record_protocol_discovery_metrics(
@@ -1362,6 +1448,7 @@ struct StartServerTaskParams {
     catalog_item_limit: usize,
     thread_identity_eligible: bool,
     canonical_thread_id: Option<String>,
+    control_endpoint: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1709,6 +1796,211 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn control_endpoint_request_is_exact_and_rejection_blocks_tools() {
+        const ENDPOINT: &str = "unix:///tmp/kcf%20control.sock";
+        let tools_list_called = Arc::new(AtomicBool::new(false));
+        let tools_list_called_for_mock = Arc::clone(&tools_list_called);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(move |request: &Request| {
+                let body: serde_json::Value = request.body_json().expect("valid JSON-RPC request");
+                match body["method"].as_str() {
+                    Some("initialize") => {
+                        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": body["id"],
+                            "result": {
+                                "protocolVersion": THREAD_IDENTITY_TEST_LEGACY_VERSION,
+                                "capabilities": {"tools": {}, "experimental": {
+                                    MCP_CONTROL_ENDPOINT_CAPABILITY: {"versions": [1]}
+                                }},
+                                "serverInfo": {"name": "endpoint-test-server", "version": "1.0.0"},
+                            },
+                        }))
+                    }
+                    Some("notifications/initialized") => ResponseTemplate::new(202),
+                    Some(MCP_CONTROL_ENDPOINT_CAPABILITY) => {
+                        let params = body["params"].as_object().expect("endpoint params object");
+                        assert_eq!(params["version"], serde_json::json!(1));
+                        assert_eq!(params["endpoint"], serde_json::json!(ENDPOINT));
+                        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": body["id"],
+                            "result": {"version": 1, "accepted": false},
+                        }))
+                    }
+                    Some("tools/list") => {
+                        tools_list_called_for_mock.store(true, Ordering::SeqCst);
+                        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                            "jsonrpc": "2.0", "id": body["id"], "result": {"tools": []},
+                        }))
+                    }
+                    other => panic!("unexpected endpoint test method: {other:?}"),
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let client = Arc::new(
+            RmcpClient::new_streamable_http_client_with_protocol_mode(
+                "control-endpoint-test",
+                &format!("{}/mcp", server.uri()),
+                None,
+                None,
+                None,
+                OAuthCredentialsStoreMode::File,
+                AuthKeyringBackendKind::default(),
+                codex_exec_server::Environment::default_for_tests().get_http_client(),
+                None,
+                McpProtocolMode::Legacy,
+            )
+            .await
+            .expect("client should construct"),
+        );
+        let result = start_server_task(
+            "control-endpoint-test".to_string(),
+            Arc::clone(&client),
+            StartServerTaskParams {
+                is_codex_apps_mcp_server: false,
+                startup_timeout: Some(Duration::from_secs(5)),
+                tx_event: None,
+                elicitation_requests: ElicitationRequestManager::new(
+                    AskForApproval::default(),
+                    PermissionProfile::read_only(),
+                    None,
+                    None,
+                    ElicitationRequestRouter::default(),
+                ),
+                codex_apps_tools_cache_context: None,
+                tool_catalog_cache_context: None,
+                tool_catalog_fetch_ticket: None,
+                client_elicitation_capability: ElicitationCapability::default(),
+                client_mcp_extensions: ClientMcpExtensions::default(),
+                catalog_item_limit: 100,
+                thread_identity_eligible: false,
+                canonical_thread_id: None,
+                control_endpoint: Some(ENDPOINT.to_string()),
+            },
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "rejected endpoint acknowledgement must fail startup"
+        );
+        assert!(
+            !tools_list_called.load(Ordering::SeqCst),
+            "tools/list must not run after endpoint acknowledgement rejection"
+        );
+        client.shutdown().await;
+    }
+
+    /// Exercises the complete production startup funnel with a compatible
+    /// provider that accepts the endpoint. This complements the rejection
+    /// discriminator above: a valid acknowledgement must allow normal tool
+    /// discovery, while a bad acknowledgement must stop before it.
+    #[tokio::test]
+    async fn accepted_control_endpoint_acknowledgement_allows_tools_list() {
+        const ENDPOINT: &str = "unix:///tmp/kcf-control.sock";
+        let tools_list_called = Arc::new(AtomicBool::new(false));
+        let tools_list_called_for_mock = Arc::clone(&tools_list_called);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(move |request: &Request| {
+                let body: serde_json::Value = request.body_json().expect("valid JSON-RPC request");
+                match body["method"].as_str() {
+                    Some("initialize") => {
+                        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": body["id"],
+                            "result": {
+                                "protocolVersion": THREAD_IDENTITY_TEST_LEGACY_VERSION,
+                                "capabilities": {"tools": {}, "experimental": {
+                                    MCP_CONTROL_ENDPOINT_CAPABILITY: {"versions": [1]}
+                                }},
+                                "serverInfo": {"name": "endpoint-test-server", "version": "1.0.0"},
+                            },
+                        }))
+                    }
+                    Some("notifications/initialized") => ResponseTemplate::new(202),
+                    Some(MCP_CONTROL_ENDPOINT_CAPABILITY) => {
+                        let params = body["params"].as_object().expect("endpoint params object");
+                        assert_eq!(params["version"], serde_json::json!(1));
+                        assert_eq!(params["endpoint"], serde_json::json!(ENDPOINT));
+                        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": body["id"],
+                            "result": {"version": 1, "accepted": true},
+                        }))
+                    }
+                    Some("tools/list") => {
+                        tools_list_called_for_mock.store(true, Ordering::SeqCst);
+                        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                            "jsonrpc": "2.0", "id": body["id"], "result": {"tools": []},
+                        }))
+                    }
+                    other => panic!("unexpected endpoint test method: {other:?}"),
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let client = Arc::new(
+            RmcpClient::new_streamable_http_client_with_protocol_mode(
+                "control-endpoint-accepted-test",
+                &format!("{}/mcp", server.uri()),
+                None,
+                None,
+                None,
+                OAuthCredentialsStoreMode::File,
+                AuthKeyringBackendKind::default(),
+                codex_exec_server::Environment::default_for_tests().get_http_client(),
+                None,
+                McpProtocolMode::Legacy,
+            )
+            .await
+            .expect("client should construct"),
+        );
+        let result = start_server_task(
+            "control-endpoint-accepted-test".to_string(),
+            Arc::clone(&client),
+            StartServerTaskParams {
+                is_codex_apps_mcp_server: false,
+                startup_timeout: Some(Duration::from_secs(5)),
+                tx_event: None,
+                elicitation_requests: ElicitationRequestManager::new(
+                    AskForApproval::default(),
+                    PermissionProfile::read_only(),
+                    None,
+                    None,
+                    ElicitationRequestRouter::default(),
+                ),
+                codex_apps_tools_cache_context: None,
+                tool_catalog_cache_context: None,
+                tool_catalog_fetch_ticket: None,
+                client_elicitation_capability: ElicitationCapability::default(),
+                client_mcp_extensions: ClientMcpExtensions::default(),
+                catalog_item_limit: 100,
+                thread_identity_eligible: false,
+                canonical_thread_id: None,
+                control_endpoint: Some(ENDPOINT.to_string()),
+            },
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "accepted endpoint acknowledgement must permit startup: {:?}",
+            result.err().map(|error| error.to_string())
+        );
+        assert!(
+            tools_list_called.load(Ordering::SeqCst),
+            "tools/list must run only after endpoint acknowledgement acceptance"
+        );
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn bind_thread_identity_fails_on_mismatched_ack() {
         let (client, _server) = start_thread_identity_test_client(
             Some(serde_json::json!([1])),
@@ -1856,6 +2148,7 @@ mod tests {
                 catalog_item_limit: 100,
                 thread_identity_eligible: true,
                 canonical_thread_id: Some("thread-abc-123".to_string()),
+                control_endpoint: None,
             },
         )
         .await;
@@ -1970,6 +2263,7 @@ mod tests {
                 catalog_item_limit: 100,
                 thread_identity_eligible: true,
                 canonical_thread_id: Some(THREAD_ID_MARKER.to_string()),
+                control_endpoint: None,
             },
         )
         .await;
@@ -2107,6 +2401,7 @@ mod tests {
                 // The server is eligible, but this caller is threadless.
                 thread_identity_eligible: true,
                 canonical_thread_id: None,
+                control_endpoint: None,
             },
         )
         .await;

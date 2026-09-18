@@ -461,6 +461,7 @@ pub async fn read_mcp_resource(
             elicitation_reviewer: None,
             elicitation_lifecycle: None,
             canonical_thread_id: None,
+            control_endpoint: None,
         },
         crate::elicitation::ElicitationRequestRouter::default(),
     )
@@ -541,6 +542,7 @@ pub async fn collect_mcp_server_status_snapshot_with_detail(
             elicitation_reviewer: None,
             elicitation_lifecycle: None,
             canonical_thread_id: None,
+            control_endpoint: None,
         },
         crate::elicitation::ElicitationRequestRouter::default(),
     )
@@ -659,6 +661,7 @@ fn mcp_server_config_for_url(
         required: false,
         supports_parallel_tool_calls: false,
         thread_identity_eligible: false,
+        control_endpoint_eligible: false,
         omit_tools_from: None,
         disabled_reason: None,
         startup_timeout_sec: Some(Duration::from_secs(30)),

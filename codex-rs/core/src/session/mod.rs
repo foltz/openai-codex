@@ -577,6 +577,7 @@ pub(crate) struct SessionSpawnArgs {
     pub(crate) thread_extension_init: ExtensionDataInit,
     pub(crate) client_mcp_extensions: ClientMcpExtensions,
     pub(crate) reserved_thread_id: Option<ThreadId>,
+    pub(crate) control_endpoint: Option<String>,
     pub(crate) analytics_events_client: Option<AnalyticsEventsClient>,
     pub(crate) image_store: Arc<dyn AttachmentStore>,
     pub(crate) thread_store: Arc<dyn ThreadStore>,
@@ -703,6 +704,7 @@ impl Session {
             thread_extension_init,
             client_mcp_extensions,
             reserved_thread_id,
+            control_endpoint,
             analytics_events_client,
             image_store,
             thread_store,
@@ -1001,6 +1003,7 @@ impl Session {
             originator,
             dynamic_tools,
             user_shell_override,
+            control_endpoint,
         };
         session_configuration
             .validate(&environment_selections)

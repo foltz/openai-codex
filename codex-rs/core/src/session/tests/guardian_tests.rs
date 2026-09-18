@@ -1343,6 +1343,7 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
         thread_extension_init,
         client_mcp_extensions: ClientMcpExtensions::default(),
         reserved_thread_id: None,
+        control_endpoint: None,
         analytics_events_client: None,
         image_store: crate::thread_manager::passthrough_image_store(),
         thread_store,

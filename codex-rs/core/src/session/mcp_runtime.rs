@@ -27,6 +27,7 @@ pub(super) struct McpDesiredState {
     pub(super) environments: TurnEnvironmentSnapshot,
     pub(super) local_process_cwd: PathBuf,
     pub(super) disabled_plugin_ids: Vec<String>,
+    pub(super) control_endpoint: Option<String>,
 }
 
 impl Session {
@@ -101,6 +102,7 @@ impl Session {
             environments,
             local_process_cwd,
             disabled_plugin_ids,
+            control_endpoint: session_configuration.control_endpoint.clone(),
         }
     }
 
@@ -132,6 +134,7 @@ impl Session {
             environments: resolved_environments.clone(),
             local_process_cwd,
             disabled_plugin_ids: session_configuration.disabled_plugin_ids.clone(),
+            control_endpoint: session_configuration.control_endpoint.clone(),
         };
         self.publish_mcp_runtime(
             &desired,
@@ -377,6 +380,7 @@ impl Session {
             elicitation_reviewer,
             elicitation_lifecycle: Some(self.mcp_elicitation_lifecycle()),
             canonical_thread_id: Some(self.services.thread_extension_data.level_id().to_string()),
+            control_endpoint: desired.control_endpoint.clone(),
         }
     }
 }

@@ -278,6 +278,7 @@ async fn build_test_processor(
         // workers are exercised by their own ownership tests and would add an
         // unrelated admitted population to the background-drain assertion.
         plugin_startup_tasks: None,
+        control_endpoint: None,
     }));
     (processor, outgoing_rx)
 }

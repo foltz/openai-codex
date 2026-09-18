@@ -293,6 +293,9 @@ pub struct StartThreadOptions {
     pub reserved_thread_id: Option<ThreadId>,
     /// Initial thread-owned plugin selection; omission restores persisted settings.
     pub disabled_plugin_ids: Option<Vec<String>>,
+    /// Hosting app-server control endpoint for capability-gated MCP provider
+    /// negotiation. `None` for ordinary CLI and in-process callers.
+    pub control_endpoint: Option<String>,
 }
 
 impl StartThreadOptions {
@@ -316,6 +319,7 @@ impl StartThreadOptions {
             client_mcp_extensions: ClientMcpExtensions::default(),
             reserved_thread_id: None,
             disabled_plugin_ids: None,
+            control_endpoint: None,
         }
     }
 }
@@ -2168,6 +2172,7 @@ impl ThreadManagerState {
             client_mcp_extensions,
             reserved_thread_id,
             disabled_plugin_ids,
+            control_endpoint,
         } = options;
         let inherited_environments = captured_environments.or(inherited_environments);
         let session_source = session_source.unwrap_or_else(|| self.session_source.clone());
@@ -2361,6 +2366,7 @@ impl ThreadManagerState {
             client_mcp_extensions,
             reserved_thread_id,
             analytics_events_client: self.analytics_events_client.clone(),
+            control_endpoint,
             image_store: Arc::clone(&self.image_store),
             thread_store: Arc::clone(&self.thread_store),
             attestation_provider: self.attestation_provider.clone(),

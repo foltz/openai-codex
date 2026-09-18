@@ -246,6 +246,7 @@ impl McpConnectionSet {
             elicitation_reviewer,
             elicitation_lifecycle,
             canonical_thread_id,
+            control_endpoint,
         } = input;
         let store_mode = config.mcp_oauth_credentials_store_mode;
         let keyring_backend_kind = config.auth_keyring_backend_kind;
@@ -449,6 +450,7 @@ impl McpConnectionSet {
                 client_elicitation_capability.clone(),
                 client_mcp_extensions.clone(),
                 canonical_thread_id.clone(),
+                control_endpoint.clone(),
                 previous
                     .and_then(|previous| previous.servers.get(&server_name))
                     .and_then(|view| view.connection.identity.as_ref()),
@@ -633,6 +635,7 @@ impl McpConnectionSet {
                 protocol_mode,
                 catalog_item_limit,
                 connection_identity.canonical_thread_id.clone(),
+                connection_identity.control_endpoint.clone(),
                 retirement_owner.lower(),
                 retirement_owner.task_ticket(),
             );

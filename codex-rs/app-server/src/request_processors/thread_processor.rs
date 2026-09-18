@@ -471,6 +471,7 @@ pub(crate) struct ThreadRequestProcessor {
     pub(super) skills_watcher: Arc<SkillsWatcher>,
     pub(super) turn_cost_worker: Option<crate::turn_cost_worker::TurnCostWorkerHandle>,
     pub(super) initial_config_warnings: Arc<Vec<ConfigWarningNotification>>,
+    pub(super) control_endpoint: Option<String>,
 }
 
 /// Whether resume attaches a client or restores a cold runtime during daemon startup.
@@ -510,6 +511,7 @@ impl ThreadRequestProcessor {
         skills_watcher: Arc<SkillsWatcher>,
         turn_cost_worker: Option<crate::turn_cost_worker::TurnCostWorkerHandle>,
         initial_config_warnings: Vec<ConfigWarningNotification>,
+        control_endpoint: Option<String>,
     ) -> Self {
         Self {
             auth_manager,
@@ -531,6 +533,7 @@ impl ThreadRequestProcessor {
             skills_watcher,
             turn_cost_worker,
             initial_config_warnings: Arc::new(initial_config_warnings),
+            control_endpoint,
         }
     }
 
@@ -1114,6 +1117,7 @@ impl ThreadRequestProcessor {
             thread_unload_delay: self.config.thread_unload_delay,
             skills_watcher: Arc::clone(&self.skills_watcher),
             turn_cost_worker: self.turn_cost_worker.clone(),
+            control_endpoint: self.control_endpoint.clone(),
         }
     }
 
@@ -1256,6 +1260,7 @@ impl ThreadRequestProcessor {
             thread_unload_delay: self.config.thread_unload_delay,
             skills_watcher: Arc::clone(&self.skills_watcher),
             turn_cost_worker: self.turn_cost_worker.clone(),
+            control_endpoint: self.control_endpoint.clone(),
         };
         let request_trace = request_context.request_trace();
         let config_manager = self.config_manager.clone();
@@ -1580,6 +1585,7 @@ impl ThreadRequestProcessor {
                 environments: Some(environments),
                 thread_extension_init,
                 client_mcp_extensions,
+                control_endpoint: listener_task_context.control_endpoint.clone(),
                 ..start_options
             })
             .instrument(tracing::info_span!(

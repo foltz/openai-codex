@@ -16,6 +16,7 @@ pub(super) struct ListenerTaskContext {
     pub(super) thread_unload_delay: Duration,
     pub(super) skills_watcher: Arc<SkillsWatcher>,
     pub(super) turn_cost_worker: Option<crate::turn_cost_worker::TurnCostWorkerHandle>,
+    pub(super) control_endpoint: Option<String>,
 }
 
 struct UnloadingState {

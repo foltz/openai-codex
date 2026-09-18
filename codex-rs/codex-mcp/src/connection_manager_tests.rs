@@ -2234,6 +2234,7 @@ async fn codex_apps_extension_does_not_share_host_owned_tools_cache() -> anyhow:
                 codex_apps_tools_cache_key: cache_key.clone(),
                 client_mcp_extensions: ClientMcpExtensions::default(),
                 canonical_thread_id: None,
+                control_endpoint: None,
                 auth: None,
                 auth_manager: None,
                 elicitation_reviewer: None,
@@ -4586,6 +4587,7 @@ async fn executor_owned_chatgpt_mcp_accepts_only_safe_explicit_authorization() -
                 ElicitationCapability::default(),
                 ClientMcpExtensions::default(),
                 /*canonical_thread_id*/ None,
+                /*control_endpoint*/ None,
                 /*previous_identity*/ None,
             )
         };
@@ -4644,6 +4646,7 @@ async fn executor_owned_chatgpt_mcp_accepts_only_safe_explicit_authorization() -
                 elicitation_reviewer: None,
                 elicitation_lifecycle: None,
                 canonical_thread_id: None,
+                control_endpoint: None,
             },
             ElicitationRequestRouter::default(),
         )
@@ -4692,6 +4695,7 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
                 required: false,
                 supports_parallel_tool_calls: false,
                 thread_identity_eligible: false,
+                control_endpoint_eligible: false,
                 omit_tools_from: None,
                 disabled_reason: None,
                 startup_timeout_sec: None,
@@ -4721,6 +4725,7 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
                 required: false,
                 supports_parallel_tool_calls: false,
                 thread_identity_eligible: false,
+                control_endpoint_eligible: false,
                 omit_tools_from: None,
                 disabled_reason: None,
                 startup_timeout_sec: None,
@@ -4766,6 +4771,7 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
             elicitation_reviewer: None,
             elicitation_lifecycle: None,
             canonical_thread_id: None,
+            control_endpoint: None,
         },
         ElicitationRequestRouter::default(),
     )
@@ -4834,6 +4840,7 @@ fn mcp_init_error_display_prompts_for_github_pat() {
         required: false,
         supports_parallel_tool_calls: false,
         thread_identity_eligible: false,
+        control_endpoint_eligible: false,
         omit_tools_from: None,
         disabled_reason: None,
         startup_timeout_sec: None,
@@ -4995,6 +5002,7 @@ fn mcp_init_error_display_reports_generic_errors() {
         required: false,
         supports_parallel_tool_calls: false,
         thread_identity_eligible: false,
+        control_endpoint_eligible: false,
         omit_tools_from: None,
         disabled_reason: None,
         startup_timeout_sec: None,
@@ -5075,6 +5083,7 @@ fn reusable_server_config(url: &str) -> McpServerConfig {
         required: false,
         supports_parallel_tool_calls: false,
         thread_identity_eligible: false,
+        control_endpoint_eligible: false,
         omit_tools_from: None,
         disabled_reason: None,
         startup_timeout_sec: None,
@@ -5151,6 +5160,7 @@ fn retirement_runtime_input(
         elicitation_reviewer: None,
         elicitation_lifecycle: None,
         canonical_thread_id: None,
+        control_endpoint: None,
     }
 }
 
@@ -5409,6 +5419,7 @@ fn reusable_server_identity(
         ElicitationCapability::default(),
         ClientMcpExtensions::default(),
         /*canonical_thread_id*/ None,
+        /*control_endpoint*/ None,
         /*previous_identity*/ None,
     )
 }
@@ -5499,6 +5510,7 @@ async fn reconcile_reusable_server_with_mcp_config(
             elicitation_reviewer: None,
             elicitation_lifecycle: None,
             canonical_thread_id: None,
+            control_endpoint: None,
         },
         ElicitationRequestRouter::default(),
     )
@@ -6097,6 +6109,7 @@ fn connection_identity_uses_effective_authorization_headers() {
                 ElicitationCapability::default(),
                 ClientMcpExtensions::default(),
                 /*canonical_thread_id*/ None,
+                /*control_endpoint*/ None,
                 /*previous_identity*/ None,
             )
         };
@@ -6146,6 +6159,7 @@ fn thread_identity_reuse_identity(
         ElicitationCapability::default(),
         ClientMcpExtensions::default(),
         canonical_thread_id.map(str::to_string),
+        /*control_endpoint*/ None,
         /*previous_identity*/ None,
     )
 }
@@ -6207,6 +6221,41 @@ fn eligible_server_with_unchanged_thread_id_reuses_connection() {
         "an already-live resume or compact keeps the same thread id and must not force a \
          reconnect for an eligible server"
     );
+}
+
+/// Connection reuse must re-run the generic endpoint negotiation when a
+/// provider's explicit eligibility changes; otherwise an already-live
+/// physical MCP connection can retain a stale discovery contract.
+#[test]
+fn control_endpoint_eligibility_toggle_does_not_reuse_connection() {
+    let runtime_context = reusable_server_runtime_context();
+    let identity = |eligible| {
+        let mut config = reusable_server_config("http://127.0.0.1:1");
+        config.control_endpoint_eligible = eligible;
+        let server = EffectiveMcpServer::configured(config.clone());
+        let resolved_environment = runtime_context.resolve_server_environment("docs", &config);
+        McpServerConnectionIdentity::new(
+            "docs",
+            &server,
+            OAuthCredentialsStoreMode::default(),
+            AuthKeyringBackendKind::default(),
+            &resolved_environment,
+            &runtime_context,
+            /*runtime_auth_provider*/ None,
+            /*auth*/ None,
+            /*codex_apps_cache_identity*/ None,
+            ElicitationCapability::default(),
+            ClientMcpExtensions::default(),
+            /*canonical_thread_id*/ None,
+            Some("unix:///tmp/kcf-control.sock".to_string()),
+            /*previous_identity*/ None,
+        )
+    };
+    let ineligible = identity(false);
+    let eligible = identity(true);
+
+    assert!(!ineligible.has_same_connection_config(&eligible));
+    assert!(!eligible.has_same_connection_config(&ineligible));
 }
 
 #[tokio::test]
@@ -6341,6 +6390,7 @@ async fn reconciliation_replaces_connection_when_protocol_mode_changes() {
             elicitation_reviewer: None,
             elicitation_lifecycle: None,
             canonical_thread_id: None,
+            control_endpoint: None,
         },
         ElicitationRequestRouter::default(),
     )
@@ -6400,6 +6450,7 @@ async fn reconciliation_reuses_legacy_stdio_server_when_modern_protocol_is_enabl
             elicitation_reviewer: None,
             elicitation_lifecycle: None,
             canonical_thread_id: None,
+            control_endpoint: None,
         },
         ElicitationRequestRouter::default(),
     )
@@ -6742,6 +6793,7 @@ async fn connection_identity_distinguishes_accounts_with_the_same_token() -> any
             ElicitationCapability::default(),
             ClientMcpExtensions::default(),
             /*canonical_thread_id*/ None,
+            /*control_endpoint*/ None,
             /*previous_identity*/ None,
         )
     };
@@ -6797,6 +6849,7 @@ async fn connection_identity_distinguishes_agent_account_runtime_and_task() -> a
             ElicitationCapability::default(),
             ClientMcpExtensions::default(),
             /*canonical_thread_id*/ None,
+            /*control_endpoint*/ None,
             /*previous_identity*/ None,
         )
     };

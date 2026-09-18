@@ -263,7 +263,10 @@ impl McpServerConnectionIdentity {
             requires_read_only_mcp_tools: server.requires_read_only_mcp_tools(),
             thread_identity_eligible: config.thread_identity_eligible,
             canonical_thread_id,
-            control_endpoint,
+            control_endpoint: config
+                .control_endpoint_eligible
+                .then_some(control_endpoint)
+                .flatten(),
             control_endpoint_eligible: config.control_endpoint_eligible,
         }
     }

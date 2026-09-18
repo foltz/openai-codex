@@ -1044,14 +1044,14 @@ async fn start_server_task(
     Ok(managed)
 }
 
-/// Validates a `codex/thread-identity` declaration's `versions` value
-/// against `kcf-runtime/04`'s exact grammar: a non-empty JSON array of
-/// distinct positive integers, compatible only when it contains `1`. An
-/// object that is missing `versions`, has a malformed list (wrong type,
-/// empty, non-positive, non-integer, or duplicate entries), or lacks `1`
-/// is an unsupported declaration in its entirety — not "supported because
-/// `1` appears somewhere in an otherwise malformed array."
-fn is_compatible_thread_identity_versions(versions: &serde_json::Value) -> bool {
+/// Validates an experimental MCP capability's `versions` value against the
+/// shared exact grammar: a non-empty JSON array of distinct positive integers,
+/// compatible only when it contains the caller's supported version. An object
+/// that is missing `versions`, has a malformed list (wrong type, empty,
+/// non-positive, non-integer, or duplicate entries), or lacks that version is
+/// an unsupported declaration in its entirety — not "supported because the
+/// version appears somewhere in an otherwise malformed array."
+fn is_compatible_capability_versions(versions: &serde_json::Value, supported_version: i64) -> bool {
     let Some(entries) = versions.as_array() else {
         return false;
     };
@@ -1070,7 +1070,11 @@ fn is_compatible_thread_identity_versions(versions: &serde_json::Value) -> bool 
             return false;
         }
     }
-    seen.contains(&MCP_THREAD_IDENTITY_SUPPORTED_VERSION)
+    seen.contains(&supported_version)
+}
+
+fn is_compatible_thread_identity_versions(versions: &serde_json::Value) -> bool {
+    is_compatible_capability_versions(versions, MCP_THREAD_IDENTITY_SUPPORTED_VERSION)
 }
 
 /// Whether `peer_info` declares a compatible `codex/thread-identity`
@@ -1119,7 +1123,7 @@ fn declares_compatible_control_endpoint(peer_info: &ServerPeerInfo) -> bool {
 }
 
 fn is_compatible_control_endpoint_versions(versions: &serde_json::Value) -> bool {
-    is_compatible_thread_identity_versions(versions)
+    is_compatible_capability_versions(versions, MCP_CONTROL_ENDPOINT_SUPPORTED_VERSION)
 }
 
 fn control_endpoint_params(endpoint: &str) -> serde_json::Value {
@@ -1553,6 +1557,67 @@ mod tests {
             .expect("initialize should succeed")
     }
 
+    fn control_endpoint_test_initialize_response(
+        request: &serde_json::Value,
+        experimental_versions: Option<&serde_json::Value>,
+    ) -> ResponseTemplate {
+        let mut capabilities = serde_json::json!({"tools": {}});
+        if let Some(versions) = experimental_versions {
+            capabilities["experimental"] = serde_json::json!({
+                MCP_CONTROL_ENDPOINT_CAPABILITY: {"versions": versions},
+            });
+        }
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {
+                "protocolVersion": THREAD_IDENTITY_TEST_LEGACY_VERSION,
+                "capabilities": capabilities,
+                "serverInfo": {"name": "control-endpoint-test-server", "version": "1.0.0"},
+            },
+        }))
+    }
+
+    async fn start_control_endpoint_test_client(
+        experimental_versions: Option<serde_json::Value>,
+    ) -> (RmcpClient, MockServer) {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(move |request: &Request| {
+                let body: serde_json::Value = request.body_json().expect("valid JSON-RPC request");
+                match body["method"].as_str() {
+                    Some("initialize") => control_endpoint_test_initialize_response(
+                        &body,
+                        experimental_versions.as_ref(),
+                    ),
+                    Some("notifications/initialized") => ResponseTemplate::new(202),
+                    Some(MCP_CONTROL_ENDPOINT_CAPABILITY) => panic!(
+                        "no endpoint request may be sent for an absent, malformed, or unsupported declaration"
+                    ),
+                    other => panic!("unexpected control-endpoint test method: {other:?}"),
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let client = RmcpClient::new_streamable_http_client_with_protocol_mode(
+            "control-endpoint-declaration-test",
+            &format!("{}/mcp", server.uri()),
+            /*bearer_token*/ None,
+            /*http_headers*/ None,
+            /*env_http_headers*/ None,
+            OAuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::default(),
+            codex_exec_server::Environment::default_for_tests().get_http_client(),
+            /*auth_provider*/ None,
+            McpProtocolMode::Legacy,
+        )
+        .await
+        .expect("client should construct");
+        (client, server)
+    }
+
     #[tokio::test]
     async fn bind_thread_identity_sends_exact_request_and_accepts_matching_ack() {
         let (client, server) = start_thread_identity_test_client(
@@ -1826,6 +1891,199 @@ mod tests {
             "tools/list must run only after endpoint acknowledgement acceptance"
         );
         client.shutdown().await;
+    }
+
+    /// Capability declarations that are absent, malformed, or declare only a
+    /// different version must all skip endpoint disclosure. The unsupported
+    /// version case is the removal discriminator for keeping this gate tied to
+    /// the control-endpoint protocol version rather than another extension's
+    /// coincidentally equal version constant.
+    #[tokio::test]
+    async fn control_endpoint_skips_absent_malformed_and_unsupported_declarations() {
+        for (case, versions) in [
+            ("absent", None),
+            ("malformed", Some(serde_json::json!("1"))),
+            ("unsupported", Some(serde_json::json!([2]))),
+        ] {
+            let (client, server) = start_control_endpoint_test_client(versions).await;
+            let initialize_result = thread_identity_test_initialize(&client).await;
+
+            let result = bind_control_endpoint(
+                &client,
+                &initialize_result,
+                "unix:///tmp/kcf-control.sock",
+                Some(Duration::from_secs(5)),
+            )
+            .await;
+            assert!(
+                result.is_ok(),
+                "the {case} declaration must skip endpoint disclosure: {result:?}"
+            );
+
+            let sent_endpoint_request = server
+                .received_requests()
+                .await
+                .expect("mock server should record requests")
+                .into_iter()
+                .map(|request| request.body_json::<serde_json::Value>().unwrap())
+                .any(|body| body["method"] == MCP_CONTROL_ENDPOINT_CAPABILITY);
+            assert!(
+                !sent_endpoint_request,
+                "the {case} declaration must not receive an endpoint request"
+            );
+
+            client.shutdown().await;
+        }
+    }
+
+    async fn start_control_endpoint_reconnect_test_client(
+        endpoint_acknowledged: bool,
+    ) -> (RmcpClient, MockServer, Arc<AtomicBool>) {
+        const ENDPOINT: &str = "unix:///tmp/kcf-reconnect-control.sock";
+        const SESSION_ID: &str = "control-endpoint-reconnect-test-session";
+
+        let session_expiry_armed = Arc::new(AtomicBool::new(false));
+        let session_expiry_armed_for_mock = Arc::clone(&session_expiry_armed);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(move |request: &Request| {
+                let body: serde_json::Value = request.body_json().expect("valid JSON-RPC request");
+                match body["method"].as_str() {
+                    Some("initialize") => ResponseTemplate::new(200)
+                        .append_header("Mcp-Session-Id", SESSION_ID)
+                        .set_body_json(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": body["id"],
+                            "result": {
+                                "protocolVersion": THREAD_IDENTITY_TEST_LEGACY_VERSION,
+                                "capabilities": {"tools": {}, "experimental": {
+                                    MCP_CONTROL_ENDPOINT_CAPABILITY: {"versions": [1]},
+                                }},
+                                "serverInfo": {"name": "control-endpoint-reconnect-test", "version": "1.0.0"},
+                            },
+                        })),
+                    Some("notifications/initialized") => ResponseTemplate::new(202),
+                    Some(MCP_CONTROL_ENDPOINT_CAPABILITY) => {
+                        let params = body["params"].as_object().expect("endpoint params object");
+                        assert_eq!(params["version"], serde_json::json!(1));
+                        assert_eq!(params["endpoint"], serde_json::json!(ENDPOINT));
+                        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": body["id"],
+                            "result": {"version": 1, "accepted": endpoint_acknowledged},
+                        }))
+                    }
+                    Some("tools/list") => {
+                        if session_expiry_armed_for_mock.swap(false, Ordering::SeqCst) {
+                            ResponseTemplate::new(404)
+                        } else {
+                            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": body["id"],
+                                "result": {"tools": []},
+                            }))
+                        }
+                    }
+                    other => panic!("unexpected control-endpoint reconnect method: {other:?}"),
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let client = RmcpClient::new_streamable_http_client_with_protocol_mode(
+            "control-endpoint-reconnect-test",
+            &format!("{}/mcp", server.uri()),
+            /*bearer_token*/ None,
+            /*http_headers*/ None,
+            /*env_http_headers*/ None,
+            OAuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::default(),
+            codex_exec_server::Environment::default_for_tests().get_http_client(),
+            /*auth_provider*/ None,
+            McpProtocolMode::Legacy,
+        )
+        .await
+        .expect("client should construct")
+        .with_post_reconnect_hook(connection_handshake_reconnect_hook(
+            /*canonical_thread_id*/ None,
+            Some(ENDPOINT.to_string()),
+            Some(Duration::from_secs(5)),
+        ));
+        thread_identity_test_initialize(&client).await;
+        client
+            .list_tools(/*params*/ None, Some(Duration::from_secs(5)))
+            .await
+            .expect("warmup tools/list should succeed before session expiry is armed");
+
+        (client, server, session_expiry_armed)
+    }
+
+    #[tokio::test]
+    async fn control_endpoint_reconnect_handshake_rebinds_before_retrying_operations() {
+        let (client, server, session_expiry_armed) =
+            start_control_endpoint_reconnect_test_client(/*endpoint_acknowledged*/ true).await;
+        session_expiry_armed.store(true, Ordering::SeqCst);
+
+        let result = client
+            .list_tools(/*params*/ None, Some(Duration::from_secs(5)))
+            .await;
+        assert!(
+            result.is_ok(),
+            "a compatible endpoint acknowledgement must admit the recovered connection: {result:?}"
+        );
+        assert!(
+            !client.is_closed().await,
+            "an accepted endpoint rebind must leave the recovered connection usable"
+        );
+
+        let endpoint_request_count = server
+            .received_requests()
+            .await
+            .expect("mock server should record requests")
+            .into_iter()
+            .filter_map(|request| request.body_json::<serde_json::Value>().ok())
+            .filter(|body| body["method"] == MCP_CONTROL_ENDPOINT_CAPABILITY)
+            .count();
+        assert_eq!(
+            endpoint_request_count, 1,
+            "the endpoint must be negotiated once on the recovered physical connection"
+        );
+
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn rejected_control_endpoint_reconnect_handshake_closes_the_connection() {
+        let (client, server, session_expiry_armed) =
+            start_control_endpoint_reconnect_test_client(/*endpoint_acknowledged*/ false).await;
+        session_expiry_armed.store(true, Ordering::SeqCst);
+
+        let error = client
+            .list_tools(/*params*/ None, Some(Duration::from_secs(5)))
+            .await
+            .expect_err("a rejected endpoint rebind must reject recovery");
+        assert!(
+            format!("{error:#}").contains("post-reconnect binding gate"),
+            "the endpoint rejection must surface as the reconnect gate: {error:#}"
+        );
+        assert!(
+            client.is_closed().await,
+            "a rejected endpoint rebind must close the connection rather than leave it retryable"
+        );
+
+        let endpoint_request_count = server
+            .received_requests()
+            .await
+            .expect("mock server should record requests")
+            .into_iter()
+            .filter_map(|request| request.body_json::<serde_json::Value>().ok())
+            .filter(|body| body["method"] == MCP_CONTROL_ENDPOINT_CAPABILITY)
+            .count();
+        assert_eq!(
+            endpoint_request_count, 1,
+            "a rejected recovered connection must not retry endpoint negotiation"
+        );
     }
 
     #[tokio::test]

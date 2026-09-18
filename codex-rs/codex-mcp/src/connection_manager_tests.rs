@@ -4613,6 +4613,33 @@ fn control_endpoint_eligibility_toggle_does_not_reuse_connection() {
 }
 
 #[test]
+fn ineligible_server_is_never_given_control_endpoint() {
+    let runtime_context = reusable_server_runtime_context();
+    let identity = control_endpoint_reuse_identity(
+        &runtime_context,
+        /*control_endpoint_eligible*/ false,
+        Some("unix:///tmp/kcf-control.sock"),
+    );
+
+    assert_eq!(identity.control_endpoint, None);
+}
+
+#[test]
+fn eligible_server_receives_control_endpoint() {
+    let runtime_context = reusable_server_runtime_context();
+    let identity = control_endpoint_reuse_identity(
+        &runtime_context,
+        /*control_endpoint_eligible*/ true,
+        Some("unix:///tmp/kcf-control.sock"),
+    );
+
+    assert_eq!(
+        identity.control_endpoint.as_deref(),
+        Some("unix:///tmp/kcf-control.sock")
+    );
+}
+
+#[test]
 fn eligible_server_with_changed_control_endpoint_does_not_reuse_connection() {
     let runtime_context = reusable_server_runtime_context();
     let before = control_endpoint_reuse_identity(

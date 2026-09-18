@@ -234,7 +234,10 @@ impl McpServerConnectionIdentity {
             agent_plugin: server.is_agent_plugin(),
             thread_identity_eligible: config.thread_identity_eligible,
             canonical_thread_id,
-            control_endpoint,
+            control_endpoint: config
+                .control_endpoint_eligible
+                .then_some(control_endpoint)
+                .flatten(),
             control_endpoint_eligible: config.control_endpoint_eligible,
         }
     }

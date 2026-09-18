@@ -6226,36 +6226,90 @@ fn eligible_server_with_unchanged_thread_id_reuses_connection() {
 /// Connection reuse must re-run the generic endpoint negotiation when a
 /// provider's explicit eligibility changes; otherwise an already-live
 /// physical MCP connection can retain a stale discovery contract.
+fn control_endpoint_reuse_identity(
+    runtime_context: &McpRuntimeContext,
+    control_endpoint_eligible: bool,
+    control_endpoint: Option<&str>,
+) -> McpServerConnectionIdentity {
+    let mut config = reusable_server_config("http://127.0.0.1:1");
+    config.control_endpoint_eligible = control_endpoint_eligible;
+    let server = EffectiveMcpServer::configured(config.clone());
+    let resolved_environment = runtime_context.resolve_server_environment("docs", &config);
+    McpServerConnectionIdentity::new(
+        "docs",
+        &server,
+        OAuthCredentialsStoreMode::default(),
+        AuthKeyringBackendKind::default(),
+        &resolved_environment,
+        runtime_context,
+        /*runtime_auth_provider*/ None,
+        /*auth*/ None,
+        /*codex_apps_cache_identity*/ None,
+        ElicitationCapability::default(),
+        ClientMcpExtensions::default(),
+        /*canonical_thread_id*/ None,
+        control_endpoint.map(str::to_string),
+        /*previous_identity*/ None,
+    )
+}
+
 #[test]
 fn control_endpoint_eligibility_toggle_does_not_reuse_connection() {
     let runtime_context = reusable_server_runtime_context();
-    let identity = |eligible| {
-        let mut config = reusable_server_config("http://127.0.0.1:1");
-        config.control_endpoint_eligible = eligible;
-        let server = EffectiveMcpServer::configured(config.clone());
-        let resolved_environment = runtime_context.resolve_server_environment("docs", &config);
-        McpServerConnectionIdentity::new(
-            "docs",
-            &server,
-            OAuthCredentialsStoreMode::default(),
-            AuthKeyringBackendKind::default(),
-            &resolved_environment,
-            &runtime_context,
-            /*runtime_auth_provider*/ None,
-            /*auth*/ None,
-            /*codex_apps_cache_identity*/ None,
-            ElicitationCapability::default(),
-            ClientMcpExtensions::default(),
-            /*canonical_thread_id*/ None,
-            Some("unix:///tmp/kcf-control.sock".to_string()),
-            /*previous_identity*/ None,
-        )
-    };
-    let ineligible = identity(false);
-    let eligible = identity(true);
+    let ineligible = control_endpoint_reuse_identity(
+        &runtime_context,
+        /*control_endpoint_eligible*/ false,
+        Some("unix:///tmp/kcf-control.sock"),
+    );
+    let eligible = control_endpoint_reuse_identity(
+        &runtime_context,
+        /*control_endpoint_eligible*/ true,
+        Some("unix:///tmp/kcf-control.sock"),
+    );
 
     assert!(!ineligible.has_same_connection_config(&eligible));
     assert!(!eligible.has_same_connection_config(&ineligible));
+}
+
+#[test]
+fn eligible_server_with_changed_control_endpoint_does_not_reuse_connection() {
+    let runtime_context = reusable_server_runtime_context();
+    let before = control_endpoint_reuse_identity(
+        &runtime_context,
+        /*control_endpoint_eligible*/ true,
+        Some("unix:///tmp/kcf-control-a.sock"),
+    );
+    let after = control_endpoint_reuse_identity(
+        &runtime_context,
+        /*control_endpoint_eligible*/ true,
+        Some("unix:///tmp/kcf-control-b.sock"),
+    );
+
+    assert!(
+        !before.has_same_connection_config(&after),
+        "an eligible server must renegotiate discovery after its control endpoint changes"
+    );
+}
+
+#[test]
+fn ineligible_server_with_changed_control_endpoint_reuses_connection() {
+    let runtime_context = reusable_server_runtime_context();
+    let before = control_endpoint_reuse_identity(
+        &runtime_context,
+        /*control_endpoint_eligible*/ false,
+        Some("unix:///tmp/kcf-control-a.sock"),
+    );
+    let after = control_endpoint_reuse_identity(
+        &runtime_context,
+        /*control_endpoint_eligible*/ false,
+        Some("unix:///tmp/kcf-control-b.sock"),
+    );
+
+    assert!(
+        before.has_same_connection_config(&after),
+        "an ineligible server never receives endpoint discovery, so endpoint changes cannot \
+         force a reconnect"
+    );
 }
 
 #[tokio::test]

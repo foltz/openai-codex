@@ -434,6 +434,7 @@ pub async fn read_mcp_resource(
     tool_catalog_cache: crate::McpToolCatalogCache,
     server: &str,
     params: ReadResourceRequestParams,
+    control_endpoint: Option<String>,
 ) -> anyhow::Result<ReadResourceResult> {
     let mut mcp_servers = effective_mcp_servers(config, auth);
     mcp_servers.retain(|name, _| name == server);
@@ -461,7 +462,10 @@ pub async fn read_mcp_resource(
             elicitation_reviewer: None,
             elicitation_lifecycle: None,
             canonical_thread_id: None,
-            control_endpoint: None,
+            // A threadless app-server resource read is still a provider
+            // operation hosted by this process. Eligible providers must see
+            // the same process-owned endpoint as status and session startup.
+            control_endpoint,
         },
         crate::elicitation::ElicitationRequestRouter::default(),
     )

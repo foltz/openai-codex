@@ -318,8 +318,7 @@ impl ThreadRequestProcessor {
                     initial_history: InitialHistory::Cleared,
                     thread_source: predecessor_snapshot.thread_source.clone(),
                     environments: Some(predecessor_snapshot.environment_selections().to_vec()),
-                    control_endpoint: self.control_endpoint.clone(),
-                    ..StartThreadOptions::new(config, None)
+                    ..StartThreadOptions::new(config, self.control_endpoint.clone())
                 },
                 predecessor_thread_id,
                 successor_thread_id,

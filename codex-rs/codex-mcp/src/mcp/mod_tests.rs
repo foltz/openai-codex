@@ -22,6 +22,8 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use wiremock::Mock;
 use wiremock::MockServer;
 use wiremock::Request;
@@ -696,6 +698,8 @@ async fn effective_mcp_servers_preserve_runtime_servers() {
 async fn status_snapshot_discloses_the_process_control_endpoint_to_an_eligible_provider() {
     const ENDPOINT: &str = "unix:///tmp/kcf-status-control.sock";
     let server = MockServer::start().await;
+    let endpoint_request_received = Arc::new(AtomicBool::new(false));
+    let endpoint_request_observed = Arc::clone(&endpoint_request_received);
     Mock::given(method("POST"))
         .and(path("/mcp"))
         .respond_with(move |request: &Request| {
@@ -720,6 +724,7 @@ async fn status_snapshot_discloses_the_process_control_endpoint_to_an_eligible_p
                     let params = body["params"].as_object().expect("endpoint params object");
                     assert_eq!(params["version"], serde_json::json!(1));
                     assert_eq!(params["endpoint"], serde_json::json!(ENDPOINT));
+                    endpoint_request_observed.store(true, Ordering::SeqCst);
                     ResponseTemplate::new(200).set_body_json(serde_json::json!({
                         "jsonrpc": "2.0",
                         "id": body["id"],
@@ -787,6 +792,10 @@ async fn status_snapshot_discloses_the_process_control_endpoint_to_an_eligible_p
     )
     .await;
 
+    assert!(
+        endpoint_request_received.load(Ordering::SeqCst),
+        "eligible status provider must receive and acknowledge the process control endpoint"
+    );
     assert!(
         snapshot
             .server_infos

@@ -690,6 +690,16 @@ impl Session {
         state.session_configuration.originator.clone()
     }
 
+    #[cfg(test)]
+    pub(crate) async fn control_endpoint_for_test(&self) -> Option<String> {
+        self.state
+            .lock()
+            .await
+            .session_configuration
+            .control_endpoint
+            .clone()
+    }
+
     pub(crate) async fn responses_metadata(
         &self,
         step_context: &StepContext,

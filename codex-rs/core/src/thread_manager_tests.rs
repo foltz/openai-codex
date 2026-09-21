@@ -46,12 +46,14 @@ use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::user_input::UserInput;
+use codex_thread_store::PreparedFork;
 use codex_utils_path_uri::PathUri;
 use core_test_support::PathBufExt;
 use core_test_support::PathExt;
 use core_test_support::responses::mount_models_once;
 use core_test_support::responses::strip_response_item_ids_from_json;
 use pretty_assertions::assert_eq;
+use std::future::Future;
 use std::time::Duration;
 use tempfile::tempdir;
 use wiremock::MockServer;
@@ -283,6 +285,21 @@ async fn thread_analytics_opt_out_overrides_shared_client() {
     assert_eq!(actual_thread_ids, expected_thread_ids);
 }
 
+fn run_async_on_large_stack(future: impl Future<Output = ()> + Send + 'static) {
+    let worker = std::thread::Builder::new()
+        .name("thread-manager-endpoint-lifecycle-test".to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build lifecycle test runtime")
+                .block_on(future);
+        })
+        .expect("spawn lifecycle test worker");
+    worker.join().expect("lifecycle test worker must not panic");
+}
+
 /// Controls without a custom allocation policy still produce distinct thread identifiers.
 #[test]
 fn thread_id_generator_defaults_to_standard_ids() {
@@ -351,16 +368,41 @@ async fn reserved_thread_id_is_used_without_changing_normal_id_generation() {
 }
 
 
-#[tokio::test]
-async fn start_thread_options_preserve_the_explicit_host_control_endpoint() {
-    let endpoint = "unix:///tmp/kcf-production-control.sock".to_string();
-    let options = StartThreadOptions::new(test_config().await, Some(endpoint.clone()));
+#[test]
+fn fresh_thread_preserves_the_explicit_host_control_endpoint() {
+    run_async_on_large_stack(async {
+        let endpoint = "unix:///tmp/kcf-production-control.sock".to_string();
+        let config = test_config().await;
+        let manager = ThreadManager::with_models_provider_and_home_for_tests(
+            CodexAuth::from_api_key("dummy"),
+            config.model_provider.clone(),
+            config.codex_home.to_path_buf(),
+            Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        );
+        let thread = manager
+            .start_thread(StartThreadOptions::new(config, Some(endpoint.clone())))
+            .await
+            .expect("start fresh thread");
 
-    assert_eq!(options.control_endpoint, Some(endpoint));
+        assert_eq!(
+            thread.thread.session.control_endpoint_for_test().await,
+            Some(endpoint),
+            "fresh thread must retain the app-server endpoint for its initial MCP runtime"
+        );
+        thread
+            .thread
+            .shutdown_and_wait()
+            .await
+            .expect("shutdown fresh thread");
+    });
 }
 
-#[tokio::test]
-async fn clear_successor_defers_authoritative_session_start() {
+#[test]
+fn clear_successor_defers_authoritative_session_start() {
+    run_async_on_large_stack(clear_successor_defers_authoritative_session_start_impl());
+}
+
+async fn clear_successor_defers_authoritative_session_start_impl() {
     let temp_dir = tempdir().expect("tempdir");
     let codex_home = temp_dir.path().join("codex-home").abs();
     std::fs::create_dir_all(&codex_home).expect("create codex home");
@@ -438,11 +480,12 @@ with Path(r"{hook_log}").open("a", encoding="utf-8") as handle:
         .expect("start predecessor");
     let predecessor_thread_id = predecessor.thread_id;
 
+    let endpoint = "unix:///tmp/kcf-clear-control.sock".to_string();
     let successor = manager
         .start_thread_for_clear(
             StartThreadOptions {
                 initial_history: InitialHistory::Cleared,
-                ..StartThreadOptions::new(config.clone(), None)
+                ..StartThreadOptions::new(config.clone(), Some(endpoint.clone()))
             },
             predecessor_thread_id,
             successor_thread_id,
@@ -451,6 +494,11 @@ with Path(r"{hook_log}").open("a", encoding="utf-8") as handle:
         .await
         .expect("start clear successor");
     assert_eq!(successor.thread_id, successor_thread_id);
+    assert_eq!(
+        successor.thread.session.control_endpoint_for_test().await,
+        Some(endpoint),
+        "clear successor must retain the hosting app-server endpoint"
+    );
     assert!(!hook_log.exists(), "clear start must remain deferred");
     successor.thread.ensure_rollout_materialized().await;
     successor
@@ -2460,8 +2508,12 @@ async fn resume_active_thread_from_rollout_returns_running_thread() {
         .expect("shutdown source thread");
 }
 
-#[tokio::test]
-async fn resume_stopped_thread_from_rollout_spawns_new_thread() {
+#[test]
+fn resume_stopped_thread_from_rollout_spawns_new_thread() {
+    run_async_on_large_stack(resume_stopped_thread_from_rollout_spawns_new_thread_impl());
+}
+
+async fn resume_stopped_thread_from_rollout_spawns_new_thread_impl() {
     let temp_dir = tempdir().expect("tempdir");
     let mut config = test_config().await;
     config.codex_home = temp_dir.path().join("codex-home").abs();
@@ -2508,6 +2560,7 @@ async fn resume_stopped_thread_from_rollout_spawns_new_thread() {
         .await
         .expect("shutdown source thread");
 
+    let endpoint = "unix:///tmp/kcf-resume-control.sock".to_string();
     let resumed = manager
         .resume_thread_from_rollout(
             config,
@@ -2515,18 +2568,81 @@ async fn resume_stopped_thread_from_rollout_spawns_new_thread() {
             auth_manager,
             /*parent_trace*/ None,
             ClientMcpExtensions::default(),
-            None,
+            Some(endpoint.clone()),
         )
         .await
         .expect("resume stopped source thread");
     assert_eq!(resumed.thread_id, source.thread_id);
     assert!(!Arc::ptr_eq(&resumed.thread, &source.thread));
+    assert_eq!(
+        resumed.thread.session.control_endpoint_for_test().await,
+        Some(endpoint),
+        "cold resume must retain the hosting app-server endpoint"
+    );
 
     resumed
         .thread
         .shutdown_and_wait()
         .await
         .expect("shutdown resumed thread");
+}
+
+#[test]
+fn copied_and_reference_forks_preserve_the_explicit_host_control_endpoint() {
+    run_async_on_large_stack(async {
+        let config = test_config().await;
+        let manager = ThreadManager::with_models_provider_and_home_for_tests(
+            CodexAuth::from_api_key("dummy"),
+            config.model_provider.clone(),
+            config.codex_home.to_path_buf(),
+            Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        );
+
+        let copied_endpoint = "unix:///tmp/kcf-copied-fork-control.sock".to_string();
+        let copied = manager
+            .fork_thread_from_history(
+                ForkSnapshot::Interrupted,
+                StartThreadOptions::new(config.clone(), Some(copied_endpoint.clone())),
+                InitialHistory::Forked(Vec::new()),
+            )
+            .await
+            .expect("start copied fork");
+        assert_eq!(
+            copied.thread.session.control_endpoint_for_test().await,
+            Some(copied_endpoint),
+            "copied fork must retain the hosting app-server endpoint"
+        );
+
+        let referenced_endpoint = "unix:///tmp/kcf-reference-fork-control.sock".to_string();
+        let referenced = manager
+            .fork_prepared_thread(
+                StartThreadOptions::new(config, Some(referenced_endpoint.clone())),
+                PreparedFork::new(
+                    ThreadId::new(),
+                    /*history_base*/ None,
+                    Arc::new(Vec::new()),
+                    "endpoint lifecycle test reservation",
+                ),
+            )
+            .await
+            .expect("start reference-backed fork");
+        assert_eq!(
+            referenced.thread.session.control_endpoint_for_test().await,
+            Some(referenced_endpoint),
+            "reference-backed fork must retain the hosting app-server endpoint"
+        );
+
+        copied
+            .thread
+            .shutdown_and_wait()
+            .await
+            .expect("shutdown copied fork");
+        referenced
+            .thread
+            .shutdown_and_wait()
+            .await
+            .expect("shutdown reference-backed fork");
+    });
 }
 
 #[tokio::test]

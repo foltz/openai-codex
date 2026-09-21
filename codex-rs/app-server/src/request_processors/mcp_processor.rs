@@ -502,6 +502,7 @@ impl McpRequestProcessor {
         let codex_apps_tools_cache = mcp_manager.codex_apps_tools_cache();
         let tool_catalog_cache = mcp_manager.tool_catalog_cache();
         let auth = self.auth_manager.auth().await;
+        let control_endpoint = self.control_endpoint.clone();
         let environment_manager = self.thread_manager.environment_manager();
         // This threadless resource-read path has no turn cwd or turn-selected
         // environment. Use config cwd only as the local stdio fallback; named
@@ -521,6 +522,7 @@ impl McpRequestProcessor {
                     tool_catalog_cache,
                     &server,
                     &uri,
+                    control_endpoint,
                 )
                 .await
                 .and_then(|result| serde_json::to_value(result).map_err(anyhow::Error::from));

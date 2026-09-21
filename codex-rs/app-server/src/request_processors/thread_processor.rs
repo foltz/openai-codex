@@ -1410,8 +1410,7 @@ impl ThreadRequestProcessor {
                 environments: Some(environments),
                 thread_extension_init,
                 client_mcp_extensions,
-                control_endpoint,
-                ..StartThreadOptions::new(config, None)
+                ..StartThreadOptions::new(config, control_endpoint)
             })
             .instrument(tracing::info_span!(
                 "app_server.thread_start.create_thread",

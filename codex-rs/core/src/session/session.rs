@@ -590,6 +590,16 @@ impl Session {
         state.session_configuration.originator.clone()
     }
 
+    #[cfg(test)]
+    pub(crate) async fn control_endpoint_for_test(&self) -> Option<String> {
+        self.state
+            .lock()
+            .await
+            .session_configuration
+            .control_endpoint
+            .clone()
+    }
+
     /// Selects the canonical `ThreadId` for a new `Session` instance from
     /// its initial-history kind. Extracted as a pure function (no `&self`,
     /// no I/O) so the exact rule per lifecycle transition — fresh, clear,

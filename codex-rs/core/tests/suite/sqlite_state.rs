@@ -154,7 +154,7 @@ async fn resume_restores_dynamic_tools_from_rollout_with_sqlite_enabled() -> Res
         .thread_manager
         .start_thread(StartThreadOptions {
             dynamic_tools: vec![dynamic_tool],
-            ..StartThreadOptions::new(base_test.config.clone())
+            ..StartThreadOptions::new(base_test.config.clone(), None)
         })
         .await?;
     let rollout_path = started
@@ -253,7 +253,7 @@ async fn resume_restores_legacy_dynamic_tools_from_rollout_with_sqlite_enabled()
     let base_test = builder.build(&server).await?;
     let started = base_test
         .thread_manager
-        .start_thread(StartThreadOptions::new(base_test.config.clone()))
+        .start_thread(StartThreadOptions::new(base_test.config.clone(), None))
         .await?;
     let rollout_path = started
         .session_configured

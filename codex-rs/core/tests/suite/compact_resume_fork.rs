@@ -832,6 +832,7 @@ async fn resume_conversation(
         auth_manager,
         /*parent_trace*/ None,
         ClientMcpExtensions::default(),
+        None,
     ))
     .await
     .expect("resume conversation")

@@ -943,7 +943,7 @@ async fn code_mode_excludes_mcp_servers_using_their_configured_identity() -> Res
                             },
                         )],
                     })],
-                    ..StartThreadOptions::new(base_test.config.clone())
+                    ..StartThreadOptions::new(base_test.config.clone(), None)
                 })
                 .await?;
             let mut test = base_test;
@@ -4883,7 +4883,7 @@ async fn code_mode_uses_the_first_dynamic_tool_for_a_normalized_name() -> Result
                     })
                 })
                 .collect(),
-                ..StartThreadOptions::new(base_test.config.clone())
+                ..StartThreadOptions::new(base_test.config.clone(), None)
             })
             .await?;
         let mut test = base_test;
@@ -5105,7 +5105,7 @@ async fn code_mode_can_call_hidden_dynamic_tools() -> Result<()> {
                     },
                 )],
             })],
-            ..StartThreadOptions::new(base_test.config.clone())
+            ..StartThreadOptions::new(base_test.config.clone(), None)
         })
         .await?;
     let mut test = base_test;
@@ -5271,7 +5271,7 @@ async fn code_mode_excludes_configured_nested_tool_namespaces() -> Result<()> {
                     },
                 )],
             })],
-            ..StartThreadOptions::new(base_test.config.clone())
+            ..StartThreadOptions::new(base_test.config.clone(), None)
         })
         .await?;
     let mut test = base_test;

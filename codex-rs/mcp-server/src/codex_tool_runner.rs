@@ -68,7 +68,7 @@ pub async fn run_codex_tool_session(
         thread,
         session_configured,
     } = match thread_manager
-        .start_thread(StartThreadOptions::new(config.clone()))
+        .start_thread(StartThreadOptions::new(config.clone(), None))
         .await
     {
         Ok(res) => res,

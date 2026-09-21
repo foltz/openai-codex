@@ -118,6 +118,7 @@ async fn emits_warning_when_resumed_model_differs() {
             auth_manager,
             /*parent_trace*/ None,
             ClientMcpExtensions::default(),
+            None,
         )
         .await
         .expect("resume conversation");

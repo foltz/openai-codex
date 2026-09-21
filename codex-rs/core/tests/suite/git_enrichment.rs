@@ -271,7 +271,7 @@ async fn ephemeral_system_thread_prewarm_skips_and_turn_observes_fresh_state() -
         .thread_manager
         .start_thread(StartThreadOptions {
             thread_source: Some(ThreadSource::Feature("system".to_string())),
-            ..StartThreadOptions::new(config)
+            ..StartThreadOptions::new(config, None)
         })
         .await?;
     let prewarm = tokio::time::timeout(
@@ -387,7 +387,7 @@ async fn concurrent_turns_keep_distinct_worktree_and_repository_metadata() -> Re
         .thread_manager
         .start_thread(StartThreadOptions {
             thread_source: Some(ThreadSource::User),
-            ..StartThreadOptions::new(worktree_config)
+            ..StartThreadOptions::new(worktree_config, None)
         })
         .await?;
 
@@ -397,7 +397,7 @@ async fn concurrent_turns_keep_distinct_worktree_and_repository_metadata() -> Re
         .thread_manager
         .start_thread(StartThreadOptions {
             thread_source: Some(ThreadSource::User),
-            ..StartThreadOptions::new(other_config)
+            ..StartThreadOptions::new(other_config, None)
         })
         .await?;
 

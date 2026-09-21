@@ -485,7 +485,7 @@ async fn loads_user_instructions_without_a_primary_environment() -> Result<()> {
         .thread_manager
         .start_thread(StartThreadOptions {
             environments: Some(Vec::new()),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), None)
         })
         .await?;
     assert_eq!(provider.load_count(), 2);
@@ -676,7 +676,7 @@ async fn multi_environment_project_instructions_share_one_byte_budget() -> Resul
                     workspace_roots: vec![PathUri::from_host_native_path(local_root.path())?],
                 },
             ]),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), None)
         })
         .await?;
 
@@ -754,7 +754,7 @@ async fn multi_environment_thread_loads_every_project_and_keeps_creation_snapsho
                     workspace_roots: vec![PathUri::from_host_native_path(local_root.path())?],
                 },
             ]),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), None)
         })
         .await?;
     assert_eq!(provider.load_count(), 2);

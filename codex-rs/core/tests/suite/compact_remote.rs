@@ -1148,7 +1148,7 @@ async fn remote_compact_v2_reuses_compaction_trigger_for_followups() -> Result<(
         .thread_manager
         .start_thread(StartThreadOptions {
             initial_history: InitialHistory::Forked(initial_history),
-            ..StartThreadOptions::new(harness.test().config.clone())
+            ..StartThreadOptions::new(harness.test().config.clone(), None)
         })
         .await?
         .thread;
@@ -1591,7 +1591,7 @@ async fn remote_compact_filters_deferred_dynamic_tools() -> Result<()> {
         .thread_manager
         .start_thread(StartThreadOptions {
             dynamic_tools,
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), None)
         })
         .await?;
     test.codex = new_thread.thread;
@@ -1710,7 +1710,7 @@ async fn remote_compact_does_not_charge_inline_audio_payload_as_text() -> Result
         .thread_manager
         .start_thread(StartThreadOptions {
             dynamic_tools: vec![dynamic_tool],
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), None)
         })
         .await?;
     test.codex = new_thread.thread;
@@ -2355,7 +2355,7 @@ async fn remote_compact_trims_tool_search_output_to_empty_tools_array() -> Resul
         .thread_manager
         .start_thread(StartThreadOptions {
             dynamic_tools: vec![dynamic_tool],
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), None)
         })
         .await?;
     test.codex = new_thread.thread;

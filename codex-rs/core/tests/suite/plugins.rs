@@ -837,7 +837,7 @@ async fn agent_turns_route_curated_plugin_skills_after_auth_switch() -> Result<(
         config.model_provider_id = model_provider_id.to_string();
         let thread = test_codex
             .thread_manager
-            .start_thread(codex_core::StartThreadOptions::new(config))
+            .start_thread(codex_core::StartThreadOptions::new(config, None))
             .await?
             .thread;
         thread

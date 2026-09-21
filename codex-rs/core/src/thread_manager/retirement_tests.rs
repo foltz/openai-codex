@@ -175,7 +175,7 @@ async fn failed_required_mcp_start_keeps_unpublished_session_until_cleanup() {
     );
     assert!(
         manager
-            .start_thread(StartThreadOptions::new(config))
+            .start_thread(StartThreadOptions::new(config, None))
             .await
             .is_err()
     );
@@ -247,14 +247,15 @@ async fn real_constructor_cancelled_before_publication_is_drained_after_close() 
     Arc::get_mut(&mut manager.state)
         .expect("builders retain unique State")
         .user_instructions_provider = provider.clone();
-    let mut observer = Box::pin(manager.start_thread(StartThreadOptions::new(config.clone())));
+    let mut observer =
+        Box::pin(manager.start_thread(StartThreadOptions::new(config.clone(), None)));
     assert!(futures::poll!(observer.as_mut()).is_pending());
     assert_eq!(provider.entered.load(Ordering::SeqCst), 1);
     drop(observer);
     manager.constructions.close();
     assert!(
         manager
-            .start_thread(StartThreadOptions::new(config))
+            .start_thread(StartThreadOptions::new(config, None))
             .await
             .is_err()
     );

@@ -99,7 +99,7 @@ async fn fixture_with_extensions(
 async fn processor_thread_owner_closes_before_poll_and_replays_one_attempt() {
     let (_home, manager, config) = fixture().await;
     let started = manager
-        .start_thread(StartThreadOptions::new(config.clone()))
+        .start_thread(StartThreadOptions::new(config.clone(), None))
         .await
         .unwrap();
     let state = ThreadStateManager::new();
@@ -109,7 +109,7 @@ async fn processor_thread_owner_closes_before_poll_and_replays_one_attempt() {
     drop(ticket);
     assert!(
         manager
-            .start_thread(StartThreadOptions::new(config))
+            .start_thread(StartThreadOptions::new(config, None))
             .await
             .is_err()
     );
@@ -175,7 +175,7 @@ async fn processor_thread_poison_refuses_without_closing_manager() {
         Err(ThreadManagerRetirementError::AuthorityUnavailable)
     ));
     let started = manager
-        .start_thread(StartThreadOptions::new(config))
+        .start_thread(StartThreadOptions::new(config, None))
         .await
         .unwrap();
     let report = manager
@@ -203,7 +203,7 @@ async fn processor_thread_ready_failed_cleanup_keeps_independent_custody() {
     extensions.thread_lifecycle_contributor(Arc::new(PanicOnStop));
     let (_home, manager, config) = fixture_with_extensions(Arc::new(extensions.build())).await;
     let started = manager
-        .start_thread(StartThreadOptions::new(config))
+        .start_thread(StartThreadOptions::new(config, None))
         .await
         .unwrap();
     let state = ThreadStateManager::new();

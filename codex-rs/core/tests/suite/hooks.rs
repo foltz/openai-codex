@@ -1656,7 +1656,7 @@ async fn session_end_skips_subagents() -> Result<()> {
             .start_thread(StartThreadOptions {
                 session_source: Some(SessionSource::SubAgent(source)),
                 environments: Some(Vec::new()),
-                ..StartThreadOptions::new(test.config.clone())
+                ..StartThreadOptions::new(test.config.clone(), None)
             })
             .await?;
 

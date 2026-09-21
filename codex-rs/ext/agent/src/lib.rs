@@ -67,7 +67,7 @@ impl AgentRunner {
                 parent_thread_id,
                 StartThreadOptions {
                     parent_trace: parent_trace.clone(),
-                    ..StartThreadOptions::new(config)
+                    ..StartThreadOptions::new(config, None)
                 },
             )
             .await?;

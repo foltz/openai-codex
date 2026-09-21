@@ -331,7 +331,7 @@ impl MemoryStartupContext {
                     InternalSessionSource::MemoryConsolidation,
                 )),
                 thread_source: Some(ThreadSource::MemoryConsolidation),
-                ..StartThreadOptions::new(config)
+                ..StartThreadOptions::new(config, None)
             })
             .await?;
 

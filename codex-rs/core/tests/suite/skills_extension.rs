@@ -1994,7 +1994,7 @@ async fn production_turn_keeps_orchestrator_world_state_incremental_across_turns
         .thread_manager
         .start_thread(StartThreadOptions {
             environments: Some(Vec::new()),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), None)
         })
         .await?;
 

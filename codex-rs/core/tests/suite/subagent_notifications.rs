@@ -803,7 +803,7 @@ async fn subagent_stop_replaces_stop_and_skips_internal_subagents() -> Result<()
         .start_thread(StartThreadOptions {
             session_source: Some(SessionSource::SubAgent(SubAgentSource::Review)),
             environments: Some(Vec::new()),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), None)
         })
         .await?;
 

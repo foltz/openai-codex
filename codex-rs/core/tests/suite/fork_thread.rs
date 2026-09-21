@@ -240,6 +240,7 @@ async fn assert_copied_fork_persists_inherited_history(history_mode: ThreadHisto
             /*thread_source*/ None,
             /*parent_trace*/ None,
             ClientMcpExtensions::default(),
+            None,
         )
         .await
         .expect("fork from stored history");
@@ -276,6 +277,7 @@ async fn assert_copied_fork_persists_inherited_history(history_mode: ThreadHisto
                 ),
                 /*parent_trace*/ None,
                 ClientMcpExtensions::default(),
+                None,
             )
             .await
             .expect("resume copied paginated fork")

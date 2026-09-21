@@ -30,7 +30,7 @@ async fn manager() -> (tempfile::TempDir, ThreadManager, Config) {
 async fn removed_runtime_stays_owned_until_exact_cleanup_completes() {
     let (_home, manager, config) = manager().await;
     let started = manager
-        .start_thread(StartThreadOptions::new(config))
+        .start_thread(StartThreadOptions::new(config, None))
         .await
         .unwrap();
     let weak = Arc::downgrade(&started.thread);
@@ -62,7 +62,7 @@ async fn removed_runtime_stays_owned_until_exact_cleanup_completes() {
 async fn loop_termination_alone_cannot_compact_removed_runtime() {
     let (_home, manager, config) = manager().await;
     let started = manager
-        .start_thread(StartThreadOptions::new(config))
+        .start_thread(StartThreadOptions::new(config, None))
         .await
         .unwrap();
     started.thread.io.session_loop_termination.request_abort();
@@ -98,7 +98,7 @@ async fn prior_legacy_cleanup_compacts_without_rebinding_or_reexecution() {
     let (_home, manager, config) = manager().await;
     for _ in 0..6 {
         let started = manager
-            .start_thread(StartThreadOptions::new(config.clone()))
+            .start_thread(StartThreadOptions::new(config.clone(), None))
             .await
             .unwrap();
         assert_eq!(manager.constructions.published().len(), 1);
@@ -138,7 +138,7 @@ async fn failed_cleanup_remains_owned_after_loop_join() {
     extensions.thread_lifecycle_contributor(Arc::new(PanicOnStop));
     Arc::get_mut(&mut manager.state).unwrap().extensions = Arc::new(extensions.build());
     let started = manager
-        .start_thread(StartThreadOptions::new(config))
+        .start_thread(StartThreadOptions::new(config, None))
         .await
         .unwrap();
     assert!(started.thread.shutdown_and_wait().await.is_err());
@@ -171,7 +171,7 @@ async fn constructor_admitted_before_close_cannot_publish_after_close() {
     Arc::get_mut(&mut manager.state)
         .unwrap()
         .user_instructions_provider = Arc::new(HeldInstructions(Mutex::new(Some(held))));
-    let mut start = Box::pin(manager.start_thread(StartThreadOptions::new(config)));
+    let mut start = Box::pin(manager.start_thread(StartThreadOptions::new(config, None)));
     assert!(futures::poll!(start.as_mut()).is_pending());
     manager.constructions.close();
     release.send(()).unwrap();

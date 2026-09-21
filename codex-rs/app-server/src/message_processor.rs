@@ -744,6 +744,7 @@ impl MessageProcessor {
             config_manager.clone(),
             applied_mcp_config_identity,
             auxiliary_tasks.clone(),
+            control_endpoint.clone(),
         );
         let plugin_processor = PluginRequestProcessor::new(
             auth_manager.clone(),

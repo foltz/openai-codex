@@ -15,6 +15,7 @@ pub(crate) struct McpRequestProcessor {
     config_manager: ConfigManager,
     applied_mcp_config_identity: AppliedMcpConfigIdentity,
     tasks: ProcessorTasks,
+    control_endpoint: Option<String>,
 }
 
 impl McpRequestProcessor {
@@ -25,6 +26,7 @@ impl McpRequestProcessor {
         config_manager: ConfigManager,
         applied_mcp_config_identity: AppliedMcpConfigIdentity,
         tasks: ProcessorTasks,
+        control_endpoint: Option<String>,
     ) -> Self {
         Self {
             auth_manager,
@@ -33,6 +35,7 @@ impl McpRequestProcessor {
             config_manager,
             applied_mcp_config_identity,
             tasks,
+            control_endpoint,
         }
     }
 
@@ -311,6 +314,7 @@ impl McpRequestProcessor {
         };
         let mcp_manager = self.thread_manager.mcp_manager();
         let auth = self.auth_manager.auth().await;
+        let control_endpoint = self.control_endpoint.clone();
         let (mcp_config, runtime_context) = match thread {
             Some(thread) => thread.runtime_mcp_config_and_context(&config).await,
             None => {
@@ -334,6 +338,7 @@ impl McpRequestProcessor {
                     auth,
                     runtime_context,
                     mcp_manager,
+                    control_endpoint,
                 )
                 .await;
             })
@@ -349,6 +354,7 @@ impl McpRequestProcessor {
         auth: Option<CodexAuth>,
         runtime_context: McpRuntimeContext,
         mcp_manager: Arc<McpManager>,
+        control_endpoint: Option<String>,
     ) {
         let result = Self::list_mcp_server_status_response(
             request_id.request_id.to_string(),
@@ -357,6 +363,7 @@ impl McpRequestProcessor {
             auth,
             runtime_context,
             mcp_manager,
+            control_endpoint,
         )
         .await;
         outgoing.send_result(request_id, result).await;
@@ -369,6 +376,7 @@ impl McpRequestProcessor {
         auth: Option<CodexAuth>,
         runtime_context: McpRuntimeContext,
         mcp_manager: Arc<McpManager>,
+        control_endpoint: Option<String>,
     ) -> Result<ListMcpServerStatusResponse, JSONRPCErrorError> {
         let detail = match params.detail.unwrap_or(McpServerStatusDetail::Full) {
             McpServerStatusDetail::Full => McpSnapshotDetail::Full,
@@ -383,6 +391,7 @@ impl McpRequestProcessor {
             mcp_manager.codex_apps_tools_cache(),
             mcp_manager.tool_catalog_cache(),
             detail,
+            control_endpoint,
         )
         .await;
 

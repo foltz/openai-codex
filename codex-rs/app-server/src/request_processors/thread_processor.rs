@@ -1011,7 +1011,6 @@ impl ThreadRequestProcessor {
             fallback_model_provider: self.config.model_provider_id.clone(),
             codex_home: self.config.codex_home.to_path_buf(),
             skills_watcher: Arc::clone(&self.skills_watcher),
-            control_endpoint: self.control_endpoint.clone(),
         }
     }
 
@@ -1134,16 +1133,17 @@ impl ThreadRequestProcessor {
             fallback_model_provider: self.config.model_provider_id.clone(),
             codex_home: self.config.codex_home.to_path_buf(),
             skills_watcher: Arc::clone(&self.skills_watcher),
-            control_endpoint: self.control_endpoint.clone(),
         };
         let request_trace = request_context.request_trace();
         let config_manager = self.config_manager.clone();
+        let control_endpoint = self.control_endpoint.clone();
         let initial_config_warnings = Arc::clone(&self.initial_config_warnings);
         let outgoing = Arc::clone(&listener_task_context.outgoing);
         let error_request_id = request_id.clone();
         let thread_start_task = async move {
             if let Err(error) = Self::thread_start_task(
                 listener_task_context,
+                control_endpoint,
                 config_manager,
                 request_id,
                 app_server_client_name,
@@ -1258,6 +1258,7 @@ impl ThreadRequestProcessor {
     #[allow(clippy::too_many_arguments)]
     async fn thread_start_task(
         listener_task_context: ListenerTaskContext,
+        control_endpoint: Option<String>,
         config_manager: ConfigManager,
         request_id: ConnectionRequestId,
         app_server_client_name: Option<String>,
@@ -1409,8 +1410,8 @@ impl ThreadRequestProcessor {
                 environments: Some(environments),
                 thread_extension_init,
                 client_mcp_extensions,
-                control_endpoint: listener_task_context.control_endpoint.clone(),
-                ..StartThreadOptions::new(config)
+                control_endpoint,
+                ..StartThreadOptions::new(config, None)
             })
             .instrument(tracing::info_span!(
                 "app_server.thread_start.create_thread",
@@ -3369,6 +3370,7 @@ impl ThreadRequestProcessor {
                 self.auth_manager.clone(),
                 self.request_trace_context(&request_id).await,
                 client_mcp_extensions,
+                self.control_endpoint.clone(),
             )
             .await
         {
@@ -4402,6 +4404,7 @@ impl ThreadRequestProcessor {
                     thread_source,
                     parent_trace,
                     client_mcp_extensions.clone(),
+                    self.control_endpoint.clone(),
                 )
                 .await
         } else {
@@ -4417,6 +4420,7 @@ impl ThreadRequestProcessor {
                     thread_source,
                     parent_trace,
                     client_mcp_extensions,
+                    self.control_endpoint.clone(),
                 )
                 .await
         };

@@ -717,6 +717,7 @@ impl TestCodexBuilder {
                     auth_manager,
                     /*parent_trace*/ None,
                     client_mcp_extensions(),
+                    None,
                 ))
                 .await?
             }
@@ -735,7 +736,7 @@ impl TestCodexBuilder {
                 Box::pin(thread_manager.start_thread(StartThreadOptions {
                     history_mode: self.history_mode,
                     client_mcp_extensions: client_mcp_extensions(),
-                    ..StartThreadOptions::new(config.clone())
+                    ..StartThreadOptions::new(config.clone(), None)
                 }))
                 .await?
             }

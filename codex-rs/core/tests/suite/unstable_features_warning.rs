@@ -52,6 +52,7 @@ async fn emits_warning_when_unstable_features_enabled_via_config() {
             auth_manager,
             /*parent_trace*/ None,
             ClientMcpExtensions::default(),
+            None,
         )
         .await
         .expect("spawn conversation");
@@ -102,6 +103,7 @@ async fn suppresses_warning_when_configured() {
             auth_manager,
             /*parent_trace*/ None,
             ClientMcpExtensions::default(),
+            None,
         )
         .await
         .expect("spawn conversation");

@@ -88,7 +88,7 @@ async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history()
     let child = test
         .thread_manager
         .fork_prepared_thread(
-            codex_core::StartThreadOptions::new(test.config.clone()),
+            codex_core::StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None),
             prepared,
         )
         .await?;
@@ -178,6 +178,7 @@ async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history()
             )),
             /*parent_trace*/ None,
             ClientMcpExtensions::default(),
+            /*control_endpoint*/ None,
         )
         .await?;
     let followup = turn(

@@ -103,7 +103,7 @@ async fn fork_thread_twice_drops_to_first_message() {
     } = thread_manager
         .fork_thread(
             ForkSnapshot::TruncateBeforeNthUserMessage(1),
-            codex_core::StartThreadOptions::new(config_for_fork.clone()),
+            codex_core::StartThreadOptions::new(config_for_fork.clone(), /*control_endpoint*/ None),
             base_path.clone(),
         )
         .await
@@ -130,7 +130,7 @@ async fn fork_thread_twice_drops_to_first_message() {
     } = thread_manager
         .fork_thread(
             ForkSnapshot::TruncateBeforeNthUserMessage(0),
-            codex_core::StartThreadOptions::new(config_for_fork.clone()),
+            codex_core::StartThreadOptions::new(config_for_fork.clone(), /*control_endpoint*/ None),
             fork1_path.clone(),
         )
         .await
@@ -206,7 +206,7 @@ async fn fork_thread_restores_history_selection_and_preserves_explicit_clear() -
         .thread_manager
         .fork_thread_from_history(
             ForkSnapshot::Interrupted,
-            codex_core::StartThreadOptions::new(test.config.clone()),
+            codex_core::StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None),
             history.clone(),
         )
         .await?;
@@ -225,7 +225,7 @@ async fn fork_thread_restores_history_selection_and_preserves_explicit_clear() -
             ForkSnapshot::Interrupted,
             codex_core::StartThreadOptions {
                 disabled_plugin_ids: Some(Vec::new()),
-                ..codex_core::StartThreadOptions::new(test.config.clone())
+                ..codex_core::StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
             },
             history,
         )
@@ -298,7 +298,7 @@ async fn assert_copied_fork_persists_inherited_history(history_mode: ThreadHisto
     } = thread_manager
         .fork_thread_from_history(
             ForkSnapshot::Interrupted,
-            codex_core::StartThreadOptions::new(test.config.clone()),
+            codex_core::StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None),
             InitialHistory::Resumed(ResumedHistory {
                 conversation_id: test.session_configured.thread_id,
                 history: Arc::new(supplied_history),
@@ -340,6 +340,7 @@ async fn assert_copied_fork_persists_inherited_history(history_mode: ThreadHisto
                 ),
                 /*parent_trace*/ None,
                 ClientMcpExtensions::default(),
+                None,
             )
             .await
             .expect("resume copied paginated fork")

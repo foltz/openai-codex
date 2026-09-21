@@ -98,7 +98,7 @@ async fn dynamic_tool_audio_exceeding_the_output_budget_is_omitted() -> Result<(
         .thread_manager
         .start_thread(StartThreadOptions {
             dynamic_tools: vec![dynamic_tool],
-            ..StartThreadOptions::new(base_test.config.clone())
+            ..StartThreadOptions::new(base_test.config.clone(), None)
         })
         .await?;
     let mut test = base_test;

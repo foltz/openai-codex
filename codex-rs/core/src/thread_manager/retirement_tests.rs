@@ -175,7 +175,7 @@ async fn failed_required_mcp_start_keeps_unpublished_session_until_cleanup() {
     );
     assert!(
         manager
-            .start_thread(StartThreadOptions::new(config))
+            .start_thread(StartThreadOptions::new(config, None))
             .await
             .is_err()
     );
@@ -250,7 +250,7 @@ async fn real_constructor_cancelled_before_publication_is_drained_after_close() 
     Arc::get_mut(&mut manager.state)
         .expect("builders retain unique State")
         .user_instructions_provider = provider.clone();
-    let mut observer = Box::pin(manager.start_thread(StartThreadOptions::new(config.clone())));
+    let mut observer = Box::pin(manager.start_thread(StartThreadOptions::new(config.clone(), /*control_endpoint*/ None)));
     // Startup now has asynchronous work before loading instruction providers.
     // Drive the real constructor to the held boundary rather than assuming
     // that its first poll reaches it.
@@ -267,7 +267,7 @@ async fn real_constructor_cancelled_before_publication_is_drained_after_close() 
     manager.constructions.close();
     assert!(
         manager
-            .start_thread(StartThreadOptions::new(config))
+            .start_thread(StartThreadOptions::new(config, None))
             .await
             .is_err()
     );
@@ -331,7 +331,7 @@ async fn managed_cancellation_terminates_constructor_before_tracker_join() {
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
     );
     let manager = Arc::new(manager);
-    let mut options = StartThreadOptions::new(config);
+    let mut options = StartThreadOptions::new(config, /*control_endpoint*/ None);
     options.thread_extension_init.insert(codex_extension_api::SessionIsolation::Isolated);
     let tasks = tokio_util::task::TaskTracker::new();
     let mut start = Box::pin(manager.start_thread_until(options, std::future::pending(), &tasks));

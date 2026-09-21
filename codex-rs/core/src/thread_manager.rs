@@ -299,7 +299,13 @@ pub struct StartThreadOptions {
 }
 
 impl StartThreadOptions {
-    pub fn new(config: Config) -> Self {
+    /// Creates options with an explicitly classified hosting endpoint.
+    ///
+    /// Callers that do not own an app-server Unix listener must pass `None`;
+    /// app-server user-thread construction passes the process-owned endpoint.
+    /// Keeping this input explicit prevents resumed, forked, and internal
+    /// session construction from silently inheriting an unrelated endpoint.
+    pub fn new(config: Config, control_endpoint: Option<String>) -> Self {
         Self {
             config,
             thread_instructions_provider: None,
@@ -319,7 +325,7 @@ impl StartThreadOptions {
             client_mcp_extensions: ClientMcpExtensions::default(),
             reserved_thread_id: None,
             disabled_plugin_ids: None,
-            control_endpoint: None,
+            control_endpoint,
         }
     }
 }
@@ -1293,6 +1299,7 @@ impl ThreadManager {
         auth_manager: Arc<AuthManager>,
         parent_trace: Option<W3cTraceContext>,
         client_mcp_extensions: ClientMcpExtensions,
+        control_endpoint: Option<String>,
     ) -> CodexResult<NewThread> {
         let initial_history = self.initial_history_from_rollout_path(rollout_path).await?;
         Box::pin(self.resume_thread_with_history(
@@ -1301,6 +1308,7 @@ impl ThreadManager {
             auth_manager,
             parent_trace,
             client_mcp_extensions,
+            control_endpoint,
         ))
         .await
     }
@@ -1346,6 +1354,7 @@ impl ThreadManager {
         auth_manager: Arc<AuthManager>,
         parent_trace: Option<W3cTraceContext>,
         client_mcp_extensions: ClientMcpExtensions,
+        control_endpoint: Option<String>,
     ) -> CodexResult<NewThread> {
         let agent_control = self.agent_control_for_config(&config);
         let (session_source, thread_source) = initial_history
@@ -1357,7 +1366,7 @@ impl ThreadManager {
             thread_source,
             parent_trace,
             client_mcp_extensions,
-            ..StartThreadOptions::new(config)
+            ..StartThreadOptions::new(config, control_endpoint)
         };
         Box::pin(self.state.spawn_thread(ThreadSpawnRequest::new(
             options,
@@ -1376,7 +1385,7 @@ impl ThreadManager {
         let agent_control = self.agent_control_for_config(&config);
         let options = StartThreadOptions {
             client_mcp_extensions,
-            ..StartThreadOptions::new(config)
+            ..StartThreadOptions::new(config, None)
         };
         let mut request =
             ThreadSpawnRequest::new(options, Arc::clone(&self.state.auth_manager), agent_control);
@@ -1402,7 +1411,7 @@ impl ThreadManager {
             session_source: Some(session_source),
             thread_source,
             client_mcp_extensions,
-            ..StartThreadOptions::new(config)
+            ..StartThreadOptions::new(config, None)
         };
         let mut request = ThreadSpawnRequest::new(options, auth_manager, agent_control);
         request.user_shell_override = Some(user_shell_override);
@@ -2007,7 +2016,7 @@ impl ThreadManagerState {
             metrics_service_name,
             environments,
             client_mcp_extensions,
-            ..StartThreadOptions::new(config)
+            ..StartThreadOptions::new(config, None)
         };
         let mut request =
             ThreadSpawnRequest::new(options, Arc::clone(&self.auth_manager), agent_control);
@@ -2050,7 +2059,7 @@ impl ThreadManagerState {
             thread_source,
             environments,
             client_mcp_extensions,
-            ..StartThreadOptions::new(config)
+            ..StartThreadOptions::new(config, None)
         };
         let mut request =
             ThreadSpawnRequest::new(options, Arc::clone(&self.auth_manager), agent_control);
@@ -2086,7 +2095,7 @@ impl ThreadManagerState {
             environments,
             thread_extension_init,
             client_mcp_extensions,
-            ..StartThreadOptions::new(config)
+            ..StartThreadOptions::new(config, None)
         };
         let mut request =
             ThreadSpawnRequest::new(options, Arc::clone(&self.auth_manager), agent_control);

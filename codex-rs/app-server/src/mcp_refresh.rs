@@ -233,7 +233,7 @@ mod tests {
             )
             .await?;
         let thread = thread_manager
-            .start_thread(codex_core::StartThreadOptions::new(thread_config))
+            .start_thread(codex_core::StartThreadOptions::new(thread_config, None))
             .await?
             .thread;
         std::fs::write(
@@ -392,10 +392,10 @@ enabled = false
             )
         });
         thread_manager
-            .start_thread(codex_core::StartThreadOptions::new(good_config))
+            .start_thread(codex_core::StartThreadOptions::new(good_config, None))
             .await?;
         thread_manager
-            .start_thread(codex_core::StartThreadOptions::new(bad_config))
+            .start_thread(codex_core::StartThreadOptions::new(bad_config, None))
             .await?;
 
         let loader = Arc::new(CountingThreadConfigLoader {

@@ -30,7 +30,7 @@ async fn manager() -> (tempfile::TempDir, ThreadManager, Config) {
 async fn removed_runtime_stays_owned_until_exact_cleanup_completes() {
     let (_home, manager, config) = manager().await;
     let started = manager
-        .start_thread(StartThreadOptions::new(config))
+        .start_thread(StartThreadOptions::new(config, None))
         .await
         .unwrap();
     let weak = Arc::downgrade(&started.thread);
@@ -62,7 +62,7 @@ async fn removed_runtime_stays_owned_until_exact_cleanup_completes() {
 async fn loop_termination_alone_cannot_compact_removed_runtime() {
     let (_home, manager, config) = manager().await;
     let started = manager
-        .start_thread(StartThreadOptions::new(config))
+        .start_thread(StartThreadOptions::new(config, None))
         .await
         .unwrap();
     started.thread.io.session_loop_termination.request_abort();
@@ -98,7 +98,7 @@ async fn prior_legacy_cleanup_compacts_without_rebinding_or_reexecution() {
     let (_home, manager, config) = manager().await;
     for _ in 0..6 {
         let started = manager
-            .start_thread(StartThreadOptions::new(config.clone()))
+            .start_thread(StartThreadOptions::new(config.clone(), None))
             .await
             .unwrap();
         assert_eq!(manager.constructions.published().len(), 1);
@@ -128,7 +128,7 @@ async fn managed_lifetime_cleanup_compacts_before_manager_shutdown() {
     let manager = Arc::new(manager);
     let stop = tokio_util::sync::CancellationToken::new();
     let tasks = tokio_util::task::TaskTracker::new();
-    let mut options = StartThreadOptions::new(config);
+    let mut options = StartThreadOptions::new(config, /*control_endpoint*/ None);
     options.thread_extension_init.insert(codex_extension_api::SessionIsolation::Isolated);
     let started = manager.start_thread_until(options, stop.clone().cancelled_owned(), &tasks)
         .await.unwrap();
@@ -163,7 +163,7 @@ async fn failed_cleanup_remains_owned_after_loop_join() {
     extensions.thread_lifecycle_contributor(Arc::new(PanicOnStop));
     Arc::get_mut(&mut manager.state).unwrap().extensions = Arc::new(extensions.build());
     let started = manager
-        .start_thread(StartThreadOptions::new(config))
+        .start_thread(StartThreadOptions::new(config, None))
         .await
         .unwrap();
     assert!(started.thread.shutdown_and_wait().await.is_err());
@@ -203,7 +203,7 @@ async fn held_extension_stop_keeps_live_history_open_after_sticky_timeout() {
     let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
     extensions.thread_lifecycle_contributor(held.clone());
     Arc::get_mut(&mut manager.state).unwrap().extensions = Arc::new(extensions.build());
-    let started = manager.start_thread(StartThreadOptions::new(config)).await.unwrap();
+    let started = manager.start_thread(StartThreadOptions::new(config, /*control_endpoint*/ None)).await.unwrap();
     let live = started.thread.session.services.live_thread.as_ref().expect("live persistence");
     live.flush().await.expect("positive persistence control");
     let ticket = started.thread.begin_retirement(Instant::now() + Duration::from_secs(2)).unwrap();
@@ -236,7 +236,7 @@ async fn constructor_admitted_before_close_cannot_publish_after_close() {
     Arc::get_mut(&mut manager.state)
         .unwrap()
         .user_instructions_provider = Arc::new(HeldInstructions(Mutex::new(Some(held))));
-    let mut start = Box::pin(manager.start_thread(StartThreadOptions::new(config)));
+    let mut start = Box::pin(manager.start_thread(StartThreadOptions::new(config, None)));
     assert!(futures::poll!(start.as_mut()).is_pending());
     manager.constructions.close();
     release.send(()).unwrap();

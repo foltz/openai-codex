@@ -502,7 +502,7 @@ async fn astra_omits_disabled_executor_skills_from_model_context() -> Result<()>
         .thread_manager
         .start_thread(StartThreadOptions {
             thread_extension_init,
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?
         .thread;

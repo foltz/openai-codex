@@ -2921,7 +2921,7 @@ async fn responses_websocket_restored_history_metric(fork: bool) -> anyhow::Resu
     initial.codex.shutdown_and_wait().await?;
 
     let manager = &initial.thread_manager;
-    let mut options = codex_core::StartThreadOptions::new(initial.config.clone());
+    let mut options = codex_core::StartThreadOptions::new(initial.config.clone(), /*control_endpoint*/ None);
     options.thread_extension_init.insert(metrics);
     let restored = if fork {
         manager

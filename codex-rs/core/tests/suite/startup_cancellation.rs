@@ -79,7 +79,7 @@ async fn cancelled_resume_releases_writer_while_mcp_startup_is_pending() -> Resu
     let resume_options = || StartThreadOptions {
         initial_history: history.clone(),
         environments: Some(environments.clone()),
-        ..StartThreadOptions::new(test.config.clone())
+        ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
     };
 
     barrier.block_next.store(true, Ordering::SeqCst);

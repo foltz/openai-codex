@@ -814,6 +814,7 @@ impl TestCodexBuilder {
                     auth_manager,
                     /*parent_trace*/ None,
                     client_mcp_extensions(),
+                    None,
                 ))
                 .await?
             }
@@ -846,7 +847,7 @@ impl TestCodexBuilder {
                     history_mode: self.history_mode,
                     client_mcp_extensions: client_mcp_extensions(),
                     environments,
-                    ..StartThreadOptions::new(config.clone())
+                    ..StartThreadOptions::new(config.clone(), /*control_endpoint*/ None)
                 }))
                 .await?
             }

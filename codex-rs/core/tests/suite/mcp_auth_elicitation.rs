@@ -598,7 +598,7 @@ approvals_reviewer = "user"
                 agent_role: None,
             })),
             environments: Some(vec![test.executor_environment().selection().clone()]),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?
         .thread;

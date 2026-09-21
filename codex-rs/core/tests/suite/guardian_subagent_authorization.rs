@@ -1051,6 +1051,7 @@ async fn guardian_subagent_review_preserves_late_root_user_authorization(
                     test.thread_manager.auth_manager(),
                     /*parent_trace*/ None,
                     ClientMcpExtensions::default(),
+                    /*control_endpoint*/ None,
                 )
                 .await?
                 .thread;

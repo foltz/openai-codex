@@ -21,6 +21,7 @@ pub(crate) struct McpRequestProcessor {
     pub(super) thread_state_manager: ThreadStateManager,
     applied_mcp_config_identity: AppliedMcpConfigIdentity,
     tasks: ProcessorTasks,
+    control_endpoint: Option<String>,
 }
 
 impl McpRequestProcessor {
@@ -32,6 +33,7 @@ impl McpRequestProcessor {
         config_manager: ConfigManager,
         applied_mcp_config_identity: AppliedMcpConfigIdentity,
         tasks: ProcessorTasks,
+        control_endpoint: Option<String>,
     ) -> Self {
         Self {
             auth_manager,
@@ -41,6 +43,7 @@ impl McpRequestProcessor {
             thread_state_manager,
             applied_mcp_config_identity,
             tasks,
+            control_endpoint,
         }
     }
 
@@ -340,6 +343,7 @@ impl McpRequestProcessor {
         };
         let mcp_manager = self.thread_manager.mcp_manager();
         let auth = self.auth_manager.auth().await;
+        let control_endpoint = self.control_endpoint.clone();
         let environment_manager = self.thread_manager.environment_manager();
 
         let _ = self.tasks.spawn(async move {
@@ -361,6 +365,7 @@ impl McpRequestProcessor {
                 runtime_context,
                 mcp_manager,
                 thread,
+                control_endpoint,
             )
             .await;
             outgoing.send_result(request, result).await;
@@ -376,6 +381,7 @@ impl McpRequestProcessor {
         runtime_context: McpRuntimeContext,
         mcp_manager: Arc<McpManager>,
         thread: Option<Arc<codex_core::CodexThread>>,
+        control_endpoint: Option<String>,
     ) -> Result<ListMcpServerStatusResponse, JSONRPCErrorError> {
         let detail = match params.detail.unwrap_or(McpServerStatusDetail::Full) {
             McpServerStatusDetail::Full => McpSnapshotDetail::Full,
@@ -390,6 +396,7 @@ impl McpRequestProcessor {
             mcp_manager.codex_apps_tools_cache(),
             mcp_manager.tool_catalog_cache(),
             detail,
+            control_endpoint,
         )
         .await;
 

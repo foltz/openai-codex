@@ -20,7 +20,7 @@ async fn managed_legacy_cleanup_in_progress_is_retained_as_incomplete() {
     ));
     let stop = tokio_util::sync::CancellationToken::new();
     let tasks = tokio_util::task::TaskTracker::new();
-    let mut options = StartThreadOptions::new(config.clone());
+    let mut options = StartThreadOptions::new(config.clone(), /*control_endpoint*/ None);
     options.thread_extension_init.insert(codex_extension_api::SessionIsolation::Isolated);
     let started = manager.start_thread_until(options, stop.clone().cancelled_owned(), &tasks)
         .await.unwrap();
@@ -46,7 +46,7 @@ async fn managed_legacy_cleanup_in_progress_is_retained_as_incomplete() {
     drop(started);
     // Registration compacts completed population before refusing the closed
     // manager. The retained shutdown report itself remains incomplete.
-    assert!(manager.start_thread(StartThreadOptions::new(config)).await.is_err());
+    assert!(manager.start_thread(StartThreadOptions::new(config, /*control_endpoint*/ None)).await.is_err());
     assert!(weak.upgrade().is_none());
 }
 

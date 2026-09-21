@@ -1117,7 +1117,6 @@ impl ThreadRequestProcessor {
             thread_unload_delay: self.config.thread_unload_delay,
             skills_watcher: Arc::clone(&self.skills_watcher),
             turn_cost_worker: self.turn_cost_worker.clone(),
-            control_endpoint: self.control_endpoint.clone(),
         }
     }
 
@@ -1260,11 +1259,11 @@ impl ThreadRequestProcessor {
             thread_unload_delay: self.config.thread_unload_delay,
             skills_watcher: Arc::clone(&self.skills_watcher),
             turn_cost_worker: self.turn_cost_worker.clone(),
-            control_endpoint: self.control_endpoint.clone(),
         };
         let request_trace = request_context.request_trace();
         let config_manager = self.config_manager.clone();
         let thread_store = Arc::clone(&self.thread_store);
+        let control_endpoint = self.control_endpoint.clone();
         let initial_config_warnings = Arc::clone(&self.initial_config_warnings);
         let outgoing = Arc::clone(&listener_task_context.outgoing);
         let error_request_id = request_id.clone();
@@ -1272,6 +1271,7 @@ impl ThreadRequestProcessor {
             if let Err(error) = Self::thread_start_task(
                 listener_task_context,
                 thread_store,
+                control_endpoint,
                 config_manager,
                 request_id,
                 app_server_client_name,
@@ -1396,6 +1396,7 @@ impl ThreadRequestProcessor {
     async fn thread_start_task(
         listener_task_context: ListenerTaskContext,
         thread_store: Arc<dyn ThreadStore>,
+        control_endpoint: Option<String>,
         config_manager: ConfigManager,
         request_id: ConnectionRequestId,
         app_server_client_name: Option<String>,
@@ -1549,7 +1550,7 @@ impl ThreadRequestProcessor {
         if !selected_capability_roots.is_empty() {
             thread_extension_init.insert(selected_capability_roots);
         }
-        let mut start_options = StartThreadOptions::new(config);
+        let mut start_options = StartThreadOptions::new(config, /*control_endpoint*/ None);
         let reserved_thread_id = if start_options.config.ephemeral {
             None
         } else {
@@ -1585,7 +1586,7 @@ impl ThreadRequestProcessor {
                 environments: Some(environments),
                 thread_extension_init,
                 client_mcp_extensions,
-                control_endpoint: listener_task_context.control_endpoint.clone(),
+                control_endpoint,
                 ..start_options
             })
             .instrument(tracing::info_span!(
@@ -2348,6 +2349,7 @@ impl ThreadRequestProcessor {
                 self.auth_manager.clone(),
                 self.request_trace_context(request_id).await,
                 client_mcp_extensions,
+                self.control_endpoint.clone(),
             )
             .await
             .map_err(|err| internal_error(format!("error reloading thread after revert: {err}")))?;
@@ -4016,6 +4018,7 @@ impl ThreadRequestProcessor {
                     ThreadResumeTarget::DaemonRecovery(_) => None,
                 },
                 client_mcp_extensions,
+                self.control_endpoint.clone(),
             )
             .await
         {
@@ -5213,7 +5216,7 @@ impl ThreadRequestProcessor {
             parent_trace,
             client_mcp_extensions,
             reserved_thread_id,
-            ..StartThreadOptions::new(config)
+            ..StartThreadOptions::new(config, self.control_endpoint.clone())
         };
         let new_thread = if let Some(prepared_fork) = prepared_fork {
             self.thread_manager

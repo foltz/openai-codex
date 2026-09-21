@@ -492,6 +492,7 @@ pub async fn collect_mcp_server_status_snapshot_with_detail(
     codex_apps_tools_cache: ConnectorRuntimeManager<ToolInfo>,
     tool_catalog_cache: crate::McpToolCatalogCache,
     detail: McpSnapshotDetail,
+    control_endpoint: Option<String>,
 ) -> McpServerStatusSnapshot {
     let mcp_servers = effective_mcp_servers(config, auth);
     if mcp_servers.is_empty() {
@@ -542,7 +543,7 @@ pub async fn collect_mcp_server_status_snapshot_with_detail(
             elicitation_reviewer: None,
             elicitation_lifecycle: None,
             canonical_thread_id: None,
-            control_endpoint: None,
+            control_endpoint,
         },
         crate::elicitation::ElicitationRequestRouter::default(),
     )

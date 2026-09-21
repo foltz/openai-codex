@@ -83,11 +83,11 @@ async fn manager() -> (tempfile::TempDir, ThreadManager, Config) {
 async fn manager_shutdown_owns_removed_and_loaded_threads_before_first_poll() {
     let (_home, manager, config) = manager().await;
     let first = manager
-        .start_thread(StartThreadOptions::new(config.clone()))
+        .start_thread(StartThreadOptions::new(config.clone(), None))
         .await
         .unwrap();
     let second = manager
-        .start_thread(StartThreadOptions::new(config.clone()))
+        .start_thread(StartThreadOptions::new(config.clone(), None))
         .await
         .unwrap();
     let first_weak = Arc::downgrade(&first.thread);
@@ -101,7 +101,7 @@ async fn manager_shutdown_owns_removed_and_loaded_threads_before_first_poll() {
     // The gate is closed by begin_shutdown itself, not by the lazy wait.
     assert!(
         manager
-            .start_thread(StartThreadOptions::new(config))
+            .start_thread(StartThreadOptions::new(config, None))
             .await
             .is_err()
     );
@@ -129,7 +129,7 @@ async fn manager_shutdown_owns_removed_and_loaded_threads_before_first_poll() {
 async fn manager_shutdown_does_not_let_lookup_lock_starve_runtime_cleanup() {
     let (_home, manager, config) = manager().await;
     let started = manager
-        .start_thread(StartThreadOptions::new(config))
+        .start_thread(StartThreadOptions::new(config, None))
         .await
         .unwrap();
     let lookup = manager.state.threads.write().await;
@@ -161,7 +161,7 @@ async fn manager_shutdown_does_not_let_lookup_lock_starve_runtime_cleanup() {
 async fn manager_shutdown_expired_observer_never_restarts_original_work() {
     let (_home, manager, config) = manager().await;
     let started = manager
-        .start_thread(StartThreadOptions::new(config))
+        .start_thread(StartThreadOptions::new(config, None))
         .await
         .unwrap();
     let deadline = Instant::now();
@@ -202,7 +202,7 @@ async fn manager_shutdown_expired_observer_never_restarts_original_work() {
 async fn manager_shutdown_replays_prior_cleanup_without_new_ordinary_classification() {
     let (_home, manager, config) = manager().await;
     let started = manager
-        .start_thread(StartThreadOptions::new(config))
+        .start_thread(StartThreadOptions::new(config, None))
         .await
         .unwrap();
     started.thread.shutdown_and_wait().await.unwrap();
@@ -245,7 +245,7 @@ async fn manager_incomplete_report_keeps_failed_start_custody_after_future_retur
         .unwrap();
     assert!(
         manager
-            .start_thread(StartThreadOptions::new(config))
+            .start_thread(StartThreadOptions::new(config, None))
             .await
             .is_err()
     );
@@ -292,7 +292,7 @@ async fn manager_shutdown_drives_admitted_constructor_after_its_observer_is_canc
     Arc::get_mut(&mut manager.state)
         .unwrap()
         .user_instructions_provider = Arc::new(HeldInstructions(Mutex::new(Some(held))));
-    let mut constructor = Box::pin(manager.start_thread(StartThreadOptions::new(config)));
+    let mut constructor = Box::pin(manager.start_thread(StartThreadOptions::new(config, None)));
     assert!(futures::poll!(constructor.as_mut()).is_pending());
     let deadline = Instant::now() + Duration::from_secs(20);
     let ticket = manager.begin_shutdown(deadline).unwrap();
@@ -323,12 +323,12 @@ async fn manager_shutdown_observes_both_exact_runtimes_when_thread_id_is_reused(
     let id = ThreadId::new();
     let manager = manager.with_thread_id_generator(move || id);
     let old = manager
-        .start_thread(StartThreadOptions::new(config.clone()))
+        .start_thread(StartThreadOptions::new(config.clone(), None))
         .await
         .unwrap();
     drop(manager.remove_thread(&id).await);
     let replacement = manager
-        .start_thread(StartThreadOptions::new(config))
+        .start_thread(StartThreadOptions::new(config, None))
         .await
         .unwrap();
     assert_eq!(old.thread_id, replacement.thread_id);

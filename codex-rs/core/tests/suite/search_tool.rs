@@ -1148,7 +1148,7 @@ async fn tool_search_returns_deferred_dynamic_tool_and_routes_follow_up_call() -
         .thread_manager
         .start_thread(StartThreadOptions {
             dynamic_tools: vec![dynamic_tool, shadow_tool],
-            ..StartThreadOptions::new(base_test.config.clone())
+            ..StartThreadOptions::new(base_test.config.clone(), None)
         })
         .await?;
     let mut test = base_test;
@@ -1807,7 +1807,7 @@ async fn tool_search_matches_dynamic_tools_by_name_description_namespace_and_sch
         .thread_manager
         .start_thread(StartThreadOptions {
             dynamic_tools: vec![dynamic_tool],
-            ..StartThreadOptions::new(base_test.config.clone())
+            ..StartThreadOptions::new(base_test.config.clone(), None)
         })
         .await?;
     let mut test = base_test;

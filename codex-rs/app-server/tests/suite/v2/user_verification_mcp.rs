@@ -157,7 +157,7 @@ async fn user_verification_mcp_round_trip_requires_proof_in_full_access() -> Res
                 json!({"userVerification": {}}),
             )]),
             environments: Some(vec![test.executor_environment().selection().clone()]),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?
         .thread;

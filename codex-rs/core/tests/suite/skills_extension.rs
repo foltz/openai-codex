@@ -1714,7 +1714,7 @@ async fn opted_in_executor_provider_skips_host_discovery_but_injects_discovered_
         .start_thread(StartThreadOptions {
             environments: Some(vec![environment.clone()]),
             thread_extension_init,
-            ..StartThreadOptions::new(executor_config)
+            ..StartThreadOptions::new(executor_config, /*control_endpoint*/ None)
         })
         .await?;
     let executor_skill_path = environment
@@ -2108,7 +2108,7 @@ async fn executor_skill_tool_reads_references_under_current_permissions(
         .start_thread(StartThreadOptions {
             environments: Some(vec![selection]),
             thread_extension_init,
-            ..StartThreadOptions::new(config)
+            ..StartThreadOptions::new(config, /*control_endpoint*/ None)
         })
         .await?;
     let response = responses::mount_sse_sequence(
@@ -3520,7 +3520,7 @@ async fn production_turn_keeps_orchestrator_world_state_incremental_across_turns
         .thread_manager
         .start_thread(StartThreadOptions {
             environments: Some(Vec::new()),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), None)
         })
         .await?;
 

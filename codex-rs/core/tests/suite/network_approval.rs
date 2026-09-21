@@ -1933,7 +1933,7 @@ async fn thread_turnover_closes_managed_proxy_tunnels() -> Result<()> {
     for cycle in 0..3 {
         let started = test
             .thread_manager
-            .start_thread(StartThreadOptions::new(config.clone()))
+            .start_thread(StartThreadOptions::new(config.clone(), /*control_endpoint*/ None))
             .await?;
         let proxy = started
             .session_configured

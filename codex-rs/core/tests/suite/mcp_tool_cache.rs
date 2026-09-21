@@ -192,7 +192,7 @@ async fn mcp_calls_stay_bound_to_each_thread() -> anyhow::Result<()> {
         ..
     } = fixture
         .thread_manager
-        .start_thread(StartThreadOptions::new(second_config))
+        .start_thread(StartThreadOptions::new(second_config, None))
         .await?;
 
     wait_for_mcp_server(&fixture.codex, SERVER_NAME).await?;
@@ -385,7 +385,7 @@ async fn apps_cache_filled_during_binding_capture_reaches_the_model() -> anyhow:
                     agent_nickname: None,
                     agent_role: None,
                 })),
-                ..StartThreadOptions::new(test.config.clone())
+                ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
             })
             .await?;
         assert_eq!(waiting_startup.initialize_attempts(), 1);
@@ -418,7 +418,7 @@ async fn apps_cache_filled_during_binding_capture_reaches_the_model() -> anyhow:
             .set(std::collections::HashMap::new())?;
         let NewThread { thread: peer, .. } = test
             .thread_manager
-            .start_thread(StartThreadOptions::new(peer_config))
+            .start_thread(StartThreadOptions::new(peer_config, /*control_endpoint*/ None))
             .await?;
         wait_for_mcp_server(&peer, CODEX_APPS_MCP_SERVER_NAME).await?;
         release_waiting.send(())?;
@@ -522,7 +522,7 @@ async fn cached_http_mcp_starts_lazily_for_subagents(
                 agent_nickname: None,
                 agent_role: None,
             })),
-            ..StartThreadOptions::new(subagent_config)
+            ..StartThreadOptions::new(subagent_config, /*control_endpoint*/ None)
         })
         .await?;
     if with_headers_helper {
@@ -676,7 +676,7 @@ async fn cached_mcp_startup_is_eager_for_root_and_lazy_for_subagents() -> anyhow
         ..
     } = fixture
         .thread_manager
-        .start_thread(StartThreadOptions::new(fixture.config.clone()))
+        .start_thread(StartThreadOptions::new(fixture.config.clone(), None))
         .await?;
     let eager_pid = wait_for_new_pid(fs.as_ref(), &pid_file, Some(&first_pid)).await?;
     wait_for_mcp_server(&eager_thread, SERVER_NAME).await?;
@@ -713,7 +713,7 @@ async fn cached_mcp_startup_is_eager_for_root_and_lazy_for_subagents() -> anyhow
                 agent_nickname: None,
                 agent_role: None,
             })),
-            ..StartThreadOptions::new(fixture.config.clone())
+            ..StartThreadOptions::new(fixture.config.clone(), None)
         })
         .await?;
     second_thread.submit(Op::Interrupt).await?;
@@ -947,7 +947,7 @@ async fn cached_mcp_startup_is_eager_for_root_and_lazy_for_subagents() -> anyhow
             session_source: Some(SessionSource::SubAgent(SubAgentSource::Other(
                 "filtered-cached-startup".to_string(),
             ))),
-            ..StartThreadOptions::new(filtered_config)
+            ..StartThreadOptions::new(filtered_config, None)
         })
         .await?;
     let filtered_pid = wait_for_new_pid(fs.as_ref(), &pid_file, Some(&second_pid)).await?;
@@ -972,7 +972,7 @@ async fn cached_mcp_startup_is_eager_for_root_and_lazy_for_subagents() -> anyhow
             session_source: Some(SessionSource::SubAgent(SubAgentSource::Other(
                 "interrupted-cached-startup".to_string(),
             ))),
-            ..StartThreadOptions::new(fixture.config.clone())
+            ..StartThreadOptions::new(fixture.config.clone(), None)
         })
         .await?;
     mount_sse_once(

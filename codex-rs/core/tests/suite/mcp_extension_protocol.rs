@@ -245,7 +245,7 @@ async fn hosted_apps_protocol_override_preserves_native_verification() -> anyhow
                 json!({"userVerification": {}}),
             )]),
             environments: Some(vec![fixture.executor_environment().selection().clone()]),
-            ..StartThreadOptions::new(fixture.config.clone())
+            ..StartThreadOptions::new(fixture.config.clone(), /*control_endpoint*/ None)
         })
         .await?
         .thread;

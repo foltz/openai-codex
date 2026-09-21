@@ -1057,7 +1057,7 @@ async fn loads_user_instructions_without_a_primary_environment() -> Result<()> {
         .thread_manager
         .start_thread(StartThreadOptions {
             environments: Some(Vec::new()),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), None)
         })
         .await?;
     assert_eq!(provider.load_count(), 2);
@@ -1132,7 +1132,7 @@ impl ThreadInstructionsFixture {
             .start_thread(StartThreadOptions {
                 environments: Some(vec![test.executor_environment().selection().clone()]),
                 thread_instructions_provider: Some(provider.clone()),
-                ..StartThreadOptions::new(test.config.clone())
+                ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
             })
             .await?
             .thread;
@@ -1326,7 +1326,7 @@ async fn isolated_guardian_keeps_applied_thread_instructions() -> Result<()> {
         .start_thread(StartThreadOptions {
             environments: Some(test.codex.environment_selections().await),
             thread_instructions_provider: Some(provider.clone()),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?;
     // Publish an update after the parent captured its instructions, before it starts Guardian.
@@ -1401,7 +1401,7 @@ async fn thread_provider_enforces_its_own_limit_before_startup_and_sampling() ->
             thread_instructions_provider: Some(Arc::new(RecordingThreadInstructionsProvider::new(
                 Some(oversized.clone()),
             ))),
-            ..StartThreadOptions::new(fixture.test.config.clone())
+            ..StartThreadOptions::new(fixture.test.config.clone(), /*control_endpoint*/ None)
         })
         .await
         .err()
@@ -1533,7 +1533,7 @@ async fn fork_preserves_thread_instructions(
             environments: Some(Vec::new()),
             thread_instructions_provider: Some(parent_provider.clone()),
             history_mode: Some(history_mode),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?;
     submit_thread_turn(&parent.thread, "persist parent instructions").await?;
@@ -1559,7 +1559,7 @@ async fn fork_preserves_thread_instructions(
         environments: Some(Vec::new()),
         thread_instructions_provider: offline
             .then(|| fork_provider.clone() as Arc<dyn ThreadInstructionsProvider>),
-        ..StartThreadOptions::new(test.config.clone())
+        ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
     };
     let fork = match source {
         InstructionForkSource::LiveRollout => {
@@ -1650,7 +1650,7 @@ async fn thread_provider_lives_with_its_session_across_resume() -> Result<()> {
         .start_thread(StartThreadOptions {
             environments: Some(Vec::new()),
             thread_instructions_provider: Some(provider.clone()),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?;
     assert_eq!(provider.load_count(), 1);
@@ -1675,7 +1675,7 @@ async fn thread_provider_lives_with_its_session_across_resume() -> Result<()> {
             .start_thread(StartThreadOptions {
                 initial_history: history.clone(),
                 thread_instructions_provider: supplied,
-                ..StartThreadOptions::new(test.config.clone())
+                ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
             })
             .await?;
         assert!(Arc::ptr_eq(&resumed.thread, &started.thread));
@@ -1696,7 +1696,7 @@ async fn thread_provider_lives_with_its_session_across_resume() -> Result<()> {
             initial_history: history,
             environments: Some(Vec::new()),
             thread_instructions_provider: Some(cold_provider.clone()),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?;
     assert!(!Arc::ptr_eq(&resumed.thread, &started.thread));
@@ -1889,7 +1889,7 @@ async fn multi_environment_project_instructions_share_one_byte_budget() -> Resul
                     config: EnvironmentConfigState::FromThread,
                 },
             ]),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), None)
         })
         .await?;
 
@@ -1973,7 +1973,7 @@ async fn multi_environment_thread_refreshes_global_and_keeps_repository_snapshot
                     config: EnvironmentConfigState::FromThread,
                 },
             ]),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), None)
         })
         .await?;
     assert_eq!(provider.load_count(), 2);
@@ -2326,7 +2326,7 @@ async fn fork_injects_changed_agents_md_once() -> Result<()> {
         .thread_manager
         .fork_thread(
             ForkSnapshot::Interrupted,
-            codex_core::StartThreadOptions::new(fork_config),
+            codex_core::StartThreadOptions::new(fork_config, /*control_endpoint*/ None),
             rollout_path,
         )
         .await?;

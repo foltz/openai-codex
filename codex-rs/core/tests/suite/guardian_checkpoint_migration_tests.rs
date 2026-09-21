@@ -73,7 +73,7 @@ pub(super) async fn resume(
                 history: Arc::new(history),
                 rollout_path: None,
             }),
-            ..StartThreadOptions::new(config)
+            ..StartThreadOptions::new(config, /*control_endpoint*/ None)
         })
         .await?
         .thread)

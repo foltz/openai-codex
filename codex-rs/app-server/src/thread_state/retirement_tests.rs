@@ -12,7 +12,7 @@ use std::sync::Arc;
 async fn processor_shutdown_lifecycle_lock_cannot_starve_runtime_cleanup() {
     let (_home, manager, config) = crate::request_processors::thread_shutdown_fixture().await;
     let started = manager
-        .start_thread(codex_core::StartThreadOptions::new(config))
+        .start_thread(codex_core::StartThreadOptions::new(config, None))
         .await
         .unwrap();
     let state = ThreadStateManager::new();
@@ -45,7 +45,7 @@ async fn processor_shutdown_lifecycle_lock_cannot_starve_runtime_cleanup() {
 async fn processor_shutdown_preserves_actual_prior_ticket_after_observation_removal() {
     let (_home, manager, config) = crate::request_processors::thread_shutdown_fixture().await;
     let old = manager
-        .start_thread(codex_core::StartThreadOptions::new(config.clone()))
+        .start_thread(codex_core::StartThreadOptions::new(config.clone(), None))
         .await
         .unwrap();
     let original_deadline = Instant::now() + std::time::Duration::from_secs(20);
@@ -72,7 +72,7 @@ async fn processor_shutdown_preserves_actual_prior_ticket_after_observation_remo
     };
     state.remove_thread_state(old.thread_id).await;
     let current = manager
-        .start_thread(codex_core::StartThreadOptions::new(config))
+        .start_thread(codex_core::StartThreadOptions::new(config, None))
         .await
         .unwrap();
     let owner = crate::request_processors::ThreadShutdownOwner::default();
@@ -210,7 +210,7 @@ async fn production_claim_and_acquire_have_one_winner_in_both_lock_orders() {
     for acquire_first in [true, false] {
         let (_home, core, config) = crate::request_processors::thread_shutdown_fixture().await;
         let started = core
-            .start_thread(codex_core::StartThreadOptions::new(config))
+            .start_thread(codex_core::StartThreadOptions::new(config, None))
             .await
             .expect("real session birth");
         let thread_id = started.thread_id;

@@ -349,7 +349,7 @@ async fn spawn_agent_fork_context_rejects_agent_type_override() {
     let role_name = install_role_with_model_override(&mut turn).await;
     let manager = thread_manager();
     let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .start_thread(StartThreadOptions::new((*turn.config).clone(), None))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -383,7 +383,7 @@ async fn multi_agent_v2_spawn_fork_turns_all_applies_agent_type_override() {
     let role_name = install_role_with_model_override(&mut turn).await;
     let manager = thread_manager();
     let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .start_thread(StartThreadOptions::new((*turn.config).clone(), None))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -438,7 +438,7 @@ async fn spawn_agent_service_tier_uses_root_preference_when_root_model_cannot_su
     config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
     let manager = thread_manager();
     let root = manager
-        .start_thread(StartThreadOptions::new(config.clone()))
+        .start_thread(StartThreadOptions::new(config.clone(), /*control_endpoint*/ None))
         .await
         .expect("root thread should start");
     assert_eq!(root.thread.config_snapshot().await.service_tier, None);
@@ -472,7 +472,7 @@ async fn spawn_agent_service_tier_inheritance_uses_root_preference_and_child_mod
         turn.config = Arc::new(config);
         let manager = thread_manager();
         let root = manager
-            .start_thread(StartThreadOptions::new((*turn.config).clone()))
+            .start_thread(StartThreadOptions::new((*turn.config).clone(), None))
             .await
             .expect("root thread should start");
         session.services.agent_control = root.thread.session.services.agent_control.clone();
@@ -518,7 +518,7 @@ async fn spawn_agent_service_tier_inheritance_uses_root_preference_and_child_mod
         turn.config = Arc::new(config);
         let manager = thread_manager();
         let root = manager
-            .start_thread(StartThreadOptions::new((*turn.config).clone()))
+            .start_thread(StartThreadOptions::new((*turn.config).clone(), None))
             .await
             .expect("root thread should start");
         session.services.agent_control = root.thread.session.services.agent_control.clone();
@@ -585,7 +585,7 @@ service_tier = "priority"
         turn.config = Arc::new(config);
         let manager = thread_manager();
         let root = manager
-            .start_thread(StartThreadOptions::new((*turn.config).clone()))
+            .start_thread(StartThreadOptions::new((*turn.config).clone(), None))
             .await
             .expect("root thread should start");
         session.services.agent_control = manager.agent_control();
@@ -655,7 +655,7 @@ service_tier = "turbo"
     turn.config = Arc::new(config);
     let manager = thread_manager();
     let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .start_thread(StartThreadOptions::new((*turn.config).clone(), None))
         .await
         .expect("root thread should start");
     session.services.agent_control = root.thread.session.services.agent_control.clone();
@@ -705,7 +705,7 @@ async fn spawn_agent_full_history_fork_inherits_root_service_tier() {
     turn.config = Arc::new(config);
     let manager = thread_manager();
     let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .start_thread(StartThreadOptions::new((*turn.config).clone(), None))
         .await
         .expect("root thread should start");
     session.services.agent_control = root.thread.session.services.agent_control.clone();
@@ -759,7 +759,7 @@ async fn multi_agent_v2_full_history_fork_inherits_root_service_tier() {
     set_turn_config(&mut turn, config);
     let manager = thread_manager();
     let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .start_thread(StartThreadOptions::new((*turn.config).clone(), None))
         .await
         .expect("root thread should start");
     session.services.agent_control = root.thread.session.services.agent_control.clone();
@@ -811,7 +811,7 @@ async fn multi_agent_v2_spawn_partial_fork_turns_allows_agent_type_override() {
     let role_name = install_role_with_model_override(&mut turn).await;
     let manager = thread_manager();
     let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .start_thread(StartThreadOptions::new((*turn.config).clone(), None))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -894,7 +894,7 @@ async fn multi_agent_v2_spawn_requires_task_name() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .start_thread(StartThreadOptions::new((*turn.config).clone(), None))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -928,7 +928,7 @@ async fn multi_agent_v2_spawn_rejects_legacy_items_field() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .start_thread(StartThreadOptions::new((*turn.config).clone(), None))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -988,7 +988,7 @@ async fn multi_agent_v2_spawn_returns_path_and_send_message_accepts_relative_pat
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .start_thread(StartThreadOptions::new((*turn.config).clone(), None))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -1083,7 +1083,7 @@ async fn multi_agent_v2_spawn_rejects_legacy_fork_context() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .start_thread(StartThreadOptions::new((*turn.config).clone(), None))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -1123,7 +1123,7 @@ async fn multi_agent_v2_spawn_rejects_invalid_fork_turns_string() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .start_thread(StartThreadOptions::new((*turn.config).clone(), None))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -1163,7 +1163,7 @@ async fn multi_agent_v2_spawn_rejects_zero_fork_turns() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .start_thread(StartThreadOptions::new((*turn.config).clone(), None))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -1209,7 +1209,7 @@ async fn multi_agent_v2_send_message_accepts_root_target_from_child() {
         .expect("test config should allow feature update");
     set_turn_config(&mut turn, config);
     let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .start_thread(StartThreadOptions::new((*turn.config).clone(), None))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -1285,7 +1285,7 @@ async fn multi_agent_v2_followup_task_rejects_root_target_from_child() {
         .expect("test config should allow feature update");
     set_turn_config(&mut turn, config);
     let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .start_thread(StartThreadOptions::new((*turn.config).clone(), None))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -1361,7 +1361,7 @@ async fn multi_agent_v2_list_agents_returns_completed_status() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .start_thread(StartThreadOptions::new((*turn.config).clone(), None))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -1449,7 +1449,7 @@ async fn multi_agent_v2_list_agents_filters_by_relative_path_prefix() {
     let _ = config.features.enable(Feature::MultiAgentV2);
     set_turn_config(&mut turn, config.clone());
     let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .start_thread(StartThreadOptions::new((*turn.config).clone(), None))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -1530,7 +1530,7 @@ async fn multi_agent_v2_list_agents_omits_closed_agents() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .start_thread(StartThreadOptions::new((*turn.config).clone(), None))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -1590,7 +1590,7 @@ async fn multi_agent_v2_list_agents_keeps_interrupted_resident_agents() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .start_thread(StartThreadOptions::new((*turn.config).clone(), None))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -1662,7 +1662,7 @@ async fn multi_agent_v2_send_message_rejects_legacy_items_field() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .start_thread(StartThreadOptions::new((*turn.config).clone(), None))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -1718,7 +1718,7 @@ async fn multi_agent_v2_send_message_rejects_interrupt_parameter() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .start_thread(StartThreadOptions::new((*turn.config).clone(), None))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -1795,7 +1795,7 @@ async fn multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn()
     let _ = config.features.enable(Feature::MultiAgentV2);
     set_turn_config(&mut turn, config);
     let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .start_thread(StartThreadOptions::new((*turn.config).clone(), None))
         .await
         .expect("root thread should start");
     // Production spawn_agent calls happen after the parent turn has resolved
@@ -1948,7 +1948,7 @@ async fn multi_agent_v2_followup_task_rejects_legacy_items_field() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .start_thread(StartThreadOptions::new((*turn.config).clone(), None))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -2001,7 +2001,7 @@ async fn multi_agent_v2_interrupted_turn_does_not_notify_parent() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .start_thread(StartThreadOptions::new((*turn.config).clone(), None))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -2078,7 +2078,7 @@ async fn multi_agent_v2_spawn_omits_agent_id_when_named() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .start_thread(StartThreadOptions::new((*turn.config).clone(), None))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -2117,7 +2117,7 @@ async fn multi_agent_v2_spawn_surfaces_task_name_validation_errors() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .start_thread(StartThreadOptions::new((*turn.config).clone(), None))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -2389,7 +2389,7 @@ async fn multi_agent_v2_spawn_agent_ignores_configured_max_depth() {
         .enable(Feature::MultiAgentV2)
         .expect("test config should allow feature update");
     let root = manager
-        .start_thread(StartThreadOptions::new(config.clone()))
+        .start_thread(StartThreadOptions::new(config.clone(), None))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -2514,7 +2514,7 @@ async fn send_input_interrupts_before_prompt() {
     session.services.agent_control = manager.agent_control();
     let config = turn.config.as_ref().clone();
     let thread = manager
-        .start_thread(StartThreadOptions::new(config.clone()))
+        .start_thread(StartThreadOptions::new(config.clone(), None))
         .await
         .expect("start thread");
     let agent_id = thread.thread_id;
@@ -2563,7 +2563,7 @@ async fn send_input_accepts_structured_items() {
     session.services.agent_control = manager.agent_control();
     let config = turn.config.as_ref().clone();
     let thread = manager
-        .start_thread(StartThreadOptions::new(config.clone()))
+        .start_thread(StartThreadOptions::new(config.clone(), None))
         .await
         .expect("start thread");
     let agent_id = thread.thread_id;
@@ -2652,7 +2652,7 @@ async fn resume_agent_noops_for_active_agent() {
     session.services.agent_control = manager.agent_control();
     let config = turn.config.as_ref().clone();
     let thread = manager
-        .start_thread(StartThreadOptions::new(config.clone()))
+        .start_thread(StartThreadOptions::new(config.clone(), None))
         .await
         .expect("start thread");
     let agent_id = thread.thread_id;
@@ -2708,6 +2708,7 @@ async fn resume_agent_restores_closed_agent_and_accepts_send_input() {
             AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy")),
             /*parent_trace*/ None,
             ClientMcpExtensions::default(),
+            None,
         )
         .await
         .expect("start thread");
@@ -2861,7 +2862,7 @@ async fn multi_agent_v2_wait_agent_accepts_timeout_only_argument() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .start_thread(StartThreadOptions::new((*turn.config).clone(), None))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -3233,7 +3234,7 @@ async fn wait_agent_times_out_when_status_is_not_final() {
     session.services.agent_control = manager.agent_control();
     let config = turn.config.as_ref().clone();
     let thread = manager
-        .start_thread(StartThreadOptions::new(config.clone()))
+        .start_thread(StartThreadOptions::new(config.clone(), None))
         .await
         .expect("start thread");
     let agent_id = thread.thread_id;
@@ -3276,7 +3277,7 @@ async fn wait_agent_clamps_short_timeouts_to_minimum() {
     session.services.agent_control = manager.agent_control();
     let config = turn.config.as_ref().clone();
     let thread = manager
-        .start_thread(StartThreadOptions::new(config.clone()))
+        .start_thread(StartThreadOptions::new(config.clone(), None))
         .await
         .expect("start thread");
     let agent_id = thread.thread_id;
@@ -3314,7 +3315,7 @@ async fn wait_agent_returns_final_status_without_timeout() {
     session.services.agent_control = manager.agent_control();
     let config = turn.config.as_ref().clone();
     let thread = manager
-        .start_thread(StartThreadOptions::new(config.clone()))
+        .start_thread(StartThreadOptions::new(config.clone(), None))
         .await
         .expect("start thread");
     let agent_id = thread.thread_id;
@@ -3364,7 +3365,7 @@ async fn multi_agent_v2_wait_agent_returns_summary_for_mailbox_activity() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .start_thread(StartThreadOptions::new((*turn.config).clone(), None))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -3457,7 +3458,7 @@ async fn multi_agent_v2_wait_agent_returns_for_already_queued_mail() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .start_thread(StartThreadOptions::new((*turn.config).clone(), None))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -3541,7 +3542,7 @@ async fn multi_agent_v2_wait_agent_wakes_on_any_mailbox_notification() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .start_thread(StartThreadOptions::new((*turn.config).clone(), None))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -3635,7 +3636,7 @@ async fn multi_agent_v2_wait_agent_does_not_return_completed_content() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .start_thread(StartThreadOptions::new((*turn.config).clone(), None))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -3727,7 +3728,7 @@ async fn multi_agent_v2_interrupt_agent_accepts_task_name_target() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .start_thread(StartThreadOptions::new((*turn.config).clone(), None))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -3853,7 +3854,7 @@ async fn multi_agent_v2_interrupt_agent_accepts_unloaded_task_name_target() {
         Some(state_db.clone()),
     );
     let root = manager
-        .start_thread(StartThreadOptions::new(config.clone()))
+        .start_thread(StartThreadOptions::new(config.clone(), None))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -3944,7 +3945,7 @@ async fn multi_agent_v2_interrupt_agent_rejects_root_target_and_id() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .start_thread(StartThreadOptions::new((*turn.config).clone(), None))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -4000,7 +4001,7 @@ async fn multi_agent_v2_interrupt_agent_rejects_self_target_by_id() {
         .expect("test config should allow feature update");
     set_turn_config(&mut turn, config);
     let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .start_thread(StartThreadOptions::new((*turn.config).clone(), None))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -4067,7 +4068,7 @@ async fn multi_agent_v2_interrupt_agent_rejects_self_target_by_task_name() {
         .expect("test config should allow feature update");
     set_turn_config(&mut turn, config);
     let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .start_thread(StartThreadOptions::new((*turn.config).clone(), None))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -4130,7 +4131,7 @@ async fn close_agent_submits_shutdown_and_returns_previous_status() {
     session.services.agent_control = manager.agent_control();
     let config = turn.config.as_ref().clone();
     let thread = manager
-        .start_thread(StartThreadOptions::new(config.clone()))
+        .start_thread(StartThreadOptions::new(config.clone(), None))
         .await
         .expect("start thread");
     let agent_id = thread.thread_id;
@@ -4196,7 +4197,7 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
     );
 
     let parent = manager
-        .start_thread(StartThreadOptions::new(config.clone()))
+        .start_thread(StartThreadOptions::new(config.clone(), None))
         .await
         .expect("parent thread should start");
     let parent_thread_id = parent.thread_id;
@@ -4354,7 +4355,7 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
     );
 
     let operator = manager
-        .start_thread(StartThreadOptions::new(config.clone()))
+        .start_thread(StartThreadOptions::new(config.clone(), None))
         .await
         .expect("operator thread should start");
     let operator_session = operator.thread.session.clone();

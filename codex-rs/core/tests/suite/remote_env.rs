@@ -1541,7 +1541,7 @@ async fn shared_executor_keeps_ready_capability_roots_scoped_to_each_attachment(
                 ..selection.clone()
             }]),
             thread_extension_init: second_thread_init,
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?;
 
@@ -1794,7 +1794,7 @@ async fn pending_attachment_installs_configuration_before_waiting_turn_resumes()
     let start_pending_thread = || {
         test.thread_manager.start_thread(StartThreadOptions {
             environments: Some(vec![pending_selection.clone()]),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
     };
     let waiting = timeout(Duration::from_secs(5), start_pending_thread())
@@ -2046,7 +2046,7 @@ async fn future_pending_environment_can_finish_without_retargeting_the_active_tu
         .thread_manager
         .start_thread(StartThreadOptions {
             environments: Some(vec![active.clone()]),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?
         .thread;
@@ -2314,7 +2314,7 @@ async fn ready_before_selection_resolves_resumed_thread_capability_root_after_wa
         .start_thread(StartThreadOptions {
             environments: Some(vec![selection.clone()]),
             thread_extension_init,
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?;
     resumed

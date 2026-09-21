@@ -131,7 +131,7 @@ async fn host_drain_allows_spawned_agent_input_but_not_automatic_work() -> anyho
                 agent_role: None,
             })),
             environments: Some(test.codex.environment_selections().await),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?
         .thread;

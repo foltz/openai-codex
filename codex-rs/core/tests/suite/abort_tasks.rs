@@ -100,7 +100,7 @@ async fn root_turn_suspension_preserves_unfinished_turn_history() {
                 agent_nickname: None,
                 agent_role: None,
             })),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await
         .expect("start a currently loaded descendant");

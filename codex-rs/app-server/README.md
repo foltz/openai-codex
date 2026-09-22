@@ -575,6 +575,11 @@ Later, after the idle unload timeout:
 
 Use `thread/read` to fetch a stored thread by id without resuming it. Pass `includeTurns` when you want thread history loaded into `thread.turns`. The returned thread includes `parentThreadId`, `agentNickname`, and `agentRole` for subagent threads when available.
 
+`threadSource` preserves the persisted thread classification across clear,
+persistence, and unloaded reads. It is independent of the client origin in
+`source` and of interactive attachment state. Missing classification remains
+`null`; it is not inferred to be `user` from either origin or attachment.
+
 Paginated threads can also use `includeTurns: true`, but clients should prefer
 `thread/turns/list` and `thread/items/list` for incremental history loading.
 

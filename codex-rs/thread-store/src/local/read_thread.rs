@@ -305,6 +305,9 @@ async fn read_thread_from_rollout_path(
     })?;
     thread.rollout_path = Some(codex_rollout::plain_rollout_path(path.as_path()));
     let meta_line = read_required_session_meta_line(path.as_path()).await?;
+    // The rollout display summary omits classification; preserve the exact
+    // optional value from session metadata rather than inferring it from origin.
+    thread.thread_source = meta_line.meta.thread_source;
     thread.forked_from_id = meta_line.meta.forked_from_id;
     thread.parent_thread_id = meta_line.meta.parent_thread_id;
     thread.history_mode = meta_line.meta.history_mode;
@@ -580,6 +583,7 @@ mod tests {
     use codex_protocol::protocol::SandboxPolicy;
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::ThreadHistoryMode;
+    use codex_protocol::protocol::ThreadSource;
     use codex_protocol::user_input::UserInput;
     use codex_rollout::RolloutItem;
     use codex_state::ThreadMetadataBuilder;
@@ -595,6 +599,79 @@ mod tests {
     use crate::local::test_support::write_session_file;
     use crate::local::test_support::write_session_file_with_fork;
     use crate::local::test_support::write_session_file_with_history_mode;
+
+    #[tokio::test]
+    async fn preview_reads_preserve_persisted_thread_source() {
+        for source in [
+            Some(ThreadSource::User),
+            Some(ThreadSource::Subagent),
+            Some(ThreadSource::MemoryConsolidation),
+            Some(ThreadSource::Feature("custom_feature".to_string())),
+            None,
+        ] {
+            let home = TempDir::new().expect("temp dir");
+            let config = test_config(home.path());
+            let uuid = Uuid::from_u128(230);
+            let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+            let path = write_session_file(home.path(), "2025-01-03T12-00-00", uuid)
+                .expect("preview-bearing rollout");
+            let contents = std::fs::read_to_string(&path).expect("read rollout");
+            let mut lines: Vec<serde_json::Value> = contents
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("rollout line"))
+                .collect();
+            lines[0]["payload"]["thread_source"] = serde_json::to_value(&source).unwrap();
+            std::fs::write(
+                &path,
+                lines
+                    .iter()
+                    .map(|line| format!("{line}\n"))
+                    .collect::<String>(),
+            )
+            .expect("write classified rollout");
+            let runtime = codex_state::StateRuntime::init(
+                config.sqlite.clone(),
+                config.default_model_provider_id.clone(),
+            )
+            .await
+            .expect("state db");
+            let mut builder =
+                ThreadMetadataBuilder::new(thread_id, path.clone(), Utc::now(), SessionSource::Cli);
+            builder.thread_source = source.clone();
+            let mut metadata = builder.build(&config.default_model_provider_id);
+            metadata.first_user_message = Some("Hello from user".to_string());
+            runtime
+                .upsert_thread(&metadata)
+                .await
+                .expect("persist classification");
+
+            for state_db in [None, Some(runtime.clone())] {
+                let store = LocalThreadStore::new(config.clone(), state_db);
+                for include_history in [false, true] {
+                    let by_id = store
+                        .read_thread(ReadThreadParams {
+                            thread_id,
+                            include_archived: false,
+                            include_history,
+                        })
+                        .await
+                        .expect("read by id");
+                    let by_path = store
+                        .read_thread_by_rollout_path(
+                            path.clone(),
+                            /*include_archived*/ false,
+                            include_history,
+                        )
+                        .await
+                        .expect("read by path");
+                    for thread in [by_id, by_path] {
+                        assert_eq!(thread.preview, "Hello from user");
+                        assert_eq!(thread.thread_source, source);
+                    }
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn read_thread_returns_active_rollout_summary() {

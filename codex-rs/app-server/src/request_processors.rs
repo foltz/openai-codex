@@ -547,6 +547,7 @@ mod process_exec_processor;
 mod remote_control_processor;
 mod search;
 mod thread_clear;
+mod thread_clear_read;
 mod thread_enrichment;
 mod thread_fork_goal;
 mod thread_processor;

@@ -148,6 +148,7 @@ pub(crate) fn classify(request: &ClientRequest) -> AccountDependency {
         | ClientRequest::RemoteControlStatusRead { .. }
         | ClientRequest::ServerDiagnostics { .. }
         | ClientRequest::ThreadAttachmentList { .. }
+        | ClientRequest::ThreadClearRead { .. }
         | ClientRequest::ThreadBackgroundTerminalsList { .. }
         | ClientRequest::ThreadDecrementElicitation { .. }
         | ClientRequest::ThreadGoalClear { .. }

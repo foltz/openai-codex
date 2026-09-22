@@ -594,6 +594,13 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::ThreadClearResponse,
     },
+    // Deliberately unscoped: observation must not queue behind clear mutation.
+    #[experimental("thread/clear/read")]
+    ThreadClearRead => "thread/clear/read" {
+        params: v2::ThreadClearReadParams,
+        serialization: None,
+        response: v2::ThreadClearReadResponse,
+    },
     #[experimental("kcf/thread/interactiveSubscription/list")]
     ThreadInteractiveSubscriptionList => "kcf/thread/interactiveSubscription/list" {
         params: v2::ThreadInteractiveSubscriptionListParams,

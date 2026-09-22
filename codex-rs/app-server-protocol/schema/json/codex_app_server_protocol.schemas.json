@@ -20969,6 +20969,26 @@
         "title": "ThreadAttachmentUpdatedNotification",
         "type": "object"
       },
+      "ThreadClearTransition": {
+        "description": "Server-recorded succession, not proof of current interactive attachment.",
+        "properties": {
+          "predecessorThreadId": {
+            "type": "string"
+          },
+          "successorThreadId": {
+            "type": "string"
+          },
+          "transitionId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "predecessorThreadId",
+          "successorThreadId",
+          "transitionId"
+        ],
+        "type": "object"
+      },
       "ThreadClosedNotification": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {

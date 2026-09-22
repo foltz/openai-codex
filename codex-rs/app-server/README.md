@@ -382,3 +382,53 @@ process control and custom output caps do not apply to MXC.
 persistence, and unloaded reads. It is independent of the client origin in
 `source` and of interactive subscription state. Missing classification remains
 `null`; it is not inferred to be `user` from either origin or subscription.
+
+## Clear transition observation
+
+Experimental clients can query this hosting server's durable clear record without
+subscribing to a thread or receiving the original clear notifications:
+
+```json
+{"id": 42, "method": "thread/clear/read", "params": {"successorThreadId": "B"}}
+```
+
+The result is a discriminated union:
+
+```json
+{"disposition": "none", "transition": null}
+{"disposition": "pending", "transition": {"transitionId": "T", "predecessorThreadId": "A", "successorThreadId": "B"}}
+{"disposition": "complete", "transition": {"transitionId": "T", "predecessorThreadId": "A", "successorThreadId": "B"}}
+```
+
+IDs above are placeholders; requests require a valid thread UUID. The lookup uses
+the existing local `clear_transitions` store, not rollout inference. `none` means
+no non-abandoned row for that successor in the available store; it does not prove
+that the thread exists, is fresh, or is eligible for any downstream service.
+Invalid IDs, unavailable/nonlocal storage, and database/decoding failures return
+errors rather than `none`. Normal initialization and experimental opt-in apply;
+this adds no authorization beyond the existing control interface.
+
+Reserved, successor-created, committed, and evidence-claimed records return
+`pending`; completed records return `complete`. Pending need not make progress
+and may become `none` when a reservation is abandoned. Consumers must own bounded
+retries, fail closed on unresolved/error outcomes, and must not treat pending or
+pending-to-none as permission to manufacture a fresh identity.
+
+This read has no thread serialization scope and takes no lifecycle lock: a second
+connection can read a pending record while a clear hook is running. It does not
+advance phases, deliver evidence, release reservations, or change subscriptions.
+Existing pre-move hook ordering is unchanged. A hook which blocks completion
+cannot wait for its own successor's subscription to move.
+
+`complete` is historical succession evidence, **not** proof of hook delivery or
+current interactive subscription. Completion precedes the connection move; a
+disconnect or startup reconciliation can leave a completed record with no
+successor subscription. Verify current subscription and any consumer policy
+separately. Reconnect by querying the same hosting server/store and exact
+successor; completed tuples survive unload, cold resume, and restart without
+replaying hooks. For a chain X → A → B, querying A returns X/A and querying B
+returns A/B; it never selects an arbitrary latest transition.
+
+Lifecycle consumers can use the already negotiated generic control endpoint.
+This API does not add hook endpoint discovery, change `codex/thread-identity`,
+or implement downstream admission, naming, trust, or routing decisions.

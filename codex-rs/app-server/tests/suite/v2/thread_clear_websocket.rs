@@ -47,6 +47,9 @@ use tempfile::TempDir;
 use tokio::time::Duration;
 use tokio::time::timeout;
 
+#[path = "thread_clear_read.rs"]
+mod clear_read;
+
 #[derive(Debug)]
 enum ClearEvidence {
     Ended(ThreadClearEndedNotification),

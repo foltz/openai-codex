@@ -527,6 +527,13 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::ThreadClearResponse,
     },
+    // Deliberately unscoped: observation must not queue behind clear mutation.
+    #[experimental("thread/clear/read")]
+    ThreadClearRead => "thread/clear/read" {
+        params: v2::ThreadClearReadParams,
+        serialization: None,
+        response: v2::ThreadClearReadResponse,
+    },
     #[experimental("thread/attachment/list")]
     ThreadAttachmentList => "thread/attachment/list" {
         params: v2::ThreadAttachmentListParams,

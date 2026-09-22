@@ -14,11 +14,107 @@ async fn runtime() -> Arc<StateRuntime> {
     .expect("state runtime")
 }
 
+#[tokio::test]
+async fn successor_lookup_retains_completed_edges_and_excludes_abandoned_reservations() {
+    let runtime = runtime().await;
+    let a = ThreadId::new();
+    let b = ThreadId::new();
+    let c = ThreadId::new();
+    assert_eq!(
+        runtime.get_clear_transition_by_successor(a).await.unwrap(),
+        None
+    );
+    for (predecessor, successor) in [(a, b), (b, c)] {
+        let mut record = reserved_record(
+            runtime
+                .reserve_clear_transition(ClearTransitionId::new(), predecessor, successor)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            runtime
+                .get_clear_transition_by_successor(successor)
+                .await
+                .unwrap(),
+            Some(record.clone())
+        );
+        for next in [
+            ClearTransitionPhase::SuccessorCreated,
+            ClearTransitionPhase::Committed,
+            ClearTransitionPhase::EvidenceClaimed,
+            ClearTransitionPhase::Completed,
+        ] {
+            assert!(
+                runtime
+                    .advance_clear_transition_phase(record.transition_id, record.phase, next)
+                    .await
+                    .unwrap()
+            );
+            record = runtime
+                .get_clear_transition(record.transition_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                runtime
+                    .get_clear_transition_by_successor(successor)
+                    .await
+                    .unwrap(),
+                Some(record.clone())
+            );
+        }
+    }
+    assert_eq!(
+        runtime
+            .get_clear_transition_by_successor(b)
+            .await
+            .unwrap()
+            .unwrap()
+            .predecessor_thread_id,
+        a
+    );
+    let abandoned = reserved_record(
+        runtime
+            .reserve_clear_transition(ClearTransitionId::new(), c, ThreadId::new())
+            .await
+            .unwrap(),
+    );
+    assert!(
+        runtime
+            .abandon_clear_transition(abandoned.transition_id, ClearTransitionPhase::Reserved)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        runtime
+            .get_clear_transition_by_successor(abandoned.successor_thread_id)
+            .await
+            .unwrap(),
+        None
+    );
+    // A read failure is not an absent record.
+    runtime.pool.close().await;
+    assert!(runtime.get_clear_transition_by_successor(b).await.is_err());
+}
+
 fn reserved_record(outcome: ClearTransitionReserveOutcome) -> ClearTransitionRecord {
     let ClearTransitionReserveOutcome::Reserved(record) = outcome else {
         panic!("expected a new reservation");
     };
     record
+}
+
+#[tokio::test]
+async fn successor_lookup_does_not_hide_malformed_records_as_absence() {
+    let runtime = runtime().await;
+    let b = ThreadId::new();
+    runtime
+        .reserve_clear_transition(ClearTransitionId::new(), ThreadId::new(), b)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE clear_transitions SET predecessor_thread_id = 'invalid' WHERE successor_thread_id = ?")
+        .bind(b.to_string()).execute(runtime.pool.as_ref()).await.unwrap();
+    assert!(runtime.get_clear_transition_by_successor(b).await.is_err());
 }
 
 #[tokio::test]

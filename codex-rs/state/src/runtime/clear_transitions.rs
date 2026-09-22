@@ -84,6 +84,15 @@ INSERT INTO clear_transitions (
         load_by_predecessor(self.pool.as_ref(), predecessor_thread_id).await
     }
 
+    /// Read exact successor lineage, including pending and completed records.
+    /// Abandoned reservations do not establish succession and are excluded.
+    pub async fn get_clear_transition_by_successor(
+        &self,
+        successor_thread_id: ThreadId,
+    ) -> anyhow::Result<Option<ClearTransitionRecord>> {
+        load_by_successor(self.pool.as_ref(), successor_thread_id).await
+    }
+
     /// Advance one phase only when the current durable phase is the expected predecessor.
     pub async fn advance_clear_transition_phase(
         &self,

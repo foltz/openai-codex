@@ -438,6 +438,7 @@ export type { ThreadClearEndedNotification } from "./ThreadClearEndedNotificatio
 export type { ThreadClearParams } from "./ThreadClearParams";
 export type { ThreadClearResponse } from "./ThreadClearResponse";
 export type { ThreadClearStartedNotification } from "./ThreadClearStartedNotification";
+export type { ThreadClearTransition } from "./ThreadClearTransition";
 export type { ThreadClosedNotification } from "./ThreadClosedNotification";
 export type { ThreadCompactStartParams } from "./ThreadCompactStartParams";
 export type { ThreadCompactStartResponse } from "./ThreadCompactStartResponse";

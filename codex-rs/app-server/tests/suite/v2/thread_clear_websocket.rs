@@ -13,6 +13,7 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
 use app_test_support::create_fake_rollout;
+use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
 use app_test_support::rollout_path;
 use app_test_support::to_response;
@@ -55,6 +56,134 @@ enum ClearEvidence {
 enum ClearAttempt {
     Won(Box<ThreadClearResponse>, Vec<ClearEvidence>),
     Lost(ThreadClearErrorCode, Vec<ClearEvidence>),
+}
+
+#[tokio::test]
+async fn clear_successor_preserves_thread_source_after_preview_and_cold_resume() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri(), "never")?;
+    let sqlite_home = codex_home.path().to_str().context("UTF-8 test home")?;
+    let (mut process, bind_addr) =
+        spawn_websocket_server_with_env(codex_home.path(), &[("CODEX_SQLITE_HOME", sqlite_home)])
+            .await?;
+    let mut client = connect_websocket(bind_addr).await?;
+    send_request(
+        &mut client,
+        "initialize",
+        1,
+        Some(json!({
+            "clientInfo": { "name": "classification-test", "version": "1" },
+            "capabilities": { "experimentalApi": true }
+        })),
+    )
+    .await?;
+    read_response_for_id(&mut client, 1).await?;
+    send_request(
+        &mut client,
+        "thread/start",
+        2,
+        Some(json!({ "model": "mock-model", "threadSource": "user" })),
+    )
+    .await?;
+    let started: ThreadStartResponse = to_response(read_response_for_id(&mut client, 2).await?)?;
+    let predecessor = started.thread.id;
+    send_clear(&mut client, 3, &predecessor).await?;
+    let (cleared, _) = read_clear_outcome(&mut client, 3).await?;
+    let successor = cleared.successor_thread.id;
+    let before_preview = read_thread(&mut client, 4, &successor).await?;
+    assert_eq!(
+        serde_json::to_value(&before_preview.thread)?["threadSource"],
+        "user"
+    );
+
+    // A real turn also exercises the preview-bearing legacy read path.
+    // No synthetic metadata or live fallback.
+    send_request(
+        &mut client,
+        "turn/start",
+        5,
+        Some(json!({
+            "threadId": successor,
+            "input": [{ "type": "text", "text": "classification preview", "text_elements": [] }]
+        })),
+    )
+    .await?;
+    read_response_for_id(&mut client, 5).await?;
+    timeout(Duration::from_secs(60), async {
+        loop {
+            if let JSONRPCMessage::Notification(notification) =
+                read_jsonrpc_message(&mut client).await?
+                && notification.method == "turn/completed"
+            {
+                let params = notification.params.context("turn completion params")?;
+                assert_eq!(params["threadId"], successor);
+                assert_eq!(params["turn"]["status"], "completed");
+                return Ok::<_, anyhow::Error>(());
+            }
+        }
+    })
+    .await??;
+    // Verify persisted history as well as the preview-only projection.
+    send_request(
+        &mut client,
+        "thread/read",
+        6,
+        Some(json!({
+            "threadId": successor, "includeTurns": true
+        })),
+    )
+    .await?;
+    let persisted: ThreadReadResponse = to_response(read_response_for_id(&mut client, 6).await?)?;
+    assert!(!persisted.thread.turns.is_empty());
+    let after_preview = read_thread(&mut client, 7, &successor).await?;
+    assert_eq!(after_preview.thread.preview, "classification preview");
+    assert_eq!(
+        serde_json::to_value(&after_preview.thread)?["threadSource"],
+        "user"
+    );
+
+    // This WebSocket observer has no trusted interactive attachment. Its
+    // attachment state must not turn a persisted user classification into null.
+    send_request(&mut client, "thread/attachment/list", 8, Some(json!({}))).await?;
+    let attachments = read_response_for_id(&mut client, 8).await?;
+    let entries = attachments.result["entries"]
+        .as_array()
+        .context("attachment entries")?;
+    assert!(!entries.iter().any(|entry| {
+        entry["threadId"] == successor
+            && entry["interactiveAttachmentCount"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0
+    }));
+
+    // Restarting the disposable server proves an unloaded read cannot be
+    // rescued by an in-memory session classification.
+    process.kill().await?;
+    drop(client);
+    let (mut restarted, bind_addr) =
+        spawn_websocket_server_with_env(codex_home.path(), &[("CODEX_SQLITE_HOME", sqlite_home)])
+            .await?;
+    let mut client = connect_websocket(bind_addr).await?;
+    initialize(&mut client, 9, "cold-classification-test").await?;
+    let unloaded = read_thread(&mut client, 10, &successor).await?;
+    assert_eq!(
+        serde_json::to_value(&unloaded.thread)?["threadSource"],
+        "user"
+    );
+    assert_eq!(
+        unloaded.thread.status,
+        codex_app_server_protocol::ThreadStatus::NotLoaded
+    );
+    resume_thread(&mut client, 11, &successor).await?;
+    let resumed = read_thread(&mut client, 12, &successor).await?;
+    assert_eq!(
+        serde_json::to_value(&resumed.thread)?["threadSource"],
+        "user"
+    );
+    restarted.kill().await?;
+    Ok(())
 }
 
 #[tokio::test]

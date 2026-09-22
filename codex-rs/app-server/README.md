@@ -375,3 +375,10 @@ compatibility but is not emitted. Non-Windows hosts report `notConfigured`.
 MXC uses the standard `command/exec` streaming and process-control path, including
 ConPTY when `tty` is enabled. The buffered legacy Windows sandbox restrictions on
 process control and custom output caps do not apply to MXC.
+
+### Persisted thread classification
+
+`thread/read` preserves the persisted `threadSource` classification across clear,
+persistence, and unloaded reads. It is independent of the client origin in
+`source` and of interactive subscription state. Missing classification remains
+`null`; it is not inferred to be `user` from either origin or subscription.

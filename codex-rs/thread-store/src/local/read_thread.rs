@@ -278,6 +278,7 @@ async fn read_thread_from_rollout_path(
     // The rollout display summary omits classification; preserve the exact
     // optional value from session metadata rather than inferring it from origin.
     thread.thread_source = meta_line.meta.thread_source;
+    thread.agent_path = meta_line.meta.agent_path;
     thread.forked_from_id = meta_line.meta.forked_from_id;
     thread.parent_thread_id = meta_line.meta.parent_thread_id;
     thread.history_mode = meta_line.meta.history_mode;
@@ -584,12 +585,18 @@ mod tests {
 
     #[tokio::test]
     async fn preview_reads_preserve_persisted_thread_source() {
-        for source in [
-            Some(ThreadSource::User),
-            Some(ThreadSource::Subagent),
-            Some(ThreadSource::MemoryConsolidation),
-            Some(ThreadSource::Feature("custom_feature".to_string())),
-            None,
+        for (source, agent_path) in [
+            (Some(ThreadSource::User), None),
+            (
+                Some(ThreadSource::Subagent),
+                Some("/root/worker".to_string()),
+            ),
+            (Some(ThreadSource::MemoryConsolidation), None),
+            (
+                Some(ThreadSource::Feature("custom_feature".to_string())),
+                None,
+            ),
+            (None, None),
         ] {
             let home = TempDir::new().expect("temp dir");
             let config = test_config(home.path());
@@ -603,6 +610,7 @@ mod tests {
                 .map(|line| serde_json::from_str(line).expect("rollout line"))
                 .collect();
             lines[0]["payload"]["thread_source"] = serde_json::to_value(&source).unwrap();
+            lines[0]["payload"]["agent_path"] = serde_json::to_value(&agent_path).unwrap();
             std::fs::write(
                 &path,
                 lines
@@ -620,6 +628,7 @@ mod tests {
             let mut builder =
                 ThreadMetadataBuilder::new(thread_id, path.clone(), Utc::now(), SessionSource::Cli);
             builder.thread_source = source.clone();
+            builder.agent_path = agent_path.clone();
             let mut metadata = builder.build(&config.default_model_provider_id);
             metadata.first_user_message = Some("Hello from user".to_string());
             runtime
@@ -649,6 +658,7 @@ mod tests {
                     for thread in [by_id, by_path] {
                         assert_eq!(thread.preview, "Hello from user");
                         assert_eq!(thread.thread_source, source);
+                        assert_eq!(thread.agent_path, agent_path);
                     }
                 }
             }

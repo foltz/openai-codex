@@ -887,6 +887,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clear_moves_no_attachment_for_disconnected_requester() {
+        for keep_bystander in [false, true] {
+            let manager = ThreadStateManager::new();
+            let predecessor = ThreadId::new();
+            let successor = ThreadId::new();
+            let requester = ConnectionId(1);
+            let bystander = ConnectionId(2);
+            let connections = if keep_bystander {
+                vec![requester, bystander]
+            } else {
+                vec![requester]
+            };
+            for connection in &connections {
+                manager
+                    .connection_initialized(
+                        *connection,
+                        ConnectionCapabilities {
+                            request_attestation: false,
+                            trusted_interactive: true,
+                            retention_principal: None,
+                        },
+                    )
+                    .await;
+                manager
+                    .try_ensure_connection_subscribed(
+                        predecessor,
+                        *connection,
+                        /* experimental_raw_events */ false,
+                    )
+                    .await
+                    .expect("trusted connection must initially be attached");
+            }
+            assert_eq!(
+                manager.thread_attachment_list().await.entries,
+                vec![ThreadAttachmentEntry {
+                    thread_id: predecessor.to_string(),
+                    interactive_attachment_count: connections.len() as u32,
+                }]
+            );
+
+            manager.remove_connection(requester).await;
+            let disconnected = manager.thread_attachment_list().await;
+            let expected_entries = if keep_bystander {
+                vec![ThreadAttachmentEntry {
+                    thread_id: predecessor.to_string(),
+                    interactive_attachment_count: 1,
+                }]
+            } else {
+                vec![]
+            };
+            assert_eq!(disconnected.entries, expected_entries);
+            assert!(
+                !manager
+                    .move_connection_for_clear(predecessor, successor, requester)
+                    .await
+            );
+            assert_eq!(manager.thread_attachment_list().await, disconnected);
+            assert!(!manager.has_subscribers(successor).await);
+        }
+    }
+
+    #[tokio::test]
     async fn disclosed_clear_successor_cannot_be_resumed_before_atomic_move() {
         let manager = ThreadStateManager::new();
         let predecessor_thread_id = ThreadId::new();

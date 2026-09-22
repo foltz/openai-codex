@@ -207,6 +207,7 @@ bypass the unfinished reset.
 - `thread/delete` — hard-delete an active or archived thread and any spawned descendant threads; returns `{}` on success and emits `thread/deleted` for each deleted thread.
 - `thread/unsubscribe` — unsubscribe this connection from thread turn/item events. If this was the last subscriber, the server keeps the thread loaded and unloads it only after it has had no subscribers and no thread activity for 30 minutes, runs `SessionEnd` hooks, then emits `thread/closed`.
 - `thread/clear` — replace the requesting connection's displayed predecessor with one server-authorized successor. The response identifies the predecessor, successor, and a stable `transitionId`. Requester-scoped `thread/clear/ended` and `thread/clear/started` notifications carry that same identity in strict order; broad `thread/started` remains compatibility context and is not succession authority. Builds that expose the additive wire types before enabling orchestration reject the request without creating a successor.
+- `thread/clear/read` (experimental) — read durable clear provenance by `successorThreadId`; no thread subscription or loaded session is needed. See [Clear transition observation](#clear-transition-observation).
 - `thread/name/set` — set or update a thread’s user-facing name for either a loaded thread or a persisted rollout; returns `{}` on success and emits `thread/name/updated` to initialized, opted-in clients. Thread names are not required to be unique; name lookups resolve to the most recently updated thread.
 - `thread/unarchive` — move an archived rollout file back into the sessions directory; returns the restored `thread` on success and emits `thread/unarchived`.
 - `thread/compact/start` — trigger conversation history compaction for a thread; returns `{}` immediately while progress streams through standard turn/item notifications.
@@ -1515,6 +1516,56 @@ All filesystem paths in this section must be absolute.
 } }
 { "id": 45, "result": {} }
 ```
+
+## Clear transition observation
+
+Experimental clients can query this hosting server's durable clear record without
+subscribing to a thread or receiving the original clear notifications:
+
+```json
+{"id": 42, "method": "thread/clear/read", "params": {"successorThreadId": "B"}}
+```
+
+The result is a discriminated union:
+
+```json
+{"disposition": "none", "transition": null}
+{"disposition": "pending", "transition": {"transitionId": "T", "predecessorThreadId": "A", "successorThreadId": "B"}}
+{"disposition": "complete", "transition": {"transitionId": "T", "predecessorThreadId": "A", "successorThreadId": "B"}}
+```
+
+IDs above are placeholders; requests require a valid thread UUID. The lookup uses
+the existing local `clear_transitions` store, not rollout inference. `none` means
+no non-abandoned row for that successor in the available store; it does not prove
+that the thread exists, is fresh, or is eligible for any downstream service.
+Invalid IDs, unavailable/nonlocal storage, and database/decoding failures return
+errors rather than `none`. Normal initialization and experimental opt-in apply;
+this adds no authorization beyond the existing control interface.
+
+Reserved, successor-created, committed, and evidence-claimed records return
+`pending`; completed records return `complete`. Pending need not make progress
+and may become `none` when a reservation is abandoned. Consumers must own bounded
+retries, fail closed on unresolved/error outcomes, and must not treat pending or
+pending-to-none as permission to manufacture a fresh identity.
+
+This read has no thread serialization scope and takes no lifecycle lock: a second
+connection can read a pending record while a clear hook is running. It does not
+advance phases, deliver evidence, release reservations, or change attachments.
+Existing pre-move hook ordering is unchanged. A hook which blocks completion
+cannot wait for its own successor's attachment to move.
+
+`complete` is historical succession evidence, **not** proof of hook delivery or
+current interactive attachment. Completion precedes the connection move; a
+disconnect or startup reconciliation can leave a completed record with no
+successor attachment. Verify current attachment and any consumer policy
+separately. Reconnect by querying the same hosting server/store and exact
+successor; completed tuples survive unload, cold resume, and restart without
+replaying hooks. For a chain X → A → B, querying A returns X/A and querying B
+returns A/B; it never selects an arbitrary latest transition.
+
+Lifecycle consumers can use the already negotiated generic control endpoint.
+This API does not add hook endpoint discovery, change `codex/thread-identity`,
+or implement downstream admission, naming, trust, or routing decisions.
 
 ## Events
 

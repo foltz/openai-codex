@@ -1601,6 +1601,11 @@ impl MessageProcessor {
                     .thread_interactive_subscription_list(params)
                     .await
             }
+            ClientRequest::ThreadClearRead { params, .. } => self
+                .thread_processor
+                .thread_clear_read(params)
+                .await
+                .map(|response| Some(response.into())),
             ClientRequest::ThreadRetentionAcquire { params, .. } => self
                 .thread_retention_acquire(params, retention_acquire_authority)
                 .await

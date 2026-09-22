@@ -568,6 +568,7 @@ mod rollout;
 mod search;
 mod thread_attachments;
 mod thread_clear;
+mod thread_clear_read;
 mod thread_enrichment;
 mod thread_fork_goal;
 mod thread_input;

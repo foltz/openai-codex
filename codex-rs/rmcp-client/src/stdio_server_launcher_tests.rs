@@ -26,6 +26,7 @@ async fn start_live_executor_process()
     let backend = Environment::default_for_tests().get_exec_backend();
     let started = backend
         .start(ExecParams {
+            metadata: Default::default(),
             process_id: ExecutorProcessTransport::next_process_id(),
             argv: vec![
                 std::env::current_exe()?.to_string_lossy().into_owned(),
@@ -35,6 +36,7 @@ async fn start_live_executor_process()
                 "--nocapture".to_owned(),
             ],
             cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
+            shell_snapshot: None,
             env_policy: None,
             env: HashMap::new(),
             tty: false,

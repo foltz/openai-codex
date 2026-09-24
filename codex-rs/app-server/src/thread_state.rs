@@ -887,7 +887,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clear_moves_no_attachment_for_disconnected_requester() {
+    async fn clear_moves_no_subscription_for_disconnected_requester() {
         for keep_bystander in [false, true] {
             let manager = ThreadStateManager::new();
             let predecessor = ThreadId::new();
@@ -920,19 +920,19 @@ mod tests {
                     .expect("trusted connection must initially be attached");
             }
             assert_eq!(
-                manager.thread_attachment_list().await.entries,
-                vec![ThreadAttachmentEntry {
+                manager.thread_interactive_subscription_list().await.entries,
+                vec![ThreadInteractiveSubscriptionEntry {
                     thread_id: predecessor.to_string(),
-                    interactive_attachment_count: connections.len() as u32,
+                    interactive_subscription_count: connections.len() as u32,
                 }]
             );
 
             manager.remove_connection(requester).await;
-            let disconnected = manager.thread_attachment_list().await;
+            let disconnected = manager.thread_interactive_subscription_list().await;
             let expected_entries = if keep_bystander {
-                vec![ThreadAttachmentEntry {
+                vec![ThreadInteractiveSubscriptionEntry {
                     thread_id: predecessor.to_string(),
-                    interactive_attachment_count: 1,
+                    interactive_subscription_count: 1,
                 }]
             } else {
                 vec![]
@@ -943,7 +943,7 @@ mod tests {
                     .move_connection_for_clear(predecessor, successor, requester)
                     .await
             );
-            assert_eq!(manager.thread_attachment_list().await, disconnected);
+            assert_eq!(manager.thread_interactive_subscription_list().await, disconnected);
             assert!(!manager.has_subscribers(successor).await);
         }
     }

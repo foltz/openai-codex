@@ -158,7 +158,7 @@ async fn failed_cleanup_remains_owned_after_loop_join() {
 async fn constructor_admitted_before_close_cannot_publish_after_close() {
     struct HeldInstructions(Mutex<Option<tokio::sync::oneshot::Receiver<()>>>);
     impl codex_extension_api::UserInstructionsProvider for HeldInstructions {
-        fn load_user_instructions(&self) -> codex_extension_api::LoadUserInstructionsFuture<'_> {
+        fn load_user_instructions(&self) -> codex_extension_api::LoadInstructionsFuture<'_> {
             let held = self.0.lock().unwrap().take().unwrap();
             Box::pin(async move {
                 held.await.unwrap();

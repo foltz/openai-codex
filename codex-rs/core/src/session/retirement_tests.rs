@@ -336,6 +336,7 @@ async fn exact_thread_full_submission_queue_freezes_births_before_waiting() {
         .io
         .submit(codex_protocol::protocol::Op::RunUserShellCommand {
             command: "queued work must not start".to_string(),
+            timeout_ms: None,
         })
         .await
         .expect("fill queue");

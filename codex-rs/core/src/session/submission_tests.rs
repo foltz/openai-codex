@@ -6,7 +6,7 @@ fn submission(id: &str) -> Submission {
     Submission {
         id: id.to_owned(),
         op: Op::Shutdown,
-        client_user_message_id: None,
+        root_turn_id: None,
         trace: None,
         parent_turn_id: None,
     }

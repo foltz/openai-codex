@@ -8450,7 +8450,7 @@ async fn closed_task_admission_prevents_direct_and_mailbox_task_creation() {
                 "pending shutdown mail".to_string(),
                 /*trigger_turn*/ true,
             ),
-            /*parent_turn_id*/ None,
+            codex_protocol::turn_input::TurnStartOptions::default(),
         )
         .await;
     session.maybe_start_turn_for_pending_work().await;

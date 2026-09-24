@@ -279,7 +279,7 @@ async fn manager_incomplete_report_keeps_failed_start_custody_after_future_retur
 async fn manager_shutdown_drives_admitted_constructor_after_its_observer_is_cancelled() {
     struct HeldInstructions(Mutex<Option<tokio::sync::oneshot::Receiver<()>>>);
     impl codex_extension_api::UserInstructionsProvider for HeldInstructions {
-        fn load_user_instructions(&self) -> codex_extension_api::LoadUserInstructionsFuture<'_> {
+        fn load_user_instructions(&self) -> codex_extension_api::LoadInstructionsFuture<'_> {
             let held = self.0.lock().unwrap().take().unwrap();
             Box::pin(async move {
                 held.await.unwrap();

@@ -216,7 +216,7 @@ async fn real_constructor_cancelled_before_publication_is_drained_after_close() 
         receiver: Mutex<Option<oneshot::Receiver<()>>>,
     }
     impl codex_extension_api::UserInstructionsProvider for HeldInstructions {
-        fn load_user_instructions(&self) -> codex_extension_api::LoadUserInstructionsFuture<'_> {
+        fn load_user_instructions(&self) -> codex_extension_api::LoadInstructionsFuture<'_> {
             let receiver = self.receiver.lock().unwrap().take().expect("one load");
             self.entered.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {

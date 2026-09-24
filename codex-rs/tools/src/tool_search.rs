@@ -16,6 +16,34 @@ pub struct ToolSearchEntry {
 }
 
 impl ToolSearchEntry {
+    /// Names exposed by the normalized search result, without materializing schemas.
+    pub fn name_candidates(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        match self.spec.as_ref() {
+            ToolSpec::Function(_) | ToolSpec::Freeform(_) => {
+                let name = self.spec.name();
+                names.push(DEFAULT_FUNCTION_NAMESPACE.to_string());
+                names.push(name.to_string());
+                names.push(format!("{DEFAULT_FUNCTION_NAMESPACE}{name}"));
+            }
+            ToolSpec::Namespace(namespace) => {
+                names.push(namespace.name.clone());
+                for tool in &namespace.tools {
+                    let name = match tool {
+                        ResponsesApiNamespaceTool::Function(tool) => &tool.name,
+                        ResponsesApiNamespaceTool::Custom(tool) => &tool.name,
+                    };
+                    names.push(name.clone());
+                    names.push(format!("{}{name}", namespace.name));
+                }
+            }
+            ToolSpec::ToolSearch { .. } | ToolSpec::WebSearch { .. } => {
+                unreachable!("search entries contain only loadable tools");
+            }
+        }
+        names
+    }
+
     /// Materialize only selected results; output schemas remain shared until discarded.
     pub fn to_loadable_spec(&self) -> LoadableToolSpec {
         let Some(output) = normalize_search_spec(self.spec.as_ref().clone()) else {

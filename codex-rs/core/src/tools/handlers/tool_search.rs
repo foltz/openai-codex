@@ -269,7 +269,7 @@ impl ToolSearchHandler {
             .iter()
             .enumerate()
             .filter_map(|(id, search_info)| {
-                loadable_tool_spec_names(&search_info.entry.output)
+                search_info.entry.name_candidates().into_iter()
                     .any(|name| {
                         query_tokens
                             .iter()
@@ -302,25 +302,6 @@ fn exact_match_query_tokens(query: &str) -> Vec<String> {
 fn tool_name_matches_token(name: &str, token: &str) -> bool {
     let name = name.to_ascii_lowercase();
     name == token || name.ends_with(&format!("_{token}"))
-}
-
-fn loadable_tool_spec_names(spec: &LoadableToolSpec) -> impl Iterator<Item = String> + '_ {
-    let mut names = Vec::new();
-    match spec {
-        LoadableToolSpec::Function(tool) => names.push(tool.name.clone()),
-        LoadableToolSpec::Namespace(namespace) => {
-            names.push(namespace.name.clone());
-            for tool in &namespace.tools {
-                let tool_name = match tool {
-                    codex_tools::ResponsesApiNamespaceTool::Function(tool) => &tool.name,
-                    codex_tools::ResponsesApiNamespaceTool::Custom(tool) => &tool.name,
-                };
-                names.push(tool_name.clone());
-                names.push(format!("{}{}", namespace.name, tool_name));
-            }
-        }
-    }
-    names.into_iter()
 }
 
 #[cfg(test)]

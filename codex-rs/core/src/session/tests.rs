@@ -9259,6 +9259,7 @@ async fn step_context_keeps_its_mcp_runtime_for_tools() -> anyhow::Result<()> {
             enabled: true,
             required: false,
             supports_parallel_tool_calls: false,
+            thread_identity_eligible: false,
             omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,
@@ -12465,4 +12466,32 @@ async fn session_start_hooks_require_project_trust_without_config_toml() -> std:
     }
 
     Ok(())
+}
+/// Exercises the identity selection used by session construction, preserving
+/// upstream's reservation rejection for resumed histories.
+#[test]
+fn select_thread_id_matches_the_contract_for_every_lifecycle_transition() {
+    let agent_control = LocalAgentControl::default();
+    let mut minted = std::collections::HashSet::new();
+    for history in [InitialHistory::New, InitialHistory::New, InitialHistory::Cleared, InitialHistory::Forked(Vec::new())] {
+        let id = Session::select_thread_id(&history, /*reserved_thread_id*/ None, &agent_control)
+            .expect("new lifecycle must select an identity");
+        assert!(minted.insert(id), "fresh, child, clear and fork must select distinct IDs");
+        let reserved = ThreadId::new();
+        assert_eq!(
+            Session::select_thread_id(&history, Some(reserved), &agent_control).unwrap(),
+            reserved,
+        );
+    }
+    let stored = ThreadId::new();
+    let history = InitialHistory::Resumed(ResumedHistory {
+        conversation_id: stored,
+        history: std::sync::Arc::new(Vec::new()),
+        rollout_path: None,
+    });
+    assert_eq!(
+        Session::select_thread_id(&history, /*reserved_thread_id*/ None, &agent_control).unwrap(),
+        stored,
+    );
+    assert!(Session::select_thread_id(&history, Some(ThreadId::new()), &agent_control).is_err());
 }

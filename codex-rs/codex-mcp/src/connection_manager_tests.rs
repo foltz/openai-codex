@@ -2036,6 +2036,7 @@ async fn read_only_apps_discovery_never_uses_a_shared_writable_catalog() -> anyh
                     EffectiveMcpServer::configured(server_config.clone()),
                 )]),
                 submit_id: "test".to_string(),
+                canonical_thread_id: None,
                 tx_event: None,
                 startup_cancellation_token: cancellation,
                 runtime_context: reusable_server_runtime_context(),
@@ -2115,6 +2116,7 @@ async fn hosted_apps_protocol_mode_is_independent_of_generic_mode() -> anyhow::R
                     ),
                 ]),
                 submit_id: "protocol-mode-scope".to_string(),
+                canonical_thread_id: None,
                 tx_event: None,
                 startup_cancellation_token,
                 runtime_context: McpRuntimeContext::new(
@@ -2225,6 +2227,7 @@ async fn codex_apps_extension_does_not_share_host_owned_tools_cache() -> anyhow:
                 tool_catalog_cache: McpToolCatalogCache::default(),
                 codex_apps_tools_cache_key: cache_key.clone(),
                 client_mcp_extensions: ClientMcpExtensions::default(),
+                canonical_thread_id: None,
                 auth: None,
                 auth_manager: None,
                 elicitation_reviewer: None,
@@ -4565,6 +4568,7 @@ async fn executor_owned_chatgpt_mcp_accepts_only_safe_explicit_authorization() -
                 /*codex_apps_cache_identity*/ None,
                 ElicitationCapability::default(),
                 ClientMcpExtensions::default(),
+                /*canonical_thread_id*/ None,
                 /*previous_identity*/ None,
             )
         };
@@ -4622,6 +4626,7 @@ async fn executor_owned_chatgpt_mcp_accepts_only_safe_explicit_authorization() -
                 auth_manager: None,
                 elicitation_reviewer: None,
                 elicitation_lifecycle: None,
+                canonical_thread_id: None,
             },
             ElicitationRequestRouter::default(),
         )
@@ -4669,6 +4674,7 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
                 enabled: true,
                 required: false,
                 supports_parallel_tool_calls: false,
+                thread_identity_eligible: false,
                 omit_tools_from: None,
                 disabled_reason: None,
                 startup_timeout_sec: None,
@@ -4697,6 +4703,7 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
                 enabled: true,
                 required: false,
                 supports_parallel_tool_calls: false,
+                thread_identity_eligible: false,
                 omit_tools_from: None,
                 disabled_reason: None,
                 startup_timeout_sec: None,
@@ -4741,6 +4748,7 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
             auth_manager: None,
             elicitation_reviewer: None,
             elicitation_lifecycle: None,
+            canonical_thread_id: None,
         },
         ElicitationRequestRouter::default(),
     )
@@ -4808,6 +4816,7 @@ fn mcp_init_error_display_prompts_for_github_pat() {
         enabled: true,
         required: false,
         supports_parallel_tool_calls: false,
+        thread_identity_eligible: false,
         omit_tools_from: None,
         disabled_reason: None,
         startup_timeout_sec: None,
@@ -4968,6 +4977,7 @@ fn mcp_init_error_display_reports_generic_errors() {
         enabled: true,
         required: false,
         supports_parallel_tool_calls: false,
+        thread_identity_eligible: false,
         omit_tools_from: None,
         disabled_reason: None,
         startup_timeout_sec: None,
@@ -5047,6 +5057,7 @@ fn reusable_server_config(url: &str) -> McpServerConfig {
         enabled: true,
         required: false,
         supports_parallel_tool_calls: false,
+        thread_identity_eligible: false,
         omit_tools_from: None,
         disabled_reason: None,
         startup_timeout_sec: None,
@@ -5089,6 +5100,7 @@ fn reusable_server_identity(
         /*codex_apps_cache_identity*/ None,
         ElicitationCapability::default(),
         ClientMcpExtensions::default(),
+        /*canonical_thread_id*/ None,
         /*previous_identity*/ None,
     )
 }
@@ -5178,6 +5190,7 @@ async fn reconcile_reusable_server_with_mcp_config(
             auth_manager: None,
             elicitation_reviewer: None,
             elicitation_lifecycle: None,
+            canonical_thread_id: None,
         },
         ElicitationRequestRouter::default(),
     )
@@ -5775,6 +5788,7 @@ fn connection_identity_uses_effective_authorization_headers() {
                 /*codex_apps_cache_identity*/ None,
                 ElicitationCapability::default(),
                 ClientMcpExtensions::default(),
+                /*canonical_thread_id*/ None,
                 /*previous_identity*/ None,
             )
         };
@@ -5796,6 +5810,95 @@ fn connection_identity_uses_effective_authorization_headers() {
             has_authorization,
         );
     }
+}
+
+/// Builds a connection identity varying only eligibility and canonical
+/// thread ID, holding every other field fixed via `reusable_server_config`.
+fn thread_identity_reuse_identity(
+    runtime_context: &McpRuntimeContext,
+    thread_identity_eligible: bool,
+    canonical_thread_id: Option<&str>,
+) -> McpServerConnectionIdentity {
+    let mut config = reusable_server_config("http://127.0.0.1:1");
+    config.thread_identity_eligible = thread_identity_eligible;
+    let server = EffectiveMcpServer::configured(config.clone());
+    let resolved_environment = runtime_context.resolve_server_environment("docs", &config);
+    McpServerConnectionIdentity::new(
+        "docs",
+        &server,
+        /*host_plugin_root*/ None,
+        OAuthCredentialsStoreMode::default(),
+        AuthKeyringBackendKind::default(),
+        McpOAuthRefreshMode::Legacy,
+        &resolved_environment,
+        runtime_context,
+        /*runtime_auth_provider*/ None,
+        /*auth*/ None,
+        /*codex_apps_cache_identity*/ None,
+        ElicitationCapability::default(),
+        ClientMcpExtensions::default(),
+        canonical_thread_id.map(str::to_string),
+        /*previous_identity*/ None,
+    )
+}
+
+#[test]
+fn eligible_server_with_changed_thread_id_does_not_reuse_connection() {
+    let runtime_context = reusable_server_runtime_context();
+    let before = thread_identity_reuse_identity(&runtime_context, true, Some("thread-a"));
+    let after = thread_identity_reuse_identity(&runtime_context, true, Some("thread-b"));
+
+    assert!(
+        !before.has_same_connection_config(&after),
+        "an eligible server must not reuse a connection bound to a different thread"
+    );
+}
+
+#[test]
+fn eligibility_toggle_does_not_reuse_connection_in_either_direction() {
+    let runtime_context = reusable_server_runtime_context();
+    let ineligible = thread_identity_reuse_identity(&runtime_context, false, Some("thread-a"));
+    let eligible = thread_identity_reuse_identity(&runtime_context, true, Some("thread-a"));
+
+    assert!(
+        !ineligible.has_same_connection_config(&eligible),
+        "toggling eligibility off-to-on must not reuse the existing connection"
+    );
+    assert!(
+        !eligible.has_same_connection_config(&ineligible),
+        "toggling eligibility on-to-off must not reuse the existing connection"
+    );
+}
+
+#[test]
+fn ineligible_server_with_changed_thread_id_still_reuses_connection() {
+    let runtime_context = reusable_server_runtime_context();
+    let before = thread_identity_reuse_identity(&runtime_context, false, Some("thread-a"));
+    let after = thread_identity_reuse_identity(&runtime_context, false, Some("thread-b"));
+
+    assert!(
+        before.has_same_connection_config(&after),
+        "an ordinary (ineligible) server's reuse decision must be unaffected by any thread \
+         change — it never binds an identity, so this must remain the pre-existing behavior"
+    );
+}
+
+/// Covers `kcf-runtime/04`'s "an already-live resume and compact retain the
+/// same thread-owned runtime and live bound connection; they do not rebind
+/// solely because the API action ran" — those transitions do not change the
+/// canonical thread ID, so the predicate must keep reusing the connection
+/// for an eligible server exactly as it always did for an ordinary one.
+#[test]
+fn eligible_server_with_unchanged_thread_id_reuses_connection() {
+    let runtime_context = reusable_server_runtime_context();
+    let before = thread_identity_reuse_identity(&runtime_context, true, Some("thread-a"));
+    let after = thread_identity_reuse_identity(&runtime_context, true, Some("thread-a"));
+
+    assert!(
+        before.has_same_connection_config(&after),
+        "an already-live resume or compact keeps the same thread id and must not force a \
+         reconnect for an eligible server"
+    );
 }
 
 #[tokio::test]
@@ -5929,6 +6032,7 @@ async fn reconciliation_replaces_connection_when_protocol_mode_changes() {
             auth_manager: None,
             elicitation_reviewer: None,
             elicitation_lifecycle: None,
+            canonical_thread_id: None,
         },
         ElicitationRequestRouter::default(),
     )
@@ -5987,6 +6091,7 @@ async fn reconciliation_reuses_legacy_stdio_server_when_modern_protocol_is_enabl
             auth_manager: None,
             elicitation_reviewer: None,
             elicitation_lifecycle: None,
+            canonical_thread_id: None,
         },
         ElicitationRequestRouter::default(),
     )
@@ -6246,6 +6351,7 @@ async fn reconciliation_reconnects_when_host_plugin_root_changes() {
         /*codex_apps_cache_identity*/ None,
         ElicitationCapability::default(),
         ClientMcpExtensions::default(),
+        /*canonical_thread_id*/ None,
         /*previous_identity*/ None,
     );
     Arc::get_mut(
@@ -6327,6 +6433,7 @@ async fn connection_identity_distinguishes_accounts_with_the_same_token() -> any
             /*codex_apps_cache_identity*/ None,
             ElicitationCapability::default(),
             ClientMcpExtensions::default(),
+            /*canonical_thread_id*/ None,
             /*previous_identity*/ None,
         )
     };
@@ -6381,6 +6488,7 @@ async fn connection_identity_distinguishes_agent_account_runtime_and_task() -> a
             /*codex_apps_cache_identity*/ None,
             ElicitationCapability::default(),
             ClientMcpExtensions::default(),
+            /*canonical_thread_id*/ None,
             /*previous_identity*/ None,
         )
     };

@@ -83,6 +83,8 @@ pub use rmcp_client::CancellableEventStreamRequest;
 pub use rmcp_client::Elicitation;
 pub use rmcp_client::ElicitationResponse;
 pub use rmcp_client::ListToolsWithConnectorIdResult;
+pub use rmcp_client::PostReconnectHook;
+pub use rmcp_client::ReconnectContext;
 pub use rmcp_client::RmcpClient;
 pub use rmcp_client::SendElicitation;
 pub use rmcp_client::StreamableHttpBearerToken;

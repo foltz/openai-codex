@@ -1081,6 +1081,7 @@ fn blocking_replace_mcp_servers_round_trips() {
             enabled: true,
             required: false,
             supports_parallel_tool_calls: true,
+            thread_identity_eligible: false,
             omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,
@@ -1114,6 +1115,7 @@ fn blocking_replace_mcp_servers_round_trips() {
             enabled: false,
             required: false,
             supports_parallel_tool_calls: false,
+            thread_identity_eligible: false,
             omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: Some(std::time::Duration::from_secs(5)),
@@ -1182,6 +1184,101 @@ B = \"2\"
     assert_eq!(raw, expected);
 }
 
+#[test]
+fn blocking_replace_mcp_servers_persists_thread_identity_eligible() {
+    let tmp = tempdir().expect("tmpdir");
+    let codex_home = tmp.path();
+
+    let mut servers = BTreeMap::new();
+    servers.insert(
+        "docs".to_string(),
+        McpServerConfig {
+            auth: Default::default(),
+            transport: McpServerTransportConfig::Stdio {
+                command: "docs-server".to_string(),
+                args: Vec::new(),
+                env: None,
+                env_vars: Vec::new(),
+                cwd: None,
+            },
+            environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
+            enabled: true,
+            required: false,
+            supports_parallel_tool_calls: false,
+            thread_identity_eligible: true,
+            omit_tools_from: None,
+            disabled_reason: None,
+            startup_timeout_sec: None,
+            tool_timeout_sec: None,
+            default_tools_approval_mode: None,
+            enabled_tools: None,
+            disabled_tools: None,
+            scopes: None,
+            oauth: None,
+            oauth_resource: None,
+            tools: HashMap::new(),
+        },
+    );
+
+    apply_blocking(codex_home, &[ConfigEdit::ReplaceMcpServers(servers)]).expect("persist");
+
+    let raw = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+    let expected = "\
+[mcp_servers.docs]
+command = \"docs-server\"
+thread_identity_eligible = true
+";
+    assert_eq!(raw, expected);
+}
+
+#[test]
+fn blocking_replace_mcp_servers_persists_thread_identity_eligible_inline() {
+    let tmp = tempdir().expect("tmpdir");
+    let codex_home = tmp.path();
+    std::fs::write(
+        codex_home.join(CONFIG_TOML_FILE),
+        "[mcp_servers]\nfoo = { command = \"cmd\" }\n",
+    )
+    .expect("seed");
+
+    let mut servers = BTreeMap::new();
+    servers.insert(
+        "foo".to_string(),
+        McpServerConfig {
+            auth: Default::default(),
+            transport: McpServerTransportConfig::Stdio {
+                command: "cmd".to_string(),
+                args: Vec::new(),
+                env: None,
+                env_vars: Vec::new(),
+                cwd: None,
+            },
+            environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
+            enabled: true,
+            required: false,
+            supports_parallel_tool_calls: false,
+            thread_identity_eligible: true,
+            omit_tools_from: None,
+            disabled_reason: None,
+            startup_timeout_sec: None,
+            tool_timeout_sec: None,
+            default_tools_approval_mode: None,
+            enabled_tools: None,
+            disabled_tools: None,
+            scopes: None,
+            oauth: None,
+            oauth_resource: None,
+            tools: HashMap::new(),
+        },
+    );
+
+    apply_blocking(codex_home, &[ConfigEdit::ReplaceMcpServers(servers)]).expect("persist");
+
+    let contents = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+    let expected = "[mcp_servers]\nfoo = { command = \"cmd\" , thread_identity_eligible = true }\n";
+    assert_eq!(contents, expected);
+}
+
 #[test_case::test_case(30_000; "positive limit")]
 #[test_case::test_case(usize::MAX; "largest native limit")]
 fn blocking_replace_mcp_servers_serializes_tool_approval_overrides(output_token_limit: usize) {
@@ -1204,6 +1301,7 @@ fn blocking_replace_mcp_servers_serializes_tool_approval_overrides(output_token_
             enabled: true,
             required: false,
             supports_parallel_tool_calls: false,
+            thread_identity_eligible: false,
             omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,
@@ -1280,6 +1378,7 @@ foo = { command = "cmd" }
             enabled: true,
             required: false,
             supports_parallel_tool_calls: false,
+            thread_identity_eligible: false,
             omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,
@@ -1332,6 +1431,7 @@ foo = { command = "cmd" } # keep me
             enabled: false,
             required: false,
             supports_parallel_tool_calls: false,
+            thread_identity_eligible: false,
             omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,
@@ -1383,6 +1483,7 @@ foo = { command = "cmd", args = ["--flag"] } # keep me
             enabled: true,
             required: false,
             supports_parallel_tool_calls: false,
+            thread_identity_eligible: false,
             omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,
@@ -1435,6 +1536,7 @@ foo = { command = "cmd" }
             enabled: false,
             required: false,
             supports_parallel_tool_calls: false,
+            thread_identity_eligible: false,
             omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,

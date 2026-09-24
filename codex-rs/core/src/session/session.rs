@@ -638,6 +638,25 @@ async fn warm_plugins_and_skills_for_session_init(
 }
 
 impl Session {
+    /// Selects a session identity without changing upstream reserved-ID rules.
+    /// Resumes retain their stored ID and cannot also reserve a new one.
+    pub(super) fn select_thread_id(
+        initial_history: &InitialHistory,
+        reserved_thread_id: Option<ThreadId>,
+        agent_control: &LocalAgentControl,
+    ) -> anyhow::Result<ThreadId> {
+        match (initial_history, reserved_thread_id) {
+            (InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_), Some(id)) => Ok(id),
+            (InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_), None) => {
+                Ok(agent_control.generate_thread_id())
+            }
+            (InitialHistory::Resumed(history), None) => Ok(history.conversation_id),
+            (InitialHistory::Resumed(_), Some(_)) => Err(anyhow::anyhow!(
+                "reserved thread ID cannot be used when resuming a thread"
+            )),
+        }
+    }
+
     /// Returns the concrete identity for this thread.
     pub(crate) fn thread_id(&self) -> ThreadId {
         self.thread_id
@@ -868,21 +887,7 @@ impl Session {
             }
             None => reserved_thread_id,
         };
-        let thread_id = match (&initial_history, reserved_thread_id) {
-            (
-                InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_),
-                Some(thread_id),
-            ) => thread_id,
-            (InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_), None) => {
-                agent_control.generate_thread_id()
-            }
-            (InitialHistory::Resumed(resumed_history), None) => resumed_history.conversation_id,
-            (InitialHistory::Resumed(_), Some(_)) => {
-                return Err(anyhow::anyhow!(
-                    "reserved thread ID cannot be used when resuming a thread"
-                ));
-            }
-        };
+        let thread_id = Self::select_thread_id(&initial_history, reserved_thread_id, &agent_control)?;
         let isolation = thread_extension_init
             .get::<codex_extension_api::SessionIsolation>()
             .map(|policy| *policy)

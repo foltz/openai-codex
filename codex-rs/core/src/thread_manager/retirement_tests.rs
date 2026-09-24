@@ -213,12 +213,14 @@ async fn real_constructor_cancelled_before_publication_is_drained_after_close() 
     use crate::thread_manager::ThreadManager;
     struct HeldInstructions {
         entered: AtomicUsize,
+        entry: tokio::sync::Notify,
         receiver: Mutex<Option<oneshot::Receiver<()>>>,
     }
     impl codex_extension_api::UserInstructionsProvider for HeldInstructions {
         fn load_user_instructions(&self) -> codex_extension_api::LoadInstructionsFuture<'_> {
             let receiver = self.receiver.lock().unwrap().take().expect("one load");
             self.entered.fetch_add(1, Ordering::SeqCst);
+            self.entry.notify_one();
             Box::pin(async move {
                 receiver.await.expect("release instructions");
                 codex_extension_api::LoadedUserInstructions::default()
@@ -242,13 +244,24 @@ async fn real_constructor_cancelled_before_publication_is_drained_after_close() 
     let (release, receiver) = oneshot::channel();
     let provider = Arc::new(HeldInstructions {
         entered: AtomicUsize::new(0),
+        entry: tokio::sync::Notify::new(),
         receiver: Mutex::new(Some(receiver)),
     });
     Arc::get_mut(&mut manager.state)
         .expect("builders retain unique State")
         .user_instructions_provider = provider.clone();
     let mut observer = Box::pin(manager.start_thread(StartThreadOptions::new(config.clone())));
-    assert!(futures::poll!(observer.as_mut()).is_pending());
+    // Startup now has asynchronous work before loading instruction providers.
+    // Drive the real constructor to the held boundary rather than assuming
+    // that its first poll reaches it.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::select! {
+            _ = provider.entry.notified() => {}
+            _ = observer.as_mut() => panic!("constructor returned before instructions were released"),
+        }
+    })
+    .await
+    .expect("constructor reaches held instructions");
     assert_eq!(provider.entered.load(Ordering::SeqCst), 1);
     drop(observer);
     manager.constructions.close();

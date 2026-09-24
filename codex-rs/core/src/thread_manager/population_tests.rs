@@ -180,6 +180,55 @@ async fn failed_cleanup_remains_owned_after_loop_join() {
 }
 
 #[tokio::test]
+async fn managed_legacy_cleanup_in_progress_is_retained_as_incomplete() {
+    struct HeldStop {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl codex_extension_api::ThreadLifecycleContributor<Config> for HeldStop {
+        fn on_thread_stop<'a>(&'a self, _input: codex_extension_api::ThreadStopInput<'a>)
+            -> codex_extension_api::ExtensionFuture<'a, ()> {
+            Box::pin(async {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.entered.notify_one();
+                self.release.acquire().await.expect("release cleanup").forget();
+            })
+        }
+    }
+    let (_home, mut manager, config) = manager().await;
+    let held = Arc::new(HeldStop { entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Semaphore::new(0), calls: std::sync::atomic::AtomicUsize::new(0) });
+    let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
+    extensions.thread_lifecycle_contributor(held.clone());
+    Arc::get_mut(&mut manager.state).unwrap().extensions = Arc::new(extensions.build());
+    let manager = Arc::new(manager);
+    let stop = tokio_util::sync::CancellationToken::new();
+    let tasks = tokio_util::task::TaskTracker::new();
+    let mut options = StartThreadOptions::new(config);
+    options.thread_extension_init.insert(codex_extension_api::SessionIsolation::Isolated);
+    let started = manager.start_thread_until(options, stop.clone().cancelled_owned(), &tasks)
+        .await.unwrap();
+    stop.cancel();
+    tasks.close();
+    tokio::time::timeout(Duration::from_secs(20), held.entered.notified()).await
+        .expect("legacy cleanup entered extension stop");
+    assert!(started.thread.observed_terminal_cleanup().is_none());
+    assert!(matches!(started.thread.begin_retirement(Instant::now() + Duration::from_secs(5)),
+        Err(crate::ThreadRetirementError::LegacyCleanupStarted)));
+    let report = manager.begin_shutdown(Instant::now() + Duration::from_secs(5))
+        .unwrap().wait().await.unwrap();
+    assert!(!report.is_complete());
+    assert_eq!(manager.constructions.published().len(), 1);
+    held.release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), tasks.wait()).await.expect("cleanup joins");
+    assert_eq!(started.thread.observed_terminal_cleanup(), Some(SessionLoopOutcome::Normal));
+    assert!(manager.constructions.published().is_empty());
+    assert_eq!(manager.constructions.state.lock().unwrap().compacted, 1);
+    assert_eq!(held.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn constructor_admitted_before_close_cannot_publish_after_close() {
     struct HeldInstructions(Mutex<Option<tokio::sync::oneshot::Receiver<()>>>);
     impl codex_extension_api::UserInstructionsProvider for HeldInstructions {

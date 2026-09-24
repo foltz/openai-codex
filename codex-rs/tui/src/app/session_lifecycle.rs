@@ -1108,6 +1108,7 @@ impl App {
             session,
             turns: response.successor_thread.turns,
             blocks_direct_input,
+            task_tools_available: false,
         };
 
         let name_error = if let Some(name) = new_thread_name {

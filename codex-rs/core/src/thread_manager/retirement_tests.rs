@@ -308,36 +308,28 @@ async fn managed_cancellation_terminates_constructor_before_tracker_join() {
     use crate::config::ConfigBuilder;
     use crate::thread_manager::StartThreadOptions;
     use crate::thread_manager::ThreadManager;
-    struct HeldInstructions {
-        entry: tokio::sync::Notify,
-        receiver: Mutex<Option<oneshot::Receiver<()>>>,
-    }
-    impl codex_extension_api::UserInstructionsProvider for HeldInstructions {
-        fn load_user_instructions(&self) -> codex_extension_api::LoadInstructionsFuture<'_> {
-            let receiver = self.receiver.lock().unwrap().take().expect("one load");
-            self.entry.notify_one();
-            Box::pin(async move {
-                receiver.await.expect("fixture must not release the constructor");
-                panic!("cancelled constructor resumed");
-            })
-        }
-    }
+    let server = wiremock::MockServer::start().await;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with({ let entered = Arc::clone(&entered); move |_: &wiremock::Request| {
+            entered.notify_one();
+            wiremock::ResponseTemplate::new(200).set_delay(Duration::from_secs(120))
+        } }).mount(&server).await;
     let home = tempfile::tempdir().unwrap();
     let mut config = ConfigBuilder::default()
         .codex_home(home.path().to_path_buf())
         .fallback_cwd(Some(home.path().to_path_buf()))
         .build().await.unwrap();
     config.ephemeral = true;
-    let mut manager = ThreadManager::with_models_provider_and_home_for_tests(
+    config.mcp_servers.set(std::collections::HashMap::from([("held".to_owned(),
+        serde_json::from_value(serde_json::json!({ "url": server.uri(), "required": true,
+            "startup_timeout_sec": 120, "http_headers": {"Authorization": "Bearer fixture"} }))
+            .expect("MCP fixture config"))])).unwrap();
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
         codex_login::CodexAuth::from_api_key("dummy"),
         config.model_provider.clone(), config.codex_home.to_path_buf(),
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
     );
-    let (release, receiver) = oneshot::channel();
-    let provider = Arc::new(HeldInstructions {
-        entry: tokio::sync::Notify::new(), receiver: Mutex::new(Some(receiver)),
-    });
-    Arc::get_mut(&mut manager.state).unwrap().user_instructions_provider = provider.clone();
     let manager = Arc::new(manager);
     let mut options = StartThreadOptions::new(config);
     options.thread_extension_init.insert(codex_extension_api::SessionIsolation::Isolated);
@@ -345,17 +337,19 @@ async fn managed_cancellation_terminates_constructor_before_tracker_join() {
     let mut start = Box::pin(manager.start_thread_until(options, std::future::pending(), &tasks));
     tokio::time::timeout(Duration::from_secs(20), async {
         tokio::select! {
-            _ = provider.entry.notified() => {},
+            _ = entered.notified() => {},
             _ = start.as_mut() => panic!("constructor returned before release"),
         }
-    }).await.expect("constructor reaches held instructions");
+    }).await.expect("constructor reaches held MCP initialize");
     drop(start);
     tasks.close();
     tokio::time::timeout(Duration::from_secs(5), tasks.wait()).await
-        .expect("managed lifetime joins without releasing instructions");
-    // A frozen Shared constructor would still retain this receiver. Joining
-    // cleanup is not enough: the constructor itself must already be terminal.
-    assert!(release.send(()).is_err());
+        .expect("managed lifetime joins without releasing MCP initialize");
+    // Inspect before driving the drain: a frozen constructor would have no
+    // terminal value even if some independent cleanup path had finished.
+    assert_eq!(manager.constructions.state.lock().unwrap().constructions.iter()
+        .map(|entry| entry.completion.peek().copied()).collect::<Vec<_>>(),
+        vec![Some(ConstructionOutcome::Returned)]);
     assert!(manager.list_thread_ids().await.is_empty());
     assert_eq!(manager.constructions.drain_until(Instant::now() + Duration::from_secs(1)).await,
         ConstructionDrain { finished: true, panicked: false, unavailable: false,

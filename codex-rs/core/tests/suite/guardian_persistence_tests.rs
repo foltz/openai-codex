@@ -232,3 +232,49 @@ async fn guardian_saves_each_completed_review_before_releasing_its_action() -> a
     test.codex.shutdown_and_wait().await?;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guardian_prewarm_reviewer_is_joined_and_compacted_before_manager_retirement() -> anyhow::Result<()> {
+    let server = responses::start_mock_server().await;
+    let (saves, _pending_saves) = mpsc::unbounded_channel();
+    let store = Arc::new(GatedReviewerStore {
+        inner: InMemoryThreadStore::default(),
+        reviewer: Mutex::new(ReviewerSaves::default()),
+        saves,
+    });
+    let test = test_codex()
+        .with_thread_store(store.clone())
+        .with_history_mode(ThreadHistoryMode::Legacy)
+        .with_config(|config| {
+            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+            config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+        })
+        .build_with_auto_env(&server).await?;
+    let reviewer_id = timeout(Duration::from_secs(20), async {
+        loop {
+            if let Some(id) = store.reviewer.lock().await.thread_id
+                && test.thread_manager.list_thread_ids().await.contains(&id) {
+                break id;
+            }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("real Guardian prewarm publishes its managed reviewer");
+    let reviewer = test.thread_manager.get_thread(reviewer_id).await?;
+    assert_eq!(reviewer.config_snapshot().await.thread_source, Some(ThreadSource::GuardianReview));
+    let weak = Arc::downgrade(&reviewer);
+    drop(reviewer);
+    timeout(Duration::from_secs(20), test.codex.shutdown_and_wait()).await??;
+    // Parent stop joins ReviewerTasks, including managed cleanup and exact map
+    // removal. Do not hide a missing join behind post-shutdown polling.
+    assert!(!test.thread_manager.list_thread_ids().await.contains(&reviewer_id));
+    let calls = store.inner.calls().await;
+    let report = test.thread_manager.begin_shutdown(tokio::time::Instant::now() + Duration::from_secs(20))?
+        .wait().await?;
+    assert!(report.is_complete(), "{report:?}");
+    // The report's documented Debug surface contains runtime IDs: a compacted
+    // reviewer must not be reclassified as another manager retirement entry.
+    assert!(!format!("{report:?}").contains(&reviewer_id.to_string()));
+    assert!(weak.upgrade().is_none());
+    assert_eq!(store.inner.calls().await, calls);
+    Ok(())
+}

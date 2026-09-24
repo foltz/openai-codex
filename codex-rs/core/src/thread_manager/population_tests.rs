@@ -123,6 +123,31 @@ async fn prior_legacy_cleanup_compacts_without_rebinding_or_reexecution() {
 }
 
 #[tokio::test]
+async fn managed_lifetime_cleanup_compacts_before_manager_shutdown() {
+    let (_home, manager, config) = manager().await;
+    let manager = Arc::new(manager);
+    let stop = tokio_util::sync::CancellationToken::new();
+    let tasks = tokio_util::task::TaskTracker::new();
+    let mut options = StartThreadOptions::new(config);
+    options.thread_extension_init.insert(codex_extension_api::SessionIsolation::Isolated);
+    let started = manager.start_thread_until(options, stop.clone().cancelled_owned(), &tasks)
+        .await.unwrap();
+    assert_eq!(manager.constructions.published().len(), 1);
+    stop.cancel();
+    tasks.close();
+    tokio::time::timeout(Duration::from_secs(20), tasks.wait()).await
+        .expect("managed lifetime cleanup joined");
+    assert_eq!(started.thread.observed_terminal_cleanup(), Some(SessionLoopOutcome::Normal));
+    assert!(manager.list_thread_ids().await.is_empty());
+    assert!(manager.constructions.published().is_empty());
+    assert_eq!(manager.constructions.state.lock().unwrap().compacted, 1);
+    let report = manager.begin_shutdown(Instant::now() + Duration::from_secs(5))
+        .unwrap().wait().await.unwrap();
+    assert!(report.is_complete());
+    assert_eq!(manager.constructions.state.lock().unwrap().compacted, 1);
+}
+
+#[tokio::test]
 async fn failed_cleanup_remains_owned_after_loop_join() {
     struct PanicOnStop;
     impl codex_extension_api::ThreadLifecycleContributor<Config> for PanicOnStop {

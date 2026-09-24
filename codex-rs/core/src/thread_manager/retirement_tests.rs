@@ -302,3 +302,62 @@ async fn real_constructor_cancelled_before_publication_is_drained_after_close() 
     assert_eq!(manager.constructions.drain_until(deadline).await, report);
     assert_eq!(provider.entered.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn managed_cancellation_terminates_constructor_before_tracker_join() {
+    use crate::config::ConfigBuilder;
+    use crate::thread_manager::StartThreadOptions;
+    use crate::thread_manager::ThreadManager;
+    struct HeldInstructions {
+        entry: tokio::sync::Notify,
+        receiver: Mutex<Option<oneshot::Receiver<()>>>,
+    }
+    impl codex_extension_api::UserInstructionsProvider for HeldInstructions {
+        fn load_user_instructions(&self) -> codex_extension_api::LoadInstructionsFuture<'_> {
+            let receiver = self.receiver.lock().unwrap().take().expect("one load");
+            self.entry.notify_one();
+            Box::pin(async move {
+                receiver.await.expect("fixture must not release the constructor");
+                panic!("cancelled constructor resumed");
+            })
+        }
+    }
+    let home = tempfile::tempdir().unwrap();
+    let mut config = ConfigBuilder::default()
+        .codex_home(home.path().to_path_buf())
+        .fallback_cwd(Some(home.path().to_path_buf()))
+        .build().await.unwrap();
+    config.ephemeral = true;
+    let mut manager = ThreadManager::with_models_provider_and_home_for_tests(
+        codex_login::CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(), config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let (release, receiver) = oneshot::channel();
+    let provider = Arc::new(HeldInstructions {
+        entry: tokio::sync::Notify::new(), receiver: Mutex::new(Some(receiver)),
+    });
+    Arc::get_mut(&mut manager.state).unwrap().user_instructions_provider = provider.clone();
+    let manager = Arc::new(manager);
+    let mut options = StartThreadOptions::new(config);
+    options.thread_extension_init.insert(codex_extension_api::SessionIsolation::Isolated);
+    let tasks = tokio_util::task::TaskTracker::new();
+    let mut start = Box::pin(manager.start_thread_until(options, std::future::pending(), &tasks));
+    tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::select! {
+            _ = provider.entry.notified() => {},
+            _ = start.as_mut() => panic!("constructor returned before release"),
+        }
+    }).await.expect("constructor reaches held instructions");
+    drop(start);
+    tasks.close();
+    tokio::time::timeout(Duration::from_secs(5), tasks.wait()).await
+        .expect("managed lifetime joins without releasing instructions");
+    // A frozen Shared constructor would still retain this receiver. Joining
+    // cleanup is not enough: the constructor itself must already be terminal.
+    assert!(release.send(()).is_err());
+    assert!(manager.list_thread_ids().await.is_empty());
+    assert_eq!(manager.constructions.drain_until(Instant::now() + Duration::from_secs(1)).await,
+        ConstructionDrain { finished: true, panicked: false, unavailable: false,
+            unpublished: 0, sessions: vec![] });
+}

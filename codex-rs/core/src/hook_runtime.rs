@@ -127,6 +127,24 @@ pub(crate) async fn run_pending_session_start_hooks(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
 ) -> bool {
+    while let Some(outcome) = sess.take_eager_session_start_hook_outcome().await {
+        emit_hook_started_events(sess, turn_context, outcome.preview_runs).await;
+        let hook_events = outcome
+            .hook_events
+            .into_iter()
+            .map(|mut event| {
+                event
+                    .turn_id
+                    .get_or_insert_with(|| turn_context.sub_id.clone());
+                event
+            })
+            .collect();
+        emit_hook_completed_events(sess, turn_context, hook_events).await;
+        record_additional_contexts(sess, turn_context, outcome.additional_contexts).await;
+        if outcome.should_stop {
+            return true;
+        }
+    }
     while let Some(session_start_source) = sess.take_pending_session_start_source().await {
         // Spawned subagents can start fresh or fork their parent's history, so both
         // sources dispatch SubagentStart. Internal/system subagents skip start hooks.
@@ -176,6 +194,51 @@ pub(crate) async fn run_pending_session_start_hooks(
     }
 
     false
+}
+
+/// Dispatches the initial `SessionStart` hook as soon as a user session is
+/// addressable, rather than waiting for its first submitted message. Context
+/// output and stop semantics remain pending until a first turn supplies the
+/// turn-scoped persistence and UI event context.
+///
+/// Subagent starts keep their existing turn-scoped dispatch: their pending
+/// start source can be remapped to `SubagentStart` only once a turn context is
+/// available.
+#[instrument(level = "trace", skip_all)]
+pub(crate) async fn run_pending_session_start_hooks_eager(sess: &Arc<Session>) {
+    let config_snapshot = sess.thread_config_snapshot().await;
+    if matches!(&config_snapshot.session_source, SessionSource::SubAgent(_)) {
+        return;
+    }
+    let Some(session_start_source) = sess.take_pending_session_start_source().await else {
+        return;
+    };
+    let config = sess.get_config().await;
+    let mut request = codex_hooks::SessionStartRequest {
+        session_id: sess.session_id().into(),
+        #[allow(deprecated)]
+        cwd: config.cwd.clone(),
+        transcript_path: None,
+        model: config_snapshot.model,
+        permission_mode: hook_permission_mode(config_snapshot.approval_policy),
+        target: StartHookTarget::SessionStart {
+            source: session_start_source,
+        },
+    };
+    let hooks = sess.hooks();
+    let preview_runs = hooks.preview_session_start(&request);
+    if preview_runs.is_empty() {
+        return;
+    }
+    request.transcript_path = sess.hook_transcript_path().await;
+    let outcome = hooks.run_session_start(request, None).await;
+    sess.queue_eager_session_start_hook_outcome(
+        preview_runs,
+        outcome.hook_events,
+        outcome.should_stop,
+        outcome.additional_contexts,
+    )
+    .await;
 }
 
 /// Runs matching `PreToolUse` hooks before a tool executes.

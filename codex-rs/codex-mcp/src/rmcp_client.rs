@@ -1489,6 +1489,7 @@ pub(crate) async fn make_rmcp_client(
 mod tests {
     use super::*;
     use crate::elicitation::ElicitationRequestRouter;
+    use crate::mcp::tests::test_elicitation_config;
     use codex_protocol::mcp::MCP_APP_UI_EXTENSION_ID;
     use codex_protocol::mcp::OPENAI_FORM_EXTENSION_ID;
     use codex_protocol::models::PermissionProfile;
@@ -1802,12 +1803,17 @@ mod tests {
             "start-server-task-bind-reject-test".to_string(),
             Arc::clone(&client),
             StartServerTaskParams {
+                server_capabilities: Arc::new(StdMutex::new(None)),
+                auth_changes: None,
                 is_codex_apps_mcp_server: false,
                 startup_timeout: Some(Duration::from_secs(5)),
                 tx_event: None,
                 elicitation_requests: ElicitationRequestManager::new(
-                    AskForApproval::default(),
-                    PermissionProfile::read_only(),
+                    test_elicitation_config(
+                        "start-server-task-bind-reject-test",
+                        AskForApproval::default(),
+                        PermissionProfile::read_only(),
+                    ),
                     /*reviewer*/ None,
                     /*lifecycle*/ None,
                     ElicitationRequestRouter::default(),
@@ -1911,12 +1917,17 @@ mod tests {
             "thread-identity-containment-test".to_string(),
             Arc::clone(&client),
             StartServerTaskParams {
+                server_capabilities: Arc::new(StdMutex::new(None)),
+                auth_changes: None,
                 is_codex_apps_mcp_server: false,
                 startup_timeout: Some(Duration::from_secs(5)),
                 tx_event: None,
                 elicitation_requests: ElicitationRequestManager::new(
-                    AskForApproval::default(),
-                    PermissionProfile::read_only(),
+                    test_elicitation_config(
+                        "thread-identity-containment-test",
+                        AskForApproval::default(),
+                        PermissionProfile::read_only(),
+                    ),
                     /*reviewer*/ None,
                     /*lifecycle*/ None,
                     ElicitationRequestRouter::default(),
@@ -2042,12 +2053,17 @@ mod tests {
             "threadless-path-test".to_string(),
             Arc::clone(&client),
             StartServerTaskParams {
+                server_capabilities: Arc::new(StdMutex::new(None)),
+                auth_changes: None,
                 is_codex_apps_mcp_server: false,
                 startup_timeout: Some(Duration::from_secs(5)),
                 tx_event: None,
                 elicitation_requests: ElicitationRequestManager::new(
-                    AskForApproval::default(),
-                    PermissionProfile::read_only(),
+                    test_elicitation_config(
+                        "threadless-path-test",
+                        AskForApproval::default(),
+                        PermissionProfile::read_only(),
+                    ),
                     /*reviewer*/ None,
                     /*lifecycle*/ None,
                     ElicitationRequestRouter::default(),

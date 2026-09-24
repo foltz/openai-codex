@@ -12461,7 +12461,7 @@ async fn session_start_hooks_require_project_trust_without_config_toml() -> std:
 /// upstream's reservation rejection for resumed histories.
 #[test]
 fn select_thread_id_matches_the_contract_for_every_lifecycle_transition() {
-    let agent_control = AgentControl::default();
+    let agent_control = LocalAgentControl::default();
     let mut minted = std::collections::HashSet::new();
     for history in [InitialHistory::New, InitialHistory::New, InitialHistory::Cleared, InitialHistory::Forked(Vec::new())] {
         let id = Session::select_thread_id(&history, /*reserved_thread_id*/ None, &agent_control)

@@ -643,7 +643,7 @@ impl Session {
     pub(super) fn select_thread_id(
         initial_history: &InitialHistory,
         reserved_thread_id: Option<ThreadId>,
-        agent_control: &AgentControl,
+        agent_control: &LocalAgentControl,
     ) -> anyhow::Result<ThreadId> {
         match (initial_history, reserved_thread_id) {
             (InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_), Some(id)) => Ok(id),

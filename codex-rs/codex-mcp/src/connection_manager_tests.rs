@@ -2036,6 +2036,7 @@ async fn read_only_apps_discovery_never_uses_a_shared_writable_catalog() -> anyh
                     EffectiveMcpServer::configured(server_config.clone()),
                 )]),
                 submit_id: "test".to_string(),
+                canonical_thread_id: None,
                 tx_event: None,
                 startup_cancellation_token: cancellation,
                 runtime_context: reusable_server_runtime_context(),
@@ -2115,6 +2116,7 @@ async fn hosted_apps_protocol_mode_is_independent_of_generic_mode() -> anyhow::R
                     ),
                 ]),
                 submit_id: "protocol-mode-scope".to_string(),
+                canonical_thread_id: None,
                 tx_event: None,
                 startup_cancellation_token,
                 runtime_context: McpRuntimeContext::new(
@@ -5824,8 +5826,10 @@ fn thread_identity_reuse_identity(
     McpServerConnectionIdentity::new(
         "docs",
         &server,
+        /*host_plugin_root*/ None,
         OAuthCredentialsStoreMode::default(),
         AuthKeyringBackendKind::default(),
+        McpOAuthRefreshMode::Legacy,
         &resolved_environment,
         runtime_context,
         /*runtime_auth_provider*/ None,
@@ -6347,6 +6351,7 @@ async fn reconciliation_reconnects_when_host_plugin_root_changes() {
         /*codex_apps_cache_identity*/ None,
         ElicitationCapability::default(),
         ClientMcpExtensions::default(),
+        /*canonical_thread_id*/ None,
         /*previous_identity*/ None,
     );
     Arc::get_mut(

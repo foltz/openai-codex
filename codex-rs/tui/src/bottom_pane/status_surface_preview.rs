@@ -273,7 +273,7 @@ impl StatusSurfacePreviewData {
                 }),
             }
         });
-        status_line_from_segments(segments, use_theme_colors)
+        status_line_from_segments(segments, use_theme_colors, self.thread_id)
     }
 }
 

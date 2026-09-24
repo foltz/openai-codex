@@ -2949,12 +2949,12 @@ async fn status_line_prefix_preserves_primary_enablement_and_order() {
         .tui_status_line_variables
         .insert("lane".to_string(), "dev".to_string());
 
-    chat.config.tui_status_line = None;
+    chat.local_settings.tui.status_line = None;
     chat.refresh_status_line();
     let default_line = status_line_text(&chat).expect("default status line");
     assert!(default_line.starts_with("(k:dev) · "), "{default_line}");
 
-    chat.config.tui_status_line = Some(vec![
+    chat.local_settings.tui.status_line = Some(vec![
         "model-name".to_string(),
         "template:{lane}".to_string(),
         "current-dir".to_string(),
@@ -2967,11 +2967,11 @@ async fn status_line_prefix_preserves_primary_enablement_and_order() {
     );
     assert!(configured_line.contains(" · dev · "), "{configured_line}");
 
-    chat.config.tui_status_line = Some(Vec::new());
+    chat.local_settings.tui.status_line = Some(Vec::new());
     chat.refresh_status_line();
     assert_eq!(status_line_text(&chat), None);
 
-    chat.config.tui_status_line = Some(vec!["not-a-status-item".to_string()]);
+    chat.local_settings.tui.status_line = Some(vec!["not-a-status-item".to_string()]);
     chat.refresh_status_line();
     assert_eq!(status_line_text(&chat), None);
 }
@@ -2980,7 +2980,7 @@ async fn status_line_prefix_preserves_primary_enablement_and_order() {
 async fn status_line_template_omission_keeps_sibling_segments() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.thread_id = Some(ThreadId::new());
-    chat.config.tui_status_line = Some(vec![
+    chat.local_settings.tui.status_line = Some(vec![
         "model-name".to_string(),
         "template:(secret:{present}:{missing})".to_string(),
         "current-dir".to_string(),

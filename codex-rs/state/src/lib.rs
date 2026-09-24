@@ -11,6 +11,7 @@ const _: () = assert!(
 
 mod audit;
 mod extract;
+mod kcf_migrations;
 pub mod log_db;
 mod migrations;
 mod model;
@@ -48,6 +49,12 @@ pub use model::Anchor;
 pub use model::BackfillState;
 pub use model::BackfillStats;
 pub use model::BackfillStatus;
+pub use model::ClearTransitionEvidenceKind;
+pub use model::ClearTransitionEvidenceState;
+pub use model::ClearTransitionId;
+pub use model::ClearTransitionPhase;
+pub use model::ClearTransitionRecord;
+pub use model::ClearTransitionReserveOutcome;
 pub use model::DirectionalThreadSpawnEdgeStatus;
 pub use model::ExtractionOutcome;
 pub use model::RemoveThreadAttachmentOutcome;

@@ -40,6 +40,7 @@ use std::time::Instant;
 use tracing::warn;
 
 mod backfill;
+mod clear_transitions;
 mod external_agent_config_imports;
 mod goals;
 mod logs;

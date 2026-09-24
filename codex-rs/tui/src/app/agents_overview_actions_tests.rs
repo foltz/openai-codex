@@ -310,6 +310,8 @@ async fn hidden_task_stays_hidden_through_activity_and_seed_until_explicit_resum
     app.track_agents_overview_notification(&ServerNotification::ThreadStarted(
         ThreadStartedNotification {
             thread: thread.clone(),
+            session_start_source: None,
+            clear_predecessor_thread_id: None,
         },
     ));
     app.track_agents_overview_notification(&ServerNotification::ThreadStatusChanged(

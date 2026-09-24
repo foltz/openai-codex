@@ -1041,6 +1041,8 @@ async fn known_thread_started_preserves_session_without_reading_unmaterialized_r
         ),
     );
     let notification = ThreadStartedNotification {
+        session_start_source: None,
+        clear_predecessor_thread_id: None,
         thread: Thread {
             originator: None,
             environments: None,

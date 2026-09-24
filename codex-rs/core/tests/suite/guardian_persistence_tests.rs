@@ -50,12 +50,28 @@ struct PendingSave {
 struct ReviewerSaves {
     thread_id: Option<ThreadId>,
     reviews: usize,
+    operations: Vec<&'static str>,
+}
+
+struct ReviewerCreationGate {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Semaphore,
 }
 
 struct GatedReviewerStore {
     inner: InMemoryThreadStore,
     reviewer: Mutex<ReviewerSaves>,
     saves: mpsc::UnboundedSender<PendingSave>,
+    creation_gate: Option<Arc<ReviewerCreationGate>>,
+}
+
+impl GatedReviewerStore {
+    async fn record_operation(&self, thread_id: ThreadId, operation: &'static str) {
+        let mut reviewer = self.reviewer.lock().await;
+        if reviewer.thread_id == Some(thread_id) {
+            reviewer.operations.push(operation);
+        }
+    }
 }
 
 macro_rules! delegate_store_methods {
@@ -73,8 +89,6 @@ impl ThreadStore for GatedReviewerStore {
 
     delegate_store_methods! {
         fn resume_thread(params: ResumeThreadParams) -> ();
-        fn append_items(params: AppendThreadItemsParams) -> ();
-        fn discard_thread(thread_id: ThreadId) -> ();
         fn load_history(params: LoadThreadHistoryParams) -> StoredThreadHistory;
         fn read_thread(params: ReadThreadParams) -> StoredThread;
         fn read_thread_by_rollout_path(params: ReadThreadByRolloutPathParams) -> StoredThread;
@@ -83,13 +97,17 @@ impl ThreadStore for GatedReviewerStore {
         fn archive_thread(params: ArchiveThreadParams) -> ();
         fn unarchive_thread(params: ArchiveThreadParams) -> StoredThread;
         fn delete_thread(params: DeleteThreadParams) -> ();
-        fn shutdown_thread(thread_id: ThreadId) -> ();
     }
 
     fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move {
             if params.thread_source == Some(ThreadSource::GuardianReview) {
                 self.reviewer.lock().await.thread_id = Some(params.thread_id);
+                self.record_operation(params.thread_id, "create").await;
+                if let Some(gate) = &self.creation_gate {
+                    gate.entered.notify_one();
+                    gate.release.acquire().await.expect("release reviewer acquisition").forget();
+                }
             }
             ThreadStore::create_thread(&self.inner, params).await
         })
@@ -100,11 +118,36 @@ impl ThreadStore for GatedReviewerStore {
         thread_id: ThreadId,
         context: PersistContext,
     ) -> ThreadStoreFuture<'_, ()> {
-        self.inner.persist_thread(thread_id, context)
+        Box::pin(async move {
+            self.record_operation(thread_id, "persist").await;
+            self.inner.persist_thread(thread_id, context).await
+        })
+    }
+
+    fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move {
+            self.record_operation(params.thread_id, "append").await;
+            self.inner.append_items(params).await
+        })
+    }
+
+    fn discard_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move {
+            self.record_operation(thread_id, "discard").await;
+            self.inner.discard_thread(thread_id).await
+        })
+    }
+
+    fn shutdown_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move {
+            self.record_operation(thread_id, "shutdown").await;
+            self.inner.shutdown_thread(thread_id).await
+        })
     }
 
     fn flush_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move {
+            self.record_operation(thread_id, "flush").await;
             let is_reviewer = self.reviewer.lock().await.thread_id == Some(thread_id);
             let pending = if is_reviewer {
                 let history = ThreadStore::load_history(
@@ -151,6 +194,7 @@ async fn guardian_saves_each_completed_review_before_releasing_its_action() -> a
         inner: InMemoryThreadStore::default(),
         reviewer: Mutex::new(ReviewerSaves::default()),
         saves,
+        creation_gate: None,
     });
     let test = test_codex()
         .with_thread_store(store)
@@ -241,6 +285,7 @@ async fn guardian_prewarm_reviewer_is_joined_and_compacted_before_manager_retire
         inner: InMemoryThreadStore::default(),
         reviewer: Mutex::new(ReviewerSaves::default()),
         saves,
+        creation_gate: None,
     });
     let test = test_codex()
         .with_thread_store(store.clone())
@@ -276,5 +321,42 @@ async fn guardian_prewarm_reviewer_is_joined_and_compacted_before_manager_retire
     assert!(!format!("{report:?}").contains(&reviewer_id.to_string()));
     assert!(weak.upgrade().is_none());
     assert_eq!(store.inner.calls().await, calls);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guardian_stop_joins_retained_acquisition_without_resuming_constructor() -> anyhow::Result<()> {
+    let server = responses::start_mock_server().await;
+    let (saves, _pending_saves) = mpsc::unbounded_channel();
+    let gate = Arc::new(ReviewerCreationGate {
+        entered: tokio::sync::Notify::new(), release: tokio::sync::Semaphore::new(0),
+    });
+    let store = Arc::new(GatedReviewerStore {
+        inner: InMemoryThreadStore::default(), reviewer: Mutex::new(ReviewerSaves::default()),
+        saves, creation_gate: Some(Arc::clone(&gate)),
+    });
+    let test = test_codex().with_thread_store(store.clone())
+        .with_history_mode(ThreadHistoryMode::Legacy)
+        .with_config(|config| {
+            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+            config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+        }).build_with_auto_env(&server).await?;
+    timeout(Duration::from_secs(20), gate.entered.notified()).await.expect("reviewer acquisition entered");
+    let reviewer_id = store.reviewer.lock().await.thread_id.expect("reviewer id");
+    let mut shutdown = Box::pin(test.codex.shutdown_and_wait());
+    // Cancellation may release the constructor, but must not abandon an
+    // acquisition that could already own a writer. Parent join stays pending.
+    assert!(timeout(Duration::from_millis(300), shutdown.as_mut()).await.is_err());
+    assert!(!test.thread_manager.list_thread_ids().await.contains(&reviewer_id));
+    gate.release.add_permits(1);
+    timeout(Duration::from_secs(20), shutdown).await??;
+    assert_eq!(store.reviewer.lock().await.operations, vec!["create", "discard"]);
+    assert!(!test.thread_manager.list_thread_ids().await.contains(&reviewer_id));
+    let report = test.thread_manager.begin_shutdown(tokio::time::Instant::now() + Duration::from_secs(10))
+        .expect("begin manager retirement").wait().await.expect("drain constructor");
+    assert!(report.is_complete(), "{report:?}");
+    assert_eq!(store.reviewer.lock().await.operations, vec!["create", "discard"]);
+    // The in-memory fixture records disposal but does not model writer closure;
+    // real local-store ThreadNotFound is covered by managed_threads_tests.
     Ok(())
 }

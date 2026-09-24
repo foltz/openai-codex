@@ -2043,6 +2043,7 @@ async fn read_only_apps_discovery_never_uses_a_shared_writable_catalog() -> anyh
                 )]),
                 submit_id: "test".to_string(),
                 canonical_thread_id: None,
+                control_endpoint: None,
                 tx_event: None,
                 startup_cancellation_token: cancellation,
                 runtime_context: reusable_server_runtime_context(),
@@ -2123,6 +2124,7 @@ async fn hosted_apps_protocol_mode_is_independent_of_generic_mode() -> anyhow::R
                 ]),
                 submit_id: "protocol-mode-scope".to_string(),
                 canonical_thread_id: None,
+                control_endpoint: None,
                 tx_event: None,
                 startup_cancellation_token,
                 runtime_context: McpRuntimeContext::new(
@@ -5156,7 +5158,7 @@ fn retirement_runtime_input(
         codex_apps_tools_cache_key: ConnectorRuntimeContextKey::personal(None, None),
         client_mcp_extensions: ClientMcpExtensions::default(),
         auth: None,
-        codex_apps_auth_manager: None,
+        auth_manager: None,
         elicitation_reviewer: None,
         elicitation_lifecycle: None,
         canonical_thread_id: None,
@@ -5186,7 +5188,7 @@ async fn external_runtime_retirement_outlives_real_runtime_and_binding() -> anyh
     )
     .await;
     let binding = runtime
-        .current_binding_with_required_servers(&["docs".to_string()])
+        .current_binding_with_requirements(&["docs".to_string()], &HashSet::new())
         .await
         .expect("real initialized binding");
     assert_eq!(binding.tools().len(), 1);
@@ -5248,7 +5250,7 @@ async fn runtime_retirement_keeps_superseded_real_stdio_and_deduplicates_reuse()
     let runtime = crate::runtime::McpRuntime::new(input(config_a.clone())).await;
     let required = ["docs".to_string()];
     let original = runtime
-        .current_binding_with_required_servers(&required)
+        .current_binding_with_requirements(&required, &HashSet::new())
         .await
         .expect("published binding");
     assert_eq!(
@@ -5258,7 +5260,7 @@ async fn runtime_retirement_keeps_superseded_real_stdio_and_deduplicates_reuse()
     );
     runtime.replace(input(config_a)).await;
     let reused = runtime
-        .current_binding_with_required_servers(&required)
+        .current_binding_with_requirements(&required, &HashSet::new())
         .await
         .expect("reused binding");
     assert_eq!(reused.tools().len(), 1);
@@ -5272,7 +5274,7 @@ async fn runtime_retirement_keeps_superseded_real_stdio_and_deduplicates_reuse()
         .replace(input(retirement_stdio_config(&marker, "generation-b")))
         .await;
     let replacement = runtime
-        .current_binding_with_required_servers(&required)
+        .current_binding_with_requirements(&required, &HashSet::new())
         .await
         .expect("replacement binding");
     assert_eq!(replacement.tools().len(), 1);
@@ -5341,8 +5343,8 @@ async fn runtime_retirement_skips_real_dormant_stdio_without_launching() -> anyh
             &config,
             &context,
             environment.as_ref(),
-            &runtime_config.client_elicitation_capability,
-            &ClientMcpExtensions::default(),
+            (&runtime_config.client_elicitation_capability, &ClientMcpExtensions::default()),
+            /*connection_identity*/ None,
         )
         .expect("cacheable stdio server");
     cached.publish_if_newest(cached.begin_fetch(), &[create_test_tool("docs", "proof")]);
@@ -6238,8 +6240,10 @@ fn control_endpoint_reuse_identity(
     McpServerConnectionIdentity::new(
         "docs",
         &server,
+        /*host_plugin_root*/ None,
         OAuthCredentialsStoreMode::default(),
         AuthKeyringBackendKind::default(),
+        McpOAuthRefreshMode::Legacy,
         &resolved_environment,
         runtime_context,
         /*runtime_auth_provider*/ None,
@@ -6792,6 +6796,7 @@ async fn reconciliation_reconnects_when_host_plugin_root_changes() {
         ElicitationCapability::default(),
         ClientMcpExtensions::default(),
         /*canonical_thread_id*/ None,
+        /*control_endpoint*/ None,
         /*previous_identity*/ None,
     );
     Arc::get_mut(

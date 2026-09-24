@@ -269,7 +269,10 @@ impl ToolSearchHandler {
             .iter()
             .enumerate()
             .filter_map(|(id, search_info)| {
-                search_info.entry.name_candidates().into_iter()
+                search_info
+                    .entry
+                    .name_candidates()
+                    .into_iter()
                     .any(|name| {
                         query_tokens
                             .iter()

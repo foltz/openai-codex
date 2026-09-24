@@ -42,7 +42,13 @@ fn shared_search_specs_preserve_results_and_release_the_source() {
     .zip([
         vec!["functions", "lookup", "functionslookup"],
         vec!["functions", "patch", "functionspatch"],
-        vec!["example", "lookup", "examplelookup", "patch", "examplepatch"],
+        vec![
+            "example",
+            "lookup",
+            "examplelookup",
+            "patch",
+            "examplepatch",
+        ],
     ]) {
         let normalized =
             ToolSearchInfo::from_spec("query".to_string(), spec.clone(), /*source_info*/ None)

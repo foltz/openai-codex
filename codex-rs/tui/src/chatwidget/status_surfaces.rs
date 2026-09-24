@@ -220,7 +220,7 @@ impl ChatWidget {
         }
 
         let mut segments = Vec::new();
-        let status_line_variables = self.config.tui_status_line_variables.clone();
+        let status_line_variables = self.local_settings.tui.status_line_variables.clone();
         for entry in &selections.status_line_items {
             match entry.render(&status_line_variables, |item| {
                 self.status_line_value_for_item(item)
@@ -475,7 +475,7 @@ impl ChatWidget {
             return (Vec::new(), invalid, false);
         }
         let (mut prefix, prefix_invalid) =
-            parse_status_line_entries(self.config.tui_status_line_prefix.clone());
+            parse_status_line_entries(self.local_settings.tui.status_line_prefix.clone());
         prefix.extend(primary);
         invalid.extend(prefix_invalid);
         (prefix, invalid, true)

@@ -2944,9 +2944,9 @@ async fn status_line_hostname_renders_current_machine_hostname() {
 #[tokio::test]
 async fn status_line_prefix_preserves_primary_enablement_and_order() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    chat.config.tui_status_line_prefix = vec!["template:(k:{lane})".to_string()];
-    chat.config
-        .tui_status_line_variables
+    chat.local_settings.tui.status_line_prefix = vec!["template:(k:{lane})".to_string()];
+    chat.local_settings.tui
+        .status_line_variables
         .insert("lane".to_string(), "dev".to_string());
 
     chat.local_settings.tui.status_line = None;
@@ -2985,7 +2985,7 @@ async fn status_line_template_omission_keeps_sibling_segments() {
         "template:(secret:{present}:{missing})".to_string(),
         "current-dir".to_string(),
     ]);
-    chat.config.tui_status_line_variables =
+    chat.local_settings.tui.status_line_variables =
         HashMap::from([("present".to_string(), "secret-shaped-value".to_string())]);
 
     chat.refresh_status_line();

@@ -342,8 +342,8 @@ impl ChatWidget {
 
     pub(super) fn open_status_line_setup(&mut self) {
         let configured_status_line_items = self.configured_status_line_items();
-        let status_line_prefix = self.config.tui_status_line_prefix.clone();
-        let status_line_variables = self.config.tui_status_line_variables.clone();
+        let status_line_prefix = self.local_settings.tui.status_line_prefix.clone();
+        let status_line_variables = self.local_settings.tui.status_line_variables.clone();
         let preview_data = self.status_surface_preview_data();
         let view = StatusLineSetupView::new_with_templates(
             Some(configured_status_line_items.as_slice()),

@@ -815,6 +815,7 @@ fn spawn_approved_task_tool_call(
         app_server.thread_params_mode(),
         app_server.remote_cwd_override(),
         /*session_start_source*/ None,
+        /*clear_predecessor_thread_id*/ None,
     );
     app_server
         .thread_tool_transport()

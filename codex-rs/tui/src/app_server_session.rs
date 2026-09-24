@@ -484,6 +484,7 @@ impl AppServerSession {
             self.thread_params_mode(),
             self.remote_cwd_override(),
             /*session_start_source*/ None,
+            /*clear_predecessor_thread_id*/ None,
         );
         self.dynamic_tool_mcp = Some(Arc::new(
             DynamicToolMcpServer::start(
@@ -2905,6 +2906,7 @@ mod tests {
             ThreadParamsMode::Remote,
             /*remote_cwd_override*/ None,
             /*session_start_source*/ None,
+            /*clear_predecessor_thread_id*/ None,
         );
 
         let overrides = params.config.expect("config overrides");
@@ -3815,6 +3817,7 @@ mod tests {
             let start = thread_start_params_from_config(
                 &config, mode, /*remote_cwd_override*/ None,
                 /*session_start_source*/ None,
+                /*clear_predecessor_thread_id*/ None,
             );
             let resume = thread_resume_params_from_config(
                 config.clone(),

@@ -138,12 +138,23 @@ impl PendingConnection {
             // observer. HTTP requests keep the original handshake budget.
             let _initialize_deadline = initialize_deadline;
             let handshake = (self.handshake)(service, lifecycle);
-            let result = match timeout {
-                Some(duration) => match tokio::time::timeout(duration, handshake).await {
-                    Ok(result) => result.map_err(|source| anyhow::Error::from(HandshakeError { source })),
-                    Err(_) => Err(anyhow!("timed out handshaking with MCP server after {duration:?}")),
-                },
-                None => handshake.await.map_err(|source| anyhow::Error::from(HandshakeError { source })),
+            let handshake_with_timeout = async move {
+                match timeout {
+                    Some(duration) => match tokio::time::timeout(duration, handshake).await {
+                        Ok(result) => result.map_err(|source| anyhow::Error::from(HandshakeError { source })),
+                        Err(_) => Err(anyhow!("timed out handshaking with MCP server after {duration:?}")),
+                    },
+                    None => handshake.await.map_err(|source| anyhow::Error::from(HandshakeError { source })),
+                }
+            };
+            // Cancel inside the retained phase: dropping the handshake returns
+            // its acknowledged transport before the phase is marked terminal.
+            // Transport creation remains separately retained until acquisition
+            // finishes; arbitrary factories are not assumed cancellation-safe.
+            let result = tokio::select! {
+                biased;
+                _ = ticket.shutdown.cancelled() => Err(anyhow!("MCP handshake cancelled by retirement")),
+                result = handshake_with_timeout => result,
             };
             let result = match result {
                 Ok(service) => {

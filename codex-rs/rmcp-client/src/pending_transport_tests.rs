@@ -8,7 +8,9 @@ use std::time::Duration;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use pretty_assertions::assert_eq;
+use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncReadExt;
+use tokio::io::BufReader;
 use tokio::io::DuplexStream;
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
@@ -22,6 +24,52 @@ struct PausedFactory {
     gate: Arc<Semaphore>,
     opened: Arc<AtomicUsize>,
     stream: Arc<Mutex<Option<DuplexStream>>>,
+}
+
+#[tokio::test(start_paused = true)]
+async fn retirement_cancels_retained_handshake_and_observes_transport_close() {
+    let (stream, server) = tokio::io::duplex(8192);
+    let mut server = BufReader::new(server);
+    let factory = Arc::new(PausedFactory {
+        gate: Arc::new(Semaphore::new(1)),
+        opened: Arc::new(AtomicUsize::new(0)),
+        stream: Arc::new(Mutex::new(Some(stream))),
+    });
+    let registry = RmcpClientRetirement::default();
+    let client = RmcpClient::new_in_process_client_in_retirement(factory, registry.clone())
+        .await
+        .expect("construct client");
+    let mut initialize = Box::pin(client.initialize(
+        rmcp::model::ClientInfo::default(),
+        Some(Duration::from_secs(120)),
+        Box::new(|_, _| Box::pin(async { panic!("unexpected elicitation") })),
+    ));
+    let mut request = String::new();
+    tokio::select! {
+        _ = initialize.as_mut() => panic!("server has not answered initialize"),
+        result = server.read_line(&mut request) => { result.expect("read initialize"); }
+    }
+    let request: serde_json::Value = serde_json::from_str(&request).expect("initialize JSON");
+    assert_eq!(request["method"], "initialize");
+    drop(initialize);
+
+    // The observation bound is deliberately shorter than retirement's deadline
+    // and the handshake timeout. No server reply is needed to cancel the phase.
+    let report = tokio::time::timeout(
+        Duration::from_secs(1),
+        registry.shutdown_until(Instant::now() + Duration::from_secs(5)),
+    )
+    .await
+    .expect("retirement must not wait for the stalled handshake");
+    assert_eq!(report.attempts, vec![(0, PhysicalRetirementOutcome::Complete)]);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), server.read(&mut [0]))
+            .await
+            .expect("transport closes promptly")
+            .expect("read closed transport"),
+        0
+    );
+    assert_eq!(registry.shutdown_until(Instant::now()).await, report);
 }
 
 impl InProcessTransportFactory for PausedFactory {

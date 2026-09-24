@@ -23,6 +23,7 @@ use rmcp::service::TxJsonRpcMessage;
 use rmcp::transport::Transport;
 use tokio::sync::watch;
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 /// Credential-free outcome for one reserved physical connection attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -57,6 +58,7 @@ pub struct RegistrationClosed;
 #[derive(Default)]
 struct RegistryState {
     closed: bool,
+    shutdown: CancellationToken,
     attempts: Vec<Arc<Attempt>>,
 }
 
@@ -94,6 +96,7 @@ struct AttemptState {
 pub(crate) struct PhysicalAttemptTicket {
     attempt: Weak<Attempt>,
     registry: Weak<Mutex<RegistryState>>,
+    pub(crate) shutdown: CancellationToken,
 }
 
 impl PhysicalAttemptTicket {
@@ -220,6 +223,7 @@ impl RmcpClientRetirement {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.closed = true;
+        state.shutdown.cancel();
         for attempt in &state.attempts {
             let mut attempt = attempt
                 .state
@@ -254,6 +258,7 @@ impl RmcpClientRetirement {
         let ticket = PhysicalAttemptTicket {
             attempt: Arc::downgrade(&attempt),
             registry: Arc::downgrade(&self.state),
+            shutdown: registry.shutdown.clone(),
         };
         registry.attempts.push(attempt);
         Ok(ticket)

@@ -423,6 +423,21 @@ async fn same_origin_redirects_preserve_timeout_and_response_body_limits() -> Re
             )?,
             &resource_url,
         );
+        // Client construction is intentionally charged to request deadlines.
+        // Warm this same-origin route first so this fixture isolates the shared
+        // redirect budget, rather than platform-dependent first-client setup.
+        let warmup = adapter
+            .execute_request(
+                oauth2::http::Request::builder()
+                    .method("GET")
+                    .uri(format!("{}/client-warmup", server.uri()))
+                    .body(Vec::new())?,
+                OAuthHttpRedirectPolicy::Follow,
+                None,
+            )
+            .await
+            .expect("client warm-up must reach the mock server");
+        assert_eq!(warmup.status(), oauth2::http::StatusCode::NOT_FOUND);
         let error = adapter
             .execute_request(
                 oauth2::http::Request::builder()

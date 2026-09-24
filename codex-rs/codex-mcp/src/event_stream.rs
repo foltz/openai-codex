@@ -88,6 +88,8 @@ impl McpEventStreamOpener {
                     connection.resolved_environment.clone(),
                     connection.auth_provider.clone(),
                     connection.protocol_mode,
+                    // Streams outlive runtime generations; keep their owner private.
+                    codex_rmcp_client::RmcpClientRetirement::default(),
                 )).await??);
                 client.initialize(
                     mcp_initialize_request_params(

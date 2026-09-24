@@ -54,6 +54,7 @@ use rmcp::transport::streamable_http_client::StreamableHttpPostResponse;
 use sse_stream::Sse;
 use sse_stream::SseStream;
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 use crate::bounded_stdio_transport::MAX_MCP_STDIO_LINE_BYTES;
 use crate::event_notification_transport::MAX_EVENT_NOTIFICATION_BYTES;
@@ -83,6 +84,7 @@ pub(crate) struct StreamableHttpClientAdapter {
     has_configured_headers: bool,
     redirect_mode: StreamableHttpRedirectMode,
     initialize_deadline: Arc<Mutex<Option<Instant>>>,
+    retirement: CancellationToken,
 }
 
 struct EventStreamCancellation {
@@ -109,6 +111,8 @@ pub(crate) enum StreamableHttpClientAdapterError {
     Header(String),
     #[error("MCP response body exceeds {maximum_bytes} bytes")]
     ResponseTooLarge { maximum_bytes: usize },
+    #[error("MCP initialization cancelled by retirement")]
+    Retired,
 }
 
 impl StreamableHttpClientAdapter {
@@ -119,6 +123,7 @@ impl StreamableHttpClientAdapter {
         has_configured_headers: bool,
         redirect_mode: StreamableHttpRedirectMode,
         initialize_deadline: Arc<Mutex<Option<Instant>>>,
+        retirement: CancellationToken,
     ) -> Self {
         Self {
             http_client: Arc::new(SameOriginRedirectHttpClient::new(http_client)),
@@ -128,6 +133,7 @@ impl StreamableHttpClientAdapter {
             has_configured_headers,
             redirect_mode,
             initialize_deadline,
+            retirement,
         }
     }
 
@@ -197,11 +203,11 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
         } else {
             self.redirect_policy(&headers)
         };
-        let timeout_ms = if matches!(
+        let is_startup_request = matches!(
             mcp_method.as_deref(),
             Some("initialize" | "notifications/initialized")
-        ) || mcp_method.as_deref() == Some(DiscoverRequestMethod::VALUE)
-        {
+        ) || mcp_method.as_deref() == Some(DiscoverRequestMethod::VALUE);
+        let timeout_ms = if is_startup_request {
             self.initialize_deadline
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -252,7 +258,15 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
                     )
                 })?
         } else {
-            request.await
+            tokio::select! {
+                biased;
+                _ = self.retirement.cancelled(), if is_startup_request => {
+                    return Err(StreamableHttpError::Client(
+                        StreamableHttpClientAdapterError::Retired,
+                    ));
+                }
+                response = request => response,
+            }
         };
         let (response, mut body_stream) = match response {
             Ok(response) => response,
@@ -269,6 +283,8 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
                 ));
             }
         };
+
+        let startup_retirement = is_startup_request.then_some(&self.retirement);
 
         if response.status == StatusCode::NOT_FOUND.as_u16() && session_id.is_some() {
             return Err(StreamableHttpError::Client(
@@ -309,7 +325,7 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
         let content_type = response_header(&response.headers, CONTENT_TYPE);
         let session_id = response_header(&response.headers, HEADER_SESSION_ID);
         if !status_is_success(response.status) {
-            let body = collect_body(&mut body_stream, maximum_response_bytes).await?;
+            let body = collect_body(&mut body_stream, maximum_response_bytes, startup_retirement).await?;
             if !retryable_post_response_status(mcp_method.as_deref(), response.status)
                 && (content_type
                     .as_deref()
@@ -361,6 +377,13 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
         match content_type.as_deref() {
             Some(content_type) if content_type.starts_with(EVENT_STREAM_MIME_TYPE) => {
                 let mut event_stream = sse_stream_from_body(body_stream, maximum_response_bytes);
+                if is_startup_request {
+                    // RMCP consumes SSE initialization outside this adapter and
+                    // does not poll its worker close token during that wait.
+                    event_stream = event_stream
+                        .take_until(self.retirement.clone().cancelled_owned())
+                        .boxed();
+                }
                 if mcp_method.as_deref() == Some(DiscoverRequestMethod::VALUE) {
                     while let Some(event) = event_stream.next().await {
                         let event = event.map_err(StreamableHttpError::Sse)?;
@@ -423,7 +446,7 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
                 Ok(StreamableHttpPostResponse::Sse(event_stream, session_id))
             }
             Some(content_type) if content_type.starts_with(JSON_MIME_TYPE) => {
-                let body = collect_body(&mut body_stream, maximum_response_bytes).await?;
+                let body = collect_body(&mut body_stream, maximum_response_bytes, startup_retirement).await?;
                 let response_message =
                     serde_json::from_slice(&body).map_err(StreamableHttpError::Deserialize)?;
                 Ok(StreamableHttpPostResponse::Json(
@@ -436,7 +459,7 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
                 ))
             }
             _ => {
-                let body = collect_body(&mut body_stream, maximum_response_bytes).await?;
+                let body = collect_body(&mut body_stream, maximum_response_bytes, startup_retirement).await?;
                 let content_type = content_type.unwrap_or_else(|| "missing-content-type".into());
                 Err(StreamableHttpError::UnexpectedContentType(Some(format!(
                     "{content_type}; body: {}",
@@ -935,11 +958,19 @@ fn has_legacy_fallback_evidence(message: &str) -> bool {
 async fn collect_body(
     body_stream: &mut HttpResponseBodyStream,
     maximum_bytes: Option<usize>,
+    retirement: Option<&CancellationToken>,
 ) -> std::result::Result<Vec<u8>, StreamableHttpError<StreamableHttpClientAdapterError>> {
     let mut body = Vec::new();
-    while let Some(chunk) = body_stream
-        .recv()
-        .await
+    while let Some(chunk) = tokio::select! {
+        biased;
+        _ = async {
+            match retirement {
+                Some(retirement) => retirement.cancelled().await,
+                None => std::future::pending().await,
+            }
+        } => return Err(StreamableHttpError::Client(StreamableHttpClientAdapterError::Retired)),
+        chunk = body_stream.recv() => chunk,
+    }
         .map_err(StreamableHttpClientAdapterError::from)
         .map_err(StreamableHttpError::Client)?
     {

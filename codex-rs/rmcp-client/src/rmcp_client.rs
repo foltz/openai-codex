@@ -1249,7 +1249,7 @@ impl RmcpClient {
         let ticket = retirement.reserve_attempt()?;
         let recipe = transport_recipe.clone();
         let phase = ticket.start_phase(move |ticket| async move {
-            let result = match Self::create_pending_transport(&recipe).await {
+            let result = match Self::create_pending_transport(&recipe, ticket.shutdown.clone()).await {
                 Ok(transport) => Ok(PendingConnection::new(transport, ticket)),
                 // A launcher error alone does not prove it never created a
                 // resource. Keep the attempt incomplete unless its ownership
@@ -1270,6 +1270,7 @@ impl RmcpClient {
 
     async fn create_pending_transport(
         transport_recipe: &TransportRecipe,
+        retirement: tokio_util::sync::CancellationToken,
     ) -> Result<PendingTransport> {
         match transport_recipe {
             TransportRecipe::InProcess { factory } => {
@@ -1383,6 +1384,7 @@ impl RmcpClient {
                         *redirect_mode,
                         *oauth_refresh_mode,
                         Arc::clone(initialize_deadline),
+                        retirement.clone(),
                     )
                     .await
                     {
@@ -1412,6 +1414,7 @@ impl RmcpClient {
                                     has_configured_headers,
                                     *redirect_mode,
                                     Arc::clone(initialize_deadline),
+                                    retirement,
                                 ),
                                 http_config,
                             );
@@ -1434,6 +1437,7 @@ impl RmcpClient {
                             has_configured_headers,
                             *redirect_mode,
                             Arc::clone(initialize_deadline),
+                            retirement,
                         ),
                         http_config,
                     );
@@ -1744,6 +1748,7 @@ async fn create_oauth_transport_and_runtime(
     redirect_mode: StreamableHttpRedirectMode,
     oauth_refresh_mode: McpOAuthRefreshMode,
     initialize_deadline: Arc<StdMutex<Option<Instant>>>,
+    retirement: tokio_util::sync::CancellationToken,
 ) -> Result<PendingTransport> {
     let oauth_http_client = Arc::new(OAuthHttpClientAdapter::new_with_redirect_mode(
         http_client.clone(),
@@ -1795,6 +1800,7 @@ async fn create_oauth_transport_and_runtime(
             has_configured_headers,
             redirect_mode,
             initialize_deadline,
+            retirement,
         ),
         manager,
     );

@@ -39,6 +39,42 @@ use tokio::time::sleep;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[tokio::test]
+async fn interactive_subscription_list_requires_experimental_opt_in() -> Result<()> {
+    let mut server = TestAppServer::builder().without_auto_env().build().await?;
+    let initialized = server
+        .initialize_with_capabilities(
+            ClientInfo {
+                name: DEFAULT_CLIENT_NAME.to_string(),
+                title: None,
+                version: "0.1.0".to_string(),
+            },
+            Some(InitializeCapabilities::default()),
+        )
+        .await?;
+    assert!(matches!(initialized, JSONRPCMessage::Response(_)));
+    let id = server
+        .send_thread_interactive_subscription_list_request(
+            ThreadInteractiveSubscriptionListParams::default(),
+        )
+        .await?;
+    let error = timeout(
+        DEFAULT_TIMEOUT,
+        server.read_stream_until_error_message(RequestId::Integer(id)),
+    )
+    .await??;
+    assert_eq!(
+        error.error,
+        codex_app_server_protocol::JSONRPCErrorError {
+            code: -32600,
+            message: "kcf/thread/interactiveSubscription/list requires experimentalApi capability"
+                .to_string(),
+            data: None,
+        }
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_interactive_subscription_list_is_empty_without_server_entitlement() -> Result<()> {
     let mut app_server = TestAppServer::builder().without_auto_env().build().await?;
     let initialized = app_server

@@ -656,6 +656,7 @@ async fn initialize_experimental(mcp: &mut TestAppServer) -> Result<()> {
             },
             Some(InitializeCapabilities {
                 experimental_api: true,
+                interactive_client: false,
                 request_attestation: false,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,

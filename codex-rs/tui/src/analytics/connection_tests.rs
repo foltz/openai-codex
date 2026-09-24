@@ -55,6 +55,7 @@ async fn remote() -> (RemoteAppServerClient, tokio::task::JoinHandle<()>) {
         client_name: "analytics-test".into(),
         client_version: "0.0.0-test".into(),
         experimental_api: true,
+        interactive_client: false,
         mcp_server_openai_form_elicitation: false,
         opt_out_notification_methods: Vec::new(),
         channel_capacity: 8,

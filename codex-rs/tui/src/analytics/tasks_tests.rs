@@ -94,6 +94,7 @@ async fn consumer_roots_include_paginated_archived_descendants_and_keep_missing_
             client_name: "analytics-test".into(),
             client_version: "test".into(),
             experimental_api: false,
+            interactive_client: false,
             mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 16,

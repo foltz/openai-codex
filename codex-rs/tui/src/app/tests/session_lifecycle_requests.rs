@@ -3295,10 +3295,9 @@ model_reasoning_effort = "low"
     )
     .await?;
     let mut tui = crate::tui::test_support::make_test_tui()?;
-    app.start_fresh_session_with_summary_hint(
+app.start_fresh_session_with_summary_hint(
         &mut tui,
         &mut server,
-        /*session_start_source*/ None,
         /*initial_user_message*/ None,
         /*new_thread_name*/ None,
     )
@@ -3658,10 +3657,9 @@ terminal_visualization_instructions = true
             .map(|entry| &entry.owner),
         Some(&crate::worktree_browser::Owner::Unavailable(missing_owner))
     );
-    app.start_fresh_session_with_summary_hint(
+app.start_fresh_session_with_summary_hint(
         &mut tui,
         &mut server,
-        /*session_start_source*/ None,
         /*initial_user_message*/ None,
         /*new_thread_name*/ None,
     )
@@ -3820,8 +3818,8 @@ async fn changing_directory_preserves_project_trust_permissions_history_and_hook
         start_recording_app_server(&app.config, no_list, background).await?;
     let (rec, plain, req) = (recorded_params, crate::key_hint::plain, &requests);
     let mut tui = crate::tui::test_support::make_test_tui()?;
-    let (source, message, name) = (None, None, Some("Previous project".to_string()));
-    app.start_fresh_session_with_summary_hint(&mut tui, &mut server, source, message, name)
+    let (message, name) = (None, Some("Previous project".to_string()));
+    app.start_fresh_session_with_summary_hint(&mut tui, &mut server, message, name)
         .await;
     let original = app.chat_widget.thread_id().expect("original thread");
     let rollout = app.chat_widget.rollout_path().expect("original rollout");

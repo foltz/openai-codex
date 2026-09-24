@@ -21,6 +21,8 @@ use crate::session::SessionIo;
 use crate::session::SessionSpawnArgs;
 use crate::session::resolve_multi_agent_version;
 use crate::session::session::Session;
+use crate::state::RuntimeConfigChangeGate;
+use crate::state::RuntimeConfigChangeListener;
 use crate::tasks::InterruptedTurnHistoryMarker;
 use crate::tasks::interrupted_turn_history_marker;
 use crate::thread_startup_metadata::ThreadStartupMetadata;
@@ -421,6 +423,8 @@ pub(crate) struct ThreadManagerState {
     session_source: SessionSource,
     installation_id: String,
     analytics_events_client: Option<AnalyticsEventsClient>,
+    runtime_config_change_listener: Option<Arc<dyn RuntimeConfigChangeListener>>,
+    runtime_config_change_gate: Option<RuntimeConfigChangeGate>,
     // Captures submitted ops for testing purpose when test mode is enabled.
     ops_log: Option<SharedCapturedOps>,
 }
@@ -583,6 +587,8 @@ impl ThreadManager {
                 session_source,
                 installation_id,
                 analytics_events_client,
+                runtime_config_change_listener: None,
+                runtime_config_change_gate: None,
                 ops_log: should_use_test_thread_manager_behavior()
                     .then(|| Arc::new(std::sync::Mutex::new(Vec::new()))),
             }),
@@ -611,6 +617,31 @@ impl ThreadManager {
             unreachable!("code-mode session provider must be set before thread manager is shared");
         };
         state.code_mode_session_provider = provider;
+        self
+    }
+
+    /// Registers a host-owned invalidator for runtime configuration reloads
+    /// before this manager is shared with threads.
+    pub fn with_runtime_config_change_listener(
+        mut self,
+        listener: Arc<dyn RuntimeConfigChangeListener>,
+    ) -> Self {
+        let Some(state) = Arc::get_mut(&mut self.state) else {
+            unreachable!(
+                "runtime config change listener must be set before thread manager is shared"
+            );
+        };
+        state.runtime_config_change_listener = Some(listener);
+        self
+    }
+
+    /// Registers the host-owned serialization gate for runtime configuration
+    /// transitions before this manager is shared with threads.
+    pub fn with_runtime_config_change_gate(mut self, gate: RuntimeConfigChangeGate) -> Self {
+        let Some(state) = Arc::get_mut(&mut self.state) else {
+            unreachable!("runtime config change gate must be set before thread manager is shared");
+        };
+        state.runtime_config_change_gate = Some(gate);
         self
     }
 
@@ -735,6 +766,8 @@ impl ThreadManager {
                 session_source: SessionSource::Exec,
                 installation_id,
                 analytics_events_client: None,
+                runtime_config_change_listener: None,
+                runtime_config_change_gate: None,
                 ops_log: should_use_test_thread_manager_behavior()
                     .then(|| Arc::new(std::sync::Mutex::new(Vec::new()))),
             }),
@@ -2294,6 +2327,8 @@ impl ThreadManagerState {
             },
             windows_sandbox_proxy_settings_mode,
             deferred_clear_session_start,
+            runtime_config_change_listener: self.runtime_config_change_listener.clone(),
+            runtime_config_change_gate: self.runtime_config_change_gate.clone(),
         })
         .await?;
         if let Some(source_thread_id) = attachment_source

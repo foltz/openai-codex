@@ -112,6 +112,7 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
+use crate::mcp_config_identity::AppliedMcpConfigIdentity;
 use crate::models_refresh_worker::ModelsRefreshWorker;
 use crate::turn_admission::TurnAdmission;
 
@@ -410,6 +411,7 @@ impl MessageProcessor {
         let extension_event_sink =
             app_server_extension_event_sink(outgoing.clone(), thread_state_manager.clone());
         let mut queue_service = None;
+        let applied_mcp_config_identity = AppliedMcpConfigIdentity::from_startup_config(&config);
         let thread_manager = Arc::new_cyclic(|thread_manager| {
             queue_service = queue_store.map(|queue| {
                 Arc::new(QueuedItemService::new(
@@ -456,10 +458,13 @@ impl MessageProcessor {
                     thread_state_manager.clone(),
                 )),
             );
-            match code_mode_session_provider {
+            let manager = match code_mode_session_provider {
                 Some(provider) => manager.with_code_mode_session_provider(provider),
                 None => manager,
-            }
+            };
+            manager
+                .with_runtime_config_change_gate(applied_mcp_config_identity.apply_gate())
+                .with_runtime_config_change_listener(Arc::new(applied_mcp_config_identity.clone()))
         });
         let model_catalog = Arc::new(crate::model_catalog::ModelCatalog::new(
             config_manager.clone(),
@@ -488,6 +493,7 @@ impl MessageProcessor {
             outgoing.clone(),
             config_manager.clone(),
             thread_manager.clone(),
+            applied_mcp_config_identity.clone(),
             analytics_events_client.clone(),
         );
         let on_effective_plugins_changed =
@@ -504,6 +510,7 @@ impl MessageProcessor {
             outgoing.clone(),
             Arc::clone(&config),
             config_manager.clone(),
+            applied_mcp_config_identity.clone(),
         );
         let apps_processor = AppsRequestProcessor::new(
             auth_manager.clone(),
@@ -559,6 +566,7 @@ impl MessageProcessor {
             thread_state_manager.clone(),
             outgoing.clone(),
             config_manager.clone(),
+            applied_mcp_config_identity.clone(),
         );
         let plugin_processor = PluginRequestProcessor::new(
             auth_manager.clone(),
@@ -566,6 +574,7 @@ impl MessageProcessor {
             outgoing.clone(),
             analytics_events_client.clone(),
             config_manager.clone(),
+            applied_mcp_config_identity,
             on_effective_plugins_changed,
         );
         let remote_control_processor = RemoteControlRequestProcessor::new(remote_control_handle);
@@ -1885,6 +1894,9 @@ impl MessageProcessor {
             }
             ClientRequest::McpServerRefresh { params, .. } => {
                 self.mcp_processor.mcp_server_refresh(params).await
+            }
+            ClientRequest::McpServerConfigIdentity { params, .. } => {
+                self.mcp_processor.mcp_server_config_identity(params).await
             }
             ClientRequest::McpServerStatusList { params, .. } => {
                 self.mcp_processor

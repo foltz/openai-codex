@@ -5,6 +5,7 @@ use super::bedrock_auth::ensure_user_model_provider_can_be_bedrock;
 use super::*;
 use crate::auth_mode::auth_mode_to_api;
 use crate::external_auth::ExternalAuthBridge;
+use crate::mcp_config_identity::AppliedMcpConfigIdentity;
 use crate::outgoing_message::AccountNotification;
 use chrono::DateTime;
 use codex_app_server_protocol::DesktopOnboardingEntrypoint;
@@ -92,6 +93,7 @@ pub(crate) struct AccountRequestProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     config: Arc<Config>,
     config_manager: ConfigManager,
+    applied_mcp_config_identity: AppliedMcpConfigIdentity,
     active_login: Arc<Mutex<Option<ActiveLogin>>>,
     workspace_routing: Arc<Mutex<Option<workspace_routing::CachedWorkspaceRouting>>>,
     workspace_routing_fetches: Arc<Mutex<workspace_routing::WorkspaceRoutingFetches>>,
@@ -105,6 +107,7 @@ impl AccountRequestProcessor {
         outgoing: Arc<OutgoingMessageSender>,
         config: Arc<Config>,
         config_manager: ConfigManager,
+        applied_mcp_config_identity: AppliedMcpConfigIdentity,
     ) -> Arc<Self> {
         let processor = Arc::new(Self {
             auth_manager,
@@ -112,6 +115,7 @@ impl AccountRequestProcessor {
             outgoing,
             config,
             config_manager,
+            applied_mcp_config_identity,
             active_login: Arc::new(Mutex::new(None)),
             workspace_routing: Arc::new(Mutex::new(None)),
             workspace_routing_fetches: Arc::new(Mutex::new(HashMap::new())),
@@ -237,6 +241,7 @@ impl AccountRequestProcessor {
         config_manager: &ConfigManager,
         thread_manager: &Arc<ThreadManager>,
         auth: Option<CodexAuth>,
+        applied_mcp_config_identity: AppliedMcpConfigIdentity,
     ) {
         thread_manager
             .plugins_manager()
@@ -250,6 +255,7 @@ impl AccountRequestProcessor {
                 Self::spawn_effective_plugins_changed_task(
                     Arc::clone(thread_manager),
                     config_manager.clone(),
+                    applied_mcp_config_identity.clone(),
                 );
                 let plugins_config = config.plugins_config_input();
                 let refresh_thread_manager = Arc::clone(thread_manager);
@@ -260,6 +266,7 @@ impl AccountRequestProcessor {
                     Self::spawn_effective_plugins_changed_task(
                         Arc::clone(&refresh_thread_manager),
                         refresh_config_manager.clone(),
+                        applied_mcp_config_identity.clone(),
                     );
                 });
                 thread_manager
@@ -287,12 +294,17 @@ impl AccountRequestProcessor {
     fn spawn_effective_plugins_changed_task(
         thread_manager: Arc<ThreadManager>,
         config_manager: ConfigManager,
+        applied_mcp_config_identity: AppliedMcpConfigIdentity,
     ) {
         tokio::spawn(async move {
             thread_manager.plugins_manager().clear_cache();
             thread_manager.skills_service().clear_cache();
-            crate::mcp_refresh::reload_mcp_config_best_effort(&thread_manager, &config_manager)
-                .await;
+            crate::mcp_refresh::reload_mcp_config_best_effort(
+                &thread_manager,
+                &config_manager,
+                &applied_mcp_config_identity,
+            )
+            .await;
             thread_manager.invalidate_mcp_runtimes().await;
         });
     }
@@ -897,6 +909,7 @@ impl AccountRequestProcessor {
                 &self.config_manager,
                 &self.thread_manager,
                 self.auth_manager.auth_cached(),
+                self.applied_mcp_config_identity.clone(),
             )
             .await;
         }
@@ -980,6 +993,7 @@ impl AccountRequestProcessor {
             &self.config_manager,
             &self.thread_manager,
             self.auth_manager.auth_cached(),
+            self.applied_mcp_config_identity.clone(),
         )
         .await;
 

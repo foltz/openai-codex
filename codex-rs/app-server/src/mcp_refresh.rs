@@ -1,4 +1,6 @@
 use crate::config_manager::ConfigManager;
+use crate::mcp_config_identity::AppliedMcpConfigIdentity;
+use crate::mcp_config_identity::McpConfigIdentity;
 use codex_core::CodexThread;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
@@ -9,10 +11,13 @@ use tracing::warn;
 pub(crate) async fn reload_mcp_config(
     thread_manager: &Arc<ThreadManager>,
     config_manager: &ConfigManager,
+    applied_mcp_config_identity: &AppliedMcpConfigIdentity,
 ) -> io::Result<()> {
-    config_manager
+    let _apply_guard = applied_mcp_config_identity.lock_apply().await;
+    let refreshed_config = config_manager
         .load_latest_config(/*fallback_cwd*/ None)
         .await?;
+    let candidate_identity = McpConfigIdentity::from_config(&refreshed_config)?;
     let mut refreshes = Vec::new();
     for thread_id in thread_manager.list_thread_ids().await {
         let thread = thread_manager
@@ -20,18 +25,29 @@ pub(crate) async fn reload_mcp_config(
             .await
             .map_err(|err| io::Error::other(format!("failed to load thread {thread_id}: {err}")))?;
         let config = load_refresh_config(thread.as_ref(), config_manager).await?;
+        if McpConfigIdentity::from_config(&config)? != candidate_identity {
+            return Err(io::Error::other(
+                "selected MCP configuration changed while reloading",
+            ));
+        }
         refreshes.push((thread, config));
     }
     for (thread, config) in refreshes {
         thread.refresh_mcp_config(config).await;
     }
+    applied_mcp_config_identity.replace(candidate_identity);
     Ok(())
 }
 
 pub(crate) async fn reload_mcp_config_best_effort(
     thread_manager: &Arc<ThreadManager>,
     config_manager: &ConfigManager,
+    applied_mcp_config_identity: &AppliedMcpConfigIdentity,
 ) {
+    let _apply_guard = applied_mcp_config_identity.lock_apply().await;
+    // A partial best-effort refresh cannot truthfully claim a single applied
+    // process-wide MCP configuration. Invalidate before any thread mutation.
+    applied_mcp_config_identity.invalidate();
     for thread_id in thread_manager.list_thread_ids().await {
         let thread = match thread_manager.get_thread(thread_id).await {
             Ok(thread) => thread,
@@ -98,13 +114,15 @@ mod tests {
 
     #[tokio::test]
     async fn strict_refresh_reports_thread_planning_failures() -> anyhow::Result<()> {
-        let (temp_dir, thread_manager, config_manager, _loader) = refresh_test_state().await?;
+        let (temp_dir, thread_manager, config_manager, _loader, applied_identity) =
+            refresh_test_state().await?;
+        let initial_identity = applied_identity.current();
         std::fs::write(
             temp_dir.path().join(codex_config::CONFIG_TOML_FILE),
             "[features]\nsecret_auth_storage = true\n",
         )?;
 
-        let err = reload_mcp_config(&thread_manager, &config_manager)
+        let err = reload_mcp_config(&thread_manager, &config_manager, &applied_identity)
             .await
             .expect_err("strict refresh should fail");
 
@@ -120,18 +138,21 @@ mod tests {
                 AuthKeyringBackendKind::Direct
             );
         }
+        assert_eq!(applied_identity.current(), initial_identity);
         Ok(())
     }
 
     #[tokio::test]
     async fn best_effort_refresh_updates_healthy_threads() -> anyhow::Result<()> {
-        let (temp_dir, thread_manager, config_manager, loader) = refresh_test_state().await?;
+        let (temp_dir, thread_manager, config_manager, loader, applied_identity) =
+            refresh_test_state().await?;
         std::fs::write(
             temp_dir.path().join(codex_config::CONFIG_TOML_FILE),
             "[features]\nsecret_auth_storage = true\n",
         )?;
 
-        reload_mcp_config_best_effort(&thread_manager, &config_manager).await;
+        reload_mcp_config_best_effort(&thread_manager, &config_manager, &applied_identity).await;
+        assert_eq!(applied_identity.current(), None);
 
         assert_eq!(loader.good_loads.load(Ordering::Relaxed), 1);
         assert_eq!(loader.bad_loads.load(Ordering::Relaxed), 1);
@@ -150,7 +171,8 @@ mod tests {
 
     #[tokio::test]
     async fn invalidation_does_not_reload_thread_config() -> anyhow::Result<()> {
-        let (_temp_dir, thread_manager, _config_manager, loader) = refresh_test_state().await?;
+        let (_temp_dir, thread_manager, _config_manager, loader, _applied_identity) =
+            refresh_test_state().await?;
 
         thread_manager.invalidate_mcp_runtimes().await;
 
@@ -161,7 +183,8 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_config_reload_only_applies_mcp_inputs() -> anyhow::Result<()> {
-        let (temp_dir, thread_manager, config_manager, _loader) = refresh_test_state().await?;
+        let (temp_dir, thread_manager, config_manager, _loader, _applied_identity) =
+            refresh_test_state().await?;
         std::fs::write(
             temp_dir.path().join(codex_config::CONFIG_TOML_FILE),
             "model = \"unrelated-model-change\"\n[features]\nsecret_auth_storage = true\n",
@@ -192,7 +215,8 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_config_preserves_thread_mcp_overrides() -> anyhow::Result<()> {
-        let (temp_dir, thread_manager, config_manager, _loader) = refresh_test_state().await?;
+        let (temp_dir, thread_manager, config_manager, _loader, _applied_identity) =
+            refresh_test_state().await?;
         let initial_config_manager =
             ConfigManager::without_managed_config_for_tests(temp_dir.path().to_path_buf());
         let thread_config = initial_config_manager
@@ -241,7 +265,8 @@ enabled = false
 
     #[tokio::test]
     async fn strict_refresh_installs_refreshed_thread_mcp_config() -> anyhow::Result<()> {
-        let (temp_dir, thread_manager, config_manager, _loader) = refresh_test_state().await?;
+        let (temp_dir, thread_manager, config_manager, _loader, applied_identity) =
+            refresh_test_state().await?;
         let mut good_thread = None;
         for thread_id in thread_manager.list_thread_ids().await {
             let thread = thread_manager.get_thread(thread_id).await?;
@@ -262,7 +287,16 @@ enabled = false
 "#,
         )?;
 
-        reload_mcp_config(&thread_manager, &config_manager).await?;
+        let initial_identity = applied_identity.current();
+        assert!(initial_identity.is_some());
+        let candidate_identity = McpConfigIdentity::from_config(
+            &config_manager
+                .load_latest_config(/*fallback_cwd*/ None)
+                .await?,
+        )?;
+        assert_ne!(candidate_identity, initial_identity);
+
+        reload_mcp_config(&thread_manager, &config_manager, &applied_identity).await?;
 
         assert!(
             thread
@@ -272,6 +306,7 @@ enabled = false
                 .get()
                 .contains_key("refreshed")
         );
+        assert_eq!(applied_identity.current(), candidate_identity);
         Ok(())
     }
 
@@ -280,6 +315,7 @@ enabled = false
         Arc<ThreadManager>,
         ConfigManager,
         Arc<CountingThreadConfigLoader>,
+        AppliedMcpConfigIdentity,
     )> {
         let temp_dir = TempDir::new()?;
         let good_cwd = temp_dir.path().join("good");
@@ -300,6 +336,7 @@ enabled = false
                 Some(good_cwd.clone()),
             )
             .await?;
+        let applied_identity = AppliedMcpConfigIdentity::from_startup_config(&good_config);
         let bad_config = initial_config_manager
             .load_for_cwd(
                 /*request_overrides*/ None,
@@ -377,7 +414,13 @@ enabled = false
             loader.clone(),
         );
 
-        Ok((temp_dir, thread_manager, config_manager, loader))
+        Ok((
+            temp_dir,
+            thread_manager,
+            config_manager,
+            loader,
+            applied_identity,
+        ))
     }
 
     struct CountingThreadConfigLoader {

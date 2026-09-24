@@ -949,6 +949,14 @@ impl CodexThread {
         self.session.refresh_runtime_config(next_config).await;
     }
 
+    /// Applies a materialized runtime configuration while the embedding host
+    /// owns the matching runtime-config transition gate.
+    pub async fn refresh_runtime_config_from_host(&self, next_config: crate::config::Config) {
+        self.session
+            .refresh_runtime_config_from_host(next_config)
+            .await;
+    }
+
     /// Refresh MCP configuration and managed requirements without reloading unrelated settings.
     pub async fn refresh_mcp_config(&self, next_config: crate::config::Config) {
         self.session.refresh_mcp_config(next_config).await;

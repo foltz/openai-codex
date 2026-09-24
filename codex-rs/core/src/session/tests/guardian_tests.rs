@@ -1353,6 +1353,8 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
         windows_sandbox_proxy_settings_mode:
             codex_sandboxing::WindowsSandboxProxySettingsMode::Preserve,
         deferred_clear_session_start: None,
+        runtime_config_change_listener: None,
+        runtime_config_change_gate: None,
     })
     .await
     .expect("spawn guardian subagent");

@@ -1,5 +1,7 @@
 use super::thread_input::ensure_direct_input_allowed;
 use super::*;
+use crate::mcp_config_identity::AppliedMcpConfigIdentity;
+use crate::mcp_config_identity::McpConfigIdentity;
 use codex_core::McpManager;
 use codex_mcp::McpServerSource;
 use codex_mcp::ReadResourceRequestParams;
@@ -16,6 +18,7 @@ pub(crate) struct McpRequestProcessor {
     pub(super) outgoing: Arc<OutgoingMessageSender>,
     config_manager: ConfigManager,
     pub(super) thread_state_manager: ThreadStateManager,
+    applied_mcp_config_identity: AppliedMcpConfigIdentity,
 }
 
 impl McpRequestProcessor {
@@ -25,6 +28,7 @@ impl McpRequestProcessor {
         thread_state_manager: ThreadStateManager,
         outgoing: Arc<OutgoingMessageSender>,
         config_manager: ConfigManager,
+        applied_mcp_config_identity: AppliedMcpConfigIdentity,
     ) -> Self {
         Self {
             auth_manager,
@@ -32,6 +36,7 @@ impl McpRequestProcessor {
             outgoing,
             config_manager,
             thread_state_manager,
+            applied_mcp_config_identity,
         }
     }
 
@@ -49,6 +54,15 @@ impl McpRequestProcessor {
         params: Option<()>,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
         self.mcp_server_refresh_response(params)
+            .await
+            .map(|response| Some(response.into()))
+    }
+
+    pub(crate) async fn mcp_server_config_identity(
+        &self,
+        params: Option<()>,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        self.mcp_server_config_identity_response(params)
             .await
             .map(|response| Some(response.into()))
     }
@@ -87,10 +101,38 @@ impl McpRequestProcessor {
         &self,
         _params: Option<()>,
     ) -> Result<McpServerRefreshResponse, JSONRPCErrorError> {
-        crate::mcp_refresh::reload_mcp_config(&self.thread_manager, &self.config_manager)
-            .await
-            .map_err(|err| internal_error(format!("failed to refresh MCP servers: {err}")))?;
+        crate::mcp_refresh::reload_mcp_config(
+            &self.thread_manager,
+            &self.config_manager,
+            &self.applied_mcp_config_identity,
+        )
+        .await
+        .map_err(|err| internal_error(format!("failed to refresh MCP servers: {err}")))?;
         Ok(McpServerRefreshResponse {})
+    }
+
+    async fn mcp_server_config_identity_response(
+        &self,
+        _params: Option<()>,
+    ) -> Result<McpServerConfigIdentityResponse, JSONRPCErrorError> {
+        let _apply_guard = self.applied_mcp_config_identity.lock_apply().await;
+        let applied = self
+            .applied_mcp_config_identity
+            .current()
+            .ok_or_else(|| internal_error("selected user configuration identity is unavailable"))?;
+        let current_config = self.load_latest_config(/*fallback_cwd*/ None).await?;
+        let current = McpConfigIdentity::from_config(&current_config)
+            .map_err(|err| {
+                internal_error(format!(
+                    "failed to identify selected MCP configuration: {err}"
+                ))
+            })?
+            .ok_or_else(|| internal_error("selected user configuration identity is unavailable"))?;
+
+        Ok(McpServerConfigIdentityResponse {
+            applied: mcp_server_config_identity(applied),
+            current: mcp_server_config_identity(current),
+        })
     }
 
     async fn load_latest_config(
@@ -567,6 +609,19 @@ fn mcp_operation_error(error: anyhow::Error) -> JSONRPCErrorError {
             data: error.data.clone(),
         },
         None => internal_error(format!("{error:#}")),
+    }
+}
+
+fn mcp_server_config_identity(identity: McpConfigIdentity) -> McpServerConfigIdentity {
+    McpServerConfigIdentity {
+        layers: identity
+            .layers
+            .into_iter()
+            .map(|layer| McpServerConfigIdentityLayer {
+                file_path: layer.file_path,
+                version: layer.version,
+            })
+            .collect(),
     }
 }
 

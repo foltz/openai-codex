@@ -7658,6 +7658,29 @@
         },
         "method": {
           "enum": [
+            "config/mcpServer/identity"
+          ],
+          "title": "Config/mcpServer/identityRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "type": "null"
+        }
+      },
+      "required": [
+        "id",
+        "method"
+      ],
+      "title": "Config/mcpServer/identityRequest",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
             "mcpServerStatus/list"
           ],
           "title": "McpServerStatus/listRequestMethod",

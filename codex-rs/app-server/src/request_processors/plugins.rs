@@ -3,6 +3,7 @@ use super::config_processor::reload_user_config;
 use super::*;
 use crate::error_code::internal_error;
 use crate::error_code::invalid_request;
+use crate::mcp_config_identity::AppliedMcpConfigIdentity;
 use codex_analytics::PluginInstallSource;
 use codex_app_server_protocol::PluginAvailability;
 use codex_app_server_protocol::PluginSharePrincipalRole;
@@ -61,6 +62,7 @@ pub(crate) struct PluginRequestProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     analytics_events_client: AnalyticsEventsClient,
     config_manager: ConfigManager,
+    applied_mcp_config_identity: AppliedMcpConfigIdentity,
     on_effective_plugins_changed:
         Arc<dyn Fn(codex_core_plugins::EffectivePluginsChange) + Send + Sync>,
 }
@@ -406,6 +408,7 @@ impl PluginRequestProcessor {
         outgoing: Arc<OutgoingMessageSender>,
         analytics_events_client: AnalyticsEventsClient,
         config_manager: ConfigManager,
+        applied_mcp_config_identity: AppliedMcpConfigIdentity,
         on_effective_plugins_changed: Arc<
             dyn Fn(codex_core_plugins::EffectivePluginsChange) + Send + Sync,
         >,
@@ -416,6 +419,7 @@ impl PluginRequestProcessor {
             outgoing,
             analytics_events_client,
             config_manager,
+            applied_mcp_config_identity,
             on_effective_plugins_changed,
         }
     }
@@ -1520,7 +1524,11 @@ impl PluginRequestProcessor {
         };
 
         self.clear_plugin_related_caches();
-        reload_user_config(&self.config_manager, &self.thread_manager).await;
+        reload_user_config(
+            &self.config_manager,
+            &self.thread_manager,
+            &self.applied_mcp_config_identity,
+        ).await;
         self.thread_manager.invalidate_mcp_runtimes().await;
         self.thread_manager.refresh_hook_runtimes().await;
 

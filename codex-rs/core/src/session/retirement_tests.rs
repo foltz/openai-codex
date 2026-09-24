@@ -5,6 +5,51 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::Notify;
 
+#[tokio::test]
+async fn managed_legacy_cleanup_in_progress_is_retained_as_incomplete() {
+    use crate::config::ConfigBuilder;
+    use crate::thread_manager::StartThreadOptions;
+    use crate::thread_manager::ThreadManager;
+    let home = tempfile::tempdir().unwrap();
+    let mut config = ConfigBuilder::default().codex_home(home.path().to_path_buf())
+        .fallback_cwd(Some(home.path().to_path_buf())).build().await.unwrap();
+    config.ephemeral = true;
+    let manager = Arc::new(ThreadManager::with_models_provider_and_home_for_tests(
+        codex_login::CodexAuth::from_api_key("dummy"), config.model_provider.clone(),
+        config.codex_home.to_path_buf(), Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    ));
+    let stop = tokio_util::sync::CancellationToken::new();
+    let tasks = tokio_util::task::TaskTracker::new();
+    let mut options = StartThreadOptions::new(config.clone());
+    options.thread_extension_init.insert(codex_extension_api::SessionIsolation::Isolated);
+    let started = manager.start_thread_until(options, stop.clone().cancelled_owned(), &tasks)
+        .await.unwrap();
+    let weak = Arc::downgrade(&started.thread);
+    let refresh = started.thread.session.mcp_refresh.acquire().await.unwrap();
+    stop.cancel();
+    tasks.close();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !started.thread.session.task_admission_closed.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("legacy common cleanup entered; refresh gate prevents completion");
+    assert!(started.thread.observed_terminal_cleanup().is_none());
+    assert!(matches!(started.thread.begin_retirement(Instant::now() + Duration::from_secs(5)),
+        Err(crate::ThreadRetirementError::LegacyCleanupStarted)));
+    let report = manager.begin_shutdown(Instant::now() + Duration::from_secs(5))
+        .unwrap().wait().await.unwrap();
+    assert!(!report.is_complete());
+    assert!(weak.upgrade().is_some());
+    drop(refresh);
+    tokio::time::timeout(Duration::from_secs(5), tasks.wait()).await.expect("cleanup joins");
+    assert_eq!(started.thread.observed_terminal_cleanup(), Some(super::super::SessionLoopOutcome::Normal));
+    drop(started);
+    // Registration compacts completed population before refusing the closed
+    // manager. The retained shutdown report itself remains incomplete.
+    assert!(manager.start_thread(StartThreadOptions::new(config)).await.is_err());
+    assert!(weak.upgrade().is_none());
+}
+
 #[derive(Clone, Copy)]
 enum ThreadLoopFixture {
     Ordinary,

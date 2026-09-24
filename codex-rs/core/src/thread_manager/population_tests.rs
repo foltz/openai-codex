@@ -180,38 +180,6 @@ async fn failed_cleanup_remains_owned_after_loop_join() {
 }
 
 #[tokio::test]
-async fn managed_legacy_cleanup_in_progress_is_retained_as_incomplete() {
-    let (_home, manager, config) = manager().await;
-    let manager = Arc::new(manager);
-    let stop = tokio_util::sync::CancellationToken::new();
-    let tasks = tokio_util::task::TaskTracker::new();
-    let mut options = StartThreadOptions::new(config);
-    options.thread_extension_init.insert(codex_extension_api::SessionIsolation::Isolated);
-    let started = manager.start_thread_until(options, stop.clone().cancelled_owned(), &tasks)
-        .await.unwrap();
-    let refresh = started.thread.session.mcp_refresh.acquire().await.unwrap();
-    stop.cancel();
-    tasks.close();
-    tokio::time::timeout(Duration::from_secs(20), async {
-        while !started.thread.session.task_admission_closed.load(std::sync::atomic::Ordering::Acquire) {
-            tokio::task::yield_now().await;
-        }
-    }).await.expect("legacy common cleanup entered; refresh gate prevents completion");
-    assert!(started.thread.observed_terminal_cleanup().is_none());
-    assert!(matches!(started.thread.begin_retirement(Instant::now() + Duration::from_secs(5)),
-        Err(crate::ThreadRetirementError::LegacyCleanupStarted)));
-    let report = manager.begin_shutdown(Instant::now() + Duration::from_secs(5))
-        .unwrap().wait().await.unwrap();
-    assert!(!report.is_complete());
-    assert_eq!(manager.constructions.published().len(), 1);
-    drop(refresh);
-    tokio::time::timeout(Duration::from_secs(5), tasks.wait()).await.expect("cleanup joins");
-    assert_eq!(started.thread.observed_terminal_cleanup(), Some(SessionLoopOutcome::Normal));
-    assert!(manager.constructions.published().is_empty());
-    assert_eq!(manager.constructions.state.lock().unwrap().compacted, 1);
-}
-
-#[tokio::test]
 async fn held_extension_stop_keeps_live_history_open_after_sticky_timeout() {
     struct HeldStop {
         entered: tokio::sync::Notify,

@@ -127,7 +127,7 @@ impl ThreadStore for GatedReviewerStore {
     fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move {
             self.record_operation(params.thread_id, "append").await;
-            self.inner.append_items(params).await
+            ThreadStore::append_items(&self.inner, params).await
         })
     }
 

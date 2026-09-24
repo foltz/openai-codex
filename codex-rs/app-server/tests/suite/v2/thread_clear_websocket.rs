@@ -143,16 +143,16 @@ async fn clear_successor_preserves_thread_source_after_preview_and_cold_resume()
         "user"
     );
 
-    // This WebSocket observer has no trusted interactive attachment. Its
-    // attachment state must not turn a persisted user classification into null.
-    send_request(&mut client, "thread/attachment/list", 8, Some(json!({}))).await?;
-    let attachments = read_response_for_id(&mut client, 8).await?;
-    let entries = attachments.result["entries"]
+    // This WebSocket observer has no trusted interactive subscription. Its
+    // subscription state must not turn a persisted user classification into null.
+    send_request(&mut client, "kcf/thread/interactiveSubscription/list", 8, Some(json!({}))).await?;
+    let subscriptions = read_response_for_id(&mut client, 8).await?;
+    let entries = subscriptions.result["entries"]
         .as_array()
-        .context("attachment entries")?;
+        .context("subscription entries")?;
     assert!(!entries.iter().any(|entry| {
         entry["threadId"] == successor
-            && entry["interactiveAttachmentCount"]
+            && entry["interactiveSubscriptionCount"]
                 .as_u64()
                 .unwrap_or_default()
                 > 0

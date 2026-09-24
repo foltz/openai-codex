@@ -482,12 +482,13 @@ with Path(r"{hook_log}").open("a", encoding="utf-8") as handle:
         .thread_config_snapshot()
         .await
         .model;
-    let turn_context = successor
+    let (turn_context, _) = successor
         .thread
         .session
         .new_turn_with_sub_id(
             "premature-clear-turn".to_string(),
             SessionSettingsUpdate::default(),
+            crate::session::turn_context::NewTurnContextOptions::default(),
         )
         .await
         .expect("build premature turn context");

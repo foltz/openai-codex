@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::HookEventName;
@@ -177,7 +178,12 @@ fn request() -> SessionEndRequest {
 
 fn engine(handler: ConfiguredHandler, shell: CommandShell) -> ClaudeHooksEngine {
     let (result_sender, _result_receiver) = async_channel::unbounded();
-    let runtime = CommandHookRuntime::new(shell, ThreadId::new(), result_sender);
+    let runtime = CommandHookRuntime::new(
+        shell,
+        Arc::new(std::env::vars_os().collect()),
+        ThreadId::new(),
+        result_sender,
+    );
     let mut engine = ClaudeHooksEngine::new(
         /*enabled*/ true,
         /*bypass_hook_trust*/ false,
@@ -185,6 +191,7 @@ fn engine(handler: ConfiguredHandler, shell: CommandShell) -> ClaudeHooksEngine 
         Vec::new(),
         Vec::new(),
         runtime,
+        crate::engine::tests::mcp_executor(),
     );
     engine.handlers = vec![handler];
     engine
@@ -201,7 +208,9 @@ fn set_command(handler: &mut ConfiguredHandler, command: &str) {
     let crate::engine::ConfiguredHandlerKind::Command {
         command: configured,
         ..
-    } = &mut handler.kind;
+    } = &mut handler.kind else {
+        panic!("expected command hook fixture");
+    };
     *configured = command.to_string();
 }
 

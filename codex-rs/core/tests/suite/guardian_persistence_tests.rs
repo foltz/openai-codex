@@ -268,8 +268,8 @@ async fn guardian_prewarm_reviewer_is_joined_and_compacted_before_manager_retire
     // removal. Do not hide a missing join behind post-shutdown polling.
     assert!(!test.thread_manager.list_thread_ids().await.contains(&reviewer_id));
     let calls = store.inner.calls().await;
-    let report = test.thread_manager.begin_shutdown(tokio::time::Instant::now() + Duration::from_secs(20))?
-        .wait().await?;
+    let report = test.thread_manager.begin_shutdown(tokio::time::Instant::now() + Duration::from_secs(20))
+        .expect("begin manager retirement").wait().await.expect("observe manager retirement");
     assert!(report.is_complete(), "{report:?}");
     // The report's documented Debug surface contains runtime IDs: a compacted
     // reviewer must not be reclassified as another manager retirement entry.

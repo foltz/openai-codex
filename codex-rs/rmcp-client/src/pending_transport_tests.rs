@@ -26,6 +26,27 @@ struct PausedFactory {
     stream: Arc<Mutex<Option<DuplexStream>>>,
 }
 
+struct ObservedHttpHeaders {
+    client: Arc<dyn codex_exec_server::HttpClient>,
+    received: tokio::sync::Notify,
+}
+
+impl codex_exec_server::HttpClient for ObservedHttpHeaders {
+    fn http_request(&self, params: codex_exec_server::HttpRequestParams)
+        -> BoxFuture<'_, Result<codex_exec_server::HttpRequestResponse, codex_exec_server::ExecServerError>> {
+        self.client.http_request(params)
+    }
+
+    fn http_request_stream(&self, params: codex_exec_server::HttpRequestParams)
+        -> BoxFuture<'_, Result<(codex_exec_server::HttpRequestResponse, codex_exec_server::HttpResponseBodyStream), codex_exec_server::ExecServerError>> {
+        async move {
+            let response = self.client.http_request_stream(params).await?;
+            self.received.notify_one();
+            Ok(response)
+        }.boxed()
+    }
+}
+
 #[tokio::test]
 async fn retirement_joins_http_worker_with_stalled_initialize() {
     for body_kind in ["headers", "application/json", "text/event-stream"] {
@@ -91,10 +112,14 @@ async fn exercise_http_initialize_retirement(body_kind: &'static str, retire: bo
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let url = format!("http://{}/mcp", listener.local_addr().expect("address"));
     let server = tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+    let http = Arc::new(ObservedHttpHeaders {
+        client: Environment::default_for_tests().get_http_client(),
+        received: tokio::sync::Notify::new(),
+    });
     let client = RmcpClient::new_streamable_http_client(
         "retirement-http", &url, Some("fixture-bearer".to_string()), None, None,
         OAuthCredentialsStoreMode::File, AuthKeyringBackendKind::default(),
-        Environment::default_for_tests().get_http_client(), None,
+        http.clone(), None,
     ).await.expect("construct HTTP client");
     let mut initialize = Box::pin(client.initialize(
         rmcp::model::ClientInfo::default(), Some(Duration::from_secs(120)),
@@ -106,6 +131,17 @@ async fn exercise_http_initialize_retirement(body_kind: &'static str, retire: bo
             _ = entered.notified() => {},
         }
     }).await.expect("initialize reached held HTTP response");
+    if body_kind != "headers" {
+        // On this current-thread runtime the worker finishes the headers poll
+        // before this observer runs. A header-only cancellation arm cannot
+        // satisfy the body cases: the response was already returned to RMCP.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                result = initialize.as_mut() => panic!("body completed before release: {result:?}"),
+                _ = http.received.notified() => {},
+            }
+        }).await.expect("client received headers before cancellation");
+    }
     if retire {
         drop(initialize);
         let report = tokio::time::timeout(Duration::from_secs(2),

@@ -7241,7 +7241,9 @@ async fn rejected_remote_cache_refresh_admission_clears_queued_work() {
 
     manager.schedule_remote_installed_plugins_cache_refresh(
         RemoteInstalledPluginsCacheRefreshRequest {
-            generation: manager.remote_installed_plugins_generation(),
+            generation: manager
+                .prepare_remote_installed_plugins_cache_generation(/*auth*/ None)
+                .expect("current unauthenticated generation"),
             service_config: service_config.clone(),
             auth: None,
             notify: RemoteInstalledPluginsCacheRefreshNotify::IfCacheChanged,

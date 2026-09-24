@@ -437,7 +437,7 @@ impl SessionRetirementIo {
             .send_shutdown(Submission {
                 id: new_submission_id(),
                 op: Op::Shutdown,
-                client_user_message_id: None,
+                root_turn_id: None,
                 trace: current_span_w3c_trace_context(),
                 parent_turn_id: None,
             })

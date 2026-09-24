@@ -176,6 +176,17 @@ fn request() -> SessionEndRequest {
     }
 }
 
+struct UnexpectedMcpExecutor;
+
+impl crate::mcp::HookMcpExecutor for UnexpectedMcpExecutor {
+    fn execute(
+        &self,
+        _call: crate::mcp::HookMcpCall,
+    ) -> futures::future::BoxFuture<'_, anyhow::Result<String>> {
+        panic!("command hook fixture must not invoke MCP");
+    }
+}
+
 fn engine(handler: ConfiguredHandler, shell: CommandShell) -> ClaudeHooksEngine {
     let (result_sender, _result_receiver) = async_channel::unbounded();
     let runtime = CommandHookRuntime::new(
@@ -191,7 +202,7 @@ fn engine(handler: ConfiguredHandler, shell: CommandShell) -> ClaudeHooksEngine 
         Vec::new(),
         Vec::new(),
         runtime,
-        crate::engine::tests::mcp_executor(),
+        Arc::new(UnexpectedMcpExecutor),
     );
     engine.handlers = vec![handler];
     engine

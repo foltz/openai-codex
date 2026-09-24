@@ -320,7 +320,9 @@ impl CodexThread {
     /// Materializes the initial rollout record and reports persistence failure to orchestrators
     /// that cannot safely publish the thread until its creation metadata is durable.
     pub async fn try_ensure_rollout_materialized(&self) -> std::io::Result<()> {
-        self.session.try_ensure_rollout_materialized().await
+        self.session
+            .try_ensure_rollout_materialized(PersistContext::Standard)
+            .await
     }
 
     #[doc(hidden)]

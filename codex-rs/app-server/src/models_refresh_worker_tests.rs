@@ -36,11 +36,12 @@ async fn shutdown_observers_retain_and_join_the_same_in_flight_refresh() {
         endpoint.clone(),
         /*auth_manager*/ None,
     ));
-    let worker = spawn_with_interval(
-        &models_manager,
-        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
-        Duration::from_millis(1),
+    let config_manager = crate::config_manager::ConfigManager::without_managed_config_for_tests(
+        home.path().to_path_buf(),
     );
+    let config = Arc::new(config_manager.load_non_project_config().await.unwrap());
+    let catalog = Arc::new(ModelCatalog::new(config_manager, config, models_manager));
+    let worker = spawn_with_interval(&catalog, Duration::from_millis(/*millis*/ 1));
     endpoint.wait_for_fetch_count(/*expected*/ 2).await;
     let mut cancelled = Box::pin(worker.shutdown_until(Instant::now() + Duration::from_secs(1)));
     assert!(futures::poll!(cancelled.as_mut()).is_pending());

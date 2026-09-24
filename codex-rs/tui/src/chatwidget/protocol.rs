@@ -340,7 +340,7 @@ impl ChatWidget {
                 }
             }
             ServerNotification::ServerRequestResolved(_)
-            | ServerNotification::ThreadAttachmentChanged(_)
+            | ServerNotification::ThreadInteractiveSubscriptionChanged(_)
             | ServerNotification::AccountUpdated(_)
             | ServerNotification::AccountRateLimitsUpdated(_)
             | ServerNotification::ThreadStarted(_)

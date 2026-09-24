@@ -55,47 +55,49 @@ pub enum ThreadStartSource {
 /// A server-owned count of trusted interactive clients attached to one exact
 /// thread.
 ///
-/// This is attachment evidence only. It does not establish thread succession,
+/// This is subscription evidence only. It does not establish thread succession,
 /// loaded state, or authority to transfer a clear transition.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(rename_all = "camelCase", export_to = "v2/")]
-pub struct ThreadAttachmentEntry {
+pub struct ThreadInteractiveSubscriptionEntry {
     pub thread_id: String,
-    pub interactive_attachment_count: u32,
+    /// Distinct live thread-event subscriptions held by server-verified
+    /// interactive clients. Not evidence of human presence, focus or retention.
+    pub interactive_subscription_count: u32,
 }
 
-/// Requests the current authoritative interactive-attachment snapshot.
+/// Requests the current authoritative interactive-subscription snapshot.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(rename_all = "camelCase", export_to = "v2/")]
-pub struct ThreadAttachmentListParams {}
+pub struct ThreadInteractiveSubscriptionListParams {}
 
-/// Complete server-owned interactive-attachment state for one app-server
+/// Complete server-owned interactive-subscription state for one app-server
 /// process generation.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(rename_all = "camelCase", export_to = "v2/")]
-pub struct ThreadAttachmentListResponse {
+pub struct ThreadInteractiveSubscriptionListResponse {
     /// New for each app-server process and rotated before its revision can
     /// overflow. A different generation requires the caller to discard any
-    /// cached attachment state and fetch a new snapshot.
+    /// cached subscription state and fetch a new snapshot.
     pub generation: String,
     /// Monotonically increasing only within `generation`.
     pub revision: u64,
-    /// Exact threads with at least one trusted interactive attachment.
-    pub entries: Vec<ThreadAttachmentEntry>,
+    /// Exact threads with at least one trusted interactive subscription.
+    pub entries: Vec<ThreadInteractiveSubscriptionEntry>,
 }
 
-/// An atomic attachment-state transition. A zero count explicitly records a
+/// An atomic subscription-state transition. A zero count explicitly records a
 /// removal; it is not encoded by omitting an entry.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(rename_all = "camelCase", export_to = "v2/")]
-pub struct ThreadAttachmentChangedNotification {
+pub struct ThreadInteractiveSubscriptionChangedNotification {
     pub generation: String,
     pub revision: u64,
-    pub changes: Vec<ThreadAttachmentEntry>,
+    pub changes: Vec<ThreadInteractiveSubscriptionEntry>,
 }
 
 // === Threads, Turns, and Items ===

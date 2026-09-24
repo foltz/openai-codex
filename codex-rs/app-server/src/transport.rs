@@ -69,7 +69,7 @@ impl ConnectionState {
 }
 
 /// Evaluates the server-owned entitlement half of D001. The caller must still
-/// require the explicit client role request before granting attachment state.
+/// require the explicit client role request before granting interactive subscription state.
 pub(crate) fn trusted_interactive_provenance(provenance: ConnectionProvenance) -> bool {
     match provenance {
         ConnectionProvenance::InProcess => true,

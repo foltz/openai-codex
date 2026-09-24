@@ -17,7 +17,7 @@ use codex_app_server_protocol::ThreadHistoryMode as ApiThreadHistoryMode;
 use codex_app_server_protocol::ThreadRevertParams;
 use codex_app_server_protocol::ThreadRevertResponse;
 use codex_app_server_protocol::ThreadRevertedNotification;
-use codex_app_server_protocol::ThreadAttachmentListParams;
+use codex_app_server_protocol::ThreadInteractiveSubscriptionListParams;
 use codex_app_server_protocol::ThreadSection;
 use codex_app_server_protocol::ThreadSectionAppearance;
 use codex_app_server_protocol::ThreadSectionMoveParams;
@@ -553,13 +553,13 @@ impl ThreadRequestProcessor {
             .map(|response| Some(response.into()))
     }
 
-    pub(crate) async fn thread_attachment_list(
+    pub(crate) async fn thread_interactive_subscription_list(
         &self,
-        _params: ThreadAttachmentListParams,
+        _params: ThreadInteractiveSubscriptionListParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
         Ok(Some(
             self.thread_state_manager
-                .thread_attachment_list()
+                .thread_interactive_subscription_list()
                 .await
                 .into(),
         ))

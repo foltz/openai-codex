@@ -197,7 +197,7 @@ pub(super) fn server_notification_thread_target(
             }
         }
         ServerNotification::ProjectChanged(_)
-        | ServerNotification::ThreadAttachmentChanged(_)
+        | ServerNotification::ThreadInteractiveSubscriptionChanged(_)
         | ServerNotification::SkillsChanged(_)
         | ServerNotification::McpServerOauthLoginCompleted(_)
         | ServerNotification::AccountUpdated(_)

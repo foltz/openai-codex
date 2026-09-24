@@ -340,12 +340,12 @@ impl ThreadRequestProcessor {
 
         if !self
             .thread_state_manager
-            .reserve_clear_successor_attachment(predecessor_thread_id, successor_thread_id)
+            .reserve_clear_successor_subscription(predecessor_thread_id, successor_thread_id)
             .await
         {
             return Err(clear_error(
                 ThreadClearErrorCode::TransitionConflict,
-                "successor attachment is already reserved by another clear transition",
+                "successor subscription is already reserved by another clear transition",
             ));
         }
 
@@ -461,7 +461,7 @@ impl ThreadRequestProcessor {
 
         // Start B's listener before the durable transition completes, but do
         // not subscribe it yet: the state manager moves A -> B atomically
-        // after completion so no attachment notification can expose both.
+        // after completion so no subscription notification can expose both.
         let successor_thread_state = self
             .thread_state_manager
             .thread_state(successor_thread_id)
@@ -487,16 +487,19 @@ impl ThreadRequestProcessor {
         // release of B's reservation. Do not couple it to the request scope:
         // post-disclosure errors retain B fail-closed for reconciliation.
         self.thread_state_manager
-            .terminalize_clear_successor_attachment(predecessor_thread_id, successor_thread_id)
+            .terminalize_clear_successor_subscription_reservation(
+                predecessor_thread_id,
+                successor_thread_id,
+            )
             .await;
         if !moved {
             // Completion is durable already. A connection close may win the
             // race after commit; it must not turn a completed transition into
-            // a contradictory client error or manufacture an attachment for a
+            // a contradictory client error or manufacture a subscription for a
             // client that is no longer present.
             warn!(
                 transition_id = %transition_id,
-                "clear requester disconnected after durable completion; no attachment move was published"
+                "clear requester disconnected after durable completion; no subscription move was published"
             );
         }
 

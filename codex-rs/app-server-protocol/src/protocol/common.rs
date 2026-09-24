@@ -594,11 +594,11 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::ThreadClearResponse,
     },
-    #[experimental("thread/attachment/list")]
-    ThreadAttachmentList => "thread/attachment/list" {
-        params: v2::ThreadAttachmentListParams,
+    #[experimental("kcf/thread/interactiveSubscription/list")]
+    ThreadInteractiveSubscriptionList => "kcf/thread/interactiveSubscription/list" {
+        params: v2::ThreadInteractiveSubscriptionListParams,
         serialization: global_shared_read("thread-attachment"),
-        response: v2::ThreadAttachmentListResponse,
+        response: v2::ThreadInteractiveSubscriptionListResponse,
     },
     #[experimental("thread/increment_elicitation")]
     /// Increment the thread-local out-of-band elicitation counter.
@@ -1923,8 +1923,8 @@ server_notification_definitions! {
     ThreadStarted => "thread/started" (v2::ThreadStartedNotification),
     ThreadClearEnded => "thread/clear/ended" (v2::ThreadClearEndedNotification),
     ThreadClearStarted => "thread/clear/started" (v2::ThreadClearStartedNotification),
-    #[experimental("thread/attachment/changed")]
-    ThreadAttachmentChanged => "thread/attachment/changed" (v2::ThreadAttachmentChangedNotification),
+    #[experimental("kcf/thread/interactiveSubscription/changed")]
+    ThreadInteractiveSubscriptionChanged => "kcf/thread/interactiveSubscription/changed" (v2::ThreadInteractiveSubscriptionChangedNotification),
     ThreadStatusChanged => "thread/status/changed" (v2::ThreadStatusChangedNotification),
     ThreadArchived => "thread/archived" (v2::ThreadArchivedNotification),
     ThreadDeleted => "thread/deleted" (v2::ThreadDeletedNotification),

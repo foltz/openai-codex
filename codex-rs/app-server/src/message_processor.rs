@@ -319,7 +319,7 @@ impl MessageProcessor {
         } = args;
         let thread_state_manager = ThreadStateManager::new();
         outgoing.watch_user_verification_auth(Arc::clone(&auth_manager));
-        thread_state_manager.set_attachment_notification_outgoing(outgoing.clone());
+        thread_state_manager.set_interactive_subscription_notification_outgoing(outgoing.clone());
         // The thread store is intentionally process-scoped. Config reloads can
         // affect per-thread behavior, but they must not move newly started,
         // resumed, or forked threads to a different persistence backend/root.
@@ -1334,8 +1334,10 @@ impl MessageProcessor {
                     .thread_clear(request_id.clone(), params)
                     .await
             }
-            ClientRequest::ThreadAttachmentList { params, .. } => {
-                self.thread_processor.thread_attachment_list(params).await
+            ClientRequest::ThreadInteractiveSubscriptionList { params, .. } => {
+                self.thread_processor
+                    .thread_interactive_subscription_list(params)
+                    .await
             }
             ClientRequest::ThreadResume { params, .. } => {
                 self.thread_processor

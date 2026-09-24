@@ -198,6 +198,21 @@ builds reject clear until the corresponding orchestration is enabled.
 
 ## Stored thread attachments
 
+### KCF interactive-subscription terminology
+
+`kcf/thread/interactiveSubscription/list` returns the experimental snapshot
+`{ generation, revision, entries: [{ threadId, interactiveSubscriptionCount }] }`.
+`kcf/thread/interactiveSubscription/changed` publishes revisioned changes.
+Both require experimental API opt-in. The counted unit is one live thread-event
+subscription held by a connection verified as a trusted interactive client,
+not evidence of human presence, display focus or retention.
+
+Historical KCF records called these relationships interactive attachments.
+The old KCF method names are not aliases: upstream now owns
+`thread/attachment/list` for stored resources. Consumers must migrate to the
+new names and count field, not silently treat the stored-resource response as
+a subscription snapshot.
+
 The KCF interactive relationship is separate from the stored resources below.
 Its experimental snapshot counts only connections requesting
 `initialize.capabilities.interactiveClient` that the server verifies as embedded

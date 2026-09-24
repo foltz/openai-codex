@@ -74,15 +74,15 @@ struct AppServerArgs {
     /// Hidden helper used only by the Unix-peer entitlement integration test.
     /// It connects through the production protocol as this exact binary.
     #[cfg(all(debug_assertions, unix))]
-    #[arg(long = "interactive-attachment-peer-helper", hide = true)]
-    interactive_attachment_peer_helper: Option<PathBuf>,
+    #[arg(long = "interactive-subscription-peer-helper", hide = true)]
+    interactive_subscription_peer_helper: Option<PathBuf>,
 
     #[cfg(all(debug_assertions, unix))]
     #[arg(
-        long = "interactive-attachment-peer-helper-expect-unproven",
+        long = "interactive-subscription-peer-helper-expect-unproven",
         hide = true
     )]
-    interactive_attachment_peer_helper_expect_unproven: bool,
+    interactive_subscription_peer_helper_expect_unproven: bool,
 
     /// Enable remote control for this app-server process without changing persistence.
     #[arg(long = "remote-control", hide = true)]
@@ -106,17 +106,17 @@ fn main() -> anyhow::Result<()> {
             #[cfg(debug_assertions)]
             disable_plugin_startup_tasks_for_tests,
             #[cfg(all(debug_assertions, unix))]
-            interactive_attachment_peer_helper,
+            interactive_subscription_peer_helper,
             #[cfg(all(debug_assertions, unix))]
-            interactive_attachment_peer_helper_expect_unproven,
+            interactive_subscription_peer_helper_expect_unproven,
             remote_control,
             managed_daemon,
         } = AppServerArgs::parse();
         #[cfg(all(debug_assertions, unix))]
-        if let Some(socket_path) = interactive_attachment_peer_helper {
-            return run_interactive_attachment_peer_helper(
+        if let Some(socket_path) = interactive_subscription_peer_helper {
+            return run_interactive_subscription_peer_helper(
                 socket_path,
-                interactive_attachment_peer_helper_expect_unproven,
+                interactive_subscription_peer_helper_expect_unproven,
             )
             .await;
         }
@@ -167,7 +167,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 #[cfg(all(debug_assertions, unix))]
-async fn run_interactive_attachment_peer_helper(
+async fn run_interactive_subscription_peer_helper(
     socket_path: PathBuf,
     expect_unproven: bool,
 ) -> anyhow::Result<()> {
@@ -241,19 +241,19 @@ async fn run_interactive_attachment_peer_helper(
     let snapshot = request(
         &mut websocket,
         3,
-        "thread/attachment/list",
+        "kcf/thread/interactiveSubscription/list",
         serde_json::json!({}),
     )
     .await?;
     let entries = snapshot["entries"]
         .as_array()
-        .ok_or_else(|| anyhow::anyhow!("attachment list did not return entries"))?;
+        .ok_or_else(|| anyhow::anyhow!("subscription list did not return entries"))?;
     let contains_thread = entries
         .iter()
         .any(|entry| entry["threadId"].as_str() == Some(thread_id));
     anyhow::ensure!(
         contains_thread != expect_unproven,
-        "unexpected attachment entitlement: expect_unproven={expect_unproven}, entries={entries:?}"
+        "unexpected subscription entitlement: expect_unproven={expect_unproven}, entries={entries:?}"
     );
     Ok(())
 }

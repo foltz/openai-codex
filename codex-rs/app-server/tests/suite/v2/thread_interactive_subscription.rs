@@ -1,3 +1,4 @@
+//! Public trusted interactive subscription contract and entitlement coverage.
 use anyhow::Result;
 use app_test_support::DEFAULT_CLIENT_NAME;
 use app_test_support::TestAppServer;
@@ -10,8 +11,8 @@ use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SessionSource;
-use codex_app_server_protocol::ThreadAttachmentListParams;
-use codex_app_server_protocol::ThreadAttachmentListResponse;
+use codex_app_server_protocol::ThreadInteractiveSubscriptionListParams;
+use codex_app_server_protocol::ThreadInteractiveSubscriptionListResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_arg0::Arg0DispatchPaths;
@@ -38,7 +39,7 @@ use tokio::time::sleep;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[tokio::test]
-async fn thread_attachment_list_is_empty_without_server_entitlement() -> Result<()> {
+async fn thread_interactive_subscription_list_is_empty_without_server_entitlement() -> Result<()> {
     let mut app_server = TestAppServer::builder().without_auto_env().build().await?;
     let initialized = app_server
         .initialize_with_capabilities(
@@ -60,9 +61,11 @@ async fn thread_attachment_list_is_empty_without_server_entitlement() -> Result<
     assert!(matches!(initialized, JSONRPCMessage::Response(_)));
 
     let request_id = app_server
-        .send_thread_attachment_list_request(ThreadAttachmentListParams::default())
+        .send_thread_interactive_subscription_list_request(
+            ThreadInteractiveSubscriptionListParams::default(),
+        )
         .await?;
-    let response: ThreadAttachmentListResponse =
+    let response: ThreadInteractiveSubscriptionListResponse =
         timeout(DEFAULT_TIMEOUT, app_server.read_response(request_id)).await??;
 
     assert!(!response.generation.is_empty());
@@ -72,7 +75,7 @@ async fn thread_attachment_list_is_empty_without_server_entitlement() -> Result<
 }
 
 #[tokio::test]
-async fn embedded_interactive_client_populates_public_attachment_snapshot() -> Result<()> {
+async fn embedded_interactive_client_populates_public_subscription_snapshot() -> Result<()> {
     let codex_home = TempDir::new()?;
     let loader_overrides = LoaderOverrides::without_managed_config_for_tests();
     let config = Arc::new(
@@ -126,17 +129,26 @@ async fn embedded_interactive_client_populates_public_attachment_snapshot() -> R
         .map_err(|err| anyhow::anyhow!("thread/start should succeed: {err:?}"))?;
     let started: ThreadStartResponse = serde_json::from_value(started)?;
     let snapshot = client
-        .request(ClientRequest::ThreadAttachmentList {
+        .request(ClientRequest::ThreadInteractiveSubscriptionList {
             request_id: RequestId::Integer(2),
-            params: ThreadAttachmentListParams::default(),
+            params: ThreadInteractiveSubscriptionListParams::default(),
         })
         .await?
-        .map_err(|err| anyhow::anyhow!("thread/attachment/list should succeed: {err:?}"))?;
-    let snapshot: ThreadAttachmentListResponse = serde_json::from_value(snapshot)?;
+        .map_err(|err| {
+            anyhow::anyhow!("kcf/thread/interactiveSubscription/list should succeed: {err:?}")
+        })?;
+    assert_eq!(
+        snapshot["entries"],
+        serde_json::json!([{
+            "threadId": started.thread.id,
+            "interactiveSubscriptionCount": 1,
+        }]),
+    );
+    let snapshot: ThreadInteractiveSubscriptionListResponse = serde_json::from_value(snapshot)?;
     assert_eq!(snapshot.revision, 1);
     assert_eq!(snapshot.entries.len(), 1);
     assert_eq!(snapshot.entries[0].thread_id, started.thread.id);
-    assert_eq!(snapshot.entries[0].interactive_attachment_count, 1);
+    assert_eq!(snapshot.entries[0].interactive_subscription_count, 1);
 
     client.shutdown().await?;
     Ok(())
@@ -148,7 +160,7 @@ async fn embedded_interactive_client_populates_public_attachment_snapshot() -> R
 /// role request alone remains unentitled.
 #[cfg(unix)]
 #[tokio::test]
-async fn unix_peer_entitlement_reaches_public_attachment_aggregate() -> Result<()> {
+async fn unix_peer_entitlement_reaches_public_subscription_aggregate() -> Result<()> {
     let temp_dir = TempDir::new()?;
     let socket_path = temp_dir.path().join("app-server.sock");
     let codex_home = temp_dir.path().join("codex-home");
@@ -188,7 +200,7 @@ async fn unix_peer_entitlement_reaches_public_attachment_aggregate() -> Result<(
     let entitled = tokio::task::spawn_blocking(move || {
         Command::new(helper_binary)
             .args([
-                "--interactive-attachment-peer-helper",
+                "--interactive-subscription-peer-helper",
                 helper_socket_path.to_str().expect("socket path utf8"),
             ])
             .env("CODEX_HOME", helper_codex_home)
@@ -210,9 +222,9 @@ async fn unix_peer_entitlement_reaches_public_attachment_aggregate() -> Result<(
         std::fs::set_permissions(&copied_binary, std::fs::Permissions::from_mode(0o700))?;
         let unentitled = Command::new(copied_binary)
             .args([
-                "--interactive-attachment-peer-helper",
+                "--interactive-subscription-peer-helper",
                 socket_path.to_str().expect("socket path utf8"),
-                "--interactive-attachment-peer-helper-expect-unproven",
+                "--interactive-subscription-peer-helper-expect-unproven",
             ])
             .env("CODEX_HOME", &codex_home)
             .status()

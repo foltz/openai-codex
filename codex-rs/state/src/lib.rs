@@ -11,6 +11,7 @@ const _: () = assert!(
 
 mod audit;
 mod extract;
+mod kcf_migrations;
 pub mod log_db;
 mod migrations;
 mod model;

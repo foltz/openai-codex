@@ -229,6 +229,46 @@ async fn managed_legacy_cleanup_in_progress_is_retained_as_incomplete() {
 }
 
 #[tokio::test]
+async fn held_extension_stop_keeps_live_history_open_after_sticky_timeout() {
+    struct HeldStop {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+        completed: std::sync::atomic::AtomicUsize,
+    }
+    impl codex_extension_api::ThreadLifecycleContributor<Config> for HeldStop {
+        fn on_thread_stop<'a>(&'a self, _input: codex_extension_api::ThreadStopInput<'a>)
+            -> codex_extension_api::ExtensionFuture<'a, ()> {
+            Box::pin(async {
+                self.entered.notify_one();
+                self.release.acquire().await.expect("release stop").forget();
+                self.completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        }
+    }
+    let (_home, mut manager, mut config) = manager().await;
+    config.ephemeral = false;
+    let held = Arc::new(HeldStop { entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Semaphore::new(0), completed: std::sync::atomic::AtomicUsize::new(0) });
+    let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
+    extensions.thread_lifecycle_contributor(held.clone());
+    Arc::get_mut(&mut manager.state).unwrap().extensions = Arc::new(extensions.build());
+    let started = manager.start_thread(StartThreadOptions::new(config)).await.unwrap();
+    let live = started.thread.session.services.live_thread.as_ref().expect("live persistence");
+    live.flush().await.expect("positive persistence control");
+    let ticket = started.thread.begin_retirement(Instant::now() + Duration::from_secs(2)).unwrap();
+    let observer = tokio::spawn({ let ticket = ticket.clone(); async move { ticket.wait().await } });
+    tokio::time::timeout(Duration::from_secs(5), held.entered.notified()).await.expect("stop entered");
+    live.flush().await.expect("history remains open during extension stop");
+    let report = observer.await.unwrap();
+    assert_eq!(report.cleanup, crate::ThreadCleanupOutcome::TimedOut);
+    live.flush().await.expect("history remains open after observer timeout");
+    held.release.add_permits(1);
+    assert_eq!(ticket.wait().await, report);
+    assert_eq!(held.completed.load(std::sync::atomic::Ordering::SeqCst), 0);
+    live.flush().await.expect("expired observation cannot close history");
+}
+
+#[tokio::test]
 async fn constructor_admitted_before_close_cannot_publish_after_close() {
     struct HeldInstructions(Mutex<Option<tokio::sync::oneshot::Receiver<()>>>);
     impl codex_extension_api::UserInstructionsProvider for HeldInstructions {

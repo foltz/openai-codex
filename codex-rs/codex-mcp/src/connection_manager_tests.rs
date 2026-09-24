@@ -5143,9 +5143,15 @@ fn retirement_runtime_input(
     cache: McpToolCatalogCache,
     policy: McpStartupPolicy,
 ) -> McpRuntimeInput {
+    let mut runtime_config = crate::mcp::tests::test_mcp_config(home.to_path_buf());
+    // A real binding now requires explicit per-server call authority, just as
+    // capture_binding supplies for the other connection-manager fixtures.
+    runtime_config
+        .server_permission_profiles
+        .insert("docs".to_string(), PermissionProfile::default());
     McpRuntimeInput {
         startup_policy: policy,
-        config: Arc::new(crate::mcp::tests::test_mcp_config(home.to_path_buf())),
+        config: Arc::new(runtime_config),
         plugins_available: false,
         ready_selected_capability_roots: Vec::new(),
         mcp_servers: HashMap::from([("docs".to_string(), EffectiveMcpServer::configured(config))]),

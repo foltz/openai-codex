@@ -703,6 +703,14 @@ async fn failed_initialization_discard_remains_the_original_common_receipt_after
     // actual failed-initialization discard path without starting cleanup twice.
     release.notify_one();
     assert_eq!(
+        owner.observe(Arc::clone(&session)).await,
+        CleanupExecution::TimedOut,
+    );
+    assert!(
+        common.peek().is_none(),
+        "even a ready stop hook must not resume common cleanup after expiry",
+    );
+    assert_eq!(
         common.await,
         CleanupExecution::Finished {
             persistence_failed: false

@@ -12,6 +12,7 @@ use crate::codex_thread::ThreadRetirement;
 use crate::codex_thread::ThreadRetirementError;
 use crate::codex_thread::ThreadRetirementReport;
 use codex_protocol::ThreadId;
+#[cfg(test)]
 use codex_thread_store::LiveThread;
 use codex_thread_store::LiveThreadInitGuard;
 use futures::FutureExt;
@@ -92,6 +93,7 @@ impl StartupCleanup {
 mod tests;
 
 impl SessionStartupCustody {
+    #[cfg(test)]
     pub(super) fn retain_persistence(&self, thread_id: ThreadId, live_thread: LiveThread) {
         self.retain_persistence_guard(
             thread_id,

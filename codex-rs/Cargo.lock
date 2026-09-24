@@ -3902,6 +3902,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
+ "tiny_http",
  "tokio",
  "tokio-util",
  "tracing",

@@ -58,6 +58,7 @@ pub(crate) fn without_notification_media(notification: ServerNotification) -> Se
         | ServerNotification::ThreadStarted(_)
         | ServerNotification::ThreadClearStarted(_)
         | ServerNotification::ThreadClearEnded(_)
+        | ServerNotification::ThreadInteractiveSubscriptionChanged(_)
         | ServerNotification::ThreadStatusChanged(_)
         | ServerNotification::ThreadArchived(_)
         | ServerNotification::ThreadDeleted(_)

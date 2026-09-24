@@ -1012,7 +1012,7 @@ impl RmcpClient {
                         });
                     if modern_session {
                         rmcp_params.meta = meta;
-                        return crate::tool_input::call_tool(&service, rmcp_params).await;
+                        return service.call_tool(rmcp_params).await;
                     }
                     let mut options = rmcp::service::PeerRequestOptions::no_options();
                     options.meta = meta;

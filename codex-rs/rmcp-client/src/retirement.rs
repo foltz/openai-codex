@@ -705,7 +705,7 @@ impl<S: Service<RoleClient>> ServiceLeaseOwner<S> {
     }
 }
 
-/// Erases the local handler type while forwarding upstream MRTR helpers intact.
+/// Erases the local handler type while retaining a lease across tool continuations.
 trait ServiceOperations: Send + Sync {
     fn close_gate(&self);
     fn call_tool(
@@ -731,12 +731,11 @@ impl<S: Service<RoleClient>> ServiceOperations for Arc<ServiceLeaseOwner<S>> {
     ) -> BoxFuture<'_, Result<rmcp::model::CallToolResult, rmcp::service::ServiceError>> {
         async move {
             let lease = self.acquire()?;
-            lease
-                .service
-                .as_ref()
-                .expect("live operation lease")
-                .call_tool(params)
-                .await
+            crate::tool_input::call_tool(
+                lease.service.as_ref().expect("live operation lease"),
+                params,
+            )
+            .await
         }
         .boxed()
     }

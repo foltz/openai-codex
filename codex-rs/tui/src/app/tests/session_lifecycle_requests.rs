@@ -265,6 +265,7 @@ pub(super) async fn start_recording_app_server_with_realtime_speech(
     let state_db =
         crate::init_state_db_for_app_server_target(config, &crate::AppServerTarget::Embedded)
             .await?;
+    let host = Arc::new(codex_app_server_client::InProcessHost::default());
     let mut embedded = crate::start_embedded_app_server(
         codex_arg0::Arg0DispatchPaths::default(),
         config.clone(),
@@ -276,6 +277,7 @@ pub(super) async fn start_recording_app_server_with_realtime_speech(
         /*log_db*/ None,
         state_db,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Arc::clone(&host),
     )
     .await?;
     let codex_home = config.codex_home.display().to_string();
@@ -617,6 +619,7 @@ pub(super) async fn start_recording_app_server_with_realtime_speech(
             }
         }
         embedded.shutdown().await?;
+        drop(host);
         Ok(())
     });
     let app_server = crate::connect_remote_app_server(crate::RemoteAppServerEndpoint::WebSocket {

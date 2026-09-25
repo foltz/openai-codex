@@ -41,6 +41,292 @@ mod model_info_overrides_tests;
 const DEFAULT_HTTP_CLIENT_FACTORY: HttpClientFactory =
     HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
 
+#[derive(Debug)]
+struct ManagedResetEndpoint {
+    identity: Mutex<String>,
+    started: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+    calls: AtomicUsize,
+    fail: bool,
+}
+
+impl ModelsEndpointClient for ManagedResetEndpoint {
+    fn identity(&self) -> Option<String> {
+        Some(self.identity.lock().expect("identity lock").clone())
+    }
+
+    fn has_command_auth(&self) -> bool {
+        false
+    }
+
+    fn uses_codex_backend(&self) -> ModelsEndpointFuture<'_, bool> {
+        Box::pin(async { true })
+    }
+
+    fn list_models<'a>(
+        &'a self,
+        _client_version: &'a str,
+        _http_client_factory: HttpClientFactory,
+    ) -> ModelsEndpointFuture<'a, CoreResult<ModelsEndpointResponse>> {
+        Box::pin(async move {
+            let identity = self.identity().expect("test identity");
+            if self.fail {
+                return Err(codex_protocol::error::CodexErr::InvalidRequest(
+                    "test endpoint failure".to_owned(),
+                ));
+            }
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                self.started.add_permits(1);
+                self.release
+                    .acquire()
+                    .await
+                    .expect("release first fetch")
+                    .forget();
+            }
+            let slug = if call == 0 {
+                "old-account"
+            } else {
+                "new-account"
+            };
+            Ok(ModelsEndpointResponse {
+                models: vec![remote_model(slug, slug, /*priority*/ 0)],
+                etag: None,
+                identity,
+            })
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn managed_reset_fences_inflight_refresh_and_replaces_disk_and_memory() {
+    let endpoint = Arc::new(ManagedResetEndpoint {
+        identity: Mutex::new("account-a".to_owned()),
+        started: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+        calls: AtomicUsize::new(0),
+        fail: false,
+    });
+    let home = tempdir().expect("home");
+    let manager = Arc::new(openai_manager_for_tests(
+        home.path().to_path_buf(),
+        endpoint.clone(),
+    ));
+    let old_manager = Arc::clone(&manager);
+    let old_refresh = tokio::spawn(async move {
+        old_manager
+            .list_models(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
+            .await
+    });
+    endpoint
+        .started
+        .acquire()
+        .await
+        .expect("old fetch entered")
+        .forget();
+    *endpoint.identity.lock().expect("identity lock") = "account-b".to_owned();
+    let mut reset = manager.reset_for_managed_auth(DEFAULT_HTTP_CLIENT_FACTORY);
+    // Poll the reset while the old network response is held. It must wait for
+    // the old publication transaction, not acknowledge and let A arrive later.
+    std::future::poll_fn(|cx| {
+        assert!(reset.as_mut().poll(cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    endpoint.release.add_permits(1);
+    old_refresh.await.expect("old worker");
+    assert_eq!(reset.await, Ok(()));
+    let expected = vec![remote_model(
+        "new-account",
+        "new-account",
+        /*priority*/ 0,
+    )];
+    assert_eq!(manager.get_remote_models().await, expected);
+    let cache = FileModelsCache::new(home.path().join(MODEL_CACHE_FILE), DEFAULT_MODEL_CACHE_TTL);
+    assert_eq!(
+        cache
+            .load(&crate::client_version_to_whole())
+            .await
+            .expect("cache read")
+            .expect("cache entry")
+            .models,
+        expected
+    );
+}
+
+#[tokio::test]
+async fn managed_reset_reports_endpoint_failure_instead_of_stale_catalog_success() {
+    let endpoint = Arc::new(ManagedResetEndpoint {
+        identity: Mutex::new("account-a".to_owned()),
+        started: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+        calls: AtomicUsize::new(0),
+        fail: true,
+    });
+    let home = tempdir().expect("home");
+    let manager = openai_manager_for_tests(home.path().to_path_buf(), endpoint);
+    manager
+        .apply_remote_models(ModelsCacheEntry {
+            fetched_at: Utc::now(),
+            etag: None,
+            client_version: Some(crate::client_version_to_whole()),
+            identity: Some("account-a".to_owned()),
+            models: vec![remote_model("old-account", "old-account", /*priority*/ 0)],
+        })
+        .await;
+    assert_eq!(
+        manager
+            .reset_for_managed_auth(DEFAULT_HTTP_CLIENT_FACTORY)
+            .await,
+        Err(ManagedModelsResetError::Endpoint)
+    );
+    assert_eq!(
+        manager.get_remote_models().await,
+        load_remote_models_from_file().expect("bundled catalog")
+    );
+}
+
+#[tokio::test]
+async fn managed_logout_reset_replaces_old_cache_without_network() {
+    let home = tempdir().expect("home");
+    let old = remote_model("old-account", "old-account", /*priority*/ 0);
+    let cache = Arc::new(FileModelsCache::new(home.path().join(MODEL_CACHE_FILE), DEFAULT_MODEL_CACHE_TTL));
+    cache.store(&ModelsCacheEntry {
+        fetched_at: Utc::now(),
+        etag: Some("old".to_owned()),
+        client_version: Some(crate::client_version_to_whole()),
+        identity: Some("test-provider".to_owned()),
+        models: vec![old.clone()],
+    }).await.expect("seed old disk cache");
+    let endpoint = TestModelsEndpoint::without_refresh(Vec::new());
+    let manager = OpenAiModelsManager::new_with_cache(
+        cache.clone(),
+        endpoint.clone(),
+        /*auth_manager*/ None,
+    );
+    assert!(manager.apply_remote_models(ModelsCacheEntry {
+        fetched_at: Utc::now(),
+        etag: None,
+        client_version: Some(crate::client_version_to_whole()),
+        identity: endpoint.identity(),
+        models: vec![old],
+    }).await);
+    assert_eq!(
+        manager
+            .reset_for_managed_auth(DEFAULT_HTTP_CLIENT_FACTORY)
+            .await,
+        Ok(())
+    );
+    let bundled = load_remote_models_from_file().expect("bundled catalog");
+    assert_eq!(manager.get_remote_models().await, bundled);
+    let invalidation = cache.load(&crate::client_version_to_whole()).await
+        .expect("read disk cache").expect("reset persisted");
+    assert_eq!(invalidation.models, bundled);
+    assert_eq!(endpoint.fetch_count(), 0);
+    assert_eq!(invalidation.identity, None);
+    assert!(!manager.try_load_cache().await, "bundled invalidation is not a remote cache hit");
+}
+
+#[tokio::test]
+async fn managed_reset_refuses_cache_invalidation_failure() {
+    let cache = TestModelsCache::failing(/*load_error*/ false, /*store_error*/ true);
+    let endpoint = TestModelsEndpoint::new(Vec::new());
+    let manager =
+        OpenAiModelsManager::new_with_cache(cache, endpoint.clone(), /*auth_manager*/ None);
+    assert_eq!(
+        manager
+            .reset_for_managed_auth(DEFAULT_HTTP_CLIENT_FACTORY)
+            .await,
+        Err(ManagedModelsResetError::Cache)
+    );
+    assert_eq!(endpoint.fetch_count(), 0);
+}
+
+#[tokio::test]
+async fn managed_reset_refuses_auth_change_while_endpoint_is_pending() {
+    let endpoint = Arc::new(ManagedResetEndpoint {
+        identity: Mutex::new("account-a".to_owned()),
+        started: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+        calls: AtomicUsize::new(0),
+        fail: false,
+    });
+    let auth =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    let manager = Arc::new(OpenAiModelsManager::new_without_cache(
+        endpoint.clone(),
+        Some(Arc::clone(&auth)),
+    ));
+    let reset_manager = Arc::clone(&manager);
+    let reset = tokio::spawn(async move {
+        reset_manager
+            .reset_for_managed_auth(DEFAULT_HTTP_CLIENT_FACTORY)
+            .await
+    });
+    endpoint
+        .started
+        .acquire()
+        .await
+        .expect("reset fetch entered")
+        .forget();
+    auth.set_external_auth(Arc::new(TestExternalApiKeyAuth))
+        .await
+        .expect("change auth");
+    endpoint.release.add_permits(1);
+    assert_eq!(
+        reset.await.expect("reset task"),
+        Err(ManagedModelsResetError::AuthChanged)
+    );
+    assert_eq!(
+        manager.get_remote_models().await,
+        load_remote_models_from_file().expect("bundled catalog")
+    );
+}
+
+#[tokio::test]
+async fn managed_reset_rejects_response_from_superseded_endpoint_identity() {
+    let endpoint = Arc::new(ManagedResetEndpoint {
+        identity: Mutex::new("account-a".to_owned()),
+        started: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+        calls: AtomicUsize::new(0),
+        fail: false,
+    });
+    let home = tempdir().expect("home");
+    let manager = Arc::new(openai_manager_for_tests(home.path().into(), endpoint.clone()));
+    let reset_manager = Arc::clone(&manager);
+    let reset = tokio::spawn(async move {
+        reset_manager.reset_for_managed_auth(DEFAULT_HTTP_CLIENT_FACTORY).await
+    });
+    endpoint.started.acquire().await.expect("fetch entered").forget();
+    // No AuthManager signal changes: the endpoint identity is an independent fence.
+    *endpoint.identity.lock().expect("identity lock") = "account-b".to_owned();
+    endpoint.release.add_permits(1);
+    assert_eq!(reset.await.expect("reset task"), Err(ManagedModelsResetError::AuthChanged));
+    assert_eq!(manager.get_remote_models().await, load_remote_models_from_file().expect("bundled"));
+    let cache = FileModelsCache::new(home.path().join(MODEL_CACHE_FILE), DEFAULT_MODEL_CACHE_TTL);
+    let entry = cache.load(&crate::client_version_to_whole()).await.expect("cache read").expect("invalidation");
+    assert_eq!(entry.identity, None);
+    assert_eq!(entry.models, load_remote_models_from_file().expect("bundled"));
+}
+
+#[tokio::test]
+async fn managed_reset_respects_disabled_api_key_discovery_without_poisoning_cache() {
+    let home = tempdir().expect("home");
+    let models = vec![remote_model("dynamic", "Dynamic", /*priority*/ 0)];
+    let endpoint = TestModelsEndpoint::without_refresh(vec![models.clone()]);
+    let auth = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("test-key"));
+    let manager = OpenAiModelsManager::new(home.path().into(), endpoint.clone(), Some(auth));
+    assert_eq!(manager.reset_for_managed_auth(DEFAULT_HTTP_CLIENT_FACTORY).await, Ok(()));
+    assert_eq!(endpoint.fetch_count(), 0);
+    assert_eq!(manager.get_remote_models().await, load_remote_models_from_file().expect("bundled"));
+
+    // The reset's bundled invalidation must not count as a remote cache hit.
+    manager.set_api_key_model_discovery_enabled(/*enabled*/ true);
+    assert_eq!(manager.raw_model_catalog(RefreshStrategy::OnlineIfUncached, DEFAULT_HTTP_CLIENT_FACTORY).await.models, models);
+    assert_eq!(endpoint.fetch_count(), 1);
+}
+
 fn remote_model(slug: &str, display: &str, priority: i32) -> ModelInfo {
     remote_model_with_visibility(slug, display, priority, "list")
 }

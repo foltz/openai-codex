@@ -359,8 +359,8 @@ async fn start_or_steer(
                 task_input.push(pending_turn_input(session, input, &turn_context.sub_id).await);
             }
             session
-                .spawn_task(turn_context, task_input, RegularTask::new())
-                .await;
+                .try_spawn_task(turn_context, task_input, RegularTask::new())
+                .await?;
             Ok(TurnInputSubmission::Started {
                 turn_id: submission_id,
             })

@@ -108,8 +108,10 @@ async fn submit_steer_only(
     .expect("steer-only submission should be valid")
 }
 
+#[test_case(TurnInputMode::StartIfIdle; "start_only")]
+#[test_case(TurnInputMode::StartOrSteer; "start_or_steer")]
 #[tokio::test]
-async fn retired_session_cannot_report_started_for_new_turn_input() {
+async fn retired_session_cannot_report_started_for_new_turn_input(mode: TurnInputMode) {
     let (session, _) = make_session_and_context().await;
     let session = Arc::new(session);
     session.close_task_admission().await;
@@ -122,7 +124,7 @@ async fn retired_session_cannot_report_started_for_new_turn_input() {
             }],
             client_id: None,
         }),
-        TurnInputMode::StartIfIdle,
+        mode,
         "retired-input".to_string(),
     )
     .await

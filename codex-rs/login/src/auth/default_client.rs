@@ -41,8 +41,10 @@ pub const DEFAULT_ORIGINATOR: &str = "codex_cli_rs";
 pub const CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR: &str = "CODEX_INTERNAL_ORIGINATOR_OVERRIDE";
 pub use codex_model_provider_info::RESIDENCY_HEADER_NAME;
 pub use codex_model_provider_info::ResidencyRequirement;
+pub use codex_model_provider_info::ResidencyRequirementUnavailable;
 pub use codex_model_provider_info::read_managed_residency_requirement as read_default_client_residency_requirement;
 pub use codex_model_provider_info::set_managed_residency_requirement as set_default_client_residency_requirement;
+pub use codex_model_provider_info::try_set_managed_residency_requirement as try_set_default_client_residency_requirement;
 
 #[derive(Debug, Clone)]
 pub struct Originator {

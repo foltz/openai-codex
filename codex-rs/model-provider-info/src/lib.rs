@@ -53,6 +53,37 @@ pub fn set_managed_residency_requirement(enforce_residency: Option<ResidencyRequ
         .unwrap_or_else(PoisonError::into_inner) = enforce_residency;
 }
 
+/// Managed reset could not acquire authoritative residency routing state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResidencyRequirementUnavailable;
+
+impl fmt::Display for ResidencyRequirementUnavailable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("residency routing state unavailable")
+    }
+}
+
+impl std::error::Error for ResidencyRequirementUnavailable {}
+
+/// Publishes a managed reset's policy only when routing state is authoritative.
+///
+/// Unlike ordinary policy publication, reset must fail closed on poison rather
+/// than acknowledge a successful account transition after recovering the lock.
+pub fn try_set_managed_residency_requirement(
+    enforce_residency: Option<ResidencyRequirement>,
+) -> Result<(), ResidencyRequirementUnavailable> {
+    replace_residency_requirement(&REQUIREMENTS_RESIDENCY, enforce_residency)
+}
+
+fn replace_residency_requirement(
+    state: &RwLock<Option<ResidencyRequirement>>,
+    enforce_residency: Option<ResidencyRequirement>,
+) -> Result<(), ResidencyRequirementUnavailable> {
+    let mut guard = state.write().map_err(|_| ResidencyRequirementUnavailable)?;
+    *guard = enforce_residency;
+    Ok(())
+}
+
 /// Returns the current process-wide managed residency requirement.
 pub fn read_managed_residency_requirement() -> Option<ResidencyRequirement> {
     *REQUIREMENTS_RESIDENCY

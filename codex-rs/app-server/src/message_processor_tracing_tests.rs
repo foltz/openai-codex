@@ -1186,7 +1186,8 @@ fn managed_transition_adoption_completes_reset_with_shared_plugin_auth() -> Resu
             app_test_support::write_chatgpt_auth(
                 harness._codex_home.path(),
                 app_test_support::ChatGptAuthFixture::new("access-token")
-                    .account_id("managed-adoption-account"),
+                    .account_id("managed-adoption-account")
+                    .plan_type("enterprise"),
                 codex_config::types::AuthCredentialsStoreMode::File,
             )
             .expect("write real chatgpt auth.json for adoption");

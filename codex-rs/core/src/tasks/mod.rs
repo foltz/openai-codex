@@ -390,7 +390,7 @@ impl Session {
         };
         // After the destination lock is acquired, consuming the batch and
         // installing the task contain no further cancellation point.
-        self.input_queue.commit_mailbox_for_turn_state(&turn.turn_state, mailbox).await;
+        self.input_queue.commit_mailbox_for_turn_state(&turn.turn_state, mailbox, &turn_context.sub_id).await;
         let agent_execution_guard = self.services.agent_control.execution_guard(
             turn_context.multi_agent_version,
             &turn_context.session_source,

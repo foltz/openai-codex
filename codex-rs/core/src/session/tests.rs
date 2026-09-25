@@ -12203,7 +12203,7 @@ async fn queue_only_mailbox_mail_waits_for_next_turn_after_answer_boundary() {
     );
     assert_eq!(
         sess.input_queue
-            .get_pending_input(&sess.active_turn)
+            .get_pending_input(&sess.active_turn, "test-turn")
             .await
             .0,
         Vec::new()
@@ -12212,7 +12212,7 @@ async fn queue_only_mailbox_mail_waits_for_next_turn_after_answer_boundary() {
     sess.abort_all_tasks(TurnAbortReason::Replaced).await;
 
     assert_eq!(
-        (sess.input_queue.get_pending_input(&sess.active_turn).await).0,
+        (sess.input_queue.get_pending_input(&sess.active_turn, "test-turn").await).0,
         vec![TurnInput::InterAgentCommunication(communication)],
     );
 }
@@ -12311,7 +12311,7 @@ async fn active_turn_keeps_first_root_when_mail_coalesces(inherited_root: Option
     }
 
     assert_eq!(
-        (sess.input_queue.get_pending_input(&sess.active_turn).await).0,
+        (sess.input_queue.get_pending_input(&sess.active_turn, "test-turn").await).0,
         vec![
             TurnInput::InterAgentCommunication(first),
             TurnInput::InterAgentCommunication(second),
@@ -12364,7 +12364,7 @@ async fn steered_input_reopens_mailbox_delivery_for_current_turn() {
     assert!(matches!(submission, TurnInputSubmission::Steered { .. }));
 
     assert_eq!(
-        (sess.input_queue.get_pending_input(&sess.active_turn).await).0,
+        (sess.input_queue.get_pending_input(&sess.active_turn, "test-turn").await).0,
         vec![
             TurnInput::UserInput {
                 acceptance_order: None,
@@ -12421,7 +12421,7 @@ async fn stale_defer_mailbox_delivery_does_not_override_steered_input() {
         .await;
 
     assert_eq!(
-        (sess.input_queue.get_pending_input(&sess.active_turn).await).0,
+        (sess.input_queue.get_pending_input(&sess.active_turn, "test-turn").await).0,
         vec![
             TurnInput::UserInput {
                 acceptance_order: None,
@@ -12487,7 +12487,7 @@ async fn tool_calls_reopen_mailbox_delivery_for_current_turn() {
     assert!(output.needs_follow_up);
     assert!(output.tool_future.is_some());
     assert_eq!(
-        (sess.input_queue.get_pending_input(&sess.active_turn).await).0,
+        (sess.input_queue.get_pending_input(&sess.active_turn, "test-turn").await).0,
         vec![TurnInput::InterAgentCommunication(communication)],
     );
 }

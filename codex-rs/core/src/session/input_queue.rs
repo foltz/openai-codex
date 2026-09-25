@@ -126,6 +126,15 @@ impl InputQueue {
         self.mailbox.enqueue(communication, start_options);
     }
 
+    pub(crate) fn enqueue_mailbox_with_work(
+        &self,
+        communication: InterAgentCommunication,
+        start_options: TurnStartOptions,
+        work: Option<Box<dyn codex_protocol::host_turn_work::HostTurnWork>>,
+    ) {
+        self.mailbox.enqueue_with_work(communication, start_options, work);
+    }
+
     pub(crate) async fn has_pending_mailbox_items(&self) -> bool {
         self.mailbox.has_pending()
     }
@@ -134,8 +143,9 @@ impl InputQueue {
         self.mailbox.has_trigger()
     }
 
+    #[cfg(test)]
     pub(crate) async fn drain_mailbox_input_items(&self) -> (Vec<TurnInput>, TurnStartOptions) {
-        self.mailbox.reserve().into_input()
+        self.mailbox.reserve().into_input("test-turn")
     }
 
     pub(crate) fn reserve_mailbox(&self) -> super::mailbox::MailboxReservation {
@@ -148,9 +158,10 @@ impl InputQueue {
         &self,
         turn_state: &Mutex<TurnState>,
         reservation: super::mailbox::MailboxReservation,
+        turn_id: &str,
     ) {
         let mut turn_state = turn_state.lock().await;
-        let (items, _) = reservation.into_input();
+        let (items, _) = reservation.into_input(turn_id);
         turn_state.pending_input.items.extend(items);
     }
 
@@ -257,6 +268,7 @@ impl InputQueue {
     pub(crate) async fn get_pending_input(
         &self,
         active_turn: &Mutex<Option<ActiveTurn>>,
+        turn_id: &str,
     ) -> (Vec<TurnInput>, TurnStartOptions) {
         let (pending_input, accepts_mailbox_delivery) = {
             let mut active = active_turn.lock().await;
@@ -278,7 +290,7 @@ impl InputQueue {
         if !accepts_mailbox_delivery {
             return (pending_input, TurnStartOptions::default());
         }
-        let (mailbox_items, start_options) = self.drain_mailbox_input_items().await;
+        let (mailbox_items, start_options) = self.mailbox.reserve().into_input(turn_id);
         if pending_input.is_empty() {
             (mailbox_items, start_options)
         } else {

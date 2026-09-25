@@ -34,14 +34,14 @@ fn cancelled_future_restores_complete_mail_and_start_options() {
     let mut attempt = Box::pin(async {
         let reservation = mailbox.reserve();
         std::future::pending::<()>().await;
-        reservation.into_input()
+        reservation.into_input("test-turn")
     });
     assert!(attempt.as_mut().now_or_never().is_none());
     assert!(!mailbox.has_pending());
     drop(attempt);
     assert!(mailbox.has_trigger());
     assert!(activity.has_changed().unwrap());
-    let (items, options) = mailbox.reserve().into_input();
+    let (items, options) = mailbox.reserve().into_input("test-turn");
     assert_eq!(items, vec![TurnInput::InterAgentCommunication(original)]);
     assert_eq!(
         (options.parent_turn_id, options.root_turn_id, options.turn_trigger,
@@ -60,10 +60,10 @@ fn competing_consumer_cannot_take_a_private_reservation() {
     mailbox.enqueue(first.clone(), TurnStartOptions::default());
     let reservation = mailbox.reserve();
     mailbox.enqueue(second.clone(), TurnStartOptions::default());
-    assert_eq!(mailbox.reserve().into_input().0,
+    assert_eq!(mailbox.reserve().into_input("test-turn").0,
         vec![TurnInput::InterAgentCommunication(second)]);
     drop(reservation);
-    assert_eq!(mailbox.reserve().into_input().0,
+    assert_eq!(mailbox.reserve().into_input("test-turn").0,
         vec![TurnInput::InterAgentCommunication(first)]);
     assert!(!mailbox.has_pending());
 }
@@ -86,7 +86,7 @@ fn reservations_restore_fifo_regardless_of_drop_order() {
             drop(second);
             drop(first);
         }
-        assert_eq!(mailbox.reserve().into_input().0,
+        assert_eq!(mailbox.reserve().into_input("test-turn").0,
             mails.into_iter().map(TurnInput::InterAgentCommunication).collect::<Vec<_>>());
         assert!(!mailbox.has_pending());
     }
@@ -108,7 +108,7 @@ fn rollback_preserves_latest_trigger_settings_and_parent_consensus() {
         ..Default::default()
     });
     drop(reservation);
-    let (_, options) = mailbox.reserve().into_input();
+    let (_, options) = mailbox.reserve().into_input("test-turn");
     assert_eq!((options.parent_turn_id, options.root_turn_id, options.final_output_json_schema),
         (None, Some("root-a".into()), None));
 }
@@ -118,7 +118,7 @@ fn consumption_does_not_requeue_or_emit_a_rollback_wakeup() {
     let (mailbox, mut activity) = mailbox();
     mailbox.enqueue(mail("consume"), TurnStartOptions::default());
     activity.borrow_and_update();
-    let (items, _) = mailbox.reserve().into_input();
+    let (items, _) = mailbox.reserve().into_input("test-turn");
     assert_eq!(items.len(), 1);
     assert!(!mailbox.has_pending());
     assert!(!activity.has_changed().unwrap());

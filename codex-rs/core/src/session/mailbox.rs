@@ -9,6 +9,7 @@ use super::input_queue::InputQueueActivity;
 use super::input_queue::TurnInput;
 use codex_diagnostics::Gauge;
 use codex_diagnostics::GaugeGuard;
+use codex_protocol::host_turn_work::HostTurnWork;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::turn_input::TurnStartOptions;
 use std::collections::BTreeMap;
@@ -21,6 +22,7 @@ static PENDING_MAILBOX_MESSAGES: Gauge = Gauge::new("core.mailbox.pending");
 struct PendingMailboxCommunication {
     communication: InterAgentCommunication,
     start_options: TurnStartOptions,
+    work: Option<Box<dyn HostTurnWork>>,
     _diagnostics_guard: GaugeGuard,
 }
 
@@ -57,12 +59,23 @@ impl Mailbox {
         communication: InterAgentCommunication,
         start_options: TurnStartOptions,
     ) {
+        self.enqueue_with_work(communication, start_options, /*work*/ None);
+    }
+
+    pub(super) fn enqueue_with_work(
+        &self,
+        communication: InterAgentCommunication,
+        start_options: TurnStartOptions,
+        work: Option<Box<dyn HostTurnWork>>,
+    ) {
+        assert!(communication.trigger_turn || work.is_none(), "queue-only mail must not carry turn work");
         let mut state = self.state.lock().expect("mailbox poisoned");
         let sequence = state.next_sequence;
         state.next_sequence = sequence.checked_add(1).expect("mailbox sequence exhausted");
         state.pending.insert(sequence, PendingMailboxCommunication {
             communication,
             start_options,
+            work,
             _diagnostics_guard: PENDING_MAILBOX_MESSAGES.track(),
         });
         drop(state);
@@ -93,6 +106,12 @@ impl Mailbox {
 impl MailboxReservation {
     pub(crate) fn is_empty(&self) -> bool {
         self.pending.is_empty()
+    }
+
+    /// Only this owned batch can authorize its start; peeking at deliverable
+    /// mail would allow a competing consumer to take the same authority.
+    pub(crate) fn has_turn_work(&self) -> bool {
+        self.pending.values().any(|mail| mail.work.is_some())
     }
 
     pub(crate) fn append(&mut self, mut other: Self) {
@@ -126,10 +145,18 @@ impl MailboxReservation {
         (start_options, author)
     }
 
-    pub(super) fn into_input(mut self) -> (Vec<TurnInput>, TurnStartOptions) {
+    pub(super) fn into_input(mut self, turn_id: &str) -> (Vec<TurnInput>, TurnStartOptions) {
         let (start_options, _) = self.start_metadata();
         let items = std::mem::take(&mut self.pending).into_values()
-            .map(|mail| TurnInput::InterAgentCommunication(mail.communication))
+            .map(|mail| {
+                // Binding and transfer are synchronous. No cancellation point
+                // can split consumption from host terminal-evidence custody.
+                if let Some(mut work) = mail.work {
+                    work.bind_submission(turn_id);
+                    work.retain_until_terminal();
+                }
+                TurnInput::InterAgentCommunication(mail.communication)
+            })
             .collect();
         (items, start_options)
     }

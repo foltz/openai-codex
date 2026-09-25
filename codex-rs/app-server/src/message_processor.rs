@@ -97,9 +97,7 @@ use codex_extension_api::TurnStartAdmission;
 use codex_feedback::CodexFeedback;
 use codex_goal_extension::GoalService;
 use codex_home::CodexHomeUserInstructionsProvider;
-use codex_http_client::HttpClientFactory;
 use codex_login::AuthManager;
-use codex_models_manager::manager::SharedModelsManager;
 use codex_protocol::ThreadId;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::protocol::SessionSource;
@@ -406,6 +404,7 @@ impl ConnectionSessionState {
 }
 
 pub(crate) struct MessageProcessorArgs {
+    pub(crate) telemetry_reset: crate::otel_reset_control::TelemetryResetControl,
     pub(crate) outgoing: Arc<OutgoingMessageSender>,
     pub(crate) analytics_events_client: AnalyticsEventsClient,
     pub(crate) arg0_paths: Arg0DispatchPaths,
@@ -425,144 +424,9 @@ pub(crate) struct MessageProcessorArgs {
     pub(crate) remote_control_handle: Option<RemoteControlHandle>,
     /// `None` skips startup tasks; otherwise preserve the initial config-loading path.
     pub(crate) plugin_startup_tasks: Option<PluginStartupConfig>,
+    pub(crate) managed_transition_control_socket_endpoint: Option<String>,
+    pub(crate) managed_transition_process_instance_id: Option<String>,
     pub(crate) control_endpoint: Option<String>,
-}
-
-/// Production wiring for `managed_transition::ResetInventory` (Issue 05
-/// Slice 4, R014): clears every account-derived cache/worker this process
-/// owns once a managed-auth adoption has installed the new account, so no
-/// caller can observe stale data from the account that just transitioned
-/// out. Deliberately never receives the adopted auth value itself -- only
-/// the already-installed `AuthManager` and the handles needed to reset
-/// around it.
-///
-/// **Scope note (reported to the driver alongside this change).** This
-/// wiring resets thread/session and MCP-runtime state
-/// (`ThreadManager::shutdown_all_threads_bounded`,
-/// `ThreadManager::invalidate_mcp_runtimes`), respawns the models-refresh
-/// worker so the model catalog picks up the new account, and re-derives
-/// `PluginsManager`'s auth mode (`set_auth_mode` +
-/// `clear_recommended_plugins_cache`) -- the same two calls
-/// `account_processor.rs`'s own established account-change path
-/// (`clear_external_auth`, `maybe_refresh_plugin_caches_for_current_config`)
-/// already makes for the ordinary (non-managed) login/logout transition.
-///
-/// Three other candidate surfaces were investigated and are deliberately
-/// **not** wired here, each with source evidence rather than an
-/// assumption:
-/// - **Skills** (`HostSkillsService::clear_cache`, reachable via
-///   `thread_manager.skills_service()`): `ext/skills/src/host_service.rs`'s
-///   cache is keyed purely by cwd/config/plugin-root state
-///   (`HostSkillsLoadInput` carries no auth or account field, and neither
-///   `HostSkillsService` nor its cache types reference `AuthManager`,
-///   `CodexAuth`, or an account id anywhere) -- proven independent.
-/// - **Codex Apps tools cache** (`CodexAppsToolsCache` /
-///   `connectors::ConnectorRuntimeManager<ToolInfo>`, owned by
-///   `McpManager`): its own module doc calls it a "process-scoped
-///   registry of connector runtime state by account and workspace";
-///   entries are keyed by `ConnectorRuntimeContextKey`, built from
-///   `account_id`/`chatgpt_user_id`/`is_workspace_account`
-///   (`connectors::connector_runtime_context_key`) -- a new account is a
-///   cache miss on a new key, never stale data served from the old one --
-///   proven independent, the same self-isolating-by-account-key shape
-///   already relied on elsewhere in this codebase
-///   (`WorkspaceSettingsCache`, the cloud-config bundle cache).
-/// - **codex-mcp's per-connection `shutdown()`**
-///   (`codex-mcp/src/connection_manager.rs`): that manager's own state
-///   (`self.servers`) is owned per-thread, not by any process-wide
-///   singleton reachable from `ThreadManager` (no reference to it exists
-///   in `thread_manager.rs`) -- already torn down as part of
-///   `shutdown_all_threads_bounded` above, not a separate surface.
-struct ProductionResetInventory {
-    thread_manager: Arc<ThreadManager>,
-    models_refresh_worker: Arc<Mutex<ModelsRefreshWorker>>,
-    model_catalog: Arc<crate::model_catalog::ModelCatalog>,
-    models_manager: SharedModelsManager,
-    http_client_factory: HttpClientFactory,
-    auth_manager: Arc<AuthManager>,
-}
-
-/// Bounded, not indefinite: Slice 03's admission barrier already drains
-/// account-dependent work to zero before this ever runs, so every tracked
-/// thread here is expected to already be idle. This bound only protects
-/// against a thread that fails to observe its own shutdown signal.
-const RESET_THREAD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
-
-impl crate::managed_transition::ResetInventory for ProductionResetInventory {
-    fn reset_all(&self) -> crate::managed_transition::ResetInventoryFuture<'_> {
-        Box::pin(async move {
-            // Result-bearing: a thread that didn't fully shut down can
-            // still hold the prior account's provider/session/MCP state,
-            // so this must fail the whole reset (and quarantine) rather
-            // than silently report success over an incomplete report.
-            let shutdown_report = self
-                .thread_manager
-                .shutdown_all_threads_bounded(RESET_THREAD_SHUTDOWN_TIMEOUT)
-                .await;
-            if !shutdown_report.submit_failed.is_empty() || !shutdown_report.timed_out.is_empty() {
-                return Err(format!(
-                    "thread shutdown incomplete: {} submit-failed, {} timed out",
-                    shutdown_report.submit_failed.len(),
-                    shutdown_report.timed_out.len()
-                ));
-            }
-            self.thread_manager.invalidate_mcp_runtimes().await;
-
-            // Mirrors `account_processor.rs`'s own established
-            // account-change reset for the ordinary (non-managed)
-            // login/logout path: `PluginsManager::auth_mode` is a bare
-            // field, not itself keyed by account, so marketplace/plugin
-            // eligibility filtering (`target_curated_marketplace`,
-            // `remote_global_catalog_active`) would otherwise keep judging
-            // by the just-replaced account's auth mode until some
-            // unrelated session happened to update it. The remote-
-            // installed-plugins cache is likewise unkeyed by account;
-            // clearing it here (rather than only the recommended-plugins
-            // cache) prevents a late in-flight refresh for the prior
-            // account from repopulating it after this reset already ran.
-            self.thread_manager
-                .plugins_manager()
-                .set_auth_mode(self.auth_manager.get_api_auth_mode());
-            self.thread_manager
-                .plugins_manager()
-                .clear_recommended_plugins_cache();
-            self.thread_manager
-                .plugins_manager()
-                .clear_remote_installed_plugins_cache();
-
-            // Swap in a freshly spawned worker rather than calling terminal
-            // `shutdown()` with no successor: the process must keep
-            // refreshing models on its normal interval, now against the
-            // newly-installed account, for its entire remaining lifetime.
-            // The lock is held only for this synchronous replace; the old
-            // worker's own `shutdown()` (also synchronous) runs after the
-            // guard is already dropped.
-            let old_worker = {
-                let mut worker = self.models_refresh_worker.lock().await;
-                std::mem::replace(
-                    &mut *worker,
-                    crate::models_refresh_worker::spawn(&self.model_catalog),
-                )
-            };
-            old_worker.shutdown();
-
-            // Awaited, not fire-and-forget: the freshly spawned worker's
-            // own first refresh runs on its own schedule and is not
-            // awaited by anything, so without this call the barrier could
-            // reopen and a caller could read the *previous* account's
-            // model catalog for one refresh round-trip. Blocking here
-            // closes that window before `Succeeded`/reopen instead of
-            // reporting success over a catalog that has not caught up yet.
-            self.models_manager
-                .list_models(
-                    codex_models_manager::manager::RefreshStrategy::Online,
-                    self.http_client_factory.clone(),
-                )
-                .await;
-
-            Ok(())
-        })
-    }
 }
 
 impl MessageProcessor {
@@ -570,6 +434,7 @@ impl MessageProcessor {
     /// `Sender` so handlers can enqueue messages to be written to stdout.
     pub(crate) fn new(args: MessageProcessorArgs) -> Self {
         let MessageProcessorArgs {
+            telemetry_reset,
             outgoing,
             analytics_events_client,
             arg0_paths,
@@ -588,6 +453,8 @@ impl MessageProcessor {
             rpc_transport,
             remote_control_handle,
             plugin_startup_tasks,
+            managed_transition_control_socket_endpoint,
+            managed_transition_process_instance_id,
             control_endpoint,
         } = args;
         let thread_state_manager = ThreadStateManager::new();
@@ -616,7 +483,15 @@ impl MessageProcessor {
         );
         let goal_service = Arc::new(GoalService::new());
         let turn_admission = TurnAdmission::default();
-        let turn_start_admission: Arc<dyn TurnStartAdmission> = Arc::new(turn_admission.clone());
+        let account_work_permits = crate::managed_transition::AccountWorkPermits::new();
+        let account_turn_work = crate::account_turn_work::AccountTurnWork::default();
+        let turn_start_admission: Arc<dyn TurnStartAdmission> = Arc::new(
+            crate::account_turn_admission::AccountTurnAdmission {
+                shutdown: turn_admission.clone(),
+                permits: account_work_permits.clone(),
+                work: account_turn_work.clone(),
+            },
+        );
         let extension_event_sink =
             app_server_extension_event_sink(outgoing.clone(), thread_state_manager.clone());
         let mut queue_service = None;
@@ -708,15 +583,6 @@ impl MessageProcessor {
             applied_mcp_config_identity.clone(),
             analytics_events_client.clone(),
         );
-        let on_effective_plugins_changed =
-            crate::effective_plugin_change::effective_plugins_changed_callback(
-                auth_manager.clone(),
-                Arc::clone(&thread_manager),
-                config_manager.clone(),
-                config_processor.clone(),
-                request_serialization_queues.clone(),
-                auxiliary_tasks.clone(),
-            );
         // Account tasks capture processor clones, so their strong census must
         // remain outside that cloneable object.
         let account_tasks = crate::processor_task_retirement::ProcessorTasks::default();
@@ -742,7 +608,7 @@ impl MessageProcessor {
             Arc::clone(&thread_manager),
             Arc::clone(&config),
             config_manager.clone(),
-            model_catalog,
+            Arc::clone(&model_catalog),
         );
         let command_exec_processor = CommandExecRequestProcessor::new(
             arg0_paths.clone(),
@@ -772,26 +638,54 @@ impl MessageProcessor {
             rpc_transport,
             Arc::clone(&user_verification),
         );
-        let managed_transition_control_socket_endpoint =
+        let managed_transition_control_socket_endpoint = managed_transition_control_socket_endpoint.unwrap_or_else(||
             crate::transport::app_server_control_socket_path(&config.codex_home)
                 .map(|path| path.display().to_string())
-                .unwrap_or_default();
+                .unwrap_or_default());
         let reset_inventory: Arc<dyn crate::managed_transition::ResetInventory> =
-            Arc::new(ProductionResetInventory {
+            Arc::new(crate::managed_reset::ProductionResetInventory {
+                telemetry_reset,
+                config_manager: config_manager.clone(),
+                chatgpt_base_url: config.chatgpt_base_url.clone(),
                 thread_manager: Arc::clone(&thread_manager),
                 models_refresh_worker: Arc::clone(&models_refresh_worker),
                 model_catalog: Arc::clone(&model_catalog),
-                models_manager: thread_manager.get_models_manager(),
                 http_client_factory: config.http_client_factory(),
                 auth_manager: Arc::clone(&auth_manager),
+                remote_control_handle: remote_control_handle.clone(),
             });
-        let managed_transition_coordinator = crate::managed_transition::ManagedTransitionCoordinator::from_authoritative_auth_state_target_evidence_and_adoption(
-                crate::managed_transition::AuthoritativeAuthState::from_auth_manager(&auth_manager),
-                std::sync::Arc::new(crate::managed_transition::ProcessTargetEvidenceSource::new(
-                    managed_transition_control_socket_endpoint,
-                )),
+        let authoritative_auth = crate::managed_transition::AuthoritativeAuthState::from_auth_manager(&auth_manager);
+        let target_evidence_source = Arc::new(crate::managed_transition::ProcessTargetEvidenceSource::new(
+            managed_transition_control_socket_endpoint,
+        ));
+        let managed_transition_coordinator = match managed_transition_process_instance_id {
+            Some(process_instance_id) => crate::managed_transition::ManagedTransitionCoordinator::with_adoption_account_projection_and_process_instance(
+                authoritative_auth,
+                target_evidence_source,
+                process_instance_id,
                 Arc::clone(&auth_manager),
                 reset_inventory,
+                Arc::clone(&outgoing),
+            ),
+            None => crate::managed_transition::ManagedTransitionCoordinator::with_adoption_and_account_projection(
+                authoritative_auth,
+                target_evidence_source,
+                Arc::clone(&auth_manager),
+                reset_inventory,
+                Arc::clone(&outgoing),
+            ),
+        };
+        let managed_transition_coordinator = managed_transition_coordinator
+            .with_account_work(account_work_permits, account_turn_work);
+        let on_effective_plugins_changed =
+            crate::effective_plugin_change::effective_plugins_changed_callback(
+                auth_manager.clone(),
+                Arc::clone(&thread_manager),
+                config_manager.clone(),
+                config_processor.clone(),
+                request_serialization_queues.clone(),
+                auxiliary_tasks.clone(),
+                managed_transition_coordinator.account_work_permits(),
             );
         let marketplace_processor = MarketplaceRequestProcessor::new(
             Arc::clone(&config),
@@ -1283,7 +1177,9 @@ impl MessageProcessor {
         &self,
         deadline: tokio::time::Instant,
     ) -> crate::models_refresh_worker::ModelsRefreshShutdown {
-        let worker = self.models_refresh_worker.lock().await;
+        let Ok(worker) = tokio::time::timeout_at(deadline, self.models_refresh_worker.lock()).await else {
+            return crate::models_refresh_worker::ModelsRefreshShutdown::TimedOut;
+        };
         worker.shutdown_until(deadline).await
     }
 
@@ -1543,21 +1439,19 @@ impl MessageProcessor {
                     processor.outgoing.send_error(error_request_id, error).await;
                     return;
                 }
-                // Held across the whole handling future, including every
-                // retry/prewarm/effect inside it, and released exactly once
-                // on drop regardless of which terminal path this future
-                // exits through (`CODEX-I05-S03-R009`).
-                let _account_work_permit = account_work_permit;
+                // Keep request admission through its effects. Each inline turn
+                // start derives separate custody that survives RPC completion
+                // and the session IO hop (`CODEX-I05-S03-R009`).
                 let processor_for_request = Arc::clone(&processor);
                 // Keep queued requests small to avoid large stack temporaries during construction.
-                let result = Box::pin(processor_for_request.handle_initialized_client_request(
+                let result = crate::account_turn_admission::within_request(account_work_permit, Box::pin(processor_for_request.handle_initialized_client_request(
                     connection_request_id,
                     codex_request,
                     request_context,
                     session,
                     event_stream_ready,
                     managed_transition_caller_authorized,
-                ))
+                )))
                 .await;
                 if let Err(error) = result {
                     processor.outgoing.send_error(error_request_id, error).await;

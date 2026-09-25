@@ -102,6 +102,7 @@ pub(crate) fn without_notification_media(notification: ServerNotification) -> Se
         | ServerNotification::McpServerStatusUpdated(_)
         | ServerNotification::McpServerEventStream(_)
         | ServerNotification::AccountUpdated(_)
+        | ServerNotification::ManagedTransitionStatusUpdated(_)
         | ServerNotification::AccountRateLimitsUpdated(_)
         | ServerNotification::AppListUpdated(_)
         | ServerNotification::RemoteControlStatusChanged(_)

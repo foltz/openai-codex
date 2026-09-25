@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use codex_core::config::Config;
+use codex_models_manager::manager::ManagedModelsResetError;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_models_manager::manager::SharedModelsManager;
 use codex_protocol::openai_models::ModelPreset;
@@ -16,7 +17,27 @@ pub(crate) struct ModelCatalog {
     models_manager: SharedModelsManager,
 }
 
+/// Secret-safe reset failures: provider diagnostics may contain credentials.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ModelCatalogResetError {
+    #[error("model catalog provider requirements refused reset")]
+    ProviderRequirements,
+    #[error("model catalog reset failed: {0:?}")]
+    Catalog(ManagedModelsResetError),
+}
+
 impl ModelCatalog {
+    pub(crate) async fn reset_for_managed_auth(&self) -> Result<(), ModelCatalogResetError> {
+        self.config_manager
+            .check_thread_model_provider(&self.config)
+            .await
+            .map_err(|_| ModelCatalogResetError::ProviderRequirements)?;
+        self.models_manager
+            .reset_for_managed_auth(self.config.http_client_factory())
+            .await
+            .map_err(ModelCatalogResetError::Catalog)
+    }
+
     pub(crate) fn new(
         config_manager: ConfigManager,
         config: Arc<Config>,

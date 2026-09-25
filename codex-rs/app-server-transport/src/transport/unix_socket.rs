@@ -50,6 +50,26 @@ pub async fn start_control_socket_acceptor(
     shutdown_token: CancellationToken,
     daemon_shutdown_access: DaemonShutdownAccess,
 ) -> IoResult<JoinHandle<()>> {
+    start_control_socket_acceptor_with_bound_hook(
+        socket_path,
+        transport_event_tx,
+        shutdown_token,
+        daemon_shutdown_access,
+        || Ok(()),
+    )
+    .await
+}
+
+/// Runs a startup publication hook after the protected socket and rendezvous
+/// path exist, but before any acceptor task is spawned. Failure drops the socket
+/// guard and prevents a partially published managed process from accepting RPCs.
+pub async fn start_control_socket_acceptor_with_bound_hook(
+    socket_path: AbsolutePathBuf,
+    transport_event_tx: mpsc::Sender<TransportEvent>,
+    shutdown_token: CancellationToken,
+    daemon_shutdown_access: DaemonShutdownAccess,
+    on_bound: impl FnOnce() -> IoResult<()>,
+) -> IoResult<JoinHandle<()>> {
     #[cfg(unix)]
     let (socket_path, rendezvous_path, _startup_lock) = {
         use std::os::unix::fs::MetadataExt;
@@ -115,6 +135,7 @@ pub async fn start_control_socket_acceptor(
         socket_guard.socket_path.as_path(),
         socket_guard.rendezvous_path.as_path(),
     )?;
+    on_bound()?;
     info!(
         socket_path = %socket_guard.socket_path.display(),
         "app-server control socket listening"

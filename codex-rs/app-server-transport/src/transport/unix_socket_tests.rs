@@ -10,6 +10,8 @@ use super::app_server_control_socket_path;
 #[cfg(target_os = "macos")]
 use super::identities_match;
 use super::start_control_socket_acceptor;
+#[cfg(unix)]
+use super::start_control_socket_acceptor_with_bound_hook;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCNotification;
 use codex_core::config::find_codex_home;
@@ -45,6 +47,46 @@ fn listen_unix_socket_parses_as_unix_socket_transport() {
             socket_path: default_control_socket_path()
         })
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn bound_hook_failure_removes_rendezvous_and_physical_socket_before_retry() {
+    let temp_dir = tempfile::TempDir::new().expect("temp dir");
+    let socket_path = test_socket_path(temp_dir.path());
+    let (events, mut received) = mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
+    let mut physical_path = None;
+    let failure = start_control_socket_acceptor_with_bound_hook(
+        socket_path.clone(),
+        events,
+        CancellationToken::new(),
+        DaemonShutdownAccess::Disabled,
+        || {
+            let physical = std::fs::read_link(socket_path.as_path()).expect("rendezvous published");
+            assert!(physical.exists(), "physical socket bound before publication hook");
+            physical_path = Some(physical);
+            Err(std::io::Error::other("synthetic target publication refusal"))
+        },
+    ).await.expect_err("publication failure must prevent acceptor startup");
+    assert_eq!(failure.kind(), std::io::ErrorKind::Other);
+    assert!(std::fs::symlink_metadata(socket_path.as_path()).is_err());
+    assert!(!physical_path.expect("hook was reached").exists());
+    assert!(matches!(received.try_recv(), Err(mpsc::error::TryRecvError::Disconnected)));
+
+    let (events, _received) = mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
+    let shutdown = CancellationToken::new();
+    let mut published = false;
+    let acceptor = start_control_socket_acceptor_with_bound_hook(
+        socket_path.clone(),
+        events,
+        shutdown.clone(),
+        DaemonShutdownAccess::Disabled,
+        || { published = true; Ok(()) },
+    ).await.expect("same rendezvous can restart after failed publication");
+    assert!(published);
+    shutdown.cancel();
+    timeout(Duration::from_secs(5), acceptor).await.expect("acceptor stops").expect("acceptor joins");
+    assert!(std::fs::symlink_metadata(socket_path.as_path()).is_err());
 }
 
 #[test]

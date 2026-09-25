@@ -267,6 +267,7 @@ mod token_budget;
 pub(crate) mod turn;
 pub(crate) mod turn_context;
 mod turn_input;
+mod turn_work;
 mod turn_suspension;
 mod world_state;
 use self::code_mode_warning::unsupported_code_mode_warning;
@@ -1081,8 +1082,12 @@ impl Session {
         let loop_cleanup_owner = Arc::clone(&cleanup_owner);
         let tx_sub = SubmissionSender::from(tx_sub);
         let submissions = tx_sub.dispatch_control();
+        let (loop_ready, ready) = tokio::sync::oneshot::channel();
         let session_loop_handle = tokio::spawn(async move {
             let _cleanup_owner = loop_cleanup_owner;
+            if ready.await.is_err() {
+                return;
+            }
             submission_loop(
                 session_for_loop,
                 configured_config,
@@ -1093,6 +1098,11 @@ impl Session {
             .await;
         });
         let mut termination = session_loop_termination_from_handle(session_loop_handle);
+        // Publish the join-only fallback before this loop can admit mailbox
+        // work. It retains no submission sender or session-cleanup owner.
+        session.services.thread_extension_data.insert(
+            turn_work::SessionLoopWorkReceipt(termination.completion.clone()),
+        );
         termination.cleanup_owner = Some(cleanup_owner);
         let io = SessionIo {
             tx_sub,
@@ -1100,6 +1110,7 @@ impl Session {
             agent_status: agent_status_rx,
             session_loop_termination: termination,
         };
+        let _ = loop_ready.send(());
 
         if let Some(startup) = startup {
             let _ = startup.io.set(io.clone());

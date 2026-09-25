@@ -519,7 +519,7 @@ impl Session {
             return;
         }
 
-        let (turn_state, mut mailbox) = {
+        let (turn_state, mut mailbox, host_work) = {
             let mut active_turn = self.active_turn.lock().await;
             if self
                 .task_admission_closed
@@ -536,8 +536,26 @@ impl Session {
             {
                 return;
             }
+            // Carried trigger work belongs to this exact private batch. A
+            // queue-only durable-sleep wake (or uncarried trigger) needs fresh
+            // account admission before any account-bound model discovery.
+            // This does not change the upstream mailbox shutdown-gate bypass.
+            let mut host_work = if mailbox.has_turn_work() {
+                None
+            } else {
+                match self.services.extensions.admit_turn_work(
+                    &self.services.thread_extension_data,
+                    self.turn_work_termination(),
+                ) {
+                    Ok(work) => work,
+                    Err(_) => return,
+                }
+            };
+            if let Some(work) = &mut host_work {
+                work.bind_submission(&sub_id);
+            }
             let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
-            (Arc::clone(&active_turn.turn_state), mailbox)
+            (Arc::clone(&active_turn.turn_state), mailbox, host_work)
         };
 
         self.services
@@ -589,8 +607,12 @@ impl Session {
         self.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
             .await;
         // Commit to the actual installed turn only after final admission.
-        let _ = self.start_task_with_mailbox(turn_context, Vec::new(), RegularTask::new(), mailbox)
-            .await;
+        if self.start_task_with_mailbox(turn_context, Vec::new(), RegularTask::new(), mailbox)
+            .await.is_ok()
+            && let Some(work) = host_work
+        {
+            work.retain_until_terminal();
+        }
     }
 
     pub async fn abort_all_tasks(self: &Arc<Self>, reason: TurnAbortReason) {

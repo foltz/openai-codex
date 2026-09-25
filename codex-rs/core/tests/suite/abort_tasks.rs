@@ -164,6 +164,15 @@ async fn root_turn_suspension_preserves_unfinished_turn_history() {
         .remove_thread(&test.session_configured.thread_id)
         .await
         .expect("unload the suspended root");
+    // Suspension must leave the common cleanup receipt settled. Otherwise the
+    // population retains the removed thread and manager retirement repeats
+    // cleanup against its already-closed writer.
+    let retirement = test.thread_manager
+        .begin_shutdown(tokio::time::Instant::now() + Duration::from_secs(20))
+        .expect("begin old manager retirement")
+        .wait().await.expect("observe old manager retirement");
+    assert!(retirement.is_complete(), "{retirement:?}");
+    assert!(!format!("{retirement:?}").contains(&test.session_configured.thread_id.to_string()));
     let recovery_server = start_mock_server().await;
     mount_sse_once(
         &recovery_server,

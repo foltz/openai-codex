@@ -830,6 +830,48 @@ async fn legacy_cleanup_cannot_be_relabelled_as_deadline_bound() {
     );
 }
 
+#[tokio::test]
+async fn suspension_cannot_relabel_an_ordinary_cleanup_receipt() {
+    let (session, _) = super::super::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let owner = session.cleanup_owner();
+    let ordinary = owner.observe(Arc::clone(&session)).await;
+    assert_eq!(ordinary, CleanupExecution::Finished { persistence_failed: false });
+    assert_eq!(owner.observe_suspension(session).await, CleanupExecution::AuthorityUnavailable);
+    assert_eq!(owner.completed(), Some(ordinary));
+}
+
+#[tokio::test]
+async fn ordinary_observer_replays_suspension_persistence_failure() {
+    let (session, _) = super::super::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    // This fixture has no writer. Ordinary cleanup permits that, but suspension
+    // must refuse it, and later observers must not replace that failed receipt.
+    assert!(session.live_thread().is_none());
+    let owner = session.cleanup_owner();
+    let result = owner.observe_suspension(Arc::clone(&session)).await;
+    assert_eq!(result, CleanupExecution::Finished { persistence_failed: true });
+    assert_eq!(owner.completed(), Some(result));
+    assert_eq!(owner.observe(session).await, result);
+}
+
+#[tokio::test]
+async fn cancelled_suspension_observer_retains_its_cleanup_sequence() {
+    let (session, _) = super::super::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let owner = session.cleanup_owner();
+    let guard = session.active_turn.lock().await;
+    let mut observer = Box::pin(owner.observe_suspension(Arc::clone(&session)));
+    assert!(futures::poll!(observer.as_mut()).is_pending());
+    drop(observer);
+    assert_eq!(owner.completed(), None);
+    drop(guard);
+    // Resuming through the ordinary entry point must still use suspension's
+    // strict writer requirement, not construct a second common cleanup.
+    assert_eq!(owner.observe(session).await,
+        CleanupExecution::Finished { persistence_failed: true });
+}
+
 #[tokio::test(start_paused = true)]
 async fn deadline_bound_cleanup_replays_a_settled_result_after_expiry() {
     let (session, _) = super::super::tests::make_session_and_context().await;

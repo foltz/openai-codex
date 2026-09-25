@@ -4,6 +4,7 @@ use pretty_assertions::assert_eq;
 use std::time::Duration;
 
 struct PausedStart {
+    calls: std::sync::atomic::AtomicUsize,
     entered: tokio::sync::Semaphore,
     release: tokio::sync::Semaphore,
     resumed: std::sync::atomic::AtomicUsize,
@@ -15,6 +16,9 @@ impl codex_extension_api::TurnLifecycleContributor for PausedStart {
         _input: codex_extension_api::TurnStartInput<'a>,
     ) -> codex_extension_api::ExtensionFuture<'a, ()> {
         Box::pin(async move {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) != 0 {
+                return;
+            }
             self.entered.add_permits(1);
             self.release.acquire().await.unwrap().forget();
             self.resumed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -26,6 +30,7 @@ impl codex_extension_api::TurnLifecycleContributor for PausedStart {
 async fn completion_wake_survives_producer_abort_and_is_driven_by_loop() {
     let (mut session, context) = tests::make_session_and_context().await;
     let pause = Arc::new(PausedStart {
+        calls: std::sync::atomic::AtomicUsize::new(0),
         entered: tokio::sync::Semaphore::new(0),
         release: tokio::sync::Semaphore::new(0),
         resumed: std::sync::atomic::AtomicUsize::new(0),
@@ -105,4 +110,62 @@ async fn closed_submission_channel_takes_precedence_over_completion_wake() {
     )).await.expect("wake does not retain the submission channel");
     assert!(session.input_queue.completion_wake.notified().now_or_never().is_some());
     assert!(session.active_turn.lock().await.is_none());
+}
+
+struct HeldTask;
+
+impl crate::tasks::SessionTask for HeldTask {
+    fn kind(&self) -> crate::state::TaskKind { crate::state::TaskKind::Regular }
+
+    fn span_name(&self) -> &'static str { "session_task.mailbox_reservation_test" }
+
+    async fn run(
+        self: Arc<Self>,
+        _session: Arc<Session>,
+        _ctx: Arc<TurnContext>,
+        _input: Vec<TurnInput>,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> crate::tasks::SessionTaskResult {
+        cancellation.cancelled().await;
+        Ok(None)
+    }
+}
+
+#[tokio::test]
+async fn displaced_mailbox_start_refuses_without_overwriting_installed_task() {
+    let (mut session, context) = tests::make_session_and_context().await;
+    let pause = Arc::new(PausedStart {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        entered: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+        resumed: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::<Config>::new();
+    builder.turn_lifecycle_contributor(pause.clone());
+    session.services.extensions = Arc::new(builder.build());
+    let session = Arc::new(session);
+    let mail = InterAgentCommunication::new(
+        codex_protocol::AgentPath::root(), codex_protocol::AgentPath::root(),
+        Vec::new(), "private first batch".to_owned(), /*trigger_turn*/ true,
+    );
+    session.input_queue.enqueue_mailbox_communication(mail.clone(), Default::default()).await;
+    let first_session = Arc::clone(&session);
+    let first = tokio::spawn(async move {
+        first_session.start_task(Arc::new(context), Vec::new(), HeldTask).await
+    });
+    tokio::time::timeout(Duration::from_secs(10), pause.entered.acquire())
+        .await.unwrap().unwrap().forget();
+    let second = session.new_turn_with_default_settings("replacement".into(), Default::default()).await;
+    session.start_task(second, Vec::new(), HeldTask).await.unwrap();
+    pause.release.add_permits(1);
+    assert!(tokio::time::timeout(Duration::from_secs(10), first).await.unwrap().unwrap().is_err());
+    {
+        let active = session.active_turn.lock().await;
+        assert_eq!(active.as_ref().unwrap().task.as_ref().unwrap().turn_context.sub_id, "replacement");
+    }
+    assert_eq!(session.input_queue.drain_mailbox_input_items().await.0,
+        vec![TurnInput::InterAgentCommunication(mail)]);
+    session.close_task_admission().await;
+    session.abort_all_tasks(codex_protocol::protocol::TurnAbortReason::Interrupted).await;
+    let _ = session.task_joins.shutdown_until(tokio::time::Instant::now() + Duration::from_secs(5)).await;
 }

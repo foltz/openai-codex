@@ -360,6 +360,9 @@ impl Session {
             {
                 return Err(CodexErr::Fatal("thread task admission is closed".to_string()));
             }
+            if active.as_ref().is_some_and(|turn| turn.task.is_some()) {
+                return Err(CodexErr::Fatal("thread already has an active task".to_string()));
+            }
             self.record_started_turn(&turn_context.sub_id).await;
             let turn = active.get_or_insert_with(ActiveTurn::default);
             debug_assert!(turn.task.is_none());
@@ -380,8 +383,11 @@ impl Session {
         {
             return Err(CodexErr::Fatal("thread task admission is closed".to_string()));
         }
-        let turn = active.get_or_insert_with(ActiveTurn::default);
-        debug_assert!(turn.task.is_none());
+        let Some(turn) = active.as_mut().filter(|turn| {
+            turn.task.is_none() && Arc::ptr_eq(&turn.turn_state, &turn_state)
+        }) else {
+            return Err(CodexErr::Fatal("thread task reservation changed".to_string()));
+        };
         // After the destination lock is acquired, consuming the batch and
         // installing the task contain no further cancellation point.
         self.input_queue.commit_mailbox_for_turn_state(&turn.turn_state, mailbox).await;
@@ -544,7 +550,7 @@ impl Session {
             .lock()
             .await
             .as_ref()
-            .is_none_or(|turn| !Arc::ptr_eq(&turn.turn_state, &turn_state))
+            .is_none_or(|turn| turn.task.is_some() || !Arc::ptr_eq(&turn.turn_state, &turn_state))
         {
             return;
         }

@@ -872,6 +872,32 @@ async fn cancelled_suspension_observer_retains_its_cleanup_sequence() {
         CleanupExecution::Finished { persistence_failed: true });
 }
 
+#[tokio::test]
+async fn bound_suspension_common_waits_for_producer_join_before_persistence() {
+    let (session, _) = super::super::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let owner = session.cleanup_owner();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let task = tokio::task::spawn_blocking(move || {
+        let _ = entered_tx.send(());
+        let _ = release_rx.recv();
+    });
+    let _task = session.task_joins.register(task);
+    entered_rx.await.expect("producer entered and cannot be aborted mid-write");
+    owner.bind_deadline(Instant::now() + Duration::from_secs(20)).expect("bind");
+    let mut observer = Box::pin(owner.observe_suspension(Arc::clone(&session)));
+    assert!(futures::poll!(observer.as_mut()).is_pending());
+    let common = owner.state.lock().expect("state").common_completion.clone().expect("common");
+    // Observe common alone: waiting only in the owner's parallel task driver
+    // would allow this sequence to reach persistence while the producer lives.
+    assert!(tokio::time::timeout(Duration::from_millis(100), common.clone()).await.is_err());
+    release_tx.send(()).expect("release producer");
+    assert_eq!(tokio::time::timeout(Duration::from_secs(5), common).await.expect("joined"),
+        CleanupExecution::Finished { persistence_failed: true });
+    assert_eq!(observer.await, CleanupExecution::Finished { persistence_failed: true });
+}
+
 #[tokio::test(start_paused = true)]
 async fn deadline_bound_cleanup_replays_a_settled_result_after_expiry() {
     let (session, _) = super::super::tests::make_session_and_context().await;

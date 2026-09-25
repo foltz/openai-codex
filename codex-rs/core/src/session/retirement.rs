@@ -178,7 +178,7 @@ impl SessionCleanupOwner {
                                 super::handlers::cleanup_session(&session, mode).await
                             }
                             CleanupSequence::Suspension => {
-                                super::turn_suspension::cleanup_suspended_session(&session, mode).await
+                                super::turn_suspension::cleanup_suspended_session(&session).await
                             }
                         }
                     };

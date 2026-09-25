@@ -120,11 +120,13 @@ pub(super) async fn suspend_turn_and_shutdown(
 /// Executed only by the retained cleanup owner, never as a second teardown.
 pub(super) async fn cleanup_suspended_session(
     session: &Arc<Session>,
-    mode: CleanupMode,
 ) -> CleanupExecution {
     // Preserve suspension's stricter ordering and stop-on-failure policy:
     // stop producers, flush their final history, then close the writer.
-    if let Some(failure) = handlers::shutdown_session_runtime(session, mode).await {
+    // Even with a bound observer, suspension must join producers *inside* this
+    // sequence before persistence. The owner's parallel deadline-bound join
+    // alone does not establish that ordering. Keep the preexisting legacy join.
+    if let Some(failure) = handlers::shutdown_session_runtime(session, CleanupMode::Legacy).await {
         return failure;
     }
     let result: anyhow::Result<()> = async {

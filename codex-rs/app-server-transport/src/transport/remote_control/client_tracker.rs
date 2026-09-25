@@ -75,11 +75,10 @@ impl ClientTracker {
 
     pub(crate) async fn bookkeep_join_set(&mut self) -> Option<(ClientId, StreamId)> {
         while let Some(join_result) = self.join_set.join_next().await {
-            let Ok(client_key) = join_result else {
-                self.workers_clean = false;
-                continue;
-            };
-            return Some(client_key);
+            match join_result {
+                Ok(client_key) => return Some(client_key),
+                Err(error) => self.workers_clean &= error.is_cancelled(),
+            }
         }
         futures::future::pending().await
     }
@@ -97,7 +96,10 @@ impl ClientTracker {
 
     async fn drain_join_set(&mut self) {
         while let Some(result) = self.join_set.join_next().await {
-            self.workers_clean &= result.is_ok();
+            // Joined cancellation proves the worker stopped. Only a panic
+            // leaves its execution unclean; required close delivery is tracked
+            // separately and is never excused by a worker's cancellation.
+            self.workers_clean &= result.is_ok() || result.is_err_and(|error| error.is_cancelled());
         }
     }
 

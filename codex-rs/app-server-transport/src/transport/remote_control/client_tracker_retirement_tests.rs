@@ -1,6 +1,40 @@
 use super::*;
 
 #[tokio::test]
+async fn joined_cancelled_clients_do_not_poison_retirement() {
+    let (server_events, _server_rx) = mpsc::channel(CHANNEL_CAPACITY);
+    let (events, _events_rx) = mpsc::channel(CHANNEL_CAPACITY);
+    let mut tracker = ClientTracker::new(server_events, events, &CancellationToken::new());
+    tracker.join_set.spawn(futures::future::pending());
+    tracker.join_set.abort_all();
+    // Normal operation joins the cancelled worker, then waits for new work.
+    assert!(
+        timeout(Duration::from_millis(10), tracker.bookkeep_join_set())
+            .await
+            .is_err()
+    );
+    assert!(tracker.join_set.is_empty());
+    tracker.join_set.spawn(futures::future::pending());
+    tracker.join_set.abort_all();
+    assert!(tracker.shutdown().await);
+    assert!(tracker.join_set.is_empty());
+    assert!(tracker.shutdown().await);
+}
+
+#[tokio::test]
+async fn panicked_client_remains_unclean_after_join() {
+    let (server_events, _server_rx) = mpsc::channel(CHANNEL_CAPACITY);
+    let (events, _events_rx) = mpsc::channel(CHANNEL_CAPACITY);
+    let mut tracker = ClientTracker::new(server_events, events, &CancellationToken::new());
+    tracker
+        .join_set
+        .spawn(async { panic!("client worker panic") });
+    assert!(!tracker.shutdown().await);
+    assert!(tracker.join_set.is_empty());
+    assert!(!tracker.shutdown().await);
+}
+
+#[tokio::test]
 async fn shutdown_observes_detached_close_and_replays_delivery_failure() {
     let (server_events, _server_rx) = mpsc::channel(CHANNEL_CAPACITY);
     let (events, events_rx) = mpsc::channel(CHANNEL_CAPACITY);

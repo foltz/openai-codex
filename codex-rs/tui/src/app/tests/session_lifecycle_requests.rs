@@ -4353,6 +4353,16 @@ fn failed_repeated_clear_keeps_resumed_predecessor_displayed_without_unsubscribe
                 let codex_home = tempdir()?;
                 app.config.codex_home = codex_home.path().to_path_buf().abs();
                 app.config.sqlite = SqliteConfig::new_for_testing(codex_home.path().abs());
+                // Fresh-session startup rebuilds config from launch overrides, not
+                // the resolved SqliteConfig above. Keep that reload isolated too.
+                app.cli_kv_overrides.push((
+                    "sqlite_home".to_string(),
+                    toml::Value::String(codex_home.path().to_string_lossy().into_owned()),
+                ));
+                let reloaded = app
+                    .rebuild_config_for_cwd(app.config.cwd.to_path_buf())
+                    .await?;
+                assert_eq!(reloaded.sqlite, app.config.sqlite);
                 let (mut app_server, requests, proxy) = start_recording_app_server(
                     &app.config,
                     /*blocked_thread_list*/ None,
@@ -4372,6 +4382,10 @@ fn failed_repeated_clear_keeps_resumed_predecessor_displayed_without_unsubscribe
                 let predecessor = app
                     .current_displayed_thread_id()
                     .expect("predecessor should be displayed");
+                assert_eq!(
+                    app.config.sqlite,
+                    SqliteConfig::new_for_testing(codex_home.path().abs())
+                );
                 let state = codex_state::StateRuntime::init(
                     app.config.sqlite.clone(),
                     app.config.model_provider_id.clone(),

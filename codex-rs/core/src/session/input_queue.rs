@@ -12,6 +12,10 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
 
+#[cfg(test)]
+#[path = "mailbox_commit_tests.rs"]
+mod mailbox_commit_tests;
+
 /// Input consumed by a regular turn.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum TurnInput {
@@ -132,6 +136,22 @@ impl InputQueue {
 
     pub(crate) async fn drain_mailbox_input_items(&self) -> (Vec<TurnInput>, TurnStartOptions) {
         self.mailbox.reserve().into_input()
+    }
+
+    pub(crate) fn reserve_mailbox(&self) -> super::mailbox::MailboxReservation {
+        self.mailbox.reserve()
+    }
+
+    /// The caller holds final task admission. Consumption happens only after
+    /// obtaining the destination lock, with no suspension after consumption.
+    pub(crate) async fn commit_mailbox_for_turn_state(
+        &self,
+        turn_state: &Mutex<TurnState>,
+        reservation: super::mailbox::MailboxReservation,
+    ) {
+        let mut turn_state = turn_state.lock().await;
+        let (items, _) = reservation.into_input();
+        turn_state.pending_input.items.extend(items);
     }
 
     pub(crate) async fn turn_state_for_sub_id(

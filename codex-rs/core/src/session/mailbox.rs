@@ -38,7 +38,7 @@ pub(super) struct Mailbox {
 /// Owns mail removed from the deliverable queue. Until `into_input`, dropping
 /// the owner returns the complete records, not reconstructed input fragments.
 #[must_use]
-pub(super) struct MailboxReservation {
+pub(crate) struct MailboxReservation {
     state: Arc<Mutex<MailboxState>>,
     activity: watch::Sender<InputQueueActivity>,
     pending: BTreeMap<u64, PendingMailboxCommunication>,
@@ -91,7 +91,16 @@ impl Mailbox {
 }
 
 impl MailboxReservation {
-    pub(super) fn into_input(mut self) -> (Vec<TurnInput>, TurnStartOptions) {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    pub(crate) fn append(&mut self, mut other: Self) {
+        assert!(Arc::ptr_eq(&self.state, &other.state), "mailbox reservation owner mismatch");
+        self.pending.append(&mut other.pending);
+    }
+
+    pub(crate) fn start_metadata(&self) -> (TurnStartOptions, Option<codex_protocol::AgentPath>) {
         // Preserve upstream's settings selection: the latest trigger wins,
         // while parent identity requires agreement across every trigger.
         let mut start_options = self.pending.values().rev()
@@ -112,6 +121,13 @@ impl MailboxReservation {
                     .filter(|id| !id.trim().is_empty())
             })
             .map(str::to_string);
+        let author = self.pending.values().find(|mail| mail.communication.trigger_turn)
+            .map(|mail| mail.communication.author.clone());
+        (start_options, author)
+    }
+
+    pub(super) fn into_input(mut self) -> (Vec<TurnInput>, TurnStartOptions) {
+        let (start_options, _) = self.start_metadata();
         let items = std::mem::take(&mut self.pending).into_values()
             .map(|mail| TurnInput::InterAgentCommunication(mail.communication))
             .collect();

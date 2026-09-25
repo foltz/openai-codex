@@ -1,5 +1,6 @@
 use super::*;
 use futures::FutureExt;
+use pretty_assertions::assert_eq;
 use std::time::Duration;
 
 struct PausedStart {
@@ -33,11 +34,12 @@ async fn completion_wake_survives_producer_abort_and_is_driven_by_loop() {
     builder.turn_lifecycle_contributor(pause.clone());
     session.services.extensions = Arc::new(builder.build());
     let session = Arc::new(session);
-    session.input_queue.enqueue_mailbox_communication(
-        InterAgentCommunication::new(
+    let mail = InterAgentCommunication::new(
             codex_protocol::AgentPath::root(), codex_protocol::AgentPath::root(),
             Vec::new(), "wake".to_owned(), /*trigger_turn*/ true,
-        ),
+        );
+    session.input_queue.enqueue_mailbox_communication(
+        mail.clone(),
         codex_protocol::turn_input::TurnStartOptions::default(),
     ).await;
     let producer_session = Arc::clone(&session);
@@ -59,6 +61,8 @@ async fn completion_wake_survives_producer_abort_and_is_driven_by_loop() {
     tokio::time::timeout(Duration::from_secs(10), pause.entered.acquire())
         .await.expect("loop drove stored completion wake").unwrap().forget();
     assert!(session.active_turn.lock().await.as_ref().is_some_and(|turn| turn.task.is_none()));
+    assert!(!session.input_queue.has_pending_mailbox_items().await,
+        "preparing start privately owns its mail");
     let (reply, response) = tokio::sync::oneshot::channel();
     sender.send(codex_protocol::protocol::Submission {
         id: "suspend-during-mailbox-start".into(),
@@ -85,6 +89,8 @@ async fn completion_wake_survives_producer_abort_and_is_driven_by_loop() {
     pause.release.add_permits(1);
     tokio::task::yield_now().await;
     assert_eq!(pause.resumed.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(session.input_queue.drain_mailbox_input_items().await.0,
+        vec![TurnInput::InterAgentCommunication(mail)]);
 }
 
 #[tokio::test]

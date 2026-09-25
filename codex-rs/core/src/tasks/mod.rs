@@ -308,15 +308,26 @@ impl Session {
         self.start_task(turn_context, input, task).await
     }
 
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "record the started turn atomically with its active reservation"
-    )]
     pub(crate) async fn start_task<T: SessionTask>(
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
         input: Vec<TurnInput>,
         task: T,
+    ) -> CodexResult<()> {
+        let mailbox = self.input_queue.reserve_mailbox();
+        self.start_task_with_mailbox(turn_context, input, task, mailbox).await
+    }
+
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "record and commit the started turn atomically with its active reservation"
+    )]
+    async fn start_task_with_mailbox<T: SessionTask>(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        input: Vec<TurnInput>,
+        task: T,
+        mut mailbox: crate::session::MailboxReservation,
     ) -> CodexResult<()> {
         self.activate_plugin_selection(&turn_context).await;
         // Inherited or recovered roots are applied before task start. Otherwise this
@@ -340,7 +351,7 @@ impl Session {
         let cancellation_token = CancellationToken::new();
         let done = Arc::new(Notify::new());
 
-        let (pending_items, _) = self.input_queue.drain_mailbox_input_items().await;
+        mailbox.append(self.input_queue.reserve_mailbox());
         let turn_state = {
             let mut active = self.active_turn.lock().await;
             if self
@@ -355,9 +366,6 @@ impl Session {
             Arc::clone(&turn.turn_state)
         };
         turn_state.lock().await.token_usage_at_turn_start = token_usage_at_turn_start.clone();
-        self.input_queue
-            .extend_pending_input_for_turn_state(turn_state.as_ref(), pending_items)
-            .await;
         self.emit_turn_start_lifecycle(
             turn_context.as_ref(),
             Some(&token_usage_at_turn_start),
@@ -374,6 +382,9 @@ impl Session {
         }
         let turn = active.get_or_insert_with(ActiveTurn::default);
         debug_assert!(turn.task.is_none());
+        // After the destination lock is acquired, consuming the batch and
+        // installing the task contain no further cancellation point.
+        self.input_queue.commit_mailbox_for_turn_state(&turn.turn_state, mailbox).await;
         let agent_execution_guard = self.services.agent_control.execution_guard(
             turn_context.multi_agent_version,
             &turn_context.session_source,
@@ -502,7 +513,7 @@ impl Session {
             return;
         }
 
-        let turn_state = {
+        let (turn_state, mut mailbox) = {
             let mut active_turn = self.active_turn.lock().await;
             if self
                 .task_admission_closed
@@ -511,8 +522,16 @@ impl Session {
             {
                 return;
             }
+            // Reserve atomically with the idle decision, before discovery.
+            // A competing consumer may have taken the mail since the peek.
+            let mailbox = self.input_queue.reserve_mailbox();
+            if mailbox.is_empty()
+                || (mailbox.start_metadata().1.is_none() && !self.has_outstanding_durable_sleep())
+            {
+                return;
+            }
             let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
-            Arc::clone(&active_turn.turn_state)
+            (Arc::clone(&active_turn.turn_state), mailbox)
         };
 
         self.services
@@ -529,11 +548,9 @@ impl Session {
         {
             return;
         }
-        let (input, mut start_options) =
-            self.input_queue.get_pending_input(&self.active_turn).await;
-        if !input.iter().any(
-            |item| matches!(item, TurnInput::InterAgentCommunication(mail) if mail.trigger_turn),
-        ) {
+        mailbox.append(self.input_queue.reserve_mailbox());
+        let (mut start_options, initiating_agent_path) = mailbox.start_metadata();
+        if initiating_agent_path.is_none() {
             // Queue-only mail wakes durable sleep without selecting a new task's settings.
             start_options.cyber_access_program = self
                 .reference_context_item()
@@ -553,14 +570,7 @@ impl Session {
             turn_context.turn_metadata_state.set_turn_trigger(trigger);
         }
         if let Some(id) = start_options.parent_turn_id {
-            if let Some(initiating_agent_path) = input.iter().find_map(|item| {
-                let TurnInput::InterAgentCommunication(communication) = item else {
-                    return None;
-                };
-                communication
-                    .trigger_turn
-                    .then(|| communication.author.clone())
-            }) {
+            if let Some(initiating_agent_path) = initiating_agent_path {
                 turn_context
                     .turn_metadata_state
                     .set_initiating_agent_path(initiating_agent_path);
@@ -572,11 +582,8 @@ impl Session {
         }
         self.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
             .await;
-        // Task completion must still save this mail if pre-turn compaction fails.
-        self.input_queue
-            .extend_pending_input_for_turn_state(turn_state.as_ref(), input)
-            .await;
-        let _ = self.start_task(turn_context, Vec::new(), RegularTask::new())
+        // Commit to the actual installed turn only after final admission.
+        let _ = self.start_task_with_mailbox(turn_context, Vec::new(), RegularTask::new(), mailbox)
             .await;
     }
 

@@ -238,6 +238,7 @@ mod inject;
 mod reasoning_effort;
 pub(crate) use reasoning_effort::RequestEffortUsage;
 mod input_queue;
+mod mailbox;
 mod mcp;
 mod mcp_prewarm;
 mod mcp_refresh;

@@ -1,8 +1,6 @@
 use crate::state::ActiveTurn;
 use crate::state::MailboxDeliveryPhase;
 use crate::state::TurnState;
-use codex_diagnostics::Gauge;
-use codex_diagnostics::GaugeGuard;
 use codex_history::ResponseItemEnvelope;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::InterAgentCommunication;
@@ -10,12 +8,9 @@ use codex_protocol::turn_input::TurnStartOptions;
 use codex_protocol::user_input::UserInput;
 use serde::Deserialize;
 use serde::Serialize;
-use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
-
-static PENDING_MAILBOX_MESSAGES: Gauge = Gauge::new("core.mailbox.pending");
 
 /// Input consumed by a regular turn.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -80,21 +75,15 @@ pub(crate) struct TurnInputQueue {
 /// Session-scoped pending input storage and active-turn mailbox delivery coordination.
 pub(crate) struct InputQueue {
     activity_tx: watch::Sender<InputQueueActivity>,
-    mailbox_pending_mails: Mutex<VecDeque<PendingMailboxCommunication>>,
-}
-
-struct PendingMailboxCommunication {
-    communication: InterAgentCommunication,
-    start_options: TurnStartOptions,
-    _diagnostics_guard: GaugeGuard,
+    mailbox: super::mailbox::Mailbox,
 }
 
 impl InputQueue {
     pub(crate) fn new() -> Self {
         let (activity_tx, _) = watch::channel(InputQueueActivity::Mailbox);
         Self {
+            mailbox: super::mailbox::Mailbox::new(activity_tx.clone()),
             activity_tx,
-            mailbox_pending_mails: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -126,66 +115,19 @@ impl InputQueue {
         communication: InterAgentCommunication,
         start_options: TurnStartOptions,
     ) {
-        self.mailbox_pending_mails
-            .lock()
-            .await
-            .push_back(PendingMailboxCommunication {
-                communication,
-                start_options,
-                _diagnostics_guard: PENDING_MAILBOX_MESSAGES.track(),
-            });
-        self.activity_tx.send_replace(InputQueueActivity::Mailbox);
+        self.mailbox.enqueue(communication, start_options);
     }
 
     pub(crate) async fn has_pending_mailbox_items(&self) -> bool {
-        !self.mailbox_pending_mails.lock().await.is_empty()
+        self.mailbox.has_pending()
     }
 
     pub(crate) async fn has_trigger_turn_mailbox_items(&self) -> bool {
-        self.mailbox_pending_mails
-            .lock()
-            .await
-            .iter()
-            .any(|mail| mail.communication.trigger_turn)
+        self.mailbox.has_trigger()
     }
 
     pub(crate) async fn drain_mailbox_input_items(&self) -> (Vec<TurnInput>, TurnStartOptions) {
-        let pending_mails = self
-            .mailbox_pending_mails
-            .lock()
-            .await
-            .drain(..)
-            .collect::<Vec<_>>();
-        // A later follow-up supersedes the earlier choice, including an omitted choice.
-        let mut start_options = pending_mails
-            .iter()
-            .rev()
-            .find(|mail| mail.communication.trigger_turn)
-            .map(|mail| mail.start_options.clone())
-            .unwrap_or_default();
-        start_options.parent_turn_id = pending_mails
-            .iter()
-            .filter(|mail| mail.communication.trigger_turn)
-            .map(|mail| mail.start_options.parent_turn_id.as_deref())
-            .reduce(|expected, candidate| expected.filter(|id| candidate == Some(*id)))
-            .and_then(|id| id.filter(|id| !id.trim().is_empty()).map(str::to_string));
-        start_options.root_turn_id = pending_mails
-            .iter()
-            .find(|mail| mail.communication.trigger_turn)
-            .and_then(|mail| {
-                mail.start_options
-                    .parent_turn_id
-                    .as_deref()
-                    .filter(|id| !id.trim().is_empty())
-                    .and(mail.start_options.root_turn_id.as_deref())
-                    .filter(|id| !id.trim().is_empty())
-            })
-            .map(str::to_string);
-        let items = pending_mails
-            .into_iter()
-            .map(|mail| TurnInput::InterAgentCommunication(mail.communication))
-            .collect();
-        (items, start_options)
+        self.mailbox.reserve().into_input()
     }
 
     pub(crate) async fn turn_state_for_sub_id(

@@ -126,6 +126,7 @@ pub(super) async fn prepare(
     target: &AppServerTarget,
     arg0_paths: &Arg0DispatchPaths,
     source_bundle: CloudConfigBundleLoader,
+    host: Arc<InProcessHost>,
 ) -> color_eyre::Result<(Config, CloudConfigBundleLoader, ManagedTuiWorktree)> {
     if let Some(id_or_name) = cli.fork_session_id.as_deref() {
         let prepared = if should_load_configured_environments(&loader_overrides, target) {
@@ -159,6 +160,7 @@ pub(super) async fn prepare(
             /*log_db*/ None,
             state,
             Arc::new(environment),
+            host,
         )
         .await?;
         let mut lookup = AppServerSession::new(

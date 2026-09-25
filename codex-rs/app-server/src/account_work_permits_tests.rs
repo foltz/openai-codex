@@ -32,23 +32,34 @@ async fn admitted_request_derives_a_turn_after_close_and_outlives_request_return
     };
     let store = codex_extension_api::ExtensionData::new("thread");
     let request_guard = coordinator.try_acquire_account_work_permit().unwrap();
-    let request = super::tests::request(coordinator.process_instance_id().await, "admitted-request");
+    let request =
+        super::tests::request(coordinator.process_instance_id().await, "admitted-request");
     let transition = coordinator.start_dispatch(request, /*caller_authorized*/ true);
     tokio::pin!(transition);
     assert!(transition.as_mut().now_or_never().is_none());
-    assert!(admission.admit_turn_work(&store, Box::pin(std::future::pending())).is_err());
+    assert!(
+        admission
+            .admit_turn_work(&store, Box::pin(std::future::pending()))
+            .is_err()
+    );
     crate::account_turn_admission::within_request(Some(request_guard), async {
-        let mut work = admission.admit_turn_work(&store, Box::pin(std::future::pending()))
-            .unwrap().unwrap();
+        let mut work = admission
+            .admit_turn_work(&store, Box::pin(std::future::pending()))
+            .unwrap()
+            .unwrap();
         work.bind_submission("late-turn");
         work.retain_until_terminal();
         assert_eq!(coordinator.account_work_permits().admitted_count(), 2);
-    }).await;
+    })
+    .await;
     assert_eq!(coordinator.account_work_permits().admitted_count(), 1);
     assert!(transition.as_mut().now_or_never().is_none());
     admission.turn_work_terminal(&store, "late-turn");
     let result = transition.await;
-    assert!(matches!(result, StartManagedTransitionResponse::Accepted { .. }));
+    assert!(matches!(
+        result,
+        StartManagedTransitionResponse::Accepted { .. }
+    ));
     assert_eq!(coordinator.account_work_permits().admitted_count(), 0);
 }
 
@@ -63,22 +74,37 @@ async fn child_derives_before_parent_reply_and_keeps_custody_after_parent_termin
     };
     let parent = codex_extension_api::ExtensionData::new("parent");
     let child = codex_extension_api::ExtensionData::new("child");
-    let mut pending = admission.admit_turn_work(&parent, Box::pin(std::future::pending()))
-        .unwrap().unwrap();
+    let mut pending = admission
+        .admit_turn_work(&parent, Box::pin(std::future::pending()))
+        .unwrap()
+        .unwrap();
     // The queue binds before handling; it has not yet returned Started.
     pending.bind_submission("parent-turn");
     coordinator.account_work_permits.close();
-    let mut descendant = admission.derive_turn_work(
-        &parent, "parent-turn", &child, Box::pin(std::future::pending()),
-    ).unwrap().unwrap();
+    let mut descendant = admission
+        .derive_turn_work(
+            &parent,
+            "parent-turn",
+            &child,
+            Box::pin(std::future::pending()),
+        )
+        .unwrap()
+        .unwrap();
     descendant.bind_submission("child-turn");
     descendant.retain_until_terminal();
     pending.retain_until_terminal();
     admission.turn_work_terminal(&parent, "parent-turn");
     assert_eq!(coordinator.account_work_permits().admitted_count(), 1);
-    assert!(admission.derive_turn_work(
-        &parent, "parent-turn", &child, Box::pin(std::future::pending()),
-    ).is_err());
+    assert!(
+        admission
+            .derive_turn_work(
+                &parent,
+                "parent-turn",
+                &child,
+                Box::pin(std::future::pending()),
+            )
+            .is_err()
+    );
     admission.turn_work_terminal(&child, "child-turn");
     assert_eq!(coordinator.account_work_permits().admitted_count(), 0);
 }
@@ -87,11 +113,16 @@ async fn child_derives_before_parent_reply_and_keeps_custody_after_parent_termin
 async fn coordinator_drain_observes_listenerless_loop_termination() {
     let coordinator = ManagedTransitionCoordinator::new();
     let (ended, termination) = tokio::sync::oneshot::channel();
-    let session = coordinator.account_turn_work().session(async move {
-        let _ = termination.await;
-    }.boxed());
-    session.begin(coordinator.try_acquire_account_work_permit().unwrap())
-        .unwrap().bind("suspended-turn".into());
+    let session = coordinator.account_turn_work().session(
+        async move {
+            let _ = termination.await;
+        }
+        .boxed(),
+    );
+    session
+        .begin(coordinator.try_acquire_account_work_permit().unwrap())
+        .unwrap()
+        .bind("suspended-turn".into());
     let request = super::tests::request(coordinator.process_instance_id().await, "loop-drain");
     let start = coordinator.start_dispatch(request, /*caller_authorized*/ true);
     tokio::pin!(start);
@@ -99,7 +130,9 @@ async fn coordinator_drain_observes_listenerless_loop_termination() {
     assert_eq!(coordinator.account_work_permits().admitted_count(), 1);
     assert!(coordinator.try_acquire_account_work_permit().is_none());
     ended.send(()).unwrap();
-    let response = tokio::time::timeout(Duration::from_secs(1), start).await.unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(1), start)
+        .await
+        .unwrap();
     let StartManagedTransitionResponse::Accepted { status } = response else {
         panic!("joined loop must release the drain's outstanding work");
     };
@@ -110,20 +143,30 @@ async fn coordinator_drain_observes_listenerless_loop_termination() {
 #[tokio::test(start_paused = true)]
 async fn live_listenerless_turn_times_out_without_releasing_or_cancelling_its_work() {
     let coordinator = ManagedTransitionCoordinator::new();
-    let (ended, termination) = tokio::sync::oneshot::channel();
-    let session = coordinator.account_turn_work().session(async move {
-        let _ = termination.await;
-    }.boxed());
-    session.begin(coordinator.try_acquire_account_work_permit().unwrap())
-        .unwrap().bind("held-turn".into());
+    let (ended, termination) = tokio::sync::oneshot::channel::<()>();
+    let session = coordinator.account_turn_work().session(
+        async move {
+            let _ = termination.await;
+        }
+        .boxed(),
+    );
+    session
+        .begin(coordinator.try_acquire_account_work_permit().unwrap())
+        .unwrap()
+        .bind("held-turn".into());
     let request = super::tests::request(coordinator.process_instance_id().await, "held-loop");
-    let response = coordinator.start_dispatch(request, /*caller_authorized*/ true).await;
+    let response = coordinator
+        .start_dispatch(request, /*caller_authorized*/ true)
+        .await;
     let StartManagedTransitionResponse::Accepted { status } = response else {
         panic!("admitted transition must retain a quarantine result");
     };
     assert_eq!(status.phase, ManagedTransitionPhase::Quarantined);
     assert_eq!(coordinator.account_work_permits().admitted_count(), 1);
-    assert!(!ended.is_closed(), "deadline must not cancel the retained loop receipt");
+    assert!(
+        !ended.is_closed(),
+        "deadline must not cancel the retained loop receipt"
+    );
     assert!(coordinator.try_acquire_account_work_permit().is_none());
     session.terminal("held-turn");
     assert_eq!(coordinator.account_work_permits().admitted_count(), 0);

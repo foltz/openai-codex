@@ -443,6 +443,8 @@ pub(super) async fn run_main_inner(
             .await??
     };
     let managed_worktree = if cli.shared.worktree {
+        // Retain lookup custody outside the cancellable preparation future.
+        let lookup_host = Arc::new(InProcessHost::default());
         let (destination, bundle, worktree) = startup_draft
             .run_until(worktree_startup::prepare(
                 &mut cli,
@@ -454,9 +456,11 @@ pub(super) async fn run_main_inner(
                 &app_server_target,
                 &arg0_paths,
                 cloud_config_bundle.clone(),
+                Arc::clone(&lookup_host),
             ))
             .await?
             .map_err(|err| std::io::Error::other(err.to_string()))?;
+        drop(lookup_host);
         config = destination;
         cloud_config_bundle = bundle;
         startup_draft.apply_config(&config);

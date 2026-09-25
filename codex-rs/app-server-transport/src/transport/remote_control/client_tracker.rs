@@ -16,7 +16,6 @@ use codex_app_server_protocol::JSONRPCMessage;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
 use tokio::task::JoinSet;
 use tokio::time::Duration;
 use tokio::time::Instant;
@@ -51,6 +50,8 @@ pub(crate) struct ClientTracker {
     server_event_tx: mpsc::Sender<QueuedServerEnvelope>,
     transport_event_tx: mpsc::Sender<TransportEvent>,
     shutdown_token: CancellationToken,
+    cleanup: super::retirement::Retirement,
+    workers_clean: bool,
 }
 
 impl ClientTracker {
@@ -67,12 +68,15 @@ impl ClientTracker {
             server_event_tx,
             transport_event_tx,
             shutdown_token: shutdown_token.child_token(),
+            cleanup: super::retirement::Retirement::default(),
+            workers_clean: true,
         }
     }
 
     pub(crate) async fn bookkeep_join_set(&mut self) -> Option<(ClientId, StreamId)> {
         while let Some(join_result) = self.join_set.join_next().await {
             let Ok(client_key) = join_result else {
+                self.workers_clean = false;
                 continue;
             };
             return Some(client_key);
@@ -80,7 +84,7 @@ impl ClientTracker {
         futures::future::pending().await
     }
 
-    pub(crate) async fn shutdown(&mut self) {
+    pub(crate) async fn shutdown(&mut self) -> bool {
         self.shutdown_token.cancel();
 
         while let Some(client_key) = self.clients.keys().next().cloned() {
@@ -88,10 +92,13 @@ impl ClientTracker {
         }
 
         self.drain_join_set().await;
+        self.cleanup.observe().await && self.workers_clean
     }
 
     async fn drain_join_set(&mut self) {
-        while self.join_set.join_next().await.is_some() {}
+        while let Some(result) = self.join_set.join_next().await {
+            self.workers_clean &= result.is_ok();
+        }
     }
 
     pub(crate) async fn handle_message(
@@ -229,7 +236,8 @@ impl ClientTracker {
                 }
 
                 let server_event_tx = self.server_event_tx.clone();
-                tokio::spawn(async move {
+                let shutdown = self.shutdown_token.clone();
+                drop(self.cleanup.track(tokio::spawn(async move {
                     let server_envelope = QueuedServerEnvelope {
                         event: ServerEvent::Pong {
                             status: PongStatus::Unknown,
@@ -238,8 +246,11 @@ impl ClientTracker {
                         stream_id,
                         write_complete_tx: None,
                     };
-                    let _ = server_event_tx.send(server_envelope).await;
-                });
+                    tokio::select! {
+                        _ = shutdown.cancelled() => true,
+                        result = server_event_tx.send(server_envelope) => result.is_ok(),
+                    }
+                })));
                 Ok(())
             }
             ClientEvent::ClientClosed => self.close_client(&client_key).await,
@@ -387,11 +398,10 @@ impl ClientTracker {
     async fn send_connection_closed(&self, connection_id: ConnectionId) -> Result<(), Stopped> {
         // Worker shutdown can abort the caller; detach the cleanup event before awaiting it.
         match self.spawn_connection_closed(connection_id).await {
-            Ok(result) => result,
-            Err(err) => {
+            true => Ok(()),
+            false => {
                 warn!(
                     transport_event = "connection_closed",
-                    ?err,
                     "remote control transport event forwarding task failed"
                 );
                 Err(Stopped)
@@ -399,16 +409,13 @@ impl ClientTracker {
         }
     }
 
-    fn spawn_connection_closed(
-        &self,
-        connection_id: ConnectionId,
-    ) -> JoinHandle<Result<(), Stopped>> {
+    fn spawn_connection_closed(&self, connection_id: ConnectionId) -> super::retirement::Receipt {
         info!(
             connection_id = ?connection_id,
             "forwarding remote control connection closed transport event"
         );
         let transport_event_tx = self.transport_event_tx.clone();
-        tokio::spawn(async move {
+        self.cleanup.track(tokio::spawn(async move {
             transport_event_tx
                 .send(TransportEvent::ConnectionClosed { connection_id })
                 .await
@@ -419,7 +426,8 @@ impl ClientTracker {
                     );
                     Stopped
                 })
-        })
+                .is_ok()
+        }))
     }
 }
 
@@ -443,6 +451,10 @@ fn remote_control_message_starts_connection(message: &JSONRPCMessage) -> bool {
 fn remote_control_client_is_alive(client: &ClientState, now: Instant) -> bool {
     now.duration_since(client.last_activity_at) < REMOTE_CONTROL_CLIENT_IDLE_TIMEOUT
 }
+
+#[cfg(test)]
+#[path = "client_tracker_retirement_tests.rs"]
+mod retirement_tests;
 
 #[cfg(test)]
 mod tests {

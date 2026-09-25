@@ -425,6 +425,8 @@ async fn background_drain_timeout_retains_work_and_reobserves_completion() -> Re
     assert_eq!(
         processor
             .models_refresh_worker
+            .lock()
+            .await
             .shutdown_until(Instant::now() + std::time::Duration::from_secs(5))
             .await,
         ModelsRefreshShutdown::Joined
@@ -1109,8 +1111,7 @@ fn managed_transition_dispatch_paths_refuse_before_authorization_without_reservi
 /// (`managed_transition_dispatch_paths_refuse_before_authorization_without_reserving_state`).
 #[test]
 #[serial(app_server_tracing)]
-fn managed_transition_adoption_completes_reset_with_shared_plugin_auth() -> Result<()>
-{
+fn managed_transition_adoption_completes_reset_with_shared_plugin_auth() -> Result<()> {
     run_current_thread_test_with_stack(
         "managed_transition_adoption_completes_reset_with_shared_plugin_auth",
         async {
@@ -1203,10 +1204,17 @@ fn managed_transition_adoption_completes_reset_with_shared_plugin_auth() -> Resu
                 codex_app_server_protocol::ManagedTransitionPhase::Succeeded
             );
             assert_eq!(
-                (status.prior_auth_fingerprint, status.result_auth_fingerprint),
                 (
-                    Some(AuthManager::managed_account_fingerprint("prior-managed-account")),
-                    Some(AuthManager::managed_account_fingerprint("managed-adoption-account")),
+                    status.prior_auth_fingerprint,
+                    status.result_auth_fingerprint
+                ),
+                (
+                    Some(AuthManager::managed_account_fingerprint(
+                        "prior-managed-account"
+                    )),
+                    Some(AuthManager::managed_account_fingerprint(
+                        "managed-adoption-account"
+                    )),
                 )
             );
 

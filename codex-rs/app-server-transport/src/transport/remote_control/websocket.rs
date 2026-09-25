@@ -459,7 +459,7 @@ impl RemoteControlWebsocket {
     pub(super) async fn run(
         mut self,
         app_server_client_name_rx: Option<oneshot::Receiver<String>>,
-    ) {
+    ) -> bool {
         let auth_owner = self.auth_manager.owner.clone();
         info!(
             remote_control_url = %self.remote_control_url,
@@ -481,12 +481,12 @@ impl RemoteControlWebsocket {
                     shutdown_requested = self.shutdown_token.is_cancelled(),
                     "app-server remote control websocket loop stopped before client name was ready"
                 );
-                self.client_tracker.lock().await.shutdown().await;
-                return;
+                return self.client_tracker.lock().await.shutdown().await;
             }
         };
         self.pairing_persistence_key
             .send_replace(app_server_client_name.clone());
+        let mut workers_clean = true;
         loop {
             let status = self.status_publisher.status();
             info!(
@@ -525,9 +525,10 @@ impl RemoteControlWebsocket {
                 ConnectOutcome::Shutdown => break,
             };
 
-            let connection_end_reason = self
+            let (connection_end_reason, clean) = self
                 .run_connection(websocket_connection, shutdown_token)
                 .await;
+            workers_clean &= clean;
             let status = self.status_publisher.status();
             info!(
                 remote_control_url = %self.remote_control_url,
@@ -541,7 +542,7 @@ impl RemoteControlWebsocket {
             );
         }
 
-        self.client_tracker.lock().await.shutdown().await;
+        let clients_clean = self.client_tracker.lock().await.shutdown().await;
         info!(
             remote_control_url = %self.remote_control_url,
             installation_id = %self.installation_id,
@@ -549,6 +550,7 @@ impl RemoteControlWebsocket {
             shutdown_requested = self.shutdown_token.is_cancelled(),
             "app-server remote control websocket loop exited"
         );
+        clients_clean && workers_clean
     }
 
     async fn wait_for_app_server_client_name(
@@ -841,9 +843,9 @@ impl RemoteControlWebsocket {
         &self,
         websocket_connection: WebSocketStream<MaybeTlsStream<TcpStream>>,
         shutdown_token: CancellationToken,
-    ) -> ConnectionEndReason {
+    ) -> (ConnectionEndReason, bool) {
         if !self.auth_manager.owner.is_current() {
-            return ConnectionEndReason::AuthOwnerChanged;
+            return (ConnectionEndReason::AuthOwnerChanged, true);
         }
         self.client_tracker.lock().await.auth = Some(self.auth_manager.owner.clone());
         let (websocket_writer, websocket_reader) = websocket_connection.split();
@@ -866,6 +868,7 @@ impl RemoteControlWebsocket {
         ));
 
         let mut desired_state_rx = self.desired_state_rx.clone();
+        let mut workers_clean = true;
         let connection_end_reason = tokio::select! {
             biased;
             _ = shutdown_token.cancelled() => ConnectionEndReason::Shutdown,
@@ -879,24 +882,29 @@ impl RemoteControlWebsocket {
                     ConnectionEndReason::EnabledWatchClosed
                 }
             }
-            _ = join_set.join_next() => ConnectionEndReason::ConnectionWorkerStopped,
+            result = join_set.join_next() => {
+                workers_clean = matches!(result, Some(Ok(())));
+                ConnectionEndReason::ConnectionWorkerStopped
+            },
         };
         shutdown_token.cancel();
 
-        Self::join_connection_workers(&mut join_set, REMOTE_CONTROL_CONNECTION_SHUTDOWN_TIMEOUT)
-            .await;
-        connection_end_reason
+        workers_clean &= Self::join_connection_workers(
+            &mut join_set,
+            REMOTE_CONTROL_CONNECTION_SHUTDOWN_TIMEOUT,
+        )
+        .await;
+        (connection_end_reason, workers_clean)
     }
 
     async fn join_connection_workers(
         join_set: &mut tokio::task::JoinSet<()>,
         shutdown_timeout: std::time::Duration,
-    ) {
-        if tokio::time::timeout(shutdown_timeout, Self::drain_join_set(join_set))
-            .await
-            .is_ok()
+    ) -> bool {
+        if let Ok(clean) =
+            tokio::time::timeout(shutdown_timeout, Self::drain_join_set(join_set)).await
         {
-            return;
+            return clean;
         }
 
         warn!(
@@ -906,10 +914,15 @@ impl RemoteControlWebsocket {
         );
         join_set.abort_all();
         Self::drain_join_set(join_set).await;
+        false
     }
 
-    async fn drain_join_set(join_set: &mut tokio::task::JoinSet<()>) {
-        while join_set.join_next().await.is_some() {}
+    async fn drain_join_set(join_set: &mut tokio::task::JoinSet<()>) -> bool {
+        let mut clean = true;
+        while let Some(result) = join_set.join_next().await {
+            clean &= result.is_ok();
+        }
+        clean
     }
 
     async fn run_server_writer(

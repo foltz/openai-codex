@@ -157,6 +157,7 @@ pub(super) enum HistoryCapabilities {
     ThreadStartFails,
     RecoveryUnsupported,
     RecoveryRevisionMismatch,
+    RecoveryWithoutStateDb,
     ConfigReadUnsupported(i64),
     ConfigReadFails,
     ConfigReadUnknownVoice,
@@ -264,9 +265,12 @@ pub(super) async fn start_recording_app_server_with_realtime_speech(
     realtime_behavior: RealtimeRequestBehavior,
     loader_overrides: LoaderOverrides,
 ) -> Result<RecordingAppServer> {
-    let state_db =
+    let state_db = if history_capabilities == HistoryCapabilities::RecoveryWithoutStateDb {
+        None
+    } else {
         crate::init_state_db_for_app_server_target(config, &crate::AppServerTarget::Embedded)
-            .await?;
+            .await?
+    };
     let mut embedded = crate::start_embedded_app_server(
         codex_arg0::Arg0DispatchPaths::default(),
         config.clone(),

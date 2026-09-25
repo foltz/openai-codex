@@ -7,6 +7,65 @@ use crossterm::event::KeyModifiers;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
+async fn recovery_selects_supported_history_on_a_fresh_connection_without_retry() -> Result<()> {
+    for capabilities in [
+        HistoryCapabilities::Current,
+        HistoryCapabilities::RecoveryWithoutStateDb,
+    ] {
+        let (mut app, _, _) = make_test_app_with_channels().await;
+        let home = tempdir()?;
+        app.config.codex_home = home.path().to_path_buf().abs();
+        app.config.sqlite = SqliteConfig::new_for_testing(home.path().abs());
+        let (mut server, requests, proxy) = start_recording_app_server_with_history(
+            &app.config,
+            capabilities,
+            None,
+            None,
+            crate::app_server_session::ThreadParamsMode::Embedded,
+            LoaderOverrides::default(),
+        )
+        .await?;
+        let a = ThreadId::new();
+        // No start or fork has taught this newly connected session LegacyOnly.
+        let started = server
+            .start_clear_recovery(&app.local_settings, &app.config, Some(a))
+            .await?;
+        assert_ne!(started.session.thread_id, a);
+        let starts = recorded_params(&requests, "thread/start");
+        assert_eq!(starts.len(), 1);
+        assert!(starts[0]["historyMode"].is_null());
+        assert_eq!(
+            starts[0]["clearRecovery"]["predecessorThreadId"],
+            a.to_string()
+        );
+        let read = server
+            .request_handle()
+            .request_typed::<codex_app_server_protocol::ThreadClearRecoveryReadResponse>(
+                codex_app_server_protocol::ClientRequest::ThreadClearRecoveryRead {
+                    request_id: codex_app_server_protocol::RequestId::String(
+                        "recovery-check".into(),
+                    ),
+                    params: codex_app_server_protocol::ThreadClearRecoveryReadParams {
+                        successor_thread_id: Some(started.session.thread_id.to_string()),
+                    },
+                },
+            )
+            .await;
+        if capabilities == HistoryCapabilities::RecoveryWithoutStateDb {
+            assert!(read.is_err());
+        } else {
+            assert!(matches!(
+                read?.observation,
+                codex_app_server_protocol::ThreadClearRecoveryObservation::Complete { .. }
+            ));
+        }
+        server.shutdown().await?;
+        proxy.await??;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn recovery_checks_support_before_creation_and_never_retries_a_failed_start() -> Result<()> {
     for capabilities in [
         HistoryCapabilities::RecoveryUnsupported,

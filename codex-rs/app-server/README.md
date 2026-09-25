@@ -463,6 +463,9 @@ Send `thread/start` with `sessionStartSource: "clear"` and
 when there genuinely is no displayed predecessor. Never put recovery A in
 `clearPredecessorThreadId`. Unsupported producers must not be sent a recovery
 creation request. There is no automatic creation retry or idempotency key.
+The recovery TUI omits `historyMode`: the server selects paginated history when
+its store supports it and otherwise uses its normal legacy default. This avoids
+a pagination-discovery retry on a fresh or reconnected client.
 
 `ThreadStartResponse.clearRecovery` echoes `successorThreadId`, the accepted
 `context`, and `durability`. An absent/mismatched echo or lost response is an

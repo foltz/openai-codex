@@ -39,9 +39,10 @@ impl AppServerSession {
             /*clear_predecessor_thread_id*/ None,
         );
         params.clear_recovery = Some(context.clone());
-        if self.history_support == ThreadHistorySupport::LegacyOnly {
-            params.history_mode = None;
-        }
+        // Let this producer select its supported history mode before creating B.
+        // A reconnect has not learned LegacyOnly, and recovery must not need a
+        // second creation request just to discover pagination support.
+        params.history_mode = None;
         self.thread_tool_transport().configure(&mut params);
         let task_tools_available = params.dynamic_tools.is_some()
             || params

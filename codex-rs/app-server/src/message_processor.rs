@@ -1724,9 +1724,13 @@ impl MessageProcessor {
                 Ok(response)
             }
             ClientRequest::ThreadClear { params, .. } => {
-                self.thread_processor
-                    .thread_clear(request_id.clone(), params)
-                    .await
+                // Keep successor-construction temporaries out of the shared dispatcher frame.
+                Box::pin(async {
+                    self.thread_processor
+                        .thread_clear(request_id.clone(), params)
+                        .await
+                })
+                .await
             }
             ClientRequest::ThreadInteractiveSubscriptionList { params, .. } => {
                 self.thread_processor

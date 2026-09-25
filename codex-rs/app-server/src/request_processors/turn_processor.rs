@@ -647,6 +647,9 @@ impl TurnRequestProcessor {
             )
             .await?;
 
+        // Core's queued submission carries its own host lease. The request's
+        // admission remains scoped by the executing dispatcher, not a listener.
+        let request_trace_context = self.request_trace_context(&request_id).await;
         let submission = thread
             .start_or_steer_turn(
                 TurnInputRequest::new(input)
@@ -660,7 +663,7 @@ impl TurnRequestProcessor {
                     })
                     .with_additional_context(additional_context)
                     .with_responses_metadata(params.responsesapi_client_metadata)
-                    .with_trace(self.request_trace_context(&request_id).await),
+                    .with_trace(request_trace_context),
             )
             .await
             .map_err(|err| {

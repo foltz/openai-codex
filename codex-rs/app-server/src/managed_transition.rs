@@ -87,6 +87,30 @@ pub(crate) struct AccountWorkPermitGuard {
     permits: AccountWorkPermits,
 }
 
+impl AccountWorkPermitGuard {
+    /// Count a child operation started by this already-admitted work.
+    ///
+    /// Unlike fresh admission, derivation remains valid after barrier closure:
+    /// the borrowed parent keeps the count nonzero until the child is counted.
+    /// The child has its own lifetime and must be retained until its terminal
+    /// evidence, even if the parent request or turn finishes first. Deriving
+    /// through the guard also prevents borrowing authority from another
+    /// coordinator's registry. Exhaustion refuses without changing the barrier.
+    pub(crate) fn try_derive(&self) -> Option<Self> {
+        self.permits
+            .inner
+            .state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                ((state & ACCOUNT_WORK_COUNT_MASK) < ACCOUNT_WORK_COUNT_MASK)
+                    .then(|| state + 1)
+            })
+            .ok()?;
+        Some(Self {
+            permits: self.permits.clone(),
+        })
+    }
+}
+
 impl Drop for AccountWorkPermitGuard {
     fn drop(&mut self) {
         self.permits.inner.state.fetch_sub(1, Ordering::AcqRel);
@@ -95,7 +119,7 @@ impl Drop for AccountWorkPermitGuard {
 }
 
 impl AccountWorkPermits {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: Arc::new(AccountWorkPermitsInner {
                 state: AtomicU64::new(0),
@@ -172,6 +196,7 @@ pub(crate) struct ManagedTransitionCoordinator {
     /// only ever queries it, never mutates it.
     target_evidence_source: Arc<dyn TargetEvidenceSource>,
     account_work_permits: AccountWorkPermits,
+    account_turn_work: crate::account_turn_work::AccountTurnWork,
     /// `None` for every Slice 1-3 construction path (`new`,
     /// `from_authoritative_auth_state[_and_target_evidence_source]`): those
     /// coordinators keep exactly their pre-Slice-4 behavior, closing the
@@ -559,6 +584,7 @@ impl ManagedTransitionCoordinator {
             })),
             target_evidence_source,
             account_work_permits: AccountWorkPermits::new(),
+            account_turn_work: crate::account_turn_work::AccountTurnWork::default(),
             adoption: None,
         }
     }
@@ -646,6 +672,23 @@ impl ManagedTransitionCoordinator {
     /// the coordinator's auth manager or reset inventory.
     pub(crate) fn account_work_permits(&self) -> AccountWorkPermits {
         self.account_work_permits.clone()
+    }
+
+    /// Listener-independent turn evidence shared with host admission hooks.
+    pub(crate) fn account_turn_work(&self) -> crate::account_turn_work::AccountTurnWork {
+        self.account_turn_work.clone()
+    }
+
+    /// Bind the owners created before ThreadManager and its host callbacks.
+    /// Used only during process construction, before this coordinator admits work.
+    pub(crate) fn with_account_work(
+        mut self,
+        permits: AccountWorkPermits,
+        work: crate::account_turn_work::AccountTurnWork,
+    ) -> Self {
+        self.account_work_permits = permits;
+        self.account_turn_work = work;
+        self
     }
 
     /// Re-derives current target evidence from this coordinator's own source
@@ -1034,7 +1077,13 @@ impl ManagedTransitionCoordinator {
                 break;
             }
 
-            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+            let work_finished = async {
+                tokio::select! {
+                    _ = notified => {}
+                    _ = self.account_turn_work.observe_terminated() => {}
+                }
+            };
+            if tokio::time::timeout_at(deadline, work_finished).await.is_err() {
                 // Deadline elapsed. `advance` sets `retryable: true` for
                 // `Quarantined` already; no auth was ever touched and
                 // admitted work was never cancelled or killed (R013).

@@ -14,6 +14,7 @@ use serde_json::json;
 use tracing::warn;
 
 use crate::config_manager::ConfigManager;
+use crate::managed_transition::AccountWorkPermits;
 use crate::processor_task_retirement::ProcessorTasks;
 use crate::request_processors::ConfigRequestProcessor;
 use crate::request_serialization::RequestSerializationAccess;
@@ -28,13 +29,26 @@ pub(crate) fn effective_plugins_changed_callback(
     config_processor: ConfigRequestProcessor,
     request_serialization_queues: RequestSerializationQueues,
     tasks: ProcessorTasks,
+    account_work_permits: AccountWorkPermits,
 ) -> Arc<dyn Fn(EffectivePluginsChange) + Send + Sync> {
     Arc::new(move |change| {
+        // Cache invalidation is synchronous and account-safe while the barrier
+        // is closed. It must not be dropped with the account-bound async work:
+        // reset does not otherwise re-drive this callback after reopening.
         thread_manager.plugins_manager().clear_cache();
         thread_manager.skills_service().clear_cache();
 
+        let Some(permit) = account_work_permits.try_acquire() else {
+            return;
+        };
+        // One admission covers every callback effect. Each actual async owner
+        // retains a share, including the queued future after enqueue returns.
+        let permit = Arc::new(permit);
+
         let refresh_thread_manager = Arc::clone(&thread_manager);
+        let refresh_permit = Arc::clone(&permit);
         if let Err(err) = tasks.spawn_unverified(async move {
+            let _permit = refresh_permit;
             refresh_thread_manager.invalidate_mcp_runtimes().await;
             refresh_thread_manager.refresh_hook_runtimes().await;
         }) {
@@ -56,6 +70,7 @@ pub(crate) fn effective_plugins_changed_callback(
                     RequestSerializationQueueKey::Global("config"),
                     RequestSerializationAccess::Exclusive,
                     async move {
+                        let _permit = permit;
                         if let Err(err) = trust_materialized_plugin_hooks(
                             change.materialized_remote_plugins,
                             &trust_auth_manager,

@@ -5,6 +5,7 @@ use std::time::Duration;
 struct PausedStart {
     entered: tokio::sync::Semaphore,
     release: tokio::sync::Semaphore,
+    resumed: std::sync::atomic::AtomicUsize,
 }
 
 impl codex_extension_api::TurnLifecycleContributor for PausedStart {
@@ -15,6 +16,7 @@ impl codex_extension_api::TurnLifecycleContributor for PausedStart {
         Box::pin(async move {
             self.entered.add_permits(1);
             self.release.acquire().await.unwrap().forget();
+            self.resumed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         })
     }
 }
@@ -25,6 +27,7 @@ async fn completion_wake_survives_producer_abort_and_is_driven_by_loop() {
     let pause = Arc::new(PausedStart {
         entered: tokio::sync::Semaphore::new(0),
         release: tokio::sync::Semaphore::new(0),
+        resumed: std::sync::atomic::AtomicUsize::new(0),
     });
     let mut builder = codex_extension_api::ExtensionRegistryBuilder::<Config>::new();
     builder.turn_lifecycle_contributor(pause.clone());
@@ -56,12 +59,32 @@ async fn completion_wake_survives_producer_abort_and_is_driven_by_loop() {
     tokio::time::timeout(Duration::from_secs(10), pause.entered.acquire())
         .await.expect("loop drove stored completion wake").unwrap().forget();
     assert!(session.active_turn.lock().await.as_ref().is_some_and(|turn| turn.task.is_none()));
-    session.close_task_admission().await;
-    drop(sender);
-    pause.release.add_permits(1);
+    let (reply, response) = tokio::sync::oneshot::channel();
+    sender.send(codex_protocol::protocol::Submission {
+        id: "suspend-during-mailbox-start".into(),
+        op: codex_protocol::protocol::Op::SuspendTurnAndShutdown { reply },
+        trace: None,
+        parent_turn_id: None,
+        root_turn_id: None,
+    }).await.unwrap();
+    assert!(matches!(tokio::time::timeout(Duration::from_secs(10), response)
+        .await.expect("suspension remains dispatchable").unwrap().unwrap(),
+        codex_protocol::turn_input::SuspendTurnOutcome::NotActive));
+    // Do not release the paused start. A queued shutdown must remain
+    // dispatchable while the loop owns that preparation future.
+    sender.send(codex_protocol::protocol::Submission {
+        id: "shutdown-during-mailbox-start".into(),
+        op: codex_protocol::protocol::Op::Shutdown,
+        trace: None,
+        parent_turn_id: None,
+        root_turn_id: None,
+    }).await.unwrap();
     tokio::time::timeout(Duration::from_secs(10), loop_task)
-        .await.expect("channel close still terminates loop").unwrap();
+        .await.expect("shutdown preempts held mailbox preparation").unwrap();
     assert!(session.active_turn.lock().await.is_none());
+    pause.release.add_permits(1);
+    tokio::task::yield_now().await;
+    assert_eq!(pause.resumed.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

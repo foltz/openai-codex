@@ -518,17 +518,24 @@ pub(super) async fn submission_loop(
     // To break out of this loop, send Op::Shutdown.
     let _cleanup_owner = sess.cleanup_owner();
     let mut shutdown_received = false;
+    // As with the former finishing-task caller, birth can interleave with
+    // handlers; install-time task admission remains the shutdown fence.
+    let mut mailbox_start: Option<futures::future::BoxFuture<'_, ()>> = None;
     loop {
+        if rx_sub.is_closed() && rx_sub.is_empty() {
+            break;
+        }
         let sub = tokio::select! {
-            // Channel closure and queued control operations take precedence
-            // over background wakeups, including during shutdown.
-            biased;
             sub = rx_sub.recv() => match sub {
                 Ok(sub) => sub,
                 Err(_) => break,
             },
-            _ = sess.input_queue.completion_wake.notified() => {
-                sess.maybe_start_turn_for_pending_work().await;
+            _ = sess.input_queue.completion_wake.notified(), if mailbox_start.is_none() => {
+                mailbox_start = Some(Box::pin(sess.maybe_start_turn_for_pending_work()));
+                continue;
+            }
+            _ = async { mailbox_start.as_mut().expect("guarded mailbox start").await }, if mailbox_start.is_some() => {
+                mailbox_start = None;
                 continue;
             }
         };
@@ -541,7 +548,7 @@ pub(super) async fn submission_loop(
             debug!(?sub, "Submission");
         }
         let dispatch_span = submission_dispatch_span(&sub);
-        let should_exit = async {
+        let dispatch = async {
             match sub.op {
                 Op::HostTurn { action, mut work } => {
                     work.bind_submission(&sub.id);
@@ -748,13 +755,25 @@ pub(super) async fn submission_loop(
                 _ => false, // Ignore unknown ops; enum is non_exhaustive to allow extensions.
             }
         }
-        .instrument(dispatch_span)
-        .await;
+        .instrument(dispatch_span);
+        tokio::pin!(dispatch);
+        // Keep discovery/start progressing even when a control handler waits
+        // on a lock it holds. Conversely, discovery never blocks dispatch.
+        let should_exit = loop {
+            tokio::select! {
+                result = &mut dispatch => break result,
+                _ = async { mailbox_start.as_mut().expect("guarded mailbox start").await }, if mailbox_start.is_some() => {
+                    mailbox_start = None;
+                }
+            }
+        };
         if should_exit {
             shutdown_received = true;
             break;
         }
     }
+    // Release any suspended preparation before cleanup acquires its locks.
+    drop(mailbox_start);
     // If the submission loop exits because the channel closed without an
     // explicit shutdown op, still run session teardown.
     if !shutdown_received {

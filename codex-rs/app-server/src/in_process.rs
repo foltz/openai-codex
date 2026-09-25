@@ -568,6 +568,7 @@ async fn start_uninitialized(
         // enclosing runtime retains these owners independently of that task's
         // join; the host shutdown controller will retain the enclosing owner.
         let processor_owner = Arc::new(MessageProcessor::new(MessageProcessorArgs {
+            telemetry_reset: crate::otel_reset_control::TelemetryResetControl::default(),
             outgoing: Arc::clone(&processor_outgoing),
             analytics_events_client,
             arg0_paths: args.arg0_paths,
@@ -588,6 +589,8 @@ async fn start_uninitialized(
             rpc_transport: AppServerRpcTransport::InProcess,
             remote_control_handle: None,
             plugin_startup_tasks: Some(PluginStartupConfig::Current),
+            managed_transition_control_socket_endpoint: None,
+            managed_transition_process_instance_id: None,
             control_endpoint: None,
         }));
         let session_owner = Arc::new(ConnectionSessionState::in_process());

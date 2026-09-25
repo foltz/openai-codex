@@ -5,6 +5,7 @@ use std::env;
 use std::str::FromStr;
 use std::sync::OnceLock;
 use std::sync::RwLock;
+use std::sync::RwLockWriteGuard;
 
 use codex_protocol::protocol::W3cTraceContext;
 use opentelemetry::Context;
@@ -23,8 +24,8 @@ static TRACEPARENT_CONTEXT: OnceLock<Option<Context>> = OnceLock::new();
 
 // Trace context propagation can happen outside the provider object, so configured
 // tracestate lives beside the process-global tracer provider.
-static TRACESTATE_ENTRIES: OnceLock<RwLock<BTreeMap<String, BTreeMap<String, String>>>> =
-    OnceLock::new();
+pub(crate) type TracestateEntries = BTreeMap<String, BTreeMap<String, String>>;
+static TRACESTATE_ENTRIES: OnceLock<RwLock<TracestateEntries>> = OnceLock::new();
 
 pub fn current_span_w3c_trace_context() -> Option<W3cTraceContext> {
     span_w3c_trace_context(&Span::current())
@@ -39,13 +40,9 @@ pub fn span_w3c_trace_context(span: &Span) -> Option<W3cTraceContext> {
     let mut headers = HashMap::new();
     TraceContextPropagator::new().inject_context(&context, &mut headers);
     let tracestate = headers.remove("tracestate");
-    let configured_tracestate_guard = tracestate_entries()
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-
     Some(W3cTraceContext {
         traceparent: headers.remove("traceparent"),
-        tracestate: merge_tracestate_entries(tracestate.as_deref(), &configured_tracestate_guard),
+        tracestate: merge_tracestate_snapshot(tracestate.as_deref(), tracestate_entries()),
     })
 }
 
@@ -85,11 +82,19 @@ pub(crate) fn set_tracestate_entries(
     entries: BTreeMap<String, BTreeMap<String, String>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     validate_tracestate_entries(&entries)?;
-    let mut guard = tracestate_entries()
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut guard = tracestate_publication_guard()?;
     *guard = entries;
     Ok(())
+}
+
+/// Acquire before a coordinated route commit; acquisition failure changes no
+/// metadata. Only install prevalidated entries while held. Do not log, invoke
+/// subscriber callbacks, or await until every publication guard is released.
+pub(crate) fn tracestate_publication_guard()
+-> std::io::Result<RwLockWriteGuard<'static, TracestateEntries>> {
+    tracestate_entries()
+        .write()
+        .map_err(|_| std::io::Error::other("telemetry propagation route unavailable"))
 }
 
 pub fn current_span_trace_id() -> Option<String> {
@@ -118,6 +123,16 @@ pub fn set_parent_from_w3c_trace_context(span: &Span, trace: &W3cTraceContext) -
 
 pub fn set_parent_from_context(span: &Span, context: Context) {
     let _ = span.set_parent(context);
+}
+
+/// Creates a contextual tracing span with its incoming parent already selected.
+/// This works with eager account-generation selection, where changing the parent
+/// after construction is too late. The closure must create a contextual span
+/// (not an explicit tracing parent), using the layer's context activation.
+/// The ambient context is restored before returning; no guard can cross await.
+pub fn span_with_parent_context(parent: Option<Context>, create: impl FnOnce() -> Span) -> Span {
+    let _parent = parent.map(Context::attach);
+    create()
 }
 
 pub fn traceparent_context_from_env() -> Option<Context> {
@@ -164,6 +179,23 @@ fn load_traceparent_context() -> Option<Context> {
 fn tracestate_entries() -> &'static RwLock<BTreeMap<String, BTreeMap<String, String>>> {
     TRACESTATE_ENTRIES.get_or_init(|| RwLock::new(BTreeMap::new()))
 }
+
+fn merge_tracestate_snapshot(
+    tracestate: Option<&str>,
+    entries: &RwLock<TracestateEntries>,
+) -> Option<String> {
+    let snapshot = entries
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    // Merging can emit tracing warnings. A subscriber may re-enter publication;
+    // no propagation guard may survive into that callback.
+    merge_tracestate_entries(tracestate, &snapshot)
+}
+
+#[cfg(test)]
+#[path = "trace_context_publication_tests.rs"]
+mod publication_tests;
 
 fn merge_tracestate_entries(
     tracestate: Option<&str>,

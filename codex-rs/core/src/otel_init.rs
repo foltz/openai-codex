@@ -8,6 +8,7 @@ use codex_otel::OtelHttpProtocol;
 use codex_otel::OtelProvider;
 use codex_otel::OtelSettings;
 use codex_otel::OtelTlsConfig as OtelTlsSettings;
+use codex_otel::PreparedOtelProvider;
 use std::error::Error;
 
 /// Build an OpenTelemetry provider from the app Config.
@@ -19,6 +20,36 @@ pub fn build_provider(
     service_name_override: Option<&str>,
     default_analytics_enabled: bool,
 ) -> Result<Option<OtelProvider>, Box<dyn Error>> {
+    OtelProvider::try_new(&provider_settings(
+        config,
+        service_version,
+        service_name_override,
+        default_analytics_enabled,
+    ))
+}
+
+/// Prepare account-configured exporters without changing any telemetry route.
+/// The reloader owns publication and must retain rejected-candidate retirement.
+pub fn prepare_provider(
+    config: &Config,
+    service_version: &str,
+    service_name_override: Option<&str>,
+    default_analytics_enabled: bool,
+) -> Result<PreparedOtelProvider, codex_otel::OtelPreparationError> {
+    OtelProvider::prepare(&provider_settings(
+        config,
+        service_version,
+        service_name_override,
+        default_analytics_enabled,
+    ))
+}
+
+fn provider_settings(
+    config: &Config,
+    service_version: &str,
+    service_name_override: Option<&str>,
+    default_analytics_enabled: bool,
+) -> OtelSettings {
     let to_otel_exporter = |kind: &Kind| match kind {
         Kind::None => OtelExporter::None,
         Kind::Statsig => OtelExporter::Statsig,
@@ -80,7 +111,7 @@ pub fn build_provider(
     let service_name = service_name_override.unwrap_or(originator.value.as_str());
     let runtime_metrics = config.features.enabled(Feature::RuntimeMetrics);
 
-    OtelProvider::try_new(&OtelSettings {
+    OtelSettings {
         service_name: service_name.to_string(),
         service_version: service_version.to_string(),
         codex_home: config.codex_home.to_path_buf(),
@@ -91,7 +122,7 @@ pub fn build_provider(
         runtime_metrics,
         span_attributes: config.otel.span_attributes.clone(),
         tracestate: config.otel.tracestate.clone(),
-    })
+    }
 }
 
 pub fn record_process_start(otel: Option<&OtelProvider>, originator: &str) {
@@ -108,3 +139,7 @@ pub fn install_sqlite_telemetry(otel: Option<&OtelProvider>, originator: &str) {
     let telemetry = codex_rollout::sqlite_telemetry_recorder(metrics.clone(), originator);
     let _ = codex_state::install_process_db_telemetry(telemetry);
 }
+
+#[cfg(test)]
+#[path = "otel_init_tests.rs"]
+mod tests;

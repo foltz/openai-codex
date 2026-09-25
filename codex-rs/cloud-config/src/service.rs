@@ -84,7 +84,7 @@ pub(crate) struct CloudConfigBundleService<C> {
     client: Arc<C>,
     cache: CloudConfigBundleCache,
     cache_enabled: bool,
-    codex_home: AbsolutePathBuf,
+    pub(crate) codex_home: AbsolutePathBuf,
     timeout: Duration,
     latest_bundle: OnceCell<Mutex<Result<Option<CloudConfigBundle>, CloudConfigBundleLoadError>>>,
 }

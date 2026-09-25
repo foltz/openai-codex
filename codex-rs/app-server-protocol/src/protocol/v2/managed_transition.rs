@@ -1,5 +1,6 @@
 use crate::JsonSchema;
 use crate::TS;
+use codex_experimental_api_macros::ExperimentalApi;
 use serde::Deserialize;
 use serde::Serialize;
 use serde::de::Error as _;
@@ -84,7 +85,11 @@ impl ManagedTransitionPhase {
 }
 
 /// Typed, secret-safe reasons for a transition request to be refused.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+// The same vocabulary carries terminal quarantine causes in status.refusal.
+// New causes are experimental; existing stable type exports remain unchanged.
+#[derive(
+    Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS, ExperimentalApi,
+)]
 #[serde(rename_all = "camelCase")]
 #[ts(rename_all = "camelCase", export_to = "v2/")]
 pub enum ManagedTransitionRefusalKind {
@@ -99,6 +104,18 @@ pub enum ManagedTransitionRefusalKind {
     LateCancellation,
     AuthorizationNotAdmitted,
     AuthoritativeAuthUnavailable,
+    #[experimental("managedAccountTransitionTerminalCauses")]
+    DrainTimedOut,
+    #[experimental("managedAccountTransitionTerminalCauses")]
+    TargetChanged,
+    #[experimental("managedAccountTransitionTerminalCauses")]
+    AuthSourceChanged,
+    #[experimental("managedAccountTransitionTerminalCauses")]
+    ResetFailed,
+    #[experimental("managedAccountTransitionTerminalCauses")]
+    AuthInstallFailed,
+    #[experimental("managedAccountTransitionTerminalCauses")]
+    IntendedResultMismatch,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
@@ -161,6 +178,11 @@ pub struct StartManagedTransitionParams {
     #[serde(deserialize_with = "deserialize_required_nullable")]
     #[schemars(required, schema_with = "nullable_string_schema")]
     pub expected_auth_fingerprint: Option<String>,
+    /// Independently binds the intended result. Explicit null means managed
+    /// logout; account adoption requires a nonempty opaque fingerprint.
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    #[schemars(required, schema_with = "nullable_string_schema")]
+    pub intended_result_auth_fingerprint: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
@@ -177,6 +199,8 @@ pub enum StartManagedTransitionResponse {
 pub struct ReadManagedTransitionParams {
     #[serde(deserialize_with = "deserialize_contract_version")]
     pub contract_version: u8,
+    /// An empty id requests the current CAS baseline when no transition owns
+    /// the barrier. A nonempty id reads that exact active or completed record.
     pub transition_id: String,
     pub process_instance_id: String,
 }
@@ -229,6 +253,7 @@ mod tests {
             expected_auth_revision: 4,
             expected_transition_revision: 7,
             expected_auth_fingerprint: Some("opaque-fingerprint".to_owned()),
+            intended_result_auth_fingerprint: Some("intended-fingerprint".to_owned()),
         };
         let json = serde_json::to_string(&params).unwrap();
         assert_eq!(
@@ -255,6 +280,7 @@ mod tests {
             expected_auth_revision: 4,
             expected_transition_revision: 7,
             expected_auth_fingerprint: None,
+            intended_result_auth_fingerprint: None,
         };
         let mut unknown = serde_json::to_value(&start).unwrap();
         unknown["accessToken"] = serde_json::json!("secret");
@@ -272,6 +298,12 @@ mod tests {
         assert!(
             serde_json::from_value::<StartManagedTransitionParams>(missing_fingerprint).is_err()
         );
+        let mut missing_intended = serde_json::to_value(&start).unwrap();
+        missing_intended
+            .as_object_mut()
+            .unwrap()
+            .remove("intendedResultAuthFingerprint");
+        assert!(serde_json::from_value::<StartManagedTransitionParams>(missing_intended).is_err());
 
         for value in [
             serde_json::json!({

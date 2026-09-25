@@ -6,7 +6,6 @@
 
 use codex_app_server_protocol::CancelManagedTransitionParams;
 use codex_app_server_protocol::CancelManagedTransitionResponse;
-use codex_app_server_protocol::MANAGED_AUTH_TRANSITION_CONTRACT_VERSION;
 use codex_app_server_protocol::ManagedTransitionIntent;
 use codex_app_server_protocol::ManagedTransitionPhase;
 use codex_app_server_protocol::ManagedTransitionRefusal;
@@ -18,13 +17,18 @@ use codex_app_server_protocol::StartManagedTransitionParams;
 use codex_app_server_protocol::StartManagedTransitionResponse;
 use codex_login::AuthManager;
 use codex_login::auth::ManagedAdoptionInstallOutcome;
-use codex_login::auth::ManagedAdoptionSourceOutcome;
+use codex_login::auth::ManagedAdoptionPrecondition;
+use codex_login::auth::ManagedAdoptionVerificationError;
+use codex_login::auth::PreparedManagedAdoption;
+#[cfg(test)]
 use sha2::Digest;
+#[cfg(test)]
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+#[cfg(test)]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -32,6 +36,10 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use uuid::Uuid;
+
+#[cfg(test)]
+#[path = "managed_account_projection_tests.rs"]
+mod account_projection_tests;
 
 /// The bounded wait for admitted account-dependent work to drain to zero
 /// before auth mutation (`CODEX-I05-S03-R012`). Fixed rather than
@@ -55,14 +63,20 @@ pub(crate) struct AccountWorkPermits {
 }
 
 struct AccountWorkPermitsInner {
-    barrier_closed: AtomicBool,
-    admitted: AtomicU64,
+    /// Closure and population share one modification order. Separate atomics
+    /// would permit an acquirer to see open while the closer sees zero.
+    state: AtomicU64,
     /// Shared by permit release and by cancellation of a draining
     /// transition -- both are "something the drain wait should recheck"
     /// events. A spurious wake from the other event class costs only one
     /// extra recheck of the two loop conditions.
     signal: Notify,
+    #[cfg(test)]
+    after_reopen: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
+
+const ACCOUNT_WORK_CLOSED: u64 = 1 << 63;
+const ACCOUNT_WORK_COUNT_MASK: u64 = ACCOUNT_WORK_CLOSED - 1;
 
 /// Held for the lifetime of one admitted account-dependent request's
 /// handling. Releases exactly once, from every terminal path (success,
@@ -75,7 +89,7 @@ pub(crate) struct AccountWorkPermitGuard {
 
 impl Drop for AccountWorkPermitGuard {
     fn drop(&mut self) {
-        self.permits.inner.admitted.fetch_sub(1, Ordering::AcqRel);
+        self.permits.inner.state.fetch_sub(1, Ordering::AcqRel);
         self.permits.inner.signal.notify_waiters();
     }
 }
@@ -84,41 +98,54 @@ impl AccountWorkPermits {
     fn new() -> Self {
         Self {
             inner: Arc::new(AccountWorkPermitsInner {
-                barrier_closed: AtomicBool::new(false),
-                admitted: AtomicU64::new(0),
+                state: AtomicU64::new(0),
                 signal: Notify::new(),
+                #[cfg(test)]
+                after_reopen: std::sync::Mutex::new(None),
             }),
         }
     }
 
-    /// Increment-then-check, not check-then-increment: this ordering means
-    /// a permit acquired concurrently with [`Self::close`] either observes
-    /// the close and backs out, or is guaranteed visible to the close's own
-    /// drain wait, because it incremented the count before that wait's
-    /// first read of it could possibly have happened. No straggler can
-    /// slip past the barrier undetected in either direction.
+    /// The successful CAS either precedes close in this one atomic's
+    /// modification order (and is counted), or observes closure and refuses.
+    /// Exhaustion also refuses rather than carrying into the closed bit.
     pub(crate) fn try_acquire(&self) -> Option<AccountWorkPermitGuard> {
-        self.inner.admitted.fetch_add(1, Ordering::AcqRel);
-        if self.inner.barrier_closed.load(Ordering::Acquire) {
-            self.inner.admitted.fetch_sub(1, Ordering::AcqRel);
-            self.inner.signal.notify_waiters();
-            return None;
-        }
+        self.inner
+            .state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                if state & ACCOUNT_WORK_CLOSED != 0 || state == ACCOUNT_WORK_COUNT_MASK {
+                    None
+                } else {
+                    Some(state + 1)
+                }
+            })
+            .ok()?;
         Some(AccountWorkPermitGuard {
             permits: self.clone(),
         })
     }
 
     fn close(&self) {
-        self.inner.barrier_closed.store(true, Ordering::Release);
+        self.inner
+            .state
+            .fetch_or(ACCOUNT_WORK_CLOSED, Ordering::AcqRel);
     }
 
     fn reopen(&self) {
-        self.inner.barrier_closed.store(false, Ordering::Release);
+        // The coordinator owns the terminal-state invariant authorizing this;
+        // cancelling a drain must preserve permits that are still finishing.
+        self.inner
+            .state
+            .fetch_and(ACCOUNT_WORK_COUNT_MASK, Ordering::AcqRel);
+        // Observe the actual admission-opening point, not terminal return.
+        #[cfg(test)]
+        if let Some(observe) = self.inner.after_reopen.lock().unwrap().take() {
+            observe();
+        }
     }
 
-    fn admitted_count(&self) -> u64 {
-        self.inner.admitted.load(Ordering::Acquire)
+    pub(crate) fn admitted_count(&self) -> u64 {
+        self.inner.state.load(Ordering::Acquire) & ACCOUNT_WORK_COUNT_MASK
     }
 
     fn wake_waiters(&self) {
@@ -134,6 +161,10 @@ impl AccountWorkPermits {
     }
 }
 
+#[cfg(test)]
+#[path = "account_work_permits_tests.rs"]
+mod account_work_permits_tests;
+
 #[derive(Clone)]
 pub(crate) struct ManagedTransitionCoordinator {
     state: Arc<Mutex<CoordinatorState>>,
@@ -146,7 +177,7 @@ pub(crate) struct ManagedTransitionCoordinator {
     /// coordinators keep exactly their pre-Slice-4 behavior, closing the
     /// barrier and draining but never auto-continuing into adoption. `Some`
     /// only via
-    /// [`Self::from_authoritative_auth_state_target_evidence_and_adoption`],
+    /// [`Self::with_adoption_and_account_projection`],
     /// the real production path (Issue 05 Slice 4, R014).
     adoption: Option<AdoptionDependencies>,
 }
@@ -155,10 +186,54 @@ pub(crate) struct ManagedTransitionCoordinator {
 struct AdoptionDependencies {
     auth_manager: Arc<AuthManager>,
     reset_inventory: Arc<dyn ResetInventory>,
+    outgoing: Option<Arc<crate::outgoing_message::OutgoingMessageSender>>,
 }
 
 pub(crate) type ResetInventoryFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = Result<(), ResetInventoryError>> + Send + 'a>>;
+
+/// Fixed internal inventory causes. Never retain backend text or credentials.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResetInventoryError {
+    AccountProjection(crate::outgoing_message::AccountProjectionReservationError),
+    Telemetry(crate::otel_reset_control::TelemetryResetError),
+    CloudConfigUnavailable,
+    ConfigPublicationUnavailable,
+    CloudConfigTimedOut,
+    ConfigLoadUnavailable,
+    ConfigLoadTimedOut,
+    ResidencyUnavailable,
+    RemoteControlUnavailable,
+    ThreadsIncomplete {
+        submit_failed: usize,
+        timed_out: usize,
+    },
+    PluginRetirementUnavailable,
+    ModelsWorkerUnavailable,
+    ModelCatalogTimedOut,
+    ModelCatalogUnavailable,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TransitionFailure {
+    kind: ManagedTransitionRefusalKind,
+    reset: Option<ResetInventoryError>,
+}
+
+impl From<ManagedTransitionRefusalKind> for TransitionFailure {
+    fn from(kind: ManagedTransitionRefusalKind) -> Self {
+        Self { kind, reset: None }
+    }
+}
+
+impl From<ResetInventoryError> for TransitionFailure {
+    fn from(reset: ResetInventoryError) -> Self {
+        Self {
+            kind: ManagedTransitionRefusalKind::ResetFailed,
+            reset: Some(reset),
+        }
+    }
+}
 
 /// Injectable, credential-free reset of every account-derived cache/worker
 /// after a successful managed-auth adoption (Issue 05 Slice 4, R014). Never
@@ -178,6 +253,7 @@ pub(crate) trait ResetInventory: Send + Sync {
 /// completion) or `Quarantined` (a reset-inventory failure after auth was
 /// already installed/logged out) -- in both cases the coordinator's own
 /// tracked truth must match what `AuthManager` actually holds.
+#[derive(Clone)]
 enum AdoptedAuthUpdate {
     Adopted(String),
     LoggedOut,
@@ -197,10 +273,12 @@ impl TargetEvidenceSource for UnsetTargetEvidenceSource {
     fn executable_identity(
         &self,
     ) -> std::io::Result<codex_app_server_transport::PeerExecutableIdentity> {
-        Ok(codex_app_server_transport::PeerExecutableIdentity::FileIdentity {
-            device: 0,
-            inode: 0,
-        })
+        Ok(
+            codex_app_server_transport::PeerExecutableIdentity::FileIdentity {
+                device: 0,
+                inode: 0,
+            },
+        )
     }
 
     fn endpoint(&self) -> String {
@@ -227,12 +305,17 @@ pub(crate) struct AuthoritativeAuthState {
 
 impl AuthoritativeAuthState {
     pub(crate) fn from_auth_manager(auth_manager: &AuthManager) -> Self {
-        match auth_manager.authoritative_auth_cached() {
-            Ok(auth) => Self::from_account_id(auth.and_then(|auth| auth.get_account_id())),
+        match auth_manager.authoritative_managed_auth_fingerprint() {
+            Ok(auth_fingerprint) => Self {
+                authority_available: true,
+                auth_revision: 0,
+                auth_fingerprint,
+            },
             Err(_) => Self::unavailable(),
         }
     }
 
+    #[cfg(test)]
     fn from_account_id(account_id: Option<String>) -> Self {
         let auth_fingerprint = account_id.as_deref().map(account_fingerprint);
         Self {
@@ -253,17 +336,11 @@ impl AuthoritativeAuthState {
     }
 }
 
-/// The single domain-separated account-fingerprint derivation shared by
-/// every reader of the credential-free auth state: the process-startup
-/// snapshot ([`AuthoritativeAuthState::from_account_id`]) and a successful
-/// managed-auth adoption's new CAS baseline
-/// (`ManagedTransitionCoordinator::complete_adoption`, Issue 05 Slice 4).
-/// Never reversible and never logs or returns the account id itself.
+/// Test fixture adapter for the manager-owned fingerprint derivation.
+/// Production coordinator paths receive only fingerprints from AuthManager.
+#[cfg(test)]
 fn account_fingerprint(account_id: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"codex-app-server/managed-auth-transition/account/v1\\0");
-    hasher.update(account_id.as_bytes());
-    format!("{:x}", hasher.finalize())
+    AuthManager::managed_account_fingerprint(account_id)
 }
 
 /// The environment variable a future repository-owned command (Slice 5) sets
@@ -282,7 +359,9 @@ pub(crate) const MANAGED_PROFILE_ENV_VAR: &str = "KESTREL_CODEX_MANAGED_PROFILE"
 /// (`R049-R050`, `R053`, `R060-R062`).
 pub(crate) trait TargetEvidenceSource: Send + Sync {
     fn declared_profile(&self) -> Option<String>;
-    fn executable_identity(&self) -> std::io::Result<codex_app_server_transport::PeerExecutableIdentity>;
+    fn executable_identity(
+        &self,
+    ) -> std::io::Result<codex_app_server_transport::PeerExecutableIdentity>;
     fn endpoint(&self) -> String;
     fn pid(&self) -> u32;
 }
@@ -305,7 +384,9 @@ impl TargetEvidenceSource for ProcessTargetEvidenceSource {
         std::env::var(MANAGED_PROFILE_ENV_VAR).ok()
     }
 
-    fn executable_identity(&self) -> std::io::Result<codex_app_server_transport::PeerExecutableIdentity> {
+    fn executable_identity(
+        &self,
+    ) -> std::io::Result<codex_app_server_transport::PeerExecutableIdentity> {
         codex_app_server_transport::PeerExecutableIdentity::capture_running_process()
     }
 
@@ -326,22 +407,16 @@ impl TargetEvidenceSource for ProcessTargetEvidenceSource {
 /// observed rather than masked by a stale snapshot.
 ///
 /// Deliberately does not derive `PartialEq`/`Eq`: the only intended
-/// comparison is [`Self::matches_target`], which excludes `record_identity`.
-/// A derived structural equality would silently disagree with that
-/// semantics (it would compare `record_identity` too, so it would always be
-/// `false` between any two captures) — see `CODEX-I05-S02` verification
-/// round 01, M2.
+/// comparison is [`Self::matches_target`]. A derived structural equality
+/// would obscure that the executable identity is unavailable evidence rather
+/// than an ordinary optional field — see `CODEX-I05-S02` verification round
+/// 01, M2.
 #[derive(Debug, Clone)]
 pub(crate) struct TargetEvidence {
     declared_profile: Option<String>,
     executable_identity: Option<codex_app_server_transport::PeerExecutableIdentity>,
     endpoint: String,
     pid: u32,
-    /// A fresh opaque identity for this specific evidence snapshot, distinct
-    /// from the coordinator's own process-instance identity: it changes on
-    /// every capture, not only on restart, so two captures within the same
-    /// process are still distinguishable records.
-    record_identity: String,
 }
 
 impl TargetEvidence {
@@ -353,14 +428,12 @@ impl TargetEvidence {
             executable_identity: source.executable_identity().ok(),
             endpoint: source.endpoint(),
             pid: source.pid(),
-            record_identity: Uuid::new_v4().to_string(),
         }
     }
 
     /// True only when every replacement-sensitive fact this capture observed
-    /// is identical to the reference capture (`record_identity` excluded --
-    /// it identifies the snapshot itself, not the target). `executable_identity`
-    /// missing on *either* side is never treated as a match: an unavailable
+    /// is identical to the reference capture. `executable_identity` missing
+    /// on *either* side is never treated as a match: an unavailable
     /// executable identity is exactly the "replaced/unreadable process"
     /// condition this check exists to catch, not evidence of consistency.
     fn matches_target(&self, reference: &TargetEvidence) -> bool {
@@ -384,6 +457,17 @@ struct CoordinatorState {
     target_evidence: TargetEvidence,
     active: Option<TransitionRecord>,
     completed: HashMap<String, TransitionRecord>,
+    pending_reset: Option<PendingResetRecovery>,
+}
+
+/// The sole owner of already-applied auth whose reset has not completed.
+/// Completed records remain immutable history when ownership transfers.
+#[derive(Debug, Clone)]
+struct PendingResetRecovery {
+    owner_transition_id: String,
+    intent: ManagedTransitionIntent,
+    auth_fingerprint: Option<String>,
+    auth_revision: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -394,6 +478,7 @@ struct TransitionEnvelope {
     expected_auth_revision: u64,
     expected_transition_revision: u64,
     expected_auth_fingerprint: Option<String>,
+    intended_result_auth_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -409,6 +494,14 @@ struct TransitionRecord {
     prior_auth_fingerprint: Option<String>,
     result_auth_fingerprint: Option<String>,
     refusal: Option<ManagedTransitionRefusalKind>,
+    reset_failure: Option<ResetInventoryError>,
+    /// True after auth installation until all reset work has completed.
+    /// Cancellation may never waive this obligation.
+    reset_pending: bool,
+    /// Credential-free manager revision captured at admission, never replaced
+    /// by a later snapshot after drain or source I/O.
+    adoption_precondition: Option<ManagedAdoptionPrecondition>,
+    prepared_adoption: Option<Arc<PreparedManagedAdoption>>,
 }
 
 impl ManagedTransitionCoordinator {
@@ -439,10 +532,22 @@ impl ManagedTransitionCoordinator {
         authoritative_auth: AuthoritativeAuthState,
         target_evidence_source: Arc<dyn TargetEvidenceSource>,
     ) -> Self {
+        Self::from_authoritative_auth_state_target_evidence_and_process_instance(
+            authoritative_auth,
+            target_evidence_source,
+            Uuid::now_v7().to_string(),
+        )
+    }
+
+    fn from_authoritative_auth_state_target_evidence_and_process_instance(
+        authoritative_auth: AuthoritativeAuthState,
+        target_evidence_source: Arc<dyn TargetEvidenceSource>,
+        process_instance_id: String,
+    ) -> Self {
         let target_evidence = TargetEvidence::capture(target_evidence_source.as_ref());
         Self {
             state: Arc::new(Mutex::new(CoordinatorState {
-                process_instance_id: Uuid::now_v7().to_string(),
+                process_instance_id,
                 auth_revision: authoritative_auth.auth_revision,
                 transition_revision: 0,
                 auth_fingerprint: authoritative_auth.auth_fingerprint,
@@ -450,6 +555,7 @@ impl ManagedTransitionCoordinator {
                 target_evidence,
                 active: None,
                 completed: HashMap::new(),
+                pending_reset: None,
             })),
             target_evidence_source,
             account_work_permits: AccountWorkPermits::new(),
@@ -457,14 +563,10 @@ impl ManagedTransitionCoordinator {
         }
     }
 
-    /// The real production construction path once adoption is wired
-    /// (`app-server/src/message_processor.rs`, Issue 05 Slice 4). Identical
-    /// to
-    /// [`Self::from_authoritative_auth_state_and_target_evidence_source`]
-    /// except that a successfully-drained transition now auto-continues
-    /// through Adopting/Resetting to its terminal outcome instead of
-    /// returning the `Draining` status (see [`Self::close_barrier_and_drain`]).
-    pub(crate) fn from_authoritative_auth_state_target_evidence_and_adoption(
+    /// State-machine fixture without an outgoing consumer. Production must
+    /// use the constructor requiring account projection ownership below.
+    #[cfg(test)]
+    fn from_authoritative_auth_state_target_evidence_and_adoption(
         authoritative_auth: AuthoritativeAuthState,
         target_evidence_source: Arc<dyn TargetEvidenceSource>,
         auth_manager: Arc<AuthManager>,
@@ -477,6 +579,52 @@ impl ManagedTransitionCoordinator {
         coordinator.adoption = Some(AdoptionDependencies {
             auth_manager,
             reset_inventory,
+            outgoing: None,
+        });
+        coordinator
+    }
+
+    /// Production adoption always owns the account notification queue. Only
+    /// private state-machine fixtures omit this consumer projection.
+    pub(crate) fn with_adoption_and_account_projection(
+        authoritative_auth: AuthoritativeAuthState,
+        target_evidence_source: Arc<dyn TargetEvidenceSource>,
+        auth_manager: Arc<AuthManager>,
+        reset_inventory: Arc<dyn ResetInventory>,
+        outgoing: Arc<crate::outgoing_message::OutgoingMessageSender>,
+    ) -> Self {
+        let mut coordinator = Self::from_authoritative_auth_state_and_target_evidence_source(
+            authoritative_auth,
+            target_evidence_source,
+        );
+        coordinator.adoption = Some(AdoptionDependencies {
+            auth_manager,
+            reset_inventory,
+            outgoing: Some(outgoing),
+        });
+        coordinator
+    }
+
+    /// Production constructor for a standalone server whose process identity
+    /// was selected before its optional immutable target record was published.
+    pub(crate) fn with_adoption_account_projection_and_process_instance(
+        authoritative_auth: AuthoritativeAuthState,
+        target_evidence_source: Arc<dyn TargetEvidenceSource>,
+        process_instance_id: String,
+        auth_manager: Arc<AuthManager>,
+        reset_inventory: Arc<dyn ResetInventory>,
+        outgoing: Arc<crate::outgoing_message::OutgoingMessageSender>,
+    ) -> Self {
+        let mut coordinator =
+            Self::from_authoritative_auth_state_target_evidence_and_process_instance(
+                authoritative_auth,
+                target_evidence_source,
+                process_instance_id,
+            );
+        coordinator.adoption = Some(AdoptionDependencies {
+            auth_manager,
+            reset_inventory,
+            outgoing: Some(outgoing),
         });
         coordinator
     }
@@ -492,6 +640,12 @@ impl ManagedTransitionCoordinator {
     /// queue or retry internally (`R010`).
     pub(crate) fn try_acquire_account_work_permit(&self) -> Option<AccountWorkPermitGuard> {
         self.account_work_permits.try_acquire()
+    }
+
+    /// Narrow admission capability for background consumers; does not retain
+    /// the coordinator's auth manager or reset inventory.
+    pub(crate) fn account_work_permits(&self) -> AccountWorkPermits {
+        self.account_work_permits.clone()
     }
 
     /// Re-derives current target evidence from this coordinator's own source
@@ -511,45 +665,158 @@ impl ManagedTransitionCoordinator {
         params: StartManagedTransitionParams,
     ) -> Result<ManagedTransitionStatus, ManagedTransitionRefusal> {
         let envelope = TransitionEnvelope::from(params);
-        // Revalidated before acquiring `state`'s own lock -- this method
-        // re-locks internally and must never be called while already held.
+        let target_evidence_matches = self.target_evidence_still_matches().await;
+        let adoption_precondition = {
+            let state = self.state.lock().await;
+            let recovering = self.validate_admission(&state, &envelope, target_evidence_matches)?;
+            if !recovering && let Some(adoption) = &self.adoption {
+                Some(
+                    adoption
+                        .auth_manager
+                        .capture_managed_adoption_precondition(
+                            envelope.expected_auth_fingerprint.as_deref(),
+                        )
+                        .map_err(|_| authoritative_auth_unavailable(&state, &envelope))?,
+                )
+            } else {
+                None
+            }
+        };
+        // Source eligibility, intended identity and parsing precede barrier
+        // effects. The same opaque candidate later installs after drain;
+        // no later read can substitute a different account.
+        let prepared_adoption = if let (Some(adoption), Some(precondition)) =
+            (&self.adoption, &adoption_precondition)
+        {
+            match adoption
+                .auth_manager
+                .prepare_managed_adoption(
+                    envelope.intended_result_auth_fingerprint.as_deref(),
+                    precondition,
+                )
+                .await
+            {
+                Ok(prepared) => Some(Arc::new(prepared)),
+                Err(error) => {
+                    let state = self.state.lock().await;
+                    return Err(match error {
+                        ManagedAdoptionVerificationError::CacheUnavailable
+                        | ManagedAdoptionVerificationError::CacheChangedConcurrently
+                        | ManagedAdoptionVerificationError::ExternalResolutionFailed
+                        | ManagedAdoptionVerificationError::BackendIoFailed
+                        | ManagedAdoptionVerificationError::ParseFailed
+                        | ManagedAdoptionVerificationError::StorageFailed(_) => {
+                            authoritative_auth_unavailable(&state, &envelope)
+                        }
+                        ManagedAdoptionVerificationError::IntendedResultMismatch
+                        | ManagedAdoptionVerificationError::RestrictionRejected
+                        | ManagedAdoptionVerificationError::MissingStableIdentity
+                        | ManagedAdoptionVerificationError::IneligibleAuthMode => refusal(
+                            &state,
+                            &envelope,
+                            ManagedTransitionRefusalKind::InvalidRequest,
+                            false,
+                        ),
+                    });
+                }
+            }
+        } else {
+            None
+        };
         let target_evidence_matches = self.target_evidence_still_matches().await;
         let mut state = self.state.lock().await;
+        let recovering = self.validate_admission(&state, &envelope, target_evidence_matches)?;
+        // Keep auth authority locked through the winning state/barrier
+        // transaction, not merely through its last validation. Recovery uses
+        // the same discipline before transferring the pending reset owner.
+        let commit = || {
+            state.transition_revision += 1;
+            let record = TransitionRecord {
+                envelope: envelope.clone(),
+                phase: ManagedTransitionPhase::Admitted,
+                retryable: false,
+                process_instance_id: state.process_instance_id.clone(),
+                prior_auth_revision: state.auth_revision,
+                result_auth_revision: state.auth_revision,
+                prior_transition_revision: state.transition_revision - 1,
+                result_transition_revision: state.transition_revision,
+                prior_auth_fingerprint: state.auth_fingerprint.clone(),
+                result_auth_fingerprint: state.auth_fingerprint.clone(),
+                refusal: None,
+                reset_failure: None,
+                reset_pending: recovering,
+                adoption_precondition: adoption_precondition.clone(),
+                prepared_adoption,
+            };
+            if let Some(pending) = &mut state.pending_reset {
+                pending.owner_transition_id = record.envelope.transition_id.clone();
+            }
+            let status = status_for(&record);
+            state.active = Some(record);
+            self.account_work_permits.close();
+            status
+        };
+        let committed = match &self.adoption {
+            Some(adoption) => match &adoption_precondition {
+                Some(precondition) => adoption
+                    .auth_manager
+                    .with_managed_adoption_precondition(precondition, commit),
+                None => adoption.auth_manager.with_managed_cached_result(
+                    envelope.expected_auth_fingerprint.as_deref(),
+                    commit,
+                ),
+            },
+            None => Ok(commit()),
+        };
+        committed.map_err(|_| authoritative_auth_unavailable(&state, &envelope))
+    }
 
-        if !state.auth_authority_available {
-            return Err(authoritative_auth_unavailable(&state, &envelope));
+    /// Run before preparation and again at the winning admission commit.
+    /// Neither validation pass changes state or reserves the barrier.
+    fn validate_admission(
+        &self,
+        state: &CoordinatorState,
+        envelope: &TransitionEnvelope,
+        target_evidence_matches: bool,
+    ) -> Result<bool, ManagedTransitionRefusal> {
+        // A pending reset is the one narrowly-scoped recovery owner that may
+        // proceed after terminal authority verification latched the
+        // coordinator unavailable. All ordinary admissions remain refused
+        // until that exact owner completes.
+        if !state.auth_authority_available && state.pending_reset.is_none() {
+            return Err(authoritative_auth_unavailable(state, envelope));
         }
 
         if !target_evidence_matches {
             return Err(refusal(
-                &state,
-                &envelope,
-                ManagedTransitionRefusalKind::InvalidRequest,
+                state,
+                envelope,
+                ManagedTransitionRefusalKind::TargetChanged,
                 false,
             ));
         }
 
         if envelope.transition_id.is_empty() || envelope.process_instance_id.is_empty() {
             return Err(refusal(
-                &state,
-                &envelope,
+                state,
+                envelope,
                 ManagedTransitionRefusalKind::InvalidRequest,
                 false,
             ));
         }
         if envelope.process_instance_id != state.process_instance_id {
             return Err(refusal(
-                &state,
-                &envelope,
+                state,
+                envelope,
                 ManagedTransitionRefusalKind::ProcessMismatch,
                 true,
             ));
         }
         if let Some(record) = state.completed.get(&envelope.transition_id) {
             return Err(refusal(
-                &state,
-                &envelope,
-                if record.envelope == envelope {
+                state,
+                envelope,
+                if record.envelope == *envelope {
                     ManagedTransitionRefusalKind::CompletedReplay
                 } else {
                     ManagedTransitionRefusalKind::TransitionIdConflict
@@ -559,8 +826,8 @@ impl ManagedTransitionCoordinator {
         }
         if let Some(record) = &state.active {
             return Err(refusal(
-                &state,
-                &envelope,
+                state,
+                envelope,
                 if record.envelope.transition_id == envelope.transition_id {
                     ManagedTransitionRefusalKind::TransitionIdConflict
                 } else {
@@ -569,78 +836,94 @@ impl ManagedTransitionCoordinator {
                 true,
             ));
         }
-        // A completed `Quarantined` record still effectively owns the
-        // single process-wide transition/barrier slot: it is structurally
-        // "completed" (`ManagedTransitionPhase::is_terminal`), but R016
-        // requires it to stay closed to new work until explicitly resolved
-        // by cancelling that exact transition, not superseded by admitting
-        // an unrelated one. Without this check, a second transition could
-        // become active/Draining while the first is still quarantined, and
-        // an explicit cancel of the first would then reopen the barrier
-        // out from under the second's own in-progress drain (verification
-        // round 02, confirmed against source before this fix).
-        if state
-            .completed
-            .values()
-            .any(|record| record.phase == ManagedTransitionPhase::Quarantined)
+        let valid_intended_result = match envelope.intent {
+            ManagedTransitionIntent::AdoptManagedAuth => envelope
+                .intended_result_auth_fingerprint
+                .as_ref()
+                .is_some_and(|value| !value.is_empty()),
+            ManagedTransitionIntent::AdoptManagedLogout => {
+                envelope.intended_result_auth_fingerprint.is_none()
+            }
+        };
+        if !valid_intended_result {
+            return Err(refusal(
+                state,
+                envelope,
+                ManagedTransitionRefusalKind::InvalidRequest,
+                false,
+            ));
+        }
+        let recovering = state.pending_reset.is_some();
+        if let Some(pending) = &state.pending_reset
+            && (pending.intent != envelope.intent
+                || pending.auth_fingerprint != envelope.intended_result_auth_fingerprint
+                || pending.auth_fingerprint != state.auth_fingerprint
+                || pending.auth_revision != state.auth_revision)
         {
             return Err(refusal(
-                &state,
-                &envelope,
+                state,
+                envelope,
+                ManagedTransitionRefusalKind::StaleAuthFingerprint,
+                true,
+            ));
+        }
+        // Only proof of a previously applied eligible logout permits an
+        // otherwise-ineligible logged-out cache to enter reset recovery.
+        let logout_recovery =
+            recovering && envelope.intent == ManagedTransitionIntent::AdoptManagedLogout;
+        if !logout_recovery && let Some(adoption) = &self.adoption {
+            match adoption.auth_manager.managed_transition_eligible() {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(refusal(
+                        state,
+                        envelope,
+                        ManagedTransitionRefusalKind::InvalidRequest,
+                        false,
+                    ));
+                }
+                Err(_) => return Err(authoritative_auth_unavailable(state, envelope)),
+            }
+        }
+        // Pre-install quarantine must still be explicitly cancelled.
+        // Post-install records are immutable history; `pending_reset`, not
+        // a scan over that history, owns the exclusion during retry chains.
+        if state.completed.values().any(|record| {
+            record.phase == ManagedTransitionPhase::Quarantined && !record.reset_pending
+        }) {
+            return Err(refusal(
+                state,
+                envelope,
                 ManagedTransitionRefusalKind::ConcurrentTransition,
                 true,
             ));
         }
         if envelope.expected_auth_revision != state.auth_revision {
             return Err(refusal(
-                &state,
-                &envelope,
+                state,
+                envelope,
                 ManagedTransitionRefusalKind::StaleAuthRevision,
                 true,
             ));
         }
         if envelope.expected_transition_revision != state.transition_revision {
             return Err(refusal(
-                &state,
-                &envelope,
+                state,
+                envelope,
                 ManagedTransitionRefusalKind::StaleTransitionRevision,
                 true,
             ));
         }
         if envelope.expected_auth_fingerprint != state.auth_fingerprint {
             return Err(refusal(
-                &state,
-                &envelope,
+                state,
+                envelope,
                 ManagedTransitionRefusalKind::StaleAuthFingerprint,
                 true,
             ));
         }
 
-        state.transition_revision += 1;
-        let record = TransitionRecord {
-            envelope,
-            phase: ManagedTransitionPhase::Admitted,
-            retryable: false,
-            process_instance_id: state.process_instance_id.clone(),
-            prior_auth_revision: state.auth_revision,
-            result_auth_revision: state.auth_revision,
-            prior_transition_revision: state.transition_revision - 1,
-            result_transition_revision: state.transition_revision,
-            prior_auth_fingerprint: state.auth_fingerprint.clone(),
-            result_auth_fingerprint: state.auth_fingerprint.clone(),
-            refusal: None,
-        };
-        let status = status_for(&record);
-        state.active = Some(record);
-        // Closed synchronously while still holding `state`'s lock,
-        // immediately after installing the active record -- not by a
-        // separate later call in `close_barrier_and_drain` -- so no
-        // observer that can see this active Admitted record (via the same
-        // lock) can ever also see the barrier still open (verification
-        // round 02's TOCTOU correction, admission-side half). Idempotent;
-        // harmless if this transition never advances past `Admitted`.
-        self.account_work_permits.close();
-        Ok(status)
+        Ok(recovering)
     }
 
     /// Slice 1 exposes the versioned wire contract but deliberately does not
@@ -756,7 +1039,7 @@ impl ManagedTransitionCoordinator {
                 // `Quarantined` already; no auth was ever touched and
                 // admitted work was never cancelled or killed (R013).
                 return self
-                    .advance(transition_id, ManagedTransitionPhase::Quarantined)
+                    .quarantine(transition_id, ManagedTransitionRefusalKind::DrainTimedOut)
                     .await;
             }
         }
@@ -794,6 +1077,19 @@ impl ManagedTransitionCoordinator {
         auth_manager: &AuthManager,
         reset_inventory: &dyn ResetInventory,
     ) -> Result<ManagedTransitionStatus, ManagedTransitionRefusal> {
+        let recovery = {
+            let state = self.state.lock().await;
+            state
+                .pending_reset
+                .as_ref()
+                .filter(|pending| pending.owner_transition_id == transition_id)
+                .cloned()
+        };
+        if let Some(pending) = recovery {
+            return self
+                .resume_pending_reset(transition_id, pending, auth_manager, reset_inventory)
+                .await;
+        }
         // Draining -> Adopting. A concurrent cancel that already took the
         // transition out of `active` (legal while still Draining) surfaces
         // here as this call's own `Err`, propagated by `?` -- the same
@@ -802,76 +1098,77 @@ impl ManagedTransitionCoordinator {
         // transition's own declared intent (Slice 1's admission already
         // fixed it), needed below to distinguish adopt-a-new-account from
         // deliberate managed logout (R001, R002).
-        let adopting_status = self
-            .advance(transition_id, ManagedTransitionPhase::Adopting)
+        self.advance(transition_id, ManagedTransitionPhase::Adopting)
             .await?;
-        let intent = adopting_status.intent;
-
-        // Captured before the read so `install_managed_adoption`/
-        // `install_managed_logout` can refuse rather than overwrite an
-        // unrelated concurrent cache change that lands during it (R014's
-        // manager-owned CAS).
-        let previous_auth = auth_manager.auth_cached();
-
-        // No lock held across this await: `AuthManager` owns its own
-        // internal lock, and this call may perform network/file/keyring
-        // I/O. Never composes distinct failure classes -- each
-        // `ManagedAdoptionSourceOutcome` variant is inspected on its own.
-        let source_outcome = auth_manager.read_managed_adoption_source().await;
-
-        let account_id = match (intent, source_outcome) {
-            (_, ManagedAdoptionSourceOutcome::Available(new_auth)) => {
-                // `read_managed_adoption_source` already rejects a missing
-                // stable identity before ever returning `Available`, so
-                // `None` here should be unreachable; quarantine rather than
-                // trust that invariant with an unwrap/panic.
-                let Some(account_id) = new_auth.get_account_id() else {
-                    return self.quarantine(transition_id).await;
-                };
-                match auth_manager.install_managed_adoption(new_auth, previous_auth) {
-                    ManagedAdoptionInstallOutcome::Installed(_) => account_id,
-                    ManagedAdoptionInstallOutcome::LoggedOut
-                    | ManagedAdoptionInstallOutcome::CacheLockUnavailable
-                    | ManagedAdoptionInstallOutcome::CacheChangedConcurrently => {
-                        return self.quarantine(transition_id).await;
-                    }
-                }
-            }
-            // Deliberate managed logout (R001, R002): a persisted absence
-            // reached under a logout-intent transition is a legitimate
-            // success, not a failure to quarantine. Every other
-            // intent/outcome pairing -- including `Absent` under an
-            // adopt-account intent, where there is nothing to adopt --
-            // quarantines.
-            (
-                Some(ManagedTransitionIntent::AdoptManagedLogout),
-                ManagedAdoptionSourceOutcome::Absent,
-            ) => {
-                return match auth_manager.install_managed_logout(previous_auth) {
-                    ManagedAdoptionInstallOutcome::LoggedOut => {
-                        self.reset_and_complete_logout(transition_id, reset_inventory)
-                            .await
-                    }
-                    ManagedAdoptionInstallOutcome::Installed(_)
-                    | ManagedAdoptionInstallOutcome::CacheLockUnavailable
-                    | ManagedAdoptionInstallOutcome::CacheChangedConcurrently => {
-                        self.quarantine(transition_id).await
-                    }
-                };
-            }
-            (
-                _,
-                ManagedAdoptionSourceOutcome::Absent
-                | ManagedAdoptionSourceOutcome::ExternalResolutionFailed
-                | ManagedAdoptionSourceOutcome::BackendIoFailed
-                | ManagedAdoptionSourceOutcome::ParseFailed
-                | ManagedAdoptionSourceOutcome::RestrictionRejected
-                | ManagedAdoptionSourceOutcome::MissingStableIdentity
-                | ManagedAdoptionSourceOutcome::IneligibleAuthMode,
-            ) => {
-                return self.quarantine(transition_id).await;
+        let (intended_fingerprint, precondition, prepared) = {
+            let state = self.state.lock().await;
+            match state
+                .active
+                .as_ref()
+                .filter(|record| record.envelope.transition_id == transition_id)
+            {
+                Some(record) => (
+                    record.envelope.intended_result_auth_fingerprint.clone(),
+                    record.adoption_precondition.clone(),
+                    record.prepared_adoption.clone(),
+                ),
+                None => (None, None, None),
             }
         };
+        let (Some(precondition), Some(prepared)) = (precondition, prepared) else {
+            return self
+                .quarantine(
+                    transition_id,
+                    ManagedTransitionRefusalKind::AuthInstallFailed,
+                )
+                .await;
+        };
+
+        // Draining may have taken arbitrarily long. Admission's target proof
+        // cannot authorize installation after the selected target changed.
+        if !self.target_evidence_still_matches().await {
+            return self
+                .quarantine(transition_id, ManagedTransitionRefusalKind::TargetChanged)
+                .await;
+        }
+
+        // Installation consumes the already-classified candidate. This is
+        // outside the coordinator mutex because raw source verification can
+        // perform I/O, but it never re-parses/replaces the prepared object.
+        let installed_fingerprint =
+            match auth_manager.install_prepared_managed_adoption(&prepared, &precondition) {
+                ManagedAdoptionInstallOutcome::Installed { fingerprint } => fingerprint,
+                ManagedAdoptionInstallOutcome::LoggedOut => {
+                    return self
+                        .reset_and_complete_logout(transition_id, auth_manager, reset_inventory)
+                        .await;
+                }
+                outcome => {
+                    let kind = match outcome {
+                        ManagedAdoptionInstallOutcome::IntendedResultMismatch => {
+                            ManagedTransitionRefusalKind::IntendedResultMismatch
+                        }
+                        ManagedAdoptionInstallOutcome::CurrentAuthIneligible => {
+                            ManagedTransitionRefusalKind::InvalidRequest
+                        }
+                        ManagedAdoptionInstallOutcome::CacheLockUnavailable
+                        | ManagedAdoptionInstallOutcome::SourceReadFailed(_) => {
+                            ManagedTransitionRefusalKind::AuthoritativeAuthUnavailable
+                        }
+                        ManagedAdoptionInstallOutcome::SourceChanged => {
+                            ManagedTransitionRefusalKind::AuthSourceChanged
+                        }
+                        ManagedAdoptionInstallOutcome::CacheChangedConcurrently => {
+                            ManagedTransitionRefusalKind::StaleAuthRevision
+                        }
+                        ManagedAdoptionInstallOutcome::Installed { .. }
+                        | ManagedAdoptionInstallOutcome::LoggedOut => {
+                            unreachable!("successful installation handled above")
+                        }
+                    };
+                    return self.quarantine(transition_id, kind).await;
+                }
+            };
 
         // Adopting -> Resetting.
         self.advance(transition_id, ManagedTransitionPhase::Resetting)
@@ -886,15 +1183,63 @@ impl ManagedTransitionCoordinator {
         // account while `AuthManager` holds the new one (R064's "auth,
         // revision, reset, acknowledgement, and quarantine remain mutually
         // consistent"), so this uses the account-aware quarantine instead.
-        if reset_inventory.reset_all().await.is_err() {
+        if let Err(failure) = self
+            .reset_and_verify(
+                reset_inventory,
+                auth_manager,
+                intended_fingerprint.as_deref(),
+            )
+            .await
+        {
             return self
-                .quarantine_after_install(transition_id, account_id)
+                .quarantine_after_install(transition_id, installed_fingerprint, failure)
                 .await;
         }
 
         // Resetting -> Succeeded, atomically with the new CAS baseline and
         // the barrier reopen (see `complete_adoption`).
-        self.complete_adoption(transition_id, account_id).await
+        self.complete_adoption(transition_id, installed_fingerprint)
+            .await
+    }
+
+    /// Fresh-ID recovery never installs auth a second time. Both asynchronous
+    /// verification passes run outside the coordinator mutex; the immutable
+    /// pending owner prevents cancellation or another admission in between.
+    async fn resume_pending_reset(
+        &self,
+        transition_id: &str,
+        pending: PendingResetRecovery,
+        auth_manager: &AuthManager,
+        reset_inventory: &dyn ResetInventory,
+    ) -> Result<ManagedTransitionStatus, ManagedTransitionRefusal> {
+        self.advance(transition_id, ManagedTransitionPhase::Adopting)
+            .await?;
+        if self.account_work_permits.admitted_count() != 0 {
+            return self
+                .quarantine(transition_id, ManagedTransitionRefusalKind::ResetFailed)
+                .await;
+        }
+        if let Err(failure) = self
+            .verify_applied_result(auth_manager, pending.auth_fingerprint.as_deref())
+            .await
+        {
+            return self.quarantine(transition_id, failure).await;
+        }
+        self.advance(transition_id, ManagedTransitionPhase::Resetting)
+            .await?;
+        if let Err(failure) = self
+            .reset_and_verify(
+                reset_inventory,
+                auth_manager,
+                pending.auth_fingerprint.as_deref(),
+            )
+            .await
+        {
+            return self.quarantine(transition_id, failure).await;
+        }
+        // No auth update: the original application already advanced it.
+        self.advance(transition_id, ManagedTransitionPhase::Succeeded)
+            .await
     }
 
     /// The logout counterpart of the Resetting/`complete_adoption` tail
@@ -905,12 +1250,16 @@ impl ManagedTransitionCoordinator {
     async fn reset_and_complete_logout(
         &self,
         transition_id: &str,
+        auth_manager: &AuthManager,
         reset_inventory: &dyn ResetInventory,
     ) -> Result<ManagedTransitionStatus, ManagedTransitionRefusal> {
         self.advance(transition_id, ManagedTransitionPhase::Resetting)
             .await?;
-        if reset_inventory.reset_all().await.is_err() {
-            return self.quarantine_after_logout(transition_id).await;
+        if let Err(failure) = self
+            .reset_and_verify(reset_inventory, auth_manager, None)
+            .await
+        {
+            return self.quarantine_after_logout(transition_id, failure).await;
         }
         self.complete_adoption_logout(transition_id).await
     }
@@ -918,9 +1267,72 @@ impl ManagedTransitionCoordinator {
     async fn quarantine(
         &self,
         transition_id: &str,
+        failure: impl Into<TransitionFailure>,
     ) -> Result<ManagedTransitionStatus, ManagedTransitionRefusal> {
-        self.advance(transition_id, ManagedTransitionPhase::Quarantined)
+        self.advance_inner(
+            transition_id,
+            ManagedTransitionPhase::Quarantined,
+            None,
+            Some(failure.into()),
+        )
+        .await
+    }
+
+    async fn reset_and_verify(
+        &self,
+        inventory: &dyn ResetInventory,
+        auth: &AuthManager,
+        fingerprint: Option<&str>,
+    ) -> Result<(), TransitionFailure> {
+        inventory
+            .reset_all()
             .await
+            .map_err(TransitionFailure::from)?;
+        self.verify_applied_result(auth, fingerprint).await
+    }
+
+    async fn verify_applied_result(
+        &self,
+        auth: &AuthManager,
+        fingerprint: Option<&str>,
+    ) -> Result<(), TransitionFailure> {
+        self.prepare_verified_terminal_result(auth, fingerprint)
+            .await
+            .map(|_| ())
+    }
+
+    async fn prepare_verified_terminal_result(
+        &self,
+        auth: &AuthManager,
+        fingerprint: Option<&str>,
+    ) -> Result<codex_login::auth::ManagedTerminalPrecondition, TransitionFailure> {
+        if !self.target_evidence_still_matches().await {
+            return Err(ManagedTransitionRefusalKind::TargetChanged.into());
+        }
+        auth.prepare_managed_terminal_commit(fingerprint)
+            .await
+            .map_err(|error| {
+                use codex_login::auth::ManagedAdoptionVerificationError as Error;
+                let kind = match error {
+                    Error::CacheChangedConcurrently => {
+                        ManagedTransitionRefusalKind::StaleAuthRevision
+                    }
+                    Error::IntendedResultMismatch => {
+                        ManagedTransitionRefusalKind::AuthSourceChanged
+                    }
+                    Error::RestrictionRejected
+                    | Error::MissingStableIdentity
+                    | Error::IneligibleAuthMode => ManagedTransitionRefusalKind::InvalidRequest,
+                    Error::CacheUnavailable
+                    | Error::ExternalResolutionFailed
+                    | Error::BackendIoFailed
+                    | Error::ParseFailed
+                    | Error::StorageFailed(_) => {
+                        ManagedTransitionRefusalKind::AuthoritativeAuthUnavailable
+                    }
+                };
+                kind.into()
+            })
     }
 
     /// Defensive re-read used only by [`Self::close_barrier_and_drain`]'s
@@ -967,6 +1379,27 @@ impl ManagedTransitionCoordinator {
                 true,
             ));
         }
+        // The repository-owned writer-first command uses an empty transition
+        // id to obtain the current CAS baseline before it has an id to read.
+        // A live transition, pending reset, or pre-install quarantine must be observed as a
+        // refusal rather than exposing a baseline that would let the writer
+        // run while the barrier already has an owner.
+        if envelope.transition_id.is_empty() {
+            if state.active.is_some()
+                || state.pending_reset.is_some()
+                || state.completed.values().any(|record| {
+                    record.phase == ManagedTransitionPhase::Quarantined && !record.reset_pending
+                })
+            {
+                return Err(refusal(
+                    &state,
+                    &envelope,
+                    ManagedTransitionRefusalKind::ConcurrentTransition,
+                    true,
+                ));
+            }
+            return Ok(current_status(&state));
+        }
         if let Some(record) = state
             .active
             .as_ref()
@@ -1008,9 +1441,6 @@ impl ManagedTransitionCoordinator {
     ) -> Result<ManagedTransitionStatus, ManagedTransitionRefusal> {
         let mut state = self.state.lock().await;
         let envelope = TransitionEnvelope::cancel(params);
-        if !state.auth_authority_available {
-            return Err(authoritative_auth_unavailable(&state, &envelope));
-        }
         if envelope.process_instance_id != state.process_instance_id {
             return Err(refusal(
                 &state,
@@ -1031,9 +1461,20 @@ impl ManagedTransitionCoordinator {
         if let Some(record) = state.completed.get(&envelope.transition_id).cloned()
             && record.phase == ManagedTransitionPhase::Quarantined
         {
+            if record.reset_pending {
+                return Err(refusal(
+                    &state,
+                    &envelope,
+                    ManagedTransitionRefusalKind::LateCancellation,
+                    state.auth_authority_available,
+                ));
+            }
             state.transition_revision += 1;
             let cancelled = TransitionRecord {
+                refusal: None,
+                reset_failure: None,
                 phase: ManagedTransitionPhase::Cancelled,
+                prepared_adoption: None,
                 retryable: true,
                 result_transition_revision: state.transition_revision,
                 ..record
@@ -1055,16 +1496,26 @@ impl ManagedTransitionCoordinator {
             // 02's own single-owner fix). `reopen`/`wake_waiters` are
             // synchronous, so this holds no lock across an `.await`.
             let no_other_owner = state.active.is_none()
+                && state.pending_reset.is_none()
                 && !state
                     .completed
                     .values()
                     .any(|other| other.phase == ManagedTransitionPhase::Quarantined);
             if no_other_owner {
+                // An authority failure before credential installation may be
+                // explicitly cancelled. This is the only recovery from the
+                // sticky authority latch; post-install quarantines remain
+                // reset_pending and are refused above.
+                state.auth_authority_available = true;
                 self.account_work_permits.reopen();
                 self.account_work_permits.wake_waiters();
             }
             drop(state);
             return Ok(status);
+        }
+
+        if !state.auth_authority_available && state.pending_reset.is_none() {
+            return Err(authoritative_auth_unavailable(&state, &envelope));
         }
 
         let Some(record) = state.active.take() else {
@@ -1089,10 +1540,12 @@ impl ManagedTransitionCoordinator {
         // requires cancellation to work anywhere before that boundary, not
         // only from Admitted. Adopting/Resetting are post-mutation and stay
         // refused as `LateCancellation`, governed by R064 in a later slice.
-        if !matches!(
-            record.phase,
-            ManagedTransitionPhase::Admitted | ManagedTransitionPhase::Draining
-        ) {
+        if record.reset_pending
+            || !matches!(
+                record.phase,
+                ManagedTransitionPhase::Admitted | ManagedTransitionPhase::Draining
+            )
+        {
             state.active = Some(record);
             return Err(refusal(
                 &state,
@@ -1103,7 +1556,10 @@ impl ManagedTransitionCoordinator {
         }
         state.transition_revision += 1;
         let cancelled = TransitionRecord {
+            refusal: None,
+            reset_failure: None,
             phase: ManagedTransitionPhase::Cancelled,
+            prepared_adoption: None,
             retryable: true,
             result_transition_revision: state.transition_revision,
             ..record
@@ -1112,6 +1568,9 @@ impl ManagedTransitionCoordinator {
         state
             .completed
             .insert(cancelled.envelope.transition_id.clone(), cancelled);
+        // The reset_pending guard above also excludes recovery attempts:
+        // they co-own the closed barrier with PendingResetRecovery and must
+        // never reopen it by cancellation after auth was already installed.
         // Unconditional, not gated on `was_draining` (verification round
         // 03): `admit()` closes the barrier itself as soon as a transition
         // reaches `Admitted` -- it is the sole closer, since
@@ -1167,7 +1626,10 @@ impl ManagedTransitionCoordinator {
         transition_id: &str,
         next_phase: ManagedTransitionPhase,
     ) -> Result<ManagedTransitionStatus, ManagedTransitionRefusal> {
-        self.advance_inner(transition_id, next_phase, None).await
+        let failure = (next_phase == ManagedTransitionPhase::Quarantined)
+            .then(|| ManagedTransitionRefusalKind::AuthInstallFailed.into());
+        self.advance_inner(transition_id, next_phase, None, failure)
+            .await
     }
 
     /// Atomically finalizes a successful managed-auth adoption
@@ -1176,17 +1638,18 @@ impl ManagedTransitionCoordinator {
     /// coordinator's new CAS baseline, and reopens the account-work
     /// barrier -- all inside the one `state` critical section this shares
     /// with every other phase transition (Issue 05 Slice 4, R014). Never
-    /// touches credential material; `new_account_id` only derives the same
-    /// domain-separated fingerprint [`AuthoritativeAuthState`] uses.
+    /// receives credential material or raw account identity: the manager
+    /// derives `installed_fingerprint` from the exact installed object.
     pub(crate) async fn complete_adoption(
         &self,
         transition_id: &str,
-        new_account_id: String,
+        installed_fingerprint: String,
     ) -> Result<ManagedTransitionStatus, ManagedTransitionRefusal> {
         self.advance_inner(
             transition_id,
             ManagedTransitionPhase::Succeeded,
-            Some(AdoptedAuthUpdate::Adopted(new_account_id)),
+            Some(AdoptedAuthUpdate::Adopted(installed_fingerprint)),
+            None,
         )
         .await
     }
@@ -1204,12 +1667,13 @@ impl ManagedTransitionCoordinator {
             transition_id,
             ManagedTransitionPhase::Succeeded,
             Some(AdoptedAuthUpdate::LoggedOut),
+            None,
         )
         .await
     }
 
     /// Quarantine after auth has *already* been installed to
-    /// `installed_account_id` (a reset-inventory failure following a
+    /// the account represented by `installed_fingerprint` (a reset-inventory failure following a
     /// successful adopt) -- unlike plain [`Self::quarantine`], this also
     /// updates the coordinator's own CAS baseline to match what
     /// `AuthManager` actually holds. Without this, the coordinator would
@@ -1224,12 +1688,14 @@ impl ManagedTransitionCoordinator {
     async fn quarantine_after_install(
         &self,
         transition_id: &str,
-        installed_account_id: String,
+        installed_fingerprint: String,
+        failure: TransitionFailure,
     ) -> Result<ManagedTransitionStatus, ManagedTransitionRefusal> {
         self.advance_inner(
             transition_id,
             ManagedTransitionPhase::Quarantined,
-            Some(AdoptedAuthUpdate::Adopted(installed_account_id)),
+            Some(AdoptedAuthUpdate::Adopted(installed_fingerprint)),
+            Some(failure),
         )
         .await
     }
@@ -1241,11 +1707,13 @@ impl ManagedTransitionCoordinator {
     async fn quarantine_after_logout(
         &self,
         transition_id: &str,
+        failure: TransitionFailure,
     ) -> Result<ManagedTransitionStatus, ManagedTransitionRefusal> {
         self.advance_inner(
             transition_id,
             ManagedTransitionPhase::Quarantined,
             Some(AdoptedAuthUpdate::LoggedOut),
+            Some(failure),
         )
         .await
     }
@@ -1253,16 +1721,74 @@ impl ManagedTransitionCoordinator {
     async fn advance_inner(
         &self,
         transition_id: &str,
-        next_phase: ManagedTransitionPhase,
+        mut next_phase: ManagedTransitionPhase,
         auth_update: Option<AdoptedAuthUpdate>,
+        mut failure: Option<TransitionFailure>,
     ) -> Result<ManagedTransitionStatus, ManagedTransitionRefusal> {
+        // Capacity waits precede every terminal lock. Revalidate source and
+        // target after that wait; the final cache fence still spans publication.
+        let mut projection = None;
+        let mut terminal_precondition = None;
+        if next_phase == ManagedTransitionPhase::Succeeded
+            && let Some(adoption) = &self.adoption
+            && let Some(outgoing) = &adoption.outgoing
+        {
+            match outgoing
+                .reserve_account_projection_until(
+                    tokio::time::Instant::now() + Duration::from_secs(5),
+                )
+                .await
+            {
+                Ok(reserved) => {
+                    let expected = match &auth_update {
+                        Some(AdoptedAuthUpdate::Adopted(fingerprint)) => Some(fingerprint.clone()),
+                        Some(AdoptedAuthUpdate::LoggedOut) => None,
+                        None => self
+                            .state
+                            .lock()
+                            .await
+                            .pending_reset
+                            .as_ref()
+                            .and_then(|pending| pending.auth_fingerprint.clone()),
+                    };
+                    match self
+                        .prepare_verified_terminal_result(
+                            &adoption.auth_manager,
+                            expected.as_deref(),
+                        )
+                        .await
+                    {
+                        Ok(precondition) => {
+                            projection = Some(reserved);
+                            terminal_precondition = Some(precondition);
+                        }
+                        Err(error) => {
+                            next_phase = ManagedTransitionPhase::Quarantined;
+                            failure = Some(error);
+                        }
+                    }
+                }
+                Err(error) => {
+                    next_phase = ManagedTransitionPhase::Quarantined;
+                    failure = Some(ResetInventoryError::AccountProjection(error).into());
+                }
+            }
+        }
         let mut state = self.state.lock().await;
-        if !state.auth_authority_available {
+        if (next_phase == ManagedTransitionPhase::Quarantined) != failure.is_some() {
+            return Err(refusal_for_transition_id(
+                &state,
+                transition_id,
+                ManagedTransitionRefusalKind::InvalidRequest,
+                false,
+            ));
+        }
+        if !state.auth_authority_available && state.pending_reset.is_none() {
             return Err(refusal_for_transition_id(
                 &state,
                 transition_id,
                 ManagedTransitionRefusalKind::AuthoritativeAuthUnavailable,
-                true,
+                state.auth_authority_available,
             ));
         }
         let Some(record) = state.active.take() else {
@@ -1292,18 +1818,162 @@ impl ManagedTransitionCoordinator {
             ));
         }
 
+        if record.reset_pending
+            && let Some(pending) = &state.pending_reset
+            && (pending.owner_transition_id != transition_id
+                || pending.auth_revision != state.auth_revision
+                || pending.auth_fingerprint != state.auth_fingerprint)
+        {
+            state.active = Some(record);
+            return Err(refusal_for_transition_id(
+                &state,
+                transition_id,
+                ManagedTransitionRefusalKind::StaleAuthRevision,
+                true,
+            ));
+        }
+        // The manager retains its auth locks through the terminal mutation
+        // and barrier reopen. A check returning a bool would leave a second
+        // check-act window, even though the coordinator mutex is still held.
+        if next_phase.is_terminal()
+            && (auth_update.is_some()
+                || record.reset_pending
+                || record.adoption_precondition.is_some())
+            && let Some(adoption) = &self.adoption
+        {
+            let expected = match &auth_update {
+                Some(AdoptedAuthUpdate::Adopted(fingerprint)) => Some(fingerprint.clone()),
+                Some(AdoptedAuthUpdate::LoggedOut) => None,
+                None => match &state.pending_reset {
+                    Some(pending) => pending.auth_fingerprint.clone(),
+                    None => record.envelope.expected_auth_fingerprint.clone(),
+                },
+            };
+            let commit = |auth_mode: Option<codex_protocol::auth::AuthMode>, plan_type| {
+                self.commit_phase_locked(
+                    &mut state,
+                    record.clone(),
+                    next_phase,
+                    auth_update.clone(),
+                    failure,
+                    projection.take().map(|reserved| {
+                        (
+                            reserved,
+                            codex_app_server_protocol::AccountUpdatedNotification {
+                                auth_mode: auth_mode.map(crate::auth_mode::auth_mode_to_api),
+                                plan_type,
+                            },
+                        )
+                    }),
+                )
+            };
+            use codex_login::auth::ManagedTerminalVerificationError as TerminalError;
+            let result = match terminal_precondition.as_ref() {
+                Some(precondition) => adoption
+                    .auth_manager
+                    .with_managed_terminal_projection(precondition, commit),
+                None => adoption
+                    .auth_manager
+                    .with_managed_account_projection(expected.as_deref(), commit)
+                    .map_err(TerminalError::Authority),
+            };
+            return match result {
+                Ok(status) => Ok(status),
+                Err(TerminalError::SourceChanged) => Ok(self.commit_phase_locked(
+                    &mut state,
+                    record,
+                    ManagedTransitionPhase::Quarantined,
+                    auth_update,
+                    Some(ManagedTransitionRefusalKind::AuthSourceChanged.into()),
+                    None,
+                )),
+                Err(TerminalError::SourceUnavailable(_)) => Ok(self.commit_phase_locked(
+                    &mut state,
+                    record,
+                    ManagedTransitionPhase::Quarantined,
+                    auth_update,
+                    Some(ManagedTransitionRefusalKind::AuthoritativeAuthUnavailable.into()),
+                    None,
+                )),
+                Err(TerminalError::Authority(error)) => {
+                    // The callback did not run. Preserve installed-result
+                    // history but never report it as current authoritative
+                    // truth when another auth owner changed or obscured it.
+                    let kind = match error {
+                        ManagedAdoptionVerificationError::IntendedResultMismatch
+                        | ManagedAdoptionVerificationError::CacheChangedConcurrently => {
+                            ManagedTransitionRefusalKind::StaleAuthRevision
+                        }
+                        _ => ManagedTransitionRefusalKind::AuthoritativeAuthUnavailable,
+                    };
+                    self.commit_phase_locked(
+                        &mut state,
+                        record,
+                        ManagedTransitionPhase::Quarantined,
+                        auth_update,
+                        Some(kind.into()),
+                        None,
+                    );
+                    state.auth_authority_available = false;
+                    Err(refusal_for_transition_id(
+                        &state,
+                        transition_id,
+                        ManagedTransitionRefusalKind::AuthoritativeAuthUnavailable,
+                        state.auth_authority_available,
+                    ))
+                }
+            };
+        }
+        Ok(self.commit_phase_locked(&mut state, record, next_phase, auth_update, failure, None))
+    }
+
+    /// Synchronous coordinator commit. Callers already own its mutex; a
+    /// successful post-install terminal commit also holds manager auth locks.
+    /// No manager call or asynchronous work belongs in this critical section.
+    fn commit_phase_locked(
+        &self,
+        state: &mut CoordinatorState,
+        record: TransitionRecord,
+        next_phase: ManagedTransitionPhase,
+        auth_update: Option<AdoptedAuthUpdate>,
+        failure: Option<TransitionFailure>,
+        projection: Option<(
+            crate::outgoing_message::AccountProjectionReservation,
+            codex_app_server_protocol::AccountUpdatedNotification,
+        )>,
+    ) -> ManagedTransitionStatus {
+        debug_assert_eq!(
+            next_phase == ManagedTransitionPhase::Quarantined,
+            failure.is_some()
+        );
         state.transition_revision += 1;
+        let applied_update = auth_update.is_some();
         if let Some(update) = auth_update {
             state.auth_revision += 1;
             state.auth_fingerprint = match update {
-                AdoptedAuthUpdate::Adopted(new_account_id) => {
-                    Some(account_fingerprint(&new_account_id))
-                }
+                AdoptedAuthUpdate::Adopted(fingerprint) => Some(fingerprint),
                 AdoptedAuthUpdate::LoggedOut => None,
             };
         }
+        if next_phase == ManagedTransitionPhase::Quarantined && applied_update {
+            state.pending_reset = Some(PendingResetRecovery {
+                owner_transition_id: record.envelope.transition_id.clone(),
+                intent: record.envelope.intent,
+                auth_fingerprint: state.auth_fingerprint.clone(),
+                auth_revision: state.auth_revision,
+            });
+        }
         let advanced = TransitionRecord {
+            refusal: failure.map(|failure| failure.kind),
+            reset_failure: failure.and_then(|failure| failure.reset),
             phase: next_phase,
+            prepared_adoption: if next_phase.is_terminal() {
+                None
+            } else {
+                record.prepared_adoption.clone()
+            },
+            reset_pending: next_phase != ManagedTransitionPhase::Succeeded
+                && (record.reset_pending || next_phase == ManagedTransitionPhase::Resetting),
             retryable: next_phase == ManagedTransitionPhase::Quarantined,
             result_transition_revision: state.transition_revision,
             result_auth_revision: state.auth_revision,
@@ -1318,20 +1988,31 @@ impl ManagedTransitionCoordinator {
         } else {
             state.active = Some(advanced);
         }
-        // `Succeeded` is the only terminal phase that is never a barrier
-        // owner (the biconditional carried from Slice 03: an owner is an
-        // active Admitted|Draining|Adopting|Resetting transition, or a
-        // completed unresolved Quarantined one). Reopening here, still
-        // under `state`'s lock, closes the exact gap Slice 03 flagged as
-        // its own carry-forward: no successful terminal advance existed yet
-        // to couple to a reopen. `Quarantined` intentionally does NOT
-        // reopen -- it must stay closed until an explicit cancel of that
-        // exact transition (R016/R017).
+        // Success retires the active/pending-reset barrier owners only after
+        // the terminal proof and queue admission. Installed-auth quarantine
+        // cannot be cancelled open: a fresh transition must take the pending
+        // reset, revalidate it, and finish it. The old quarantined record stays
+        // immutable history. Pre-install cancellation has its own guarded
+        // reopen path; it cannot discharge an installed pending reset.
+        let recovering_authority_latch = next_phase == ManagedTransitionPhase::Succeeded
+            && state.pending_reset.is_some()
+            && !state.auth_authority_available;
         if next_phase == ManagedTransitionPhase::Succeeded {
+            state.pending_reset = None;
+            if recovering_authority_latch {
+                // A successful exact pending-reset recovery proves the
+                // authority that was unavailable at quarantine is usable
+                // again. Ordinary success cannot reach this branch with the
+                // latch cleared because admission remains refused.
+                state.auth_authority_available = true;
+            }
+            if let Some((reserved, notification)) = projection {
+                reserved.publish(notification);
+            }
             self.account_work_permits.reopen();
             self.account_work_permits.wake_waiters();
         }
-        Ok(status)
+        status
     }
 }
 
@@ -1344,6 +2025,7 @@ impl From<StartManagedTransitionParams> for TransitionEnvelope {
             expected_auth_revision: params.expected_auth_revision,
             expected_transition_revision: params.expected_transition_revision,
             expected_auth_fingerprint: params.expected_auth_fingerprint,
+            intended_result_auth_fingerprint: params.intended_result_auth_fingerprint,
         }
     }
 }
@@ -1357,6 +2039,7 @@ impl TransitionEnvelope {
             expected_auth_revision: 0,
             expected_transition_revision: 0,
             expected_auth_fingerprint: None,
+            intended_result_auth_fingerprint: None,
         }
     }
 
@@ -1368,6 +2051,7 @@ impl TransitionEnvelope {
             expected_auth_revision: 0,
             expected_transition_revision: 0,
             expected_auth_fingerprint: None,
+            intended_result_auth_fingerprint: None,
         }
     }
 }
@@ -1441,8 +2125,25 @@ fn authoritative_auth_unavailable(
         state,
         envelope,
         ManagedTransitionRefusalKind::AuthoritativeAuthUnavailable,
-        true,
+        state.auth_authority_available,
     )
+}
+
+fn current_status(state: &CoordinatorState) -> ManagedTransitionStatus {
+    ManagedTransitionStatus {
+        process_instance_id: state.process_instance_id.clone(),
+        transition_id: None,
+        intent: None,
+        phase: ManagedTransitionPhase::Idle,
+        retryable: false,
+        prior_auth_revision: state.auth_revision,
+        auth_revision: state.auth_revision,
+        prior_transition_revision: state.transition_revision,
+        transition_revision: state.transition_revision,
+        prior_auth_fingerprint: state.auth_fingerprint.clone(),
+        result_auth_fingerprint: state.auth_fingerprint.clone(),
+        refusal: None,
+    }
 }
 
 fn status_for(record: &TransitionRecord) -> ManagedTransitionStatus {
@@ -1496,8 +2197,12 @@ fn legal_phase_edge(from: ManagedTransitionPhase, to: ManagedTransitionPhase) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_app_server_protocol::MANAGED_AUTH_TRANSITION_CONTRACT_VERSION;
 
-    fn request(process_instance_id: String, transition_id: &str) -> StartManagedTransitionParams {
+    pub(super) fn request(
+        process_instance_id: String,
+        transition_id: &str,
+    ) -> StartManagedTransitionParams {
         request_at_revision(process_instance_id, transition_id, 0)
     }
 
@@ -1514,6 +2219,71 @@ mod tests {
             expected_auth_revision: 0,
             expected_transition_revision,
             expected_auth_fingerprint: None,
+            intended_result_auth_fingerprint: Some(account_fingerprint("account-b")),
+        }
+    }
+
+    #[tokio::test]
+    async fn intended_result_is_required_and_part_of_transition_identity() {
+        let coordinator = ManagedTransitionCoordinator::new();
+        let process = coordinator.process_instance_id().await;
+        let mut missing = request(process.clone(), "intent-missing");
+        missing.intended_result_auth_fingerprint = None;
+        assert_eq!(
+            coordinator.admit(missing).await.unwrap_err().kind,
+            ManagedTransitionRefusalKind::InvalidRequest
+        );
+        assert!(coordinator.try_acquire_account_work_permit().is_some());
+
+        let mut start = request(process, "intent-bound");
+        coordinator.admit(start.clone()).await.unwrap();
+        start.intended_result_auth_fingerprint = Some(account_fingerprint("account-c"));
+        assert_eq!(
+            coordinator.admit(start).await.unwrap_err().kind,
+            ManagedTransitionRefusalKind::TransitionIdConflict
+        );
+    }
+
+    #[tokio::test]
+    async fn unintended_account_and_logout_with_present_auth_never_install_or_reset() {
+        for intent in [
+            ManagedTransitionIntent::AdoptManagedAuth,
+            ManagedTransitionIntent::AdoptManagedLogout,
+        ] {
+            let home = tempfile::TempDir::new().unwrap();
+            write_chatgpt_auth_for_intended_account(home.path(), "account-a");
+            let auth = Arc::new(real_auth_manager(home.path()).await);
+            let reset = Arc::new(RecordingResetInventory::new(false));
+            let coordinator = ManagedTransitionCoordinator::from_authoritative_auth_state_target_evidence_and_adoption(
+                AuthoritativeAuthState::from_auth_manager(&auth), Arc::new(UnsetTargetEvidenceSource),
+                Arc::clone(&auth), Arc::clone(&reset) as Arc<dyn ResetInventory>,
+            );
+            let mut start = request(coordinator.process_instance_id().await, "intended-b");
+            start.expected_auth_fingerprint = Some(account_fingerprint("account-a"));
+            start.intent = intent;
+            start.intended_result_auth_fingerprint = match intent {
+                ManagedTransitionIntent::AdoptManagedAuth => Some(account_fingerprint("account-b")),
+                ManagedTransitionIntent::AdoptManagedLogout => None,
+            };
+            write_chatgpt_auth_for_intended_account(home.path(), "account-c");
+            let StartManagedTransitionResponse::Refused { refusal } =
+                coordinator.start_dispatch(start, true).await
+            else {
+                panic!("unintended source must refuse before admission");
+            };
+            assert_eq!(refusal.kind, ManagedTransitionRefusalKind::InvalidRequest);
+            assert_eq!(
+                auth.authoritative_auth_cached()
+                    .unwrap()
+                    .unwrap()
+                    .get_account_id()
+                    .as_deref(),
+                Some("account-a")
+            );
+            assert!(!reset.was_called());
+            assert!(coordinator.try_acquire_account_work_permit().is_some());
+            assert!(coordinator.state.lock().await.active.is_none());
+            assert_eq!(coordinator.state.lock().await.transition_revision, 0);
         }
     }
 
@@ -1549,6 +2319,139 @@ mod tests {
         assert_eq!(cancelled.phase, ManagedTransitionPhase::Cancelled);
         assert_eq!(cancelled.transition_revision, 2);
         assert!(cancelled.retryable);
+    }
+
+    #[tokio::test]
+    async fn empty_read_returns_current_cas_baseline_only_when_unowned() {
+        let coordinator = ManagedTransitionCoordinator::new();
+        let process_id = coordinator.process_instance_id().await;
+        let current = coordinator
+            .read(ReadManagedTransitionParams {
+                contract_version: MANAGED_AUTH_TRANSITION_CONTRACT_VERSION,
+                transition_id: String::new(),
+                process_instance_id: process_id.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(current.phase, ManagedTransitionPhase::Idle);
+        assert_eq!(current.transition_id, None);
+        assert_eq!(current.auth_revision, 0);
+        assert_eq!(current.transition_revision, 0);
+
+        coordinator
+            .admit(request(process_id.clone(), "transition-a"))
+            .await
+            .unwrap();
+        assert_eq!(
+            coordinator
+                .read(ReadManagedTransitionParams {
+                    contract_version: MANAGED_AUTH_TRANSITION_CONTRACT_VERSION,
+                    transition_id: String::new(),
+                    process_instance_id: process_id.clone(),
+                })
+                .await
+                .unwrap_err()
+                .kind,
+            ManagedTransitionRefusalKind::ConcurrentTransition
+        );
+
+        coordinator
+            .cancel(cancel_request(process_id.clone(), "transition-a"))
+            .await
+            .unwrap();
+        let after_cancel = coordinator
+            .read(ReadManagedTransitionParams {
+                contract_version: MANAGED_AUTH_TRANSITION_CONTRACT_VERSION,
+                transition_id: String::new(),
+                process_instance_id: process_id.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(after_cancel.phase, ManagedTransitionPhase::Idle);
+        assert_eq!(after_cancel.transition_revision, 2);
+    }
+
+    #[tokio::test]
+    async fn empty_read_refuses_pending_reset_owner_without_active_record() {
+        let coordinator = ManagedTransitionCoordinator::new();
+        let process_id = coordinator.process_instance_id().await;
+        coordinator.state.lock().await.pending_reset = Some(PendingResetRecovery {
+            owner_transition_id: "pending-reset".to_owned(),
+            intent: ManagedTransitionIntent::AdoptManagedAuth,
+            auth_fingerprint: None,
+            auth_revision: 0,
+        });
+
+        let refusal = coordinator
+            .read(ReadManagedTransitionParams {
+                contract_version: MANAGED_AUTH_TRANSITION_CONTRACT_VERSION,
+                transition_id: String::new(),
+                process_instance_id: process_id,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refusal.kind,
+            ManagedTransitionRefusalKind::ConcurrentTransition
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_reset_admission_can_cross_a_latched_authority_only_for_matching_recovery() {
+        let coordinator = ManagedTransitionCoordinator::new();
+        let process_id = coordinator.process_instance_id().await;
+        let current_fingerprint = account_fingerprint("account-b");
+        {
+            let mut state = coordinator.state.lock().await;
+            state.auth_authority_available = false;
+            state.auth_fingerprint = Some(current_fingerprint.clone());
+            state.pending_reset = Some(PendingResetRecovery {
+                owner_transition_id: "original".to_owned(),
+                intent: ManagedTransitionIntent::AdoptManagedAuth,
+                auth_fingerprint: Some(current_fingerprint.clone()),
+                auth_revision: 0,
+            });
+        }
+
+        let mut recovery = request(process_id, "recovery");
+        recovery.expected_auth_fingerprint = Some(current_fingerprint);
+        assert_eq!(
+            coordinator.admit(recovery).await.unwrap().phase,
+            ManagedTransitionPhase::Admitted
+        );
+        assert!(coordinator.try_acquire_account_work_permit().is_none());
+    }
+
+    #[tokio::test]
+    async fn authority_quarantine_can_be_explicitly_cancelled_before_install() {
+        let coordinator = ManagedTransitionCoordinator::new();
+        let process_id = coordinator.process_instance_id().await;
+        coordinator
+            .admit(request(process_id.clone(), "authority-failure"))
+            .await
+            .unwrap();
+        let quarantined = coordinator
+            .advance("authority-failure", ManagedTransitionPhase::Quarantined)
+            .await
+            .unwrap();
+        assert_eq!(quarantined.phase, ManagedTransitionPhase::Quarantined);
+        coordinator.state.lock().await.auth_authority_available = false;
+
+        let refused = coordinator
+            .read(read_request(process_id.clone(), "authority-failure"))
+            .await
+            .unwrap_err();
+        assert!(!refused.retryable);
+        let cancelled = coordinator
+            .cancel(cancel_request(process_id.clone(), "authority-failure"))
+            .await
+            .unwrap();
+        assert_eq!(cancelled.phase, ManagedTransitionPhase::Cancelled);
+        assert!(
+            coordinator.state.lock().await.auth_authority_available,
+            "explicit cancellation restores admission after pre-install authority failure"
+        );
+        assert!(coordinator.try_acquire_account_work_permit().is_some());
     }
 
     #[tokio::test]
@@ -1638,28 +2541,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wire_admission_refuses_an_unauthorized_caller_without_mutation() {
-        let coordinator = ManagedTransitionCoordinator::new();
+    async fn unauthorized_wire_admission_returns_complete_placeholder_without_mutation() {
+        let coordinator =
+            ManagedTransitionCoordinator::from_authoritative_auth_state(AuthoritativeAuthState {
+                authority_available: true,
+                auth_revision: 41,
+                auth_fingerprint: Some(account_fingerprint("account-a")),
+            });
+        coordinator.state.lock().await.transition_revision = 7;
         let process_id = coordinator.process_instance_id().await;
+        let mut request = request_at_revision(process_id.clone(), "transition-a", 7);
+        request.expected_auth_revision = 41;
+        request.expected_auth_fingerprint = Some(account_fingerprint("account-a"));
         let refused = coordinator
-            .start_dispatch(
-                request(process_id.clone(), "transition-a"),
-                /*caller_authorized*/ false,
-            )
+            .start_dispatch(request.clone(), /*caller_authorized*/ false)
             .await;
-        let StartManagedTransitionResponse::Refused { refusal } = refused else {
-            panic!("an unauthorized wire caller must never be admitted");
-        };
         assert_eq!(
-            refusal.kind,
-            ManagedTransitionRefusalKind::AuthorizationNotAdmitted
+            refused,
+            StartManagedTransitionResponse::Refused {
+                refusal: ManagedTransitionRefusal {
+                    kind: ManagedTransitionRefusalKind::AuthorizationNotAdmitted,
+                    retryable: false,
+                    process_instance_id: String::new(),
+                    transition_id: "transition-a".to_owned(),
+                    auth_revision: 0,
+                    transition_revision: 0,
+                    auth_fingerprint: None,
+                },
+            }
         );
 
         let admitted = coordinator
-            .admit(request(process_id, "transition-a"))
+            .admit(request)
             .await
             .expect("the refused wire request must not reserve the transition id");
         assert_eq!(admitted.phase, ManagedTransitionPhase::Admitted);
+        assert_eq!(admitted.prior_auth_revision, 41);
+        assert_eq!(admitted.prior_transition_revision, 7);
     }
 
     #[tokio::test]
@@ -1724,20 +2642,34 @@ mod tests {
 
     impl TargetEvidenceSource for SyntheticTargetEvidenceSource {
         fn declared_profile(&self) -> Option<String> {
-            self.facts.lock().expect("synthetic facts lock").declared_profile.clone()
+            self.facts
+                .lock()
+                .expect("synthetic facts lock")
+                .declared_profile
+                .clone()
         }
 
         fn executable_identity(
             &self,
         ) -> std::io::Result<codex_app_server_transport::PeerExecutableIdentity> {
-            Ok(codex_app_server_transport::PeerExecutableIdentity::FileIdentity {
-                device: 1,
-                inode: self.facts.lock().expect("synthetic facts lock").executable_identity_inode,
-            })
+            Ok(
+                codex_app_server_transport::PeerExecutableIdentity::FileIdentity {
+                    device: 1,
+                    inode: self
+                        .facts
+                        .lock()
+                        .expect("synthetic facts lock")
+                        .executable_identity_inode,
+                },
+            )
         }
 
         fn endpoint(&self) -> String {
-            self.facts.lock().expect("synthetic facts lock").endpoint.clone()
+            self.facts
+                .lock()
+                .expect("synthetic facts lock")
+                .endpoint
+                .clone()
         }
 
         fn pid(&self) -> u32 {
@@ -1748,14 +2680,15 @@ mod tests {
     #[tokio::test]
     async fn admit_refuses_when_target_evidence_no_longer_matches_the_captured_reference() {
         let source = SyntheticTargetEvidenceSource::new(SyntheticTargetFacts::baseline());
-        let coordinator = ManagedTransitionCoordinator::from_authoritative_auth_state_and_target_evidence_source(
-            AuthoritativeAuthState {
-                authority_available: true,
-                auth_revision: 0,
-                auth_fingerprint: None,
-            },
-            source.clone(),
-        );
+        let coordinator =
+            ManagedTransitionCoordinator::from_authoritative_auth_state_and_target_evidence_source(
+                AuthoritativeAuthState {
+                    authority_available: true,
+                    auth_revision: 0,
+                    auth_fingerprint: None,
+                },
+                source.clone(),
+            );
         let process_id = coordinator.process_instance_id().await;
 
         // A simulated replacement: the same coordinator, but its target
@@ -1770,7 +2703,7 @@ mod tests {
             .admit(request(process_id.clone(), "transition-a"))
             .await
             .unwrap_err();
-        assert_eq!(refused.kind, ManagedTransitionRefusalKind::InvalidRequest);
+        assert_eq!(refused.kind, ManagedTransitionRefusalKind::TargetChanged);
 
         // Exact no-effect snapshot: the refused attempt must not have
         // reserved the transition id or consumed a transition-revision
@@ -1815,7 +2748,7 @@ mod tests {
                 .admit(request(process_id.clone(), "transition-a"))
                 .await
                 .unwrap_err();
-            assert_eq!(refused.kind, ManagedTransitionRefusalKind::InvalidRequest);
+            assert_eq!(refused.kind, ManagedTransitionRefusalKind::TargetChanged);
 
             // Exact no-effect snapshot, same rationale as the
             // executable-identity-replacement case above.
@@ -1833,14 +2766,15 @@ mod tests {
     #[tokio::test]
     async fn admit_succeeds_when_target_evidence_is_re_derived_identically() {
         let source = SyntheticTargetEvidenceSource::new(SyntheticTargetFacts::baseline());
-        let coordinator = ManagedTransitionCoordinator::from_authoritative_auth_state_and_target_evidence_source(
-            AuthoritativeAuthState {
-                authority_available: true,
-                auth_revision: 0,
-                auth_fingerprint: None,
-            },
-            source,
-        );
+        let coordinator =
+            ManagedTransitionCoordinator::from_authoritative_auth_state_and_target_evidence_source(
+                AuthoritativeAuthState {
+                    authority_available: true,
+                    auth_revision: 0,
+                    auth_fingerprint: None,
+                },
+                source,
+            );
         let process_id = coordinator.process_instance_id().await;
         let admitted = coordinator
             .admit(request(process_id, "transition-a"))
@@ -2172,6 +3106,10 @@ mod tests {
         let StartManagedTransitionResponse::Accepted { status } = response else {
             panic!("a timed-out drain is a status transition, not a refusal");
         };
+        assert_eq!(
+            status.refusal,
+            Some(ManagedTransitionRefusalKind::DrainTimedOut)
+        );
         assert_eq!(status.phase, ManagedTransitionPhase::Quarantined);
         assert!(status.retryable);
 
@@ -2358,7 +3296,10 @@ mod tests {
         let StartManagedTransitionResponse::Refused { refusal } = b_refused else {
             panic!("B must be refused while A is still Quarantined");
         };
-        assert_eq!(refusal.kind, ManagedTransitionRefusalKind::ConcurrentTransition);
+        assert_eq!(
+            refusal.kind,
+            ManagedTransitionRefusalKind::ConcurrentTransition
+        );
         assert!(
             coordinator.try_acquire_account_work_permit().is_none(),
             "the barrier must still be closed after B's refused attempt"
@@ -2578,7 +3519,9 @@ mod tests {
     /// `read`/`cancel` methods, never through the public wire gate, so this
     /// never opens the still-unexposed Slice 2 authorization surface
     /// (`CODEX-I05-S01-R07-001`'s own required correction).
-    async fn coordinator_from_real_persisted_auth(codex_home: &std::path::Path) -> (ManagedTransitionCoordinator, String) {
+    async fn coordinator_from_real_persisted_auth(
+        codex_home: &std::path::Path,
+    ) -> (ManagedTransitionCoordinator, String) {
         let auth_manager = codex_login::AuthManager::new(
             codex_home.to_path_buf(),
             /*enable_codex_api_key_env*/ false,
@@ -2611,8 +3554,7 @@ mod tests {
         };
         let header = encode(&serde_json::json!({ "alg": "none", "typ": "JWT" }));
         let payload = encode(&serde_json::json!({}));
-        let signature =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"test-signature");
+        let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"test-signature");
         let raw_jwt = format!("{header}.{payload}.{signature}");
         codex_login::token_data::parse_chatgpt_jwt_claims(&raw_jwt)
             .expect("minimal JWT must parse as valid ID token claims")
@@ -2622,7 +3564,10 @@ mod tests {
     /// account id, so the production mapper reconstructs the durable
     /// intended-account fingerprint rather than a null one (`CODEX-I05-S01-R04`
     /// Round 08's third required correction).
-    fn write_chatgpt_auth_for_intended_account(codex_home: &std::path::Path, account_id: &str) {
+    pub(super) fn write_chatgpt_auth_for_intended_account(
+        codex_home: &std::path::Path,
+        account_id: &str,
+    ) {
         let auth = codex_login::AuthDotJson {
             auth_mode: Some(codex_protocol::auth::AuthMode::Chatgpt),
             openai_api_key: None,
@@ -2636,6 +3581,7 @@ mod tests {
             agent_identity: None,
             personal_access_token: None,
             bedrock_api_key: None,
+            bedrock_access_keys: None,
         };
         codex_login::save_auth(
             codex_home,
@@ -2754,10 +3700,9 @@ mod tests {
             let transition_id = format!("real-mapper-{boundary}");
             let mut initial = request(old_process_id.clone(), &transition_id);
             initial.expected_auth_fingerprint = Some(expected_fingerprint.clone());
-            let admitted = before_restart
-                .admit(initial)
-                .await
-                .unwrap_or_else(|e| panic!("{boundary}: admit under available real auth must succeed: {e:?}"));
+            let admitted = before_restart.admit(initial).await.unwrap_or_else(|e| {
+                panic!("{boundary}: admit under available real auth must succeed: {e:?}")
+            });
             assert_eq!(
                 admitted.result_auth_fingerprint.as_deref(),
                 Some(expected_fingerprint.as_str()),
@@ -2798,12 +3743,22 @@ mod tests {
             // genuinely compares process identity and refuses the stale one.
             assert_eq!(
                 restarted
-                    .read(read_request(old_process_id, &transition_id))
+                    .read(read_request(old_process_id.clone(), &transition_id))
                     .await
                     .unwrap_err()
                     .kind,
                 ManagedTransitionRefusalKind::ProcessMismatch,
                 "{boundary}: old process identity must never resolve a transition after restart"
+            );
+
+            assert_eq!(
+                restarted
+                    .cancel(cancel_request(old_process_id, &transition_id))
+                    .await
+                    .unwrap_err()
+                    .kind,
+                ManagedTransitionRefusalKind::ProcessMismatch,
+                "{boundary}: old process identity must never cancel a transition after restart"
             );
 
             // No manufactured old outcome or reservation: the restarted
@@ -2823,8 +3778,13 @@ mod tests {
             // completes and acknowledges truthfully with the intended
             // account's own fingerprint -- not merely a fresh `Admitted`
             // re-admission.
-            complete_a_fresh_transition(&restarted, &new_process_id, boundary, &expected_fingerprint)
-                .await;
+            complete_a_fresh_transition(
+                &restarted,
+                &new_process_id,
+                boundary,
+                &expected_fingerprint,
+            )
+            .await;
         }
 
         // Initial-load failure: the real mapper must report the coordinator
@@ -2850,8 +3810,13 @@ mod tests {
         write_chatgpt_auth_for_intended_account(codex_home.path(), REAL_MAPPER_TEST_ACCOUNT_ID);
         let (repaired, repaired_process_id) =
             coordinator_from_real_persisted_auth(codex_home.path()).await;
-        complete_a_fresh_transition(&repaired, &repaired_process_id, "repaired", &expected_fingerprint)
-            .await;
+        complete_a_fresh_transition(
+            &repaired,
+            &repaired_process_id,
+            "repaired",
+            &expected_fingerprint,
+        )
+        .await;
     }
 
     /// A synthetic [`ResetInventory`] that records whether it ran and can be
@@ -2879,7 +3844,7 @@ mod tests {
             Box::pin(async move {
                 self.called.store(true, Ordering::Release);
                 if self.should_fail {
-                    Err("synthetic reset failure".to_owned())
+                    Err(ResetInventoryError::ModelCatalogUnavailable)
                 } else {
                     Ok(())
                 }
@@ -2887,7 +3852,9 @@ mod tests {
         }
     }
 
-    async fn real_auth_manager(codex_home: &std::path::Path) -> codex_login::AuthManager {
+    pub(super) async fn real_auth_manager(
+        codex_home: &std::path::Path,
+    ) -> codex_login::AuthManager {
         codex_login::AuthManager::new(
             codex_home.to_path_buf(),
             /*enable_codex_api_key_env*/ false,
@@ -2898,6 +3865,547 @@ mod tests {
             codex_login::test_support::transport_default_auth_route_config(),
         )
         .await
+    }
+
+    struct RetryResetInventory {
+        fails: AtomicBool,
+        calls: AtomicU64,
+    }
+
+    #[tokio::test]
+    async fn target_replacement_during_drain_refuses_before_auth_install() {
+        let home = tempfile::TempDir::new().unwrap();
+        write_chatgpt_auth_for_intended_account(home.path(), "account-a");
+        let manager = Arc::new(real_auth_manager(home.path()).await);
+        let resets = Arc::new(RetryResetInventory {
+            fails: AtomicBool::new(false),
+            calls: AtomicU64::new(0),
+        });
+        let source = SyntheticTargetEvidenceSource::new(SyntheticTargetFacts::baseline());
+        let coordinator = ManagedTransitionCoordinator::from_authoritative_auth_state_target_evidence_and_adoption(
+            AuthoritativeAuthState::from_auth_manager(&manager), source.clone(), manager.clone(), resets.clone(),
+        );
+        let permit = coordinator.try_acquire_account_work_permit().unwrap();
+        let mut start = request(coordinator.process_instance_id().await, "changed-target");
+        start.expected_auth_fingerprint = Some(account_fingerprint("account-a"));
+        write_chatgpt_auth_for_intended_account(home.path(), "account-b");
+        coordinator.admit(start).await.unwrap();
+        let drain = coordinator.close_barrier_and_drain("changed-target");
+        tokio::pin!(drain);
+        assert!(futures::poll!(drain.as_mut()).is_pending());
+        assert_eq!(
+            coordinator
+                .state
+                .lock()
+                .await
+                .active
+                .as_ref()
+                .unwrap()
+                .phase,
+            ManagedTransitionPhase::Draining
+        );
+
+        let mut changed = SyntheticTargetFacts::baseline();
+        changed.executable_identity_inode += 1;
+        source.replace_facts(changed);
+        drop(permit);
+        let status = drain.await.unwrap();
+        assert_eq!(
+            status.refusal,
+            Some(ManagedTransitionRefusalKind::TargetChanged)
+        );
+        assert_eq!(status.phase, ManagedTransitionPhase::Quarantined);
+        assert_eq!(status.auth_revision, 0);
+        assert_eq!(
+            manager.authoritative_managed_auth_fingerprint().unwrap(),
+            Some(account_fingerprint("account-a"))
+        );
+        assert_eq!(resets.calls.load(Ordering::SeqCst), 0);
+        assert!(coordinator.try_acquire_account_work_permit().is_none());
+    }
+
+    #[tokio::test]
+    async fn prepared_source_replacement_refuses_without_installing_or_reparsing_it() {
+        let home = tempfile::TempDir::new().unwrap();
+        write_chatgpt_auth_for_intended_account(home.path(), "account-a");
+        let manager = Arc::new(real_auth_manager(home.path()).await);
+        let resets = Arc::new(RetryResetInventory {
+            fails: AtomicBool::new(false),
+            calls: AtomicU64::new(0),
+        });
+        let coordinator = ManagedTransitionCoordinator::from_authoritative_auth_state_target_evidence_and_adoption(
+            AuthoritativeAuthState::from_auth_manager(&manager), Arc::new(UnsetTargetEvidenceSource), manager.clone(), resets.clone(),
+        );
+        let mut start = request(coordinator.process_instance_id().await, "prepared-b");
+        start.expected_auth_fingerprint = Some(account_fingerprint("account-a"));
+        write_chatgpt_auth_for_intended_account(home.path(), "account-b");
+        coordinator.admit(start).await.unwrap();
+        assert!(
+            coordinator
+                .state
+                .lock()
+                .await
+                .active
+                .as_ref()
+                .unwrap()
+                .prepared_adoption
+                .is_some()
+        );
+        write_chatgpt_auth_for_intended_account(home.path(), "account-c");
+        let status = coordinator
+            .close_barrier_and_drain("prepared-b")
+            .await
+            .unwrap();
+        assert_eq!(
+            status.refusal,
+            Some(ManagedTransitionRefusalKind::AuthSourceChanged)
+        );
+        assert_eq!(status.phase, ManagedTransitionPhase::Quarantined);
+        assert_eq!(status.auth_revision, 0);
+        assert_eq!(
+            manager
+                .authoritative_auth_cached()
+                .unwrap()
+                .and_then(|auth| auth.get_account_id()),
+            Some("account-a".to_owned())
+        );
+        assert_eq!(resets.calls.load(Ordering::SeqCst), 0);
+        assert!(
+            coordinator
+                .state
+                .lock()
+                .await
+                .completed
+                .get("prepared-b")
+                .unwrap()
+                .prepared_adoption
+                .is_none()
+        );
+        assert!(coordinator.try_acquire_account_work_permit().is_none());
+    }
+
+    #[tokio::test]
+    async fn adoption_uses_the_admission_precondition_not_a_later_cache_snapshot() {
+        let home = tempfile::TempDir::new().unwrap();
+        write_chatgpt_auth_for_intended_account(home.path(), "account-a");
+        let manager = Arc::new(real_auth_manager(home.path()).await);
+        let resets = Arc::new(RetryResetInventory {
+            fails: AtomicBool::new(false),
+            calls: AtomicU64::new(0),
+        });
+        let coordinator = ManagedTransitionCoordinator::from_authoritative_auth_state_target_evidence_and_adoption(
+            AuthoritativeAuthState::from_auth_manager(&manager), Arc::new(UnsetTargetEvidenceSource), manager.clone(), resets.clone(),
+        );
+        let mut start = request(coordinator.process_instance_id().await, "admitted-a");
+        start.expected_auth_fingerprint = Some(account_fingerprint("account-a"));
+        write_chatgpt_auth_for_intended_account(home.path(), "account-b");
+        coordinator.admit(start).await.unwrap();
+        // An independent writer changes current auth before the adoption
+        // function takes its old late snapshot; intended durable B follows.
+        write_chatgpt_auth_for_intended_account(home.path(), "account-c");
+        let _ = manager.reload().await;
+        assert_eq!(
+            manager
+                .authoritative_auth_cached()
+                .unwrap()
+                .and_then(|auth| auth.get_account_id()),
+            Some("account-c".to_owned())
+        );
+        write_chatgpt_auth_for_intended_account(home.path(), "account-b");
+        let refusal = coordinator
+            .close_barrier_and_drain("admitted-a")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refusal.kind,
+            ManagedTransitionRefusalKind::AuthoritativeAuthUnavailable
+        );
+        assert_eq!(
+            manager
+                .authoritative_auth_cached()
+                .unwrap()
+                .and_then(|auth| auth.get_account_id()),
+            Some("account-c".to_owned())
+        );
+        assert_eq!(resets.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(coordinator.state.lock().await.auth_revision, 0);
+        assert!(coordinator.try_acquire_account_work_permit().is_none());
+    }
+
+    impl ResetInventory for RetryResetInventory {
+        fn reset_all(&self) -> ResetInventoryFuture<'_> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if self.fails.load(Ordering::SeqCst) {
+                    Err(ResetInventoryError::ModelCatalogUnavailable)
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_reset_recovery_reports_non_quiescent_work_as_reset_failure() {
+        let home = tempfile::TempDir::new().unwrap();
+        write_chatgpt_auth_for_intended_account(home.path(), "account-b");
+        let manager = Arc::new(real_auth_manager(home.path()).await);
+        let resets = Arc::new(RetryResetInventory {
+            fails: AtomicBool::new(false),
+            calls: AtomicU64::new(0),
+        });
+        let coordinator = ManagedTransitionCoordinator::from_authoritative_auth_state_target_evidence_and_adoption(
+            AuthoritativeAuthState::from_auth_manager(&manager),
+            Arc::new(UnsetTargetEvidenceSource),
+            Arc::clone(&manager),
+            resets.clone(),
+        );
+        let fingerprint = account_fingerprint("account-b");
+        let pending = PendingResetRecovery {
+            owner_transition_id: "original".to_owned(),
+            intent: ManagedTransitionIntent::AdoptManagedAuth,
+            auth_fingerprint: Some(fingerprint.clone()),
+            auth_revision: 0,
+        };
+        coordinator.state.lock().await.pending_reset = Some(pending);
+
+        let process = coordinator.process_instance_id().await;
+        let mut recovery = request(process, "recovery");
+        recovery.expected_auth_fingerprint = Some(fingerprint.clone());
+        recovery.intended_result_auth_fingerprint = Some(fingerprint);
+        coordinator.admit(recovery).await.unwrap();
+        coordinator
+            .advance("recovery", ManagedTransitionPhase::Draining)
+            .await
+            .unwrap();
+        let transferred_pending = coordinator
+            .state
+            .lock()
+            .await
+            .pending_reset
+            .clone()
+            .unwrap();
+        coordinator
+            .account_work_permits
+            .inner
+            .state
+            .fetch_add(1, Ordering::AcqRel);
+
+        let failed = coordinator
+            .resume_pending_reset("recovery", transferred_pending, &manager, resets.as_ref())
+            .await
+            .unwrap();
+        coordinator
+            .account_work_permits
+            .inner
+            .state
+            .fetch_sub(1, Ordering::AcqRel);
+
+        assert_eq!(failed.phase, ManagedTransitionPhase::Quarantined);
+        assert_eq!(
+            failed.refusal,
+            Some(ManagedTransitionRefusalKind::ResetFailed)
+        );
+        assert_eq!(resets.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_reset_retries_transfer_one_owner_without_reinstall_or_reopening() {
+        for intent in [
+            ManagedTransitionIntent::AdoptManagedAuth,
+            ManagedTransitionIntent::AdoptManagedLogout,
+        ] {
+            let home = tempfile::TempDir::new().unwrap();
+            write_chatgpt_auth_for_intended_account(home.path(), "account-a");
+            let manager = Arc::new(real_auth_manager(home.path()).await);
+            let resets = Arc::new(RetryResetInventory {
+                fails: AtomicBool::new(true),
+                calls: AtomicU64::new(0),
+            });
+            let coordinator = ManagedTransitionCoordinator::from_authoritative_auth_state_target_evidence_and_adoption(
+                AuthoritativeAuthState::from_auth_manager(&manager), Arc::new(UnsetTargetEvidenceSource),
+                Arc::clone(&manager), resets.clone(),
+            );
+            if intent == ManagedTransitionIntent::AdoptManagedAuth {
+                write_chatgpt_auth_for_intended_account(home.path(), "account-b");
+            } else {
+                std::fs::remove_file(home.path().join("auth.json")).unwrap();
+            }
+            let process = coordinator.process_instance_id().await;
+            let mut first = request(process.clone(), "original");
+            first.intent = intent;
+            first.expected_auth_fingerprint = Some(account_fingerprint("account-a"));
+            if intent == ManagedTransitionIntent::AdoptManagedLogout {
+                first.intended_result_auth_fingerprint = None;
+            }
+            let StartManagedTransitionResponse::Accepted { status: original } =
+                coordinator.start_dispatch(first.clone(), true).await
+            else {
+                panic!("initial adoption refused")
+            };
+            assert_eq!(original.phase, ManagedTransitionPhase::Quarantined);
+            assert_eq!(
+                coordinator.admit(first.clone()).await.unwrap_err().kind,
+                ManagedTransitionRefusalKind::CompletedReplay
+            );
+            first.intended_result_auth_fingerprint = Some("different".to_owned());
+            assert_eq!(
+                coordinator.admit(first).await.unwrap_err().kind,
+                ManagedTransitionRefusalKind::TransitionIdConflict
+            );
+            let mut fresh =
+                request_at_revision(process.clone(), "retry", original.transition_revision);
+            fresh.intent = intent;
+            fresh.expected_auth_revision = original.auth_revision;
+            fresh.expected_auth_fingerprint = original.result_auth_fingerprint.clone();
+            fresh.intended_result_auth_fingerprint = original.result_auth_fingerprint.clone();
+            let mut stale = fresh.clone();
+            stale.expected_auth_revision = original.auth_revision + 1;
+            assert_eq!(
+                coordinator.admit(stale).await.unwrap_err().kind,
+                ManagedTransitionRefusalKind::StaleAuthRevision
+            );
+            let mut mismatch = fresh.clone();
+            mismatch.intended_result_auth_fingerprint = Some("unintended".to_owned());
+            assert!(coordinator.admit(mismatch).await.is_err());
+            assert_eq!(resets.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                coordinator
+                    .state
+                    .lock()
+                    .await
+                    .pending_reset
+                    .as_ref()
+                    .unwrap()
+                    .owner_transition_id,
+                "original"
+            );
+
+            let mut other = fresh.clone();
+            other.transition_id = "competing-retry".to_owned();
+            let a = coordinator.clone();
+            let b = coordinator.clone();
+            let (left, right) = tokio::join!(
+                tokio::spawn(async move { a.admit(fresh).await }),
+                tokio::spawn(async move { b.admit(other).await })
+            );
+            let results = [left.unwrap(), right.unwrap()];
+            assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+            let winner = results
+                .into_iter()
+                .find_map(Result::ok)
+                .unwrap()
+                .transition_id
+                .unwrap();
+            assert!(coordinator.try_acquire_account_work_permit().is_none());
+            assert_eq!(
+                coordinator
+                    .cancel(cancel_request(process.clone(), &winner))
+                    .await
+                    .unwrap_err()
+                    .kind,
+                ManagedTransitionRefusalKind::LateCancellation
+            );
+            let failed = coordinator.close_barrier_and_drain(&winner).await.unwrap();
+            assert_eq!(failed.phase, ManagedTransitionPhase::Quarantined);
+            assert_eq!(failed.auth_revision, original.auth_revision);
+            assert!(coordinator.try_acquire_account_work_permit().is_none());
+            assert_eq!(
+                coordinator
+                    .read(read_request(process.clone(), "original"))
+                    .await
+                    .unwrap(),
+                original
+            );
+            assert_eq!(
+                coordinator
+                    .state
+                    .lock()
+                    .await
+                    .pending_reset
+                    .as_ref()
+                    .unwrap()
+                    .owner_transition_id,
+                winner
+            );
+
+            // Model the terminal authority-verification failure that leaves
+            // this installed result quarantined: only a request matching the
+            // pending owner's intent and fingerprint may enter recovery while
+            // ordinary new work remains blocked.
+            coordinator.state.lock().await.auth_authority_available = false;
+            resets.fails.store(false, Ordering::SeqCst);
+            let mut third =
+                request_at_revision(process.clone(), "final-retry", failed.transition_revision);
+            third.intent = intent;
+            third.expected_auth_revision = failed.auth_revision;
+            third.expected_auth_fingerprint = failed.result_auth_fingerprint.clone();
+            third.intended_result_auth_fingerprint = failed.result_auth_fingerprint.clone();
+            let mut ordinary = third.clone();
+            ordinary.transition_id = "ordinary-while-authority-unavailable".to_owned();
+            ordinary.intent = match intent {
+                ManagedTransitionIntent::AdoptManagedAuth => {
+                    ManagedTransitionIntent::AdoptManagedLogout
+                }
+                ManagedTransitionIntent::AdoptManagedLogout => {
+                    ManagedTransitionIntent::AdoptManagedAuth
+                }
+            };
+            ordinary.intended_result_auth_fingerprint = match ordinary.intent {
+                ManagedTransitionIntent::AdoptManagedAuth => {
+                    Some(account_fingerprint("ordinary-account"))
+                }
+                ManagedTransitionIntent::AdoptManagedLogout => None,
+            };
+            assert_eq!(
+                coordinator.admit(ordinary).await.unwrap_err().kind,
+                ManagedTransitionRefusalKind::StaleAuthFingerprint,
+                "a cleared authority latch admits only a matching pending-reset recovery"
+            );
+            let StartManagedTransitionResponse::Accepted { status: success } =
+                coordinator.start_dispatch(third, true).await
+            else {
+                panic!("recovery refused")
+            };
+            assert_eq!(success.phase, ManagedTransitionPhase::Succeeded);
+            assert_eq!(success.auth_revision, original.auth_revision);
+            assert_eq!(resets.calls.load(Ordering::SeqCst), 3);
+            let state = coordinator.state.lock().await;
+            assert!(state.pending_reset.is_none());
+            assert!(
+                state.auth_authority_available,
+                "successful pending-reset recovery must restore the authority latch"
+            );
+            drop(state);
+            assert!(coordinator.try_acquire_account_work_permit().is_some());
+            assert_eq!(
+                coordinator
+                    .read(read_request(process, "original"))
+                    .await
+                    .unwrap(),
+                original
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_reset_recovery_refuses_changed_or_unreadable_source_and_cache() {
+        for fault in [
+            "source-absent",
+            "source-malformed",
+            "source-changed",
+            "cache-changed",
+        ] {
+            let home = tempfile::TempDir::new().unwrap();
+            write_chatgpt_auth_for_intended_account(home.path(), "account-a");
+            let manager = Arc::new(real_auth_manager(home.path()).await);
+            let resets = Arc::new(RetryResetInventory {
+                fails: AtomicBool::new(true),
+                calls: AtomicU64::new(0),
+            });
+            let coordinator = ManagedTransitionCoordinator::from_authoritative_auth_state_target_evidence_and_adoption(
+                AuthoritativeAuthState::from_auth_manager(&manager), Arc::new(UnsetTargetEvidenceSource), manager.clone(), resets.clone(),
+            );
+            let process = coordinator.process_instance_id().await;
+            write_chatgpt_auth_for_intended_account(home.path(), "account-b");
+            let mut first = request(process.clone(), "first");
+            first.expected_auth_fingerprint = Some(account_fingerprint("account-a"));
+            let StartManagedTransitionResponse::Accepted { status: applied } =
+                coordinator.start_dispatch(first, true).await
+            else {
+                panic!("adoption refused")
+            };
+            assert_eq!(applied.phase, ManagedTransitionPhase::Quarantined);
+            match fault {
+                "source-absent" => std::fs::remove_file(home.path().join("auth.json")).unwrap(),
+                "source-malformed" => {
+                    std::fs::write(home.path().join("auth.json"), "invalid").unwrap()
+                }
+                "source-changed" => {
+                    write_chatgpt_auth_for_intended_account(home.path(), "account-c")
+                }
+                "cache-changed" => {
+                    write_chatgpt_auth_for_intended_account(home.path(), "account-c");
+                    let _ = manager.reload().await;
+                    assert_eq!(
+                        manager
+                            .authoritative_auth_cached()
+                            .unwrap()
+                            .and_then(|auth| auth.get_account_id()),
+                        Some("account-c".to_owned())
+                    );
+                    write_chatgpt_auth_for_intended_account(home.path(), "account-b");
+                }
+                _ => unreachable!(),
+            }
+            resets.fails.store(false, Ordering::SeqCst);
+            let mut retry =
+                request_at_revision(process.clone(), "retry", applied.transition_revision);
+            retry.expected_auth_revision = applied.auth_revision;
+            retry.expected_auth_fingerprint = applied.result_auth_fingerprint.clone();
+            let outcome = coordinator.start_dispatch(retry, true).await;
+            if fault == "cache-changed" {
+                let StartManagedTransitionResponse::Refused { refusal } = outcome else {
+                    panic!("changed cache must not be reported as current intended truth")
+                };
+                assert_eq!(
+                    refusal.kind,
+                    ManagedTransitionRefusalKind::AuthoritativeAuthUnavailable
+                );
+                let state = coordinator.state.lock().await;
+                assert!(state.active.is_none());
+                assert_eq!(
+                    state.pending_reset.as_ref().unwrap().owner_transition_id,
+                    "first"
+                );
+                assert_eq!(state.transition_revision, applied.transition_revision);
+                drop(state);
+                assert!(coordinator.try_acquire_account_work_permit().is_none());
+                assert_eq!(resets.calls.load(Ordering::SeqCst), 1);
+                continue;
+            }
+            let StartManagedTransitionResponse::Accepted { status: failed } = outcome else {
+                panic!("source-only failure should remain observable quarantine")
+            };
+            assert_eq!(failed.phase, ManagedTransitionPhase::Quarantined, "{fault}");
+            assert_eq!(failed.auth_revision, applied.auth_revision, "{fault}");
+            assert_eq!(
+                resets.calls.load(Ordering::SeqCst),
+                1,
+                "{fault}: reset must not execute"
+            );
+            assert!(coordinator.try_acquire_account_work_permit().is_none());
+            assert_eq!(
+                coordinator
+                    .read(read_request(process, "first"))
+                    .await
+                    .unwrap(),
+                applied
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn logged_out_without_pending_managed_logout_cannot_start_recovery() {
+        let home = tempfile::TempDir::new().unwrap();
+        let manager = Arc::new(real_auth_manager(home.path()).await);
+        let resets = Arc::new(RetryResetInventory {
+            fails: AtomicBool::new(false),
+            calls: AtomicU64::new(0),
+        });
+        let coordinator = ManagedTransitionCoordinator::from_authoritative_auth_state_target_evidence_and_adoption(
+            AuthoritativeAuthState::from_auth_manager(&manager), Arc::new(UnsetTargetEvidenceSource), manager, resets.clone(),
+        );
+        let mut start = request(coordinator.process_instance_id().await, "unproven-logout");
+        start.intent = ManagedTransitionIntent::AdoptManagedLogout;
+        start.intended_result_auth_fingerprint = None;
+        assert_eq!(
+            coordinator.admit(start).await.unwrap_err().kind,
+            ManagedTransitionRefusalKind::InvalidRequest
+        );
+        assert!(coordinator.state.lock().await.active.is_none());
+        assert_eq!(resets.calls.load(Ordering::SeqCst), 0);
+        assert!(coordinator.try_acquire_account_work_permit().is_some());
     }
 
     /// The full production Adopting/Resetting/Succeeded chain, driven
@@ -2974,12 +4482,9 @@ mod tests {
         );
     }
 
-    /// A source-read failure (no on-disk auth by the time Adopting runs)
-    /// must quarantine rather than report a false success or silently
-    /// touch nothing -- credential material is never involved, only the
-    /// coordinator's typed classification of the read outcome.
+    /// An absent source for auth adoption refuses before barrier effects.
     #[tokio::test]
-    async fn adoption_source_read_failure_quarantines_and_never_calls_reset() {
+    async fn adoption_source_read_failure_refuses_before_admission_and_reset() {
         let codex_home = tempfile::TempDir::new().expect("create temp codex_home");
         write_chatgpt_auth_for_intended_account(codex_home.path(), "account-a");
         let auth_manager = Arc::new(real_auth_manager(codex_home.path()).await);
@@ -2992,27 +4497,42 @@ mod tests {
         );
         let process_id = coordinator.process_instance_id().await;
 
-        // The source disappears before Adopting reads it.
+        // The source disappears before admission preparation reads it.
         std::fs::remove_file(codex_home.path().join("auth.json")).expect("remove auth.json");
 
         let mut start = request(process_id, "adopt-missing");
         start.expected_auth_fingerprint = Some(expected_fingerprint_for_account("account-a"));
-        let status = match coordinator.start_dispatch(start, true).await {
-            StartManagedTransitionResponse::Accepted { status } => status,
-            StartManagedTransitionResponse::Refused { refusal } => {
-                panic!("expected acceptance carrying a quarantined status, got refusal: {refusal:?}")
+        let refusal = match coordinator.start_dispatch(start.clone(), true).await {
+            StartManagedTransitionResponse::Accepted { .. } => {
+                panic!("missing source must not admit")
             }
+            StartManagedTransitionResponse::Refused { refusal } => refusal,
         };
-        assert_eq!(status.phase, ManagedTransitionPhase::Quarantined);
-        assert!(status.retryable);
+        assert_eq!(refusal.kind, ManagedTransitionRefusalKind::InvalidRequest);
+        // Absence is an invalid intended auth result; malformed storage is
+        // operational unavailability, not a client request error. Neither
+        // attempt consumes the transition ID or mutates barrier/revisions.
+        std::fs::write(codex_home.path().join("auth.json"), "not-json").unwrap();
+        let StartManagedTransitionResponse::Refused { refusal } =
+            coordinator.start_dispatch(start, true).await
+        else {
+            panic!("unreadable source must not admit")
+        };
+        assert_eq!(
+            refusal.kind,
+            ManagedTransitionRefusalKind::AuthoritativeAuthUnavailable
+        );
+        assert!(refusal.retryable);
         assert!(
             !reset_inventory.was_called(),
-            "a source-read failure must quarantine before ever reaching the reset step"
+            "a source-read failure must refuse before ever reaching the reset step"
         );
         assert!(
-            coordinator.try_acquire_account_work_permit().is_none(),
-            "quarantine must keep the barrier closed until an explicit cancel"
+            coordinator.try_acquire_account_work_permit().is_some(),
+            "preparation failure must leave the barrier untouched"
         );
+        assert!(coordinator.state.lock().await.active.is_none());
+        assert_eq!(coordinator.state.lock().await.transition_revision, 0);
     }
 
     /// A reset-inventory failure after a successful read/install must also
@@ -3038,7 +4558,9 @@ mod tests {
         let status = match coordinator.start_dispatch(start, true).await {
             StartManagedTransitionResponse::Accepted { status } => status,
             StartManagedTransitionResponse::Refused { refusal } => {
-                panic!("expected acceptance carrying a quarantined status, got refusal: {refusal:?}")
+                panic!(
+                    "expected acceptance carrying a quarantined status, got refusal: {refusal:?}"
+                )
             }
         };
         assert_eq!(status.phase, ManagedTransitionPhase::Quarantined);
@@ -3046,6 +4568,22 @@ mod tests {
         assert!(
             reset_inventory.was_called(),
             "the reset inventory must have run before it reported failure"
+        );
+        assert_eq!(
+            status.refusal,
+            Some(ManagedTransitionRefusalKind::ResetFailed)
+        );
+        assert_eq!(
+            coordinator.state.lock().await.completed["adopt-then-fail-reset"].reset_failure,
+            Some(ResetInventoryError::ModelCatalogUnavailable)
+        );
+        assert_eq!(
+            coordinator
+                .current_transition_status("adopt-then-fail-reset")
+                .await
+                .unwrap(),
+            status,
+            "read must retain the cause committed with the terminal record"
         );
         assert!(
             coordinator.try_acquire_account_work_permit().is_none(),
@@ -3062,6 +4600,19 @@ mod tests {
             .expect("auth manager readable")
             .and_then(|auth| auth.get_account_id());
         assert_eq!(installed_account_id, Some("account-b".to_owned()));
+        let cancellation = coordinator
+            .cancel(CancelManagedTransitionParams {
+                contract_version: MANAGED_AUTH_TRANSITION_CONTRACT_VERSION,
+                transition_id: "adopt-then-fail-reset".to_owned(),
+                process_instance_id: coordinator.process_instance_id().await,
+            })
+            .await
+            .expect_err("cancellation must not bypass a pending reset");
+        assert_eq!(
+            cancellation.kind,
+            ManagedTransitionRefusalKind::LateCancellation
+        );
+        assert!(coordinator.try_acquire_account_work_permit().is_none());
         // The coordinator's own CAS baseline must match what AuthManager
         // actually holds (B), not the pre-adoption account (A) or `None`
         // -- otherwise a later exact-quarantine cancel would reopen the
@@ -3083,7 +4634,8 @@ mod tests {
     /// Slice 1-3 test above still valid: opting into the Slice 4 chain is a
     /// property of construction, not of drain completion.
     #[tokio::test]
-    async fn a_coordinator_without_adoption_dependencies_stops_at_draining_after_a_completed_drain() {
+    async fn a_coordinator_without_adoption_dependencies_stops_at_draining_after_a_completed_drain()
+    {
         let coordinator = ManagedTransitionCoordinator::new();
         let process_id = coordinator.process_instance_id().await;
         let response = coordinator

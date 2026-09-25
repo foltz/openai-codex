@@ -128,6 +128,7 @@ mod models;
 mod models_refresh_worker;
 mod notification_media;
 mod otel_reloader;
+mod otel_reset_control;
 mod outgoing_message;
 mod plugin_config_reload;
 mod processor_task_retirement;

@@ -1808,11 +1808,24 @@ impl ThreadManagerState {
         root_turn_id: Option<String>,
     ) -> CodexResult<String> {
         let thread = self.get_thread(thread_id).await?;
+        self.send_op_to_thread(&thread, op, parent_turn_id, root_turn_id)
+            .await
+    }
+
+    /// Submit to the exact loop whose handle the caller already owns. In
+    /// particular, host work derived for this loop must not follow an ID reload.
+    pub(crate) async fn send_op_to_thread(
+        &self,
+        thread: &CodexThread,
+        op: Op,
+        parent_turn_id: Option<String>,
+        root_turn_id: Option<String>,
+    ) -> CodexResult<String> {
         if let Some(ops_log) = &self.ops_log
             && let Ok(mut log) = ops_log.lock()
             && let Some(captured_op) = capture_test_op(&op)
         {
-            log.push((thread_id, captured_op));
+            log.push((thread.session.thread_id, captured_op));
         }
         thread
             .io

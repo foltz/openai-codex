@@ -1,7 +1,7 @@
 //! Parent identity captured at a tool boundary, never reconstructed from IDs.
 
 use crate::CodexThread;
-use crate::session::Session;
+use crate::session::session::Session;
 use codex_extension_api::TurnWorkRefused;
 use codex_protocol::host_turn_work::HostTurnWork;
 use std::sync::Arc;

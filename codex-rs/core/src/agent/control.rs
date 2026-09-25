@@ -317,10 +317,10 @@ impl LocalAgentControl {
         start_options: TurnStartOptions,
         parent: Option<&crate::ParentTurnAuthority>,
     ) -> CodexResult<String> {
+        let child = state.get_thread(agent_id).await?;
         let work = if communication.trigger_turn {
             match parent {
                 Some(parent) => {
-                    let child = state.get_thread(agent_id).await?;
                     parent.derive(&child).map_err(|_| CodexErr::InvalidRequest(
                         "parent turn no longer admits child work".into(),
                     ))?
@@ -345,8 +345,8 @@ impl LocalAgentControl {
                 agent_id,
                 state,
                 state
-                    .send_op(
-                        agent_id,
+                    .send_op_to_thread(
+                        &child,
                         Op::InterAgentCommunication {
                             communication,
                             start_options,

@@ -47,7 +47,7 @@ impl TurnStartAdmission for ParentGate {
     }
 }
 
-async fn parent() -> (Arc<crate::session::Session>, Arc<ParentGate>) {
+async fn parent() -> (Arc<crate::session::session::Session>, Arc<ParentGate>) {
     let (mut session, _) = crate::session::tests::make_session_and_context().await;
     let gate = Arc::new(ParentGate {
         parent_store: session.services.thread_extension_data.level_id().to_owned(),
@@ -114,5 +114,65 @@ async fn expired_parent_refuses_input_and_trigger_but_queue_only_has_no_lease() 
     drop(parent);
     assert!(weak.upgrade().is_none(), "provenance must not own the parent");
     assert!(authority.derive(&child).is_err());
+    child.shutdown_and_wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn derived_delivery_uses_the_resolved_loop_after_lookup_removal() {
+    let harness = AgentControlHarness::new().await;
+    let (id, child) = harness.start_thread().await;
+    child.session.close_task_admission().await;
+    let (parent, gate) = parent().await;
+    let authority = crate::ParentTurnAuthority::capture(&parent, "live-parent");
+    let work = authority.derive(&child).unwrap();
+    let state = harness.control.upgrade().unwrap();
+    assert!(state.remove_thread(&id).await.is_some());
+    assert!(state.get_thread(id).await.is_err());
+    state.send_op_to_thread(
+        &child,
+        Op::InterAgentCommunication {
+            communication: InterAgentCommunication::new(
+                AgentPath::root(), AgentPath::root(), Vec::new(),
+                "exact loop".into(), /*trigger_turn*/ true,
+            ),
+            start_options: Default::default(),
+            work,
+        },
+        /*parent_turn_id*/ None,
+        /*root_turn_id*/ None,
+    ).await.unwrap();
+    timeout(Duration::from_secs(10), async {
+        while !child.session.input_queue.has_pending_mailbox_items().await {
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    assert!(gate.events.lock().unwrap().is_empty());
+    let batch = child.session.input_queue.reserve_mailbox();
+    assert!(batch.has_turn_work());
+    let _ = batch.into_input("same-loop-turn");
+    assert_eq!(*gate.events.lock().unwrap(), vec!["bound:same-loop-turn", "retained", "drop"]);
+    child.shutdown_and_wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn queue_only_operation_drops_invalid_work_without_stopping_the_loop() {
+    let harness = AgentControlHarness::new().await;
+    let (_, child) = harness.start_thread().await;
+    let events = Arc::new(Mutex::new(Vec::new()));
+    child.io.submit(Op::InterAgentCommunication {
+        communication: InterAgentCommunication::new(
+            AgentPath::root(), AgentPath::root(), Vec::new(),
+            "queue only".into(), /*trigger_turn*/ false,
+        ),
+        start_options: Default::default(),
+        work: Some(Box::new(ChildWork(Arc::clone(&events)))),
+    }).await.unwrap();
+    timeout(Duration::from_secs(10), async {
+        while !child.session.input_queue.has_pending_mailbox_items().await {
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    assert_eq!(*events.lock().unwrap(), vec!["drop"]);
+    assert!(!child.session.input_queue.reserve_mailbox().has_turn_work());
     child.shutdown_and_wait().await.unwrap();
 }

@@ -84,6 +84,15 @@ pub async fn inter_agent_communication(
     work: Option<Box<dyn codex_protocol::host_turn_work::HostTurnWork>>,
 ) {
     let trigger_turn = communication.trigger_turn;
+    let work = if trigger_turn {
+        work
+    } else {
+        if work.is_some() {
+            tracing::debug!("discarding host turn work attached to queue-only mail");
+        }
+        drop(work);
+        None
+    };
     sess.input_queue
         .enqueue_mailbox_with_work(communication, start_options, work);
     crate::agent_communication::emit_agent_communication_receive(&sub_id);

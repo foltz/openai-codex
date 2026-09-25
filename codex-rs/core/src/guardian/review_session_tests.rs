@@ -152,6 +152,7 @@ async fn test_review_session() -> (
 
     (
         GuardianReviewSession {
+            parent_session: Arc::downgrade(&session),
             session,
             io: SessionIo {
                 tx_sub: tx_sub.into(),

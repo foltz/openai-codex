@@ -101,6 +101,7 @@ pub use registry::empty_extension_registry;
 pub use state::ExtensionData;
 pub use state::ExtensionDataInit;
 pub use turn_admission::TurnStartAdmission;
+pub use turn_admission::TurnWorkRefused;
 pub use user_instructions::Instructions;
 pub use user_instructions::LoadInstructionsFuture;
 pub use user_instructions::LoadedUserInstructions;

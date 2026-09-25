@@ -207,6 +207,8 @@ pub(crate) async fn run_codex_thread_one_shot(
     // requiring the caller to cancel the parent token.
     let child_cancel = cancel_token.child_token();
     let parent_turn_id = parent_ctx.sub_id.clone();
+    let parent_for_admission = Arc::clone(&parent_session);
+    let host = Arc::clone(&parent_session.services.extensions);
     let parent_environments = parent_ctx.initial_environments.clone();
     let root_turn_id = parent_ctx.turn_metadata_state.root_turn_id();
     let (session, io) = Box::pin(run_codex_thread_interactive(
@@ -226,6 +228,14 @@ pub(crate) async fn run_codex_thread_one_shot(
     .await?;
 
     // Send the initial input to kick off the one-shot turn.
+    let termination = io.session_loop_termination.clone();
+    let host_work = host.derive_turn_work(
+        &parent_for_admission.services.thread_extension_data,
+        &parent_turn_id,
+        &session.services.thread_extension_data,
+        Box::pin(async move { termination.await; }),
+    ).map_err(|_| CodexErr::Fatal("delegate parent has no admitted account work".to_string()))?;
+    drop(parent_for_admission);
     let submission = io
         .submit_turn_input(
             TurnInputRequest::user_input(input).on_start(TurnStartOptions {
@@ -236,6 +246,7 @@ pub(crate) async fn run_codex_thread_one_shot(
                 ..Default::default()
             }),
             TurnInputMode::StartIfIdle,
+            host_work,
         )
         .await?;
     match submission {
@@ -253,12 +264,16 @@ pub(crate) async fn run_codex_thread_one_shot(
     let agent_status = io.agent_status.clone();
     let session_loop_termination = io.session_loop_termination.clone();
     let io_for_bridge = io;
+    let child_for_evidence = Arc::clone(&session);
     tokio::spawn(async move {
         while let Ok(event) = io_for_bridge.next_event().await {
             let should_shutdown = matches!(
                 event.msg,
                 EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_)
             );
+            if should_shutdown {
+                host.turn_work_terminal(&child_for_evidence.services.thread_extension_data, &event.id);
+            }
             let _ = tx_bridge.send(event).await;
             if should_shutdown {
                 let _ = ops_tx

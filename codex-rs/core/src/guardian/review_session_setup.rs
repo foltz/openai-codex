@@ -153,6 +153,7 @@ impl PreparedGuardianContext {
             SubAgentSource::Other(GUARDIAN_REVIEWER_NAME.to_owned()),
         );
         GuardianReviewSession {
+            parent_session: Arc::downgrade(&self.parent),
             session,
             io,
             cancel_token: cancellation,

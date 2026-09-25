@@ -239,6 +239,24 @@ impl CodexThread {
     }
 
     pub async fn submit(&self, op: Op) -> CodexResult<String> {
+        let op = if matches!(&op, Op::Compact | Op::Review { .. }) {
+            match self.session.services.extensions.admit_turn_work(
+                &self.session.services.thread_extension_data,
+                Box::pin(self.termination_receipt()),
+            ).map_err(|_| CodexErr::Fatal("account work admission is closed".to_string()))? {
+                Some(work) => {
+                    let action = match op {
+                        Op::Compact => codex_protocol::host_turn_work::HostTurnAction::Compact,
+                        Op::Review { review_request } => codex_protocol::host_turn_work::HostTurnAction::Review(review_request),
+                        _ => unreachable!("only compact and review acquire legacy turn work"),
+                    };
+                    Op::HostTurn { action, work }
+                }
+                None => op,
+            }
+        } else {
+            op
+        };
         self.io.submit(op).await
     }
 
@@ -273,7 +291,21 @@ impl CodexThread {
 
     /// Wait until the underlying session loop has terminated.
     pub async fn wait_until_terminated(&self) {
-        self.io.session_loop_termination.clone().await;
+        self.termination_receipt().await;
+    }
+
+    /// Retain observation of this exact session loop without retaining the
+    /// thread handle. Dropping an observer neither cancels the loop nor consumes
+    /// its completion; independent observers can await the same termination.
+    ///
+    /// Completion proves loop termination, including panic or cancellation,
+    /// not successful session-resource cleanup. Hosts can use this as a fallback
+    /// for logical turn evidence when the loop cannot emit a terminal event.
+    pub fn termination_receipt(&self) -> impl std::future::Future<Output = ()> + Send + 'static + use<> {
+        let termination = self.io.session_loop_termination.clone();
+        async move {
+            termination.await;
+        }
     }
 
     pub(crate) async fn emit_thread_ready_lifecycle(&self) {
@@ -414,6 +446,15 @@ impl CodexThread {
         &self,
         request: RecoverTurnRequest,
     ) -> CodexResult<StartIfIdleSubmission> {
+        let host_work = match self.session.services.extensions.admit_turn_work(
+            &self.session.services.thread_extension_data,
+            Box::pin(self.termination_receipt()),
+        ) {
+            Ok(work) => work,
+            Err(_) => return Ok(StartIfIdleSubmission::NotSubmitted {
+                reason: codex_protocol::turn_input::NotSubmittedReason::ServerDraining,
+            }),
+        };
         self.session
             .services
             .agent_control
@@ -438,7 +479,7 @@ impl CodexThread {
         };
         match self
             .io
-            .submit_recover_turn(thread_settings, start_options, trace, turn_id)
+            .submit_recover_turn(thread_settings, start_options, trace, turn_id, host_work)
             .await?
         {
             TurnInputSubmission::Started { turn_id } => {
@@ -519,6 +560,19 @@ impl CodexThread {
         request: TurnInputRequest,
         mode: TurnInputMode,
     ) -> CodexResult<TurnInputSubmission> {
+        let host_work = if matches!(mode, TurnInputMode::Steer { .. }) {
+            None
+        } else {
+            match self.session.services.extensions.admit_turn_work(
+                &self.session.services.thread_extension_data,
+                Box::pin(self.termination_receipt()),
+            ) {
+                Ok(work) => work,
+                Err(_) => return Ok(TurnInputSubmission::NotSubmitted {
+                    reason: codex_protocol::turn_input::NotSubmittedReason::ServerDraining,
+                }),
+            }
+        };
         if !matches!(mode, TurnInputMode::Steer { .. }) {
             self.session
                 .services
@@ -526,7 +580,7 @@ impl CodexThread {
                 .ensure_execution_capacity_for_turn_start(self)
                 .await?;
         }
-        self.io.submit_turn_input(request, mode).await
+        self.io.submit_turn_input(request, mode, host_work).await
     }
 
     /// Persist whether this thread is eligible for future memory generation.

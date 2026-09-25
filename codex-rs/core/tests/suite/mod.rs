@@ -205,6 +205,7 @@ mod tool_parallelism;
 mod tools;
 mod truncation;
 mod turn_input_submission;
+mod host_turn_work;
 mod turn_state;
 mod unified_exec;
 mod unified_exec_process_events;

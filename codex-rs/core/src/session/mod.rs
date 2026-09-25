@@ -1164,6 +1164,7 @@ impl SessionIo {
         &self,
         mut request: TurnInputRequest,
         mode: TurnInputMode,
+        host_work: Option<Box<dyn codex_protocol::host_turn_work::HostTurnWork>>,
     ) -> CodexResult<TurnInputSubmission> {
         let id = new_submission_id();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -1173,6 +1174,7 @@ impl SessionIo {
             op: Op::TurnInput {
                 request: Box::new(request),
                 mode,
+                host_work,
                 reply: reply_tx,
             },
             trace,
@@ -1189,6 +1191,7 @@ impl SessionIo {
         start_options: TurnStartOptions,
         trace: Option<W3cTraceContext>,
         turn_id: String,
+        host_work: Option<Box<dyn codex_protocol::host_turn_work::HostTurnWork>>,
     ) -> CodexResult<TurnInputSubmission> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.submit_with_id(Submission {
@@ -1196,6 +1199,7 @@ impl SessionIo {
             op: Op::RecoverTurn {
                 thread_settings,
                 start_options,
+                host_work,
                 reply: reply_tx,
             },
             trace,

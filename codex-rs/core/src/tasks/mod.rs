@@ -292,9 +292,20 @@ impl Session {
         input: Vec<TurnInput>,
         task: T,
     ) {
+        let _ = self.try_spawn_task(turn_context, input, task).await;
+    }
+
+    /// Preserve replacement ordering while exposing refusal to callers that
+    /// must distinguish a started task from a rejected submission.
+    pub(crate) async fn try_spawn_task<T: SessionTask>(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        input: Vec<TurnInput>,
+        task: T,
+    ) -> CodexResult<()> {
         self.abort_all_tasks(TurnAbortReason::Replaced).await;
         self.clear_connector_selection().await;
-        let _ = self.start_task(turn_context, input, task).await;
+        self.start_task(turn_context, input, task).await
     }
 
     #[expect(

@@ -193,6 +193,39 @@ impl<C: Sync> ExtensionRegistry<C> {
         }
     }
 
+    /// Acquire account-work custody without changing Core's shutdown gate.
+    pub fn admit_turn_work(
+        &self,
+        thread_store: &crate::ExtensionData,
+        termination: crate::ExtensionFuture<'static, ()>,
+    ) -> Result<Option<Box<dyn codex_protocol::host_turn_work::HostTurnWork>>, crate::TurnWorkRefused> {
+        match &self.turn_start_admission {
+            Some(admission) => admission.admit_turn_work(thread_store, termination),
+            None => Ok(None),
+        }
+    }
+
+    /// Derive child custody from a live parent turn without reopening admission.
+    pub fn derive_turn_work(
+        &self,
+        parent_store: &crate::ExtensionData,
+        parent_turn_id: &str,
+        child_store: &crate::ExtensionData,
+        termination: crate::ExtensionFuture<'static, ()>,
+    ) -> Result<Option<Box<dyn codex_protocol::host_turn_work::HostTurnWork>>, crate::TurnWorkRefused> {
+        match &self.turn_start_admission {
+            Some(admission) => admission.derive_turn_work(parent_store, parent_turn_id, child_store, termination),
+            None => Ok(None),
+        }
+    }
+
+    /// Forward terminal evidence from an existing child event consumer.
+    pub fn turn_work_terminal(&self, thread_store: &crate::ExtensionData, turn_id: &str) {
+        if let Some(admission) = &self.turn_start_admission {
+            admission.turn_work_terminal(thread_store, turn_id);
+        }
+    }
+
     /// Returns the host event sink retained by this registry.
     pub fn event_sink(&self) -> Arc<dyn ExtensionEventSink> {
         Arc::clone(&self.event_sink)

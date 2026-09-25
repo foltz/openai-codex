@@ -241,14 +241,16 @@ pub async fn reload_user_config(sess: &Arc<Session>) {
     sess.reload_user_config_layer().await;
 }
 
-pub async fn compact(sess: &Arc<Session>, sub_id: String) {
+pub async fn compact(sess: &Arc<Session>, sub_id: String) -> bool {
     // Stop the old turn before the compact task picks up the next turn's environments.
     sess.abort_all_tasks(TurnAbortReason::Replaced).await;
     let turn_context = sess
         .new_turn_with_default_settings(sub_id, Default::default())
         .await;
 
-    sess.spawn_task(turn_context, Vec::new(), CompactTask).await;
+    sess.try_spawn_task(turn_context, Vec::new(), CompactTask)
+        .await
+        .is_ok()
 }
 
 pub(super) async fn persist_thread_memory_mode_update(
@@ -474,7 +476,7 @@ pub async fn review(
     config: &Arc<Config>,
     sub_id: String,
     review_request: ReviewRequest,
-) {
+) -> bool {
     let turn_context = sess
         .new_turn_with_default_settings(sub_id.clone(), Default::default())
         .await;
@@ -490,7 +492,7 @@ pub async fn review(
                 sub_id,
                 resolved,
             )
-            .await;
+            .await
         }
         Err(err) => {
             let event = Event {
@@ -502,6 +504,7 @@ pub async fn review(
                 }),
             };
             sess.send_event(&turn_context, event.msg).await;
+            false
         }
     }
 }
@@ -527,6 +530,21 @@ pub(super) async fn submission_loop(
         let dispatch_span = submission_dispatch_span(&sub);
         let should_exit = async {
             match sub.op {
+                Op::HostTurn { action, mut work } => {
+                    work.bind_submission(&sub.id);
+                    let started = match action {
+                        codex_protocol::host_turn_work::HostTurnAction::Compact => {
+                            compact(&sess, sub.id.clone()).await
+                        }
+                        codex_protocol::host_turn_work::HostTurnAction::Review(request) => {
+                            review(&sess, &config, sub.id.clone(), request).await
+                        }
+                    };
+                    if started {
+                        work.retain_until_terminal();
+                    }
+                    false
+                }
                 Op::Interrupt => {
                     interrupt(&sess).await;
                     false
@@ -574,17 +592,30 @@ pub(super) async fn submission_loop(
                 Op::TurnInput {
                     request,
                     mode,
+                    mut host_work,
                     reply,
                 } => {
+                    if let Some(work) = &mut host_work {
+                        work.bind_submission(&sub.id);
+                    }
                     let result = turn_input::handle(&sess, *request, mode, sub.id.clone()).await;
+                    if matches!(&result, Ok(codex_protocol::turn_input::TurnInputSubmission::Started { .. }))
+                        && let Some(work) = host_work.take()
+                    {
+                        work.retain_until_terminal();
+                    }
                     let _ = reply.send(result);
                     false
                 }
                 Op::RecoverTurn {
                     thread_settings,
                     start_options,
+                    mut host_work,
                     reply,
                 } => {
+                    if let Some(work) = &mut host_work {
+                        work.bind_submission(&sub.id);
+                    }
                     let result = turn_input::handle_recovery(
                         &sess,
                         thread_settings,
@@ -592,6 +623,11 @@ pub(super) async fn submission_loop(
                         sub.id.clone(),
                     )
                     .await;
+                    if matches!(&result, Ok(codex_protocol::turn_input::TurnInputSubmission::Started { .. }))
+                        && let Some(work) = host_work.take()
+                    {
+                        work.retain_until_terminal();
+                    }
                     let _ = reply.send(result);
                     false
                 }

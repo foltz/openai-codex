@@ -4,6 +4,7 @@ use crate::config::ConfigBuilder;
 use crate::session::SessionLoopOutcome;
 use crate::thread_manager::StartThreadOptions;
 use crate::thread_manager::ThreadManager;
+use futures::FutureExt;
 use pretty_assertions::assert_eq;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -24,6 +25,49 @@ async fn manager() -> (tempfile::TempDir, ThreadManager, Config) {
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
     );
     (home, manager, config)
+}
+
+#[tokio::test]
+async fn termination_receipt_does_not_retain_thread_or_cancel_loop_on_observer_drop() {
+    let (_home, manager, config) = manager().await;
+    let started = manager
+        .start_thread(StartThreadOptions::new(config, /*control_endpoint*/ None))
+        .await
+        .unwrap();
+    let receipt = started.thread.termination_receipt().boxed().shared();
+    assert!(receipt.clone().now_or_never().is_none());
+    drop(receipt.clone());
+    assert!(receipt.clone().now_or_never().is_none());
+
+    started.thread.shutdown_and_wait().await.unwrap();
+    let weak = Arc::downgrade(&started.thread);
+    drop(manager.remove_thread(&started.thread_id).await);
+    drop(started);
+    assert!(manager.constructions.published().is_empty());
+    assert!(weak.upgrade().is_none());
+    // The receipt remains valid after compaction and is repeatable.
+    receipt.clone().await;
+    receipt.await;
+}
+
+#[tokio::test]
+async fn termination_receipt_observes_aborted_loop_without_claiming_cleanup() {
+    let (_home, manager, config) = manager().await;
+    let started = manager
+        .start_thread(StartThreadOptions::new(config, /*control_endpoint*/ None))
+        .await
+        .unwrap();
+    let receipt = started.thread.termination_receipt();
+    started.thread.io.session_loop_termination.request_abort();
+    tokio::time::timeout(Duration::from_secs(5), receipt).await.unwrap();
+    assert!(started.thread.observed_terminal_cleanup().is_none());
+    let report = started.thread
+        .begin_retirement(Instant::now() + Duration::from_secs(20))
+        .unwrap().wait().await;
+    assert_eq!(report.session_loop, crate::ThreadLoopOutcome::Cancelled);
+    assert_eq!(report.cleanup, crate::ThreadCleanupOutcome::Finished {
+        persistence_failed: false,
+    });
 }
 
 #[tokio::test]

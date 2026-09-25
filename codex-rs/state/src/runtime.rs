@@ -40,7 +40,10 @@ use std::time::Instant;
 use tracing::warn;
 
 mod backfill;
+mod clear_recoveries;
 mod clear_transitions;
+pub use clear_recoveries::ClearRecoveryPhase;
+pub use clear_recoveries::ClearRecoveryRecord;
 mod external_agent_config_imports;
 mod goals;
 mod logs;

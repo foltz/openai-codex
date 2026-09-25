@@ -569,6 +569,7 @@ mod search;
 mod thread_attachments;
 mod thread_clear;
 mod thread_clear_read;
+mod thread_clear_recovery;
 mod thread_enrichment;
 mod thread_fork_goal;
 mod thread_input;
@@ -609,11 +610,11 @@ pub(crate) use thread_processor::ProcessorThreadRetirement;
 pub(crate) use thread_processor::ProcessorThreadShutdown;
 pub(crate) use thread_processor::ThreadRequestProcessor;
 pub(crate) use thread_processor::ThreadResumeTarget;
-pub(crate) use thread_queue_processor::ThreadQueueRequestProcessor;
 #[cfg(test)]
 pub(crate) use thread_processor::ThreadShutdownOwner;
 #[cfg(test)]
 pub(crate) use thread_processor::thread_shutdown_fixture;
+pub(crate) use thread_queue_processor::ThreadQueueRequestProcessor;
 pub(crate) use turn_processor::TurnRequestProcessor;
 pub(crate) use windows_sandbox_processor::WindowsSandboxRequestProcessor;
 

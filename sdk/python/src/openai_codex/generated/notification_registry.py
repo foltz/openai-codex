@@ -55,10 +55,13 @@ from .v2_all import StrictReviewRequiredNotification
 from .v2_all import TerminalInteractionNotification
 from .v2_all import ThreadArchivedNotification
 from .v2_all import ThreadAttachmentUpdatedNotification
+from .v2_all import ThreadClearEndedNotification
+from .v2_all import ThreadClearStartedNotification
 from .v2_all import ThreadClosedNotification
 from .v2_all import ThreadDeletedNotification
 from .v2_all import ThreadGoalClearedNotification
 from .v2_all import ThreadGoalUpdatedNotification
+from .v2_all import ThreadInteractiveSubscriptionChangedNotification
 from .v2_all import ThreadNameUpdatedNotification
 from .v2_all import ThreadProjectUpdatedNotification
 from .v2_all import ThreadQueueChangedNotification
@@ -137,10 +140,13 @@ KnownNotificationPayload: TypeAlias = (
     | TerminalInteractionNotification
     | ThreadArchivedNotification
     | ThreadAttachmentUpdatedNotification
+    | ThreadClearEndedNotification
+    | ThreadClearStartedNotification
     | ThreadClosedNotification
     | ThreadDeletedNotification
     | ThreadGoalClearedNotification
     | ThreadGoalUpdatedNotification
+    | ThreadInteractiveSubscriptionChangedNotification
     | ThreadNameUpdatedNotification
     | ThreadProjectUpdatedNotification
     | ThreadQueueChangedNotification
@@ -203,6 +209,7 @@ NOTIFICATION_MODELS: dict[str, type[KnownNotificationPayload]] = {
     "item/reasoning/summaryTextDelta": ReasoningSummaryTextDeltaNotification,
     "item/reasoning/textDelta": ReasoningTextDeltaNotification,
     "item/started": ItemStartedNotification,
+    "kcf/thread/interactiveSubscription/changed": ThreadInteractiveSubscriptionChangedNotification,
     "mcpServer/event/stream/notification": McpServerEventStreamNotification,
     "mcpServer/oauthLogin/completed": McpServerOauthLoginCompletedNotification,
     "mcpServer/startupStatus/updated": McpServerStatusUpdatedNotification,
@@ -219,6 +226,8 @@ NOTIFICATION_MODELS: dict[str, type[KnownNotificationPayload]] = {
     "skills/changed": SkillsChangedNotification,
     "thread/archived": ThreadArchivedNotification,
     "thread/attachment/updated": ThreadAttachmentUpdatedNotification,
+    "thread/clear/ended": ThreadClearEndedNotification,
+    "thread/clear/started": ThreadClearStartedNotification,
     "thread/closed": ThreadClosedNotification,
     "thread/compacted": ContextCompactedNotification,
     "thread/deleted": ThreadDeletedNotification,

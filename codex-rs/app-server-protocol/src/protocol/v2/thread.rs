@@ -289,6 +289,10 @@ pub struct ThreadStartParams {
     #[experimental("thread/start.clearPredecessor")]
     #[ts(optional = nullable)]
     pub clear_predecessor_thread_id: Option<String>,
+    /// Independent recovery provenance; incompatible with clearPredecessorThreadId.
+    #[experimental("thread/start.clearRecovery")]
+    #[ts(optional = nullable)]
+    pub clear_recovery: Option<super::ThreadClearRecoveryContext>,
     /// Optional client-supplied analytics source classification for this thread.
     #[ts(optional = nullable)]
     pub thread_source: Option<ThreadSource>,
@@ -356,6 +360,10 @@ pub struct MockExperimentalMethodResponse {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadStartResponse {
+    /// Accepted recovery provenance, not authoritative clear lineage.
+    #[experimental("thread/start.clearRecovery")]
+    #[serde(default)]
+    pub clear_recovery: Option<super::ThreadClearRecovery>,
     pub thread: Thread,
     pub model: String,
     pub model_provider: String,

@@ -4244,6 +4244,42 @@
       ],
       "type": "object"
     },
+    "ThreadClearParams": {
+      "description": "Parameters for the server-owned clear-and-replace operation.",
+      "properties": {
+        "threadId": {
+          "description": "The predecessor currently displayed by the requesting connection.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "threadId"
+      ],
+      "type": "object"
+    },
+    "ThreadClearRecoveryContext": {
+      "additionalProperties": false,
+      "description": "Caller provenance, never an authoritative clear edge or a shutdown receipt.",
+      "properties": {
+        "contractVersion": {
+          "description": "Must match the recovery-read contract on this connection before creation.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "predecessorThreadId": {
+          "description": "Null means genuinely no displayed predecessor, not an unavailable known ID.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "contractVersion"
+      ],
+      "type": "object"
+    },
     "ThreadCompactStartParams": {
       "properties": {
         "threadId": {
@@ -6073,6 +6109,30 @@
         "params"
       ],
       "title": "Thread/unsubscribeRequest",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "thread/clear"
+          ],
+          "title": "Thread/clearRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/ThreadClearParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "Thread/clearRequest",
       "type": "object"
     },
     {

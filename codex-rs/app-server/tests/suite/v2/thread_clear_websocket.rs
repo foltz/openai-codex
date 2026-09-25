@@ -49,6 +49,8 @@ use tokio::time::timeout;
 
 #[path = "thread_clear_read.rs"]
 mod clear_read;
+#[path = "thread_clear_recovery.rs"]
+mod clear_recovery;
 
 #[derive(Debug)]
 enum ClearEvidence {
@@ -148,7 +150,13 @@ async fn clear_successor_preserves_thread_source_after_preview_and_cold_resume()
 
     // This WebSocket observer has no trusted interactive subscription. Its
     // subscription state must not turn a persisted user classification into null.
-    send_request(&mut client, "kcf/thread/interactiveSubscription/list", 8, Some(json!({}))).await?;
+    send_request(
+        &mut client,
+        "kcf/thread/interactiveSubscription/list",
+        8,
+        Some(json!({})),
+    )
+    .await?;
     let subscriptions = read_response_for_id(&mut client, 8).await?;
     let entries = subscriptions.result["entries"]
         .as_array()

@@ -442,3 +442,50 @@ returns A/B; it never selects an arbitrary latest transition.
 Lifecycle consumers can use the already negotiated generic control endpoint.
 This API does not add hook endpoint discovery, change `codex/thread-identity`,
 or implement downstream admission, naming, trust, or routing decisions.
+
+## Clear recovery observation (experimental)
+
+Recovery creates an independent thread when the client's displayed predecessor
+is unavailable, or when no predecessor is displayed. It does not shut down the
+predecessor, authorize succession, or create a `clear_transitions` edge. The TUI
+uses its existing unavailable predicate; the server does not arbitrate whether
+an authoritative clear could have succeeded from fresher client state.
+
+Before creation, probe `thread/clear/recovery/read` with `{}` on the same
+connection. A supported producer returns `contractVersion: 1`,
+`durability: "durable" | "unavailable"`, and `observation: {"type":"support"}`.
+Revision 1 promises both this read and the revision-1 `thread/start.clearRecovery`
+write contract. Repeat the probe after reconnect. Method existence alone, an
+experimental opt-in, or a post-creation echo is not support proof.
+
+Send `thread/start` with `sessionStartSource: "clear"` and
+`clearRecovery: {"contractVersion":1,"predecessorThreadId":"A"}`. Use null only
+when there genuinely is no displayed predecessor. Never put recovery A in
+`clearPredecessorThreadId`. Unsupported producers must not be sent a recovery
+creation request. There is no automatic creation retry or idempotency key.
+
+`ThreadStartResponse.clearRecovery` echoes `successorThreadId`, the accepted
+`context`, and `durability`. An absent/mismatched echo or lost response is an
+unknown outcome; a new attempt may create another thread. Hooks and notifications
+are unchanged: a clear-source hook without an authoritative tuple is not a
+recovery receipt. Consumers discover provenance through the successor-keyed read.
+
+Read with `{"successorThreadId":"B"}`. The result has the same version and
+durability fields, plus an observation whose type is `none`, `pending`,
+`complete`, or `failed`. The latter three contain `recovery` in the response
+echo's shape. Pending is written before construction (including the composed
+KCF eager hooks); complete means core thread creation succeeded, not that the
+client received its response or that A stopped. Failed means creation returned
+an error. Cancellation, a crash or a failed phase write can leave pending;
+consumers must bound waiting and fail closed. No background expiry or repair
+turns pending into permission.
+
+Evidence lives in the process state database, independently of rollouts. Even an
+ephemeral successor has durable evidence when that database is available. Without
+it, creation is allowed with explicitly unavailable durability and the accepted
+context in the response, but every successor-specific read errors, including
+during construction. An in-memory response is not restart evidence. `none` from
+this read and `thread/clear/read` together still does not prove freshness. Errors,
+lost storage or a previously observed recovery disappearing must never fall
+through to fresh identity admission. Records have no implicit TTL or predecessor
+uniqueness constraint; repeated independent recoveries can name the same A.

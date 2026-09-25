@@ -16,10 +16,10 @@ use crate::processor_task_retirement::ProcessorTaskDrain;
 use crate::processor_task_retirement::ProcessorTasks;
 use codex_app_server_protocol::SelectedCapabilityRoot;
 use codex_app_server_protocol::ThreadHistoryMode as ApiThreadHistoryMode;
+use codex_app_server_protocol::ThreadInteractiveSubscriptionListParams;
 use codex_app_server_protocol::ThreadRevertParams;
 use codex_app_server_protocol::ThreadRevertResponse;
 use codex_app_server_protocol::ThreadRevertedNotification;
-use codex_app_server_protocol::ThreadInteractiveSubscriptionListParams;
 use codex_app_server_protocol::ThreadSection;
 use codex_app_server_protocol::ThreadSectionAppearance;
 use codex_app_server_protocol::ThreadSectionMoveParams;
@@ -1184,11 +1184,19 @@ impl ThreadRequestProcessor {
             history_mode,
             session_start_source,
             clear_predecessor_thread_id,
+            clear_recovery,
             thread_source,
             project_id,
             daybreak_enabled,
             environments,
         } = params;
+        if let Some(context) = &clear_recovery {
+            super::thread_clear_recovery::validate_recovery(
+                context,
+                session_start_source,
+                &clear_predecessor_thread_id,
+            )?;
+        }
         if matches!(
             history_mode,
             Some(codex_app_server_protocol::ThreadHistoryMode::Paginated)
@@ -1267,6 +1275,7 @@ impl ThreadRequestProcessor {
         let initial_config_warnings = Arc::clone(&self.initial_config_warnings);
         let outgoing = Arc::clone(&listener_task_context.outgoing);
         let error_request_id = request_id.clone();
+        let recovery_state = self.state_db.clone();
         let thread_start_task = async move {
             if let Err(error) = Self::thread_start_task(
                 listener_task_context,
@@ -1284,6 +1293,8 @@ impl ThreadRequestProcessor {
                 history_mode.map(Into::into),
                 session_start_source,
                 clear_predecessor_thread_id,
+                clear_recovery,
+                recovery_state,
                 thread_source.map(Into::into),
                 project_id,
                 daybreak_enabled,
@@ -1307,7 +1318,9 @@ impl ThreadRequestProcessor {
             crate::processor_task_retirement::ProcessorTaskJoin::Joined => {}
             crate::processor_task_retirement::ProcessorTaskJoin::Cancelled
             | crate::processor_task_retirement::ProcessorTaskJoin::Panicked => {
-                return Err(internal_error("thread startup task stopped before completing"));
+                return Err(internal_error(
+                    "thread startup task stopped before completing",
+                ));
             }
         }
         Ok(())
@@ -1409,6 +1422,8 @@ impl ThreadRequestProcessor {
         history_mode: Option<ThreadHistoryMode>,
         session_start_source: Option<codex_app_server_protocol::ThreadStartSource>,
         clear_predecessor_thread_id: Option<String>,
+        clear_recovery: Option<codex_app_server_protocol::ThreadClearRecoveryContext>,
+        recovery_state: Option<StateDbHandle>,
         thread_source: Option<codex_protocol::protocol::ThreadSource>,
         project_id: Option<String>,
         daybreak_enabled: Option<bool>,
@@ -1551,7 +1566,7 @@ impl ThreadRequestProcessor {
             thread_extension_init.insert(selected_capability_roots);
         }
         let mut start_options = StartThreadOptions::new(config, /*control_endpoint*/ None);
-        let reserved_thread_id = if start_options.config.ephemeral {
+        let mut reserved_thread_id = if start_options.config.ephemeral {
             None
         } else {
             stage_pending_thread_metadata(
@@ -1565,6 +1580,43 @@ impl ThreadRequestProcessor {
                 "thread/start",
             )
             .await?
+        };
+        // Recovery also reserves IDs for empty metadata and ephemeral threads.
+        // Its separate evidence does not depend on rollout materialization.
+        if clear_recovery.is_some() && reserved_thread_id.is_none() {
+            reserved_thread_id = Some(listener_task_context.thread_manager.reserve_thread_id());
+        }
+        let recovery = if let (Some(context), Some(successor)) =
+            (clear_recovery, reserved_thread_id)
+        {
+            let durability = if let Some(state) = &recovery_state {
+                let predecessor = context
+                    .predecessor_thread_id
+                    .as_deref()
+                    .map(ThreadId::from_string)
+                    .transpose()
+                    .map_err(|err| {
+                        invalid_request(format!("invalid recovery predecessor: {err}"))
+                    })?;
+                if let Err(err) = state.reserve_clear_recovery(successor, predecessor).await {
+                    remove_pending_thread_metadata(thread_store.as_ref(), reserved_thread_id).await;
+                    return Err(internal_error(format!(
+                        "failed to reserve recovery evidence: {err}"
+                    )));
+                }
+                codex_app_server_protocol::ThreadClearRecoveryDurability::Durable
+            } else {
+                // All exact recovery reads on this producer report unavailable,
+                // including during construction: no consumer can observe false none.
+                codex_app_server_protocol::ThreadClearRecoveryDurability::Unavailable
+            };
+            Some(codex_app_server_protocol::ThreadClearRecovery {
+                successor_thread_id: successor.to_string(),
+                context,
+                durability,
+            })
+        } else {
+            None
         };
         start_options.reserved_thread_id = reserved_thread_id;
         let create_thread_started_at = std::time::Instant::now();
@@ -1604,6 +1656,14 @@ impl ThreadRequestProcessor {
             Ok(new_thread) => new_thread,
             Err(err) => {
                 remove_pending_thread_metadata(thread_store.as_ref(), reserved_thread_id).await;
+                if recovery.is_some()
+                    && let (Some(state), Some(successor)) = (&recovery_state, reserved_thread_id)
+                    && let Err(record_err) = state
+                        .finish_clear_recovery(successor, codex_state::ClearRecoveryPhase::Failed)
+                        .await
+                {
+                    warn!("recovery remains pending after failed creation: {record_err}");
+                }
                 return Err(match err.details() {
                     CodexErrorDetails::InvalidRequest(message) => invalid_request(message.clone()),
                     CodexErrorDetails::UnsupportedOperation(message) => {
@@ -1613,6 +1673,14 @@ impl ThreadRequestProcessor {
                 });
             }
         };
+        if recovery.is_some()
+            && let Some(state) = &recovery_state
+        {
+            state.finish_clear_recovery(thread_id, codex_state::ClearRecoveryPhase::Complete)
+                .await.map_err(|err| internal_error(format!(
+                    "thread {thread_id} created but recovery evidence outcome is unknown: {err}; do not automatically retry"
+                )))?;
+        }
         let session_telemetry = thread.session_telemetry();
         session_telemetry.record_startup_phase(
             "thread_start_create_thread",
@@ -1692,6 +1760,7 @@ impl ThreadRequestProcessor {
         let thread_originator = config_snapshot.originator.clone();
 
         let response = ThreadStartResponse {
+            clear_recovery: recovery,
             thread: thread.clone(),
             disabled_plugin_ids: config_snapshot.disabled_plugin_ids,
             model: config_snapshot.model,

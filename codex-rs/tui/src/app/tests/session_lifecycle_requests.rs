@@ -155,6 +155,8 @@ pub(super) enum HistoryCapabilities {
     ItemsAndSummaryTurnsFail,
     ThreadListFails,
     ThreadStartFails,
+    RecoveryUnsupported,
+    RecoveryRevisionMismatch,
     ConfigReadUnsupported(i64),
     ConfigReadFails,
     ConfigReadUnknownVoice,
@@ -441,6 +443,27 @@ pub(super) async fn start_recording_app_server_with_realtime_speech(
                                 data: None,
                                 message: "method not found".to_string(),
                             },
+                        })
+                    } else if history_capabilities == HistoryCapabilities::RecoveryUnsupported
+                        && request.method == "thread/clear/recovery/read"
+                    {
+                        JSONRPCMessage::Error(JSONRPCError {
+                            id: request_id,
+                            error: JSONRPCErrorError {
+                                code: -32601,
+                                data: None,
+                                message: "method not found".into(),
+                            },
+                        })
+                    } else if history_capabilities == HistoryCapabilities::RecoveryRevisionMismatch
+                        && request.method == "thread/clear/recovery/read"
+                    {
+                        JSONRPCMessage::Response(JSONRPCResponse {
+                            id: request_id,
+                            result: serde_json::json!({
+                                "contractVersion": 2, "durability": "durable",
+                                "observation": {"type": "support"}
+                            }),
                         })
                     } else if history_capabilities == HistoryCapabilities::ThreadStartFails
                         && request.method == "thread/start"
@@ -3292,11 +3315,12 @@ model_reasoning_effort = "low"
     )
     .await?;
     let mut tui = crate::tui::test_support::make_test_tui()?;
-app.start_fresh_session_with_summary_hint(
+    app.start_fresh_session_with_summary_hint(
         &mut tui,
         &mut server,
         /*initial_user_message*/ None,
         /*new_thread_name*/ None,
+        /*session_start_source*/ None,
     )
     .await;
     assert_eq!(
@@ -3654,11 +3678,12 @@ terminal_visualization_instructions = true
             .map(|entry| &entry.owner),
         Some(&crate::worktree_browser::Owner::Unavailable(missing_owner))
     );
-app.start_fresh_session_with_summary_hint(
+    app.start_fresh_session_with_summary_hint(
         &mut tui,
         &mut server,
         /*initial_user_message*/ None,
         /*new_thread_name*/ None,
+        /*session_start_source*/ None,
     )
     .await;
     let unsaved = app.chat_widget.thread_id().expect("unsaved thread");
@@ -3816,8 +3841,14 @@ async fn changing_directory_preserves_project_trust_permissions_history_and_hook
     let (rec, plain, req) = (recorded_params, crate::key_hint::plain, &requests);
     let mut tui = crate::tui::test_support::make_test_tui()?;
     let (message, name) = (None, Some("Previous project".to_string()));
-    app.start_fresh_session_with_summary_hint(&mut tui, &mut server, message, name)
-        .await;
+    app.start_fresh_session_with_summary_hint(
+        &mut tui,
+        &mut server,
+        message,
+        name,
+        /*session_start_source*/ None,
+    )
+    .await;
     let original = app.chat_widget.thread_id().expect("original thread");
     let rollout = app.chat_widget.rollout_path().expect("original rollout");
     let json = r#"{"type":"message","role":"assistant","content":[{"type":"output_text","text":"saved history"}]}"#;
@@ -4117,6 +4148,7 @@ fn fresh_session_applies_requested_name() -> Result<()> {
                     &mut app_server,
                     /*initial_user_message*/ None,
                     /*new_thread_name*/ Some("Add User".to_string()),
+                    /*session_start_source*/ None,
                 )
                 .await;
 
@@ -4177,6 +4209,7 @@ fn clear_session_uses_exact_displayed_thread_before_unsubscribe_and_attaches_suc
                     &mut app_server,
                     /*initial_user_message*/ None,
                     /*new_thread_name*/ None,
+                    /*session_start_source*/ None,
                 )
                 .await;
                 let primary = app
@@ -4267,6 +4300,7 @@ fn clear_then_submit_ui_path_uses_one_combined_request() -> Result<()> {
                     &mut app_server,
                     /*initial_user_message*/ None,
                     /*new_thread_name*/ None,
+                    /*session_start_source*/ None,
                 )
                 .await;
                 let predecessor = app
@@ -4327,6 +4361,7 @@ fn failed_repeated_clear_keeps_resumed_predecessor_displayed_without_unsubscribe
                     &mut app_server,
                     /*initial_user_message*/ None,
                     /*new_thread_name*/ None,
+                    /*session_start_source*/ None,
                 )
                 .await;
                 let predecessor = app
@@ -4555,6 +4590,7 @@ fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
                     &mut app_server,
                     /*initial_user_message*/ None,
                     /*new_thread_name*/ None,
+                    /*session_start_source*/ None,
                 )
                 .await;
 

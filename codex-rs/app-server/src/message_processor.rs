@@ -80,12 +80,12 @@ use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::JSONRPCResponse;
-use codex_app_server_protocol::UserVerificationCancelResponse;
 use codex_app_server_protocol::ThreadRetentionAcquireParams;
 use codex_app_server_protocol::ThreadRetentionAcquireResponse;
 use codex_app_server_protocol::ThreadRetentionRefusalReason;
 use codex_app_server_protocol::ThreadRetentionReleaseParams;
 use codex_app_server_protocol::ThreadRetentionReleaseResponse;
+use codex_app_server_protocol::UserVerificationCancelResponse;
 use codex_app_server_protocol::experimental_required_message;
 use codex_arg0::Arg0DispatchPaths;
 use codex_code_mode::CodeModeSessionProvider;
@@ -287,7 +287,11 @@ pub(crate) struct InitializedConnectionSessionState {
 
 impl ConnectionSessionState {
     pub(crate) fn new(origin: crate::transport::ConnectionOrigin) -> Self {
-        Self::with_provenance(origin, crate::transport::ConnectionProvenance::Unproven, RetentionPrincipalId::unclassified())
+        Self::with_provenance(
+            origin,
+            crate::transport::ConnectionProvenance::Unproven,
+            RetentionPrincipalId::unclassified(),
+        )
     }
 
     pub(crate) fn in_process() -> Self {
@@ -485,13 +489,12 @@ impl MessageProcessor {
         let turn_admission = TurnAdmission::default();
         let account_work_permits = crate::managed_transition::AccountWorkPermits::new();
         let account_turn_work = crate::account_turn_work::AccountTurnWork::default();
-        let turn_start_admission: Arc<dyn TurnStartAdmission> = Arc::new(
-            crate::account_turn_admission::AccountTurnAdmission {
+        let turn_start_admission: Arc<dyn TurnStartAdmission> =
+            Arc::new(crate::account_turn_admission::AccountTurnAdmission {
                 shutdown: turn_admission.clone(),
                 permits: account_work_permits.clone(),
                 work: account_turn_work.clone(),
-            },
-        );
+            });
         let extension_event_sink =
             app_server_extension_event_sink(outgoing.clone(), thread_state_manager.clone());
         let mut queue_service = None;
@@ -556,9 +559,9 @@ impl MessageProcessor {
             Arc::clone(&config),
             thread_manager.get_models_manager(),
         ));
-        let models_refresh_worker = Arc::new(Mutex::new(
-            crate::models_refresh_worker::spawn(&model_catalog),
-        ));
+        let models_refresh_worker = Arc::new(Mutex::new(crate::models_refresh_worker::spawn(
+            &model_catalog,
+        )));
         let turn_cost_worker =
             TurnCostWorker::spawn(Arc::clone(&config), Arc::clone(&auth_manager));
         thread_manager
@@ -638,10 +641,12 @@ impl MessageProcessor {
             rpc_transport,
             Arc::clone(&user_verification),
         );
-        let managed_transition_control_socket_endpoint = managed_transition_control_socket_endpoint.unwrap_or_else(||
-            crate::transport::app_server_control_socket_path(&config.codex_home)
-                .map(|path| path.display().to_string())
-                .unwrap_or_default());
+        let managed_transition_control_socket_endpoint = managed_transition_control_socket_endpoint
+            .unwrap_or_else(|| {
+                crate::transport::app_server_control_socket_path(&config.codex_home)
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default()
+            });
         let reset_inventory: Arc<dyn crate::managed_transition::ResetInventory> =
             Arc::new(crate::managed_reset::ProductionResetInventory {
                 telemetry_reset,
@@ -654,10 +659,12 @@ impl MessageProcessor {
                 auth_manager: Arc::clone(&auth_manager),
                 remote_control_handle: remote_control_handle.clone(),
             });
-        let authoritative_auth = crate::managed_transition::AuthoritativeAuthState::from_auth_manager(&auth_manager);
-        let target_evidence_source = Arc::new(crate::managed_transition::ProcessTargetEvidenceSource::new(
-            managed_transition_control_socket_endpoint,
-        ));
+        let authoritative_auth =
+            crate::managed_transition::AuthoritativeAuthState::from_auth_manager(&auth_manager);
+        let target_evidence_source =
+            Arc::new(crate::managed_transition::ProcessTargetEvidenceSource::new(
+                managed_transition_control_socket_endpoint,
+            ));
         let managed_transition_coordinator = match managed_transition_process_instance_id {
             Some(process_instance_id) => crate::managed_transition::ManagedTransitionCoordinator::with_adoption_account_projection_and_process_instance(
                 authoritative_auth,
@@ -1177,7 +1184,8 @@ impl MessageProcessor {
         &self,
         deadline: tokio::time::Instant,
     ) -> crate::models_refresh_worker::ModelsRefreshShutdown {
-        let Ok(worker) = tokio::time::timeout_at(deadline, self.models_refresh_worker.lock()).await else {
+        let Ok(worker) = tokio::time::timeout_at(deadline, self.models_refresh_worker.lock()).await
+        else {
             return crate::models_refresh_worker::ModelsRefreshShutdown::TimedOut;
         };
         worker.shutdown_until(deadline).await
@@ -1325,12 +1333,12 @@ impl MessageProcessor {
                 .await?;
             if connection_initialized {
                 self.connection_initialized(
-                        connection_id,
-                        session.request_attestation(),
-                        session.trusted_interactive(),
-                        session.retention_principal(),
-                    )
-                    .await;
+                    connection_id,
+                    session.request_attestation(),
+                    session.trusted_interactive(),
+                    session.retention_principal(),
+                )
+                .await;
             }
             return Ok(());
         }
@@ -1444,14 +1452,17 @@ impl MessageProcessor {
                 // and the session IO hop (`CODEX-I05-S03-R009`).
                 let processor_for_request = Arc::clone(&processor);
                 // Keep queued requests small to avoid large stack temporaries during construction.
-                let result = crate::account_turn_admission::within_request(account_work_permit, Box::pin(processor_for_request.handle_initialized_client_request(
-                    connection_request_id,
-                    codex_request,
-                    request_context,
-                    session,
-                    event_stream_ready,
-                    managed_transition_caller_authorized,
-                )))
+                let result = crate::account_turn_admission::within_request(
+                    account_work_permit,
+                    Box::pin(processor_for_request.handle_initialized_client_request(
+                        connection_request_id,
+                        codex_request,
+                        request_context,
+                        session,
+                        event_stream_ready,
+                        managed_transition_caller_authorized,
+                    )),
+                )
                 .await;
                 if let Err(error) = result {
                     processor.outgoing.send_error(error_request_id, error).await;
@@ -1725,6 +1736,11 @@ impl MessageProcessor {
             ClientRequest::ThreadClearRead { params, .. } => self
                 .thread_processor
                 .thread_clear_read(params)
+                .await
+                .map(|response| Some(response.into())),
+            ClientRequest::ThreadClearRecoveryRead { params, .. } => self
+                .thread_processor
+                .thread_clear_recovery_read(params)
                 .await
                 .map(|response| Some(response.into())),
             ClientRequest::ThreadRetentionAcquire { params, .. } => self

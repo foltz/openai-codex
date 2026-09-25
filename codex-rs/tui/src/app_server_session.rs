@@ -3,6 +3,7 @@
 //! This module owns the typed JSON-RPC calls needed by the TUI and keeps
 //! request/response plumbing out of `App` and `ChatWidget`.
 
+mod clear_recovery;
 mod fs;
 mod history;
 mod models;
@@ -3834,8 +3835,7 @@ mod tests {
         for mode in [ThreadParamsMode::Embedded, ThreadParamsMode::Remote] {
             let start = thread_start_params_from_config(
                 &config, mode, /*remote_cwd_override*/ None,
-                /*session_start_source*/ None,
-                /*clear_predecessor_thread_id*/ None,
+                /*session_start_source*/ None, /*clear_predecessor_thread_id*/ None,
             );
             let resume = thread_resume_params_from_config(
                 config.clone(),

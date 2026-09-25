@@ -263,7 +263,14 @@ async fn newer_kcf_history_refuses_without_relaxing_upstream_policy() -> anyhow:
     let pool = sqlite
         .open_state_db(&runtime_state_migrator(), /*telemetry_override*/ None)
         .await?;
-    sqlx::query("INSERT INTO _kcf_state_migrations (version, description, success, checksum, execution_time) VALUES (2, 'future', 1, X'01', 0)").execute(&pool).await?;
+    let future_version: i64 =
+        sqlx::query_scalar("SELECT MAX(version) + 1 FROM _kcf_state_migrations")
+            .fetch_one(&pool)
+            .await?;
+    sqlx::query("INSERT INTO _kcf_state_migrations (version, description, success, checksum, execution_time) VALUES (?, 'future', 1, X'01', 0)")
+        .bind(future_version)
+        .execute(&pool)
+        .await?;
     runtime_state_migrator().run(&pool).await?;
     let err = StateRuntime::init(sqlite, "test".into())
         .await
@@ -273,7 +280,7 @@ async fn newer_kcf_history_refuses_without_relaxing_upstream_policy() -> anyhow:
         matches!(
             err.chain()
                 .find_map(|cause| cause.downcast_ref::<MigrateError>()),
-            Some(MigrateError::VersionMissing(2))
+            Some(MigrateError::VersionMissing(version)) if *version == future_version
         ),
         "{err:#}"
     );

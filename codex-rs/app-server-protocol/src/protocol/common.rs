@@ -601,6 +601,12 @@ client_request_definitions! {
         serialization: None,
         response: v2::ThreadClearReadResponse,
     },
+    #[experimental("thread/clear/recovery/read")]
+    ThreadClearRecoveryRead => "thread/clear/recovery/read" {
+        params: v2::ThreadClearRecoveryReadParams,
+        serialization: None,
+        response: v2::ThreadClearRecoveryReadResponse,
+    },
     #[experimental("kcf/thread/interactiveSubscription/list")]
     ThreadInteractiveSubscriptionList => "kcf/thread/interactiveSubscription/list" {
         params: v2::ThreadInteractiveSubscriptionListParams,
@@ -3263,6 +3269,7 @@ mod tests {
         let response = ClientResponse::ThreadStart {
             request_id: RequestId::Integer(7),
             response: v2::ThreadStartResponse {
+                clear_recovery: None,
                 disabled_plugin_ids: Vec::new(),
                 thread: v2::Thread {
                     originator: None,
@@ -3324,6 +3331,7 @@ mod tests {
                 "method": "thread/start",
                 "id": 7,
                 "response": {
+                    "clearRecovery": null,
                     "thread": {
                         "id": "67e55044-10b1-426f-9247-bb680e5fe0c8",
                         "environments": null,

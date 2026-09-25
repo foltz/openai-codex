@@ -5,4 +5,4 @@
 /**
  * Typed, secret-safe reasons for a transition request to be refused.
  */
-export type ManagedTransitionRefusalKind = "invalidRequest" | "processMismatch" | "staleAuthRevision" | "staleTransitionRevision" | "staleAuthFingerprint" | "concurrentTransition" | "completedReplay" | "transitionIdConflict" | "lateCancellation" | "authorizationNotAdmitted" | "authoritativeAuthUnavailable";
+export type ManagedTransitionRefusalKind = "invalidRequest" | "processMismatch" | "staleAuthRevision" | "staleTransitionRevision" | "staleAuthFingerprint" | "concurrentTransition" | "completedReplay" | "transitionIdConflict" | "lateCancellation" | "authorizationNotAdmitted" | "authoritativeAuthUnavailable" | "drainTimedOut" | "targetChanged" | "authSourceChanged" | "resetFailed" | "authInstallFailed" | "intendedResultMismatch";

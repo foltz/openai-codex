@@ -258,6 +258,29 @@
       ],
       "type": "object"
     },
+    "ThreadClearRecoveryContext": {
+      "additionalProperties": false,
+      "description": "Caller provenance, never an authoritative clear edge or a shutdown receipt.",
+      "properties": {
+        "contractVersion": {
+          "description": "Must match the recovery-read contract on this connection before creation.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "predecessorThreadId": {
+          "description": "Null means genuinely no displayed predecessor, not an unavailable known ID.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "contractVersion"
+      ],
+      "type": "object"
+    },
     "ThreadHistoryMode": {
       "enum": [
         "legacy",

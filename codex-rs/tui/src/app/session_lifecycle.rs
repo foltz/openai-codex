@@ -929,6 +929,7 @@ impl App {
         app_server: &mut AppServerSession,
         initial_user_message: Option<crate::chatwidget::UserMessage>,
         new_thread_name: Option<String>,
+        session_start_source: Option<codex_app_server_protocol::ThreadStartSource>,
     ) {
         if self.reject_pending_permission_root_switch() {
             if let Some(message) = initial_user_message {
@@ -963,17 +964,28 @@ impl App {
             self.chat_widget.thread_name(),
             self.chat_widget.rollout_path().as_deref(),
         );
-        match app_server
-            .start_thread_with_session_start_source(
-                &self.local_settings,
-                &config,
-                /*session_start_source*/ None,
-                /*clear_predecessor_thread_id*/ None,
-                /*remote_cwd_override*/ None,
-                /*selected_profile*/ None,
-            )
-            .await
-        {
+        let started =
+            if session_start_source == Some(codex_app_server_protocol::ThreadStartSource::Clear) {
+                app_server
+                    .start_clear_recovery(
+                        &self.local_settings,
+                        &config,
+                        self.current_displayed_thread_id(),
+                    )
+                    .await
+            } else {
+                app_server
+                    .start_thread_with_session_start_source(
+                        &self.local_settings,
+                        &config,
+                        session_start_source,
+                        /*clear_predecessor_thread_id*/ None,
+                        /*remote_cwd_override*/ None,
+                        /*selected_profile*/ None,
+                    )
+                    .await
+            };
+        match started {
             Ok(mut started) => {
                 self.shutdown_current_thread(app_server).await;
                 let tracked_thread_ids: Vec<ThreadId> =
@@ -1058,10 +1070,19 @@ impl App {
         initial_user_message: Option<crate::chatwidget::UserMessage>,
         new_thread_name: Option<String>,
     ) {
-        let Some(predecessor_thread_id) = self.current_displayed_thread_id() else {
-            self.chat_widget
-                .add_error_message("Failed to clear: no displayed thread is available".to_string());
-            tui.frame_requester().schedule_frame();
+        let displayed = self.current_displayed_thread_id();
+        if displayed.is_none() || displayed.is_some_and(|id| self.thread_unavailable(id)) {
+            self.start_fresh_session_with_summary_hint(
+                tui,
+                app_server,
+                initial_user_message,
+                new_thread_name,
+                Some(codex_app_server_protocol::ThreadStartSource::Clear),
+            )
+            .await;
+            return;
+        }
+        let Some(predecessor_thread_id) = displayed else {
             return;
         };
         let summary = session_summary(

@@ -3129,6 +3129,7 @@ fn write_api_key_auth_file(codex_home: &Path, api_key: &str) {
         agent_identity: None,
         personal_access_token: None,
         bedrock_api_key: None,
+        bedrock_access_keys: None,
     };
     super::save_auth(
         codex_home,

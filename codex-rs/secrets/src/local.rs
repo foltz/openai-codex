@@ -122,6 +122,58 @@ impl LocalSecretsBackend {
         Ok(file.secrets.get(&canonical_key).cloned())
     }
 
+    /// Reads existing ciphertext without creating a passphrase or treating
+    /// filesystem query failures as absence. Existing ciphertext with a missing
+    /// key is an error, never a request to generate a replacement key.
+    pub fn get_existing(&self, scope: &SecretScope, name: &SecretName) -> Result<Option<String>> {
+        self.get_existing_with_preimage(scope, name)
+            .map(|(value, _)| value)
+    }
+
+    /// Returns comparison evidence from the same ciphertext read as the value.
+    /// The digest is internal verification material, not an identity or log field.
+    pub fn get_existing_with_preimage(
+        &self,
+        scope: &SecretScope,
+        name: &SecretName,
+    ) -> Result<(Option<String>, [u8; 32])> {
+        let ciphertext = match fs::read(self.secrets_path()) {
+            Ok(ciphertext) => ciphertext,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((
+                    None,
+                    Sha256::digest(b"codex-secrets/existing-absent/v1").into(),
+                ));
+            }
+            Err(error) => return Err(error).context("failed to read existing secrets file"),
+        };
+        let canonical_home = self
+            .codex_home
+            .canonicalize()
+            .context("failed to resolve existing secrets storage")?;
+        let account = compute_keyring_account(&canonical_home, self.namespace);
+        let passphrase = self
+            .keyring_store
+            .load(keyring_service(), &account)
+            .map_err(|_| anyhow::anyhow!("failed to load existing secrets key"))?
+            .context("existing secrets key is unavailable")?;
+        let plaintext = decrypt_with_passphrase(&ciphertext, &SecretString::from(passphrase))
+            .map_err(|_| anyhow::anyhow!("failed to decrypt existing secrets file"))?;
+        let parsed: SecretsFile = serde_json::from_slice(&plaintext)
+            .map_err(|_| anyhow::anyhow!("failed to parse existing secrets file"))?;
+        anyhow::ensure!(
+            parsed.version <= SECRETS_VERSION,
+            "existing secrets file version is unsupported"
+        );
+        let mut hasher = Sha256::new();
+        hasher.update(b"codex-secrets/existing-present/v1\0");
+        hasher.update(&ciphertext);
+        Ok((
+            parsed.secrets.get(&scope.canonical_key(name)).cloned(),
+            hasher.finalize().into(),
+        ))
+    }
+
     pub fn delete(&self, scope: &SecretScope, name: &SecretName) -> Result<bool> {
         let canonical_key = scope.canonical_key(name);
         let mut file = self.load_file()?;
@@ -426,6 +478,62 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     static MCP_OAUTH_CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn existing_read_proves_absence_without_creating_storage_or_key() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let keyring = Arc::new(MockKeyringStore::default());
+        let backend = LocalSecretsBackend::new(home.path().to_path_buf(), keyring.clone());
+        let name = SecretName::new("TEST_SECRET")?;
+        assert_eq!(backend.get_existing(&SecretScope::Global, &name)?, None);
+        assert!(!backend.secrets_path().exists());
+        assert!(!keyring.contains(&compute_keyring_account(home.path(), LocalSecretsNamespace::ManagedSecrets)));
+        Ok(())
+    }
+
+    #[test]
+    fn existing_read_never_replaces_a_missing_ciphertext_key() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let keyring = Arc::new(MockKeyringStore::default());
+        let backend = LocalSecretsBackend::new(home.path().to_path_buf(), keyring.clone());
+        let name = SecretName::new("TEST_SECRET")?;
+        backend.set(&SecretScope::Global, &name, "secret-sentinel")?;
+        let ciphertext = fs::read(backend.secrets_path())?;
+        let account = compute_keyring_account(home.path(), LocalSecretsNamespace::ManagedSecrets);
+        keyring.delete(keyring_service(), &account)?;
+        assert!(backend.get_existing(&SecretScope::Global, &name).is_err());
+        assert_eq!(keyring.saved_value(&account), None);
+        assert_eq!(fs::read(backend.secrets_path())?, ciphertext);
+        Ok(())
+    }
+
+    #[test]
+    fn existing_read_preserves_error_and_existing_value() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let keyring = Arc::new(MockKeyringStore::default());
+        let backend = LocalSecretsBackend::new(home.path().to_path_buf(), keyring.clone());
+        let name = SecretName::new("TEST_SECRET")?;
+        backend.set(&SecretScope::Global, &name, "secret-sentinel")?;
+        assert_eq!(
+            backend.get_existing(&SecretScope::Global, &name)?,
+            Some("secret-sentinel".into())
+        );
+        let ciphertext = fs::read(backend.secrets_path())?;
+        let account = compute_keyring_account(home.path(), LocalSecretsNamespace::ManagedSecrets);
+        keyring.set_error(
+            &account,
+            KeyringError::Invalid("secret-error-sentinel".into(), "load".into()),
+        );
+        let error = backend
+            .get_existing(&SecretScope::Global, &name)
+            .unwrap_err();
+        assert!(!format!("{error:#}").contains("secret-error-sentinel"));
+        assert_eq!(fs::read(backend.secrets_path())?, ciphertext);
+        fs::remove_file(backend.secrets_path())?;
+        fs::create_dir(backend.secrets_path())?;
+        assert!(backend.get_existing(&SecretScope::Global, &name).is_err());
+        Ok(())
+    }
 
     #[test]
     fn load_file_rejects_newer_schema_versions() -> Result<()> {

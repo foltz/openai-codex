@@ -5247,3 +5247,7 @@ mod elicitation_holders_tests;
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+#[path = "mailbox_wake_tests.rs"]
+mod mailbox_wake_tests;

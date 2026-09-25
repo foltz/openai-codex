@@ -124,7 +124,10 @@ impl Drop for MailboxReservation {
         if self.pending.is_empty() {
             return;
         }
-        self.state.lock().expect("mailbox poisoned").pending.append(&mut self.pending);
+        // Rollback also runs during unwinding. Preserve custody without a
+        // second panic; ordinary queue access still refuses poisoned state.
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending.append(&mut self.pending);
         // Wake a later consumer after rollback, including cancellation while
         // other input was enqueued. No task or runtime is needed for restoration.
         self.activity.send_replace(InputQueueActivity::Mailbox);

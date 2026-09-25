@@ -913,7 +913,10 @@ impl Session {
             warn!("failed to flush rollout after emitting terminal turn event: {err}");
         }
         if cleared_active_turn {
-            self.maybe_start_turn_for_pending_work().await;
+            // This task can still be aborted during retirement. Let the
+            // submission loop own any task-less reservation across discovery;
+            // a stored Notify permit survives cancellation of this producer.
+            self.input_queue.completion_wake.notify_one();
         }
     }
 

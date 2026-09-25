@@ -123,3 +123,25 @@ fn consumption_does_not_requeue_or_emit_a_rollback_wakeup() {
     assert!(!mailbox.has_pending());
     assert!(!activity.has_changed().unwrap());
 }
+
+#[test]
+fn rollback_preserves_mail_after_mutex_poisoning() {
+    let (mailbox, mut activity) = mailbox();
+    let original = mail("reserved before poison");
+    mailbox.enqueue(original.clone(), TurnStartOptions::default());
+    let reservation = mailbox.reserve();
+    activity.borrow_and_update();
+    let state = Arc::clone(&mailbox.state);
+    assert!(std::thread::spawn(move || {
+        let _guard = state.lock().unwrap();
+        panic!("injected mailbox poison");
+    }).join().is_err());
+
+    drop(reservation);
+
+    let state = mailbox.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(state.pending.values().map(|mail| mail.communication.clone()).collect::<Vec<_>>(),
+        vec![original]);
+    assert!(mailbox.state.is_poisoned());
+    assert!(activity.has_changed().unwrap());
+}

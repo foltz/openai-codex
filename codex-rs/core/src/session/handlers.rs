@@ -518,7 +518,20 @@ pub(super) async fn submission_loop(
     // To break out of this loop, send Op::Shutdown.
     let _cleanup_owner = sess.cleanup_owner();
     let mut shutdown_received = false;
-    while let Ok(sub) = rx_sub.recv().await {
+    loop {
+        let sub = tokio::select! {
+            // Channel closure and queued control operations take precedence
+            // over background wakeups, including during shutdown.
+            biased;
+            sub = rx_sub.recv() => match sub {
+                Ok(sub) => sub,
+                Err(_) => break,
+            },
+            _ = sess.input_queue.completion_wake.notified() => {
+                sess.maybe_start_turn_for_pending_work().await;
+                continue;
+            }
+        };
         let _dispatch = submissions
             .as_ref()
             .map(super::submission::SubmissionDispatch::begin);

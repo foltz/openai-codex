@@ -99,6 +99,7 @@ impl Handler {
                     cyber_access_program: turn.cyber_access_program,
                     ..Default::default()
                 },
+                Some(&crate::ParentTurnAuthority::capture(&session, &turn.sub_id)),
             )
             .await
             .map_err(|err| collab_agent_error(receiver_thread_id, err));

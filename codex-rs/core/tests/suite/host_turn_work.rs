@@ -147,3 +147,31 @@ async fn account_refusal_precedes_submission_even_when_shutdown_gate_is_open() -
     test.codex.shutdown_and_wait().await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn carried_trigger_mail_starts_with_its_own_work_when_fresh_admission_is_closed() -> anyhow::Result<()> {
+    let server = responses::start_mock_server().await;
+    let response = responses::mount_sse_once(&server, responses::sse_completed("mail-done")).await;
+    let gate = Arc::new(Gate::default());
+    gate.refused.store(true, Ordering::Release);
+    let mut extensions = ExtensionRegistryBuilder::new();
+    extensions.turn_start_admission(gate.clone());
+    let test = test_codex().with_extensions(Arc::new(extensions.build()))
+        .build_with_auto_env(&server).await?;
+    test.codex.submit(codex_protocol::protocol::Op::InterAgentCommunication {
+        communication: codex_protocol::protocol::InterAgentCommunication::new(
+            codex_protocol::AgentPath::root(), codex_protocol::AgentPath::root(),
+            Vec::new(), "admitted trigger".into(), /*trigger_turn*/ true,
+        ),
+        start_options: Default::default(),
+        work: Some(Box::new(Lease { evidence: Arc::clone(&gate.evidence), retained: false })),
+    }).await?;
+    let event = wait_for_event(&test.codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    let EventMsg::TurnComplete(completed) = event else { unreachable!() };
+    assert_eq!(*gate.evidence.lock().unwrap(), Evidence {
+        bound: Some(completed.turn_id), retained: 1, cancelled: 0,
+    });
+    assert_eq!(response.requests().len(), 1);
+    test.codex.shutdown_and_wait().await?;
+    Ok(())
+}

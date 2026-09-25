@@ -81,11 +81,11 @@ pub async fn inter_agent_communication(
     sub_id: String,
     communication: InterAgentCommunication,
     start_options: codex_protocol::turn_input::TurnStartOptions,
+    work: Option<Box<dyn codex_protocol::host_turn_work::HostTurnWork>>,
 ) {
     let trigger_turn = communication.trigger_turn;
     sess.input_queue
-        .enqueue_mailbox_communication(communication, start_options)
-        .await;
+        .enqueue_mailbox_with_work(communication, start_options, work);
     crate::agent_communication::emit_agent_communication_receive(&sub_id);
     if trigger_turn || sess.has_outstanding_durable_sleep() {
         sess.maybe_start_turn_for_pending_work_with_sub_id(sub_id)
@@ -688,8 +688,9 @@ pub(super) async fn submission_loop(
                 Op::InterAgentCommunication {
                     communication,
                     start_options,
+                    work,
                 } => {
-                    inter_agent_communication(&sess, sub.id.clone(), communication, start_options)
+                    inter_agent_communication(&sess, sub.id.clone(), communication, start_options, work)
                         .await;
                     false
                 }

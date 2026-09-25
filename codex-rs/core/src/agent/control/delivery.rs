@@ -56,6 +56,7 @@ impl LocalAgentControl {
     /// Resolves and delivers captured input, restoring an evicted runtime when necessary.
     pub(crate) async fn send(&self, request: SendRequest) -> CodexResult<DeliveryReceipt> {
         let SendRequest {
+            parent_authority,
             caller,
             target,
             resume_config,
@@ -70,7 +71,7 @@ impl LocalAgentControl {
                     self.ensure_v2_agent_loaded(resume_config, target, /*parent*/ None)
                         .await?;
                 }
-                let submission_id = self.send_input(target, input, start_options).await?;
+                let submission_id = self.send_input(target, input, start_options, parent_authority.as_ref()).await?;
                 (receiver.unwrap_or_default(), submission_id)
             }
             AgentInput::Message { message, mode } => {
@@ -107,6 +108,7 @@ impl LocalAgentControl {
                         communication,
                         AgentCommunicationContext::new(kind, caller),
                         start_options,
+                        parent_authority.as_ref(),
                     )
                     .await?;
                 (receiver, submission_id)

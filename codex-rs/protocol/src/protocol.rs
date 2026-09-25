@@ -673,6 +673,8 @@ pub enum Op {
     InterAgentCommunication {
         communication: InterAgentCommunication,
         start_options: TurnStartOptions,
+        /// In-process custody follows trigger mail until its consuming turn.
+        work: Option<Box<dyn crate::host_turn_work::HostTurnWork>>,
     },
 
     /// Approve a command execution

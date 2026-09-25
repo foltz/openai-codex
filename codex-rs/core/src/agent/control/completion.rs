@@ -110,6 +110,7 @@ impl LocalAgentControl {
                 communication,
                 context,
                 TurnStartOptions::default(),
+                /*parent*/ None,
             )
             .await
         {

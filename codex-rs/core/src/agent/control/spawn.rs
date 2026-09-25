@@ -801,7 +801,7 @@ impl LocalAgentControl {
         };
         match initial_input {
             SpawnInitialInput::UserInput(input) => {
-                self.send_input(new_thread.thread_id, input, start_options)
+                self.send_input(new_thread.thread_id, input, start_options, options.parent_authority.as_ref())
                     .await?;
             }
             SpawnInitialInput::InterAgentCommunication(communication, context) => {
@@ -811,6 +811,7 @@ impl LocalAgentControl {
                     communication,
                     context,
                     start_options,
+                    options.parent_authority.as_ref(),
                 )
                 .await?;
             }

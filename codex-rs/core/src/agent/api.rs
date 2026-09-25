@@ -205,6 +205,8 @@ pub struct SpawnRequest {
 }
 
 pub struct SendRequest {
+    /// Captured parent provenance; never inferred from `caller` or start options.
+    pub parent_authority: Option<crate::ParentTurnAuthority>,
     pub caller: ThreadId,
     pub target: AgentTarget,
     /// Captured caller settings used if the recipient must be restored.

@@ -901,6 +901,7 @@ async fn remote_compact_v2_reuses_compaction_trigger_for_followups() -> Result<(
 
     codex
         .submit(Op::InterAgentCommunication {
+            work: None,
             communication: InterAgentCommunication::new(
                 AgentPath::root().join("child").expect("valid child path"),
                 AgentPath::root(),
@@ -914,6 +915,7 @@ async fn remote_compact_v2_reuses_compaction_trigger_for_followups() -> Result<(
         .await?;
     codex
         .submit(Op::InterAgentCommunication {
+            work: None,
             communication: InterAgentCommunication::new(
                 AgentPath::root().join("child").expect("valid child path"),
                 AgentPath::root(),
@@ -927,6 +929,7 @@ async fn remote_compact_v2_reuses_compaction_trigger_for_followups() -> Result<(
     let delegated_task_ciphertext = format!("delegated compact task{}", "x".repeat(40_000));
     codex
         .submit(Op::InterAgentCommunication {
+            work: None,
             communication: InterAgentCommunication::new_encrypted(
                 AgentPath::root(),
                 AgentPath::root().join("worker").expect("valid worker path"),
@@ -943,6 +946,7 @@ async fn remote_compact_v2_reuses_compaction_trigger_for_followups() -> Result<(
     let worker_path = AgentPath::root().join("worker").expect("valid worker path");
     codex
         .submit(Op::InterAgentCommunication {
+            work: None,
             communication: InterAgentCommunication::new_encrypted(
                 worker_path.join("child").expect("valid grandchild path"),
                 worker_path,

@@ -139,9 +139,12 @@ fn capture_test_op(op: &Op) -> Option<Op> {
         Op::InterAgentCommunication {
             communication,
             start_options,
+            ..
         } => Some(Op::InterAgentCommunication {
             communication: communication.clone(),
             start_options: start_options.clone(),
+            // Snapshot metadata only; never clone or retain live authority.
+            work: None,
         }),
         Op::Shutdown => Some(Op::Shutdown),
         _ => None,

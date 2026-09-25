@@ -379,6 +379,7 @@ async fn steer_user_input(codex: &CodexThread, text: &str) {
 async fn enqueue_queue_only_agent_mail(codex: &CodexThread, text: &str) {
     codex
         .submit(Op::InterAgentCommunication {
+            work: None,
             communication: InterAgentCommunication::new(
                 AgentPath::try_from("/root/worker").expect("worker path should parse"),
                 AgentPath::root(),
@@ -1274,6 +1275,7 @@ async fn terminal_compaction_error_does_not_retry_pending_input(
         PendingInputAfterFailure::TriggeringMail => {
             codex
                 .submit(Op::InterAgentCommunication {
+                    work: None,
                     communication: InterAgentCommunication::new(
                         AgentPath::root().join("worker").expect("valid worker path"),
                         AgentPath::root(),

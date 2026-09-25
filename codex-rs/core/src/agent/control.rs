@@ -187,13 +187,16 @@ impl LocalAgentControl {
         agent_id: ThreadId,
         input: Vec<UserInput>,
         start_options: TurnStartOptions,
+        parent: Option<&crate::ParentTurnAuthority>,
     ) -> CodexResult<String> {
         let state = self.upgrade()?;
         let thread = state.get_thread(agent_id).await?;
-        let result = match thread
-            .start_or_steer_turn(TurnInputRequest::user_input(input).on_start(start_options))
-            .await
-        {
+        let request = TurnInputRequest::user_input(input).on_start(start_options);
+        let submission = match parent {
+            Some(parent) => thread.start_or_steer_turn_from_parent(request, parent).await,
+            None => thread.start_or_steer_turn(request).await,
+        };
+        let result = match submission {
             Ok(TurnInputSubmission::Started { turn_id }) => Ok(turn_id),
             Ok(TurnInputSubmission::Steered { .. }) => {
                 // MAv1 exposes an opaque `submission_id` to the model. The legacy
@@ -217,6 +220,7 @@ impl LocalAgentControl {
         communication: InterAgentCommunication,
         agent_communication_context: AgentCommunicationContext,
         start_options: TurnStartOptions,
+        parent: Option<&crate::ParentTurnAuthority>,
     ) -> CodexResult<String> {
         let state = self.upgrade()?;
         if communication.trigger_turn {
@@ -230,6 +234,7 @@ impl LocalAgentControl {
             communication,
             agent_communication_context,
             start_options,
+            parent,
         )
         .await
     }
@@ -290,6 +295,7 @@ impl LocalAgentControl {
         communication: InterAgentCommunication,
         context: AgentCommunicationContext,
         start_options: TurnStartOptions,
+        parent: Option<&crate::ParentTurnAuthority>,
     ) -> CodexResult<String> {
         self.submit_inter_agent_communication(
             agent_id,
@@ -297,6 +303,7 @@ impl LocalAgentControl {
             communication,
             context,
             start_options,
+            parent,
         )
         .await
     }
@@ -308,7 +315,21 @@ impl LocalAgentControl {
         communication: InterAgentCommunication,
         context: AgentCommunicationContext,
         start_options: TurnStartOptions,
+        parent: Option<&crate::ParentTurnAuthority>,
     ) -> CodexResult<String> {
+        let work = if communication.trigger_turn {
+            match parent {
+                Some(parent) => {
+                    let child = state.get_thread(agent_id).await?;
+                    parent.derive(&child).map_err(|_| CodexErr::InvalidRequest(
+                        "parent turn no longer admits child work".into(),
+                    ))?
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         let communication_for_log =
             crate::agent_communication::logging_enabled().then(|| communication.clone());
         let (parent_turn_id, root_turn_id) = if communication.trigger_turn {
@@ -329,6 +350,7 @@ impl LocalAgentControl {
                         Op::InterAgentCommunication {
                             communication,
                             start_options,
+                            work,
                         },
                         parent_turn_id,
                         root_turn_id,
@@ -667,6 +689,7 @@ impl LocalAgentControl {
                         communication,
                         context,
                         TurnStartOptions::default(),
+                        /*parent*/ None,
                     )
                     .await;
                 return;

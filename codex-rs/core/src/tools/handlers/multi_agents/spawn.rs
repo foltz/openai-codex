@@ -117,6 +117,7 @@ async fn handle_spawn_agent(
             /*task_name*/ None,
         )?),
         SpawnAgentOptions {
+            parent_authority: Some(crate::ParentTurnAuthority::capture(&session, &turn.sub_id)),
             fork_parent_spawn_call_id: args.fork_context.then(|| call_id.clone()),
             fork_mode: args.fork_context.then_some(SpawnAgentForkMode::FullHistory),
             parent_thread_id: Some(session.thread_id),

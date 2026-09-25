@@ -4,6 +4,7 @@ use codex_extension_api::ExtensionFuture;
 use codex_extension_api::TurnStartAdmission;
 use codex_extension_api::TurnWorkRefused;
 use codex_protocol::host_turn_work::HostTurnWork;
+use pretty_assertions::assert_eq;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -83,7 +84,9 @@ async fn trigger_operation_owns_derived_work_until_mail_is_consumed() {
     assert!(gate.events.lock().unwrap().is_empty(), "enqueue is not turn binding");
     let batch = child.session.input_queue.reserve_mailbox();
     assert!(batch.has_turn_work());
-    let _ = batch.into_input("consuming-turn");
+    child.session.input_queue.commit_mailbox_for_turn_state(
+        &tokio::sync::Mutex::new(Default::default()), batch, "consuming-turn",
+    ).await;
     assert_eq!(*gate.events.lock().unwrap(), vec!["bound:consuming-turn", "retained", "drop"]);
     child.shutdown_and_wait().await.unwrap();
 }
@@ -149,7 +152,9 @@ async fn derived_delivery_uses_the_resolved_loop_after_lookup_removal() {
     assert!(gate.events.lock().unwrap().is_empty());
     let batch = child.session.input_queue.reserve_mailbox();
     assert!(batch.has_turn_work());
-    let _ = batch.into_input("same-loop-turn");
+    child.session.input_queue.commit_mailbox_for_turn_state(
+        &tokio::sync::Mutex::new(Default::default()), batch, "same-loop-turn",
+    ).await;
     assert_eq!(*gate.events.lock().unwrap(), vec!["bound:same-loop-turn", "retained", "drop"]);
     child.shutdown_and_wait().await.unwrap();
 }

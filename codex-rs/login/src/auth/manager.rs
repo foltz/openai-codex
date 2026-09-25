@@ -2216,6 +2216,7 @@ pub struct AuthManager {
     inner: RwLock<CachedAuth>,
     auth_change_tx: watch::Sender<u64>,
     prepared_managed_adoptions: Arc<Mutex<PreparedManagedAdoptionStore>>,
+    last_managed_auth_generation: AtomicU64,
     auth_change_state_tx: watch::Sender<AuthChangeState>,
     workspace_routing_resolver: OnceLock<Weak<dyn WorkspaceRoutingResolver>>,
     enable_codex_api_key_env: bool,
@@ -2361,6 +2362,7 @@ impl AuthManager {
             }),
             auth_change_tx,
             prepared_managed_adoptions: Arc::default(),
+            last_managed_auth_generation: AtomicU64::new(0),
             auth_change_state_tx: watch::channel(AuthChangeState::default()).0,
             workspace_routing_resolver: OnceLock::new(),
             enable_codex_api_key_env,
@@ -2399,6 +2401,7 @@ impl AuthManager {
             inner: RwLock::new(cached),
             auth_change_tx,
             prepared_managed_adoptions: Arc::default(),
+            last_managed_auth_generation: AtomicU64::new(0),
             auth_change_state_tx: watch::channel(AuthChangeState::default()).0,
             workspace_routing_resolver: OnceLock::new(),
             enable_codex_api_key_env: false,
@@ -2431,6 +2434,7 @@ impl AuthManager {
             inner: RwLock::new(cached),
             auth_change_tx,
             prepared_managed_adoptions: Arc::default(),
+            last_managed_auth_generation: AtomicU64::new(0),
             auth_change_state_tx: watch::channel(AuthChangeState::default()).0,
             workspace_routing_resolver: OnceLock::new(),
             enable_codex_api_key_env: false,
@@ -2467,6 +2471,7 @@ impl AuthManager {
             inner: RwLock::new(cached),
             auth_change_tx,
             prepared_managed_adoptions: Arc::default(),
+            last_managed_auth_generation: AtomicU64::new(0),
             auth_change_state_tx: watch::channel(AuthChangeState::default()).0,
             workspace_routing_resolver: OnceLock::new(),
             enable_codex_api_key_env: false,
@@ -2501,6 +2506,7 @@ impl AuthManager {
             }),
             auth_change_tx,
             prepared_managed_adoptions: Arc::default(),
+            last_managed_auth_generation: AtomicU64::new(0),
             auth_change_state_tx: watch::channel(AuthChangeState::default()).0,
             workspace_routing_resolver: OnceLock::new(),
             enable_codex_api_key_env: false,
@@ -2587,6 +2593,13 @@ impl AuthManager {
     /// Subscribes to cached auth changes that can affect request recovery.
     pub fn auth_change_receiver(&self) -> watch::Receiver<u64> {
         self.auth_change_tx.subscribe()
+    }
+
+    /// Classifies a notified generation's managed origin, not caller authority.
+    /// Managed reset owns publication for these generations; ordinary watchers
+    /// must not race it. Callers must separately validate the current revision.
+    pub fn is_managed_auth_change(&self, generation: u64) -> bool {
+        generation != 0 && self.last_managed_auth_generation.load(Ordering::Acquire) == generation
     }
 
     /// Subscribes to credential and owner revisions published together, including when changes coalesce.
@@ -3068,7 +3081,11 @@ impl AuthManager {
                     state.owner_generation += 1;
                 }
             });
-            self.auth_change_tx.send_modify(|revision| *revision += 1);
+            self.auth_change_tx.send_modify(|revision| {
+                *revision += 1;
+                self.last_managed_auth_generation
+                    .store(*revision, Ordering::Release);
+            });
         }
         ManagedAdoptionInstallOutcome::Installed { fingerprint }
     }
@@ -3478,7 +3495,11 @@ impl AuthManager {
                 state.generation += 1;
                 state.owner_generation += 1;
             });
-            self.auth_change_tx.send_modify(|revision| *revision += 1);
+            self.auth_change_tx.send_modify(|revision| {
+                *revision += 1;
+                self.last_managed_auth_generation
+                    .store(*revision, Ordering::Release);
+            });
         }
         ManagedAdoptionInstallOutcome::LoggedOut
     }

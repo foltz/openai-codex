@@ -3352,6 +3352,7 @@ async fn install_managed_logout_clears_the_cache_and_publishes_a_revision() {
         "expected LoggedOut, got {outcome:?}"
     );
     assert_eq!(manager.auth_cached(), None);
+    assert!(manager.is_managed_auth_change(*manager.auth_change_receiver().borrow()));
     assert_eq!(
         *manager.auth_change_state_receiver().borrow(),
         AuthChangeState {
@@ -3495,6 +3496,9 @@ async fn managed_adoption_preserves_upstream_credential_and_owner_generations() 
             ManagedAdoptionInstallOutcome::Installed { .. }
         ));
         let after = *manager.auth_change_state_receiver().borrow();
+        let managed_revision = *manager.auth_change_receiver().borrow();
+        assert!(manager.is_managed_auth_change(managed_revision));
+        assert!(!manager.is_managed_auth_change(0));
         assert_eq!(after, AuthChangeState {
             generation: before.generation + 1,
             owner_generation: before.owner_generation + owner_delta,
@@ -3505,6 +3509,10 @@ async fn managed_adoption_preserves_upstream_credential_and_owner_generations() 
             ManagedAdoptionInstallOutcome::IntendedResultMismatch
         ));
         assert_eq!(*manager.auth_change_state_receiver().borrow(), after);
+        manager.set_cached_auth(None);
+        let ordinary_revision = *manager.auth_change_receiver().borrow();
+        assert!(ordinary_revision > managed_revision);
+        assert!(!manager.is_managed_auth_change(ordinary_revision));
     }
 }
 

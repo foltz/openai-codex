@@ -521,11 +521,19 @@ pub(super) async fn submission_loop(
     // As with the former finishing-task caller, birth can interleave with
     // handlers; install-time task admission remains the shutdown fence.
     let mut mailbox_start: Option<futures::future::BoxFuture<'_, ()>> = None;
+    // Retain the retry observer across select iterations. Dropping a losing
+    // select arm must not discard the host's pending reopen signal.
+    let mut mailbox_retry = Box::pin(sess.input_queue.work_retry.wait());
     loop {
         if rx_sub.is_closed() && rx_sub.is_empty() {
             break;
         }
         let sub = tokio::select! {
+            _ = &mut mailbox_retry => {
+                mailbox_retry = Box::pin(sess.input_queue.work_retry.wait());
+                sess.input_queue.completion_wake.notify_one();
+                continue;
+            }
             sub = rx_sub.recv() => match sub {
                 Ok(sub) => sub,
                 Err(_) => break,
@@ -762,6 +770,10 @@ pub(super) async fn submission_loop(
         let should_exit = loop {
             tokio::select! {
                 result = &mut dispatch => break result,
+                _ = &mut mailbox_retry => {
+                    mailbox_retry = Box::pin(sess.input_queue.work_retry.wait());
+                    sess.input_queue.completion_wake.notify_one();
+                }
                 _ = async { mailbox_start.as_mut().expect("guarded mailbox start").await }, if mailbox_start.is_some() => {
                     mailbox_start = None;
                 }
@@ -774,6 +786,7 @@ pub(super) async fn submission_loop(
     }
     // Release any suspended preparation before cleanup acquires its locks.
     drop(mailbox_start);
+    drop(mailbox_retry);
     // If the submission loop exits because the channel closed without an
     // explicit shutdown op, still run session teardown.
     if !shutdown_received {

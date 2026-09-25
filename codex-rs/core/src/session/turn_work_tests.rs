@@ -59,7 +59,7 @@ impl TurnStartAdmission for Gate {
         _termination: ExtensionFuture<'static, ()>,
     ) -> Result<Option<Box<dyn HostTurnWork>>, TurnWorkRefused> {
         self.events.lock().unwrap().push("admit".into());
-        if self.closed { return Err(TurnWorkRefused); }
+        if self.closed { return Err(TurnWorkRefused::Unavailable); }
         Ok(Some(Box::new(Work { events: Arc::clone(&self.events), retained: false })))
     }
 }
@@ -111,6 +111,87 @@ impl codex_extension_api::TurnLifecycleContributor for HoldRunningTurn {
     }
     fn on_turn_start<'a>(&'a self, _input: codex_extension_api::TurnStartInput<'a>) -> ExtensionFuture<'a, ()> {
         Box::pin(std::future::pending())
+    }
+}
+
+#[derive(Debug)]
+struct ReopenGate {
+    open: tokio::sync::watch::Receiver<bool>,
+    refused: tokio::sync::Notify,
+    attempts: AtomicUsize,
+}
+
+impl TurnStartAdmission for ReopenGate {
+    fn admit_turn_start(&self) -> Option<Box<dyn Send>> {
+        Some(Box::new(()))
+    }
+
+    fn admit_turn_work(
+        &self,
+        _store: &codex_extension_api::ExtensionData,
+        _termination: ExtensionFuture<'static, ()>,
+    ) -> Result<Option<Box<dyn HostTurnWork>>, TurnWorkRefused> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        if *self.open.borrow() {
+            return Ok(None);
+        }
+        self.refused.notify_one();
+        let mut open = self.open.clone();
+        Err(TurnWorkRefused::RetryAfter(Box::pin(async move {
+            open.wait_for(|open| *open).await.unwrap();
+        })))
+    }
+}
+
+#[test_case::test_case(true; "reopen retries without unrelated input")]
+#[test_case::test_case(false; "closed barrier does not prevent loop exit")]
+#[tokio::test]
+async fn mailbox_retries_after_reopen_without_an_unrelated_submission(reopen: bool) {
+    let (mut session, context) = make_session_and_context().await;
+    let (open, receiver) = tokio::sync::watch::channel(false);
+    let gate = Arc::new(ReopenGate {
+        open: receiver,
+        refused: tokio::sync::Notify::new(),
+        attempts: AtomicUsize::new(0),
+    });
+    let start = Arc::new(HoldStart(tokio::sync::Notify::new()));
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::<crate::config::Config>::new();
+    builder.turn_start_admission(gate.clone());
+    builder.turn_lifecycle_contributor(start.clone());
+    session.services.extensions = Arc::new(builder.build());
+    let models = Arc::new(RefreshCounter {
+        inner: Arc::clone(&session.services.models_manager),
+        calls: AtomicUsize::new(0),
+    });
+    session.services.models_manager = models.clone();
+    let session = Arc::new(session);
+    session.input_queue.enqueue_mailbox_communication(
+        InterAgentCommunication::new(
+            codex_protocol::AgentPath::root(), codex_protocol::AgentPath::root(),
+            Vec::new(), "retry".into(), /*trigger_turn*/ true,
+        ), Default::default(),
+    ).await;
+    session.input_queue.completion_wake.notify_one();
+    let (sender, receiver) = async_channel::bounded(1);
+    let loop_task = tokio::spawn(super::super::handlers::submission_loop(
+        Arc::clone(&session), context.config.clone(), receiver, None,
+    ));
+    tokio::time::timeout(Duration::from_secs(10), gate.refused.notified()).await.unwrap();
+    assert!(session.active_turn.lock().await.is_none());
+    assert_eq!(models.calls.load(Ordering::SeqCst), 0);
+    assert!(session.input_queue.has_pending_mailbox_items().await);
+    if reopen {
+        open.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), start.0.notified()).await.unwrap();
+        assert_eq!(gate.attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(models.calls.load(Ordering::SeqCst), 1);
+    }
+    // A held preparation and the retry observer must not prevent loop exit.
+    drop(sender);
+    tokio::time::timeout(Duration::from_secs(10), loop_task).await.unwrap().unwrap();
+    if !reopen {
+        assert_eq!(gate.attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(models.calls.load(Ordering::SeqCst), 0);
     }
 }
 

@@ -58,11 +58,16 @@ impl TurnStartAdmission for AccountTurnAdmission {
         termination: ExtensionFuture<'static, ()>,
     ) -> Result<Option<Box<dyn HostTurnWork>>, TurnWorkRefused> {
         let permit = match REQUEST_WORK.try_with(|parent| parent.try_derive()) {
-            Ok(derived) => derived,
-            Err(_) => self.permits.try_acquire(),
-        }.ok_or(TurnWorkRefused)?;
+            Ok(derived) => derived.ok_or(TurnWorkRefused::Unavailable)?,
+            Err(_) => self.permits.try_acquire().ok_or_else(|| {
+                let permits = self.permits.clone();
+                TurnWorkRefused::RetryAfter(Box::pin(async move {
+                    permits.wait_until_available().await;
+                }))
+            })?,
+        };
         let session = thread_store.get_or_init(|| self.work.session(termination));
-        let pending = session.begin(permit).ok_or(TurnWorkRefused)?;
+        let pending = session.begin(permit).ok_or(TurnWorkRefused::Unavailable)?;
         Ok(Some(Box::new(pending)))
     }
 
@@ -73,10 +78,10 @@ impl TurnStartAdmission for AccountTurnAdmission {
         child_store: &ExtensionData,
         termination: ExtensionFuture<'static, ()>,
     ) -> Result<Option<Box<dyn HostTurnWork>>, TurnWorkRefused> {
-        let parent = parent_store.get::<AccountTurnSession>().ok_or(TurnWorkRefused)?;
-        let permit = parent.derive(parent_turn_id).ok_or(TurnWorkRefused)?;
+        let parent = parent_store.get::<AccountTurnSession>().ok_or(TurnWorkRefused::Unavailable)?;
+        let permit = parent.derive(parent_turn_id).ok_or(TurnWorkRefused::Unavailable)?;
         let child = child_store.get_or_init(|| self.work.session(termination));
-        let pending = child.begin(permit).ok_or(TurnWorkRefused)?;
+        let pending = child.begin(permit).ok_or(TurnWorkRefused::Unavailable)?;
         Ok(Some(Box::new(pending)))
     }
 

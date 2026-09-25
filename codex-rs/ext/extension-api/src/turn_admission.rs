@@ -40,5 +40,19 @@ pub trait TurnStartAdmission: std::fmt::Debug + Send + Sync {
 }
 
 /// The host's account-work barrier refused a new submission.
-#[derive(Debug)]
-pub struct TurnWorkRefused;
+pub enum TurnWorkRefused {
+    /// No retry signal exists, for example because the parent turn has ended.
+    Unavailable,
+    /// A host-wide admission change may permit retry. This is only a wakeup:
+    /// the caller must acquire fresh authority again after it resolves.
+    RetryAfter(crate::ExtensionFuture<'static, ()>),
+}
+
+impl std::fmt::Debug for TurnWorkRefused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Unavailable => "TurnWorkRefused::Unavailable",
+            Self::RetryAfter(_) => "TurnWorkRefused::RetryAfter",
+        })
+    }
+}

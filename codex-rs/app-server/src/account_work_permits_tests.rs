@@ -3,6 +3,25 @@ use futures::FutureExt;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
+async fn reopen_retry_observes_both_registered_and_not_yet_polled_waiters() {
+    let permits = AccountWorkPermits::new();
+    permits.close();
+    let waiting = permits.wait_until_available();
+    tokio::pin!(waiting);
+    assert!(waiting.as_mut().now_or_never().is_none());
+    permits.wake_waiters();
+    assert!(waiting.as_mut().now_or_never().is_none());
+    permits.reopen();
+    assert_eq!(waiting.as_mut().now_or_never(), Some(()));
+
+    permits.close();
+    let not_polled = permits.wait_until_available();
+    permits.reopen();
+    assert_eq!(not_polled.now_or_never(), Some(()));
+    assert_eq!(permits.admitted_count(), 0, "a wake is not an admission");
+}
+
+#[tokio::test]
 async fn admitted_request_derives_a_turn_after_close_and_outlives_request_return() {
     use codex_extension_api::TurnStartAdmission;
     let coordinator = ManagedTransitionCoordinator::new();

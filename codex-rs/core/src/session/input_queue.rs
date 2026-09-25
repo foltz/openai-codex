@@ -83,6 +83,7 @@ pub(crate) struct InputQueue {
     /// Coalesced completion wake, consumed only by the submission loop. Unlike
     /// a submission sender, this cannot keep that loop's channel open.
     pub(crate) completion_wake: tokio::sync::Notify,
+    pub(crate) work_retry: super::turn_work::MailboxWorkRetry,
 }
 
 impl InputQueue {
@@ -92,6 +93,7 @@ impl InputQueue {
             mailbox: super::mailbox::Mailbox::new(activity_tx.clone()),
             activity_tx,
             completion_wake: tokio::sync::Notify::new(),
+            work_retry: super::turn_work::MailboxWorkRetry::default(),
         }
     }
 

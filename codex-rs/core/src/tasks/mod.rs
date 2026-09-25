@@ -548,7 +548,13 @@ impl Session {
                     self.turn_work_termination(),
                 ) {
                     Ok(work) => work,
-                    Err(_) => return,
+                    Err(refusal) => {
+                        if let codex_extension_api::TurnWorkRefused::RetryAfter(retry) = refusal {
+                            self.input_queue.work_retry.defer(retry);
+                        }
+                        tracing::debug!("mailbox start deferred by host account admission");
+                        return;
+                    }
                 }
             };
             if let Some(work) = &mut host_work {

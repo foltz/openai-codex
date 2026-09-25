@@ -74,7 +74,7 @@ impl TurnStartAdmission for Gate {
         _termination: ExtensionFuture<'static, ()>,
     ) -> Result<Option<Box<dyn HostTurnWork>>, TurnWorkRefused> {
         if self.refused.load(Ordering::Acquire) {
-            return Err(TurnWorkRefused);
+            return Err(TurnWorkRefused::Unavailable);
         }
         Ok(Some(Box::new(Lease { evidence: Arc::clone(&self.evidence), retained: false })))
     }

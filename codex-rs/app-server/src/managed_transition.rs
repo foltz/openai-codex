@@ -161,6 +161,7 @@ impl AccountWorkPermits {
         self.inner
             .state
             .fetch_and(ACCOUNT_WORK_COUNT_MASK, Ordering::AcqRel);
+        self.inner.signal.notify_waiters();
         // Observe the actual admission-opening point, not terminal return.
         #[cfg(test)]
         if let Some(observe) = self.inner.after_reopen.lock().unwrap().take() {
@@ -170,6 +171,21 @@ impl AccountWorkPermits {
 
     pub(crate) fn admitted_count(&self) -> u64 {
         self.inner.state.load(Ordering::Acquire) & ACCOUNT_WORK_COUNT_MASK
+    }
+
+    /// A retry hint, not admission. Register before checking so reopening
+    /// between refusal and this future's first poll cannot lose the wake.
+    pub(crate) async fn wait_until_available(&self) {
+        loop {
+            let notified = self.inner.signal.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let state = self.inner.state.load(Ordering::Acquire);
+            if state & ACCOUNT_WORK_CLOSED == 0 && state < ACCOUNT_WORK_COUNT_MASK {
+                return;
+            }
+            notified.await;
+        }
     }
 
     fn wake_waiters(&self) {

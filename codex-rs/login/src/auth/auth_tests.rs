@@ -59,6 +59,114 @@ fn header_auth_exposes_a_valid_chatgpt_account_id() {
 }
 
 #[tokio::test]
+async fn managed_account_projection_is_exact_guarded_and_credential_free() {
+    let home = tempdir().unwrap();
+    write_managed_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".to_owned()),
+            chatgpt_account_id: Some("projection-account".to_owned()),
+        },
+        home.path(),
+    )
+    .unwrap();
+    let manager = AuthManager::new(
+        home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+        /*forced_chatgpt_workspace_id*/ None,
+        /*chatgpt_base_url*/ None,
+        AuthKeyringBackendKind::default(),
+        crate::test_support::transport_default_auth_route_config(),
+    )
+    .await;
+    let fingerprint = AuthManager::managed_account_fingerprint("projection-account");
+    let revision = *manager.auth_change_receiver().borrow();
+    let projected = manager
+        .with_managed_account_projection(Some(&fingerprint), |mode, plan| {
+            assert!(
+                manager.inner.try_write().is_err(),
+                "cache guard must span the callback"
+            );
+            assert!(
+                manager.external_auth.try_write().is_err(),
+                "external authority stays fenced"
+            );
+            (mode, plan)
+        })
+        .unwrap();
+    assert_eq!(
+        projected,
+        (Some(AuthMode::Chatgpt), Some(AccountPlanType::Pro))
+    );
+    assert_eq!(*manager.auth_change_receiver().borrow(), revision);
+    let terminal = manager
+        .prepare_managed_terminal_commit(Some(&fingerprint))
+        .await
+        .unwrap();
+    let storage = create_auth_storage(
+        home.path().to_path_buf(),
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
+    );
+    let mut raw = storage.load().unwrap().unwrap();
+    let competing_writer = storage.lock_managed_source().unwrap();
+    assert!(matches!(
+        manager.with_managed_terminal_projection(&terminal, |_, _| panic!(
+            "contended source must not publish"
+        )),
+        Err(ManagedTerminalVerificationError::SourceUnavailable(
+            ManagedAuthStorageError::ReadFailed(ManagedAuthStorageFailure::CoordinationContended)
+        ))
+    ));
+    drop(competing_writer);
+    // Contention did not consume the proof or obscure the cached authority;
+    // the same unchanged precondition can be checked after the writer leaves.
+    assert_eq!(
+        manager
+            .with_managed_terminal_projection(&terminal, |mode, plan| {
+                assert!(manager.inner.try_write().is_err());
+                assert!(manager.external_auth.try_write().is_err());
+                assert!(
+                    storage.save(&raw).is_err(),
+                    "cooperating writer must be excluded through callback"
+                );
+                (mode, plan)
+            })
+            .unwrap(),
+        (Some(AuthMode::Chatgpt), Some(AccountPlanType::Pro))
+    );
+    raw.tokens.as_mut().unwrap().access_token = "replaced-after-final-verification".to_owned();
+    storage.save(&raw).unwrap();
+    assert!(matches!(
+        manager.with_managed_terminal_projection(&terminal, |_, _| panic!(
+            "changed durable source must not publish"
+        )),
+        Err(ManagedTerminalVerificationError::SourceChanged)
+    ));
+    assert!(matches!(
+        manager.with_managed_account_projection(Some("wrong"), |_, _| {
+            panic!("mismatched cache must not publish")
+        }),
+        Err(ManagedAdoptionVerificationError::IntendedResultMismatch)
+    ));
+    manager.inner.write().unwrap().auth = None;
+    assert_eq!(
+        manager
+            .with_managed_account_projection(None, |mode, plan| (mode, plan))
+            .unwrap(),
+        (None, None)
+    );
+    manager.inner.write().unwrap().initial_load_failed = true;
+    assert!(matches!(
+        manager.with_managed_account_projection(None, |_, _| {
+            panic!("unavailable authority must not publish absence")
+        }),
+        Err(ManagedAdoptionVerificationError::CacheUnavailable)
+    ));
+}
+
+#[tokio::test]
 async fn refresh_without_id_token() {
     let codex_home = tempdir().unwrap();
     let fake_jwt = write_auth_file(
@@ -3384,7 +3492,7 @@ async fn managed_adoption_preserves_upstream_credential_and_owner_generations() 
         ).await.unwrap();
         assert!(matches!(
             manager.install_prepared_managed_adoption(&prepared, &precondition),
-            ManagedAdoptionInstallOutcome::Installed(_)
+            ManagedAdoptionInstallOutcome::Installed { .. }
         ));
         let after = *manager.auth_change_state_receiver().borrow();
         assert_eq!(after, AuthChangeState {
@@ -3483,7 +3591,7 @@ async fn prepared_managed_candidate_refuses_changed_source_and_installs_only_onc
         .unwrap();
     assert!(matches!(
         manager.install_prepared_managed_adoption(&prepared, &precondition),
-        ManagedAdoptionInstallOutcome::Installed(_)
+        ManagedAdoptionInstallOutcome::Installed { .. }
     ));
     assert_eq!(
         manager.auth_cached().unwrap().get_account_id().as_deref(),
@@ -3561,7 +3669,9 @@ async fn managed_recovery_verifies_durable_and_cached_result_without_installing(
 async fn managed_adoption_outcomes_never_debug_print_credential_material() {
     let secret = "sk-must-never-appear-in-debug-output";
     let source_outcome = ManagedAdoptionSourceOutcome::Available(CodexAuth::from_api_key(secret));
-    let install_outcome = ManagedAdoptionInstallOutcome::Installed(CodexAuth::from_api_key(secret));
+    let install_outcome = ManagedAdoptionInstallOutcome::Installed {
+        fingerprint: AuthManager::managed_account_fingerprint("opaque-account"),
+    };
     assert!(!format!("{source_outcome:?}").contains(secret));
     assert!(!format!("{install_outcome:?}").contains(secret));
 }

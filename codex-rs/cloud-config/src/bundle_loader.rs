@@ -11,6 +11,8 @@ use codex_config::CloudConfigBundleLoadError;
 use codex_http_client::HttpClientFactory;
 use codex_login::AuthConfig;
 use codex_login::AuthManager;
+use std::future::Future;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -79,9 +81,36 @@ fn registered_loader<C: BundleClient + 'static>(
     service: CloudConfigBundleService<C>,
     replacement_slot: Option<&Mutex<Option<AbortHandle>>>,
 ) -> Result<(CloudConfigBundleLoader, AbortHandle), CloudConfigBundleLoadError> {
-    let lifecycle = home_lifecycle(&service.codex_home)?;
+    let birth = LoaderBirth::capture(&service.codex_home)?;
+    registered_loader_at_birth(service, replacement_slot, birth)
+}
+
+struct LoaderBirth {
+    lifecycle: Arc<HomeLifecycle>,
+    generation: u64,
+}
+
+impl LoaderBirth {
+    fn capture(home: &Path) -> Result<Self, CloudConfigBundleLoadError> {
+        let lifecycle = home_lifecycle(home)?;
+        let owners = lifecycle.owners.lock().map_err(|_| lifecycle_error("cloud owner lock unavailable"))?;
+        if owners.retiring {
+            return Err(lifecycle_error("cloud reset is still retiring prior work"));
+        }
+        let generation = lifecycle.generation.load(Ordering::Acquire);
+        drop(owners);
+        Ok(Self { lifecycle, generation })
+    }
+}
+
+fn registered_loader_at_birth<C: BundleClient + 'static>(
+    service: CloudConfigBundleService<C>,
+    replacement_slot: Option<&Mutex<Option<AbortHandle>>>,
+    birth: LoaderBirth,
+) -> Result<(CloudConfigBundleLoader, AbortHandle), CloudConfigBundleLoadError> {
+    let lifecycle = birth.lifecycle;
     let mut owners = lifecycle.owners.lock().map_err(|_| lifecycle_error("cloud owner lock unavailable"))?;
-    if owners.retiring {
+    if owners.retiring || lifecycle.generation.load(Ordering::Acquire) != birth.generation {
         return Err(lifecycle_error("cloud reset is still retiring prior work"));
     }
     let result = start_loader(service, &lifecycle, &mut owners);
@@ -129,11 +158,11 @@ pub async fn cloud_config_bundle_loader_for_storage(
     auth_config: AuthConfig,
     enable_codex_api_key_env: bool,
 ) -> std::io::Result<CloudConfigBundleLoader> {
-    let service =
-        cloud_config_bundle_service_for_storage(auth_config, enable_codex_api_key_env).await?;
-    registered_loader(service, Some(refresher_task_slot()))
-        .map(|(loader, _)| loader)
-        .map_err(std::io::Error::other)
+    storage_loader(
+        auth_config.codex_home.clone(),
+        cloud_config_bundle_service_for_storage(auth_config, enable_codex_api_key_env),
+        StorageMode::Cached,
+    ).await
 }
 
 /// Fetches directly from the network on each load, without reading or writing
@@ -142,20 +171,50 @@ pub async fn cloud_config_bundle_loader_for_storage_without_cache(
     auth_config: AuthConfig,
     enable_codex_api_key_env: bool,
 ) -> std::io::Result<CloudConfigBundleLoader> {
-    let service =
-        cloud_config_bundle_service_for_storage(auth_config, enable_codex_api_key_env)
-            .await?
-            .without_cache();
-    uncached_loader(service).map_err(std::io::Error::other)
+    storage_loader(
+        auth_config.codex_home.clone(),
+        cloud_config_bundle_service_for_storage(auth_config, enable_codex_api_key_env),
+        StorageMode::Uncached,
+    ).await
 }
 
+enum StorageMode {
+    Cached,
+    Uncached,
+}
+
+async fn storage_loader<C: BundleClient + 'static>(
+    home: PathBuf,
+    construct: impl Future<Output = std::io::Result<CloudConfigBundleService<C>>>,
+    mode: StorageMode,
+) -> std::io::Result<CloudConfigBundleLoader> {
+    // Capture before AuthManager construction can read an old identity and
+    // suspend. Never stamp that snapshot with a later reset's generation.
+    let birth = LoaderBirth::capture(&home).map_err(std::io::Error::other)?;
+    let service = construct.await?;
+    match mode {
+        StorageMode::Cached => registered_loader_at_birth(service, Some(refresher_task_slot()), birth)
+            .map(|(loader, _)| loader),
+        StorageMode::Uncached => uncached_loader_at_birth(service, birth),
+    }.map_err(std::io::Error::other)
+}
+
+#[cfg(test)]
 pub(crate) fn uncached_loader<C: BundleClient + 'static>(
     service: CloudConfigBundleService<C>,
 ) -> Result<CloudConfigBundleLoader, CloudConfigBundleLoadError> {
+    let birth = LoaderBirth::capture(&service.codex_home)?;
+    uncached_loader_at_birth(service, birth)
+}
+
+fn uncached_loader_at_birth<C: BundleClient + 'static>(
+    service: CloudConfigBundleService<C>,
+    birth: LoaderBirth,
+) -> Result<CloudConfigBundleLoader, CloudConfigBundleLoadError> {
     let mut service = service.without_cache();
-    let lifecycle = home_lifecycle(&service.codex_home)?;
+    let lifecycle = birth.lifecycle;
     let owners = lifecycle.owners.lock().map_err(|_| lifecycle_error("cloud owner lock unavailable"))?;
-    if owners.retiring {
+    if owners.retiring || lifecycle.generation.load(Ordering::Acquire) != birth.generation {
         return Err(lifecycle_error("cloud reset is still retiring prior work"));
     }
     service.publication = Arc::clone(&lifecycle.publication);
@@ -217,3 +276,7 @@ async fn cloud_config_bundle_service_for_storage(
         CLOUD_CONFIG_BUNDLE_TIMEOUT,
     ))
 }
+
+#[cfg(test)]
+#[path = "bundle_loader_tests.rs"]
+mod tests;

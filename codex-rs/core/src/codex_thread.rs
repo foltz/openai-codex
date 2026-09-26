@@ -216,6 +216,10 @@ pub struct BackgroundTerminalInfo {
     pub cwd: PathUri,
 }
 
+#[cfg(test)]
+#[path = "codex_thread_submission_tests.rs"]
+mod submission_tests;
+
 /// Conduit for the bidirectional stream of messages that compose a thread
 /// (formerly called a conversation) in Codex.
 impl CodexThread {
@@ -239,25 +243,7 @@ impl CodexThread {
     }
 
     pub async fn submit(&self, op: Op) -> CodexResult<String> {
-        let op = if matches!(&op, Op::Compact | Op::Review { .. }) {
-            match self.session.services.extensions.admit_turn_work(
-                &self.session.services.thread_extension_data,
-                Box::pin(self.termination_receipt()),
-            ).map_err(|_| CodexErr::Fatal("account work admission is closed".to_string()))? {
-                Some(work) => {
-                    let action = match op {
-                        Op::Compact => codex_protocol::host_turn_work::HostTurnAction::Compact,
-                        Op::Review { review_request } => codex_protocol::host_turn_work::HostTurnAction::Review(review_request),
-                        _ => unreachable!("only compact and review acquire legacy turn work"),
-                    };
-                    Op::HostTurn { action, work }
-                }
-                None => op,
-            }
-        } else {
-            op
-        };
-        self.io.submit(op).await
+        self.submit_with_trace(op, /*trace*/ None).await
     }
 
     /// Returns the session telemetry handle for thread-scoped production instrumentation.
@@ -377,6 +363,26 @@ impl CodexThread {
         op: Op,
         trace: Option<W3cTraceContext>,
     ) -> CodexResult<String> {
+        // Traced app-server requests must retain the same account-work custody
+        // as direct submissions before crossing into the session loop.
+        let op = if matches!(&op, Op::Compact | Op::Review { .. }) {
+            match self.session.services.extensions.admit_turn_work(
+                &self.session.services.thread_extension_data,
+                Box::pin(self.termination_receipt()),
+            ).map_err(|_| CodexErr::Fatal("account work admission is closed".to_string()))? {
+                Some(work) => {
+                    let action = match op {
+                        Op::Compact => codex_protocol::host_turn_work::HostTurnAction::Compact,
+                        Op::Review { review_request } => codex_protocol::host_turn_work::HostTurnAction::Review(review_request),
+                        _ => unreachable!("only compact and review acquire legacy turn work"),
+                    };
+                    Op::HostTurn { action, work }
+                }
+                None => op,
+            }
+        } else {
+            op
+        };
         self.io
             .submit_with_trace(
                 op, trace, /*parent_turn_id*/ None, /*root_turn_id*/ None,

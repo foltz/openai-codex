@@ -1,3 +1,4 @@
+mod account_work;
 mod managed;
 mod shared_instructions;
 
@@ -2137,10 +2138,18 @@ impl ThreadManagerState {
 
     /// Spawn a new thread with optional history and register it with the manager.
     async fn spawn_thread(self: &Arc<Self>, request: ThreadSpawnRequest) -> CodexResult<NewThread> {
+        // Capture while the caller's request scope is live. The retained
+        // constructor runs independently and must not rediscover that scope.
+        let account_work = match self.extensions.host_admission() {
+            Some(host) => host.derive_request_operation_work().map_err(|_| {
+                CodexErr::Fatal("request account work cannot admit thread construction".to_owned())
+            })?,
+            None => None,
+        };
         let state = Arc::clone(self);
         let stop = request.startup.as_ref().map(|startup| startup.stop.clone());
         self.constructions
-            .register(move |custody, publication| async move {
+            .register(account_work, move |custody, publication| async move {
                 if let Some(startup) = request.startup.as_ref() {
                     let _ = startup.custody.set(Arc::clone(&custody));
                 }

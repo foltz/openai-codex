@@ -92,6 +92,15 @@ impl TurnStartAdmission for AccountTurnAdmission {
         Ok(Some(Box::new(AccountOperationWork { permit, turns: self.work.clone() })))
     }
 
+    fn derive_request_operation_work(
+        &self,
+    ) -> Result<Option<Box<dyn HostOperationWork>>, TurnWorkRefused> {
+        Ok(derive_request_work()?.map(|permit| {
+            Box::new(AccountOperationWork { permit, turns: self.work.clone() })
+                as Box<dyn HostOperationWork>
+        }))
+    }
+
     fn admit_turn_work(
         &self,
         thread_store: &ExtensionData,

@@ -58,6 +58,26 @@ async fn optional_background_admission_is_fresh_even_inside_an_admitted_request(
 }
 
 #[tokio::test]
+async fn request_operation_capture_derives_during_drain_without_a_turn_entry() {
+    use codex_extension_api::TurnStartAdmission;
+    let permits = AccountWorkPermits::new();
+    let admission = crate::account_turn_admission::AccountTurnAdmission {
+        shutdown: crate::turn_admission::TurnAdmission::default(),
+        permits: permits.clone(),
+        work: crate::account_turn_work::AccountTurnWork::default(),
+    };
+    assert!(admission.derive_request_operation_work().unwrap().is_none());
+    let operation = crate::account_turn_admission::within_request(permits.try_acquire(), async {
+        permits.close();
+        admission.derive_request_operation_work().unwrap().unwrap()
+    }).await;
+    assert_eq!(permits.admitted_count(), 1);
+    assert!(permits.try_acquire().is_none());
+    drop(operation);
+    assert_eq!(permits.admitted_count(), 0);
+}
+
+#[tokio::test]
 async fn processor_work_keeps_request_custody_after_observer_drop() {
     use crate::account_turn_admission::derive_request_work;
     use crate::account_turn_admission::within_request;

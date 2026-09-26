@@ -20,6 +20,15 @@ pub trait TurnStartAdmission: std::fmt::Debug + Send + Sync {
         Ok(None)
     }
 
+    /// Capture finite work from the currently executing host request before
+    /// handing construction to another task. No request scope means `Ok(None)`;
+    /// exhausted derivation must refuse, never acquire fresh authority.
+    fn derive_request_operation_work(
+        &self,
+    ) -> Result<Option<Box<dyn crate::HostOperationWork>>, TurnWorkRefused> {
+        Ok(None)
+    }
+
     /// Derive finite work from an exact live turn, never from a claimed ID alone.
     fn derive_operation_work(
         &self,

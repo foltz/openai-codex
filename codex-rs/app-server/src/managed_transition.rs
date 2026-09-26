@@ -245,6 +245,7 @@ pub(crate) enum ResetInventoryError {
     ConfigLoadTimedOut,
     ResidencyUnavailable,
     RemoteControlUnavailable,
+    ConstructorsIncomplete,
     ThreadsIncomplete {
         submit_failed: usize,
         timed_out: usize,
@@ -285,6 +286,12 @@ impl From<ResetInventoryError> for TransitionFailure {
 /// without touching any real subsystem.
 pub(crate) trait ResetInventory: Send + Sync {
     fn reset_all(&self) -> ResetInventoryFuture<'_>;
+
+    /// Progress already-admitted construction before adoption. This is not a
+    /// reset and must not close admission, retire sessions or admit fresh work.
+    fn drive_admitted_constructions(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(std::future::pending())
+    }
 }
 
 /// What `advance_inner` should do to the coordinator's own CAS baseline
@@ -1057,6 +1064,14 @@ impl ManagedTransitionCoordinator {
             .await?;
 
         let deadline = tokio::time::Instant::now() + DRAIN_DEADLINE;
+        let construction_progress = async {
+            if let Some(deps) = &self.adoption {
+                deps.reset_inventory.drive_admitted_constructions().await;
+            }
+            // A stopped inventory observer is not a drain-completion signal.
+            std::future::pending::<()>().await;
+        };
+        tokio::pin!(construction_progress);
         loop {
             // Race-free: `Notify::notified()` captures its
             // `notify_waiters_calls` baseline at *creation* (before this
@@ -1097,6 +1112,7 @@ impl ManagedTransitionCoordinator {
                 tokio::select! {
                     _ = notified => {}
                     _ = self.account_turn_work.observe_terminated() => {}
+                    _ = &mut construction_progress => {}
                 }
             };
             if tokio::time::timeout_at(deadline, work_finished).await.is_err() {
@@ -3889,6 +3905,7 @@ mod tests {
     struct RecordingResetInventory {
         called: AtomicBool,
         should_fail: bool,
+        parked_work: std::sync::Mutex<Option<AccountWorkPermitGuard>>,
     }
 
     impl RecordingResetInventory {
@@ -3896,6 +3913,7 @@ mod tests {
             Self {
                 called: AtomicBool::new(false),
                 should_fail,
+                parked_work: std::sync::Mutex::new(None),
             }
         }
 
@@ -3905,6 +3923,13 @@ mod tests {
     }
 
     impl ResetInventory for RecordingResetInventory {
+        fn drive_admitted_constructions(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(async move {
+                drop(self.parked_work.lock().unwrap().take());
+                std::future::pending::<()>().await;
+            })
+        }
+
         fn reset_all(&self) -> ResetInventoryFuture<'_> {
             Box::pin(async move {
                 self.called.store(true, Ordering::Release);
@@ -4495,6 +4520,12 @@ mod tests {
             Arc::clone(&reset_inventory) as Arc<dyn ResetInventory>,
         );
         let process_id = coordinator.process_instance_id().await;
+
+        // An abandoned constructor cannot rely on the later reset to poll it:
+        // the coordinator must drive already-admitted work before adoption.
+        *reset_inventory.parked_work.lock().unwrap() = Some(
+            coordinator.try_acquire_account_work_permit().expect("admit constructor"),
+        );
 
         // A different account lands on disk before the transition reaches
         // Adopting -- simulating the operator's external managed-auth write

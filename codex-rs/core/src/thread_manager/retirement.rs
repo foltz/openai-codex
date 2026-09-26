@@ -18,6 +18,7 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::Weak;
+use tokio::sync::Notify;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
@@ -29,6 +30,7 @@ enum ConstructionOutcome {
 
 struct Construction {
     completion: Shared<BoxFuture<'static, ConstructionOutcome>>,
+    account_dependent: bool,
     startup: Arc<SessionStartupCustody>,
 }
 
@@ -49,10 +51,11 @@ mod population;
 #[derive(Clone, Default)]
 pub(super) struct ThreadConstructions {
     state: Arc<Mutex<State>>,
+    activity: Arc<Notify>,
 }
 
 #[derive(Clone)]
-pub(super) struct ConstructionTicket(Weak<Mutex<State>>);
+pub(super) struct ConstructionTicket(Weak<Mutex<State>>, Arc<Notify>);
 
 /// Caller cancellation and final map publication share one synchronous gate.
 #[derive(Clone)]
@@ -94,11 +97,62 @@ impl ThreadConstructions {
     pub(super) fn close_until(&self, deadline: Instant) -> CodexResult<Instant> {
         let mut state = self.state.lock().map_err(|_| CodexErr::InternalAgentDied)?;
         state.closed = true;
+        self.activity.notify_waiters();
         Ok(*state.deadline.get_or_insert(deadline))
     }
 
     pub(super) fn ticket(&self) -> ConstructionTicket {
-        ConstructionTicket(Arc::downgrade(&self.state))
+        ConstructionTicket(Arc::downgrade(&self.state), Arc::clone(&self.activity))
+    }
+
+    /// Progress only constructors that already carry account authority. This
+    /// observer neither closes admission nor begins retirement. Dropping it
+    /// leaves the original Shared futures in this registry.
+    pub(super) async fn drive_account_work(&self) {
+        loop {
+            let changed = self.activity.notified();
+            let pending = {
+                let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state.closed {
+                    return;
+                }
+                state.constructions.iter()
+                    .filter(|entry| entry.account_dependent && entry.completion.peek().is_none())
+                    .map(|entry| entry.completion.clone())
+                    .collect::<Vec<_>>()
+            };
+            if pending.is_empty() {
+                changed.await;
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = changed => {},
+                    _ = futures::future::join_all(pending) => {},
+                }
+            }
+        }
+    }
+
+    pub(super) async fn retire_completed_startup_until(&self, deadline: Instant) -> bool {
+        let (finished, startup) = {
+            let Ok(state) = self.state.lock() else {
+                return false;
+            };
+            let finished = !state.panicked && state.constructions.iter()
+                .all(|entry| entry.completion.peek() == Some(&ConstructionOutcome::Returned));
+            let startup = state.constructions.iter()
+                .filter(|entry| entry.completion.peek().is_some())
+                .map(|entry| Arc::clone(&entry.startup))
+                .collect::<Vec<_>>();
+            (finished, startup)
+        };
+        let results = futures::future::join_all(startup.into_iter().map(|startup| async move {
+            // Like reusable bulk thread shutdown, bound this observation of
+            // retained legacy cleanup. Do not latch an account-reset deadline
+            // into the separate permanent-manager retirement transaction.
+            tokio::time::timeout_at(deadline, startup.shutdown_legacy()).await.unwrap_or(false)
+        })).await;
+        finished && results.into_iter().all(|complete| complete)
     }
 
     #[cfg(test)]
@@ -107,6 +161,7 @@ impl ThreadConstructions {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .closed = true;
+        self.activity.notify_waiters();
     }
 
     pub(super) async fn drain_until(&self, deadline: Instant) -> ConstructionDrain {
@@ -117,6 +172,7 @@ impl ThreadConstructions {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.closed = true;
+            self.activity.notify_waiters();
             if !unavailable && let Some(report) = &state.terminal {
                 return report.clone();
             }
@@ -193,6 +249,7 @@ impl ThreadConstructions {
 impl ConstructionTicket {
     pub(super) fn register<F, Fut>(
         &self,
+        account_work: Option<Box<dyn codex_extension_api::HostOperationWork>>,
         factory: F,
     ) -> CodexResult<BoxFuture<'static, CodexResult<NewThread>>>
     where
@@ -217,7 +274,9 @@ impl ConstructionTicket {
         let publication = ConstructionPublication(Arc::new(Mutex::new(true)));
         let observer = ObserverGuard(publication.clone());
         let (sender, receiver) = oneshot::channel();
+        let account_dependent = account_work.is_some();
         let completion = async move {
+            let _account_work = account_work;
             match AssertUnwindSafe(async move { factory(construction_startup, publication).await })
                 .catch_unwind()
                 .await
@@ -235,8 +294,10 @@ impl ConstructionTicket {
         .shared();
         state.constructions.push(Construction {
             completion: completion.clone(),
+            account_dependent,
             startup,
         });
+        self.1.notify_waiters();
         // The original is installed under the close gate before any polling.
         Ok(async move {
             let _observer = observer;

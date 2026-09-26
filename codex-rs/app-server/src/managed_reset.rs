@@ -38,6 +38,12 @@ pub(crate) struct ProductionResetInventory {
 const RESET_STAGE_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl ResetInventory for ProductionResetInventory {
+    fn drive_admitted_constructions(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(self.thread_manager.drive_admitted_constructions())
+    }
+
     fn reset_all(&self) -> ResetInventoryFuture<'_> {
         Box::pin(async move {
             let telemetry_generation = *self.auth_manager.auth_change_receiver().borrow();
@@ -56,6 +62,12 @@ impl ResetInventory for ProductionResetInventory {
                     submit_failed: shutdown_report.submit_failed.len(),
                     timed_out: shutdown_report.timed_out.len(),
                 });
+            }
+            if !self.thread_manager
+                .shutdown_unpublished_constructions_bounded(RESET_STAGE_TIMEOUT)
+                .await
+            {
+                return Err(ResetInventoryError::ConstructorsIncomplete);
             }
             self.thread_manager.invalidate_mcp_runtimes().await;
 

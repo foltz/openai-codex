@@ -14,7 +14,7 @@ async fn cancelled_constructor_observer_preserves_original_until_drain() {
     let count = Arc::clone(&entered);
     let mut observer = owner
         .ticket()
-        .register(move |_, _| async move {
+        .register(/*account_work*/ None, move |_, _| async move {
             let _resource = resource;
             count.fetch_add(1, Ordering::SeqCst);
             held.await.expect("release constructor");
@@ -28,7 +28,7 @@ async fn cancelled_constructor_observer_preserves_original_until_drain() {
     assert!(
         owner
             .ticket()
-            .register(|_, _| async { panic!("closed factory ran") })
+            .register(/*account_work*/ None, |_, _| async { panic!("closed factory ran") })
             .is_err()
     );
     release.send(()).expect("original retained");
@@ -56,7 +56,7 @@ async fn expired_original_deadline_never_resumes_constructor() {
     let invoked = Arc::clone(&count);
     let observer = owner
         .ticket()
-        .register(move |_, _| async move {
+        .register(/*account_work*/ None, move |_, _| async move {
             invoked.fetch_add(1, Ordering::SeqCst);
             Err(CodexErr::InternalAgentDied)
         })
@@ -84,7 +84,7 @@ async fn constructor_panic_is_sticky_and_dead_ticket_refuses_birth() {
     let owner = ThreadConstructions::default();
     let ticket = owner.ticket();
     let observer = ticket
-        .register(|_, _| async { panic!("constructor panic") })
+        .register(/*account_work*/ None, |_, _| async { panic!("constructor panic") })
         .expect("admit");
     assert!(observer.await.is_err());
     let deadline = Instant::now() + Duration::from_secs(1);
@@ -100,7 +100,7 @@ async fn constructor_panic_is_sticky_and_dead_ticket_refuses_birth() {
     drop(owner);
     assert!(
         ticket
-            .register(|_, _| async { panic!("expired factory ran") })
+            .register(/*account_work*/ None, |_, _| async { panic!("expired factory ran") })
             .is_err()
     );
 }
@@ -111,7 +111,7 @@ async fn completed_constructor_compaction_preserves_prior_panic() {
     assert!(
         owner
             .ticket()
-            .register(|_, _| async { panic!("first constructor") })
+            .register(/*account_work*/ None, |_, _| async { panic!("first constructor") })
             .unwrap()
             .await
             .is_err()
@@ -120,7 +120,7 @@ async fn completed_constructor_compaction_preserves_prior_panic() {
         assert!(
             owner
                 .ticket()
-                .register(|_, _| async { Err(CodexErr::InternalAgentDied) })
+                .register(/*account_work*/ None, |_, _| async { Err(CodexErr::InternalAgentDied) })
                 .unwrap()
                 .await
                 .is_err()
@@ -211,6 +211,46 @@ async fn real_constructor_cancelled_before_publication_is_drained_after_close() 
     use crate::config::ConfigBuilder;
     use crate::thread_manager::StartThreadOptions;
     use crate::thread_manager::ThreadManager;
+    #[derive(Debug, Default)]
+    struct RequestHost {
+        request_alive: std::sync::atomic::AtomicBool,
+        operations: AtomicUsize,
+        released: tokio::sync::Notify,
+    }
+    #[derive(Debug)]
+    struct ConstructionWork(Arc<RequestHost>);
+    impl Drop for ConstructionWork {
+        fn drop(&mut self) {
+            self.0.operations.fetch_sub(1, Ordering::SeqCst);
+            self.0.released.notify_one();
+        }
+    }
+    impl codex_extension_api::HostOperationWork for ConstructionWork {
+        fn derive_operation(&self) -> Result<Box<dyn codex_extension_api::HostOperationWork>, codex_extension_api::TurnWorkRefused> {
+            Err(codex_extension_api::TurnWorkRefused::Unavailable)
+        }
+        fn derive_turn_work(
+            &self,
+            _: &codex_extension_api::ExtensionData,
+            _: codex_extension_api::ExtensionFuture<'static, ()>,
+        ) -> Result<Box<dyn codex_protocol::host_turn_work::HostTurnWork>, codex_extension_api::TurnWorkRefused> {
+            Err(codex_extension_api::TurnWorkRefused::Unavailable)
+        }
+    }
+    #[derive(Debug)]
+    struct ConstructionAdmission(Arc<RequestHost>);
+    impl codex_extension_api::TurnStartAdmission for ConstructionAdmission {
+        fn admit_turn_start(&self) -> Option<Box<dyn Send>> {
+            Some(Box::new(()))
+        }
+        fn derive_request_operation_work(&self) -> Result<Option<Box<dyn codex_extension_api::HostOperationWork>>, codex_extension_api::TurnWorkRefused> {
+            if !self.0.request_alive.load(Ordering::SeqCst) {
+                return Err(codex_extension_api::TurnWorkRefused::Unavailable);
+            }
+            self.0.operations.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(Box::new(ConstructionWork(Arc::clone(&self.0)))))
+        }
+    }
     struct HeldInstructions {
         entered: AtomicUsize,
         entry: tokio::sync::Notify,
@@ -250,6 +290,11 @@ async fn real_constructor_cancelled_before_publication_is_drained_after_close() 
     Arc::get_mut(&mut manager.state)
         .expect("builders retain unique State")
         .user_instructions_provider = provider.clone();
+    let host = Arc::new(RequestHost::default());
+    host.request_alive.store(true, Ordering::SeqCst);
+    let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
+    extensions.turn_start_admission(Arc::new(ConstructionAdmission(Arc::clone(&host))));
+    Arc::get_mut(&mut manager.state).unwrap().extensions = Arc::new(extensions.build());
     let mut observer = Box::pin(manager.start_thread(StartThreadOptions::new(config.clone(), /*control_endpoint*/ None)));
     // Startup now has asynchronous work before loading instruction providers.
     // Drive the real constructor to the held boundary rather than assuming
@@ -264,17 +309,29 @@ async fn real_constructor_cancelled_before_publication_is_drained_after_close() 
     .expect("constructor reaches held instructions");
     assert_eq!(provider.entered.load(Ordering::SeqCst), 1);
     drop(observer);
-    manager.constructions.close();
-    assert!(
-        manager
-            .start_thread(StartThreadOptions::new(config, None))
-            .await
-            .is_err()
-    );
+    host.request_alive.store(false, Ordering::SeqCst);
+    assert_eq!(host.operations.load(Ordering::SeqCst), 1);
     assert!(manager.list_thread_ids().await.is_empty());
     release
         .send(())
         .expect("retained constructor still waiting");
+    // Account progress must finish counted construction without initiating
+    // thread shutdown, which only happens after account adoption.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::select! {
+            _ = host.released.notified() => {},
+            _ = manager.drive_admitted_constructions() => panic!("progress observer stopped"),
+        }
+    })
+        .await
+        .expect("abandoned constructor completes before retirement");
+    assert_eq!(host.operations.load(Ordering::SeqCst), 0);
+    let startup = Arc::clone(&manager.constructions.state.lock().unwrap().constructions[0].startup);
+    assert!(!startup.is_empty(), "unpublished runtime remains owned until reset");
+    assert!(manager.shutdown_unpublished_constructions_bounded(Duration::from_secs(20)).await);
+    assert!(startup.is_empty(), "reset retires the runtime outside the lookup map");
+    manager.constructions.close();
+    assert!(manager.start_thread(StartThreadOptions::new(config, /*control_endpoint*/ None)).await.is_err());
     let deadline = Instant::now() + Duration::from_secs(20);
     let report = manager.constructions.drain_until(deadline).await;
     assert_eq!(
@@ -284,15 +341,7 @@ async fn real_constructor_cancelled_before_publication_is_drained_after_close() 
             panicked: false,
             unavailable: false,
             unpublished: 0,
-            sessions: vec![StartupCleanup::Loop(
-                crate::codex_thread::ThreadRetirementReport {
-                    ordinary: crate::codex_thread::ThreadShutdownOutcome::Complete,
-                    session_loop: crate::codex_thread::ThreadLoopOutcome::Normal,
-                    cleanup: crate::codex_thread::ThreadCleanupOutcome::Finished {
-                        persistence_failed: false
-                    },
-                }
-            )],
+            sessions: vec![],
         }
     );
     assert!(

@@ -2991,7 +2991,7 @@ async fn status_line_template_omission_keeps_sibling_segments() {
     chat.refresh_status_line();
     let line = status_line_text(&chat).expect("built-in siblings remain");
     assert!(!line.contains("secret"));
-    let warning = drain_insert_history(&mut rx);
+    let warning = drain_insert_history_transcript(&mut rx);
     assert_eq!(warning.len(), 1);
     let warning = lines_to_single_string(&warning[0]);
     assert!(warning.contains("missing"));

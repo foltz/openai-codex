@@ -4,6 +4,8 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 
+use futures::future::BoxFuture;
+
 use crate::account_dependency::AccountDependency;
 use crate::account_dependency::classify;
 use crate::attestation::app_server_attestation_provider;
@@ -1454,14 +1456,14 @@ impl MessageProcessor {
                 // Keep queued requests small to avoid large stack temporaries during construction.
                 let result = crate::account_turn_admission::within_request(
                     account_work_permit,
-                    Box::pin(processor_for_request.handle_initialized_client_request(
+                    processor_for_request.handle_initialized_client_request(
                         connection_request_id,
                         codex_request,
                         request_context,
                         session,
                         event_stream_ready,
                         managed_transition_caller_authorized,
-                    )),
+                    ),
                 )
                 .await;
                 if let Err(error) = result {
@@ -1484,7 +1486,10 @@ impl MessageProcessor {
         Ok(())
     }
 
-    async fn handle_initialized_client_request(
+    // Return before polling any branch so construction temporaries do not
+    // add another async frame below session construction in debug builds.
+    #[inline(never)]
+    fn handle_initialized_client_request(
         self: Arc<Self>,
         connection_request_id: ConnectionRequestId,
         codex_request: ClientRequest,
@@ -1492,13 +1497,18 @@ impl MessageProcessor {
         session: Arc<ConnectionSessionState>,
         event_stream_ready: Option<McpEventStreamReady>,
         managed_transition_caller_authorized: bool,
-    ) -> Result<(), JSONRPCErrorError> {
-        // Clear constructs its successor inline. Select it before polling the general
-        // dispatcher: that dispatcher has a multi-MiB debug frame even for a boxed arm.
-        // Both paths remain inside the same serialized, account-admitted request task.
+    ) -> BoxFuture<'static, Result<(), JSONRPCErrorError>> {
+        // Clear and resume construct sessions inline. Select them before polling
+        // the general dispatcher, which has a multi-MiB debug poll frame.
+        // Every path stays inside the same serialized, account-admitted request task.
         match codex_request {
             ClientRequest::ThreadClear { request_id, params } => {
                 Box::pin(async move {
+                    // Preserve the original request inputs' lifetime even though
+                    // clear does not read them. Cancellation drops them with this future.
+                    let _request_context = request_context;
+                    let _session = session;
+                    let _event_stream_ready = event_stream_ready;
                     let request_id = ConnectionRequestId {
                         connection_id: connection_request_id.connection_id,
                         request_id,
@@ -1518,26 +1528,52 @@ impl MessageProcessor {
                     }
                     Ok(())
                 })
-                .await
             }
-            request => {
+            ClientRequest::ThreadResume { request_id, params } => {
                 Box::pin(async move {
-                    self.handle_initialized_client_request_without_clear(
-                        connection_request_id,
-                        request,
-                        request_context,
-                        session,
-                        event_stream_ready,
-                        managed_transition_caller_authorized,
-                    )
-                    .await
+                    let _request_context = request_context;
+                    let _event_stream_ready = event_stream_ready;
+                    let app_server_client_name = session.app_server_client_name().map(str::to_string);
+                    let client_version = session.client_version().map(str::to_string);
+                    let client_mcp_extensions = session.client_mcp_extensions();
+                    let request_id = ConnectionRequestId {
+                        connection_id: connection_request_id.connection_id,
+                        request_id,
+                    };
+                    match self
+                        .thread_processor
+                        .thread_resume(
+                            ThreadResumeTarget::Client(request_id.clone()),
+                            params,
+                            app_server_client_name,
+                            client_version,
+                            client_mcp_extensions,
+                        )
+                        .await
+                    {
+                        Ok(Some(response)) => {
+                            self.outgoing.send_response_as(request_id, response).await;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            self.outgoing.send_error(request_id, error).await;
+                        }
+                    }
+                    Ok(())
                 })
-                .await
             }
+            request => Box::pin(self.handle_general_initialized_client_request(
+                connection_request_id,
+                request,
+                request_context,
+                session,
+                event_stream_ready,
+                managed_transition_caller_authorized,
+            )),
         }
     }
 
-    async fn handle_initialized_client_request_without_clear(
+    async fn handle_general_initialized_client_request(
         self: Arc<Self>,
         connection_request_id: ConnectionRequestId,
         codex_request: ClientRequest,
@@ -1802,16 +1838,8 @@ impl MessageProcessor {
                 .thread_retention_release(params, retention_acquire_authority)
                 .await
                 .map(|response| Some(response.into())),
-            ClientRequest::ThreadResume { params, .. } => {
-                self.thread_processor
-                    .thread_resume(
-                        ThreadResumeTarget::Client(request_id.clone()),
-                        params,
-                        app_server_client_name.clone(),
-                        client_version.clone(),
-                        client_mcp_extensions.clone(),
-                    )
-                    .await
+            ClientRequest::ThreadResume { .. } => {
+                unreachable!("resume is selected before polling the general dispatcher")
             }
             ClientRequest::ThreadFork { params, .. } => {
                 self.thread_processor

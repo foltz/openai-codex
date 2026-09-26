@@ -1497,10 +1497,10 @@ impl MessageProcessor {
         // dispatcher: that dispatcher has a multi-MiB debug frame even for a boxed arm.
         // Both paths remain inside the same serialized, account-admitted request task.
         match codex_request {
-            ClientRequest::ThreadClear { id, params } => {
+            ClientRequest::ThreadClear { request_id, params } => {
                 let request_id = ConnectionRequestId {
                     connection_id: connection_request_id.connection_id,
-                    request_id: id,
+                    request_id,
                 };
                 match self
                     .thread_processor

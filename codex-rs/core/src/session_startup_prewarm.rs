@@ -220,11 +220,26 @@ impl Session {
             .await;
         }
 
+        // Capture operation custody before spawning. It is deliberately not a
+        // turn lease: construction precedes the loop receipt, and the operation
+        // may outlive the loop. Refusal skips only this optional optimization.
+        let account_work = match self.services.host_admission.as_ref() {
+            Some(admission) => match admission.admit_operation_work() {
+                Ok(work) => work,
+                Err(_) => {
+                    tracing::debug!("account admission refused optional startup prewarm");
+                    return;
+                }
+            },
+            None => None,
+        };
+
         if !self.services.model_client.responses_websocket_enabled() {
             // Without websocket prewarm, resolve auth once so Agent Identity bootstrap can
             // register or engage this session's bearer fallback before the first user request.
             let model_client = self.services.model_client.clone();
             self.spawn_startup_auxiliary(async move {
+                let _account_work = account_work;
                 if let Err(err) = model_client.prewarm_auth().await {
                     warn!("startup auth prewarm failed: {err:#}");
                 }
@@ -248,6 +263,7 @@ impl Session {
         }
         let startup_prewarm = tokio::spawn(
             async move {
+                let _account_work = account_work;
                 let result =
                     schedule_startup_prewarm_inner(startup_prewarm_session, base_instructions)
                         .await;

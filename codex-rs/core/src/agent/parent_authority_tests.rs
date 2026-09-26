@@ -58,6 +58,7 @@ async fn parent() -> (Arc<crate::session::session::Session>, Arc<ParentGate>) {
     let mut extensions = codex_extension_api::ExtensionRegistryBuilder::<Config>::new();
     extensions.turn_start_admission(gate.clone());
     session.services.extensions = Arc::new(extensions.build());
+    session.services.host_admission = session.services.extensions.host_admission();
     (Arc::new(session), gate)
 }
 

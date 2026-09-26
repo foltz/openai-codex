@@ -882,6 +882,34 @@ async fn startup_prewarm_ready_result_is_consumed_once_with_join_retained() {
     assert!(task_exit.is_finished());
 }
 
+#[tokio::test]
+async fn startup_prewarm_uses_host_admission_with_an_empty_extension_registry() {
+    #[derive(Debug)]
+    struct Refused(std::sync::atomic::AtomicUsize);
+    impl codex_extension_api::TurnStartAdmission for Refused {
+        fn admit_turn_start(&self) -> Option<Box<dyn Send>> {
+            panic!("prewarm must not use turn admission");
+        }
+
+        fn admit_operation_work(&self) -> Result<Option<Box<dyn codex_extension_api::HostOperationWork>>, codex_extension_api::TurnWorkRefused> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err(codex_extension_api::TurnWorkRefused::Unavailable)
+        }
+    }
+
+    let (mut session, _) = make_session_and_context().await;
+    let host = Arc::new(Refused(std::sync::atomic::AtomicUsize::new(0)));
+    session.services.extensions = codex_extension_api::empty_extension_registry();
+    session.services.host_admission = Some(host.clone());
+    let session = Arc::new(session);
+    session.schedule_startup_prewarm(String::new()).await;
+    assert_eq!(host.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+    // No prewarm task was spawned: the current-thread runtime has not yielded
+    // to a worker, and joining an empty registry requires no time budget.
+    assert_eq!(session.task_joins.shutdown_until(tokio::time::Instant::now()).await,
+        crate::tasks::TaskJoinOutcome::Complete { panicked: false });
+}
+
 fn test_model_client_session() -> crate::client::ModelClientSession {
     let thread_id = ThreadId::try_from("00000000-0000-4000-8000-000000000001")
         .expect("test thread id should be valid");
@@ -6071,6 +6099,7 @@ async fn session_new_fails_when_zsh_fork_enabled_without_packaged_zsh() {
         mcp_manager,
         Arc::new(codex_code_mode::DisabledCodeModeSessionProvider),
         Arc::new(codex_extension_api::ExtensionRegistryBuilder::new().build()),
+        /*host_admission*/ None,
         codex_extension_api::ExtensionDataInit::default(),
         ClientMcpExtensions::default(),
         LocalAgentControl::default(),
@@ -6308,6 +6337,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         plugins_manager,
         mcp_manager,
         extensions: Arc::new(codex_extension_api::ExtensionRegistryBuilder::new().build()),
+        host_admission: None,
         session_extension_data: codex_extension_api::ExtensionData::new(
             agent_control.session_id().to_string(),
         ),
@@ -6590,6 +6620,7 @@ async fn make_session_with_config_and_listener_and_rx(
         mcp_manager,
         Arc::new(codex_code_mode::DisabledCodeModeSessionProvider),
         Arc::new(codex_extension_api::ExtensionRegistryBuilder::new().build()),
+        /*host_admission*/ None,
         codex_extension_api::ExtensionDataInit::default(),
         ClientMcpExtensions::default(),
         LocalAgentControl::default(),
@@ -6743,6 +6774,7 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         mcp_manager,
         Arc::new(codex_code_mode::DisabledCodeModeSessionProvider),
         Arc::new(codex_extension_api::ExtensionRegistryBuilder::new().build()),
+        /*host_admission*/ None,
         codex_extension_api::ExtensionDataInit::default(),
         ClientMcpExtensions::default(),
         agent_control,
@@ -8826,6 +8858,7 @@ where
         plugins_manager,
         mcp_manager,
         extensions: Arc::new(codex_extension_api::ExtensionRegistryBuilder::new().build()),
+        host_admission: None,
         session_extension_data: codex_extension_api::ExtensionData::new(
             agent_control.session_id().to_string(),
         ),

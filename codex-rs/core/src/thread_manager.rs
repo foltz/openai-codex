@@ -2360,6 +2360,7 @@ impl ThreadManagerState {
             mcp_manager,
             code_mode_session_provider: Arc::clone(&self.code_mode_session_provider),
             extensions,
+            host_admission: self.extensions.host_admission(),
             conversation_history: initial_history,
             disabled_plugin_ids,
             requested_history_mode: history_mode,

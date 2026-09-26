@@ -3,6 +3,61 @@ use futures::FutureExt;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
+async fn operation_outlives_origin_loop_and_derives_child_during_drain() {
+    use codex_extension_api::TurnStartAdmission;
+    let permits = AccountWorkPermits::new();
+    let registry = crate::account_turn_work::AccountTurnWork::default();
+    let admission = crate::account_turn_admission::AccountTurnAdmission {
+        shutdown: crate::turn_admission::TurnAdmission::default(),
+        permits: permits.clone(),
+        work: registry.clone(),
+    };
+    let parent = codex_extension_api::ExtensionData::new("parent");
+    let (ended, termination) = tokio::sync::oneshot::channel();
+    let mut turn = admission.admit_turn_work(&parent, Box::pin(async move {
+        let _ = termination.await;
+    })).unwrap().unwrap();
+    turn.bind_submission("parent-turn");
+    turn.retain_until_terminal();
+    let operation = admission.derive_operation_work(&parent, "parent-turn").unwrap().unwrap();
+    permits.close();
+    ended.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), registry.observe_terminated()).await.unwrap();
+    assert_eq!(permits.admitted_count(), 1, "loop exit must not retire the operation");
+
+    let descendant = operation.derive_operation().unwrap();
+    drop(operation);
+    let child = codex_extension_api::ExtensionData::new("child");
+    let mut child_turn = descendant.derive_turn_work(&child, Box::pin(std::future::pending())).unwrap();
+    child_turn.bind_submission("child-turn");
+    child_turn.retain_until_terminal();
+    drop(descendant);
+    assert_eq!(permits.admitted_count(), 1, "accepted child owns independent custody");
+    admission.turn_work_terminal(&child, "child-turn");
+    assert_eq!(permits.admitted_count(), 0);
+}
+
+#[tokio::test]
+async fn optional_background_admission_is_fresh_even_inside_an_admitted_request() {
+    use codex_extension_api::TurnStartAdmission;
+    let permits = AccountWorkPermits::new();
+    let admission = crate::account_turn_admission::AccountTurnAdmission {
+        shutdown: crate::turn_admission::TurnAdmission::default(),
+        permits: permits.clone(),
+        work: crate::account_turn_work::AccountTurnWork::default(),
+    };
+    let operation = admission.admit_operation_work().unwrap().unwrap();
+    crate::account_turn_admission::within_request(permits.try_acquire(), async {
+        permits.close();
+        assert!(matches!(admission.admit_operation_work(), Err(codex_extension_api::TurnWorkRefused::RetryAfter(_))));
+        assert_eq!(permits.admitted_count(), 2);
+    }).await;
+    assert_eq!(permits.admitted_count(), 1);
+    drop(operation);
+    assert_eq!(permits.admitted_count(), 0);
+}
+
+#[tokio::test]
 async fn processor_work_keeps_request_custody_after_observer_drop() {
     use crate::account_turn_admission::derive_request_work;
     use crate::account_turn_admission::within_request;

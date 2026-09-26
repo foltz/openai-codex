@@ -10,6 +10,25 @@
 pub trait TurnStartAdmission: std::fmt::Debug + Send + Sync {
     fn admit_turn_start(&self) -> Option<Box<dyn Send>>;
 
+    /// Acquire fresh admission for a finite background operation without a
+    /// turn-registry entry or an ambient request-scope lookup. A caller must
+    /// move the returned custody into the actual operation.
+    /// Ungated hosts return `Ok(None)`; a refusal must precede account effects.
+    fn admit_operation_work(
+        &self,
+    ) -> Result<Option<Box<dyn crate::HostOperationWork>>, TurnWorkRefused> {
+        Ok(None)
+    }
+
+    /// Derive finite work from an exact live turn, never from a claimed ID alone.
+    fn derive_operation_work(
+        &self,
+        _parent_store: &crate::ExtensionData,
+        _parent_turn_id: &str,
+    ) -> Result<Option<Box<dyn crate::HostOperationWork>>, TurnWorkRefused> {
+        Ok(None)
+    }
+
     /// Acquire host account-work custody in the submitting task, before the
     /// IO hop. This is separate from the shutdown gate Core rechecks later.
     /// Ungated hosts return `Ok(None)`; refusal must precede submission.

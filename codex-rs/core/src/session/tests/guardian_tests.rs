@@ -1320,6 +1320,7 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
         mcp_manager,
         code_mode_session_provider: Arc::new(codex_code_mode::DisabledCodeModeSessionProvider),
         extensions: codex_extension_api::empty_extension_registry(),
+        host_admission: None,
         conversation_history: InitialHistory::New,
         disabled_plugin_ids: None,
         requested_history_mode: None,

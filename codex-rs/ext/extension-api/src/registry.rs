@@ -193,6 +193,12 @@ impl<C: Sync> ExtensionRegistry<C> {
         }
     }
 
+    /// Host admission is independent of contributor isolation. Constructors
+    /// retain this handle even when a child receives an empty extension registry.
+    pub fn host_admission(&self) -> Option<Arc<dyn crate::TurnStartAdmission>> {
+        self.turn_start_admission.clone()
+    }
+
     /// Acquire account-work custody without changing Core's shutdown gate.
     pub fn admit_turn_work(
         &self,

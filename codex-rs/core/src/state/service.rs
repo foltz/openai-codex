@@ -103,6 +103,9 @@ pub(crate) struct SessionServices {
     pub(crate) plugins_manager: Arc<PluginsManager>,
     pub(crate) mcp_manager: Arc<McpManager>,
     pub(crate) extensions: Arc<ExtensionRegistry<crate::config::Config>>,
+    /// Account admission survives contributor isolation. This holds no permit
+    /// while the session is idle and never installs contributors into a child.
+    pub(crate) host_admission: Option<Arc<dyn codex_extension_api::TurnStartAdmission>>,
     pub(crate) session_extension_data: ExtensionData,
     pub(crate) thread_extension_data: ExtensionData,
     /// MCP extensions fixed when this session is created.

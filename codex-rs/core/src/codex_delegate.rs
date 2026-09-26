@@ -101,6 +101,7 @@ pub(crate) async fn run_codex_thread_interactive(
         mcp_manager: Arc::clone(&parent_session.services.mcp_manager),
         code_mode_session_provider: parent_session.services.code_mode_service.session_provider(),
         extensions,
+        host_admission: parent_session.services.host_admission.clone(),
         conversation_history,
         disabled_plugin_ids: None,
         requested_history_mode: None,
@@ -208,7 +209,7 @@ pub(crate) async fn run_codex_thread_one_shot(
     let child_cancel = cancel_token.child_token();
     let parent_turn_id = parent_ctx.sub_id.clone();
     let parent_for_admission = Arc::clone(&parent_session);
-    let host = Arc::clone(&parent_session.services.extensions);
+    let host = parent_session.services.host_admission.clone();
     let parent_environments = parent_ctx.initial_environments.clone();
     let root_turn_id = parent_ctx.turn_metadata_state.root_turn_id();
     let (session, io) = Box::pin(run_codex_thread_interactive(
@@ -229,12 +230,15 @@ pub(crate) async fn run_codex_thread_one_shot(
 
     // Send the initial input to kick off the one-shot turn.
     let termination = io.session_loop_termination.clone();
-    let host_work = host.derive_turn_work(
-        &parent_for_admission.services.thread_extension_data,
-        &parent_turn_id,
-        &session.services.thread_extension_data,
-        Box::pin(async move { termination.await; }),
-    ).map_err(|_| CodexErr::Fatal("delegate parent has no admitted account work".to_string()))?;
+    let host_work = match host {
+        Some(host) => host.derive_turn_work(
+            &parent_for_admission.services.thread_extension_data,
+            &parent_turn_id,
+            &session.services.thread_extension_data,
+            Box::pin(async move { termination.await; }),
+        ).map_err(|_| CodexErr::Fatal("delegate parent has no admitted account work".to_string()))?,
+        None => None,
+    };
     drop(parent_for_admission);
     let submission = io
         .submit_turn_input(

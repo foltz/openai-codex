@@ -1,5 +1,6 @@
 mod capabilities;
 mod contributors;
+mod operation_work;
 mod registry;
 mod session_isolation;
 mod state;
@@ -96,6 +97,7 @@ pub use contributors::TurnStopInput;
 pub use contributors::WorldStateContributionInput;
 pub use contributors::WorldStateSectionContribution;
 pub use registry::ExtensionRegistry;
+pub use operation_work::HostOperationWork;
 pub use registry::ExtensionRegistryBuilder;
 pub use registry::empty_extension_registry;
 pub use state::ExtensionData;

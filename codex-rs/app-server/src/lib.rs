@@ -92,6 +92,7 @@ fn is_unsupported_untrusted_approval_policy_error(err: &std::io::Error) -> bool 
 }
 
 mod account_dependency;
+mod account_operation_work;
 mod account_turn_admission;
 mod account_turn_work;
 mod analytics_utils;

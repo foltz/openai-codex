@@ -1,6 +1,7 @@
 //! Account admission in the caller, shutdown admission in Core, and logical
 //! terminal evidence independent of any app-server notification listener.
 
+use crate::account_operation_work::AccountOperationWork;
 use crate::account_turn_work::AccountTurnSession;
 use crate::account_turn_work::AccountTurnWork;
 use crate::managed_transition::AccountWorkPermitGuard;
@@ -8,6 +9,7 @@ use crate::managed_transition::AccountWorkPermits;
 use crate::turn_admission::TurnAdmission;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionFuture;
+use codex_extension_api::HostOperationWork;
 use codex_extension_api::TurnAbortInput;
 use codex_extension_api::TurnLifecycleContributor;
 use codex_extension_api::TurnStartAdmission;
@@ -57,9 +59,37 @@ impl std::fmt::Debug for AccountTurnAdmission {
     }
 }
 
+impl AccountTurnAdmission {
+    fn acquire_fresh_work(&self) -> Result<AccountWorkPermitGuard, TurnWorkRefused> {
+        self.permits.try_acquire().ok_or_else(|| {
+            let permits = self.permits.clone();
+            TurnWorkRefused::RetryAfter(Box::pin(async move {
+                permits.wait_until_available().await;
+            }))
+        })
+    }
+}
+
 impl TurnStartAdmission for AccountTurnAdmission {
     fn admit_turn_start(&self) -> Option<Box<dyn Send>> {
         self.shutdown.admit_turn_start()
+    }
+
+    fn admit_operation_work(&self) -> Result<Option<Box<dyn HostOperationWork>>, TurnWorkRefused> {
+        Ok(Some(Box::new(AccountOperationWork {
+            permit: self.acquire_fresh_work()?,
+            turns: self.work.clone(),
+        })))
+    }
+
+    fn derive_operation_work(
+        &self,
+        parent_store: &ExtensionData,
+        parent_turn_id: &str,
+    ) -> Result<Option<Box<dyn HostOperationWork>>, TurnWorkRefused> {
+        let parent = parent_store.get::<AccountTurnSession>().ok_or(TurnWorkRefused::Unavailable)?;
+        let permit = parent.derive(parent_turn_id).ok_or(TurnWorkRefused::Unavailable)?;
+        Ok(Some(Box::new(AccountOperationWork { permit, turns: self.work.clone() })))
     }
 
     fn admit_turn_work(
@@ -69,12 +99,7 @@ impl TurnStartAdmission for AccountTurnAdmission {
     ) -> Result<Option<Box<dyn HostTurnWork>>, TurnWorkRefused> {
         let permit = match derive_request_work()? {
             Some(derived) => derived,
-            None => self.permits.try_acquire().ok_or_else(|| {
-                let permits = self.permits.clone();
-                TurnWorkRefused::RetryAfter(Box::pin(async move {
-                    permits.wait_until_available().await;
-                }))
-            })?,
+            None => self.acquire_fresh_work()?,
         };
         let session = thread_store.get_or_init(|| self.work.session(termination));
         let pending = session.begin(permit).ok_or(TurnWorkRefused::Unavailable)?;

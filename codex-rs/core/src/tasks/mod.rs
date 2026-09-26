@@ -363,7 +363,6 @@ impl Session {
             if active.as_ref().is_some_and(|turn| turn.task.is_some()) {
                 return Err(CodexErr::Fatal("thread already has an active task".to_string()));
             }
-            self.record_started_turn(&turn_context.sub_id).await;
             let turn = active.get_or_insert_with(ActiveTurn::default);
             debug_assert!(turn.task.is_none());
             Arc::clone(&turn.turn_state)
@@ -388,9 +387,9 @@ impl Session {
         }) else {
             return Err(CodexErr::Fatal("thread task reservation changed".to_string()));
         };
-        // After the destination lock is acquired, consuming the batch and
-        // installing the task contain no further cancellation point.
-        self.input_queue.commit_mailbox_for_turn_state(&turn.turn_state, mailbox, &turn_context.sub_id).await;
+        // Acquire state and destination locks before consuming the batch or
+        // recording this turn. From commit through install there is no await.
+        self.commit_started_turn(&turn_context.sub_id, &turn.turn_state, mailbox).await;
         let agent_execution_guard = self.services.agent_control.execution_guard(
             turn_context.multi_agent_version,
             &turn_context.session_source,

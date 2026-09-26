@@ -155,10 +155,12 @@ async fn displaced_mailbox_start_refuses_without_overwriting_installed_task() {
     });
     tokio::time::timeout(Duration::from_secs(10), pause.entered.acquire())
         .await.unwrap().unwrap().forget();
+    assert_eq!(session.state.lock().await.last_started_turn_id, None);
     let second = session.new_turn_with_default_settings("replacement".into(), Default::default()).await;
     session.start_task(second, Vec::new(), HeldTask).await.unwrap();
     pause.release.add_permits(1);
     assert!(tokio::time::timeout(Duration::from_secs(10), first).await.unwrap().unwrap().is_err());
+    assert_eq!(session.state.lock().await.last_started_turn_id.as_deref(), Some("replacement"));
     {
         let active = session.active_turn.lock().await;
         assert_eq!(active.as_ref().unwrap().task.as_ref().unwrap().turn_context.sub_id, "replacement");

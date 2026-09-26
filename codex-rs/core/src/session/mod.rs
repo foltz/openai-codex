@@ -5263,3 +5263,7 @@ pub(crate) mod tests;
 #[cfg(test)]
 #[path = "mailbox_wake_tests.rs"]
 mod mailbox_wake_tests;
+
+#[cfg(test)]
+#[path = "turn_install_tests.rs"]
+mod turn_install_tests;

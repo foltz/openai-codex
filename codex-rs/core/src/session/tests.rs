@@ -8393,6 +8393,7 @@ async fn closing_task_admission_during_preparation_prevents_final_install() {
         }
     }
     let (mut session, context) = make_session_and_context().await;
+    session.state.lock().await.last_started_turn_id = Some("previous".into());
     let pause = Arc::new(PausedTurnStart {
         entered: tokio::sync::Semaphore::new(0),
         release: tokio::sync::Semaphore::new(0),
@@ -8431,6 +8432,7 @@ async fn closing_task_admission_during_preparation_prevents_final_install() {
     assert!(session.active_turn.lock().await.is_none());
     pause.release.add_permits(1);
     start.await.expect("start returned");
+    assert_eq!(session.state.lock().await.last_started_turn_id.as_deref(), Some("previous"));
     assert!(
         session.active_turn.lock().await.is_none(),
         "late final install must refuse without residue"

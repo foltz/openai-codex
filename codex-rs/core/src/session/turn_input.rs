@@ -554,9 +554,26 @@ async fn steer(
 }
 
 impl Session {
-    /// Called under the active-turn lock before running any task or lifecycle callback.
-    pub(crate) async fn record_started_turn(&self, turn_id: &str) {
-        self.state.lock().await.last_started_turn_id = Some(turn_id.to_string());
+    /// Called under final active-turn admission, immediately before task installation.
+    /// Lock order is active_turn -> state -> turn_state. Cancellation before the
+    /// destination lock restores mail without recording an uninstalled turn;
+    /// the caller must not await again between this commit and installation.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "ordered state and destination locks precede the cancellation-free turn commit"
+    )]
+    pub(crate) async fn commit_started_turn(
+        &self,
+        turn_id: &str,
+        turn_state: &tokio::sync::Mutex<TurnState>,
+        mailbox: super::MailboxReservation,
+    ) {
+        let turn_id = turn_id.to_owned();
+        let mut state = self.state.lock().await;
+        self.input_queue
+            .commit_mailbox_for_turn_state(turn_state, mailbox, &turn_id)
+            .await;
+        state.last_started_turn_id = Some(turn_id);
     }
 
     pub(crate) async fn route_realtime_text_input(

@@ -130,7 +130,6 @@ async fn non_startup_history_dismisses_logo_until_a_new_thread() -> Result<()> {
         &mut tui,
         Box::new(history_cell::UpdateAvailableHistoryCell::new(
             "99.0.0".into(),
-            /*update_action*/ None,
         )),
     );
     app.insert_history_cell(

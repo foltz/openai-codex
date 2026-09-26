@@ -2018,6 +2018,15 @@ impl TerminalRestoreGuard {
         Self { active: true }
     }
 
+    #[cfg(test)]
+    fn restore(&mut self) -> color_eyre::Result<()> {
+        if self.active {
+            crate::tui::restore_after_exit()?;
+            self.active = false;
+        }
+        Ok(())
+    }
+
     fn restore_silently(&mut self) {
         if self.active {
             restore();

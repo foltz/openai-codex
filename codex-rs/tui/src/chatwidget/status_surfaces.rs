@@ -85,10 +85,10 @@ impl StatusSurfaceSelections {
     }
 
     fn uses_thread_usage(&self) -> bool {
-        self.status_line_items.iter().any(|item| {
+        self.status_line_items.iter().any(|entry| {
             matches!(
-                item,
-                StatusLineItem::ThreadCredits | StatusLineItem::EstimatedThreadCost
+                entry.built_in(),
+                Some(StatusLineItem::ThreadCredits | StatusLineItem::EstimatedThreadCost)
             )
         }) || self.terminal_title_items.iter().any(|item| {
             matches!(
@@ -416,12 +416,12 @@ impl ChatWidget {
         if self.local_settings.tui.animations
             && self.local_settings.tui.effects.progress
             && self.status_state.thread_title_generation_pending
-            && (selections.status_line_items.iter().any(|item| {
+            && (selections.status_line_items.iter().any(|entry| {
                 matches!(
-                    item,
-                    StatusLineItem::ThreadName
+                    entry.built_in(),
+                    Some(StatusLineItem::ThreadName
                         | StatusLineItem::ThreadTitle
-                        | StatusLineItem::SessionId
+                        | StatusLineItem::SessionId)
                 )
             }) || selections.terminal_title_items.iter().any(|item| {
                 matches!(

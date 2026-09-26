@@ -35,6 +35,16 @@ pub(crate) async fn within_request<T>(
     }
 }
 
+/// Capture independently counted work in the executing request, before an IO
+/// or spawn hop. An absent scope is distinct from exhausted derivation: only
+/// the former permits ungated callers. Nothing acquires fresh authority here.
+pub(crate) fn derive_request_work() -> Result<Option<AccountWorkPermitGuard>, TurnWorkRefused> {
+    match REQUEST_WORK.try_with(|parent| parent.try_derive()) {
+        Ok(derived) => derived.map(Some).ok_or(TurnWorkRefused::Unavailable),
+        Err(_) => Ok(None),
+    }
+}
+
 pub(crate) struct AccountTurnAdmission {
     pub(crate) shutdown: TurnAdmission,
     pub(crate) permits: AccountWorkPermits,
@@ -57,9 +67,9 @@ impl TurnStartAdmission for AccountTurnAdmission {
         thread_store: &ExtensionData,
         termination: ExtensionFuture<'static, ()>,
     ) -> Result<Option<Box<dyn HostTurnWork>>, TurnWorkRefused> {
-        let permit = match REQUEST_WORK.try_with(|parent| parent.try_derive()) {
-            Ok(derived) => derived.ok_or(TurnWorkRefused::Unavailable)?,
-            Err(_) => self.permits.try_acquire().ok_or_else(|| {
+        let permit = match derive_request_work()? {
+            Some(derived) => derived,
+            None => self.permits.try_acquire().ok_or_else(|| {
                 let permits = self.permits.clone();
                 TurnWorkRefused::RetryAfter(Box::pin(async move {
                     permits.wait_until_available().await;

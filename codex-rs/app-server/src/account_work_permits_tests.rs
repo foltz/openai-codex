@@ -3,6 +3,151 @@ use futures::FutureExt;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
+async fn processor_work_keeps_request_custody_after_observer_drop() {
+    use crate::account_turn_admission::derive_request_work;
+    use crate::account_turn_admission::within_request;
+    use crate::processor_task_retirement::ProcessorTasks;
+
+    let permits = AccountWorkPermits::new();
+    let tasks = ProcessorTasks::default();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (descendant_tx, descendant_rx) = tokio::sync::oneshot::channel();
+    let mut request = Box::pin(within_request(permits.try_acquire(), async {
+        let construction_work = derive_request_work().unwrap();
+        let receipt = tasks
+            .spawn(within_request(construction_work, async move {
+                started_tx.send(()).unwrap();
+                release_rx.await.unwrap();
+                // The explicitly transferred scope can derive after CLOSED;
+                // no request observer or fresh admission is needed.
+                assert!(descendant_tx.send(derive_request_work().unwrap()).is_ok());
+            }))
+            .unwrap();
+        receipt.await
+    }));
+    assert!(request.as_mut().now_or_never().is_none());
+    tokio::time::timeout(Duration::from_secs(1), started_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(permits.admitted_count(), 2);
+    permits.close();
+    drop(request);
+    assert_eq!(permits.admitted_count(), 1);
+    assert!(permits.try_acquire().is_none());
+
+    release_tx.send(()).unwrap();
+    let descendant = tokio::time::timeout(Duration::from_secs(1), descendant_rx)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        tasks
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .is_clean()
+    );
+    assert_eq!(permits.admitted_count(), 1);
+    drop(descendant);
+    assert_eq!(permits.admitted_count(), 0);
+}
+
+#[tokio::test]
+async fn refused_processor_registration_releases_captured_account_work() {
+    use crate::account_turn_admission::derive_request_work;
+    use crate::account_turn_admission::within_request;
+    use crate::processor_task_retirement::ProcessorTaskAdmissionError;
+    use crate::processor_task_retirement::ProcessorTasks;
+
+    let permits = AccountWorkPermits::new();
+    let tasks = ProcessorTasks::default();
+    tasks.close_registration().unwrap();
+    within_request(permits.try_acquire(), async {
+        let construction_work = derive_request_work().unwrap();
+        assert_eq!(permits.admitted_count(), 2);
+        let result = tasks.spawn(within_request(construction_work, async {
+            panic!("refused work must not run");
+        }));
+        assert!(matches!(result, Err(ProcessorTaskAdmissionError::Closed)));
+        assert_eq!((permits.admitted_count(), tasks.len()), (1, 0));
+    })
+    .await;
+    assert_eq!(permits.admitted_count(), 0);
+}
+
+#[tokio::test]
+async fn transferred_request_scope_releases_on_panic_and_task_cancellation() {
+    use crate::account_turn_admission::derive_request_work;
+    use crate::account_turn_admission::within_request;
+    use crate::processor_task_retirement::ProcessorTaskJoin;
+    use crate::processor_task_retirement::ProcessorTasks;
+
+    let permits = AccountWorkPermits::new();
+    let tasks = ProcessorTasks::default();
+    let receipt = within_request(permits.try_acquire(), async {
+        tasks
+            .spawn(within_request(derive_request_work().unwrap(), async {
+                panic!("synthetic constructor panic");
+            }))
+            .unwrap()
+    })
+    .await;
+    assert_eq!(receipt.await, ProcessorTaskJoin::Panicked);
+    assert_eq!(permits.admitted_count(), 0);
+
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let task = within_request(permits.try_acquire(), async {
+        tokio::spawn(within_request(derive_request_work().unwrap(), async move {
+            started_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        }))
+    })
+    .await;
+    tokio::time::timeout(Duration::from_secs(1), started_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(permits.admitted_count(), 1);
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(permits.admitted_count(), 0);
+}
+
+#[tokio::test]
+async fn request_scope_absence_and_exhaustion_are_distinct_before_spawn() {
+    use crate::account_turn_admission::derive_request_work;
+    use crate::account_turn_admission::within_request;
+    use crate::processor_task_retirement::ProcessorTaskJoin;
+    use crate::processor_task_retirement::ProcessorTasks;
+    use codex_extension_api::TurnWorkRefused;
+
+    let permits = AccountWorkPermits::new();
+    let tasks = ProcessorTasks::default();
+    let ungated = derive_request_work().unwrap();
+    assert!(ungated.is_none());
+    assert_eq!(
+        tasks.spawn(within_request(ungated, async {})).unwrap().await,
+        ProcessorTaskJoin::Joined
+    );
+    let exhausted_tasks = ProcessorTasks::default();
+    within_request(permits.try_acquire(), async {
+        let exhausted = ACCOUNT_WORK_CLOSED | ACCOUNT_WORK_COUNT_MASK;
+        permits.inner.state.store(exhausted, Ordering::Release);
+        let result = derive_request_work()
+            .map(|work| exhausted_tasks.spawn(within_request(work, async {})));
+        assert!(matches!(result, Err(TurnWorkRefused::Unavailable)));
+        assert_eq!(exhausted_tasks.len(), 0);
+        assert_eq!(permits.inner.state.load(Ordering::Acquire), exhausted);
+        // Restore the one real guard before its scope drops.
+        permits.inner.state.store(ACCOUNT_WORK_CLOSED | 1, Ordering::Release);
+    })
+    .await;
+    assert_eq!(permits.inner.state.load(Ordering::Acquire), ACCOUNT_WORK_CLOSED);
+}
+
+#[tokio::test]
 async fn reopen_retry_observes_both_registered_and_not_yet_polled_waiters() {
     let permits = AccountWorkPermits::new();
     permits.close();

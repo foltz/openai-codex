@@ -1276,6 +1276,12 @@ impl ThreadRequestProcessor {
         let outgoing = Arc::clone(&listener_task_context.outgoing);
         let error_request_id = request_id.clone();
         let recovery_state = self.state_db.clone();
+        // Capture inside the executing request, not in its synchronous factory.
+        // ProcessorTasks keeps construction alive if the receipt observer drops;
+        // its account custody must survive that observer too. Descendant spawns
+        // do not inherit this scope and still need their own custody.
+        let construction_work = crate::account_turn_admission::derive_request_work()
+            .map_err(|_| internal_error("account-work custody unavailable for thread startup"))?;
         let thread_start_task = async move {
             if let Err(error) = Self::thread_start_task(
                 listener_task_context,
@@ -1312,7 +1318,10 @@ impl ThreadRequestProcessor {
         };
         let receipt = self
             .background_tasks
-            .spawn(thread_start_task.instrument(request_context.span()))
+            .spawn(
+                crate::account_turn_admission::within_request(construction_work, thread_start_task)
+                    .instrument(request_context.span()),
+            )
             .map_err(|_| internal_error("background thread-start admission unavailable"))?;
         match receipt.await {
             crate::processor_task_retirement::ProcessorTaskJoin::Joined => {}

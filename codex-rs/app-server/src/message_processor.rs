@@ -1498,7 +1498,7 @@ impl MessageProcessor {
         event_stream_ready: Option<McpEventStreamReady>,
         managed_transition_caller_authorized: bool,
     ) -> BoxFuture<'static, Result<(), JSONRPCErrorError>> {
-        // Clear and resume construct sessions inline. Select them before polling
+        // Clear, resume and fork construct sessions inline. Select them before polling
         // the general dispatcher, which has a multi-MiB debug poll frame.
         // Every path stays inside the same serialized, account-admitted request task.
         match codex_request {
@@ -1544,6 +1544,39 @@ impl MessageProcessor {
                         .thread_processor
                         .thread_resume(
                             ThreadResumeTarget::Client(request_id.clone()),
+                            params,
+                            app_server_client_name,
+                            client_version,
+                            client_mcp_extensions,
+                        )
+                        .await
+                    {
+                        Ok(Some(response)) => {
+                            self.outgoing.send_response_as(request_id, response).await;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            self.outgoing.send_error(request_id, error).await;
+                        }
+                    }
+                    Ok(())
+                })
+            }
+            ClientRequest::ThreadFork { request_id, params } => {
+                Box::pin(async move {
+                    let _request_context = request_context;
+                    let _event_stream_ready = event_stream_ready;
+                    let app_server_client_name = session.app_server_client_name().map(str::to_string);
+                    let client_version = session.client_version().map(str::to_string);
+                    let client_mcp_extensions = session.client_mcp_extensions();
+                    let request_id = ConnectionRequestId {
+                        connection_id: connection_request_id.connection_id,
+                        request_id,
+                    };
+                    match self
+                        .thread_processor
+                        .thread_fork(
+                            request_id.clone(),
                             params,
                             app_server_client_name,
                             client_version,
@@ -1841,16 +1874,8 @@ impl MessageProcessor {
             ClientRequest::ThreadResume { .. } => {
                 unreachable!("resume is selected before polling the general dispatcher")
             }
-            ClientRequest::ThreadFork { params, .. } => {
-                self.thread_processor
-                    .thread_fork(
-                        request_id.clone(),
-                        params,
-                        app_server_client_name.clone(),
-                        client_version.clone(),
-                        client_mcp_extensions.clone(),
-                    )
-                    .await
+            ClientRequest::ThreadFork { .. } => {
+                unreachable!("fork is selected before polling the general dispatcher")
             }
             ClientRequest::ThreadArchive { params, .. } => {
                 self.thread_processor

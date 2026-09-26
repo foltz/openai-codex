@@ -162,8 +162,10 @@ async fn refused_traced_work_does_not_enqueue_and_interrupt_still_passes() {
     let (thread, rx, gate) = fixture().await;
     gate.closed.store(true, Ordering::SeqCst);
     for op in [Op::Compact, Op::Review { review_request: review() }] {
-        assert!(matches!(thread.submit_with_trace(op, Some(trace())).await,
-            Err(CodexErr::Fatal(message)) if message == "account work admission is closed"));
+        let error = thread.submit_with_trace(op, Some(trace())).await.unwrap_err();
+        assert!(matches!(error.details(),
+            codex_protocol::error::CodexErrorDetails::Fatal(message)
+                if message == "account work admission is closed"));
         assert!(rx.is_empty());
     }
     assert_eq!(gate.calls.load(Ordering::SeqCst), 2);

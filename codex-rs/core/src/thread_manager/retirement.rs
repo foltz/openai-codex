@@ -138,7 +138,9 @@ impl ThreadConstructions {
             let Ok(state) = self.state.lock() else {
                 return false;
             };
-            let finished = !state.panicked && state.constructions.iter()
+            // Reset concerns current resources, not the historical panic bit
+            // retained for the permanent manager-retirement report.
+            let finished = state.constructions.iter()
                 .all(|entry| entry.completion.peek() == Some(&ConstructionOutcome::Returned));
             let startup = state.constructions.iter()
                 .filter(|entry| entry.completion.peek().is_some())

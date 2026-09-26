@@ -116,6 +116,7 @@ async fn completed_constructor_compaction_preserves_prior_panic() {
             .await
             .is_err()
     );
+    assert!(!owner.retire_completed_startup_until(Instant::now() + Duration::from_secs(1)).await);
     for _ in 0..100 {
         assert!(
             owner
@@ -127,6 +128,7 @@ async fn completed_constructor_compaction_preserves_prior_panic() {
         );
         assert_eq!(owner.state.lock().unwrap().constructions.len(), 1);
     }
+    assert!(owner.retire_completed_startup_until(Instant::now() + Duration::from_secs(1)).await);
     assert_eq!(
         owner
             .drain_until(Instant::now() + Duration::from_secs(1))

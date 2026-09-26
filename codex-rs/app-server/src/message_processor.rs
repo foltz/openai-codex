@@ -1498,24 +1498,27 @@ impl MessageProcessor {
         // Both paths remain inside the same serialized, account-admitted request task.
         match codex_request {
             ClientRequest::ThreadClear { request_id, params } => {
-                let request_id = ConnectionRequestId {
-                    connection_id: connection_request_id.connection_id,
-                    request_id,
-                };
-                match self
-                    .thread_processor
-                    .thread_clear(request_id.clone(), params)
-                    .await
-                {
-                    Ok(Some(response)) => {
-                        self.outgoing.send_response_as(request_id, response).await;
+                Box::pin(async move {
+                    let request_id = ConnectionRequestId {
+                        connection_id: connection_request_id.connection_id,
+                        request_id,
+                    };
+                    match self
+                        .thread_processor
+                        .thread_clear(request_id.clone(), params)
+                        .await
+                    {
+                        Ok(Some(response)) => {
+                            self.outgoing.send_response_as(request_id, response).await;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            self.outgoing.send_error(request_id, error).await;
+                        }
                     }
-                    Ok(None) => {}
-                    Err(error) => {
-                        self.outgoing.send_error(request_id, error).await;
-                    }
-                }
-                Ok(())
+                    Ok(())
+                })
+                .await
             }
             request => {
                 Box::pin(async move {

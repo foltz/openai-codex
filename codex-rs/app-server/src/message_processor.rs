@@ -1493,6 +1493,56 @@ impl MessageProcessor {
         event_stream_ready: Option<McpEventStreamReady>,
         managed_transition_caller_authorized: bool,
     ) -> Result<(), JSONRPCErrorError> {
+        // Clear constructs its successor inline. Select it before polling the general
+        // dispatcher: that dispatcher has a multi-MiB debug frame even for a boxed arm.
+        // Both paths remain inside the same serialized, account-admitted request task.
+        match codex_request {
+            ClientRequest::ThreadClear { id, params } => {
+                let request_id = ConnectionRequestId {
+                    connection_id: connection_request_id.connection_id,
+                    request_id: id,
+                };
+                match self
+                    .thread_processor
+                    .thread_clear(request_id.clone(), params)
+                    .await
+                {
+                    Ok(Some(response)) => {
+                        self.outgoing.send_response_as(request_id, response).await;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.outgoing.send_error(request_id, error).await;
+                    }
+                }
+                Ok(())
+            }
+            request => {
+                Box::pin(async move {
+                    self.handle_initialized_client_request_without_clear(
+                        connection_request_id,
+                        request,
+                        request_context,
+                        session,
+                        event_stream_ready,
+                        managed_transition_caller_authorized,
+                    )
+                    .await
+                })
+                .await
+            }
+        }
+    }
+
+    async fn handle_initialized_client_request_without_clear(
+        self: Arc<Self>,
+        connection_request_id: ConnectionRequestId,
+        codex_request: ClientRequest,
+        request_context: RequestContext,
+        session: Arc<ConnectionSessionState>,
+        event_stream_ready: Option<McpEventStreamReady>,
+        managed_transition_caller_authorized: bool,
+    ) -> Result<(), JSONRPCErrorError> {
         let connection_id = connection_request_id.connection_id;
         let app_server_client_name = session.app_server_client_name().map(str::to_string);
         let retention_principal = session.retention_principal();
@@ -1723,14 +1773,8 @@ impl MessageProcessor {
                 }
                 Ok(response)
             }
-            ClientRequest::ThreadClear { params, .. } => {
-                // Keep successor-construction temporaries out of the shared dispatcher frame.
-                Box::pin(async {
-                    self.thread_processor
-                        .thread_clear(request_id.clone(), params)
-                        .await
-                })
-                .await
+            ClientRequest::ThreadClear { .. } => {
+                unreachable!("clear is handled before entering the general dispatcher")
             }
             ClientRequest::ThreadInteractiveSubscriptionList { params, .. } => {
                 self.thread_processor

@@ -304,3 +304,48 @@ async fn session_without_a_loop_never_reports_termination() {
     let (session, _) = make_session_and_context().await;
     assert!(session.turn_work_termination().now_or_never().is_none());
 }
+
+#[test_case::test_case(true; "closed handoff refuses before install")]
+#[test_case::test_case(false; "open handoff retains only a started turn")]
+#[tokio::test]
+async fn realtime_handoff_owns_turn_admission(closed: bool) {
+    let (mut session, _) = make_session_and_context().await;
+    let events = Arc::new(Mutex::new(Vec::new()));
+    // Keep the shutdown gate independent: this host only supplies account work.
+    session.services.host_admission = Some(Arc::new(Gate {
+        closed,
+        events: Arc::clone(&events),
+    }));
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::<crate::config::Config>::new();
+    builder.turn_lifecycle_contributor(Arc::new(HoldRunningTurn));
+    session.services.extensions = Arc::new(builder.build());
+    let session = Arc::new(session);
+    let result = session.route_realtime_text_input("handoff".into()).await;
+    if closed {
+        assert_eq!(result, Err("Server is draining; retry the turn after reconnecting"));
+        assert_eq!(*events.lock().unwrap(), vec!["admit"]);
+        assert!(session.active_turn.lock().await.is_none());
+        assert_eq!(session.state.lock().await.last_started_turn_id, None);
+        return;
+    }
+    assert_eq!(result, Ok(()));
+    let turn_id = session.active_turn.lock().await.as_ref().unwrap()
+        .task.as_ref().unwrap().turn_context.sub_id.clone();
+    assert_eq!(*events.lock().unwrap(), vec![
+        "admit".to_string(), format!("bind:{turn_id}"), "retained".to_string(),
+    ]);
+    events.lock().unwrap().clear();
+    assert_eq!(session.route_realtime_text_input("steering".into()).await, Ok(()));
+    let steering_events = events.lock().unwrap().clone();
+    assert_eq!(steering_events.len(), 3);
+    let steering_id = steering_events[1].strip_prefix("bind:").unwrap();
+    assert_ne!(steering_id, turn_id);
+    assert_eq!(steering_events, vec![
+        "admit".to_string(), format!("bind:{steering_id}"), "dropped".to_string(),
+    ]);
+    assert_eq!(session.active_turn.lock().await.as_ref().unwrap()
+        .task.as_ref().unwrap().turn_context.sub_id, turn_id);
+    session.close_task_admission().await;
+    session.abort_all_tasks(codex_protocol::protocol::TurnAbortReason::Interrupted).await;
+    let _ = session.task_joins.shutdown_until(tokio::time::Instant::now() + Duration::from_secs(5)).await;
+}

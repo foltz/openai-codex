@@ -581,6 +581,12 @@ impl Session {
         text: String,
     ) -> Result<(), &'static str> {
         let submission_id = Uuid::now_v7().to_string();
+        let mut work = self
+            .admit_turn_work(self.turn_work_termination())
+            .map_err(|_| "Server is draining; retry the turn after reconnecting")?;
+        if let Some(work) = &mut work {
+            work.bind_submission(&submission_id);
+        }
         let submission = handle(
             self,
             TurnInputRequest::user_input(vec![UserInput::Text {
@@ -595,6 +601,15 @@ impl Session {
             submission_id.clone(),
         )
         .await;
+        // Installation and Started return have no intervening await. Transfer
+        // custody here before anything else can suspend this fanout task.
+        if matches!(&submission, Ok(TurnInputSubmission::Started { .. })) {
+            if let Some(work) = work {
+                work.retain_until_terminal();
+            }
+        } else {
+            drop(work);
+        }
         match submission {
             Ok(TurnInputSubmission::Started { .. } | TurnInputSubmission::Steered { .. }) => {}
             Ok(TurnInputSubmission::NotSubmitted {

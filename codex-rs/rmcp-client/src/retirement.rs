@@ -617,6 +617,10 @@ impl<T> Drop for AcknowledgedTransport<T> {
 impl<T: Transport<RoleClient>> Transport<RoleClient> for AcknowledgedTransport<T> {
     type Error = T::Error;
 
+    #[expect(
+        clippy::expect_used,
+        reason = "inner is initialized by new and taken only by Drop; these &mut methods cannot run afterwards"
+    )]
     fn send(
         &mut self,
         item: TxJsonRpcMessage<RoleClient>,
@@ -627,6 +631,10 @@ impl<T: Transport<RoleClient>> Transport<RoleClient> for AcknowledgedTransport<T
             .send(item)
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "inner is initialized by new and taken only by Drop; these &mut methods cannot run afterwards"
+    )]
     fn receive(&mut self) -> impl Future<Output = Option<RxJsonRpcMessage<RoleClient>>> + Send {
         self.inner
             .as_mut()
@@ -634,6 +642,10 @@ impl<T: Transport<RoleClient>> Transport<RoleClient> for AcknowledgedTransport<T
             .receive()
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "inner is initialized by new and taken only by Drop; these &mut methods cannot run afterwards"
+    )]
     async fn close(&mut self) -> Result<(), Self::Error> {
         let result = self
             .inner
@@ -730,6 +742,10 @@ impl<S: Service<RoleClient>> ServiceOperations for Arc<ServiceLeaseOwner<S>> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .closing = true;
     }
+    #[expect(
+        clippy::expect_used,
+        reason = "acquire initializes the lease service, which is taken only when the lease drops"
+    )]
     fn call_tool(
         &self,
         params: rmcp::model::CallToolRequestParams,
@@ -744,6 +760,10 @@ impl<S: Service<RoleClient>> ServiceOperations for Arc<ServiceLeaseOwner<S>> {
         }
         .boxed()
     }
+    #[expect(
+        clippy::expect_used,
+        reason = "acquire initializes the lease service, which is taken only when the lease drops"
+    )]
     fn read_resource(
         &self,
         params: rmcp::model::ReadResourceRequestParams,

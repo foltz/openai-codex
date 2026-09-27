@@ -323,10 +323,9 @@ fn spawn_callback_dispatcher(
                     break;
                 }
                 CallbackOutcome::Error(error) => {
-                    let response: CallbackResponse = http::Response::builder()
-                        .status(400)
-                        .body(Full::new(Bytes::from(error.to_string())))
-                        .expect("valid OAuth callback error response");
+                    let mut response: CallbackResponse =
+                        http::Response::new(Full::new(Bytes::from(error.to_string())));
+                    *response.status_mut() = http::StatusCode::BAD_REQUEST;
                     if let Err(err) = request.respond(response).await {
                         eprintln!("Failed to respond to OAuth callback: {err}");
                     }
@@ -336,10 +335,9 @@ fn spawn_callback_dispatcher(
                     break;
                 }
                 CallbackOutcome::Invalid => {
-                    let response: CallbackResponse = http::Response::builder()
-                        .status(400)
-                        .body(Full::new(Bytes::from("Invalid OAuth callback")))
-                        .expect("valid OAuth callback response");
+                    let mut response: CallbackResponse =
+                        http::Response::new(Full::new(Bytes::from("Invalid OAuth callback")));
+                    *response.status_mut() = http::StatusCode::BAD_REQUEST;
                     if let Err(err) = request.respond(response).await {
                         eprintln!("Failed to respond to OAuth callback: {err}");
                     }
@@ -447,6 +445,10 @@ impl OauthLoginHandle {
         &self.authorization_url
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "completion is initialized by new and taken only by methods that consume self"
+    )]
     pub fn into_parts(mut self) -> (String, oneshot::Receiver<Result<()>>) {
         // Preserve the historical receiver-only escape hatch. Callers using
         // it explicitly take responsibility for the detached compatibility
@@ -460,6 +462,10 @@ impl OauthLoginHandle {
         )
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "completion is initialized by new and taken only by methods that consume self"
+    )]
     pub async fn wait(mut self) -> Result<()> {
         let mut completion = self
             .completion
@@ -851,7 +857,7 @@ impl OauthLoginFlow {
         self.guard.close();
         let report = self.guard.server.wait().await;
         let dispatcher = (&mut self.callback_dispatcher).await;
-        let retirement_clean = !dispatcher.is_err()
+        let retirement_clean = dispatcher.is_ok()
             && !report.unavailable
             && report.acceptor == crate::oauth_callback_server::WorkerOutcome::Joined
             && report.connections.interrupted == 0

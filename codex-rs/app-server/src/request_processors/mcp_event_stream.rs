@@ -268,7 +268,7 @@ async fn forward_events(
         };
         let active = notification.method == "notifications/events/active";
         let terminated = notification.method == "notifications/events/terminated";
-        if active {
+        if active || terminated {
             // Activation ends startup custody. Receiving events and retaining
             // an idle subscription must not pin the account-transition drain.
             drop(account_work.take());
@@ -294,6 +294,7 @@ async fn forward_events(
             reconnect_deadline = None;
         }
     }
+    drop(account_work);
     if let Some(ready) = ready {
         let _ = ready.send(Err(internal_error(
             "MCP event stream ended before becoming active",

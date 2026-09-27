@@ -31,7 +31,7 @@ fn sync_config(responses_url: &str) -> MockResponsesConfig {
     MockResponsesConfig::new(responses_url)
         .with_provider_config("supports_websockets = false")
         .with_approval_policy("on-request")
-        .with_root_config("approvals_reviewer = \"auto_review\"\nthread_unload_delay_secs = 0")
+        .with_root_config("approvals_reviewer = \"auto_review\"")
         .with_extra_config("[features.guardianv2]\nenabled = false")
         .enable_feature(Feature::GuardianApproval)
         .disable_feature(Feature::EnableRequestCompression)
@@ -175,7 +175,11 @@ async fn managed_reviewers_reuse_fork_and_resume_after_parent_shutdown(
         codex_home.path().join("AGENTS.md"),
         "Keep this project private.",
     )?;
+    // Subscriptions observe but do not retain KCF threads. Allow the parent to
+    // survive brief idle gaps; below we observe thread/closed before resuming
+    // its reviewer, rather than inferring unload from unsubscribe or a sleep.
     sync_config(server.uri())
+        .with_root_config("thread_unload_delay_secs = 2")
         .with_extra_config(&format!(
             "[mcp_servers.{TEST_SERVER_NAME}]\nurl = \"{mcp_url}/mcp\"\ndefault_tools_approval_mode = \"prompt\""
         ))

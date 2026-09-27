@@ -382,6 +382,8 @@ mod tests {
                 .collect();
             let call = codex_tools::ToolCall {
                 environments: Vec::new(),
+                // Keep the metadata, not the callback's borrowed authority.
+                mcp_access: Err(codex_mcp::McpAttemptRefused),
                 ..call
             };
             *self.captured_call.lock().await = Some(call);

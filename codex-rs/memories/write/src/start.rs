@@ -6,6 +6,7 @@ use crate::phase1;
 use crate::phase2;
 use crate::runtime::MemoryStartupContext;
 use codex_core::CodexThread;
+use codex_core::HostOperationWork;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
 use codex_features::Feature;
@@ -29,6 +30,7 @@ pub fn start_memories_startup_task(
     config: Arc<Config>,
     parent_permission_profile: PermissionProfile,
     source: &SessionSource,
+    account_work: Option<Box<dyn HostOperationWork>>,
 ) {
     if config.ephemeral
         || !config.features.enabled(Feature::MemoryTool)
@@ -43,6 +45,15 @@ pub fn start_memories_startup_task(
         vec![config.memories.version]
     };
     for version in versions {
+        // Each detached version owns its authority before any account reads.
+        // Refusal skips this not-yet-admitted pipeline; it never runs ungated.
+        let work = match account_work.as_ref().map(|work| work.derive_operation()).transpose() {
+            Ok(work) => work.map(Arc::from),
+            Err(_) => {
+                warn!("account work unavailable for memories startup pipeline; skipping");
+                continue;
+            }
+        };
         let mut pipeline_config = config.as_ref().clone();
         pipeline_config.memories.version = version;
         let config = Arc::new(pipeline_config);
@@ -55,6 +66,7 @@ pub fn start_memories_startup_task(
             Arc::clone(&thread),
             config.as_ref(),
             source.clone(),
+            work,
         ));
         tokio::spawn(async move {
             if context.memory_store().await.is_none() {

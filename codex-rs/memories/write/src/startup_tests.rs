@@ -651,6 +651,7 @@ async fn memories_startup_phase1_uses_live_thread_service_tier_and_detached_meta
         Arc::clone(&test.codex),
         &test.config,
         config_snapshot.session_source.clone(),
+        /*account_work*/ None,
     );
     let request_context = context
         .stage_one_request_context(
@@ -1118,6 +1119,7 @@ async fn trigger_memories_startup(test: &TestCodex) {
         Arc::new(config),
         parent_permission_profile,
         &config_snapshot.session_source,
+        /*account_work*/ None,
     );
 }
 

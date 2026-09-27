@@ -3,6 +3,56 @@ use futures::FutureExt;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
+async fn detached_operation_constructs_and_starts_child_after_request_and_parent_end() -> anyhow::Result<()> {
+    use codex_extension_api::ExtensionRegistryBuilder;
+    use codex_protocol::protocol::EventMsg;
+    use codex_protocol::user_input::UserInput;
+    use core_test_support::responses;
+    use core_test_support::test_codex::test_codex;
+    use core_test_support::wait_for_event;
+
+    let permits = AccountWorkPermits::new();
+    let mut extensions = ExtensionRegistryBuilder::new();
+    extensions.turn_start_admission(Arc::new(crate::account_turn_admission::AccountTurnAdmission {
+        shutdown: crate::turn_admission::TurnAdmission::default(),
+        permits: permits.clone(),
+        work: crate::account_turn_work::AccountTurnWork::default(),
+    }));
+    extensions.turn_lifecycle_contributor(Arc::new(crate::account_turn_admission::AccountTurnLifecycle));
+    let server = responses::start_mock_server().await;
+    let response = responses::mount_sse_once(&server, responses::sse_completed("child")).await;
+    let test = test_codex().with_extensions(Arc::new(extensions.build()))
+        .build_with_auto_env(&server).await?;
+    let operation = crate::account_turn_admission::within_request(permits.try_acquire(), async {
+        test.thread_manager.derive_request_operation_work().unwrap().unwrap()
+    }).await;
+    permits.close();
+    assert!(permits.try_acquire().is_none());
+    assert!(test.codex.shutdown_and_wait_with_cleanup().await.is_complete());
+
+    // There is no live originating request or turn to rediscover here.
+    let child = test.thread_manager.start_thread(codex_core::StartThreadOptions {
+        account_work: Some(operation.derive_operation().unwrap()),
+        ..codex_core::StartThreadOptions::new(test.config.clone(), None)
+    }).await?;
+    let input = || codex_core::TurnInputRequest::user_input(vec![UserInput::Text {
+        text: "consolidate".to_owned(),
+        text_elements: Vec::new(),
+    }]);
+    assert!(matches!(child.thread.start_turn_if_idle(input()).await?,
+        codex_core::StartIfIdleSubmission::NotSubmitted { .. }));
+    assert!(matches!(child.thread.start_turn_if_idle_from_operation(input(), operation.as_ref()).await?,
+        codex_core::StartIfIdleSubmission::Started { .. }));
+    wait_for_event(&child.thread, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    assert_eq!(response.requests().len(), 1);
+    assert!(child.thread.shutdown_and_wait_with_cleanup().await.is_complete());
+    assert_eq!(permits.admitted_count(), 1, "only the finite operation remains");
+    drop(operation);
+    assert_eq!(permits.admitted_count(), 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn operation_outlives_origin_loop_and_derives_child_during_drain() {
     use codex_extension_api::TurnStartAdmission;
     let permits = AccountWorkPermits::new();

@@ -688,7 +688,10 @@ impl TurnRequestProcessor {
         if turn_has_input && started {
             let config_snapshot = thread.config_snapshot().await;
             if config_snapshot.is_primary_environment_configured() {
-                codex_memories_write::start_memories_startup_task(
+                // The turn is already accepted. Refusing an optional memory
+                // pipeline must not turn that accepted input into an error.
+                match self.thread_manager.derive_request_operation_work() {
+                    Ok(work) => codex_memories_write::start_memories_startup_task(
                     Arc::clone(&self.thread_manager),
                     Arc::clone(&self.auth_manager),
                     thread_id,
@@ -696,7 +699,10 @@ impl TurnRequestProcessor {
                     thread.config().await,
                     config_snapshot.permission_profile,
                     &config_snapshot.session_source,
-                );
+                    work,
+                    ),
+                    Err(error) => tracing::warn!("memory startup admission refused: {error}"),
+                }
             }
         }
 

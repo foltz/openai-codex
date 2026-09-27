@@ -45,6 +45,7 @@ pub use codex_protocol::mcp_policy::EnvironmentMcpPolicy;
 pub use codex_protocol::protocol::EnvironmentConfig;
 pub use codex_thread::BackgroundTerminalInfo;
 pub use codex_thread::CodexThread;
+pub use codex_extension_api::HostOperationWork;
 pub use codex_thread::CodexThreadSettingsOverrides;
 pub use codex_thread::GuardianAuthorizationVersion;
 pub use codex_thread::GuardianRootMessage;

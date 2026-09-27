@@ -263,6 +263,9 @@ pub struct InternalSessionParent {
 
 pub struct StartThreadOptions {
     pub config: Config,
+    /// Explicit custody for construction descended from a finite operation.
+    /// Consumed by the retained constructor, never kept on the idle session.
+    pub account_work: Option<Box<dyn codex_extension_api::HostOperationWork>>,
     /// Host-owned provider for this root thread's additional instructions.
     ///
     /// Core composes these after the global [`UserInstructionsProvider`]
@@ -312,6 +315,7 @@ impl StartThreadOptions {
     pub fn new(config: Config, control_endpoint: Option<String>) -> Self {
         Self {
             config,
+            account_work: None,
             thread_instructions_provider: None,
             allow_provider_model_fallback: false,
             initial_history: InitialHistory::New,
@@ -2137,14 +2141,17 @@ impl ThreadManagerState {
     }
 
     /// Spawn a new thread with optional history and register it with the manager.
-    async fn spawn_thread(self: &Arc<Self>, request: ThreadSpawnRequest) -> CodexResult<NewThread> {
+    async fn spawn_thread(self: &Arc<Self>, mut request: ThreadSpawnRequest) -> CodexResult<NewThread> {
         // Capture while the caller's request scope is live. The retained
         // constructor runs independently and must not rediscover that scope.
-        let account_work = match self.extensions.host_admission() {
-            Some(host) => host.derive_request_operation_work().map_err(|_| {
-                CodexErr::Fatal("request account work cannot admit thread construction".to_owned())
-            })?,
-            None => None,
+        let account_work = match request.options.account_work.take() {
+            Some(work) => Some(work),
+            None => match self.extensions.host_admission() {
+                Some(host) => host.derive_request_operation_work().map_err(|_| {
+                    CodexErr::Fatal("request account work cannot admit thread construction".to_owned())
+                })?,
+                None => None,
+            },
         };
         let state = Arc::clone(self);
         let stop = request.startup.as_ref().map(|startup| startup.stop.clone());
@@ -2189,6 +2196,7 @@ impl ThreadManagerState {
         } = request;
         let StartThreadOptions {
             mut config,
+            account_work: _, // Already transferred into the retained constructor.
             thread_instructions_provider,
             allow_provider_model_fallback,
             initial_history,

@@ -263,10 +263,20 @@ impl Session {
         }
         let startup_prewarm = tokio::spawn(
             async move {
-                let _account_work = account_work;
-                let result =
-                    schedule_startup_prewarm_inner(startup_prewarm_session, base_instructions)
-                        .await;
+                let work = account_work.map(|work| {
+                    Box::new(crate::session::McpOperationWork(work))
+                        as Box<dyn codex_mcp::McpAttemptWork>
+                });
+                let access = work.as_deref().map_or(
+                    codex_mcp::McpAttemptAccess::Unscoped,
+                    codex_mcp::McpAttemptAccess::Admitted,
+                );
+                let result = schedule_startup_prewarm_inner(
+                    startup_prewarm_session,
+                    base_instructions,
+                    access,
+                )
+                .await;
                 let status = if result.is_ok() { "ready" } else { "failed" };
                 session_telemetry.record_startup_phase(
                     "startup_prewarm_total",
@@ -316,6 +326,7 @@ impl Session {
 async fn schedule_startup_prewarm_inner(
     session: Arc<Session>,
     base_instructions: String,
+    access: codex_mcp::McpAttemptAccess<'_>,
 ) -> CodexResult<ModelClientSession> {
     let prewarm_started_at = Instant::now();
     let startup_turn_context = session
@@ -330,9 +341,10 @@ async fn schedule_startup_prewarm_inner(
     let built_tools_started_at = Instant::now();
     // Startup prewarm runs before run_turn and needs its own tool-building snapshot.
     let step_context = session
-        .capture_step_context(
+        .capture_step_context_with_authority(
             Arc::clone(&startup_turn_context),
             &startup_cancellation_token,
+            access,
         )
         .await?;
     startup_turn_context.session_telemetry.record_startup_phase(

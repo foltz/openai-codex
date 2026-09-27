@@ -356,7 +356,8 @@ impl Session {
         selected_capability_roots: &[ResolvedSelectedCapabilityRoot],
         required_servers: &[String],
         required_plugins: &HashSet<String>,
-    ) -> Arc<codex_mcp::McpBinding> {
+        access: codex_mcp::McpAttemptAccess<'_>,
+    ) -> CodexResult<Arc<codex_mcp::McpBinding>> {
         let ready_selected_capability_roots =
             Self::ready_selected_capability_roots(selected_capability_roots);
         if self
@@ -383,7 +384,9 @@ impl Session {
         {
             self.mark_mcp_runtime_dirty();
         }
-        self.refresh_mcp_if_dirty().await;
+        self.refresh_mcp_if_dirty_with_authority(access)
+            .await
+            .map_err(|err| CodexErr::Fatal(err.to_string()))?;
         let required_servers = required_servers
             .iter()
             .chain(&recovered_oauth_servers)
@@ -392,13 +395,17 @@ impl Session {
         if let Some(binding) = self
             .services
             .mcp_runtime
-            .current_binding_with_requirements(&required_servers, required_plugins)
+            .current_binding_with_requirements_and_authority(
+                &required_servers,
+                required_plugins,
+                access,
+            )
             .await
         {
-            return binding;
+            return Ok(binding);
         }
         let config = Arc::new(self.runtime_mcp_config(&turn_context.config).await);
-        Arc::new(codex_mcp::McpBinding::empty(config))
+        Ok(Arc::new(codex_mcp::McpBinding::empty(config)))
     }
 
     #[tracing::instrument(

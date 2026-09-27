@@ -852,9 +852,18 @@ async fn ensure_guardian_node_repl_policy(
         .is_none()
     {
         let initialize_context: BoxFuture<'_, anyhow::Result<()>> = Box::pin(async {
+            let work = params.parent_session.turn_mcp_work(params.parent_context.turn())?;
+            let access = work.as_deref().map_or(
+                codex_mcp::McpAttemptAccess::Unscoped,
+                codex_mcp::McpAttemptAccess::Admitted,
+            );
             let step_context = review_session
                 .session
-                .capture_step_context(Arc::clone(&turn_context), &review_session.cancel_token)
+                .capture_step_context_with_authority(
+                    Arc::clone(&turn_context),
+                    &review_session.cancel_token,
+                    access,
+                )
                 .await?;
             review_session
                 .session

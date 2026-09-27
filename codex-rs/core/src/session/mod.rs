@@ -246,6 +246,7 @@ mod mcp_prewarm_tests;
 mod mcp_refresh;
 mod mcp_runtime;
 mod mcp_work;
+pub(crate) use mcp_work::McpOperationWork;
 pub(crate) mod multi_agents;
 mod plugin_selection;
 mod realtime_history;
@@ -3905,12 +3906,41 @@ impl Session {
         required_servers: &[String],
         required_plugins: &HashSet<String>,
     ) -> CodexResult<Arc<StepContext>> {
+        let work = self
+            .turn_mcp_work(&turn_context)
+            .map_err(|err| CodexErr::Fatal(err.to_string()))?;
+        let access = work.as_deref().map_or(
+            codex_mcp::McpAttemptAccess::Unscoped,
+            codex_mcp::McpAttemptAccess::Admitted,
+        );
         let step_context = self
             .capture_step_context_inner(
                 turn_context,
                 cancellation_token,
                 required_servers,
                 required_plugins,
+                access,
+            )
+            .await?;
+        self.set_last_known_step_context(&step_context).await;
+        Ok(step_context)
+    }
+
+    /// Standalone captures have no installed turn entry. Their caller supplies
+    /// request, parent-turn, or prewarm authority for this invocation only.
+    pub(crate) async fn capture_step_context_with_authority(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        cancellation_token: &CancellationToken,
+        access: codex_mcp::McpAttemptAccess<'_>,
+    ) -> CodexResult<Arc<StepContext>> {
+        let step_context = self
+            .capture_step_context_inner(
+                turn_context,
+                cancellation_token,
+                /*required_servers*/ &[],
+                /*required_plugins*/ &HashSet::new(),
+                access,
             )
             .await?;
         self.set_last_known_step_context(&step_context).await;
@@ -3924,11 +3954,19 @@ impl Session {
         turn_context: Arc<TurnContext>,
         cancellation_token: &CancellationToken,
     ) -> CodexResult<Arc<StepContext>> {
+        let work = self
+            .turn_mcp_work(&turn_context)
+            .map_err(|err| CodexErr::Fatal(err.to_string()))?;
+        let access = work.as_deref().map_or(
+            codex_mcp::McpAttemptAccess::Unscoped,
+            codex_mcp::McpAttemptAccess::Admitted,
+        );
         self.capture_step_context_inner(
             turn_context,
             cancellation_token,
             /*required_servers*/ &[],
             /*required_plugins*/ &HashSet::new(),
+            access,
         )
         .await
     }
@@ -3940,6 +3978,7 @@ impl Session {
         cancellation_token: &CancellationToken,
         required_servers: &[String],
         required_plugins: &HashSet<String>,
+        access: codex_mcp::McpAttemptAccess<'_>,
     ) -> CodexResult<Arc<StepContext>> {
         // Capture settings and selection together before asynchronous planning.
         // Existing steps retain this version even if the turn is updated.
@@ -4023,12 +4062,14 @@ impl Session {
                     &selected_capability_roots,
                     required_servers,
                     required_plugins,
+                    access,
                 )),
                 turn::prepare_tool_recommendations(self.as_ref(), turn_context.as_ref()),
             )
         }
         .or_cancel(cancellation_token)
         .await?;
+        let mcp = mcp?;
         let mut selected_plugins = self
             .services
             .thread_extension_data

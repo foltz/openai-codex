@@ -7,7 +7,7 @@ use codex_extension_api::HostOperationWork;
 use codex_mcp::McpAttemptRefused;
 use codex_mcp::McpAttemptWork;
 
-struct McpOperationWork(Box<dyn HostOperationWork>);
+pub(super) struct McpOperationWork(pub(super) Box<dyn HostOperationWork>);
 
 impl McpAttemptWork for McpOperationWork {
     fn derive_attempt(&self) -> Result<Box<dyn McpAttemptWork>, McpAttemptRefused> {

@@ -241,6 +241,8 @@ mod input_queue;
 mod mailbox;
 mod mcp;
 mod mcp_prewarm;
+#[cfg(test)]
+mod mcp_prewarm_tests;
 mod mcp_refresh;
 mod mcp_runtime;
 mod mcp_work;

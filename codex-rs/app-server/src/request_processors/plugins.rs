@@ -1778,7 +1778,7 @@ impl PluginRequestProcessor {
         );
         let (app_summaries, accessible_connectors_result) = tokio::join!(
             load_plugin_app_summaries(config, auth, &plugin_apps, &app_category_by_id),
-            connectors::list_accessible_connectors_with_authority(
+            codex_core::connectors::list_accessible_connectors_with_authority(
                 config,
                 /*force_refetch*/ true,
                 Arc::clone(&environment_manager),
@@ -1903,7 +1903,17 @@ impl PluginRequestProcessor {
             let http_client = Arc::clone(&http_client);
             let global_callback_url = config.mcp_oauth_callback_url.clone();
 
+            let account_work = match crate::account_turn_admission::derive_request_work() {
+                Ok(work) => work,
+                Err(_) => {
+                    warn!(server = %name, "plugin OAuth account work unavailable");
+                    continue;
+                }
+            };
             if let Err(err) = self.tasks.spawn(async move {
+                // Silent login awaits the flow inline. The actual task owns
+                // custody through both attempts, credential storage and its tail.
+                let _account_work = account_work;
                 let oauth_client_id = server.oauth_client_id();
                 let first_attempt = perform_oauth_login_silent(
                     &oauth_credential_name,

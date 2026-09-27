@@ -517,6 +517,10 @@ pub async fn review(
     }
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "the loop exclusively owns mailbox_start and select guards polling on Some"
+)]
 pub(super) async fn submission_loop(
     sess: Arc<Session>,
     config: Arc<Config>,

@@ -18,11 +18,19 @@ pub(crate) struct MailboxWorkRetry {
 }
 
 impl MailboxWorkRetry {
+    #[expect(
+        clippy::expect_used,
+        reason = "poisoned retry state must not silently lose its pending observation"
+    )]
     pub(crate) fn defer(&self, retry: BoxFuture<'static, ()>) {
         *self.pending.lock().expect("mailbox retry poisoned") = Some(retry);
         self.changed.notify_one();
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "poisoned retry state cannot establish a completed retry hint"
+    )]
     pub(crate) async fn wait(&self) {
         loop {
             self.changed.notified().await;

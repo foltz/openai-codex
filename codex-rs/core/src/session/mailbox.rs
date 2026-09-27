@@ -62,6 +62,10 @@ impl Mailbox {
         self.enqueue_with_work(communication, start_options, /*work*/ None);
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "mail custody fails closed on poison or enqueue sequence exhaustion"
+    )]
     pub(super) fn enqueue_with_work(
         &self,
         communication: InterAgentCommunication,
@@ -90,6 +94,10 @@ impl Mailbox {
 
     /// Reports only deliverable mail; another attempt's private reservation
     /// cannot authorize or feed a competing start.
+    #[expect(
+        clippy::expect_used,
+        reason = "poisoned queue state cannot establish deliverable mail"
+    )]
     pub(super) fn has_pending(&self) -> bool {
         !self
             .state
@@ -99,6 +107,10 @@ impl Mailbox {
             .is_empty()
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "poisoned queue state cannot authorize a trigger turn"
+    )]
     pub(super) fn has_trigger(&self) -> bool {
         self.state
             .lock()
@@ -108,6 +120,10 @@ impl Mailbox {
             .any(|mail| mail.communication.trigger_turn)
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "mail custody cannot transfer out of poisoned queue state"
+    )]
     pub(super) fn reserve(&self) -> MailboxReservation {
         let pending = std::mem::take(&mut self.state.lock().expect("mailbox poisoned").pending);
         MailboxReservation {

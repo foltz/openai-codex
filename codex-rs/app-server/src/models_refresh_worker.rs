@@ -39,6 +39,10 @@ impl ModelsRefreshWorker {
     /// Observe the actual worker, retaining its join on timeout/cancellation.
     /// This mutex is the exclusive join poll right, not a worker dependency;
     /// the worker never needs it to finish. No timeout aborts an active fetch.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "exclusive join polling retains custody across observer cancellation; the worker never takes this lock"
+    )]
     pub(crate) async fn shutdown_until(&self, deadline: Instant) -> ModelsRefreshShutdown {
         if let Ok(completion) = self.completion.try_lock()
             && let RefreshCompletion::Finished(outcome) = &*completion

@@ -32,11 +32,19 @@ pub(super) struct MailboxReplacement<'a> {
 }
 
 impl MailboxPreparationSlot {
+    #[expect(
+        clippy::expect_used,
+        reason = "poisoned preparation state cannot authorize a new start"
+    )]
     pub(crate) fn is_busy(&self) -> bool {
         let state = self.state.lock().expect("mailbox preparation poisoned");
         state.current.is_some() || state.replacing > 0
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "poisoned preparation state cannot authorize a retry"
+    )]
     pub(super) fn defer_if_busy(&self, wake: &Notify) -> bool {
         let state = self.state.lock().expect("mailbox preparation poisoned");
         if state.replacing > 0 {
@@ -51,6 +59,10 @@ impl MailboxPreparationSlot {
         false
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "poisoned preparation state cannot accept a new owner"
+    )]
     pub(crate) fn register(&self) -> MailboxPreparation {
         let preparation = Arc::new(Preparation {
             cancellation: CancellationToken::new(),
@@ -66,6 +78,10 @@ impl MailboxPreparationSlot {
         }
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "replacement requires unpoisoned owner and witness state"
+    )]
     pub(super) fn begin_replacement<'a>(
         &'a self,
         wake: &'a Notify,
@@ -79,6 +95,10 @@ impl MailboxPreparationSlot {
         (MailboxReplacement { slot: self, wake }, completed)
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "poisoned preparation state cannot supply a trustworthy witness"
+    )]
     pub(super) fn cancel_for_replacement(&self) -> Option<CancellationToken> {
         let state = self.state.lock().expect("mailbox preparation poisoned");
         state.current.as_ref().map(|preparation| {
@@ -99,6 +119,10 @@ impl MailboxPreparation {
 }
 
 impl Drop for MailboxPreparation {
+    #[expect(
+        clippy::expect_used,
+        reason = "do not signal completion over poisoned preparation ownership"
+    )]
     fn drop(&mut self) {
         let mut state = self.slot.lock().expect("mailbox preparation poisoned");
         if state
@@ -113,6 +137,10 @@ impl Drop for MailboxPreparation {
 }
 
 impl Drop for MailboxReplacement<'_> {
+    #[expect(
+        clippy::expect_used,
+        reason = "do not authorize a retry over a poisoned replacement count"
+    )]
     fn drop(&mut self) {
         let mut state = self
             .slot

@@ -119,7 +119,7 @@ impl Session {
             environments,
             local_process_cwd,
             disabled_plugin_ids,
-            control_endpoint: session_configuration.control_endpoint.clone(),
+            control_endpoint: session_configuration.control_endpoint,
         }
     }
 

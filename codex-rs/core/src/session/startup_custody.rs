@@ -235,6 +235,10 @@ impl SessionStartupCustody {
             .is_ok_and(|state| state.session.is_none() && state.persistence.is_none())
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the retained disposal receipt exclusively owns acquisition and discard through this guard"
+    )]
     fn persistence_disposal(
         persistence: &mut PreSessionPersistence,
         phase: PersistenceDisposalPhase,
@@ -340,6 +344,10 @@ impl SessionStartupCustody {
         }
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "the unbounded branch constructs a disposal receipt; the bounded branch returns before use"
+    )]
     async fn shutdown_persistence_legacy(&self) -> Option<bool> {
         let (thread_id, disposal, bounded_deadline) = {
             let Ok(mut state) = self.state.lock() else {

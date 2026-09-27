@@ -402,22 +402,19 @@ impl InProcessClientHandle {
                 ));
             }
             Ok(TaskTermination::Cancelled) => {
-                return Err(IoError::new(
-                    ErrorKind::Other,
+                return Err(IoError::other(
                     "in-process app-server runtime shutdown was cancelled",
                 ));
             }
             Ok(TaskTermination::Panicked) => {
-                return Err(IoError::new(
-                    ErrorKind::Other,
+                return Err(IoError::other(
                     "in-process app-server runtime shutdown panicked",
                 ));
             }
             Ok(TaskTermination::Normal) => {}
         }
         if !cleanup_report.is_proven_complete() {
-            return Err(IoError::new(
-                ErrorKind::Other,
+            return Err(IoError::other(
                 "in-process app-server cleanup completion was not proven",
             ));
         }

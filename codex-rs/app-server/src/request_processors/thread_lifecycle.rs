@@ -479,7 +479,7 @@ pub(super) async fn unload_idle_unretained_thread(
     };
     let (claim, ticket) = ticket;
     let report = ticket.wait().await;
-    if !report_is_complete(&report) {
+    if !report_is_complete(report) {
         pending_thread_unloads.lock().await.remove(&thread_id);
         warn!(thread_id = %thread_id, ?report, "idle thread retirement remains incomplete");
         return;
@@ -508,7 +508,7 @@ pub(super) async fn unload_idle_unretained_thread(
     pending_thread_unloads.lock().await.remove(&thread_id);
 }
 
-fn report_is_complete(report: &codex_core::ThreadRetirementReport) -> bool {
+fn report_is_complete(report: codex_core::ThreadRetirementReport) -> bool {
     report.is_complete()
 }
 

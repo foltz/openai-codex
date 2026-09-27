@@ -76,6 +76,10 @@ impl AccountTurnWork {
     /// observer; the registry retains every unresolved receipt and permit.
     /// Call concurrently with the permit-count notification under the drain's
     /// existing deadline. A live idle loop is never shut down to make progress.
+    #[expect(
+        clippy::expect_used,
+        reason = "poisoned permit ownership cannot establish observed retirement"
+    )]
     pub(crate) async fn observe_terminated(&self) {
         loop {
             let changed = self.inner.changed.notified();
@@ -109,6 +113,10 @@ impl AccountTurnWork {
         }
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "poisoned permit ownership must not be silently removed from the registry"
+    )]
     fn compact(&self) {
         self.inner
             .sessions
@@ -127,6 +135,10 @@ impl AccountTurnWork {
 }
 
 impl AccountTurnSession {
+    #[expect(
+        clippy::expect_used,
+        reason = "poisoned registry or session state cannot admit new account work"
+    )]
     pub(crate) fn begin(&self, permit: AccountWorkPermitGuard) -> Option<PendingAccountTurn> {
         let key = Arc::new(());
         // Registry -> session is the only nested lock order. Registration and
@@ -167,6 +179,10 @@ impl AccountTurnSession {
 
     /// Delegate from the exact live parent turn, not merely a thread ID or a
     /// boolean claiming that some request once held a permit.
+    #[expect(
+        clippy::expect_used,
+        reason = "poisoned session state cannot authorize derived account work"
+    )]
     pub(crate) fn derive(&self, turn_id: &str) -> Option<AccountWorkPermitGuard> {
         let state = self
             .work
@@ -185,6 +201,10 @@ impl AccountTurnSession {
     }
 
     /// Logical stop/abort evidence, not a claim of physical task cleanup.
+    #[expect(
+        clippy::expect_used,
+        reason = "poisoned session state cannot establish logical retirement"
+    )]
     pub(crate) fn terminal(&self, turn_id: &str) {
         let retired = {
             let mut state = self
@@ -226,6 +246,10 @@ impl std::fmt::Debug for PendingAccountTurn {
 }
 
 impl HostTurnWork for PendingAccountTurn {
+    #[expect(
+        clippy::expect_used,
+        reason = "only consuming operations remove the key; binding must fail closed on poisoned session state"
+    )]
     fn bind_submission(&mut self, turn_id: &str) {
         let key = self
             .key
@@ -266,6 +290,10 @@ impl HostTurnWork for PendingAccountTurn {
 }
 
 impl Drop for PendingAccountTurn {
+    #[expect(
+        clippy::expect_used,
+        reason = "poisoned session state cannot establish which pending permit this owner may release"
+    )]
     fn drop(&mut self) {
         let Some(key) = self.key.take() else {
             return;

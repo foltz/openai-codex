@@ -1182,6 +1182,10 @@ impl MessageProcessor {
         self.thread_processor.drain_background_tasks().await;
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the worker lock prevents replacement while shutdown observes its retained join"
+    )]
     async fn shutdown_models_refresh_worker_until(
         &self,
         deadline: tokio::time::Instant,
@@ -1624,7 +1628,7 @@ impl MessageProcessor {
     ) -> Result<(), JSONRPCErrorError> {
         let connection_id = connection_request_id.connection_id;
         let app_server_client_name = session.app_server_client_name().map(str::to_string);
-        let retention_principal = session.retention_principal();
+        let _retention_principal = session.retention_principal();
         let retention_acquire_authority = session.retention_acquire_authority();
         let client_version = session.client_version().map(str::to_string);
         let client_mcp_extensions = session.client_mcp_extensions();

@@ -686,10 +686,7 @@ impl InProcessAppServerClient {
 
         match timeout_at(deadline, &mut worker_handle).await {
             Ok(Ok(())) => command_error.map_or(Ok(()), Err),
-            Ok(Err(_)) => Err(IoError::new(
-                ErrorKind::Other,
-                "in-process app-server worker panicked",
-            )),
+            Ok(Err(_)) => Err(IoError::other("in-process app-server worker panicked")),
             Err(_) => Err(IoError::new(
                 ErrorKind::TimedOut,
                 "in-process app-server worker shutdown timed out",

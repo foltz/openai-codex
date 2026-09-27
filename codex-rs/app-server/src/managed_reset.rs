@@ -46,6 +46,10 @@ impl ResetInventory for ProductionResetInventory {
         Box::pin(self.thread_manager.drive_admitted_constructions())
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the worker lock retains exclusive observation and replacement custody across reset cancellation"
+    )]
     fn reset_all(&self) -> ResetInventoryFuture<'_> {
         Box::pin(async move {
             let telemetry_generation = *self.auth_manager.auth_change_receiver().borrow();

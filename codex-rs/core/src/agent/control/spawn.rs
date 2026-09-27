@@ -1292,7 +1292,7 @@ impl LocalAgentControl {
         // Each retained constructor owns a child of this invocation's operation,
         // so descendant resumes do not depend on the original turn staying live.
         let account_work = account_work
-            .map(|work| work.derive_operation())
+            .map(codex_extension_api::HostOperationWork::derive_operation)
             .transpose()
             .map_err(|_| {
                 CodexErr::Fatal("account work cannot admit resumed agent construction".to_owned())

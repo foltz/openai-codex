@@ -73,9 +73,19 @@ impl ListMcpResourceTemplatesHandler {
         };
 
         run_resource_operation(&session, &step_context, &call_id, invocation, async {
-            if let Some((server_name, params)) = args.target(turn.as_ref())? {
+            let target = args.target(turn.as_ref())?;
+            let work = session.turn_mcp_work(&turn).map_err(|err| {
+                FunctionCallError::RespondToModel(format!(
+                    "resources/templates/list failed: {err:#}"
+                ))
+            })?;
+            let access = work.as_deref().map_or(
+                codex_mcp::McpAttemptAccess::Unscoped,
+                codex_mcp::McpAttemptAccess::Admitted,
+            );
+            if let Some((server_name, params)) = target {
                 let result = mcp
-                    .list_resource_templates(&server_name, params)
+                    .list_resource_templates_with_authority(&server_name, params, access)
                     .await
                     .map_err(|err| {
                         FunctionCallError::RespondToModel(format!(
@@ -88,9 +98,10 @@ impl ListMcpResourceTemplatesHandler {
                 ))
             } else {
                 let templates = mcp
-                    .list_all_resource_templates(|server_name| {
-                        model_can_access_mcp_server(turn.as_ref(), server_name)
-                    })
+                    .list_all_resource_templates_with_authority(
+                        |server_name| model_can_access_mcp_server(turn.as_ref(), server_name),
+                        access,
+                    )
                     .await;
                 Ok(ListResourceTemplatesPayload::from_all_servers(templates))
             }

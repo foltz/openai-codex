@@ -278,8 +278,14 @@ impl Session {
     /// Reconnects the runtime so refreshed Apps tools belong to their new exact client.
     pub(crate) async fn hard_refresh_latest_codex_apps_tools(
         self: &Arc<Self>,
+        turn: &TurnContext,
     ) -> anyhow::Result<Vec<codex_mcp::ToolInfo>> {
-        self.refresh_mcp_if_dirty().await;
+        let work = self.turn_mcp_work(turn)?;
+        let access = work.as_deref().map_or(
+            codex_mcp::McpAttemptAccess::Unscoped,
+            codex_mcp::McpAttemptAccess::Admitted,
+        );
+        self.refresh_mcp_if_dirty_with_authority(access).await?;
         let _refresh = self
             .mcp_refresh
             .acquire()
@@ -330,7 +336,7 @@ impl Session {
             )
             .await;
         let selected_plugins = mcp_projection.selected_plugins.clone();
-        let input = self.build_mcp_runtime_input(
+        let mut input = self.build_mcp_runtime_input(
             &desired,
             mcp_projection,
             &ready_selected_capability_roots,
@@ -340,7 +346,15 @@ impl Session {
             input.mcp_servers.contains_key(CODEX_APPS_MCP_SERVER_NAME),
             "unknown MCP server '{CODEX_APPS_MCP_SERVER_NAME}'"
         );
-        let refreshed = self.services.mcp_runtime.replace_fresh(input).await;
+        input.startup_work = match access {
+            codex_mcp::McpAttemptAccess::Unscoped => None,
+            codex_mcp::McpAttemptAccess::Admitted(work) => Some(work.derive_attempt()?),
+        };
+        let refreshed = self
+            .services
+            .mcp_runtime
+            .replace_fresh_with_authority(input, access)
+            .await;
         self.services.thread_extension_data.insert(selected_plugins);
         refreshed
     }

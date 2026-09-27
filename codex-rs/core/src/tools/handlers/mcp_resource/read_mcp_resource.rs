@@ -79,8 +79,19 @@ impl ReadMcpResourceHandler {
 
         run_resource_operation(&session, &step_context, &call_id, invocation, async {
             ensure_model_can_access_mcp_server(turn.as_ref(), &server)?;
+            let work = session.turn_mcp_work(&turn).map_err(|err| {
+                FunctionCallError::RespondToModel(format!("resources/read failed: {err:#}"))
+            })?;
+            let access = work.as_deref().map_or(
+                codex_mcp::McpAttemptAccess::Unscoped,
+                codex_mcp::McpAttemptAccess::Admitted,
+            );
             let result = mcp
-                .read_resource(&server, ReadResourceRequestParams::new(uri.clone()))
+                .read_resource_with_authority(
+                    &server,
+                    ReadResourceRequestParams::new(uri.clone()),
+                    access,
+                )
                 .await
                 .map_err(|err| {
                     FunctionCallError::RespondToModel(format!("resources/read failed: {err:#}"))

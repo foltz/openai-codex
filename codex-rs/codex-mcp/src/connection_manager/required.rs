@@ -62,6 +62,7 @@ impl McpConnectionSet {
 fn startup_outcome_error_message(error: StartupOutcomeError) -> String {
     match error {
         StartupOutcomeError::Cancelled => "MCP startup cancelled".to_string(),
+        StartupOutcomeError::Refused(error) => error.to_string(),
         StartupOutcomeError::Failed { error, .. } => error,
     }
 }

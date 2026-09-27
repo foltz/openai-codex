@@ -9,6 +9,12 @@
 
 #[path = "rmcp_client/status.rs"]
 mod status;
+#[path = "rmcp_client/startup_work.rs"]
+mod startup_work;
+
+pub(crate) use startup_work::ClientStartup;
+use crate::attempt_work::McpAttemptAccess;
+use crate::attempt_work::McpAttemptRequirement;
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -187,6 +193,7 @@ struct CodexAppsStartupStatusContext {
 }
 
 pub(crate) struct CodexAppsStartupReconnect {
+    requirement: McpAttemptRequirement,
     retirement_ticket: Option<crate::runtime_retirement::RuntimeTaskTicket>,
     factory: Arc<dyn Fn() -> ManagedClientFuture + Send + Sync>,
     state: StdMutex<CodexAppsStartupReconnectState>,
@@ -194,8 +201,12 @@ pub(crate) struct CodexAppsStartupReconnect {
 }
 
 impl CodexAppsStartupReconnect {
-    pub(crate) fn new(factory: Arc<dyn Fn() -> ManagedClientFuture + Send + Sync>) -> Self {
+    pub(crate) fn new(
+        factory: Arc<dyn Fn() -> ManagedClientFuture + Send + Sync>,
+        requirement: McpAttemptRequirement,
+    ) -> Self {
         Self {
+            requirement,
             factory,
             retirement_ticket: None,
             state: StdMutex::new(CodexAppsStartupReconnectState::default()),
@@ -233,8 +244,8 @@ impl CodexAppsStartupReconnect {
             .clone()
     }
 
-    fn reconnect_in_background(self: &Arc<Self>) {
-        {
+    fn reconnect_in_background(self: &Arc<Self>, access: McpAttemptAccess<'_>) {
+        let work = {
             let mut state = self
                 .state
                 .lock()
@@ -248,12 +259,19 @@ impl CodexAppsStartupReconnect {
             {
                 return;
             }
+            let Ok(work) = self.requirement.derive(access) else {
+                return;
+            };
             state.reconnect_in_flight = true;
-        }
+            work
+        };
 
         let reconnect = Arc::clone(self);
         let task = async move {
             let result = (reconnect.factory)().await;
+            // Custody ends with this attempt, not with the reusable factory,
+            // current client, or a potentially blocked status notification.
+            drop(work);
             let startup_status_context = reconnect.startup_status_context.clone();
             let recovered = {
                 let mut state = reconnect
@@ -299,8 +317,12 @@ impl CodexAppsStartupReconnect {
             crate::runtime_retirement::RuntimeTaskOutcome::Complete
         };
         if let Some(ticket) = &self.retirement_ticket {
-            if let Ok(task) = ticket.register(move || task) {
-                tokio::spawn(task);
+            match ticket.register(move || task) {
+                Ok(task) => { tokio::spawn(task); }
+                Err(_) => {
+                    self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .reconnect_in_flight = false;
+                }
             }
         } else {
             // Synthetic reconnect fixtures have no physical runtime owner.
@@ -385,6 +407,12 @@ impl ManagedClientStartup {
             .unwrap_or(DEFAULT_STARTUP_TIMEOUT);
         let cancel_token_for_fut = cancel_token;
         async move {
+            // or_cancel is unbiased; do not give a never-started transport a
+            // first poll after cancellation has already been observed.
+            if cancel_token_for_fut.is_cancelled() {
+                startup_complete.store(true, Ordering::Release);
+                return Err(StartupOutcomeError::Cancelled);
+            }
             let tool_catalog_fetch_ticket = tool_catalog_cache_context
                 .as_ref()
                 .map(McpToolCatalogCacheContext::begin_fetch);
@@ -494,7 +522,7 @@ impl ManagedClientStartup {
 
 #[derive(Clone)]
 pub(crate) struct AsyncManagedClient {
-    pub(crate) client: ManagedClientFuture,
+    pub(crate) client: ClientStartup,
     pub(crate) is_codex_apps_mcp_server: bool,
     pub(crate) cached_server_info: Option<McpServerInfo>,
     /// Retained after initialization even if subsequent tool discovery fails.
@@ -573,11 +601,14 @@ impl AsyncManagedClient {
             canonical_thread_id,
             control_endpoint,
         });
-        let client = startup.start();
+        let client = ClientStartup::new(startup.start(), McpAttemptRequirement::Ungated);
         let startup_reconnect = is_codex_apps_mcp_server.then(|| {
             let startup = Arc::clone(&startup);
             Arc::new(
-                CodexAppsStartupReconnect::new(Arc::new(move || startup.start()))
+                CodexAppsStartupReconnect::new(
+                    Arc::new(move || startup.start()),
+                    McpAttemptRequirement::Ungated,
+                )
                     .with_retirement_ticket(retirement_ticket)
                     .with_startup_status_context(
                         startup_submit_id,
@@ -600,6 +631,13 @@ impl AsyncManagedClient {
     }
 
     pub(crate) async fn client(&self) -> Result<ManagedClient, StartupOutcomeError> {
+        self.client_with_authority(McpAttemptAccess::Unscoped).await
+    }
+
+    pub(crate) async fn client_with_authority(
+        &self,
+        access: McpAttemptAccess<'_>,
+    ) -> Result<ManagedClient, StartupOutcomeError> {
         if let Some(client) = self
             .startup_reconnect
             .as_ref()
@@ -607,7 +645,16 @@ impl AsyncManagedClient {
         {
             return Ok(client);
         }
-        self.client.clone().await
+        if self.cancel_token.is_cancelled() && !self.startup_complete.load(Ordering::Acquire) {
+            self.client.cancel_unstarted();
+        }
+        let result = self.client.observe(access).await;
+        if matches!(&result, Err(StartupOutcomeError::Cancelled)) {
+            // The admission wrapper can finish cancellation without polling
+            // start(), whose terminal store would otherwise do this.
+            self.startup_complete.store(true, Ordering::Release);
+        }
+        result
     }
 
     /// Returns the current ready client, including its tool catalog and metadata,
@@ -629,6 +676,13 @@ impl AsyncManagedClient {
     }
 
     pub(crate) async fn reconnect_failed_startup(&self) {
+        self.reconnect_failed_startup_with_authority(McpAttemptAccess::Unscoped).await;
+    }
+
+    pub(crate) async fn reconnect_failed_startup_with_authority(
+        &self,
+        access: McpAttemptAccess<'_>,
+    ) {
         let Some(startup_reconnect) = self.startup_reconnect.as_ref() else {
             return;
         };
@@ -636,7 +690,7 @@ impl AsyncManagedClient {
             return;
         }
         if matches!(self.client().await, Err(StartupOutcomeError::Failed { .. })) {
-            startup_reconnect.reconnect_in_background();
+            startup_reconnect.reconnect_in_background(access);
         }
     }
 
@@ -681,6 +735,10 @@ impl AsyncManagedClient {
 pub(crate) enum StartupOutcomeError {
     #[error("MCP startup cancelled")]
     Cancelled,
+    /// No attempt ran. This is neither memoized startup failure nor grounds
+    /// for an automatic reconnect.
+    #[error(transparent)]
+    Refused(crate::McpAttemptRefused),
     // We can't store the original error here because anyhow::Error doesn't implement
     // `Clone`.
     #[error("MCP startup failed: {error}")]
@@ -693,7 +751,7 @@ pub(crate) enum StartupOutcomeError {
 impl StartupOutcomeError {
     pub(crate) fn is_authentication_required(&self) -> bool {
         match self {
-            Self::Cancelled => false,
+            Self::Cancelled | Self::Refused(_) => false,
             Self::Failed {
                 error,
                 is_authentication_required,

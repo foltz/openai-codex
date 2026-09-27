@@ -40,7 +40,7 @@ impl AsyncManagedClient {
             }
             Some(Err(StartupOutcomeError::Failed { .. })) => Status::Failed,
             Some(Err(StartupOutcomeError::Cancelled)) => Status::Cancelled,
-            None => Status::Starting,
+            Some(Err(StartupOutcomeError::Refused(_))) | None => Status::Starting,
         }
     }
 }

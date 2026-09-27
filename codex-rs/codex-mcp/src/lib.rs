@@ -1,4 +1,8 @@
 pub use binding::McpBinding;
+pub use attempt_work::McpAttemptAccess;
+pub use attempt_work::McpAttemptRefused;
+pub use attempt_work::McpAttemptRequirement;
+pub use attempt_work::McpAttemptWork;
 pub use binding::PreparedMcpCall;
 pub use client_capabilities::client_mcp_extensions;
 pub use client_tool_catalog::CodexAppsToolSnapshot;
@@ -104,6 +108,7 @@ pub use mcp::mcp_permission_prompt_is_auto_approved;
 pub use mcp::qualified_mcp_tool_name_prefix;
 
 mod auth_changes;
+mod attempt_work;
 pub(crate) mod auth_elicitation;
 mod binding;
 pub(crate) mod binding_clients;

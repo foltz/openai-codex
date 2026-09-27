@@ -368,12 +368,14 @@ impl Session {
             Arc::clone(&turn.turn_state)
         };
         turn_state.lock().await.token_usage_at_turn_start = token_usage_at_turn_start.clone();
+        // This phase has no fallible refresh or authority lookup. Any future
+        // pre-registration refusal must also preserve reservation cleanup.
         self.emit_turn_start_lifecycle(
             turn_context.as_ref(),
             Some(&token_usage_at_turn_start),
             codex_extension_api::TurnStartPhase::BeforeTaskRegistration,
         )
-        .await;
+        .await?;
 
         let mut active = self.active_turn.lock().await;
         if self

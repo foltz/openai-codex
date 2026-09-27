@@ -3,6 +3,8 @@ use std::sync::Arc;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ThreadIdleCause;
 use codex_extension_api::TurnStartPhase;
+use codex_protocol::error::CodexErr;
+use codex_protocol::error::Result as CodexResult;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnAbortReason;
@@ -16,7 +18,7 @@ impl Session {
         turn_context: &TurnContext,
         token_usage_at_turn_start: Option<&TokenUsage>,
         phase: TurnStartPhase,
-    ) {
+    ) -> CodexResult<()> {
         let collaboration_mode = turn_context.collaboration_mode();
         for contributor in self.services.extensions.turn_lifecycle_contributors() {
             if contributor.turn_start_phase(&self.services.thread_extension_data) != phase {
@@ -25,7 +27,17 @@ impl Session {
             if phase == TurnStartPhase::RegularTaskStart
                 && contributor.requires_mcp_runtime(&self.services.thread_extension_data)
             {
-                self.refresh_mcp_if_dirty().await;
+                // Only this post-install phase has a bound turn entry.
+                let work = self
+                    .turn_mcp_work(turn_context)
+                    .map_err(|err| CodexErr::Fatal(err.to_string()))?;
+                let access = work.as_deref().map_or(
+                    codex_mcp::McpAttemptAccess::Unscoped,
+                    codex_mcp::McpAttemptAccess::Admitted,
+                );
+                self.refresh_mcp_if_dirty_with_authority(access)
+                    .await
+                    .map_err(|err| CodexErr::Fatal(err.to_string()))?;
             }
             contributor
                 .on_turn_start(codex_extension_api::TurnStartInput {
@@ -38,6 +50,7 @@ impl Session {
                 })
                 .await;
         }
+        Ok(())
     }
 
     pub(super) async fn emit_turn_stop_lifecycle(&self, turn_store: &ExtensionData) {

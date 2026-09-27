@@ -3,6 +3,7 @@ use crate::McpAttemptAccess;
 use crate::McpAttemptRefused;
 use crate::McpAttemptRequirement;
 use crate::McpAttemptWork;
+use pretty_assertions::assert_eq;
 use std::sync::atomic::AtomicUsize;
 
 struct Work(Arc<AtomicUsize>);

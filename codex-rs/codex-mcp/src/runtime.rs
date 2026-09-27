@@ -207,7 +207,7 @@ pub(crate) struct McpPublicationGate {
 }
 
 impl McpPublicationGate {
-    fn pending() -> (watch::Sender<bool>, Self) {
+    pub(crate) fn pending() -> (watch::Sender<bool>, Self) {
         let (publish, published) = watch::channel(false);
         (
             publish,

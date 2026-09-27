@@ -107,6 +107,120 @@ fn incoming_parent_overrides_ambient_without_changing_creation_generation() {
     second.shutdown().unwrap();
 }
 
+#[test]
+fn explicit_root_parent_does_not_retain_ambient_or_move_to_a_later_generation() {
+    use codex_protocol::protocol::W3cTraceContext;
+    use opentelemetry::trace::TraceContextExt as _;
+    let a = InMemorySpanExporter::default();
+    let b = InMemorySpanExporter::default();
+    let first = SdkTracerProvider::builder().with_simple_exporter(a.clone()).build();
+    let second = SdkTracerProvider::builder().with_simple_exporter(b.clone()).build();
+    let route = LocalTraceRoute::default();
+    let _initial = route.replace(Some(first.tracer("a"))).unwrap();
+    let parent = W3cTraceContext {
+        traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into()),
+        tracestate: None,
+    };
+    let expected = crate::context_from_w3c_trace_context(&parent).unwrap();
+    tracing::subscriber::with_default(tracing_subscriber::registry().with(route.layer()), || {
+        let ambient = tracing::info_span!("ambient");
+        let root = {
+            let _entered = ambient.enter();
+            crate::root_span_with_w3c_parent(Some(&parent), || {
+                let span = tracing::info_span!(parent: None, "detached");
+                // Publication before helper return must not change the selected epoch.
+                let _old = route.replace(Some(second.tracer("b"))).unwrap();
+                span
+            })
+        };
+        drop(ambient);
+        assert_eq!(a.get_finished_spans().unwrap().iter().map(|s| s.name.as_ref()).collect::<Vec<_>>(), vec!["ambient"]);
+        let propagated = crate::span_w3c_trace_context(&root).unwrap();
+        let actual = crate::context_from_w3c_trace_context(&propagated).unwrap();
+        assert_eq!(actual.span().span_context().trace_id(), expected.span().span_context().trace_id());
+        drop(root);
+        drop(tracing::info_span!(parent: None, "next_generation"));
+    });
+    let spans = a.get_finished_spans().unwrap();
+    let root = spans.iter().find(|span| span.name == "detached").unwrap();
+    assert_eq!(root.span_context.trace_id(), expected.span().span_context().trace_id());
+    assert_eq!(root.parent_span_id, expected.span().span_context().span_id());
+    let later = b.get_finished_spans().unwrap();
+    assert_eq!(later.len(), 1);
+    assert_eq!(later[0].name, "next_generation");
+    assert_ne!(later[0].span_context.trace_id(), root.span_context.trace_id());
+    first.shutdown().unwrap();
+    second.shutdown().unwrap();
+}
+
+#[test]
+fn explicit_root_parent_works_with_a_plain_subscriber_without_retaining_ambient() {
+    use codex_protocol::protocol::W3cTraceContext;
+    use opentelemetry::trace::TraceContextExt as _;
+    let exporter = InMemorySpanExporter::default();
+    let provider = SdkTracerProvider::builder().with_simple_exporter(exporter.clone()).build();
+    let parent = W3cTraceContext {
+        traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into()),
+        tracestate: None,
+    };
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("plain")));
+    tracing::subscriber::with_default(subscriber, || {
+        let ambient = tracing::info_span!("ambient");
+        let root = {
+            let _entered = ambient.enter();
+            crate::root_span_with_w3c_parent(Some(&parent), || tracing::info_span!(parent: None, "detached"))
+        };
+        drop(ambient);
+        assert_eq!(exporter.get_finished_spans().unwrap().len(), 1);
+        drop(root);
+    });
+    let spans = exporter.get_finished_spans().unwrap();
+    let root = spans.iter().find(|span| span.name == "detached").unwrap();
+    let expected = crate::context_from_w3c_trace_context(&parent).unwrap();
+    assert_eq!(root.span_context.trace_id(), expected.span().span_context().trace_id());
+    assert_eq!(root.parent_span_id, expected.span().span_context().span_id());
+    provider.shutdown().unwrap();
+}
+
+#[test]
+fn nested_root_parent_scope_restores_after_unwind_without_leaking_into_later_spans() {
+    use codex_protocol::protocol::W3cTraceContext;
+    use opentelemetry::trace::TraceContextExt as _;
+    let exporter = InMemorySpanExporter::default();
+    let provider = SdkTracerProvider::builder().with_simple_exporter(exporter.clone()).build();
+    let route = LocalTraceRoute::default();
+    let _initial = route.replace(Some(provider.tracer("roots"))).unwrap();
+    let outer = W3cTraceContext {
+        traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into()),
+        tracestate: None,
+    };
+    let inner = W3cTraceContext {
+        traceparent: Some("00-11111111111111111111111111111111-2222222222222222-01".into()),
+        tracestate: None,
+    };
+    tracing::subscriber::with_default(tracing_subscriber::registry().with(route.layer()), || {
+        drop(crate::root_span_with_w3c_parent(Some(&outer), || {
+            let interrupted = std::panic::catch_unwind(|| {
+                crate::root_span_with_w3c_parent(Some(&inner), || panic!("interrupted creation"))
+            });
+            assert!(interrupted.is_err());
+            drop(crate::root_span_with_w3c_parent(Some(&inner), || tracing::info_span!(parent: None, "inner")));
+            tracing::info_span!(parent: None, "outer")
+        }));
+        drop(tracing::info_span!(parent: None, "unrelated"));
+    });
+    let spans = exporter.get_finished_spans().unwrap();
+    let trace_id = |name: &str| spans.iter().find(|span| span.name == name).unwrap().span_context.trace_id();
+    let outer_context = crate::context_from_w3c_trace_context(&outer).unwrap();
+    let inner_context = crate::context_from_w3c_trace_context(&inner).unwrap();
+    assert_eq!(trace_id("outer"), outer_context.span().span_context().trace_id());
+    assert_eq!(trace_id("inner"), inner_context.span().span_context().trace_id());
+    assert_ne!(trace_id("unrelated"), trace_id("outer"));
+    assert_ne!(trace_id("unrelated"), trace_id("inner"));
+    provider.shutdown().unwrap();
+}
+
 #[tokio::test(start_paused = true)]
 async fn selected_a_build_drains_exactly_once_after_swap_timeout_and_observer_cancellation() {
     use opentelemetry::trace::Span as _;

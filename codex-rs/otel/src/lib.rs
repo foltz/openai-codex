@@ -6,6 +6,7 @@ pub(crate) mod metrics;
 mod prepared_provider;
 pub(crate) mod provider;
 mod provider_retirement;
+mod root_span_context;
 pub(crate) mod trace_context;
 mod trace_exporter_retirement;
 
@@ -40,6 +41,7 @@ pub use crate::provider::OtelProvider;
 pub use crate::provider::OtelShutdownError;
 pub use crate::provider_retirement::OtelRetirement;
 pub use crate::provider_retirement::OtelRetirementError;
+pub use crate::root_span_context::root_span_with_w3c_parent;
 pub use crate::trace_context::context_from_w3c_trace_context;
 pub use crate::trace_context::current_span_trace_id;
 pub use crate::trace_context::current_span_w3c_trace_context;

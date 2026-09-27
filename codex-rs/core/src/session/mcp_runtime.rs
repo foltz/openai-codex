@@ -290,6 +290,26 @@ impl Session {
         ready_selected_capability_roots: &[SelectedCapabilityRoot],
         elicitation_reviewer: Option<ElicitationReviewerHandle>,
     ) {
+        if let Err(error) = self.publish_mcp_runtime_with_authority(
+            desired, mcp_projection, ready_selected_capability_roots,
+            elicitation_reviewer, codex_mcp::McpAttemptAccess::Unscoped,
+        ).await {
+            warn!("MCP runtime publication failed: {error:#}");
+        }
+    }
+
+    pub(super) async fn publish_mcp_runtime_with_authority(
+        &self,
+        desired: &McpDesiredState,
+        mcp_projection: McpRuntimeProjection,
+        ready_selected_capability_roots: &[SelectedCapabilityRoot],
+        elicitation_reviewer: Option<ElicitationReviewerHandle>,
+        access: codex_mcp::McpAttemptAccess<'_>,
+    ) -> anyhow::Result<()> {
+        let startup_work = match access {
+            codex_mcp::McpAttemptAccess::Unscoped => None,
+            codex_mcp::McpAttemptAccess::Admitted(work) => Some(work.derive_attempt()?),
+        };
         let mcp_projection = self
             .project_selected_environment_mcp_servers(
                 &desired.config,
@@ -298,14 +318,18 @@ impl Session {
             )
             .await;
         let selected_plugins = mcp_projection.selected_plugins.clone();
-        let input = self.build_mcp_runtime_input(
+        let mut input = self.build_mcp_runtime_input(
             desired,
             mcp_projection,
             ready_selected_capability_roots,
             elicitation_reviewer,
         );
+        // Keep the existing requirement until every constructor/turn producer
+        // is converted; explicit callers already transfer finite startup work.
+        input.startup_work = startup_work;
         self.services.mcp_runtime.replace(input).await;
         self.services.thread_extension_data.insert(selected_plugins);
+        Ok(())
     }
 
     pub(super) fn build_mcp_runtime_input(

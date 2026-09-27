@@ -22,6 +22,7 @@ struct AppsWorkTicket {
     tasks: ProcessorTaskTicket,
     runtimes: AppsRuntimeTicket,
     shutdown: CancellationToken,
+    account_work: Option<Box<dyn codex_mcp::McpAttemptWork>>,
 }
 
 pub(super) use read::APP_READ_MAX_IDS;
@@ -116,6 +117,9 @@ impl AppsRequestProcessor {
             tasks: self.tasks.ticket(),
             runtimes: self.runtimes.ticket(),
             shutdown: shutdown_token.clone(),
+            account_work: crate::account_turn_admission::derive_request_work()
+                .map_err(|_| internal_error("app-list account work unavailable"))?
+                .map(|work| Box::new(work) as Box<dyn codex_mcp::McpAttemptWork>),
         };
         let _receipt = self
             .tasks
@@ -265,6 +269,14 @@ impl AppsRequestProcessor {
             .reserve()
             .map_err(|_| internal_error("app-list runtime admission unavailable"))?;
         let shutdown = work.shutdown.clone();
+        // Both children can outlive the response task, including its timeout
+        // and cancellation. Derive before spawning, never inside an unscoped task.
+        let accessible_work = work.account_work.as_deref()
+            .map(codex_mcp::McpAttemptWork::derive_attempt).transpose()
+            .map_err(|_| internal_error("app discovery account work unavailable"))?;
+        let directory_work = work.account_work.as_deref()
+            .map(codex_mcp::McpAttemptWork::derive_attempt).transpose()
+            .map_err(|_| internal_error("app directory account work unavailable"))?;
         // Cancellation is safe only because external runtime custody was
         // registered above, before this task or its constructor can run.
         let _accessible_receipt = work
@@ -273,12 +285,13 @@ impl AppsRequestProcessor {
                 let result = tokio::select! {
                     biased;
                     _ = shutdown.cancelled() => return,
-                    result = codex_core::connectors::list_accessible_connectors_in_retirement(
+                    result = codex_core::connectors::list_accessible_connectors_with_authority(
                         &accessible_config,
                         force_refetch,
                         Arc::clone(&environment_manager),
                         mcp_manager,
-                        retirement,
+                        Some(retirement),
+                        codex_mcp::McpAttemptAccess::from_work(accessible_work.as_deref()),
                     ) => result,
                 }
                 .map_err(|err| format!("failed to load accessible apps: {err}"));
@@ -291,6 +304,7 @@ impl AppsRequestProcessor {
         let _directory_receipt = work
             .tasks
             .spawn(async move {
+                let _account_work = directory_work;
                 let result = connectors::list_all_connectors_with_options(
                     &all_config,
                     force_refetch,

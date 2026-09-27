@@ -419,8 +419,9 @@ async fn oauth_login_automatically_selects_callback_specific_cimd_without_metada
 
     let codex_home = TempDir::new()?;
     mock_responses_config(&responses_server.uri())
+        .with_root_config("mcp_oauth_credentials_store = \"file\"")
         .with_extra_config(&format!(
-            "mcp_oauth_credentials_store = \"file\"\n[mcp_servers.cimd]\nurl = \"{base_url}/mcp\""
+            "[mcp_servers.cimd]\nurl = \"{base_url}/mcp\""
         ))
         .write(codex_home.path())?;
     let mut app_server = TestAppServer::builder()

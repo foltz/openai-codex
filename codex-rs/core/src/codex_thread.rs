@@ -1054,7 +1054,10 @@ impl CodexThread {
     pub async fn refresh_codex_apps_tools(
         &self,
     ) -> anyhow::Result<codex_mcp::CodexAppsToolSnapshot> {
-        self.session.refresh_codex_apps_tools().await
+        let work = self.session.request_mcp_work()?;
+        self.session.refresh_codex_apps_tools(
+            codex_mcp::McpAttemptAccess::from_work(work.as_deref()),
+        ).await
     }
 
     /// Returns the environments configured for future turns.
@@ -1091,7 +1094,9 @@ impl CodexThread {
         params: ReadResourceRequestParams,
     ) -> anyhow::Result<serde_json::Value> {
         let work = self.session.request_mcp_work()?;
-        self.session.refresh_mcp_if_dirty().await;
+        self.session.refresh_mcp_if_dirty_with_authority(
+            codex_mcp::McpAttemptAccess::from_work(work.as_deref()),
+        ).await?;
         let result = self
             .session
             .services
@@ -1109,7 +1114,9 @@ impl CodexThread {
         uri: &str,
     ) -> anyhow::Result<serde_json::Value> {
         let work = self.session.request_mcp_work()?;
-        self.session.refresh_mcp_if_dirty().await;
+        self.session.refresh_mcp_if_dirty_with_authority(
+            codex_mcp::McpAttemptAccess::from_work(work.as_deref()),
+        ).await?;
         let result = self
             .session
             .services
@@ -1135,7 +1142,9 @@ impl CodexThread {
             None => None,
         };
         let _ = self.session.services.auth_manager.auth().await;
-        self.session.refresh_mcp_if_dirty().await;
+        self.session.refresh_mcp_if_dirty_with_authority(
+            codex_mcp::McpAttemptAccess::from_work(work.as_deref()),
+        ).await?;
         codex_mcp::McpResourceClient::new(Arc::clone(&self.session.services.mcp_runtime))
             .open_event_stream_with_authority(name, &arguments, meta, codex_mcp::McpAttemptAccess::from_work(work.as_deref()))
             .await
@@ -1149,7 +1158,9 @@ impl CodexThread {
         meta: Option<serde_json::Value>,
     ) -> anyhow::Result<CallToolResult> {
         let work = self.session.request_mcp_work()?;
-        self.session.refresh_mcp_if_dirty().await;
+        self.session.refresh_mcp_if_dirty_with_authority(
+            codex_mcp::McpAttemptAccess::from_work(work.as_deref()),
+        ).await?;
         self.session
             .services
             .mcp_runtime

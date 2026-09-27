@@ -210,12 +210,13 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
     environment_manager: Arc<EnvironmentManager>,
     mcp_manager: Arc<McpManager>,
 ) -> anyhow::Result<AccessibleConnectorsStatus> {
-    list_accessible_connectors_with_custody(
+    list_accessible_connectors_with_authority(
         config,
         force_refetch,
         environment_manager,
         mcp_manager,
         /*retirement*/ None,
+        codex_mcp::McpAttemptAccess::Unscoped,
     )
     .await
 }
@@ -229,22 +230,26 @@ pub async fn list_accessible_connectors_in_retirement(
     mcp_manager: Arc<McpManager>,
     retirement: codex_mcp::McpRuntimeRetirement,
 ) -> anyhow::Result<AccessibleConnectorsStatus> {
-    list_accessible_connectors_with_custody(
+    list_accessible_connectors_with_authority(
         config,
         force_refetch,
         environment_manager,
         mcp_manager,
         Some(retirement),
+        codex_mcp::McpAttemptAccess::Unscoped,
     )
     .await
 }
 
-async fn list_accessible_connectors_with_custody(
+/// Threadless discovery with invocation-owned account authority. Retained MCP
+/// startup attempts derive their own work; no authority is cached with apps.
+pub async fn list_accessible_connectors_with_authority(
     config: &Config,
     force_refetch: bool,
     environment_manager: Arc<EnvironmentManager>,
     mcp_manager: Arc<McpManager>,
     retirement: Option<codex_mcp::McpRuntimeRetirement>,
+    access: codex_mcp::McpAttemptAccess<'_>,
 ) -> anyhow::Result<AccessibleConnectorsStatus> {
     let auth_manager =
         AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await?;
@@ -288,8 +293,14 @@ async fn list_accessible_connectors_with_custody(
         codex_mcp::host_owned_codex_apps_enabled(&mcp_config, auth.as_ref())
             .then(|| Arc::clone(&auth_manager));
     let input = McpRuntimeInput {
-        attempt_requirement: codex_mcp::McpAttemptRequirement::Ungated,
-        startup_work: None,
+        attempt_requirement: match access {
+            codex_mcp::McpAttemptAccess::Unscoped => codex_mcp::McpAttemptRequirement::Ungated,
+            codex_mcp::McpAttemptAccess::Admitted(_) => codex_mcp::McpAttemptRequirement::Required,
+        },
+        startup_work: match access {
+            codex_mcp::McpAttemptAccess::Unscoped => None,
+            codex_mcp::McpAttemptAccess::Admitted(work) => Some(work.derive_attempt()?),
+        },
         startup_policy: McpStartupPolicy::Eager,
         config: Arc::clone(&mcp_config),
         plugins_available: false,
@@ -319,7 +330,7 @@ async fn list_accessible_connectors_with_custody(
 
     let refreshed_tools = if force_refetch {
         match mcp_runtime
-            .latest_hard_refresh_codex_apps_tools_cache()
+            .latest_hard_refresh_codex_apps_tools_cache_with_authority(access)
             .await
         {
             Ok(tools) => Some(tools),
@@ -338,14 +349,14 @@ async fn list_accessible_connectors_with_custody(
     let mut tools = if let Some(tools) = refreshed_tools {
         tools
     } else {
-        mcp_runtime.latest_list_all_tools().await
+        mcp_runtime.latest_list_all_tools_with_authority(access).await
     };
     let mut should_reload_tools = false;
     let codex_apps_ready = if refreshed_tools_succeeded {
         true
     } else if let Some(cfg) = mcp_servers.get(CODEX_APPS_MCP_SERVER_NAME) {
         let immediate_ready = mcp_runtime
-            .latest_wait_for_server_ready(CODEX_APPS_MCP_SERVER_NAME, Duration::ZERO)
+            .latest_wait_for_server_ready_with_authority(CODEX_APPS_MCP_SERVER_NAME, Duration::ZERO, access)
             .await;
         if immediate_ready {
             true
@@ -355,7 +366,7 @@ async fn list_accessible_connectors_with_custody(
                 .startup_timeout_sec
                 .unwrap_or(CONNECTORS_READY_TIMEOUT_ON_EMPTY_TOOLS);
             let ready = mcp_runtime
-                .latest_wait_for_server_ready(CODEX_APPS_MCP_SERVER_NAME, timeout)
+                .latest_wait_for_server_ready_with_authority(CODEX_APPS_MCP_SERVER_NAME, timeout, access)
                 .await;
             should_reload_tools = ready;
             ready
@@ -366,7 +377,7 @@ async fn list_accessible_connectors_with_custody(
         false
     };
     if should_reload_tools {
-        tools = mcp_runtime.latest_list_all_tools().await;
+        tools = mcp_runtime.latest_list_all_tools_with_authority(access).await;
     }
     if codex_apps_ready {
         cancel_token.cancel();

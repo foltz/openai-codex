@@ -1765,13 +1765,26 @@ impl PluginRequestProcessor {
             })
             .collect();
         let environment_manager = self.thread_manager.environment_manager();
+        let request_work = match crate::account_turn_admission::derive_request_work() {
+            Ok(work) => work,
+            Err(_) => {
+                warn!(plugin = plugin_id, "plugin app discovery account work unavailable");
+                return Vec::new();
+            }
+        };
+        let access = request_work.as_ref().map_or(
+            codex_mcp::McpAttemptAccess::Unscoped,
+            |work| codex_mcp::McpAttemptAccess::Admitted(work),
+        );
         let (app_summaries, accessible_connectors_result) = tokio::join!(
             load_plugin_app_summaries(config, auth, &plugin_apps, &app_category_by_id),
-            connectors::list_accessible_connectors_from_mcp_tools_with_mcp_manager(
+            connectors::list_accessible_connectors_with_authority(
                 config,
                 /*force_refetch*/ true,
                 Arc::clone(&environment_manager),
                 self.thread_manager.mcp_manager(),
+                /*retirement*/ None,
+                access,
             ),
         );
 

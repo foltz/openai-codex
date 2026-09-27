@@ -170,10 +170,22 @@ impl Session {
     /// Publishes changed MCP state, waiting for any refresh already in progress.
     #[tracing::instrument(name = "mcp.runtime.refresh_if_dirty", skip_all)]
     pub(crate) async fn refresh_mcp_if_dirty(self: &Arc<Self>) {
-        let Ok(_refresh) = self.mcp_refresh.acquire().await else {
-            error!("MCP runtime refresh semaphore closed");
-            return;
-        };
+        if let Err(error) = self
+            .refresh_mcp_if_dirty_with_authority(codex_mcp::McpAttemptAccess::Unscoped)
+            .await
+        {
+            warn!("MCP runtime refresh failed: {error:#}");
+        }
+    }
+
+    /// The caller owns admission across the refresh; retained startup drivers
+    /// derive their own work before publication. Never freshly admit here.
+    pub(crate) async fn refresh_mcp_if_dirty_with_authority(
+        self: &Arc<Self>,
+        access: codex_mcp::McpAttemptAccess<'_>,
+    ) -> anyhow::Result<()> {
+        let _refresh = self.mcp_refresh.acquire().await
+            .map_err(|_| anyhow::anyhow!("MCP runtime refresh semaphore closed"))?;
         loop {
             // Compare and rebuild from current environments, not choices saved for a future turn.
             let environments = self.services.turn_environments.snapshot().await;
@@ -194,7 +206,7 @@ impl Session {
             }
 
             if !self.mcp_refresh.claim() {
-                return;
+                return Ok(());
             }
             let mut refresh_invalidation = McpRefreshInvalidationGuard {
                 refresh: &self.mcp_refresh,
@@ -235,13 +247,14 @@ impl Session {
                     executor_capability_discovery.as_deref(),
                 )
                 .await;
-            self.publish_mcp_runtime(
+            self.publish_mcp_runtime_with_authority(
                 &desired,
                 mcp_projection,
                 &ready_selected_capability_roots,
                 Some(self.mcp_elicitation_reviewer()),
+                access,
             )
-            .await;
+            .await?;
             refresh_invalidation.published = true;
         }
     }
@@ -249,16 +262,17 @@ impl Session {
     /// Refreshes Apps tools on the published thread runtime and returns that client's snapshot.
     pub(crate) async fn refresh_codex_apps_tools(
         self: &Arc<Self>,
+        access: codex_mcp::McpAttemptAccess<'_>,
     ) -> anyhow::Result<codex_mcp::CodexAppsToolSnapshot> {
         // Reconcile unchanged config so failed or closed clients can be replaced.
         self.mark_mcp_runtime_dirty();
-        self.refresh_mcp_if_dirty().await;
+        self.refresh_mcp_if_dirty_with_authority(access).await?;
         let _refresh = self
             .mcp_refresh
             .acquire()
             .await
             .map_err(|_| anyhow::anyhow!("MCP runtime refresh semaphore closed"))?;
-        self.services.mcp_runtime.refresh_codex_apps_tools().await
+        self.services.mcp_runtime.refresh_codex_apps_tools_with_authority(access).await
     }
 
     /// Reconnects the runtime so refreshed Apps tools belong to their new exact client.

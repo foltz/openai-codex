@@ -157,6 +157,9 @@ async fn managed_trace_route_preserves_explicit_request_spawn_and_submission_par
     write_otel_config(home.path(), &format!("{}/trace-test", collector.uri()))?;
     let config_path = home.path().join("config.toml");
     let config = std::fs::read_to_string(&config_path)?;
+    // Detached snapshot work retains the request span while running the login
+    // shell. This fixture tests parent selection, not shell-profile completion.
+    let config = format!("{config}\n[features]\nshell_snapshot = false\n");
     std::fs::write(
         config_path,
         config.replace("http://127.0.0.1:1/v1", &format!("{}/v1", model.uri())),

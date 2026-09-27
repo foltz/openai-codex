@@ -214,6 +214,7 @@ where
                         executor_capability_discovery: None,
                     },
                     &thread_state,
+                    Ok(codex_mcp::McpAttemptAccess::Unscoped),
                 )
                 .await;
             for warning in bounded_warnings(&catalog.warnings) {
@@ -392,7 +393,7 @@ where
                 .get::<ExecutorSkillsStepState>()
                 .map(|executor_skills| executor_skills.0.clone())
                 .unwrap_or_default();
-            catalog.extend(self.list_skills(query, &thread_state).await);
+            catalog.extend(self.list_skills(query, &thread_state, input.mcp_access).await);
             for warning in bounded_warnings(&catalog.warnings) {
                 self.emit_warning(thread_store.level_id(), Some(&input.turn_id), warning);
             }
@@ -461,6 +462,7 @@ where
                         host_snapshot.clone(),
                         mcp_resources.clone(),
                         &thread_state,
+                        input.mcp_access,
                     )
                     .await
                 {
@@ -580,6 +582,7 @@ impl<C> SkillsExtension<C> {
         &self,
         mut query: SkillListQuery,
         thread_state: &SkillsThreadState,
+        mcp_access: Result<codex_mcp::McpAttemptAccess<'_>, codex_mcp::McpAttemptRefused>,
     ) -> SkillCatalog {
         let include_orchestrator_skills = query.include_orchestrator_skills;
         let orchestrator_query = query.clone();
@@ -588,7 +591,7 @@ impl<C> SkillsExtension<C> {
         let mut catalog = self.providers.list_for_turn(query).await;
         if include_orchestrator_skills {
             let orchestrator_catalog = thread_state
-                .orchestrator_catalog_snapshot(&self.providers, orchestrator_query, Ok(codex_mcp::McpAttemptAccess::Unscoped))
+                .orchestrator_catalog_snapshot(&self.providers, orchestrator_query, mcp_access)
                 .await;
             catalog.extend(orchestrator_catalog);
         }
@@ -602,12 +605,13 @@ impl<C> SkillsExtension<C> {
         host_snapshot: Option<Arc<HostSkillsSnapshot>>,
         mcp_resources: Option<Arc<McpResourceClient>>,
         thread_state: &SkillsThreadState,
+        mcp_access: Result<codex_mcp::McpAttemptAccess<'_>, codex_mcp::McpAttemptRefused>,
     ) -> Result<SkillReadResult, String> {
         thread_state
             .read_skill(
                 &self.providers,
                 SkillReadRequest {
-                    mcp_access: Ok(codex_mcp::McpAttemptAccess::Unscoped),
+                    mcp_access,
                     _lifetime: PhantomData,
                     authority: entry.authority.clone(),
                     package: entry.id.clone(),

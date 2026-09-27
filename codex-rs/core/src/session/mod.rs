@@ -4384,6 +4384,21 @@ impl Session {
         step_context: &StepContext,
         world_state: &WorldState,
     ) -> Vec<ResponseItem> {
+        let work = self.turn_mcp_work(&step_context.turn);
+        let access = match &work {
+            Ok(work) => Ok(codex_mcp::McpAttemptAccess::from_work(work.as_deref())),
+            Err(_) => Err(codex_mcp::McpAttemptRefused),
+        };
+        self.build_initial_context_with_world_state_and_authority(step_context, world_state, access)
+            .await
+    }
+
+    async fn build_initial_context_with_world_state_and_authority(
+        &self,
+        step_context: &StepContext,
+        world_state: &WorldState,
+        access: Result<codex_mcp::McpAttemptAccess<'_>, codex_mcp::McpAttemptRefused>,
+    ) -> Vec<ResponseItem> {
         let turn_context = step_context.turn.as_ref();
         let mut developer_sections = Vec::<RenderedFragment>::with_capacity(8);
         let mut contextual_user_sections = Vec::<RenderedFragment>::with_capacity(2);
@@ -4488,10 +4503,11 @@ impl Session {
                 .token_budget
                 .as_ref()
                 .is_some_and(|config| config.use_history_notes_extension)
+                && let Ok(access) = access
                 && let Some(mcp_result) = self
                     .services
                     .mcp_runtime
-                    .latest_call_tool(
+                    .latest_call_tool_with_authority(
                         "notes",
                         "thread_hint",
                         /*environment_id*/ None,
@@ -4501,6 +4517,7 @@ impl Session {
                         })),
                         /*requested_timeout*/ None,
                         /*wait_for_server*/ true,
+                        access,
                     )
                     .await
                     .ok()
@@ -4756,6 +4773,19 @@ impl Session {
         &self,
         step_context: &StepContext,
     ) -> CodexResult<Arc<WorldState>> {
+        let work = self.turn_mcp_work(&step_context.turn);
+        let access = match &work {
+            Ok(work) => Ok(codex_mcp::McpAttemptAccess::from_work(work.as_deref())),
+            Err(_) => Err(codex_mcp::McpAttemptRefused),
+        };
+        self.record_context_updates_with_authority(step_context, access).await
+    }
+
+    pub(crate) async fn record_context_updates_with_authority(
+        &self,
+        step_context: &StepContext,
+        access: Result<codex_mcp::McpAttemptAccess<'_>, codex_mcp::McpAttemptRefused>,
+    ) -> CodexResult<Arc<WorldState>> {
         let turn_context = step_context.turn.as_ref();
         let reference_context_item = {
             let state = self.state.lock().await;
@@ -4764,11 +4794,13 @@ impl Session {
         let turn_context_item = step_context.to_turn_context_item();
         let turn_context_changed = reference_context_item.as_ref() != Some(&turn_context_item);
         let should_inject_full_context = reference_context_item.is_none();
-        let world_state = Arc::new(self.build_world_state_for_step(step_context).await?);
+        let world_state = Arc::new(
+            self.build_world_state_for_step_with_authority(step_context, access).await?
+        );
         // Full initial context resets the baseline; later turns persist only its changes.
         let (mut context_items, world_state_item) = if should_inject_full_context {
             let context_items = self
-                .build_initial_context_with_world_state(step_context, world_state.as_ref())
+                .build_initial_context_with_world_state_and_authority(step_context, world_state.as_ref(), access)
                 .await;
             let snapshot = world_state.snapshot();
             self.state

@@ -1185,7 +1185,13 @@ async fn build_extension_turn_input_items(
         })
         .collect::<Vec<_>>();
 
+    let mcp_work = sess.turn_mcp_work(turn_context);
+    let mcp_access = match &mcp_work {
+        Ok(work) => Ok(codex_mcp::McpAttemptAccess::from_work(work.as_deref())),
+        Err(_) => Err(codex_mcp::McpAttemptRefused),
+    };
     let input = TurnInputContext {
+        mcp_access,
         turn_id: turn_context.sub_id.to_string(),
         user_input: user_input.to_vec(),
         environments,

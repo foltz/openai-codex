@@ -36,6 +36,19 @@ impl Session {
         &self,
         step_context: &StepContext,
     ) -> CodexResult<WorldState> {
+        let work = self.turn_mcp_work(&step_context.turn);
+        let access = match &work {
+            Ok(work) => Ok(codex_mcp::McpAttemptAccess::from_work(work.as_deref())),
+            Err(_) => Err(codex_mcp::McpAttemptRefused),
+        };
+        self.build_world_state_for_step_with_authority(step_context, access).await
+    }
+
+    pub(crate) async fn build_world_state_for_step_with_authority(
+        &self,
+        step_context: &StepContext,
+        access: Result<codex_mcp::McpAttemptAccess<'_>, codex_mcp::McpAttemptRefused>,
+    ) -> CodexResult<WorldState> {
         let turn_context = step_context.turn.as_ref();
         let settings = &step_context.settings;
         let model_info = settings.model_info.as_ref();
@@ -253,6 +266,7 @@ impl Session {
         for contributor in self.services.extensions.context_contributors() {
             for section in contributor
                 .contribute_world_state(WorldStateContributionInput {
+                    mcp_access: access,
                     thread_id: self.thread_id(),
                     turn_id: turn_context.sub_id.as_str(),
                     model_info: &step_context.settings.model_info,

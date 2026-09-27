@@ -847,7 +847,7 @@ impl CodexThread {
                 )
                 .await?;
             self.session
-                .record_context_updates_and_set_reference_context_item(step_context.as_ref())
+                .record_context_updates_with_authority(step_context.as_ref(), Ok(access))
                 .await?;
         }
         self.session

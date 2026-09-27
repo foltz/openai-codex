@@ -12,6 +12,8 @@ use crate::ExtensionMetrics;
 
 /// Host state available while an extension contributes one sampling step's World State.
 pub struct WorldStateContributionInput<'a> {
+    /// Invocation-only MCP authority; refusal must not become ungated access.
+    pub mcp_access: Result<codex_mcp::McpAttemptAccess<'a>, codex_mcp::McpAttemptRefused>,
     pub thread_id: ThreadId,
     pub turn_id: &'a str,
     /// Resolved model metadata captured for this sampling step, retained across discovery.

@@ -18,6 +18,8 @@ pub struct TurnInputEnvironment<'a> {
 /// Turn facts supplied before the host records turn-local model input items.
 #[derive(Debug, Clone)]
 pub struct TurnInputContext<'a> {
+    /// Invocation-only MCP authority; refusal must not become ungated access.
+    pub mcp_access: Result<codex_mcp::McpAttemptAccess<'a>, codex_mcp::McpAttemptRefused>,
     /// Stable host-owned turn identifier.
     pub turn_id: String,
     /// User input submitted for this turn.

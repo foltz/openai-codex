@@ -867,7 +867,7 @@ async fn ensure_guardian_node_repl_policy(
                 .await?;
             review_session
                 .session
-                .record_context_updates_and_set_reference_context_item(step_context.as_ref())
+                .record_context_updates_with_authority(step_context.as_ref(), Ok(access))
                 .await?;
             Ok(())
         });

@@ -2623,6 +2623,12 @@ async fn assert_catalog_model_switch(max_context_tokens: Option<usize>) -> Resul
     const MODEL_A: &str = "skills-model-a";
     const MODEL_B: &str = "skills-model-b";
     let server = responses::start_mock_server().await;
+    // Exporter shutdown flushes to the configured sink after the snapshot assertions.
+    Mock::given(method("POST"))
+        .and(path_regex("^/metrics$"))
+        .respond_with(ResponseTemplate::new(/*status*/ 200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
     let response = responses::mount_sse_sequence(
         &server,
         vec![

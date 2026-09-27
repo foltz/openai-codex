@@ -310,7 +310,7 @@ impl Session {
         input: Vec<TurnInput>,
         task: T,
     ) -> CodexResult<()> {
-        self.input_queue.preparation.cancel_for_replacement();
+        let _ = self.input_queue.preparation.cancel_for_replacement();
         self.abort_all_tasks(TurnAbortReason::Replaced).await;
         self.clear_connector_selection().await;
         self.start_task(turn_context, input, task).await
@@ -348,10 +348,14 @@ impl Session {
         turn_context: Arc<TurnContext>,
         input: Vec<TurnInput>,
         task: T,
-        mut mailbox: crate::session::MailboxReservation,
+        mailbox: crate::session::MailboxReservation,
         reservation: TaskReservation,
     ) -> CodexResult<()> {
-        let turn_state = {
+        let mut replacement = None;
+        // Locals drop in reverse order: restore any uncommitted mail before
+        // the replacement guard's retry wake, including cancellation in wait.
+        let mut mailbox = mailbox;
+        let turn_state = loop {
             let mut active = self.active_turn.lock().await;
             if self.task_admission_closed.load(std::sync::atomic::Ordering::Acquire) {
                 return Err(CodexErr::Fatal("thread task admission is closed".to_string()));
@@ -359,23 +363,34 @@ impl Session {
             if active.as_ref().is_some_and(|turn| turn.task.is_some()) {
                 return Err(CodexErr::Fatal("thread already has an active task".to_string()));
             }
-            match reservation {
+            match &reservation {
                 TaskReservation::New => {
-                    // Preparation can register while replacement awaits the
-                    // old task's abort. Cancel under the registration lock
-                    // before replacing its task-less slot. A distinct identity
-                    // prevents the cancelled owner from clearing our slot.
-                    self.input_queue.preparation.cancel_for_replacement();
+                    let completed = if replacement.is_some() {
+                        self.input_queue.preparation.cancel_for_replacement()
+                    } else {
+                        let (guard, completed) = self.input_queue.preparation
+                            .begin_replacement(&self.input_queue.completion_wake);
+                        replacement = Some(guard);
+                        completed
+                    };
+                    if let Some(completed) = completed {
+                        // Realtime can replace from another task. Cancellation
+                        // alone cannot stop a callback already mid-poll. Wait
+                        // for its owner to drop before owning a new slot.
+                        drop(active);
+                        completed.cancelled().await;
+                        continue;
+                    }
                     let turn = ActiveTurn::default();
                     let turn_state = Arc::clone(&turn.turn_state);
                     *active = Some(turn);
-                    turn_state
+                    break turn_state;
                 }
                 TaskReservation::Existing(expected) => {
-                    if !active.as_ref().is_some_and(|turn| Arc::ptr_eq(&turn.turn_state, &expected)) {
+                    if !active.as_ref().is_some_and(|turn| Arc::ptr_eq(&turn.turn_state, expected)) {
                         return Err(CodexErr::Fatal("thread task reservation changed".to_string()));
                     }
-                    expected
+                    break Arc::clone(expected);
                 }
             }
         };
@@ -568,6 +583,9 @@ impl Session {
                 .load(std::sync::atomic::Ordering::Acquire)
                 || active_turn.is_some()
             {
+                return;
+            }
+            if self.input_queue.preparation.defer_if_busy(&self.input_queue.completion_wake) {
                 return;
             }
             // Reserve atomically with the idle decision, before discovery.

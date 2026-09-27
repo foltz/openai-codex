@@ -116,6 +116,18 @@ async fn closed_submission_channel_takes_precedence_over_completion_wake() {
 
 struct HeldTask;
 
+struct HoldInstalledTurn;
+
+impl codex_extension_api::TurnLifecycleContributor for HoldInstalledTurn {
+    fn turn_start_phase(&self, _store: &codex_extension_api::ExtensionData) -> codex_extension_api::TurnStartPhase {
+        codex_extension_api::TurnStartPhase::RegularTaskStart
+    }
+
+    fn on_turn_start<'a>(&'a self, _input: codex_extension_api::TurnStartInput<'a>) -> codex_extension_api::ExtensionFuture<'a, ()> {
+        Box::pin(std::future::pending())
+    }
+}
+
 impl crate::tasks::SessionTask for HeldTask {
     fn kind(&self) -> crate::state::TaskKind { crate::state::TaskKind::Regular }
 
@@ -171,15 +183,16 @@ async fn replaced_mailbox_preparation_stops_before_overwriting_installed_task() 
         }
     });
     tokio::time::timeout(Duration::from_secs(10), async {
-        tokio::select! {
-            _ = &mut winner => panic!("winner must park in its callback"),
-            entered = pause.entered.acquire() => entered.unwrap().forget(),
-        }
+        tokio::join!(first, async {
+            tokio::select! {
+                _ = &mut winner => panic!("winner must park in its callback"),
+                entered = pause.entered.acquire() => entered.unwrap().forget(),
+            }
+        });
     }).await.unwrap();
-    // Losing cleanup runs while the winner is still task-less. It must not
-    // clear the winner's different reservation or resume the losing callback.
+    // The winner cannot enter callbacks until the losing owner has dropped.
+    // Its distinct reservation remains intact while its own callback waits.
     let winner_state = Arc::clone(&session.active_turn.lock().await.as_ref().unwrap().turn_state);
-    tokio::time::timeout(Duration::from_secs(10), first).await.unwrap();
     assert!(Arc::ptr_eq(&session.active_turn.lock().await.as_ref().unwrap().turn_state, &winner_state));
     assert_eq!(pause.resumed.load(std::sync::atomic::Ordering::SeqCst), 0);
     pause.release.add_permits(1);
@@ -275,4 +288,182 @@ async fn interrupted_mailbox_preparation_restores_mail_without_rearming_the_wake
     assert!(session.input_queue.completion_wake.notified().now_or_never().is_none());
     assert_eq!(session.input_queue.drain_mailbox_input_items().await.0,
         vec![TurnInput::InterAgentCommunication(mail)]);
+}
+
+#[tokio::test]
+async fn off_loop_replacers_wait_without_owning_slots_and_release_mail_on_cancel() {
+    let (mut session, _) = tests::make_session_and_context().await;
+    let pause = Arc::new(PausedStart {
+        pause_calls: 2,
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        entered: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+        resumed: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::<Config>::new();
+    builder.turn_lifecycle_contributor(pause.clone());
+    session.services.extensions = Arc::new(builder.build());
+    let session = Arc::new(session);
+    let mail = InterAgentCommunication::new(
+        codex_protocol::AgentPath::root(), codex_protocol::AgentPath::root(),
+        Vec::new(), "cancelled replacement".into(), /*trigger_turn*/ true,
+    );
+    session.input_queue.enqueue_mailbox_communication(mail.clone(), Default::default()).await;
+    let mut first = Box::pin(session.maybe_start_turn_for_pending_work_with_sub_id("loser".into()));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::select! {
+            _ = &mut first => panic!("preparation must park"),
+            entered = pause.entered.acquire() => entered.unwrap().forget(),
+        }
+    }).await.unwrap();
+    let original = Arc::clone(&session.active_turn.lock().await.as_ref().unwrap().turn_state);
+    let mut replacements = Vec::new();
+    for id in ["first replacement", "second replacement"] {
+        let context = session.new_turn_with_default_settings(id.into(), Default::default()).await;
+        let replacing_session = Arc::clone(&session);
+        let replacement = tokio::spawn(async move {
+            let mut replacement = Box::pin(async move {
+                replacing_session.start_task(context, Vec::new(), HeldTask).await
+            });
+            // No locks are contended and New must stop at its completion
+            // witness before plugin awaits or a replacement slot exist.
+            assert!(replacement.as_mut().now_or_never().is_none());
+            replacement
+        }).await.unwrap();
+        assert!(Arc::ptr_eq(&session.active_turn.lock().await.as_ref().unwrap().turn_state, &original));
+        replacements.push(replacement);
+    }
+    drop(replacements.pop());
+    tokio::time::timeout(Duration::from_secs(10), first).await.unwrap();
+    assert!(session.active_turn.lock().await.is_none());
+    assert!(session.input_queue.completion_wake.notified().now_or_never().is_some());
+    session.maybe_start_turn_for_pending_work_with_sub_id("still blocked".into()).await;
+    assert_eq!(pause.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(session.input_queue.has_pending_mailbox_items().await);
+    assert!(session.input_queue.completion_wake.notified().now_or_never().is_none());
+    drop(replacements);
+    assert!(session.input_queue.completion_wake.notified().now_or_never().is_some());
+    let mut retry = Box::pin(session.maybe_start_turn_for_pending_work_with_sub_id("retry".into()));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::select! {
+            _ = &mut retry => panic!("restored mail must reach preparation"),
+            entered = pause.entered.acquire() => entered.unwrap().forget(),
+        }
+    }).await.unwrap();
+    assert_eq!(pause.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    session.close_task_admission().await;
+    drop(retry);
+    assert_eq!(session.input_queue.drain_mailbox_input_items().await.0,
+        vec![TurnInput::InterAgentCommunication(mail)]);
+}
+
+#[tokio::test]
+async fn interrupted_registration_defers_new_trigger_and_idle_start_until_owner_drops() {
+    let (mut session, _) = tests::make_session_and_context().await;
+    let pause = Arc::new(PausedStart {
+        pause_calls: 2,
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        entered: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+        resumed: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::<Config>::new();
+    builder.turn_lifecycle_contributor(pause.clone());
+    session.services.extensions = Arc::new(builder.build());
+    let session = Arc::new(session);
+    let mail = InterAgentCommunication::new(
+        codex_protocol::AgentPath::root(), codex_protocol::AgentPath::root(),
+        Vec::new(), "interrupted owner".into(), /*trigger_turn*/ true,
+    );
+    session.input_queue.enqueue_mailbox_communication(mail.clone(), Default::default()).await;
+    let mut first = Box::pin(session.maybe_start_turn_for_pending_work_with_sub_id("interrupted".into()));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::select! {
+            _ = &mut first => panic!("preparation must park"),
+            entered = pause.entered.acquire() => entered.unwrap().forget(),
+        }
+    }).await.unwrap();
+    session.interrupt_task().await;
+    let result = turn_input::handle(
+        &session,
+        codex_protocol::turn_input::TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "idle contender".into(), text_elements: Vec::new(),
+        }]),
+        codex_protocol::turn_input::TurnInputMode::StartIfIdle,
+        "idle contender".into(),
+    ).await.unwrap();
+    assert_eq!(result, codex_protocol::turn_input::TurnInputSubmission::NotSubmitted {
+        reason: codex_protocol::turn_input::NotSubmittedReason::NotIdle,
+    });
+    session.input_queue.enqueue_mailbox_communication(mail.clone(), Default::default()).await;
+    session.maybe_start_turn_for_pending_work_with_sub_id("new trigger".into()).await;
+    assert_eq!(pause.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    pause.release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(10), first).await.unwrap();
+    assert!(session.active_turn.lock().await.is_none());
+    assert!(session.input_queue.completion_wake.notified().now_or_never().is_some());
+    let mut retry = Box::pin(session.maybe_start_turn_for_pending_work_with_sub_id("deferred trigger".into()));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::select! {
+            _ = &mut retry => panic!("deferred trigger must reach preparation"),
+            entered = pause.entered.acquire() => entered.unwrap().forget(),
+        }
+    }).await.unwrap();
+    assert_eq!(pause.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    session.close_task_admission().await;
+    drop(retry);
+    assert_eq!(session.input_queue.drain_mailbox_input_items().await.0, vec![
+        TurnInput::InterAgentCommunication(mail.clone()), TurnInput::InterAgentCommunication(mail),
+    ]);
+}
+
+#[tokio::test]
+async fn replacement_observes_idle_start_completion_without_cancelling_its_input() {
+    let (mut session, _) = tests::make_session_and_context().await;
+    let pause = Arc::new(PausedStart {
+        pause_calls: 1,
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        entered: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+        resumed: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::<Config>::new();
+    builder.turn_lifecycle_contributor(pause.clone());
+    builder.turn_lifecycle_contributor(Arc::new(HoldInstalledTurn));
+    session.services.extensions = Arc::new(builder.build());
+    let session = Arc::new(session);
+    let mut idle = Box::pin(turn_input::handle(
+        &session,
+        codex_protocol::turn_input::TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "idle input".into(), text_elements: Vec::new(),
+        }]),
+        codex_protocol::turn_input::TurnInputMode::StartIfIdle,
+        "idle owner".into(),
+    ));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::select! {
+            _ = &mut idle => panic!("idle start must park"),
+            entered = pause.entered.acquire() => entered.unwrap().forget(),
+        }
+    }).await.unwrap();
+    let original = Arc::clone(&session.active_turn.lock().await.as_ref().unwrap().turn_state);
+    let context = session.new_turn_with_default_settings("replacement".into(), Default::default()).await;
+    let replacing_session = Arc::clone(&session);
+    let replacement = tokio::spawn(async move {
+        let mut replacement = Box::pin(async move {
+            replacing_session.start_task(context, Vec::new(), HeldTask).await
+        });
+        assert!(replacement.as_mut().now_or_never().is_none());
+        replacement
+    }).await.unwrap();
+    assert!(Arc::ptr_eq(&session.active_turn.lock().await.as_ref().unwrap().turn_state, &original));
+    pause.release.add_permits(1);
+    assert_eq!(tokio::time::timeout(Duration::from_secs(10), idle).await.unwrap().unwrap(),
+        codex_protocol::turn_input::TurnInputSubmission::Started { turn_id: "idle owner".into() });
+    assert!(tokio::time::timeout(Duration::from_secs(10), replacement).await.unwrap().is_err());
+    assert_eq!(pause.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(session.state.lock().await.last_started_turn_id.as_deref(), Some("idle owner"));
+    session.close_task_admission().await;
+    session.abort_all_tasks(codex_protocol::protocol::TurnAbortReason::Interrupted).await;
+    let _ = session.task_joins.shutdown_until(tokio::time::Instant::now() + Duration::from_secs(5)).await;
 }

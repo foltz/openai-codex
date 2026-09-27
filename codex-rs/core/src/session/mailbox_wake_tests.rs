@@ -375,12 +375,15 @@ async fn reserved_start_refuses_a_cleared_or_replaced_slot_before_callbacks() {
         assert!(result.is_err());
         assert_eq!(pause.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(session.state.lock().await.last_started_turn_id, None);
-        let active = session.active_turn.lock().await;
-        match successor_state {
-            Some(expected) => assert!(Arc::ptr_eq(&active.as_ref().unwrap().turn_state, &expected)),
-            None => assert!(active.is_none()),
+        {
+            let active = session.active_turn.lock().await;
+            match successor_state {
+                Some(expected) => {
+                    assert!(Arc::ptr_eq(&active.as_ref().unwrap().turn_state, &expected))
+                }
+                None => assert!(active.is_none()),
+            }
         }
-        drop(active);
         assert_eq!(
             session.input_queue.drain_mailbox_input_items().await.0,
             vec![TurnInput::InterAgentCommunication(mail)]

@@ -293,14 +293,15 @@ async fn exact_thread_idle_commit_refuses_busy_or_active_admission_without_effec
     ));
     assert!(!thread.session.task_admission_closed.load(Ordering::Acquire));
     let deadline = Instant::now() + Duration::from_secs(3);
-    let mut active = thread.session.active_turn.lock().await;
-    assert!(matches!(
-        thread.try_begin_idle_retirement(deadline),
-        Err(crate::ThreadRetirementError::TaskAdmissionBusy)
-    ));
-    assert!(!thread.session.task_admission_closed.load(Ordering::Acquire));
-    *active = Some(crate::state::ActiveTurn::default());
-    drop(active);
+    {
+        let mut active = thread.session.active_turn.lock().await;
+        assert!(matches!(
+            thread.try_begin_idle_retirement(deadline),
+            Err(crate::ThreadRetirementError::TaskAdmissionBusy)
+        ));
+        assert!(!thread.session.task_admission_closed.load(Ordering::Acquire));
+        *active = Some(crate::state::ActiveTurn::default());
+    }
     assert!(matches!(
         thread.try_begin_idle_retirement(deadline),
         Err(crate::ThreadRetirementError::ActiveWork)
@@ -455,6 +456,10 @@ async fn exact_thread_full_submission_queue_freezes_births_before_waiting() {
 }
 
 #[tokio::test(start_paused = true)]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "the test keeps admission locked until the shutdown observer deadline expires"
+)]
 async fn exact_thread_expired_observer_does_not_resume_shutdown_enqueue() {
     let thread = exact_thread_fixture(ThreadLoopFixture::Hung).await;
     let active = thread.session.active_turn.lock().await;
@@ -686,6 +691,10 @@ async fn auxiliary_startup_is_joined_and_cannot_restart_after_cleanup() {
 }
 
 #[tokio::test(start_paused = true)]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "blocked common cleanup is the discriminator for independent MCP retirement"
+)]
 async fn blocked_common_cleanup_does_not_starve_mcp_retirement() {
     let (session, _) = super::super::tests::make_session_and_context().await;
     let session = Arc::new(session);
@@ -826,6 +835,10 @@ async fn expired_cleanup_does_not_start_and_cannot_refresh_its_budget() {
 }
 
 #[tokio::test(start_paused = true)]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "the held admission lock keeps cleanup pending while its deadline is tightened"
+)]
 async fn tightening_deadline_wakes_an_existing_cleanup_observer() {
     let (session, _) = super::super::tests::make_session_and_context().await;
     let session = Arc::new(session);
@@ -910,12 +923,13 @@ async fn cancelled_suspension_observer_retains_its_cleanup_sequence() {
     let (session, _) = super::super::tests::make_session_and_context().await;
     let session = Arc::new(session);
     let owner = session.cleanup_owner();
-    let guard = session.active_turn.lock().await;
-    let mut observer = Box::pin(owner.observe_suspension(Arc::clone(&session)));
-    assert!(futures::poll!(observer.as_mut()).is_pending());
-    drop(observer);
-    assert_eq!(owner.completed(), None);
-    drop(guard);
+    {
+        let _guard = session.active_turn.lock().await;
+        let mut observer = Box::pin(owner.observe_suspension(Arc::clone(&session)));
+        assert!(futures::poll!(observer.as_mut()).is_pending());
+        drop(observer);
+        assert_eq!(owner.completed(), None);
+    }
     // Resuming through the ordinary entry point must still use suspension's
     // strict writer requirement, not construct a second common cleanup.
     assert_eq!(

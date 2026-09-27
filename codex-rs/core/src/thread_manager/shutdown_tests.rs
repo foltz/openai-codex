@@ -126,6 +126,10 @@ async fn manager_shutdown_owns_removed_and_loaded_threads_before_first_poll() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "holding the lookup lock is the discriminator proving independent runtime cleanup"
+)]
 async fn manager_shutdown_does_not_let_lookup_lock_starve_runtime_cleanup() {
     let (_home, manager, config) = manager().await;
     let started = manager

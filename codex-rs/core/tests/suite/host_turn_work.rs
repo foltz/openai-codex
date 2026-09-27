@@ -38,11 +38,11 @@ struct Lease {
 
 impl HostTurnWork for Lease {
     fn bind_submission(&mut self, turn_id: &str) {
-        self.evidence.lock().unwrap().bound = Some(turn_id.to_owned());
+        self.evidence.lock().expect("test evidence lock").bound = Some(turn_id.to_owned());
     }
 
     fn retain_until_terminal(mut self: Box<Self>) {
-        self.evidence.lock().unwrap().retained += 1;
+        self.evidence.lock().expect("test evidence lock").retained += 1;
         self.retained = true;
     }
 }
@@ -50,7 +50,7 @@ impl HostTurnWork for Lease {
 impl Drop for Lease {
     fn drop(&mut self) {
         if !self.retained {
-            self.evidence.lock().unwrap().cancelled += 1;
+            self.evidence.lock().expect("test evidence lock").cancelled += 1;
         }
     }
 }
@@ -87,7 +87,11 @@ impl TurnLifecycleContributor for Gate {
     fn on_turn_start<'a>(&'a self, input: TurnStartInput<'a>) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
             assert_eq!(
-                self.evidence.lock().unwrap().bound.as_deref(),
+                self.evidence
+                    .lock()
+                    .expect("test evidence lock")
+                    .bound
+                    .as_deref(),
                 Some(input.turn_id)
             );
             self.entered.notify_one();
@@ -127,10 +131,11 @@ async fn cancelled_caller_does_not_release_a_queued_turn_lease() -> anyhow::Resu
         matches!(event, EventMsg::TurnComplete(_))
     })
     .await;
-    let evidence = gate.evidence.lock().unwrap();
-    assert!(evidence.bound.is_some());
-    assert_eq!((evidence.retained, evidence.cancelled), (1, 0));
-    drop(evidence);
+    {
+        let evidence = gate.evidence.lock().unwrap();
+        assert!(evidence.bound.is_some());
+        assert_eq!((evidence.retained, evidence.cancelled), (1, 0));
+    }
     assert_eq!(response.requests().len(), 1);
     test.codex.shutdown_and_wait().await?;
     Ok(())

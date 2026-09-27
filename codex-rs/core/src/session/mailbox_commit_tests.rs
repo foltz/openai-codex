@@ -48,6 +48,10 @@ fn mail(content: &str) -> InterAgentCommunication {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "the test holds the destination lock to prove cancellation restores the private batch"
+)]
 async fn cancelled_commit_restores_batch_while_destination_is_locked() {
     let queue = InputQueue::new();
     let original = mail("held");

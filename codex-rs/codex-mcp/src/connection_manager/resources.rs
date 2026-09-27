@@ -59,7 +59,14 @@ impl McpConnectionSet {
             };
             let timeout = view.tool_timeout;
             let client = managed_client.client;
+            let Ok(work) = view.connection.client.client.requirement.derive(access) else {
+                warn!("MCP resource listing account work is unavailable for '{server_name}'");
+                continue;
+            };
             join_set.spawn(async move {
+                // JoinSet drop requests abort; the task itself retains work
+                // until that abort has actually destroyed its future.
+                let _work = work;
                 let resources = collect_paginated("resources/list", timeout, |params| {
                     let client = Arc::clone(&client);
                     async move {
@@ -114,7 +121,12 @@ impl McpConnectionSet {
             };
             let timeout = view.tool_timeout;
             let client = managed_client.client;
+            let Ok(work) = view.connection.client.client.requirement.derive(access) else {
+                warn!("MCP resource template listing account work is unavailable for '{server_name}'");
+                continue;
+            };
             join_set.spawn(async move {
+                let _work = work;
                 let templates = collect_paginated("resources/templates/list", timeout, |params| {
                     let client = Arc::clone(&client);
                     async move {

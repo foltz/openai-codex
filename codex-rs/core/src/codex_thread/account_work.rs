@@ -15,6 +15,23 @@ use codex_protocol::turn_input::TurnInputRequest;
 use codex_protocol::turn_input::TurnInputSubmission;
 
 impl CodexThread {
+    /// A reconnect after an idle event subscription is new background work.
+    /// Refuse before opening when admission is closed; do not wait for reopen
+    /// or derive from the already-completed stream-start request.
+    pub fn admit_mcp_event_stream_retry(
+        &self,
+    ) -> anyhow::Result<Option<Box<dyn codex_mcp::McpAttemptWork>>> {
+        let Some(host) = &self.session.services.host_admission else {
+            return Ok(None);
+        };
+        host.admit_operation_work()
+            .map(|work| work.map(|work| {
+                Box::new(crate::session::McpOperationWork(work))
+                    as Box<dyn codex_mcp::McpAttemptWork>
+            }))
+            .map_err(|_| anyhow::anyhow!("MCP event stream retry account work is unavailable"))
+    }
+
     /// Observe ordinary shutdown, exact loop termination, and retained cleanup
     /// separately. A pre-shutdown loop panic still needs its cleanup driven.
     /// This binds no new deadline and cannot turn a failed loop into success.

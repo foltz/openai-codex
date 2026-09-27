@@ -1425,7 +1425,17 @@ impl MessageProcessor {
             ClientRequest::McpServerEventStreamStart { params, .. } => Some(
                 session
                     .mcp_event_streams
-                    .start(connection_id, params.clone(), self.mcp_processor.clone())
+                    .start(
+                        connection_id,
+                        params.clone(),
+                        self.mcp_processor.clone(),
+                        // This spawn precedes within_request; capture from the
+                        // actual request permit, not an absent task-local scope.
+                        account_work_permit.as_ref()
+                            .map(codex_mcp::McpAttemptWork::derive_attempt)
+                            .transpose()
+                            .map_err(|_| account_transition_in_progress())?,
+                    )
                     .await?,
             ),
             _ => None,

@@ -10,6 +10,8 @@ use codex_app_server_protocol::ServerNotification;
 use codex_core::CodexThread;
 use codex_login::AuthManager;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
+use codex_mcp::McpAttemptAccess;
+use codex_mcp::McpAttemptWork;
 use codex_mcp::McpEventStream;
 use codex_protocol::ThreadId;
 use serde_json::Value;
@@ -49,6 +51,7 @@ impl McpEventStreams {
         connection_id: ConnectionId,
         params: McpServerEventStreamStartParams,
         processor: McpRequestProcessor,
+        account_work: Option<Box<dyn McpAttemptWork>>,
     ) -> Result<McpEventStreamReady, JSONRPCErrorError> {
         if params.server != CODEX_APPS_MCP_SERVER_NAME {
             return Err(invalid_request(
@@ -96,10 +99,11 @@ impl McpEventStreams {
                         }
                         let (_, thread) = processor.load_thread(&params.thread_id).await?;
                         let stream = thread
-                            .start_mcp_event_stream(
+                            .start_mcp_event_stream_with_authority(
                                 &params.name,
                                 params.arguments.clone(),
                                 params.meta.clone(),
+                                McpAttemptAccess::from_work(account_work.as_deref()),
                             )
                             .await
                             .map_err(|error| internal_error(format!(
@@ -119,6 +123,7 @@ impl McpEventStreams {
                             stream,
                             auth_changes,
                             ready_tx,
+                            account_work,
                         )
                         .await;
                     }
@@ -188,6 +193,7 @@ async fn forward_events(
     mut stream: McpEventStream,
     mut auth_changes: McpEventStreamAuthChanges,
     ready: oneshot::Sender<Result<(), JSONRPCErrorError>>,
+    mut account_work: Option<Box<dyn McpAttemptWork>>,
 ) {
     let mut ready = Some(ready);
     let mut reconnect_attempts = 0;
@@ -226,14 +232,20 @@ async fn forward_events(
                                     * (1 << (reconnect_attempts - 1)),
                             )
                             .await;
+                            let work = thread.admit_mcp_event_stream_retry()?;
                             let mut stream = thread
-                                .start_mcp_event_stream(
+                                .start_mcp_event_stream_with_authority(
                                     &params.name,
                                     params.arguments.clone(),
                                     params.meta.clone(),
+                                    McpAttemptAccess::from_work(work.as_deref()),
                                 )
                                 .await?;
                             let notification = stream.recv().await?;
+                            // A reconnect may resume with an ordinary event,
+                            // without another active notification. Its work
+                            // ends at this bounded first-notification boundary.
+                            drop(work);
                             Ok::<_, anyhow::Error>((stream, notification))
                         }) => match result {
                             Ok(Ok((reconnected, Some(notification)))) => {
@@ -256,6 +268,11 @@ async fn forward_events(
         };
         let active = notification.method == "notifications/events/active";
         let terminated = notification.method == "notifications/events/terminated";
+        if active {
+            // Activation ends startup custody. Receiving events and retaining
+            // an idle subscription must not pin the account-transition drain.
+            drop(account_work.take());
+        }
         if !send(McpServerEventNotification {
             method: notification.method,
             params: notification

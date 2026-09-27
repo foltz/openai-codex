@@ -26,7 +26,14 @@ async fn detached_operation_constructs_and_starts_child_after_request_and_parent
     let operation = crate::account_turn_admission::within_request(permits.try_acquire(), async {
         test.thread_manager.derive_request_operation_work().unwrap().unwrap()
     }).await;
-    permits.close();
+    let retry = test.codex.admit_mcp_event_stream_retry()?.unwrap();
+    drop(retry);
+    crate::account_turn_admission::within_request(permits.try_acquire(), async {
+        permits.close();
+        // An idle stream's reconnect is a new producer, not a descendant
+        // of whichever request happens to be polling it.
+        assert!(test.codex.admit_mcp_event_stream_retry().is_err());
+    }).await;
     assert!(permits.try_acquire().is_none());
     assert!(test.codex.shutdown_and_wait_with_cleanup().await.is_complete());
 

@@ -1139,13 +1139,15 @@ impl CodexThread {
         Ok(serde_json::to_value(result)?)
     }
 
-    pub async fn start_mcp_event_stream(
+    /// Open under invocation-owned authority. The caller keeps the work until
+    /// activation, then releases it instead of retaining it on an idle stream.
+    pub async fn start_mcp_event_stream_with_authority(
         &self,
         name: &str,
         arguments: serde_json::Value,
         meta: Option<serde_json::Value>,
+        access: codex_mcp::McpAttemptAccess<'_>,
     ) -> anyhow::Result<codex_mcp::McpEventStream> {
-        let work = self.session.request_mcp_work()?;
         let meta = match meta.as_ref() {
             Some(serde_json::Value::Object(meta)) => Some(meta),
             Some(other) => {
@@ -1155,10 +1157,10 @@ impl CodexThread {
         };
         let _ = self.session.services.auth_manager.auth().await;
         self.session.refresh_mcp_if_dirty_with_authority(
-            codex_mcp::McpAttemptAccess::from_work(work.as_deref()),
+            access,
         ).await?;
         codex_mcp::McpResourceClient::new(Arc::clone(&self.session.services.mcp_runtime))
-            .open_event_stream_with_authority(name, &arguments, meta, codex_mcp::McpAttemptAccess::from_work(work.as_deref()))
+            .open_event_stream_with_authority(name, &arguments, meta, access)
             .await
     }
 

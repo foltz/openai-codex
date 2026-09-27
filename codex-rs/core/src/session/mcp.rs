@@ -695,6 +695,17 @@ impl Session {
         refresh_config: &Config,
         elicitation_reviewer: Option<ElicitationReviewerHandle>,
     ) {
+        let work = match self.turn_mcp_work(turn_context) {
+            Ok(work) => work,
+            Err(error) => {
+                warn!("MCP dependency refresh account work is unavailable: {error:#}");
+                return;
+            }
+        };
+        let access = work.as_deref().map_or(
+            codex_mcp::McpAttemptAccess::Unscoped,
+            codex_mcp::McpAttemptAccess::Admitted,
+        );
         let Ok(_refresh) = self.mcp_refresh.acquire().await else {
             error!("MCP runtime refresh semaphore closed");
             return;
@@ -743,13 +754,21 @@ impl Session {
                 executor_capability_discovery.as_deref(),
             )
             .await;
-        self.publish_mcp_runtime(
-            &desired,
-            mcp_projection,
-            &ready_selected_capability_roots,
-            elicitation_reviewer,
-        )
-        .await;
+        if let Err(error) = self
+            .publish_mcp_runtime_with_authority(
+                &desired,
+                mcp_projection,
+                &ready_selected_capability_roots,
+                elicitation_reviewer,
+                access,
+            )
+            .await
+        {
+            // The session configuration was already updated above; keep the
+            // publication retryable if deriving startup work was refused.
+            self.mark_mcp_runtime_dirty();
+            warn!("MCP dependency runtime publication failed: {error:#}");
+        }
     }
 
     pub(crate) fn ready_selected_capability_roots(

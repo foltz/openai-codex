@@ -304,21 +304,6 @@ impl Session {
     }
 
     #[tracing::instrument(name = "mcp.runtime.refresh", skip_all)]
-    pub(super) async fn publish_mcp_runtime(
-        &self,
-        desired: &McpDesiredState,
-        mcp_projection: McpRuntimeProjection,
-        ready_selected_capability_roots: &[SelectedCapabilityRoot],
-        elicitation_reviewer: Option<ElicitationReviewerHandle>,
-    ) {
-        if let Err(error) = self.publish_mcp_runtime_with_authority(
-            desired, mcp_projection, ready_selected_capability_roots,
-            elicitation_reviewer, codex_mcp::McpAttemptAccess::Unscoped,
-        ).await {
-            warn!("MCP runtime publication failed: {error:#}");
-        }
-    }
-
     pub(super) async fn publish_mcp_runtime_with_authority(
         &self,
         desired: &McpDesiredState,

@@ -1,7 +1,7 @@
 use super::*;
 use crate::extensions::send_thread_warning;
-use codex_app_server_protocol::ThreadQueueChangedNotification;
 use crate::thread_state::RetentionSnapshot;
+use codex_app_server_protocol::ThreadQueueChangedNotification;
 use codex_extension_api::ThreadIdleCause;
 use codex_protocol::config_types::MultiAgentMode;
 

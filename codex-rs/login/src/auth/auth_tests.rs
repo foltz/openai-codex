@@ -3473,7 +3473,8 @@ async fn managed_adoption_preserves_upstream_credential_and_owner_generations() 
                     chatgpt_account_id: Some(account.to_owned()),
                 },
                 home.path(),
-            ).unwrap();
+            )
+            .unwrap();
         };
         write_account("owner-a", "pro");
         let manager = AuthManager::new(
@@ -3484,16 +3485,23 @@ async fn managed_adoption_preserves_upstream_credential_and_owner_generations() 
             /*chatgpt_base_url*/ None,
             AuthKeyringBackendKind::default(),
             crate::test_support::transport_default_auth_route_config(),
-        ).await;
+        )
+        .await;
         let before = *manager.auth_change_state_receiver().borrow();
-        let precondition = manager.capture_managed_adoption_precondition(
-            Some(&AuthManager::managed_account_fingerprint("owner-a")),
-        ).unwrap();
+        let precondition = manager
+            .capture_managed_adoption_precondition(Some(&AuthManager::managed_account_fingerprint(
+                "owner-a",
+            )))
+            .unwrap();
         // Changing the ID token forces a credential change even for the same owner.
         write_account(next_account, "plus");
-        let prepared = manager.prepare_managed_adoption(
-            Some(&AuthManager::managed_account_fingerprint(next_account)), &precondition,
-        ).await.unwrap();
+        let prepared = manager
+            .prepare_managed_adoption(
+                Some(&AuthManager::managed_account_fingerprint(next_account)),
+                &precondition,
+            )
+            .await
+            .unwrap();
         assert!(matches!(
             manager.install_prepared_managed_adoption(&prepared, &precondition),
             ManagedAdoptionInstallOutcome::Installed { .. }
@@ -3502,10 +3510,13 @@ async fn managed_adoption_preserves_upstream_credential_and_owner_generations() 
         let managed_revision = *manager.auth_change_receiver().borrow();
         assert!(manager.is_managed_auth_change(managed_revision));
         assert!(!manager.is_managed_auth_change(0));
-        assert_eq!(after, AuthChangeState {
-            generation: before.generation + 1,
-            owner_generation: before.owner_generation + owner_delta,
-        });
+        assert_eq!(
+            after,
+            AuthChangeState {
+                generation: before.generation + 1,
+                owner_generation: before.owner_generation + owner_delta,
+            }
+        );
         // A refused reuse must not publish another owner or credential change.
         assert!(matches!(
             manager.install_prepared_managed_adoption(&prepared, &precondition),

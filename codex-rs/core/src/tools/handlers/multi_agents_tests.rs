@@ -438,7 +438,10 @@ async fn spawn_agent_service_tier_uses_root_preference_when_root_model_cannot_su
     config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
     let manager = thread_manager();
     let root = manager
-        .start_thread(StartThreadOptions::new(config.clone(), /*control_endpoint*/ None))
+        .start_thread(StartThreadOptions::new(
+            config.clone(),
+            /*control_endpoint*/ None,
+        ))
         .await
         .expect("root thread should start");
     assert_eq!(root.thread.config_snapshot().await.service_tier, None);

@@ -128,7 +128,8 @@ impl McpServerConnection {
     }
 
     pub(crate) async fn client(&self) -> Result<ManagedClient, StartupOutcomeError> {
-        self.client_with_authority(crate::McpAttemptAccess::Unscoped).await
+        self.client_with_authority(crate::McpAttemptAccess::Unscoped)
+            .await
     }
 
     pub(crate) async fn client_with_authority(
@@ -543,16 +544,16 @@ impl McpConnectionSet {
                 if connection.client.client.requirement == attempt_requirement
                     && reuse_work.is_ok()
                     && (reusable_pending_startup
-                    || unchanged_auth_failure.is_some()
-                    || connection
-                        .reusable_client(&connection_identity)
-                        .await
-                        .is_some_and(|client| {
-                            previous_view.catalog_item_limit == catalog_item_limit
-                                && expected_protocol_mode.is_some_and(|expected| {
-                                    client.client.protocol_mode() == expected
-                                })
-                        }))
+                        || unchanged_auth_failure.is_some()
+                        || connection
+                            .reusable_client(&connection_identity)
+                            .await
+                            .is_some_and(|client| {
+                                previous_view.catalog_item_limit == catalog_item_limit
+                                    && expected_protocol_mode.is_some_and(|expected| {
+                                        client.client.protocol_mode() == expected
+                                    })
+                            }))
                 {
                     let pending_client =
                         reusable_pending_startup.then(|| connection.client.clone());
@@ -839,7 +840,9 @@ impl McpConnectionSet {
                 }
 
                 if matches!(&outcome, Err(StartupOutcomeError::Failed { .. })) {
-                    async_managed_client.reconnect_failed_startup_with_authority(access).await;
+                    async_managed_client
+                        .reconnect_failed_startup_with_authority(access)
+                        .await;
                 }
 
                 (server_name, outcome)
@@ -1016,7 +1019,8 @@ impl McpConnectionSet {
     }
 
     pub(crate) async fn wait_for_server_startup(&self, server_name: &str) -> bool {
-        self.wait_for_server_startup_with_authority(server_name, crate::McpAttemptAccess::Unscoped).await
+        self.wait_for_server_startup_with_authority(server_name, crate::McpAttemptAccess::Unscoped)
+            .await
     }
 
     pub(crate) async fn wait_for_server_startup_with_authority(
@@ -1027,7 +1031,8 @@ impl McpConnectionSet {
         let Some(view) = self.servers.get(server_name) else {
             return false;
         };
-        view.connection.client.ready_transport().is_some() || view.connection.client_with_authority(access).await.is_ok()
+        view.connection.client.ready_transport().is_some()
+            || view.connection.client_with_authority(access).await.is_ok()
     }
 
     /// Stop all MCP clients owned by this manager and terminate stdio server processes.
@@ -1058,7 +1063,12 @@ impl McpConnectionSet {
     }
 
     pub async fn wait_for_server_ready(&self, server_name: &str, timeout: Duration) -> bool {
-        self.wait_for_server_ready_with_authority(server_name, timeout, crate::McpAttemptAccess::Unscoped).await
+        self.wait_for_server_ready_with_authority(
+            server_name,
+            timeout,
+            crate::McpAttemptAccess::Unscoped,
+        )
+        .await
     }
 
     pub(crate) async fn wait_for_server_ready_with_authority(
@@ -1089,7 +1099,17 @@ impl McpConnectionSet {
         requested_timeout: Option<Duration>,
         wait_for_server: bool,
     ) -> Result<CallToolResult> {
-        self.call_tool_with_authority(server, tool, environment_id, arguments, meta, requested_timeout, wait_for_server, crate::McpAttemptAccess::Unscoped).await
+        self.call_tool_with_authority(
+            server,
+            tool,
+            environment_id,
+            arguments,
+            meta,
+            requested_timeout,
+            wait_for_server,
+            crate::McpAttemptAccess::Unscoped,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1177,7 +1197,8 @@ impl McpConnectionSet {
     /// Codex Apps metadata may come from its existing cache; regular MCP server information is
     /// connection-specific, so pending regular clients are awaited.
     pub(crate) async fn list_available_server_infos(&self) -> HashMap<String, McpServerInfo> {
-        self.list_available_server_infos_with_authority(crate::McpAttemptAccess::Unscoped).await
+        self.list_available_server_infos_with_authority(crate::McpAttemptAccess::Unscoped)
+            .await
     }
 
     pub(crate) async fn list_available_server_infos_with_authority(

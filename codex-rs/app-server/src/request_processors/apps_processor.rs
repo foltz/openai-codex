@@ -271,11 +271,17 @@ impl AppsRequestProcessor {
         let shutdown = work.shutdown.clone();
         // Both children can outlive the response task, including its timeout
         // and cancellation. Derive before spawning, never inside an unscoped task.
-        let accessible_work = work.account_work.as_deref()
-            .map(codex_mcp::McpAttemptWork::derive_attempt).transpose()
+        let accessible_work = work
+            .account_work
+            .as_deref()
+            .map(codex_mcp::McpAttemptWork::derive_attempt)
+            .transpose()
             .map_err(|_| internal_error("app discovery account work unavailable"))?;
-        let directory_work = work.account_work.as_deref()
-            .map(codex_mcp::McpAttemptWork::derive_attempt).transpose()
+        let directory_work = work
+            .account_work
+            .as_deref()
+            .map(codex_mcp::McpAttemptWork::derive_attempt)
+            .transpose()
             .map_err(|_| internal_error("app directory account work unavailable"))?;
         // Cancellation is safe only because external runtime custody was
         // registered above, before this task or its constructor can run.

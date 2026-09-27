@@ -380,26 +380,30 @@ async fn selected_root_id_distinguishes_identical_executor_paths() {
         /*restriction_product*/ None,
     );
     let catalog = provider
-        .list(SkillListQuery {
-            turn_id: "turn-1".to_string(),
-            executor_roots: ["root-a", "root-b"]
-                .into_iter()
-                .map(|id| SelectedCapabilityRoot {
-                    id: id.to_string(),
-                    location: CapabilityRootLocation::Environment {
-                        environment_id: "local".to_string(),
-                        path: PathUri::from_host_native_path(&test_root).expect("skill root URI"),
-                    },
-                })
-                .collect(),
-            resolved_executor_roots: Vec::new(),
-            host_snapshot: None,
-            include_host_skills: false,
-            include_bundled_skills: true,
-            include_orchestrator_skills: false,
-            mcp_resources: None,
-            executor_capability_discovery: None,
-        }, Ok(codex_mcp::McpAttemptAccess::Unscoped))
+        .list(
+            SkillListQuery {
+                turn_id: "turn-1".to_string(),
+                executor_roots: ["root-a", "root-b"]
+                    .into_iter()
+                    .map(|id| SelectedCapabilityRoot {
+                        id: id.to_string(),
+                        location: CapabilityRootLocation::Environment {
+                            environment_id: "local".to_string(),
+                            path: PathUri::from_host_native_path(&test_root)
+                                .expect("skill root URI"),
+                        },
+                    })
+                    .collect(),
+                resolved_executor_roots: Vec::new(),
+                host_snapshot: None,
+                include_host_skills: false,
+                include_bundled_skills: true,
+                include_orchestrator_skills: false,
+                mcp_resources: None,
+                executor_capability_discovery: None,
+            },
+            Ok(codex_mcp::McpAttemptAccess::Unscoped),
+        )
         .await
         .expect("list executor skills");
 
@@ -479,17 +483,20 @@ async fn executor_discovery_preserves_posix_and_windows_locator_alias_roots() {
             HashMap::new(),
         );
         let catalog = provider
-            .list(SkillListQuery {
-                turn_id: "turn-1".to_string(),
-                executor_roots: vec![selected_root],
-                resolved_executor_roots: Vec::new(),
-                host_snapshot: None,
-                include_host_skills: false,
-                include_bundled_skills: true,
-                include_orchestrator_skills: false,
-                mcp_resources: None,
-                executor_capability_discovery: Some(discovery),
-            }, Ok(codex_mcp::McpAttemptAccess::Unscoped))
+            .list(
+                SkillListQuery {
+                    turn_id: "turn-1".to_string(),
+                    executor_roots: vec![selected_root],
+                    resolved_executor_roots: Vec::new(),
+                    host_snapshot: None,
+                    include_host_skills: false,
+                    include_bundled_skills: true,
+                    include_orchestrator_skills: false,
+                    mcp_resources: None,
+                    executor_capability_discovery: Some(discovery),
+                },
+                Ok(codex_mcp::McpAttemptAccess::Unscoped),
+            )
             .await
             .expect("list executor skills");
         let resource = format!("{alias_root}/skill/SKILL.md");
@@ -616,7 +623,10 @@ async fn executor_discovery_routes_produce_equivalent_catalog_metadata() {
         .snapshot(&executor_roots, &Default::default())
         .await;
     let bundled = provider
-        .list(query(Some(discovery.clone())), Ok(codex_mcp::McpAttemptAccess::Unscoped))
+        .list(
+            query(Some(discovery.clone())),
+            Ok(codex_mcp::McpAttemptAccess::Unscoped),
+        )
         .await
         .expect("list bundled executor skills");
 
@@ -748,17 +758,20 @@ async fn pre_discovered_executor_catalog_snapshot() {
         .snapshot(&executor_roots, &Default::default())
         .await;
     let catalog = provider
-        .list(SkillListQuery {
-            turn_id: "turn-1".to_string(),
-            executor_roots,
-            resolved_executor_roots: Vec::new(),
-            host_snapshot: None,
-            include_host_skills: false,
-            include_bundled_skills: true,
-            include_orchestrator_skills: false,
-            mcp_resources: None,
-            executor_capability_discovery: Some(executor_capability_discovery),
-        }, Ok(codex_mcp::McpAttemptAccess::Unscoped))
+        .list(
+            SkillListQuery {
+                turn_id: "turn-1".to_string(),
+                executor_roots,
+                resolved_executor_roots: Vec::new(),
+                host_snapshot: None,
+                include_host_skills: false,
+                include_bundled_skills: true,
+                include_orchestrator_skills: false,
+                mcp_resources: None,
+                executor_capability_discovery: Some(executor_capability_discovery),
+            },
+            Ok(codex_mcp::McpAttemptAccess::Unscoped),
+        )
         .await
         .expect("list pre-discovered executor skills");
 
@@ -865,17 +878,20 @@ async fn direct_executor_discovery_preserves_hidden_nested_and_probed_metadata()
         manager, /*restriction_product*/ None,
     );
     let direct = provider
-        .list(SkillListQuery {
-            turn_id: "turn-1".to_string(),
-            executor_roots: vec![selected_root],
-            resolved_executor_roots: Vec::new(),
-            host_snapshot: None,
-            include_host_skills: false,
-            include_bundled_skills: true,
-            include_orchestrator_skills: false,
-            mcp_resources: None,
-            executor_capability_discovery: None,
-        }, Ok(codex_mcp::McpAttemptAccess::Unscoped))
+        .list(
+            SkillListQuery {
+                turn_id: "turn-1".to_string(),
+                executor_roots: vec![selected_root],
+                resolved_executor_roots: Vec::new(),
+                host_snapshot: None,
+                include_host_skills: false,
+                include_bundled_skills: true,
+                include_orchestrator_skills: false,
+                mcp_resources: None,
+                executor_capability_discovery: None,
+            },
+            Ok(codex_mcp::McpAttemptAccess::Unscoped),
+        )
         .await
         .expect("list directly discovered executor skills");
 
@@ -925,17 +941,20 @@ async fn high_level_discovery_reuses_materialized_skill_contents_for_reads() {
         .snapshot(&executor_roots, &Default::default())
         .await;
     let catalog = provider
-        .list(SkillListQuery {
-            turn_id: "turn-1".to_string(),
-            executor_roots,
-            resolved_executor_roots: Vec::new(),
-            host_snapshot: None,
-            include_host_skills: false,
-            include_bundled_skills: true,
-            include_orchestrator_skills: false,
-            mcp_resources: None,
-            executor_capability_discovery: Some(executor_capability_discovery),
-        }, Ok(codex_mcp::McpAttemptAccess::Unscoped))
+        .list(
+            SkillListQuery {
+                turn_id: "turn-1".to_string(),
+                executor_roots,
+                resolved_executor_roots: Vec::new(),
+                host_snapshot: None,
+                include_host_skills: false,
+                include_bundled_skills: true,
+                include_orchestrator_skills: false,
+                mcp_resources: None,
+                executor_capability_discovery: Some(executor_capability_discovery),
+            },
+            Ok(codex_mcp::McpAttemptAccess::Unscoped),
+        )
         .await
         .expect("list executor skills");
     let [entry] = catalog.entries.as_slice() else {

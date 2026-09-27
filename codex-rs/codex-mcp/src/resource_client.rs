@@ -281,7 +281,8 @@ impl McpResourceClient {
         server: &str,
         cursor: Option<String>,
     ) -> Result<McpResourcePage> {
-        self.list_resources_with_authority(server, cursor, crate::McpAttemptAccess::Unscoped).await
+        self.list_resources_with_authority(server, cursor, crate::McpAttemptAccess::Unscoped)
+            .await
     }
 
     pub async fn list_resources_with_authority(
@@ -313,7 +314,8 @@ impl McpResourceClient {
         &self,
         params: CodexAppsResourceListParams,
     ) -> Result<McpResourcePage> {
-        self.list_codex_apps_resources_with_authority(params, crate::McpAttemptAccess::Unscoped).await
+        self.list_codex_apps_resources_with_authority(params, crate::McpAttemptAccess::Unscoped)
+            .await
     }
 
     pub async fn list_codex_apps_resources_with_authority(
@@ -352,10 +354,16 @@ impl McpResourceClient {
 
     /// Reads one resource from the named server.
     pub async fn read_resource(&self, server: &str, uri: &str) -> Result<McpResourceReadResult> {
-        self.read_resource_with_authority(server, uri, crate::McpAttemptAccess::Unscoped).await
+        self.read_resource_with_authority(server, uri, crate::McpAttemptAccess::Unscoped)
+            .await
     }
 
-    pub async fn read_resource_with_authority(&self, server: &str, uri: &str, access: crate::McpAttemptAccess<'_>) -> Result<McpResourceReadResult> {
+    pub async fn read_resource_with_authority(
+        &self,
+        server: &str,
+        uri: &str,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Result<McpResourceReadResult> {
         let params = ReadResourceRequestParams::new(uri.to_string());
         let result = self
             .runtime
@@ -372,10 +380,14 @@ impl McpResourceClient {
 
     /// Lists the events advertised by the MCP event server.
     pub async fn list_events(&self) -> Result<McpEventCatalogSnapshot> {
-        self.list_events_with_authority(crate::McpAttemptAccess::Unscoped).await
+        self.list_events_with_authority(crate::McpAttemptAccess::Unscoped)
+            .await
     }
 
-    pub async fn list_events_with_authority(&self, access: crate::McpAttemptAccess<'_>) -> Result<McpEventCatalogSnapshot> {
+    pub async fn list_events_with_authority(
+        &self,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Result<McpEventCatalogSnapshot> {
         let (connections, _) = self
             .runtime
             .latest_connections_for_event_server(CODEX_APPS_MCP_SERVER_NAME)?;
@@ -408,7 +420,13 @@ impl McpResourceClient {
         arguments: &Value,
         request_meta: Option<&Map<String, Value>>,
     ) -> Result<McpEventStream> {
-        self.open_event_stream_with_authority(event_name, arguments, request_meta, crate::McpAttemptAccess::Unscoped).await
+        self.open_event_stream_with_authority(
+            event_name,
+            arguments,
+            request_meta,
+            crate::McpAttemptAccess::Unscoped,
+        )
+        .await
     }
 
     pub async fn open_event_stream_with_authority(

@@ -184,7 +184,10 @@ impl Session {
         self: &Arc<Self>,
         access: codex_mcp::McpAttemptAccess<'_>,
     ) -> anyhow::Result<()> {
-        let _refresh = self.mcp_refresh.acquire().await
+        let _refresh = self
+            .mcp_refresh
+            .acquire()
+            .await
             .map_err(|_| anyhow::anyhow!("MCP runtime refresh semaphore closed"))?;
         loop {
             // Compare and rebuild from current environments, not choices saved for a future turn.
@@ -272,7 +275,10 @@ impl Session {
             .acquire()
             .await
             .map_err(|_| anyhow::anyhow!("MCP runtime refresh semaphore closed"))?;
-        self.services.mcp_runtime.refresh_codex_apps_tools_with_authority(access).await
+        self.services
+            .mcp_runtime
+            .refresh_codex_apps_tools_with_authority(access)
+            .await
     }
 
     /// Reconnects the runtime so refreshed Apps tools belong to their new exact client.

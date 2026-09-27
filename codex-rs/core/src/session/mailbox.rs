@@ -68,16 +68,22 @@ impl Mailbox {
         start_options: TurnStartOptions,
         work: Option<Box<dyn HostTurnWork>>,
     ) {
-        assert!(communication.trigger_turn || work.is_none(), "queue-only mail must not carry turn work");
+        assert!(
+            communication.trigger_turn || work.is_none(),
+            "queue-only mail must not carry turn work"
+        );
         let mut state = self.state.lock().expect("mailbox poisoned");
         let sequence = state.next_sequence;
         state.next_sequence = sequence.checked_add(1).expect("mailbox sequence exhausted");
-        state.pending.insert(sequence, PendingMailboxCommunication {
-            communication,
-            start_options,
-            work,
-            _diagnostics_guard: PENDING_MAILBOX_MESSAGES.track(),
-        });
+        state.pending.insert(
+            sequence,
+            PendingMailboxCommunication {
+                communication,
+                start_options,
+                work,
+                _diagnostics_guard: PENDING_MAILBOX_MESSAGES.track(),
+            },
+        );
         drop(state);
         self.activity.send_replace(InputQueueActivity::Mailbox);
     }
@@ -85,11 +91,20 @@ impl Mailbox {
     /// Reports only deliverable mail; another attempt's private reservation
     /// cannot authorize or feed a competing start.
     pub(super) fn has_pending(&self) -> bool {
-        !self.state.lock().expect("mailbox poisoned").pending.is_empty()
+        !self
+            .state
+            .lock()
+            .expect("mailbox poisoned")
+            .pending
+            .is_empty()
     }
 
     pub(super) fn has_trigger(&self) -> bool {
-        self.state.lock().expect("mailbox poisoned").pending.values()
+        self.state
+            .lock()
+            .expect("mailbox poisoned")
+            .pending
+            .values()
             .any(|mail| mail.communication.trigger_turn)
     }
 
@@ -115,39 +130,55 @@ impl MailboxReservation {
     }
 
     pub(crate) fn append(&mut self, mut other: Self) {
-        assert!(Arc::ptr_eq(&self.state, &other.state), "mailbox reservation owner mismatch");
+        assert!(
+            Arc::ptr_eq(&self.state, &other.state),
+            "mailbox reservation owner mismatch"
+        );
         self.pending.append(&mut other.pending);
     }
 
     pub(crate) fn start_metadata(&self) -> (TurnStartOptions, Option<codex_protocol::AgentPath>) {
         // Preserve upstream's settings selection: the latest trigger wins,
         // while parent identity requires agreement across every trigger.
-        let mut start_options = self.pending.values().rev()
+        let mut start_options = self
+            .pending
+            .values()
+            .rev()
             .find(|mail| mail.communication.trigger_turn)
             .map(|mail| mail.start_options.clone())
             .unwrap_or_default();
-        start_options.parent_turn_id = self.pending.values()
+        start_options.parent_turn_id = self
+            .pending
+            .values()
             .filter(|mail| mail.communication.trigger_turn)
             .map(|mail| mail.start_options.parent_turn_id.as_deref())
             .reduce(|expected, candidate| expected.filter(|id| candidate == Some(*id)))
             .and_then(|id| id.filter(|id| !id.trim().is_empty()).map(str::to_string));
-        start_options.root_turn_id = self.pending.values()
+        start_options.root_turn_id = self
+            .pending
+            .values()
             .find(|mail| mail.communication.trigger_turn)
             .and_then(|mail| {
-                mail.start_options.parent_turn_id.as_deref()
+                mail.start_options
+                    .parent_turn_id
+                    .as_deref()
                     .filter(|id| !id.trim().is_empty())
                     .and(mail.start_options.root_turn_id.as_deref())
                     .filter(|id| !id.trim().is_empty())
             })
             .map(str::to_string);
-        let author = self.pending.values().find(|mail| mail.communication.trigger_turn)
+        let author = self
+            .pending
+            .values()
+            .find(|mail| mail.communication.trigger_turn)
             .map(|mail| mail.communication.author.clone());
         (start_options, author)
     }
 
     pub(super) fn into_input(mut self, turn_id: &str) -> (Vec<TurnInput>, TurnStartOptions) {
         let (start_options, _) = self.start_metadata();
-        let items = std::mem::take(&mut self.pending).into_values()
+        let items = std::mem::take(&mut self.pending)
+            .into_values()
             .map(|mail| {
                 // Binding and transfer are synchronous. No cancellation point
                 // can split consumption from host terminal-evidence custody.
@@ -169,8 +200,11 @@ impl Drop for MailboxReservation {
         }
         // Rollback also runs during unwinding. Preserve custody without a
         // second panic; ordinary queue access still refuses poisoned state.
-        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pending.append(&mut self.pending);
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending
+            .append(&mut self.pending);
         // Wake a later consumer after rollback, including cancellation while
         // other input was enqueued. No task or runtime is needed for restoration.
         self.activity.send_replace(InputQueueActivity::Mailbox);

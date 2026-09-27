@@ -100,8 +100,15 @@ pub(super) async fn suspend_turn_and_shutdown(
     // intentionally drops that state; persisting or replaying it needs a separate protocol.
     session.input_queue.clear_pending(&turn).await;
 
-    let cleanup = session.cleanup_owner().observe_suspension(Arc::clone(session)).await;
-    if cleanup != (CleanupExecution::Finished { persistence_failed: false }) {
+    let cleanup = session
+        .cleanup_owner()
+        .observe_suspension(Arc::clone(session))
+        .await;
+    if cleanup
+        != (CleanupExecution::Finished {
+            persistence_failed: false,
+        })
+    {
         return Err(CodexErr::Fatal(format!(
             "cleanup after root turn suspension failed: {cleanup:?}"
         )));
@@ -118,9 +125,7 @@ pub(super) async fn suspend_turn_and_shutdown(
 }
 
 /// Executed only by the retained cleanup owner, never as a second teardown.
-pub(super) async fn cleanup_suspended_session(
-    session: &Arc<Session>,
-) -> CleanupExecution {
+pub(super) async fn cleanup_suspended_session(session: &Arc<Session>) -> CleanupExecution {
     // Preserve suspension's stricter ordering and stop-on-failure policy:
     // stop producers, flush their final history, then close the writer.
     // Even with a bound observer, suspension must join producers *inside* this
@@ -130,14 +135,16 @@ pub(super) async fn cleanup_suspended_session(
         return failure;
     }
     let result: anyhow::Result<()> = async {
-        let live_thread = session
-            .live_thread_for_persistence("close a suspended root turn")?;
+        let live_thread = session.live_thread_for_persistence("close a suspended root turn")?;
         live_thread.flush().await?;
         live_thread.shutdown().await?;
         Ok(())
-    }.await;
+    }
+    .await;
     if let Err(error) = &result {
         warn!(thread_id = %session.thread_id, %error, "suspended root turn persistence cleanup failed");
     }
-    CleanupExecution::Finished { persistence_failed: result.is_err() }
+    CleanupExecution::Finished {
+        persistence_failed: result.is_err(),
+    }
 }

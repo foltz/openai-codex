@@ -43,7 +43,9 @@ async fn refused_replacement_does_not_report_a_started_task() {
         .try_spawn_task(turn_context, Vec::new(), PendingTask)
         .await;
     let error = result.expect_err("closed admission must refuse replacement");
-    assert!(matches!(error.details(), codex_protocol::error::CodexErrorDetails::Fatal(message) if message == "thread task admission is closed"));
+    assert!(
+        matches!(error.details(), codex_protocol::error::CodexErrorDetails::Fatal(message) if message == "thread task admission is closed")
+    );
     assert!(session.active_turn.lock().await.is_none());
 }
 

@@ -406,7 +406,8 @@ impl LocalStdioServerLauncher {
             }));
             stop_tx
         });
-        let process = StdioServerProcessHandle::local(program_name, terminator, exit_observer, stderr_reader);
+        let process =
+            StdioServerProcessHandle::local(program_name, terminator, exit_observer, stderr_reader);
 
         Ok(StdioServerTransport {
             inner: transport,
@@ -573,49 +574,50 @@ impl StdioServerProcessHandle {
             return Ok(());
         }
         let result = async {
-        match &self.inner.kind {
-            StdioServerProcessKind::Local {
-                terminator,
-                exit_observer,
-            } => {
-                let Some(terminator) = terminator else {
-                    exit_observer.abort();
-                    return Err(io::Error::other(
-                        "local MCP process has no process-group terminal evidence",
-                    ));
-                };
-                let mut exit_observer = exit_observer.clone();
-                tokio::time::timeout_at(deadline, async {
-                    tokio::try_join!(exit_observer.wait(), terminator.terminate_and_observe())?;
-                    Ok::<(), io::Error>(())
-                })
-                .await
-                .map_err(|_| {
-                    io::Error::new(io::ErrorKind::TimedOut, "local MCP exit timed out")
-                })??;
-                self.inner.terminal_observed.store(true, Ordering::Release);
-                Ok(())
-            }
-            StdioServerProcessKind::Executor(process) => {
-                // Subscribe before the request so a quickly-closing process is
-                // observed through replay rather than mistaken request acceptance.
-                let mut events = process.subscribe_events();
-                // A previous cancelled/failed attempt is not terminal proof.
-                // Resend the idempotent request; successful observation is
-                // retained by this handle independently of bounded replay.
-                tokio::time::timeout_at(deadline, async {
-                    process.terminate().await.map_err(io::Error::other)?;
-                    await_executor_process_close(&mut events).await
-                })
-                .await
-                .map_err(|_| {
-                    io::Error::new(io::ErrorKind::TimedOut, "executor MCP close timed out")
-                })??;
-                self.inner.terminal_observed.store(true, Ordering::Release);
-                Ok(())
+            match &self.inner.kind {
+                StdioServerProcessKind::Local {
+                    terminator,
+                    exit_observer,
+                } => {
+                    let Some(terminator) = terminator else {
+                        exit_observer.abort();
+                        return Err(io::Error::other(
+                            "local MCP process has no process-group terminal evidence",
+                        ));
+                    };
+                    let mut exit_observer = exit_observer.clone();
+                    tokio::time::timeout_at(deadline, async {
+                        tokio::try_join!(exit_observer.wait(), terminator.terminate_and_observe())?;
+                        Ok::<(), io::Error>(())
+                    })
+                    .await
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::TimedOut, "local MCP exit timed out")
+                    })??;
+                    self.inner.terminal_observed.store(true, Ordering::Release);
+                    Ok(())
+                }
+                StdioServerProcessKind::Executor(process) => {
+                    // Subscribe before the request so a quickly-closing process is
+                    // observed through replay rather than mistaken request acceptance.
+                    let mut events = process.subscribe_events();
+                    // A previous cancelled/failed attempt is not terminal proof.
+                    // Resend the idempotent request; successful observation is
+                    // retained by this handle independently of bounded replay.
+                    tokio::time::timeout_at(deadline, async {
+                        process.terminate().await.map_err(io::Error::other)?;
+                        await_executor_process_close(&mut events).await
+                    })
+                    .await
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::TimedOut, "executor MCP close timed out")
+                    })??;
+                    self.inner.terminal_observed.store(true, Ordering::Release);
+                    Ok(())
+                }
             }
         }
-        }.await;
+        .await;
         if let Some(stderr_reader) = &self.inner.stderr_reader {
             stderr_reader.send_replace(());
         }
@@ -1014,14 +1016,14 @@ mod tests {
         let mut command = Command::new("/bin/sleep");
         command.arg("30");
         let (transport, _) =
-            LocalStdioTransport::spawn(command, "test".to_owned(), McpProtocolMode::Legacy).unwrap();
-        let handle =
-            StdioServerProcessHandle::local(
-                "test".to_owned(),
-                /*terminator*/ None,
-                transport.exit_observer(),
-                /*stderr_reader*/ None,
-            );
+            LocalStdioTransport::spawn(command, "test".to_owned(), McpProtocolMode::Legacy)
+                .unwrap();
+        let handle = StdioServerProcessHandle::local(
+            "test".to_owned(),
+            /*terminator*/ None,
+            transport.exit_observer(),
+            /*stderr_reader*/ None,
+        );
         for _ in 0..2 {
             assert!(handle.terminate().await.is_err());
             assert!(!handle.inner.terminal_observed.load(Ordering::Acquire));

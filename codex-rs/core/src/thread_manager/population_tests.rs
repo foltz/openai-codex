@@ -31,7 +31,9 @@ async fn manager() -> (tempfile::TempDir, ThreadManager, Config) {
 async fn termination_receipt_does_not_retain_thread_or_cancel_loop_on_observer_drop() {
     let (_home, manager, config) = manager().await;
     let started = manager
-        .start_thread(StartThreadOptions::new(config, /*control_endpoint*/ None))
+        .start_thread(StartThreadOptions::new(
+            config, /*control_endpoint*/ None,
+        ))
         .await
         .unwrap();
     let receipt = started.thread.termination_receipt().boxed().shared();
@@ -54,20 +56,30 @@ async fn termination_receipt_does_not_retain_thread_or_cancel_loop_on_observer_d
 async fn termination_receipt_observes_aborted_loop_without_claiming_cleanup() {
     let (_home, manager, config) = manager().await;
     let started = manager
-        .start_thread(StartThreadOptions::new(config, /*control_endpoint*/ None))
+        .start_thread(StartThreadOptions::new(
+            config, /*control_endpoint*/ None,
+        ))
         .await
         .unwrap();
     let receipt = started.thread.termination_receipt();
     started.thread.io.session_loop_termination.request_abort();
-    tokio::time::timeout(Duration::from_secs(5), receipt).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), receipt)
+        .await
+        .unwrap();
     assert!(started.thread.observed_terminal_cleanup().is_none());
-    let report = started.thread
+    let report = started
+        .thread
         .begin_retirement(Instant::now() + Duration::from_secs(20))
-        .unwrap().wait().await;
+        .unwrap()
+        .wait()
+        .await;
     assert_eq!(report.session_loop, crate::ThreadLoopOutcome::Cancelled);
-    assert_eq!(report.cleanup, crate::ThreadCleanupOutcome::Finished {
-        persistence_failed: false,
-    });
+    assert_eq!(
+        report.cleanup,
+        crate::ThreadCleanupOutcome::Finished {
+            persistence_failed: false,
+        }
+    );
 }
 
 #[tokio::test]
@@ -173,20 +185,32 @@ async fn managed_lifetime_cleanup_compacts_before_manager_shutdown() {
     let stop = tokio_util::sync::CancellationToken::new();
     let tasks = tokio_util::task::TaskTracker::new();
     let mut options = StartThreadOptions::new(config, /*control_endpoint*/ None);
-    options.thread_extension_init.insert(codex_extension_api::SessionIsolation::Isolated);
-    let started = manager.start_thread_until(options, stop.clone().cancelled_owned(), &tasks)
-        .await.unwrap();
+    options
+        .thread_extension_init
+        .insert(codex_extension_api::SessionIsolation::Isolated);
+    let started = manager
+        .start_thread_until(options, stop.clone().cancelled_owned(), &tasks)
+        .await
+        .unwrap();
     assert_eq!(manager.constructions.published().len(), 1);
     stop.cancel();
     tasks.close();
-    tokio::time::timeout(Duration::from_secs(20), tasks.wait()).await
+    tokio::time::timeout(Duration::from_secs(20), tasks.wait())
+        .await
         .expect("managed lifetime cleanup joined");
-    assert_eq!(started.thread.observed_terminal_cleanup(), Some(SessionLoopOutcome::Normal));
+    assert_eq!(
+        started.thread.observed_terminal_cleanup(),
+        Some(SessionLoopOutcome::Normal)
+    );
     assert!(manager.list_thread_ids().await.is_empty());
     assert!(manager.constructions.published().is_empty());
     assert_eq!(manager.constructions.state.lock().unwrap().compacted, 1);
-    let report = manager.begin_shutdown(Instant::now() + Duration::from_secs(5))
-        .unwrap().wait().await.unwrap();
+    let report = manager
+        .begin_shutdown(Instant::now() + Duration::from_secs(5))
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
     assert!(report.is_complete());
     assert_eq!(manager.constructions.state.lock().unwrap().compacted, 1);
 }
@@ -226,12 +250,17 @@ async fn failed_cleanup_remains_owned_after_loop_join() {
     // Lookup absence must not let account reset overlook failed resource cleanup.
     // Re-observation retains the same failure rather than inventing a clean retry.
     for _ in 0..2 {
-        let report = manager.shutdown_all_threads_bounded(Duration::from_secs(5)).await;
-        assert_eq!(report, crate::ThreadShutdownReport {
-            completed: Vec::new(),
-            submit_failed: vec![thread_id],
-            timed_out: Vec::new(),
-        });
+        let report = manager
+            .shutdown_all_threads_bounded(Duration::from_secs(5))
+            .await;
+        assert_eq!(
+            report,
+            crate::ThreadShutdownReport {
+                completed: Vec::new(),
+                submit_failed: vec![thread_id],
+                timed_out: Vec::new(),
+            }
+        );
         assert!(weak.upgrade().is_some());
     }
 }
@@ -244,36 +273,67 @@ async fn held_extension_stop_keeps_live_history_open_after_sticky_timeout() {
         completed: std::sync::atomic::AtomicUsize,
     }
     impl codex_extension_api::ThreadLifecycleContributor<Config> for HeldStop {
-        fn on_thread_stop<'a>(&'a self, _input: codex_extension_api::ThreadStopInput<'a>)
-            -> codex_extension_api::ExtensionFuture<'a, ()> {
+        fn on_thread_stop<'a>(
+            &'a self,
+            _input: codex_extension_api::ThreadStopInput<'a>,
+        ) -> codex_extension_api::ExtensionFuture<'a, ()> {
             Box::pin(async {
                 self.entered.notify_one();
                 self.release.acquire().await.expect("release stop").forget();
-                self.completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.completed
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             })
         }
     }
     let (_home, mut manager, mut config) = manager().await;
     config.ephemeral = false;
-    let held = Arc::new(HeldStop { entered: tokio::sync::Notify::new(),
-        release: tokio::sync::Semaphore::new(0), completed: std::sync::atomic::AtomicUsize::new(0) });
+    let held = Arc::new(HeldStop {
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Semaphore::new(0),
+        completed: std::sync::atomic::AtomicUsize::new(0),
+    });
     let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
     extensions.thread_lifecycle_contributor(held.clone());
     Arc::get_mut(&mut manager.state).unwrap().extensions = Arc::new(extensions.build());
-    let started = manager.start_thread(StartThreadOptions::new(config, /*control_endpoint*/ None)).await.unwrap();
-    let live = started.thread.session.services.live_thread.as_ref().expect("live persistence");
+    let started = manager
+        .start_thread(StartThreadOptions::new(
+            config, /*control_endpoint*/ None,
+        ))
+        .await
+        .unwrap();
+    let live = started
+        .thread
+        .session
+        .services
+        .live_thread
+        .as_ref()
+        .expect("live persistence");
     live.flush().await.expect("positive persistence control");
-    let ticket = started.thread.begin_retirement(Instant::now() + Duration::from_secs(2)).unwrap();
-    let observer = tokio::spawn({ let ticket = ticket.clone(); async move { ticket.wait().await } });
-    tokio::time::timeout(Duration::from_secs(5), held.entered.notified()).await.expect("stop entered");
-    live.flush().await.expect("history remains open during extension stop");
+    let ticket = started
+        .thread
+        .begin_retirement(Instant::now() + Duration::from_secs(2))
+        .unwrap();
+    let observer = tokio::spawn({
+        let ticket = ticket.clone();
+        async move { ticket.wait().await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), held.entered.notified())
+        .await
+        .expect("stop entered");
+    live.flush()
+        .await
+        .expect("history remains open during extension stop");
     let report = observer.await.unwrap();
     assert_eq!(report.cleanup, crate::ThreadCleanupOutcome::TimedOut);
-    live.flush().await.expect("history remains open after observer timeout");
+    live.flush()
+        .await
+        .expect("history remains open after observer timeout");
     held.release.add_permits(1);
     assert_eq!(ticket.wait().await, report);
     assert_eq!(held.completed.load(std::sync::atomic::Ordering::SeqCst), 0);
-    live.flush().await.expect("expired observation cannot close history");
+    live.flush()
+        .await
+        .expect("expired observation cannot close history");
 }
 
 #[tokio::test]

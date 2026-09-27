@@ -84,7 +84,10 @@ impl<'call> ToolExecutor<ToolCall<'call>> for ReadTool {
                 super::SkillToolAuthoritySelector::Orchestrator,
                 super::SkillToolAuthoritySelector::Executor,
             ] {
-                let catalog = self.context.catalog(&call.turn_id, selector, call.mcp_access).await;
+                let catalog = self
+                    .context
+                    .catalog(&call.turn_id, selector, call.mcp_access)
+                    .await;
                 let alias_plan = build_alias_plan(
                     &catalog
                         .entries

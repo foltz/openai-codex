@@ -30,7 +30,9 @@ impl Session {
             return Ok(None);
         };
         host.derive_operation_work(&self.services.thread_extension_data, &turn.sub_id)
-            .map(|work| work.map(|work| Box::new(McpOperationWork(work)) as Box<dyn McpAttemptWork>))
+            .map(|work| {
+                work.map(|work| Box::new(McpOperationWork(work)) as Box<dyn McpAttemptWork>)
+            })
             .map_err(|_| anyhow::anyhow!("MCP turn account work is unavailable"))
     }
 
@@ -41,7 +43,9 @@ impl Session {
             return Ok(None);
         };
         host.derive_request_operation_work()
-            .map(|work| work.map(|work| Box::new(McpOperationWork(work)) as Box<dyn McpAttemptWork>))
+            .map(|work| {
+                work.map(|work| Box::new(McpOperationWork(work)) as Box<dyn McpAttemptWork>)
+            })
             .map_err(|_| anyhow::anyhow!("MCP request account work is unavailable"))
     }
 }

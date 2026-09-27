@@ -137,7 +137,8 @@ impl McpConnectionSet {
 
     #[instrument(level = "trace", skip_all, fields(mcp_server_count = self.servers.len()))]
     pub(crate) async fn list_tools_with_errors(&self) -> (Vec<ToolInfo>, HashMap<String, String>) {
-        self.list_tools_with_errors_with_authority(crate::McpAttemptAccess::Unscoped).await
+        self.list_tools_with_errors_with_authority(crate::McpAttemptAccess::Unscoped)
+            .await
     }
 
     pub(crate) async fn list_tools_with_errors_with_authority(
@@ -149,7 +150,10 @@ impl McpConnectionSet {
         let mut available_server_count = 0;
         let mut unavailable_server_count = 0;
         let server_results = join_all(self.servers.iter().map(|(server_name, view)| async move {
-            view.connection.client.reconnect_failed_startup_with_authority(access).await;
+            view.connection
+                .client
+                .reconnect_failed_startup_with_authority(access)
+                .await;
             let has_cached_tools = view.connection.client.has_cached_tools();
             let startup_complete = view
                 .connection
@@ -217,7 +221,14 @@ impl McpConnectionSet {
         required_servers: &[String],
         required_plugins: &HashSet<String>,
     ) -> McpBinding {
-        self.capture_binding_with_authority(config, plugins_available, required_servers, required_plugins, crate::McpAttemptAccess::Unscoped).await
+        self.capture_binding_with_authority(
+            config,
+            plugins_available,
+            required_servers,
+            required_plugins,
+            crate::McpAttemptAccess::Unscoped,
+        )
+        .await
     }
 
     pub(crate) async fn capture_binding_with_authority(
@@ -391,7 +402,11 @@ impl McpConnectionSet {
             clients
                 .into_iter()
                 .map(|(server_name, (client, _))| {
-                    let requirement = self.servers[&server_name].connection.client.client.requirement;
+                    let requirement = self.servers[&server_name]
+                        .connection
+                        .client
+                        .client
+                        .requirement;
                     (server_name, (client, requirement))
                 })
                 .collect(),
@@ -433,7 +448,11 @@ impl McpConnectionSet {
         &self,
         config: &crate::McpConfig,
     ) -> Result<CodexAppsToolSnapshot> {
-        self.refresh_codex_apps_client_catalog_with_authority(config, crate::McpAttemptAccess::Unscoped).await
+        self.refresh_codex_apps_client_catalog_with_authority(
+            config,
+            crate::McpAttemptAccess::Unscoped,
+        )
+        .await
     }
 
     pub(crate) async fn refresh_codex_apps_client_catalog_with_authority(
@@ -475,10 +494,16 @@ impl McpConnectionSet {
 
     /// Refreshes Apps tools and returns the prepared shared-cache winner for discovery.
     pub async fn refresh_codex_apps_tools_for_discovery(&self) -> Result<Vec<ToolInfo>> {
-        self.refresh_codex_apps_tools_for_discovery_with_authority(crate::McpAttemptAccess::Unscoped).await
+        self.refresh_codex_apps_tools_for_discovery_with_authority(
+            crate::McpAttemptAccess::Unscoped,
+        )
+        .await
     }
 
-    pub(crate) async fn refresh_codex_apps_tools_for_discovery_with_authority(&self, access: crate::McpAttemptAccess<'_>) -> Result<Vec<ToolInfo>> {
+    pub(crate) async fn refresh_codex_apps_tools_for_discovery_with_authority(
+        &self,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Result<Vec<ToolInfo>> {
         let refresh_start = Instant::now();
         let view = self
             .servers
@@ -505,7 +530,10 @@ impl McpConnectionSet {
     }
 
     /// Publishes the exact client catalog and returns both raw inventories.
-    async fn refresh_codex_apps_tool_catalog(&self, access: crate::McpAttemptAccess<'_>) -> Result<(Vec<ToolInfo>, Vec<ToolInfo>)> {
+    async fn refresh_codex_apps_tool_catalog(
+        &self,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Result<(Vec<ToolInfo>, Vec<ToolInfo>)> {
         let view = self
             .servers
             .get(CODEX_APPS_MCP_SERVER_NAME)

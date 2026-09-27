@@ -312,7 +312,8 @@ where
                 return;
             }
 
-            self.clear_continuation_deferral_after_turn(runtime.thread_id()).await;
+            self.clear_continuation_deferral_after_turn(runtime.thread_id())
+                .await;
 
             let turn_id = input.turn_store.level_id();
             if let Some(expected_goal_id) =
@@ -381,7 +382,8 @@ where
                 return;
             }
 
-            self.clear_continuation_deferral_after_turn(runtime.thread_id()).await;
+            self.clear_continuation_deferral_after_turn(runtime.thread_id())
+                .await;
 
             let turn_id = input.turn_store.level_id();
             input.thread_store.remove::<TurnStartOptions>();

@@ -325,7 +325,8 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
         let content_type = response_header(&response.headers, CONTENT_TYPE);
         let session_id = response_header(&response.headers, HEADER_SESSION_ID);
         if !status_is_success(response.status) {
-            let body = collect_body(&mut body_stream, maximum_response_bytes, startup_retirement).await?;
+            let body =
+                collect_body(&mut body_stream, maximum_response_bytes, startup_retirement).await?;
             if !retryable_post_response_status(mcp_method.as_deref(), response.status)
                 && (content_type
                     .as_deref()
@@ -446,7 +447,9 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
                 Ok(StreamableHttpPostResponse::Sse(event_stream, session_id))
             }
             Some(content_type) if content_type.starts_with(JSON_MIME_TYPE) => {
-                let body = collect_body(&mut body_stream, maximum_response_bytes, startup_retirement).await?;
+                let body =
+                    collect_body(&mut body_stream, maximum_response_bytes, startup_retirement)
+                        .await?;
                 let response_message =
                     serde_json::from_slice(&body).map_err(StreamableHttpError::Deserialize)?;
                 Ok(StreamableHttpPostResponse::Json(
@@ -459,7 +462,9 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
                 ))
             }
             _ => {
-                let body = collect_body(&mut body_stream, maximum_response_bytes, startup_retirement).await?;
+                let body =
+                    collect_body(&mut body_stream, maximum_response_bytes, startup_retirement)
+                        .await?;
                 let content_type = content_type.unwrap_or_else(|| "missing-content-type".into());
                 Err(StreamableHttpError::UnexpectedContentType(Some(format!(
                     "{content_type}; body: {}",
@@ -971,8 +976,8 @@ async fn collect_body(
         } => return Err(StreamableHttpError::Client(StreamableHttpClientAdapterError::Retired)),
         chunk = body_stream.recv() => chunk,
     }
-        .map_err(StreamableHttpClientAdapterError::from)
-        .map_err(StreamableHttpError::Client)?
+    .map_err(StreamableHttpClientAdapterError::from)
+    .map_err(StreamableHttpError::Client)?
     {
         if let Some(maximum_bytes) = maximum_bytes
             && chunk.len() > maximum_bytes.saturating_sub(body.len())

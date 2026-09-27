@@ -235,10 +235,8 @@ impl OtelProvider {
     /// on the caller; the managed receipt must report that ownership incomplete.
     pub(crate) fn dispatch_retirement(
         mut self,
-    ) -> Result<
-        tokio::sync::oneshot::Receiver<Result<(), OtelShutdownError>>,
-        ManuallyDrop<Self>,
-    > {
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<(), OtelShutdownError>>, ManuallyDrop<Self>>
+    {
         let Some(worker_tx) = self.shutdown_worker.take() else {
             return Err(ManuallyDrop::new(self));
         };
@@ -319,8 +317,7 @@ impl OtelProvider {
         };
         // Prepare the shutdown vehicle before any SDK owner is constructed.
         // A spawn/ready failure therefore cannot strand a partial exporter.
-        prepare_worker(&mut provider)
-            .map_err(crate::OtelPreparationError::before_resources)?;
+        prepare_worker(&mut provider).map_err(crate::OtelPreparationError::before_resources)?;
         let construction = (|| -> Result<(), Box<dyn Error>> {
             provider.metrics = if matches!(metric_exporter, OtelExporter::None) {
                 None

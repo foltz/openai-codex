@@ -47,7 +47,11 @@ pub fn start_memories_startup_task(
     for version in versions {
         // Each detached version owns its authority before any account reads.
         // Refusal skips this not-yet-admitted pipeline; it never runs ungated.
-        let work = match account_work.as_ref().map(|work| work.derive_operation()).transpose() {
+        let work = match account_work
+            .as_ref()
+            .map(|work| work.derive_operation())
+            .transpose()
+        {
             Ok(work) => work.map(Arc::from),
             Err(_) => {
                 warn!("account work unavailable for memories startup pipeline; skipping");

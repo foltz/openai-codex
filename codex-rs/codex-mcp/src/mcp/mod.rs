@@ -483,7 +483,9 @@ pub async fn read_mcp_resource(
     )
     .await;
 
-    let result = manager.read_resource_with_authority(server, params, access).await;
+    let result = manager
+        .read_resource_with_authority(server, params, access)
+        .await;
     cancel_token.cancel();
     result
 }
@@ -819,13 +821,19 @@ async fn collect_mcp_server_status_snapshot_from_manager(
 ) -> McpServerStatusSnapshot {
     let ((server_infos, (tools, tools_errors)), resources, resource_templates) = tokio::join!(
         async {
-            let server_infos = mcp_connection_manager.list_available_server_infos_with_authority(access).await;
-            let tools = mcp_connection_manager.list_tools_with_errors_with_authority(access).await;
+            let server_infos = mcp_connection_manager
+                .list_available_server_infos_with_authority(access)
+                .await;
+            let tools = mcp_connection_manager
+                .list_tools_with_errors_with_authority(access)
+                .await;
             (server_infos, tools)
         },
         async {
             if detail.include_resources() {
-                mcp_connection_manager.list_all_resources_with_authority(|_| true, access).await
+                mcp_connection_manager
+                    .list_all_resources_with_authority(|_| true, access)
+                    .await
             } else {
                 HashMap::new()
             }

@@ -48,7 +48,9 @@ pub enum ThreadCleanupOutcome {
 impl From<CleanupExecution> for ThreadCleanupOutcome {
     fn from(cleanup: CleanupExecution) -> Self {
         match cleanup {
-            CleanupExecution::Finished { persistence_failed } => Self::Finished { persistence_failed },
+            CleanupExecution::Finished { persistence_failed } => {
+                Self::Finished { persistence_failed }
+            }
             CleanupExecution::Panicked => Self::Panicked,
             CleanupExecution::TimedOut => Self::TimedOut,
             CleanupExecution::AuthorityUnavailable => Self::AuthorityUnavailable,

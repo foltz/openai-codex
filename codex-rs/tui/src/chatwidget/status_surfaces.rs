@@ -419,9 +419,11 @@ impl ChatWidget {
             && (selections.status_line_items.iter().any(|entry| {
                 matches!(
                     entry.built_in(),
-                    Some(StatusLineItem::ThreadName
-                        | StatusLineItem::ThreadTitle
-                        | StatusLineItem::SessionId)
+                    Some(
+                        StatusLineItem::ThreadName
+                            | StatusLineItem::ThreadTitle
+                            | StatusLineItem::SessionId
+                    )
                 )
             }) || selections.terminal_title_items.iter().any(|item| {
                 matches!(

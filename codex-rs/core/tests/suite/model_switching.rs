@@ -1002,7 +1002,10 @@ async fn model_change_projects_media_without_changing_live_or_replayed_history(
             test.thread_manager
                 .fork_thread(
                     ForkSnapshot::Interrupted,
-                    codex_core::StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None),
+                    codex_core::StartThreadOptions::new(
+                        test.config.clone(),
+                        /*control_endpoint*/ None,
+                    ),
                     rollout_path,
                 )
                 .await?

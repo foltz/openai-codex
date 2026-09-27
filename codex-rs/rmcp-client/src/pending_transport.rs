@@ -96,10 +96,7 @@ impl PendingConnection {
                 /*retryable*/ true,
             ),
             PendingTransport::StreamableHttpWithAccessTokenOnly { transport } => Self::bind(
-                transport,
-                ticket,
-                /*process*/ None,
-                /*oauth*/ None,
+                transport, ticket, /*process*/ None, /*oauth*/ None,
                 /*retryable*/ true,
             ),
         }

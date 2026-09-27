@@ -6,12 +6,12 @@ use super::REMOTE_WORKSPACE_SHARED_WITH_ME_PRIVATE_MARKETPLACE_NAME;
 use super::REMOTE_WORKSPACE_SHARED_WITH_ME_UNLISTED_MARKETPLACE_NAME;
 use super::RemoteInstalledPlugin;
 use super::RemoteInstalledPluginScope;
+use super::RemotePluginBundleSyncGeneration;
 use super::RemotePluginCapabilities;
 use super::RemotePluginCatalogError;
 use super::RemotePluginScope;
 use super::RemotePluginServiceConfig;
 use super::RemotePluginShareDiscoverability;
-use super::RemotePluginBundleSyncGeneration;
 use super::ensure_chatgpt_auth;
 use super::fetch_installed_plugins;
 use crate::store::PLUGINS_CACHE_DIR;
@@ -414,7 +414,8 @@ async fn remove_stale_remote_plugin_caches(
         installed_plugin_names_by_marketplace,
         removed_plugins,
         &generation,
-    ).await
+    )
+    .await
 }
 
 async fn remove_stale_remote_plugin_caches_for_generation(
@@ -839,23 +840,38 @@ mod tests {
         let home = tempfile::tempdir().expect("create codex home");
         let old = RemotePluginBundleSyncGeneration::capture(home.path());
         super::super::retire_remote_plugin_bundle_sync(home.path());
-        let cache_path = home.path().join(PLUGINS_CACHE_DIR)
-            .join(REMOTE_GLOBAL_MARKETPLACE_NAME).join("new-account");
+        let cache_path = home
+            .path()
+            .join(PLUGINS_CACHE_DIR)
+            .join(REMOTE_GLOBAL_MARKETPLACE_NAME)
+            .join("new-account");
         std::fs::create_dir_all(&cache_path).expect("create new account cache");
         std::fs::write(cache_path.join("marker"), b"new account").expect("write marker");
         let store = PluginStore::try_new(home.path().to_path_buf()).expect("store");
         let mut removed = Vec::new();
         let result = remove_stale_remote_plugin_caches_for_generation(
-            &store, &BTreeMap::new(), &mut removed, &old,
-        ).await;
+            &store,
+            &BTreeMap::new(),
+            &mut removed,
+            &old,
+        )
+        .await;
         assert!(result.is_err());
-        assert_eq!(std::fs::read(cache_path.join("marker")).unwrap(), b"new account");
+        assert_eq!(
+            std::fs::read(cache_path.join("marker")).unwrap(),
+            b"new account"
+        );
         assert!(removed.is_empty());
 
         let current = RemotePluginBundleSyncGeneration::capture(home.path());
         remove_stale_remote_plugin_caches_for_generation(
-            &store, &BTreeMap::new(), &mut removed, &current,
-        ).await.expect("current cleanup proceeds");
+            &store,
+            &BTreeMap::new(),
+            &mut removed,
+            &current,
+        )
+        .await
+        .expect("current cleanup proceeds");
         assert!(!cache_path.exists());
         assert_eq!(removed.len(), 1);
     }

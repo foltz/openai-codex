@@ -79,7 +79,12 @@ impl AccountTurnWork {
     pub(crate) async fn observe_terminated(&self) {
         loop {
             let changed = self.inner.changed.notified();
-            let sessions = self.inner.sessions.lock().expect("account turn registry poisoned").clone();
+            let sessions = self
+                .inner
+                .sessions
+                .lock()
+                .expect("account turn registry poisoned")
+                .clone();
             let mut pending = FuturesUnordered::new();
             for session in sessions {
                 pending.push(async move {
@@ -105,8 +110,18 @@ impl AccountTurnWork {
     }
 
     fn compact(&self) {
-        self.inner.sessions.lock().expect("account turn registry poisoned")
-            .retain(|session| !session.state.lock().expect("account turn session poisoned").entries.is_empty());
+        self.inner
+            .sessions
+            .lock()
+            .expect("account turn registry poisoned")
+            .retain(|session| {
+                !session
+                    .state
+                    .lock()
+                    .expect("account turn session poisoned")
+                    .entries
+                    .is_empty()
+            });
         self.inner.changed.notify_waiters();
     }
 }
@@ -116,37 +131,67 @@ impl AccountTurnSession {
         let key = Arc::new(());
         // Registry -> session is the only nested lock order. Registration and
         // compaction share it, so a new pending slot cannot be lost in between.
-        let mut sessions = self.registry.inner.sessions.lock().expect("account turn registry poisoned");
-        let mut state = self.work.state.lock().expect("account turn session poisoned");
+        let mut sessions = self
+            .registry
+            .inner
+            .sessions
+            .lock()
+            .expect("account turn registry poisoned");
+        let mut state = self
+            .work
+            .state
+            .lock()
+            .expect("account turn session poisoned");
         if state.terminated || self.work.termination.clone().now_or_never().is_some() {
             return None;
         }
-        state.entries.push(Entry { key: Arc::clone(&key), turn_id: None, permit });
-        if !sessions.iter().any(|session| Arc::ptr_eq(session, &self.work)) {
+        state.entries.push(Entry {
+            key: Arc::clone(&key),
+            turn_id: None,
+            permit,
+        });
+        if !sessions
+            .iter()
+            .any(|session| Arc::ptr_eq(session, &self.work))
+        {
             sessions.push(Arc::clone(&self.work));
         }
         drop(state);
         drop(sessions);
         self.registry.inner.changed.notify_waiters();
-        Some(PendingAccountTurn { session: self.clone(), key: Some(key) })
+        Some(PendingAccountTurn {
+            session: self.clone(),
+            key: Some(key),
+        })
     }
 
     /// Delegate from the exact live parent turn, not merely a thread ID or a
     /// boolean claiming that some request once held a permit.
     pub(crate) fn derive(&self, turn_id: &str) -> Option<AccountWorkPermitGuard> {
-        let state = self.work.state.lock().expect("account turn session poisoned");
+        let state = self
+            .work
+            .state
+            .lock()
+            .expect("account turn session poisoned");
         if state.terminated || self.work.termination.clone().now_or_never().is_some() {
             return None;
         }
-        state.entries.iter()
+        state
+            .entries
+            .iter()
             .find(|entry| entry.turn_id.as_deref() == Some(turn_id))?
-            .permit.try_derive()
+            .permit
+            .try_derive()
     }
 
     /// Logical stop/abort evidence, not a claim of physical task cleanup.
     pub(crate) fn terminal(&self, turn_id: &str) {
         let retired = {
-            let mut state = self.work.state.lock().expect("account turn session poisoned");
+            let mut state = self
+                .work
+                .state
+                .lock()
+                .expect("account turn session poisoned");
             if state.entries.iter().any(|entry| entry.turn_id.is_none()) {
                 state.early_terminal.insert(turn_id.to_owned());
             }
@@ -182,10 +227,22 @@ impl std::fmt::Debug for PendingAccountTurn {
 
 impl HostTurnWork for PendingAccountTurn {
     fn bind_submission(&mut self, turn_id: &str) {
-        let key = self.key.as_ref().expect("pending turn has submission authority");
+        let key = self
+            .key
+            .as_ref()
+            .expect("pending turn has submission authority");
         let retired = {
-            let mut state = self.session.work.state.lock().expect("account turn session poisoned");
-            let Some(index) = state.entries.iter().position(|entry| Arc::ptr_eq(&entry.key, key)) else {
+            let mut state = self
+                .session
+                .work
+                .state
+                .lock()
+                .expect("account turn session poisoned");
+            let Some(index) = state
+                .entries
+                .iter()
+                .position(|entry| Arc::ptr_eq(&entry.key, key))
+            else {
                 return;
             };
             let retired = if state.early_terminal.contains(turn_id) {
@@ -210,10 +267,20 @@ impl HostTurnWork for PendingAccountTurn {
 
 impl Drop for PendingAccountTurn {
     fn drop(&mut self) {
-        let Some(key) = self.key.take() else { return; };
+        let Some(key) = self.key.take() else {
+            return;
+        };
         let retired = {
-            let mut state = self.session.work.state.lock().expect("account turn session poisoned");
-            let retired = state.entries.iter().position(|entry| Arc::ptr_eq(&entry.key, &key))
+            let mut state = self
+                .session
+                .work
+                .state
+                .lock()
+                .expect("account turn session poisoned");
+            let retired = state
+                .entries
+                .iter()
+                .position(|entry| Arc::ptr_eq(&entry.key, &key))
                 .map(|index| state.entries.swap_remove(index));
             if state.entries.iter().all(|entry| entry.turn_id.is_some()) {
                 state.early_terminal.clear();

@@ -14,18 +14,21 @@ async fn cancelled_acquisition_remains_owned_until_its_writer_is_disposed() {
     custody.retain_persistence_guard(session.thread_id, Arc::clone(&guard));
     let mut acquisition = Box::pin(async {
         let release = Arc::clone(&release);
-        guard.lock().await.acquire(async move {
-            release.notified().await;
-            Ok(live_thread)
-        }).await
+        guard
+            .lock()
+            .await
+            .acquire(async move {
+                release.notified().await;
+                Ok(live_thread)
+            })
+            .await
     });
     assert!(futures::poll!(acquisition.as_mut()).is_pending());
     drop(acquisition);
     assert!(!custody.is_empty(), "pending acquisition is still custody");
 
-    let mut cleanup = Box::pin(custody.shutdown_until(
-        Instant::now() + std::time::Duration::from_secs(3),
-    ));
+    let mut cleanup =
+        Box::pin(custody.shutdown_until(Instant::now() + std::time::Duration::from_secs(3)));
     assert!(futures::poll!(cleanup.as_mut()).is_pending());
     release.notify_one();
     assert_eq!(
@@ -37,7 +40,12 @@ async fn cancelled_acquisition_remains_owned_until_its_writer_is_disposed() {
     assert!(custody.is_empty());
     assert!(guard.lock().await.as_ref().is_none());
     assert!(
-        session.live_thread().expect("same writer").discard().await.is_err(),
+        session
+            .live_thread()
+            .expect("same writer")
+            .discard()
+            .await
+            .is_err(),
         "the retained acquisition's writer was actually disposed",
     );
 }

@@ -1,7 +1,7 @@
 use super::AppServerTransport;
 use super::CHANNEL_CAPACITY;
-use super::DaemonShutdownAccess;
 use super::ConnectionProvenance;
+use super::DaemonShutdownAccess;
 #[cfg(target_os = "macos")]
 use super::PeerExecutableIdentity;
 use super::TransportEvent;
@@ -63,15 +63,25 @@ async fn bound_hook_failure_removes_rendezvous_and_physical_socket_before_retry(
         DaemonShutdownAccess::Disabled,
         || {
             let physical = std::fs::read_link(socket_path.as_path()).expect("rendezvous published");
-            assert!(physical.exists(), "physical socket bound before publication hook");
+            assert!(
+                physical.exists(),
+                "physical socket bound before publication hook"
+            );
             physical_path = Some(physical);
-            Err(std::io::Error::other("synthetic target publication refusal"))
+            Err(std::io::Error::other(
+                "synthetic target publication refusal",
+            ))
         },
-    ).await.expect_err("publication failure must prevent acceptor startup");
+    )
+    .await
+    .expect_err("publication failure must prevent acceptor startup");
     assert_eq!(failure.kind(), std::io::ErrorKind::Other);
     assert!(std::fs::symlink_metadata(socket_path.as_path()).is_err());
     assert!(!physical_path.expect("hook was reached").exists());
-    assert!(matches!(received.try_recv(), Err(mpsc::error::TryRecvError::Disconnected)));
+    assert!(matches!(
+        received.try_recv(),
+        Err(mpsc::error::TryRecvError::Disconnected)
+    ));
 
     let (events, _received) = mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
     let shutdown = CancellationToken::new();
@@ -81,11 +91,19 @@ async fn bound_hook_failure_removes_rendezvous_and_physical_socket_before_retry(
         events,
         shutdown.clone(),
         DaemonShutdownAccess::Disabled,
-        || { published = true; Ok(()) },
-    ).await.expect("same rendezvous can restart after failed publication");
+        || {
+            published = true;
+            Ok(())
+        },
+    )
+    .await
+    .expect("same rendezvous can restart after failed publication");
     assert!(published);
     shutdown.cancel();
-    timeout(Duration::from_secs(5), acceptor).await.expect("acceptor stops").expect("acceptor joins");
+    timeout(Duration::from_secs(5), acceptor)
+        .await
+        .expect("acceptor stops")
+        .expect("acceptor joins");
     assert!(std::fs::symlink_metadata(socket_path.as_path()).is_err());
 }
 

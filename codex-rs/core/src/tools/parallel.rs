@@ -183,7 +183,8 @@ impl ToolCallRuntime {
         let mut dispatch_handle = AbortOnDropHandle::new(tokio::spawn(
             async move {
                 if let Some(tool_runtime) = tool_runtime
-                    && let Some(readiness) = tool_runtime.wait_until_ready(&session, &step_context.turn)
+                    && let Some(readiness) =
+                        tool_runtime.wait_until_ready(&session, &step_context.turn)
                 {
                     readiness.await;
                 }

@@ -677,7 +677,9 @@ impl OauthLoginFlow {
         let listener = TcpListener::bind(bind_addr)
             .await
             .with_context(|| format!("failed to bind OAuth callback listener at {bind_addr}"))?;
-        let callback_addr = listener.local_addr().context("unable to determine callback address")?;
+        let callback_addr = listener
+            .local_addr()
+            .context("unable to determine callback address")?;
         let (server, callback_requests) = CallbackServer::start(listener)?;
         let server = Arc::new(server);
         let guard = CallbackServerGuard {
@@ -738,7 +740,9 @@ impl OauthLoginFlow {
         let callback_path = callback_path_from_redirect_uri(&redirect_uri)?;
         let (tx, rx) = oneshot::channel();
         let callback_dispatcher = AbortOnDropHandle::new(spawn_callback_dispatcher(
-            callback_requests, tx, callback_path,
+            callback_requests,
+            tx,
+            callback_path,
         ));
         let auth_url = append_query_param(
             &oauth_state.get_authorization_url().await?,
@@ -864,7 +868,10 @@ impl OauthLoginFlow {
         result
     }
 
-    fn spawn(self, operation_work: Option<Box<dyn Send>>) -> (oneshot::Receiver<Result<()>>, JoinHandle<()>) {
+    fn spawn(
+        self,
+        operation_work: Option<Box<dyn Send>>,
+    ) -> (oneshot::Receiver<Result<()>>, JoinHandle<()>) {
         let server_name = self.server_name.clone();
         let (tx, rx) = oneshot::channel();
 
@@ -1552,7 +1559,9 @@ mod tests {
     #[test]
     fn portless_loopback_callbacks_use_the_active_listener_port() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("start callback listener");
-        let callback_addr = listener.local_addr().expect("resolve callback listener address");
+        let callback_addr = listener
+            .local_addr()
+            .expect("resolve callback listener address");
         let listener_port = callback_addr.port();
 
         for path in ["/callback", "/callback/callback-id", "/custom/callback"] {

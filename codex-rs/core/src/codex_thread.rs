@@ -289,7 +289,9 @@ impl CodexThread {
     /// Completion proves loop termination, including panic or cancellation,
     /// not successful session-resource cleanup. Hosts can use this as a fallback
     /// for logical turn evidence when the loop cannot emit a terminal event.
-    pub fn termination_receipt(&self) -> impl std::future::Future<Output = ()> + Send + 'static + use<> {
+    pub fn termination_receipt(
+        &self,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static + use<> {
         let termination = self.io.session_loop_termination.clone();
         async move {
             termination.await;
@@ -368,13 +370,17 @@ impl CodexThread {
         // Traced app-server requests must retain the same account-work custody
         // as direct submissions before crossing into the session loop.
         let op = if matches!(&op, Op::Compact | Op::Review { .. }) {
-            match self.session.admit_turn_work(
-                Box::pin(self.termination_receipt()),
-            ).map_err(|_| CodexErr::Fatal("account work admission is closed".to_string()))? {
+            match self
+                .session
+                .admit_turn_work(Box::pin(self.termination_receipt()))
+                .map_err(|_| CodexErr::Fatal("account work admission is closed".to_string()))?
+            {
                 Some(work) => {
                     let action = match op {
                         Op::Compact => codex_protocol::host_turn_work::HostTurnAction::Compact,
-                        Op::Review { review_request } => codex_protocol::host_turn_work::HostTurnAction::Review(review_request),
+                        Op::Review { review_request } => {
+                            codex_protocol::host_turn_work::HostTurnAction::Review(review_request)
+                        }
                         _ => unreachable!("only compact and review acquire legacy turn work"),
                     };
                     Op::HostTurn { action, work }
@@ -412,12 +418,20 @@ impl CodexThread {
     ) -> CodexResult<TurnInputSubmission> {
         let work = match parent.derive(self) {
             Ok(work) => work,
-            Err(_) => return Ok(TurnInputSubmission::NotSubmitted {
-                reason: codex_protocol::turn_input::NotSubmittedReason::ServerDraining,
-            }),
+            Err(_) => {
+                return Ok(TurnInputSubmission::NotSubmitted {
+                    reason: codex_protocol::turn_input::NotSubmittedReason::ServerDraining,
+                });
+            }
         };
-        self.session.services.agent_control.ensure_execution_capacity_for_turn_start(self).await?;
-        self.io.submit_turn_input(request, TurnInputMode::StartOrSteer, work).await
+        self.session
+            .services
+            .agent_control
+            .ensure_execution_capacity_for_turn_start(self)
+            .await?;
+        self.io
+            .submit_turn_input(request, TurnInputMode::StartOrSteer, work)
+            .await
     }
 
     /// Starts a regular turn only when the thread is idle.
@@ -469,13 +483,16 @@ impl CodexThread {
         &self,
         request: RecoverTurnRequest,
     ) -> CodexResult<StartIfIdleSubmission> {
-        let host_work = match self.session.admit_turn_work(
-            Box::pin(self.termination_receipt()),
-        ) {
+        let host_work = match self
+            .session
+            .admit_turn_work(Box::pin(self.termination_receipt()))
+        {
             Ok(work) => work,
-            Err(_) => return Ok(StartIfIdleSubmission::NotSubmitted {
-                reason: codex_protocol::turn_input::NotSubmittedReason::ServerDraining,
-            }),
+            Err(_) => {
+                return Ok(StartIfIdleSubmission::NotSubmitted {
+                    reason: codex_protocol::turn_input::NotSubmittedReason::ServerDraining,
+                });
+            }
         };
         self.session
             .services
@@ -585,13 +602,16 @@ impl CodexThread {
         let host_work = if matches!(mode, TurnInputMode::Steer { .. }) {
             None
         } else {
-            match self.session.admit_turn_work(
-                Box::pin(self.termination_receipt()),
-            ) {
+            match self
+                .session
+                .admit_turn_work(Box::pin(self.termination_receipt()))
+            {
                 Ok(work) => work,
-                Err(_) => return Ok(TurnInputSubmission::NotSubmitted {
-                    reason: codex_protocol::turn_input::NotSubmittedReason::ServerDraining,
-                }),
+                Err(_) => {
+                    return Ok(TurnInputSubmission::NotSubmitted {
+                        reason: codex_protocol::turn_input::NotSubmittedReason::ServerDraining,
+                    });
+                }
             }
         };
         if !matches!(mode, TurnInputMode::Steer { .. }) {
@@ -1064,9 +1084,9 @@ impl CodexThread {
         &self,
     ) -> anyhow::Result<codex_mcp::CodexAppsToolSnapshot> {
         let work = self.session.request_mcp_work()?;
-        self.session.refresh_codex_apps_tools(
-            codex_mcp::McpAttemptAccess::from_work(work.as_deref()),
-        ).await
+        self.session
+            .refresh_codex_apps_tools(codex_mcp::McpAttemptAccess::from_work(work.as_deref()))
+            .await
     }
 
     /// Returns the environments configured for future turns.
@@ -1103,14 +1123,20 @@ impl CodexThread {
         params: ReadResourceRequestParams,
     ) -> anyhow::Result<serde_json::Value> {
         let work = self.session.request_mcp_work()?;
-        self.session.refresh_mcp_if_dirty_with_authority(
-            codex_mcp::McpAttemptAccess::from_work(work.as_deref()),
-        ).await?;
+        self.session
+            .refresh_mcp_if_dirty_with_authority(codex_mcp::McpAttemptAccess::from_work(
+                work.as_deref(),
+            ))
+            .await?;
         let result = self
             .session
             .services
             .mcp_runtime
-            .latest_read_resource_with_authority(server, params, codex_mcp::McpAttemptAccess::from_work(work.as_deref()))
+            .latest_read_resource_with_authority(
+                server,
+                params,
+                codex_mcp::McpAttemptAccess::from_work(work.as_deref()),
+            )
             .await?;
 
         Ok(serde_json::to_value(result)?)
@@ -1123,14 +1149,21 @@ impl CodexThread {
         uri: &str,
     ) -> anyhow::Result<serde_json::Value> {
         let work = self.session.request_mcp_work()?;
-        self.session.refresh_mcp_if_dirty_with_authority(
-            codex_mcp::McpAttemptAccess::from_work(work.as_deref()),
-        ).await?;
+        self.session
+            .refresh_mcp_if_dirty_with_authority(codex_mcp::McpAttemptAccess::from_work(
+                work.as_deref(),
+            ))
+            .await?;
         let result = self
             .session
             .services
             .mcp_runtime
-            .read_resource_for_call_with_authority(self.session.thread_id, call_id, uri, codex_mcp::McpAttemptAccess::from_work(work.as_deref()))
+            .read_resource_for_call_with_authority(
+                self.session.thread_id,
+                call_id,
+                uri,
+                codex_mcp::McpAttemptAccess::from_work(work.as_deref()),
+            )
             .await?;
 
         Ok(serde_json::to_value(result)?)
@@ -1153,9 +1186,9 @@ impl CodexThread {
             None => None,
         };
         let _ = self.session.services.auth_manager.auth().await;
-        self.session.refresh_mcp_if_dirty_with_authority(
-            access,
-        ).await?;
+        self.session
+            .refresh_mcp_if_dirty_with_authority(access)
+            .await?;
         codex_mcp::McpResourceClient::new(Arc::clone(&self.session.services.mcp_runtime))
             .open_event_stream_with_authority(name, &arguments, meta, access)
             .await
@@ -1169,15 +1202,22 @@ impl CodexThread {
         meta: Option<serde_json::Value>,
     ) -> anyhow::Result<CallToolResult> {
         let work = self.session.request_mcp_work()?;
-        self.session.refresh_mcp_if_dirty_with_authority(
-            codex_mcp::McpAttemptAccess::from_work(work.as_deref()),
-        ).await?;
+        self.session
+            .refresh_mcp_if_dirty_with_authority(codex_mcp::McpAttemptAccess::from_work(
+                work.as_deref(),
+            ))
+            .await?;
         self.session
             .services
             .mcp_runtime
             .latest_call_tool_with_authority(
-                server, tool, /*environment_id*/ None, arguments, meta,
-                /*requested_timeout*/ None, /*wait_for_server*/ true,
+                server,
+                tool,
+                /*environment_id*/ None,
+                arguments,
+                meta,
+                /*requested_timeout*/ None,
+                /*wait_for_server*/ true,
                 codex_mcp::McpAttemptAccess::from_work(work.as_deref()),
             )
             .await

@@ -64,8 +64,6 @@ mod tests;
 pub use plugin_capabilities::RemotePluginCapabilities;
 pub use remote_installed_plugin_sync::RemoteInstalledPluginBundleSyncError;
 pub use remote_installed_plugin_sync::RemoteInstalledPluginBundleSyncOutcome;
-pub(crate) use reset_authority::RemotePluginBundleSyncGeneration;
-pub(crate) use reset_authority::retire_remote_plugin_bundle_sync;
 pub use remote_installed_plugin_sync::RemotePluginCacheMutationGuard;
 pub use remote_installed_plugin_sync::RemotePluginChange;
 pub use remote_installed_plugin_sync::RemotePluginMaterialization;
@@ -73,6 +71,8 @@ pub use remote_installed_plugin_sync::mark_remote_plugin_cache_mutation_in_fligh
 pub(crate) use remote_installed_plugin_sync::remote_installed_plugin_bundle_sync_gate;
 pub use remote_installed_plugin_sync::sync_remote_installed_plugin_bundles_once;
 pub(crate) use remote_installed_plugin_sync::sync_remote_installed_plugin_bundles_once_with_snapshot;
+pub(crate) use reset_authority::RemotePluginBundleSyncGeneration;
+pub(crate) use reset_authority::retire_remote_plugin_bundle_sync;
 pub use search::RemotePluginSearchPage;
 pub use search::RemotePluginSearchRequest;
 pub use search::search_remote_plugins;
@@ -1707,7 +1707,9 @@ pub(crate) async fn uninstall_remote_plugin_for_generation(
     target: RemotePluginUninstallTarget,
     generation: RemotePluginBundleSyncGeneration,
 ) -> Result<(), RemotePluginCatalogError> {
-    let _lease = generation.begin_commit().ok_or(RemotePluginCatalogError::AuthChanged)?;
+    let _lease = generation
+        .begin_commit()
+        .ok_or(RemotePluginCatalogError::AuthChanged)?;
     let auth = ensure_chatgpt_auth(auth)?;
     let RemotePluginUninstallTarget {
         plugin_id,
@@ -1737,7 +1739,9 @@ pub(crate) async fn uninstall_remote_plugin_for_generation(
 
     let legacy_plugin_id = response.id;
     tokio::task::spawn_blocking(move || {
-        let _lease = generation.begin_commit().ok_or(RemotePluginCatalogError::AuthChanged)?;
+        let _lease = generation
+            .begin_commit()
+            .ok_or(RemotePluginCatalogError::AuthChanged)?;
         remove_remote_plugin_cache(codex_home, marketplace_name, plugin_name, legacy_plugin_id)
             .map_err(RemotePluginCatalogError::CacheRemove)
     })

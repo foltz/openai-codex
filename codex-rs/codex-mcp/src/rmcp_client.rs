@@ -7,14 +7,14 @@
 //! Higher-level aggregation and resource/tool APIs live in
 //! [`crate::connection_manager`].
 
-#[path = "rmcp_client/status.rs"]
-mod status;
 #[path = "rmcp_client/startup_work.rs"]
 mod startup_work;
+#[path = "rmcp_client/status.rs"]
+mod status;
 
-pub(crate) use startup_work::ClientStartup;
 use crate::attempt_work::McpAttemptAccess;
 use crate::attempt_work::McpAttemptRequirement;
+pub(crate) use startup_work::ClientStartup;
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -318,9 +318,13 @@ impl CodexAppsStartupReconnect {
         };
         if let Some(ticket) = &self.retirement_ticket {
             match ticket.register(move || task) {
-                Ok(task) => { tokio::spawn(task); }
+                Ok(task) => {
+                    tokio::spawn(task);
+                }
                 Err(_) => {
-                    self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                    self.state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .reconnect_in_flight = false;
                 }
             }
@@ -440,7 +444,8 @@ impl ManagedClientStartup {
                 .await
                 {
                     Ok(result) => {
-                        let client = result?.with_read_only_tools(server.requires_read_only_mcp_tools());
+                        let client =
+                            result?.with_read_only_tools(server.requires_read_only_mcp_tools());
                         let client = match (
                             thread_identity_eligible
                                 .then_some(canonical_thread_id.clone())
@@ -610,12 +615,12 @@ impl AsyncManagedClient {
                     Arc::new(move || startup.start()),
                     attempt_requirement,
                 )
-                    .with_retirement_ticket(retirement_ticket)
-                    .with_startup_status_context(
-                        startup_submit_id,
-                        reconnect_server_name,
-                        reconnect_tx_event,
-                    ),
+                .with_retirement_ticket(retirement_ticket)
+                .with_startup_status_context(
+                    startup_submit_id,
+                    reconnect_server_name,
+                    reconnect_tx_event,
+                ),
             )
         });
         Self {
@@ -677,7 +682,8 @@ impl AsyncManagedClient {
     }
 
     pub(crate) async fn reconnect_failed_startup(&self) {
-        self.reconnect_failed_startup_with_authority(McpAttemptAccess::Unscoped).await;
+        self.reconnect_failed_startup_with_authority(McpAttemptAccess::Unscoped)
+            .await;
     }
 
     pub(crate) async fn reconnect_failed_startup_with_authority(

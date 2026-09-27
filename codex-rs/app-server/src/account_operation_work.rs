@@ -14,7 +14,9 @@ pub(crate) struct AccountOperationWork {
 }
 
 impl codex_mcp::McpAttemptWork for AccountWorkPermitGuard {
-    fn derive_attempt(&self) -> Result<Box<dyn codex_mcp::McpAttemptWork>, codex_mcp::McpAttemptRefused> {
+    fn derive_attempt(
+        &self,
+    ) -> Result<Box<dyn codex_mcp::McpAttemptWork>, codex_mcp::McpAttemptRefused> {
         self.try_derive()
             .map(|work| Box::new(work) as Box<dyn codex_mcp::McpAttemptWork>)
             .ok_or(codex_mcp::McpAttemptRefused)
@@ -29,8 +31,14 @@ impl std::fmt::Debug for AccountOperationWork {
 
 impl HostOperationWork for AccountOperationWork {
     fn derive_operation(&self) -> Result<Box<dyn HostOperationWork>, TurnWorkRefused> {
-        let permit = self.permit.try_derive().ok_or(TurnWorkRefused::Unavailable)?;
-        Ok(Box::new(Self { permit, turns: self.turns.clone() }))
+        let permit = self
+            .permit
+            .try_derive()
+            .ok_or(TurnWorkRefused::Unavailable)?;
+        Ok(Box::new(Self {
+            permit,
+            turns: self.turns.clone(),
+        }))
     }
 
     fn derive_turn_work(
@@ -38,7 +46,10 @@ impl HostOperationWork for AccountOperationWork {
         child_store: &ExtensionData,
         termination: ExtensionFuture<'static, ()>,
     ) -> Result<Box<dyn HostTurnWork>, TurnWorkRefused> {
-        let permit = self.permit.try_derive().ok_or(TurnWorkRefused::Unavailable)?;
+        let permit = self
+            .permit
+            .try_derive()
+            .ok_or(TurnWorkRefused::Unavailable)?;
         let child = child_store.get_or_init(|| self.turns.session(termination));
         let pending = child.begin(permit).ok_or(TurnWorkRefused::Unavailable)?;
         Ok(Box::new(pending))

@@ -635,8 +635,10 @@ pub(super) async fn submission_loop(
                         work.bind_submission(&sub.id);
                     }
                     let result = turn_input::handle(&sess, *request, mode, sub.id.clone()).await;
-                    if matches!(&result, Ok(codex_protocol::turn_input::TurnInputSubmission::Started { .. }))
-                        && let Some(work) = host_work.take()
+                    if matches!(
+                        &result,
+                        Ok(codex_protocol::turn_input::TurnInputSubmission::Started { .. })
+                    ) && let Some(work) = host_work.take()
                     {
                         work.retain_until_terminal();
                     }
@@ -659,8 +661,10 @@ pub(super) async fn submission_loop(
                         sub.id.clone(),
                     )
                     .await;
-                    if matches!(&result, Ok(codex_protocol::turn_input::TurnInputSubmission::Started { .. }))
-                        && let Some(work) = host_work.take()
+                    if matches!(
+                        &result,
+                        Ok(codex_protocol::turn_input::TurnInputSubmission::Started { .. })
+                    ) && let Some(work) = host_work.take()
                     {
                         work.retain_until_terminal();
                     }
@@ -698,8 +702,14 @@ pub(super) async fn submission_loop(
                     start_options,
                     work,
                 } => {
-                    inter_agent_communication(&sess, sub.id.clone(), communication, start_options, work)
-                        .await;
+                    inter_agent_communication(
+                        &sess,
+                        sub.id.clone(),
+                        communication,
+                        start_options,
+                        work,
+                    )
+                    .await;
                     false
                 }
                 Op::ExecApproval {
@@ -848,7 +858,10 @@ async fn approve_guardian_denied_action(sess: &Arc<Session>, event: GuardianAsse
 pub(super) fn submission_dispatch_span(sub: &Submission) -> tracing::Span {
     let op_name = sub.op.kind();
     let span_name = format!("op.dispatch.{op_name}");
-    let parent = sub.trace.as_ref().and_then(codex_otel::context_from_w3c_trace_context);
+    let parent = sub
+        .trace
+        .as_ref()
+        .and_then(codex_otel::context_from_w3c_trace_context);
     if sub.trace.is_some() && parent.is_none() {
         warn!(
             submission.id = sub.id.as_str(),

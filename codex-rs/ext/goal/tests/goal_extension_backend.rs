@@ -265,35 +265,64 @@ async fn fork_goal_deferral_survives_preparation_until_stop_or_abort() -> anyhow
         let runtime = test_runtime().await?;
         let thread_id = test_thread_id()?;
         seed_thread_metadata(runtime.as_ref(), thread_id).await?;
-        let goal = runtime.thread_goals().replace_thread_goal(
-            thread_id, "inherited goal", codex_state::ThreadGoalStatus::Active,
-            /*token_budget*/ None,
-        ).await?;
-        runtime.thread_goals().replace_thread_goal_snapshot(&goal).await?;
+        let goal = runtime
+            .thread_goals()
+            .replace_thread_goal(
+                thread_id,
+                "inherited goal",
+                codex_state::ThreadGoalStatus::Active,
+                /*token_budget*/ None,
+            )
+            .await?;
+        runtime
+            .thread_goals()
+            .replace_thread_goal_snapshot(&goal)
+            .await?;
         let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
 
         // These callbacks run before installation. Abandoning preparation
         // emits no terminal callback and must leave the durable marker intact.
-        harness.start_turn("abandoned", &TokenUsage::default()).await;
+        harness
+            .start_turn("abandoned", &TokenUsage::default())
+            .await;
         harness.resume_thread().await;
-        assert!(runtime.thread_goals().has_thread_goal_continuation_deferral(thread_id).await?);
+        assert!(
+            runtime
+                .thread_goals()
+                .has_thread_goal_continuation_deferral(thread_id)
+                .await?
+        );
 
-        harness.start_turn("installed", &TokenUsage::default()).await;
-        assert!(runtime.thread_goals().has_thread_goal_continuation_deferral(thread_id).await?);
+        harness
+            .start_turn("installed", &TokenUsage::default())
+            .await;
+        assert!(
+            runtime
+                .thread_goals()
+                .has_thread_goal_continuation_deferral(thread_id)
+                .await?
+        );
         if let Some(reason) = abort_reason {
             let turn_store = ExtensionData::new("installed");
             for contributor in harness.registry.turn_lifecycle_contributors() {
-                contributor.on_turn_abort(TurnAbortInput {
-                    reason: reason.clone(),
-                    session_store: &harness.session_store,
-                    thread_store: &harness.thread_store,
-                    turn_store: &turn_store,
-                }).await;
+                contributor
+                    .on_turn_abort(TurnAbortInput {
+                        reason: reason.clone(),
+                        session_store: &harness.session_store,
+                        thread_store: &harness.thread_store,
+                        turn_store: &turn_store,
+                    })
+                    .await;
             }
         } else {
             harness.stop_turn("installed").await;
         }
-        assert!(!runtime.thread_goals().has_thread_goal_continuation_deferral(thread_id).await?);
+        assert!(
+            !runtime
+                .thread_goals()
+                .has_thread_goal_continuation_deferral(thread_id)
+                .await?
+        );
     }
     Ok(())
 }

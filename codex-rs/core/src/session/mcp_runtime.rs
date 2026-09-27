@@ -76,7 +76,8 @@ impl Session {
             codex_mcp::McpAttemptAccess::Admitted,
         );
         self.refresh_mcp_if_dirty_with_authority(access).await?;
-        Ok(self.services
+        Ok(self
+            .services
             .mcp_runtime
             .current_binding_for_call_with_authority(server, access)
             .await
@@ -388,7 +389,10 @@ impl Session {
             desired.environments.ready_environment_handles(),
         );
         McpRuntimeInput {
-            attempt_requirement: if self.services.host_admission.as_ref()
+            attempt_requirement: if self
+                .services
+                .host_admission
+                .as_ref()
                 .is_some_and(|host| host.requires_account_work())
             {
                 codex_mcp::McpAttemptRequirement::Required

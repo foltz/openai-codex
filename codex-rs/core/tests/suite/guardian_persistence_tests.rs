@@ -106,7 +106,11 @@ impl ThreadStore for GatedReviewerStore {
                 self.record_operation(params.thread_id, "create").await;
                 if let Some(gate) = &self.creation_gate {
                     gate.entered.notify_one();
-                    gate.release.acquire().await.expect("release reviewer acquisition").forget();
+                    gate.release
+                        .acquire()
+                        .await
+                        .expect("release reviewer acquisition")
+                        .forget();
                 }
             }
             ThreadStore::create_thread(&self.inner, params).await
@@ -279,9 +283,20 @@ async fn guardian_saves_each_completed_review_before_releasing_its_action() -> a
     // threads, so neither is a discriminator for their cleanup or removal.
     let reviewer_id = reviewer_id.expect("two reviews used a managed reviewer");
     let operations = store.reviewer.lock().await.operations.clone();
-    assert_eq!(operations.iter().filter(|operation| **operation == "shutdown").count(), 1);
-    let report = test.thread_manager.begin_shutdown(tokio::time::Instant::now() + Duration::from_secs(20))
-        .expect("begin manager retirement").wait().await.expect("observe manager retirement");
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|operation| **operation == "shutdown")
+            .count(),
+        1
+    );
+    let report = test
+        .thread_manager
+        .begin_shutdown(tokio::time::Instant::now() + Duration::from_secs(20))
+        .expect("begin manager retirement")
+        .wait()
+        .await
+        .expect("observe manager retirement");
     assert!(report.is_complete(), "{report:?}");
     // The report's documented Debug surface contains runtime IDs: a compacted
     // reviewer must not be reclassified as another manager retirement entry.
@@ -291,7 +306,8 @@ async fn guardian_saves_each_completed_review_before_releasing_its_action() -> a
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn guardian_stop_joins_retained_acquisition_without_resuming_constructor() -> anyhow::Result<()> {
+async fn guardian_stop_joins_retained_acquisition_without_resuming_constructor()
+-> anyhow::Result<()> {
     use codex_extension_api::HostOperationWork;
     use codex_extension_api::TurnStartAdmission;
     use codex_extension_api::TurnWorkRefused;
@@ -320,7 +336,8 @@ async fn guardian_stop_joins_retained_acquisition_without_resuming_constructor()
             &self,
             _: &codex_extension_api::ExtensionData,
             _: codex_extension_api::ExtensionFuture<'static, ()>,
-        ) -> Result<Box<dyn codex_protocol::host_turn_work::HostTurnWork>, TurnWorkRefused> {
+        ) -> Result<Box<dyn codex_protocol::host_turn_work::HostTurnWork>, TurnWorkRefused>
+        {
             Err(TurnWorkRefused::Unavailable)
         }
     }
@@ -330,7 +347,9 @@ async fn guardian_stop_joins_retained_acquisition_without_resuming_constructor()
         fn admit_turn_start(&self) -> Option<Box<dyn Send>> {
             Some(Box::new(()))
         }
-        fn admit_operation_work(&self) -> Result<Option<Box<dyn HostOperationWork>>, TurnWorkRefused> {
+        fn admit_operation_work(
+            &self,
+        ) -> Result<Option<Box<dyn HostOperationWork>>, TurnWorkRefused> {
             self.0.active.fetch_add(1, Ordering::SeqCst);
             Ok(Some(Box::new(Work(Arc::clone(&self.0)))))
         }
@@ -339,23 +358,31 @@ async fn guardian_stop_joins_retained_acquisition_without_resuming_constructor()
     let server = responses::start_mock_server().await;
     let (saves, _pending_saves) = mpsc::unbounded_channel();
     let gate = Arc::new(ReviewerCreationGate {
-        entered: tokio::sync::Notify::new(), release: tokio::sync::Semaphore::new(0),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Semaphore::new(0),
     });
     let store = Arc::new(GatedReviewerStore {
-        inner: InMemoryThreadStore::default(), reviewer: Mutex::new(ReviewerSaves::default()),
-        saves, creation_gate: Some(Arc::clone(&gate)),
+        inner: InMemoryThreadStore::default(),
+        reviewer: Mutex::new(ReviewerSaves::default()),
+        saves,
+        creation_gate: Some(Arc::clone(&gate)),
     });
     let counts = Arc::new(Counts::default());
     let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
     extensions.turn_start_admission(Arc::new(Admission(Arc::clone(&counts))));
-    let test = test_codex().with_thread_store(store.clone())
+    let test = test_codex()
+        .with_thread_store(store.clone())
         .with_extensions(Arc::new(extensions.build()))
         .with_history_mode(ThreadHistoryMode::Legacy)
         .with_config(|config| {
             config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
             config.approvals_reviewer = ApprovalsReviewer::AutoReview;
-        }).build_with_auto_env(&server).await?;
-    timeout(Duration::from_secs(20), gate.entered.notified()).await.expect("reviewer acquisition entered");
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    timeout(Duration::from_secs(20), gate.entered.notified())
+        .await
+        .expect("reviewer acquisition entered");
     // Guardian's background prewarm must transfer authority through the managed
     // spawn into both the retained constructor and its initial MCP publication.
     // Neither the parent constructor nor auth-only prewarm derives this work.
@@ -364,15 +391,30 @@ async fn guardian_stop_joins_retained_acquisition_without_resuming_constructor()
     let mut shutdown = Box::pin(test.codex.shutdown_and_wait());
     // Cancellation may release the constructor, but must not abandon an
     // acquisition that could already own a writer. Parent join stays pending.
-    assert!(timeout(Duration::from_millis(300), shutdown.as_mut()).await.is_err());
+    assert!(
+        timeout(Duration::from_millis(300), shutdown.as_mut())
+            .await
+            .is_err()
+    );
     gate.release.add_permits(1);
     timeout(Duration::from_secs(20), shutdown).await??;
     assert_eq!(counts.active.load(Ordering::SeqCst), 0);
-    assert_eq!(store.reviewer.lock().await.operations, vec!["create", "discard"]);
-    let report = test.thread_manager.begin_shutdown(tokio::time::Instant::now() + Duration::from_secs(10))
-        .expect("begin manager retirement").wait().await.expect("drain constructor");
+    assert_eq!(
+        store.reviewer.lock().await.operations,
+        vec!["create", "discard"]
+    );
+    let report = test
+        .thread_manager
+        .begin_shutdown(tokio::time::Instant::now() + Duration::from_secs(10))
+        .expect("begin manager retirement")
+        .wait()
+        .await
+        .expect("drain constructor");
     assert!(report.is_complete(), "{report:?}");
-    assert_eq!(store.reviewer.lock().await.operations, vec!["create", "discard"]);
+    assert_eq!(
+        store.reviewer.lock().await.operations,
+        vec!["create", "discard"]
+    );
     // The in-memory fixture records disposal but does not model writer closure;
     // real local-store ThreadNotFound is covered by managed_threads_tests.
     Ok(())

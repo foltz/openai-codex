@@ -393,7 +393,10 @@ where
                 .get::<ExecutorSkillsStepState>()
                 .map(|executor_skills| executor_skills.0.clone())
                 .unwrap_or_default();
-            catalog.extend(self.list_skills(query, &thread_state, input.mcp_access).await);
+            catalog.extend(
+                self.list_skills(query, &thread_state, input.mcp_access)
+                    .await,
+            );
             for warning in bounded_warnings(&catalog.warnings) {
                 self.emit_warning(thread_store.level_id(), Some(&input.turn_id), warning);
             }

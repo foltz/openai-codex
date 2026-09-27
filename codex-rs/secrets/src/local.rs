@@ -487,7 +487,10 @@ mod tests {
         let name = SecretName::new("TEST_SECRET")?;
         assert_eq!(backend.get_existing(&SecretScope::Global, &name)?, None);
         assert!(!backend.secrets_path().exists());
-        assert!(!keyring.contains(&compute_keyring_account(home.path(), LocalSecretsNamespace::ManagedSecrets)));
+        assert!(!keyring.contains(&compute_keyring_account(
+            home.path(),
+            LocalSecretsNamespace::ManagedSecrets
+        )));
         Ok(())
     }
 

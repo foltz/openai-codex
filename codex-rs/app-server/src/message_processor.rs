@@ -1431,7 +1431,8 @@ impl MessageProcessor {
                         self.mcp_processor.clone(),
                         // This spawn precedes within_request; capture from the
                         // actual request permit, not an absent task-local scope.
-                        account_work_permit.as_ref()
+                        account_work_permit
+                            .as_ref()
                             .map(codex_mcp::McpAttemptWork::derive_attempt)
                             .transpose()
                             .map_err(|_| account_transition_in_progress())?,
@@ -1539,72 +1540,68 @@ impl MessageProcessor {
                     Ok(())
                 })
             }
-            ClientRequest::ThreadResume { request_id, params } => {
-                Box::pin(async move {
-                    let _request_context = request_context;
-                    let _event_stream_ready = event_stream_ready;
-                    let app_server_client_name = session.app_server_client_name().map(str::to_string);
-                    let client_version = session.client_version().map(str::to_string);
-                    let client_mcp_extensions = session.client_mcp_extensions();
-                    let request_id = ConnectionRequestId {
-                        connection_id: connection_request_id.connection_id,
-                        request_id,
-                    };
-                    match self
-                        .thread_processor
-                        .thread_resume(
-                            ThreadResumeTarget::Client(request_id.clone()),
-                            params,
-                            app_server_client_name,
-                            client_version,
-                            client_mcp_extensions,
-                        )
-                        .await
-                    {
-                        Ok(Some(response)) => {
-                            self.outgoing.send_response_as(request_id, response).await;
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            self.outgoing.send_error(request_id, error).await;
-                        }
+            ClientRequest::ThreadResume { request_id, params } => Box::pin(async move {
+                let _request_context = request_context;
+                let _event_stream_ready = event_stream_ready;
+                let app_server_client_name = session.app_server_client_name().map(str::to_string);
+                let client_version = session.client_version().map(str::to_string);
+                let client_mcp_extensions = session.client_mcp_extensions();
+                let request_id = ConnectionRequestId {
+                    connection_id: connection_request_id.connection_id,
+                    request_id,
+                };
+                match self
+                    .thread_processor
+                    .thread_resume(
+                        ThreadResumeTarget::Client(request_id.clone()),
+                        params,
+                        app_server_client_name,
+                        client_version,
+                        client_mcp_extensions,
+                    )
+                    .await
+                {
+                    Ok(Some(response)) => {
+                        self.outgoing.send_response_as(request_id, response).await;
                     }
-                    Ok(())
-                })
-            }
-            ClientRequest::ThreadFork { request_id, params } => {
-                Box::pin(async move {
-                    let _request_context = request_context;
-                    let _event_stream_ready = event_stream_ready;
-                    let app_server_client_name = session.app_server_client_name().map(str::to_string);
-                    let client_version = session.client_version().map(str::to_string);
-                    let client_mcp_extensions = session.client_mcp_extensions();
-                    let request_id = ConnectionRequestId {
-                        connection_id: connection_request_id.connection_id,
-                        request_id,
-                    };
-                    match self
-                        .thread_processor
-                        .thread_fork(
-                            request_id.clone(),
-                            params,
-                            app_server_client_name,
-                            client_version,
-                            client_mcp_extensions,
-                        )
-                        .await
-                    {
-                        Ok(Some(response)) => {
-                            self.outgoing.send_response_as(request_id, response).await;
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            self.outgoing.send_error(request_id, error).await;
-                        }
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.outgoing.send_error(request_id, error).await;
                     }
-                    Ok(())
-                })
-            }
+                }
+                Ok(())
+            }),
+            ClientRequest::ThreadFork { request_id, params } => Box::pin(async move {
+                let _request_context = request_context;
+                let _event_stream_ready = event_stream_ready;
+                let app_server_client_name = session.app_server_client_name().map(str::to_string);
+                let client_version = session.client_version().map(str::to_string);
+                let client_mcp_extensions = session.client_mcp_extensions();
+                let request_id = ConnectionRequestId {
+                    connection_id: connection_request_id.connection_id,
+                    request_id,
+                };
+                match self
+                    .thread_processor
+                    .thread_fork(
+                        request_id.clone(),
+                        params,
+                        app_server_client_name,
+                        client_version,
+                        client_mcp_extensions,
+                    )
+                    .await
+                {
+                    Ok(Some(response)) => {
+                        self.outgoing.send_response_as(request_id, response).await;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.outgoing.send_error(request_id, error).await;
+                    }
+                }
+                Ok(())
+            }),
             request => Box::pin(self.handle_general_initialized_client_request(
                 connection_request_id,
                 request,

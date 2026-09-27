@@ -943,7 +943,10 @@ mod tests {
                     .move_connection_for_clear(predecessor, successor, requester)
                     .await
             );
-            assert_eq!(manager.thread_interactive_subscription_list().await, disconnected);
+            assert_eq!(
+                manager.thread_interactive_subscription_list().await,
+                disconnected
+            );
             assert!(!manager.has_subscribers(successor).await);
         }
     }
@@ -1663,8 +1666,14 @@ impl ThreadStateManagerInner {
         self.publish_retention(thread_id);
     }
 
-    fn add_interactive_subscription(&mut self, thread_id: ThreadId) -> ThreadInteractiveSubscriptionEntry {
-        let interactive_subscription_count = self.interactive_subscription_counts.entry(thread_id).or_default();
+    fn add_interactive_subscription(
+        &mut self,
+        thread_id: ThreadId,
+    ) -> ThreadInteractiveSubscriptionEntry {
+        let interactive_subscription_count = self
+            .interactive_subscription_counts
+            .entry(thread_id)
+            .or_default();
         *interactive_subscription_count = interactive_subscription_count.saturating_add(1);
         ThreadInteractiveSubscriptionEntry {
             thread_id: thread_id.to_string(),
@@ -1904,7 +1913,10 @@ impl ThreadStateManager {
         Ok(RetentionReleaseOutcome::Released)
     }
 
-    async fn publish_interactive_subscription_change(&self, change: Option<ThreadInteractiveSubscriptionChangedNotification>) {
+    async fn publish_interactive_subscription_change(
+        &self,
+        change: Option<ThreadInteractiveSubscriptionChangedNotification>,
+    ) {
         let Some(change) = change else {
             return;
         };
@@ -2268,7 +2280,10 @@ impl ThreadStateManager {
                 .live_connections
                 .get(&connection_id)
                 .and_then(|capabilities| capabilities.retention_principal);
-            if trusted_interactive && !state.interactive_subscription_counts.contains_key(&predecessor_thread_id)
+            if trusted_interactive
+                && !state
+                    .interactive_subscription_counts
+                    .contains_key(&predecessor_thread_id)
             {
                 return false;
             }

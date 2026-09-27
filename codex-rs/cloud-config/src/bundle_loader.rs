@@ -6,8 +6,8 @@ use crate::home_lifecycle::home_lifecycle;
 use crate::home_lifecycle::lifecycle_error;
 use crate::service::CLOUD_CONFIG_BUNDLE_TIMEOUT;
 use crate::service::CloudConfigBundleService;
-use codex_config::CloudConfigBundleLoader;
 use codex_config::CloudConfigBundleLoadError;
+use codex_config::CloudConfigBundleLoader;
 use codex_http_client::HttpClientFactory;
 use codex_login::AuthConfig;
 use codex_login::AuthManager;
@@ -93,13 +93,19 @@ struct LoaderBirth {
 impl LoaderBirth {
     fn capture(home: &Path) -> Result<Self, CloudConfigBundleLoadError> {
         let lifecycle = home_lifecycle(home)?;
-        let owners = lifecycle.owners.lock().map_err(|_| lifecycle_error("cloud owner lock unavailable"))?;
+        let owners = lifecycle
+            .owners
+            .lock()
+            .map_err(|_| lifecycle_error("cloud owner lock unavailable"))?;
         if owners.retiring {
             return Err(lifecycle_error("cloud reset is still retiring prior work"));
         }
         let generation = lifecycle.generation.load(Ordering::Acquire);
         drop(owners);
-        Ok(Self { lifecycle, generation })
+        Ok(Self {
+            lifecycle,
+            generation,
+        })
     }
 }
 
@@ -109,7 +115,10 @@ fn registered_loader_at_birth<C: BundleClient + 'static>(
     birth: LoaderBirth,
 ) -> Result<(CloudConfigBundleLoader, AbortHandle), CloudConfigBundleLoadError> {
     let lifecycle = birth.lifecycle;
-    let mut owners = lifecycle.owners.lock().map_err(|_| lifecycle_error("cloud owner lock unavailable"))?;
+    let mut owners = lifecycle
+        .owners
+        .lock()
+        .map_err(|_| lifecycle_error("cloud owner lock unavailable"))?;
     if owners.retiring || lifecycle.generation.load(Ordering::Acquire) != birth.generation {
         return Err(lifecycle_error("cloud reset is still retiring prior work"));
     }
@@ -149,7 +158,11 @@ fn start_loader<C: BundleClient + 'static>(
     let loader = CloudConfigBundleLoader::from_getter(move || {
         let lifetime = Arc::clone(&lifetime);
         let lifecycle = Arc::clone(&lifecycle);
-        async move { lifecycle.load(expected_generation, lifetime.service.get_latest()).await }
+        async move {
+            lifecycle
+                .load(expected_generation, lifetime.service.get_latest())
+                .await
+        }
     });
     (loader, abort_handle)
 }
@@ -162,7 +175,8 @@ pub async fn cloud_config_bundle_loader_for_storage(
         auth_config.codex_home.clone(),
         cloud_config_bundle_service_for_storage(auth_config, enable_codex_api_key_env),
         StorageMode::Cached,
-    ).await
+    )
+    .await
 }
 
 /// Fetches directly from the network on each load, without reading or writing
@@ -175,7 +189,8 @@ pub async fn cloud_config_bundle_loader_for_storage_without_cache(
         auth_config.codex_home.clone(),
         cloud_config_bundle_service_for_storage(auth_config, enable_codex_api_key_env),
         StorageMode::Uncached,
-    ).await
+    )
+    .await
 }
 
 enum StorageMode {
@@ -193,10 +208,13 @@ async fn storage_loader<C: BundleClient + 'static>(
     let birth = LoaderBirth::capture(&home).map_err(std::io::Error::other)?;
     let service = construct.await?;
     match mode {
-        StorageMode::Cached => registered_loader_at_birth(service, Some(refresher_task_slot()), birth)
-            .map(|(loader, _)| loader),
+        StorageMode::Cached => {
+            registered_loader_at_birth(service, Some(refresher_task_slot()), birth)
+                .map(|(loader, _)| loader)
+        }
         StorageMode::Uncached => uncached_loader_at_birth(service, birth),
-    }.map_err(std::io::Error::other)
+    }
+    .map_err(std::io::Error::other)
 }
 
 #[cfg(test)]
@@ -213,7 +231,10 @@ fn uncached_loader_at_birth<C: BundleClient + 'static>(
 ) -> Result<CloudConfigBundleLoader, CloudConfigBundleLoadError> {
     let mut service = service.without_cache();
     let lifecycle = birth.lifecycle;
-    let owners = lifecycle.owners.lock().map_err(|_| lifecycle_error("cloud owner lock unavailable"))?;
+    let owners = lifecycle
+        .owners
+        .lock()
+        .map_err(|_| lifecycle_error("cloud owner lock unavailable"))?;
     if owners.retiring || lifecycle.generation.load(Ordering::Acquire) != birth.generation {
         return Err(lifecycle_error("cloud reset is still retiring prior work"));
     }
@@ -226,14 +247,24 @@ fn uncached_loader_at_birth<C: BundleClient + 'static>(
     Ok(CloudConfigBundleLoader::from_getter(move || {
         let service = Arc::clone(&service);
         let lifecycle = Arc::clone(&lifecycle);
-        async move { lifecycle.load(expected_generation, service.load_startup_bundle_with_timeout()).await }
+        async move {
+            lifecycle
+                .load(
+                    expected_generation,
+                    service.load_startup_bundle_with_timeout(),
+                )
+                .await
+        }
     }))
 }
 
 /// Retires this process's prior same-home cloud owners and cache publications.
 /// The caller must successfully await `get()` before publishing this strict
 /// loader as an acknowledged configuration reset.
-#[expect(clippy::await_holding_invalid_type, reason = "serializes same-home reset and installation; getters and writers never take the reset lock")]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "serializes same-home reset and installation; getters and writers never take the reset lock"
+)]
 pub async fn managed_cloud_config_bundle_loader(
     auth_manager: Arc<AuthManager>,
     chatgpt_base_url: String,
@@ -241,17 +272,24 @@ pub async fn managed_cloud_config_bundle_loader(
     http_client_factory: HttpClientFactory,
 ) -> Result<CloudConfigBundleLoader, CloudConfigBundleLoadError> {
     let lifecycle = home_lifecycle(&codex_home)?;
-    let _reset = tokio::time::timeout(CLOUD_CONFIG_BUNDLE_TIMEOUT, lifecycle.reset.lock()).await
+    let _reset = tokio::time::timeout(CLOUD_CONFIG_BUNDLE_TIMEOUT, lifecycle.reset.lock())
+        .await
         .map_err(|_| lifecycle_error("cloud reset ownership timed out"))?;
     lifecycle.retire_owners().await?;
     let mut service = CloudConfigBundleService::new(
         auth_manager,
-        Arc::new(BackendBundleClient::new(chatgpt_base_url, http_client_factory)),
+        Arc::new(BackendBundleClient::new(
+            chatgpt_base_url,
+            http_client_factory,
+        )),
         codex_home,
         CLOUD_CONFIG_BUNDLE_TIMEOUT,
     );
     service.strict_cache_publication = true;
-    let mut owners = lifecycle.owners.lock().map_err(|_| lifecycle_error("cloud owner lock unavailable"))?;
+    let mut owners = lifecycle
+        .owners
+        .lock()
+        .map_err(|_| lifecycle_error("cloud owner lock unavailable"))?;
     let (loader, refresh_task) = start_loader(service, &lifecycle, &mut owners);
     replace_refresh_task(refresher_task_slot(), refresh_task);
     owners.retiring = false;

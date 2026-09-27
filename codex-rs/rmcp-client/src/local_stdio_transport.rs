@@ -190,7 +190,9 @@ impl Transport<RoleClient> for LocalStdioTransport {
         match tokio::time::timeout(
             super::stdio_server_launcher::PROCESS_RETIREMENT_TIMEOUT,
             exit_observer.wait(),
-        ).await {
+        )
+        .await
+        {
             Ok(result) => result,
             Err(_) => Err(io::Error::new(
                 io::ErrorKind::TimedOut,

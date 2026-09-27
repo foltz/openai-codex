@@ -39,7 +39,8 @@ impl McpConnectionSet {
         &self,
         include_server: impl Fn(&str) -> bool,
     ) -> HashMap<String, Vec<Resource>> {
-        self.list_all_resources_with_authority(include_server, crate::McpAttemptAccess::Unscoped).await
+        self.list_all_resources_with_authority(include_server, crate::McpAttemptAccess::Unscoped)
+            .await
     }
 
     pub(crate) async fn list_all_resources_with_authority(
@@ -101,7 +102,11 @@ impl McpConnectionSet {
         &self,
         include_server: impl Fn(&str) -> bool,
     ) -> HashMap<String, Vec<ResourceTemplate>> {
-        self.list_all_resource_templates_with_authority(include_server, crate::McpAttemptAccess::Unscoped).await
+        self.list_all_resource_templates_with_authority(
+            include_server,
+            crate::McpAttemptAccess::Unscoped,
+        )
+        .await
     }
 
     pub(crate) async fn list_all_resource_templates_with_authority(
@@ -122,7 +127,9 @@ impl McpConnectionSet {
             let timeout = view.tool_timeout;
             let client = managed_client.client;
             let Ok(work) = view.connection.client.client.requirement.derive(access) else {
-                warn!("MCP resource template listing account work is unavailable for '{server_name}'");
+                warn!(
+                    "MCP resource template listing account work is unavailable for '{server_name}'"
+                );
                 continue;
             };
             join_set.spawn(async move {
@@ -163,7 +170,8 @@ impl McpConnectionSet {
         server: &str,
         params: Option<PaginatedRequestParams>,
     ) -> Result<ListResourcesResult> {
-        self.list_resources_with_authority(server, params, crate::McpAttemptAccess::Unscoped).await
+        self.list_resources_with_authority(server, params, crate::McpAttemptAccess::Unscoped)
+            .await
     }
 
     pub(crate) async fn list_resources_with_authority(
@@ -185,7 +193,12 @@ impl McpConnectionSet {
         server: &str,
         params: Option<PaginatedRequestParams>,
     ) -> Result<ListResourceTemplatesResult> {
-        self.list_resource_templates_with_authority(server, params, crate::McpAttemptAccess::Unscoped).await
+        self.list_resource_templates_with_authority(
+            server,
+            params,
+            crate::McpAttemptAccess::Unscoped,
+        )
+        .await
     }
 
     pub(crate) async fn list_resource_templates_with_authority(
@@ -207,7 +220,8 @@ impl McpConnectionSet {
         server: &str,
         params: ReadResourceRequestParams,
     ) -> Result<ReadResourceResult> {
-        self.read_resource_with_authority(server, params, crate::McpAttemptAccess::Unscoped).await
+        self.read_resource_with_authority(server, params, crate::McpAttemptAccess::Unscoped)
+            .await
     }
 
     pub(crate) async fn read_resource_with_authority(
@@ -229,7 +243,8 @@ impl McpConnectionSet {
         &self,
         name: &str,
     ) -> Result<(ManagedClient, Option<Duration>)> {
-        self.client_by_name_with_authority(name, crate::McpAttemptAccess::Unscoped).await
+        self.client_by_name_with_authority(name, crate::McpAttemptAccess::Unscoped)
+            .await
     }
 
     pub(crate) async fn client_by_name_with_authority(
@@ -246,7 +261,9 @@ impl McpConnectionSet {
             .client_with_authority(access)
             .await
             .map_err(|error| match error {
-                crate::rmcp_client::StartupOutcomeError::Refused(refused) => anyhow::Error::new(refused),
+                crate::rmcp_client::StartupOutcomeError::Refused(refused) => {
+                    anyhow::Error::new(refused)
+                }
                 error => anyhow::Error::new(error),
             })
             .context("failed to get client")?;

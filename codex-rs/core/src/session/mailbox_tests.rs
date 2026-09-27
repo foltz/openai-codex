@@ -22,14 +22,17 @@ fn mailbox() -> (Mailbox, watch::Receiver<InputQueueActivity>) {
 fn cancelled_future_restores_complete_mail_and_start_options() {
     let (mailbox, mut activity) = mailbox();
     let original = mail("reserved");
-    mailbox.enqueue(original.clone(), TurnStartOptions {
-        parent_turn_id: Some("parent".into()),
-        root_turn_id: Some("root".into()),
-        turn_trigger: Some("followup".into()),
-        service_tier: Some("priority".into()),
-        final_output_json_schema: Some(serde_json::json!({"type": "object"})),
-        ..Default::default()
-    });
+    mailbox.enqueue(
+        original.clone(),
+        TurnStartOptions {
+            parent_turn_id: Some("parent".into()),
+            root_turn_id: Some("root".into()),
+            turn_trigger: Some("followup".into()),
+            service_tier: Some("priority".into()),
+            final_output_json_schema: Some(serde_json::json!({"type": "object"})),
+            ..Default::default()
+        },
+    );
     activity.borrow_and_update();
     let mut attempt = Box::pin(async {
         let reservation = mailbox.reserve();
@@ -44,10 +47,20 @@ fn cancelled_future_restores_complete_mail_and_start_options() {
     let (items, options) = mailbox.reserve().into_input("test-turn");
     assert_eq!(items, vec![TurnInput::InterAgentCommunication(original)]);
     assert_eq!(
-        (options.parent_turn_id, options.root_turn_id, options.turn_trigger,
-            options.service_tier, options.final_output_json_schema),
-        (Some("parent".into()), Some("root".into()), Some("followup".into()),
-            Some("priority".into()), Some(serde_json::json!({"type": "object"}))),
+        (
+            options.parent_turn_id,
+            options.root_turn_id,
+            options.turn_trigger,
+            options.service_tier,
+            options.final_output_json_schema
+        ),
+        (
+            Some("parent".into()),
+            Some("root".into()),
+            Some("followup".into()),
+            Some("priority".into()),
+            Some(serde_json::json!({"type": "object"}))
+        ),
     );
     assert!(!mailbox.has_pending());
 }
@@ -60,11 +73,15 @@ fn competing_consumer_cannot_take_a_private_reservation() {
     mailbox.enqueue(first.clone(), TurnStartOptions::default());
     let reservation = mailbox.reserve();
     mailbox.enqueue(second.clone(), TurnStartOptions::default());
-    assert_eq!(mailbox.reserve().into_input("test-turn").0,
-        vec![TurnInput::InterAgentCommunication(second)]);
+    assert_eq!(
+        mailbox.reserve().into_input("test-turn").0,
+        vec![TurnInput::InterAgentCommunication(second)]
+    );
     drop(reservation);
-    assert_eq!(mailbox.reserve().into_input("test-turn").0,
-        vec![TurnInput::InterAgentCommunication(first)]);
+    assert_eq!(
+        mailbox.reserve().into_input("test-turn").0,
+        vec![TurnInput::InterAgentCommunication(first)]
+    );
     assert!(!mailbox.has_pending());
 }
 
@@ -86,8 +103,13 @@ fn reservations_restore_fifo_regardless_of_drop_order() {
             drop(second);
             drop(first);
         }
-        assert_eq!(mailbox.reserve().into_input("test-turn").0,
-            mails.into_iter().map(TurnInput::InterAgentCommunication).collect::<Vec<_>>());
+        assert_eq!(
+            mailbox.reserve().into_input("test-turn").0,
+            mails
+                .into_iter()
+                .map(TurnInput::InterAgentCommunication)
+                .collect::<Vec<_>>()
+        );
         assert!(!mailbox.has_pending());
     }
 }
@@ -95,22 +117,34 @@ fn reservations_restore_fifo_regardless_of_drop_order() {
 #[test]
 fn rollback_preserves_latest_trigger_settings_and_parent_consensus() {
     let (mailbox, _activity) = mailbox();
-    mailbox.enqueue(mail("old"), TurnStartOptions {
-        parent_turn_id: Some("parent-a".into()),
-        root_turn_id: Some("root-a".into()),
-        final_output_json_schema: Some(serde_json::json!({"type": "object"})),
-        ..Default::default()
-    });
+    mailbox.enqueue(
+        mail("old"),
+        TurnStartOptions {
+            parent_turn_id: Some("parent-a".into()),
+            root_turn_id: Some("root-a".into()),
+            final_output_json_schema: Some(serde_json::json!({"type": "object"})),
+            ..Default::default()
+        },
+    );
     let reservation = mailbox.reserve();
-    mailbox.enqueue(mail("new"), TurnStartOptions {
-        parent_turn_id: Some("parent-b".into()),
-        root_turn_id: Some("root-b".into()),
-        ..Default::default()
-    });
+    mailbox.enqueue(
+        mail("new"),
+        TurnStartOptions {
+            parent_turn_id: Some("parent-b".into()),
+            root_turn_id: Some("root-b".into()),
+            ..Default::default()
+        },
+    );
     drop(reservation);
     let (_, options) = mailbox.reserve().into_input("test-turn");
-    assert_eq!((options.parent_turn_id, options.root_turn_id, options.final_output_json_schema),
-        (None, Some("root-a".into()), None));
+    assert_eq!(
+        (
+            options.parent_turn_id,
+            options.root_turn_id,
+            options.final_output_json_schema
+        ),
+        (None, Some("root-a".into()), None)
+    );
 }
 
 #[test]
@@ -132,16 +166,29 @@ fn rollback_preserves_mail_after_mutex_poisoning() {
     let reservation = mailbox.reserve();
     activity.borrow_and_update();
     let state = Arc::clone(&mailbox.state);
-    assert!(std::thread::spawn(move || {
-        let _guard = state.lock().unwrap();
-        panic!("injected mailbox poison");
-    }).join().is_err());
+    assert!(
+        std::thread::spawn(move || {
+            let _guard = state.lock().unwrap();
+            panic!("injected mailbox poison");
+        })
+        .join()
+        .is_err()
+    );
 
     drop(reservation);
 
-    let state = mailbox.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    assert_eq!(state.pending.values().map(|mail| mail.communication.clone()).collect::<Vec<_>>(),
-        vec![original]);
+    let state = mailbox
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(
+        state
+            .pending
+            .values()
+            .map(|mail| mail.communication.clone())
+            .collect::<Vec<_>>(),
+        vec![original]
+    );
     assert!(mailbox.state.is_poisoned());
     assert!(activity.has_changed().unwrap());
 }

@@ -65,7 +65,8 @@ impl ResetInventory for ProductionResetInventory {
                     timed_out: shutdown_report.timed_out.len(),
                 });
             }
-            if !self.thread_manager
+            if !self
+                .thread_manager
                 .shutdown_unpublished_constructions_bounded(RESET_STAGE_TIMEOUT)
                 .await
             {
@@ -120,9 +121,10 @@ impl ResetInventory for ProductionResetInventory {
             // timeout; replacement is allowed only after positive join evidence.
             {
                 let deadline = tokio::time::Instant::now() + RESET_STAGE_TIMEOUT;
-                let mut worker = tokio::time::timeout_at(deadline, self.models_refresh_worker.lock())
-                    .await
-                    .map_err(|_| ResetInventoryError::ModelsWorkerUnavailable)?;
+                let mut worker =
+                    tokio::time::timeout_at(deadline, self.models_refresh_worker.lock())
+                        .await
+                        .map_err(|_| ResetInventoryError::ModelsWorkerUnavailable)?;
                 if worker.shutdown_until(deadline).await != ModelsRefreshShutdown::Joined {
                     return Err(ResetInventoryError::ModelsWorkerUnavailable);
                 }
@@ -131,13 +133,16 @@ impl ResetInventory for ProductionResetInventory {
 
             // Preserve upstream's managed-provider gate as well as the explicit
             // reset acknowledgement; the background worker alone proves neither.
-            tokio::time::timeout(RESET_STAGE_TIMEOUT, self.model_catalog.reset_for_managed_auth())
-                .await
-                .map_err(|_| ResetInventoryError::ModelCatalogTimedOut)?
-                .map_err(|error| {
-                    tracing::warn!(outcome = ?error, "managed model catalog reset refused");
-                    ResetInventoryError::ModelCatalogUnavailable
-                })?;
+            tokio::time::timeout(
+                RESET_STAGE_TIMEOUT,
+                self.model_catalog.reset_for_managed_auth(),
+            )
+            .await
+            .map_err(|_| ResetInventoryError::ModelCatalogTimedOut)?
+            .map_err(|error| {
+                tracing::warn!(outcome = ?error, "managed model catalog reset refused");
+                ResetInventoryError::ModelCatalogUnavailable
+            })?;
             Ok(())
         })
     }

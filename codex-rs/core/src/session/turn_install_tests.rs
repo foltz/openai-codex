@@ -4,7 +4,10 @@ use futures::FutureExt;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
-#[expect(clippy::await_holding_invalid_type, reason = "hold the destination to exercise commit cancellation")]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "hold the destination to exercise commit cancellation"
+)]
 async fn cancelled_turn_commit_waiting_for_destination_preserves_previous_id_and_mail() {
     let (session, _context) = tests::make_session_and_context().await;
     session.state.lock().await.last_started_turn_id = Some("previous".into());
@@ -15,7 +18,10 @@ async fn cancelled_turn_commit_waiting_for_destination_preserves_previous_id_and
         "waiting for destination".into(),
         /*trigger_turn*/ true,
     );
-    session.input_queue.enqueue_mailbox_communication(mail.clone(), Default::default()).await;
+    session
+        .input_queue
+        .enqueue_mailbox_communication(mail.clone(), Default::default())
+        .await;
     let mut active = session.active_turn.lock().await;
     *active = Some(ActiveTurn::default());
     let turn_state = Arc::clone(&active.as_ref().unwrap().turn_state);
@@ -27,14 +33,28 @@ async fn cancelled_turn_commit_waiting_for_destination_preserves_previous_id_and
     drop(commit);
     drop(destination);
     assert!(active.as_ref().unwrap().task.is_none());
-    assert_eq!(session.state.lock().await.last_started_turn_id.as_deref(), Some("previous"));
-    assert!(session.input_queue.take_pending_input_for_turn_state(&turn_state).await.is_empty());
-    assert_eq!(session.input_queue.drain_mailbox_input_items().await.0,
-        vec![TurnInput::InterAgentCommunication(mail)]);
+    assert_eq!(
+        session.state.lock().await.last_started_turn_id.as_deref(),
+        Some("previous")
+    );
+    assert!(
+        session
+            .input_queue
+            .take_pending_input_for_turn_state(&turn_state)
+            .await
+            .is_empty()
+    );
+    assert_eq!(
+        session.input_queue.drain_mailbox_input_items().await.0,
+        vec![TurnInput::InterAgentCommunication(mail)]
+    );
 }
 
 #[tokio::test]
-#[expect(clippy::await_holding_invalid_type, reason = "hold session state to exercise commit cancellation")]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "hold session state to exercise commit cancellation"
+)]
 async fn cancelled_turn_commit_waiting_for_session_state_preserves_previous_id_and_mail() {
     let (session, _context) = tests::make_session_and_context().await;
     let mail = InterAgentCommunication::new(
@@ -44,7 +64,10 @@ async fn cancelled_turn_commit_waiting_for_session_state_preserves_previous_id_a
         "waiting for session state".into(),
         /*trigger_turn*/ true,
     );
-    session.input_queue.enqueue_mailbox_communication(mail.clone(), Default::default()).await;
+    session
+        .input_queue
+        .enqueue_mailbox_communication(mail.clone(), Default::default())
+        .await;
     let mut active = session.active_turn.lock().await;
     *active = Some(ActiveTurn::default());
     let turn_state = Arc::clone(&active.as_ref().unwrap().turn_state);
@@ -56,7 +79,15 @@ async fn cancelled_turn_commit_waiting_for_session_state_preserves_previous_id_a
     drop(commit);
     assert_eq!(state.last_started_turn_id.as_deref(), Some("previous"));
     assert!(active.as_ref().unwrap().task.is_none());
-    assert!(session.input_queue.take_pending_input_for_turn_state(&turn_state).await.is_empty());
-    assert_eq!(session.input_queue.drain_mailbox_input_items().await.0,
-        vec![TurnInput::InterAgentCommunication(mail)]);
+    assert!(
+        session
+            .input_queue
+            .take_pending_input_for_turn_state(&turn_state)
+            .await
+            .is_empty()
+    );
+    assert_eq!(
+        session.input_queue.drain_mailbox_input_items().await.0,
+        vec![TurnInput::InterAgentCommunication(mail)]
+    );
 }

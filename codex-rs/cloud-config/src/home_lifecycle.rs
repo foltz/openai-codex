@@ -60,7 +60,11 @@ struct GetterGuard<'a>(&'a HomeLifecycle);
 
 impl Drop for GetterGuard<'_> {
     fn drop(&mut self) {
-        let mut owners = self.0.owners.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut owners = self
+            .0
+            .owners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         owners.active_getters -= 1;
     }
 }
@@ -77,11 +81,16 @@ impl HomeLifecycle {
         tokio::pin!(retired);
         retired.as_mut().enable();
         let _getter = {
-            let mut owners = self.owners.lock().map_err(|_| lifecycle_error("cloud owner lock unavailable"))?;
+            let mut owners = self
+                .owners
+                .lock()
+                .map_err(|_| lifecycle_error("cloud owner lock unavailable"))?;
             if owners.retiring || self.generation.load(Ordering::Acquire) != expected_generation {
                 return Err(lifecycle_error("cloud loader generation retired"));
             }
-            owners.active_getters = owners.active_getters.checked_add(1)
+            owners.active_getters = owners
+                .active_getters
+                .checked_add(1)
                 .ok_or_else(|| lifecycle_error("cloud getter count exhausted"))?;
             GetterGuard(self)
         };
@@ -92,7 +101,10 @@ impl HomeLifecycle {
             () = &mut retired => Err(lifecycle_error("cloud loader generation retired")),
             result = work => result,
         };
-        let owners = self.owners.lock().map_err(|_| lifecycle_error("cloud owner lock unavailable"))?;
+        let owners = self
+            .owners
+            .lock()
+            .map_err(|_| lifecycle_error("cloud owner lock unavailable"))?;
         if owners.retiring || self.generation.load(Ordering::Acquire) != expected_generation {
             return Err(lifecycle_error("cloud loader generation retired"));
         }
@@ -103,9 +115,15 @@ impl HomeLifecycle {
     /// Failure leaves admission closed; a later managed retry can finish it.
     pub(crate) async fn retire_owners(&self) -> Result<(), CloudConfigBundleLoadError> {
         {
-            let mut owners = self.owners.lock().map_err(|_| lifecycle_error("cloud owner lock unavailable"))?;
+            let mut owners = self
+                .owners
+                .lock()
+                .map_err(|_| lifecycle_error("cloud owner lock unavailable"))?;
             owners.retiring = true;
-            self.generation.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| value.checked_add(1))
+            self.generation
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                    value.checked_add(1)
+                })
                 .map_err(|_| lifecycle_error("cloud generation exhausted"))?;
             self.retired.notify_waiters();
             for task in &owners.tasks {
@@ -115,7 +133,10 @@ impl HomeLifecycle {
         tokio::time::timeout(CLOUD_CONFIG_BUNDLE_TIMEOUT, async {
             loop {
                 let done = {
-                    let mut owners = self.owners.lock().map_err(|_| lifecycle_error("cloud owner lock unavailable"))?;
+                    let mut owners = self
+                        .owners
+                        .lock()
+                        .map_err(|_| lifecycle_error("cloud owner lock unavailable"))?;
                     owners.reap_finished();
                     owners.tasks.is_empty() && owners.active_getters == 0
                 };
@@ -128,20 +149,33 @@ impl HomeLifecycle {
             // any writer already inside this lease must finish before ack.
             let _publication = self.publication.lock().await;
             Ok::<(), CloudConfigBundleLoadError>(())
-        }).await.map_err(|_| lifecycle_error("cloud retirement timed out"))??;
-        let mut owners = self.owners.lock().map_err(|_| lifecycle_error("cloud owner lock unavailable"))?;
+        })
+        .await
+        .map_err(|_| lifecycle_error("cloud retirement timed out"))??;
+        let mut owners = self
+            .owners
+            .lock()
+            .map_err(|_| lifecycle_error("cloud owner lock unavailable"))?;
         if std::mem::take(&mut owners.failed_owner) {
-            return Err(lifecycle_error("cloud prior owner failed during retirement"));
+            return Err(lifecycle_error(
+                "cloud prior owner failed during retirement",
+            ));
         }
         Ok(())
     }
 }
 
 pub(crate) fn lifecycle_error(message: &'static str) -> CloudConfigBundleLoadError {
-    CloudConfigBundleLoadError::new(CloudConfigBundleLoadErrorCode::Internal, /*status_code*/ None, message)
+    CloudConfigBundleLoadError::new(
+        CloudConfigBundleLoadErrorCode::Internal,
+        /*status_code*/ None,
+        message,
+    )
 }
 
-pub(crate) fn home_lifecycle(home: &Path) -> Result<Arc<HomeLifecycle>, CloudConfigBundleLoadError> {
+pub(crate) fn home_lifecycle(
+    home: &Path,
+) -> Result<Arc<HomeLifecycle>, CloudConfigBundleLoadError> {
     let home = codex_config::AbsolutePathBuf::resolve_path_against_base(home, "/");
     // Resolve the existing ancestor too: two aliases of an uncreated home
     // must not mint independent write fences.
@@ -151,7 +185,12 @@ pub(crate) fn home_lifecycle(home: &Path) -> Result<Arc<HomeLifecycle>, CloudCon
         match std::fs::canonicalize(&ancestor) {
             Ok(path) => break path,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                suffix.push(ancestor.file_name().ok_or_else(|| lifecycle_error("cloud home identity unavailable"))?.to_owned());
+                suffix.push(
+                    ancestor
+                        .file_name()
+                        .ok_or_else(|| lifecycle_error("cloud home identity unavailable"))?
+                        .to_owned(),
+                );
                 if !ancestor.pop() {
                     return Err(lifecycle_error("cloud home identity unavailable"));
                 }
@@ -164,7 +203,9 @@ pub(crate) fn home_lifecycle(home: &Path) -> Result<Arc<HomeLifecycle>, CloudCon
         identity.push(part);
     }
     static HOMES: OnceLock<Mutex<HashMap<PathBuf, Arc<HomeLifecycle>>>> = OnceLock::new();
-    let mut homes = HOMES.get_or_init(Mutex::default).lock()
+    let mut homes = HOMES
+        .get_or_init(Mutex::default)
+        .lock()
         .map_err(|_| lifecycle_error("cloud home registry unavailable"))?;
     Ok(Arc::clone(homes.entry(identity).or_default()))
 }

@@ -891,7 +891,12 @@ async fn startup_prewarm_uses_host_admission_with_an_empty_extension_registry() 
             panic!("prewarm must not use turn admission");
         }
 
-        fn admit_operation_work(&self) -> Result<Option<Box<dyn codex_extension_api::HostOperationWork>>, codex_extension_api::TurnWorkRefused> {
+        fn admit_operation_work(
+            &self,
+        ) -> Result<
+            Option<Box<dyn codex_extension_api::HostOperationWork>>,
+            codex_extension_api::TurnWorkRefused,
+        > {
             self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Err(codex_extension_api::TurnWorkRefused::Unavailable)
         }
@@ -906,8 +911,13 @@ async fn startup_prewarm_uses_host_admission_with_an_empty_extension_registry() 
     assert_eq!(host.0.load(std::sync::atomic::Ordering::Relaxed), 1);
     // No prewarm task was spawned: the current-thread runtime has not yielded
     // to a worker, and joining an empty registry requires no time budget.
-    assert_eq!(session.task_joins.shutdown_until(tokio::time::Instant::now()).await,
-        crate::tasks::TaskJoinOutcome::Complete { panicked: false });
+    assert_eq!(
+        session
+            .task_joins
+            .shutdown_until(tokio::time::Instant::now())
+            .await,
+        crate::tasks::TaskJoinOutcome::Complete { panicked: false }
+    );
 }
 
 fn test_model_client_session() -> crate::client::ModelClientSession {
@@ -4020,7 +4030,10 @@ async fn fork_startup_context_then_first_turn_diff_snapshot() -> anyhow::Result<
         .thread_manager
         .fork_thread(
             usize::MAX,
-            core_test_support::test_codex::StartThreadOptions::new(fork_config.clone(), /*control_endpoint*/ None),
+            core_test_support::test_codex::StartThreadOptions::new(
+                fork_config.clone(),
+                /*control_endpoint*/ None,
+            ),
             rollout_path,
         )
         .await?;
@@ -8467,7 +8480,10 @@ async fn closing_task_admission_during_preparation_prevents_final_install() {
     assert!(session.active_turn.lock().await.is_none());
     pause.release.add_permits(1);
     start.await.expect("start returned");
-    assert_eq!(session.state.lock().await.last_started_turn_id.as_deref(), Some("previous"));
+    assert_eq!(
+        session.state.lock().await.last_started_turn_id.as_deref(),
+        Some("previous")
+    );
     assert!(
         session.active_turn.lock().await.is_none(),
         "late final install must refuse without residue"
@@ -9453,13 +9469,14 @@ async fn mcp_policy_changes_schedule_runtime_refresh() {
 #[tokio::test]
 async fn mcp_refresh_detects_shared_auth_manager_changes() {
     let codex_home = tempfile::tempdir().expect("create temp dir");
-    let (session, _turn_context, _rx_event) = make_session_and_context_with_auth_config_home_and_rx(
-        CodexAuth::from_api_key("Test API Key"),
-        Vec::new(),
-        codex_home.path(),
-        |_| {},
-    )
-    .await;
+    let (session, _turn_context, _rx_event) =
+        make_session_and_context_with_auth_config_home_and_rx(
+            CodexAuth::from_api_key("Test API Key"),
+            Vec::new(),
+            codex_home.path(),
+            |_| {},
+        )
+        .await;
 
     assert_eq!(
         session.services.plugins_manager.auth_mode(),
@@ -12258,7 +12275,11 @@ async fn queue_only_mailbox_mail_waits_for_next_turn_after_answer_boundary() {
     sess.abort_all_tasks(TurnAbortReason::Replaced).await;
 
     assert_eq!(
-        (sess.input_queue.get_pending_input(&sess.active_turn, "test-turn").await).0,
+        (sess
+            .input_queue
+            .get_pending_input(&sess.active_turn, "test-turn")
+            .await)
+            .0,
         vec![TurnInput::InterAgentCommunication(communication)],
     );
 }
@@ -12357,7 +12378,11 @@ async fn active_turn_keeps_first_root_when_mail_coalesces(inherited_root: Option
     }
 
     assert_eq!(
-        (sess.input_queue.get_pending_input(&sess.active_turn, "test-turn").await).0,
+        (sess
+            .input_queue
+            .get_pending_input(&sess.active_turn, "test-turn")
+            .await)
+            .0,
         vec![
             TurnInput::InterAgentCommunication(first),
             TurnInput::InterAgentCommunication(second),
@@ -12410,7 +12435,11 @@ async fn steered_input_reopens_mailbox_delivery_for_current_turn() {
     assert!(matches!(submission, TurnInputSubmission::Steered { .. }));
 
     assert_eq!(
-        (sess.input_queue.get_pending_input(&sess.active_turn, "test-turn").await).0,
+        (sess
+            .input_queue
+            .get_pending_input(&sess.active_turn, "test-turn")
+            .await)
+            .0,
         vec![
             TurnInput::UserInput {
                 acceptance_order: None,
@@ -12467,7 +12496,11 @@ async fn stale_defer_mailbox_delivery_does_not_override_steered_input() {
         .await;
 
     assert_eq!(
-        (sess.input_queue.get_pending_input(&sess.active_turn, "test-turn").await).0,
+        (sess
+            .input_queue
+            .get_pending_input(&sess.active_turn, "test-turn")
+            .await)
+            .0,
         vec![
             TurnInput::UserInput {
                 acceptance_order: None,
@@ -12533,7 +12566,11 @@ async fn tool_calls_reopen_mailbox_delivery_for_current_turn() {
     assert!(output.needs_follow_up);
     assert!(output.tool_future.is_some());
     assert_eq!(
-        (sess.input_queue.get_pending_input(&sess.active_turn, "test-turn").await).0,
+        (sess
+            .input_queue
+            .get_pending_input(&sess.active_turn, "test-turn")
+            .await)
+            .0,
         vec![TurnInput::InterAgentCommunication(communication)],
     );
 }
@@ -12929,10 +12966,19 @@ async fn session_start_hooks_require_project_trust_without_config_toml() -> std:
 fn select_thread_id_matches_the_contract_for_every_lifecycle_transition() {
     let agent_control = LocalAgentControl::default();
     let mut minted = std::collections::HashSet::new();
-    for history in [InitialHistory::New, InitialHistory::New, InitialHistory::Cleared, InitialHistory::Forked(Vec::new())] {
-        let id = Session::select_thread_id(&history, /*reserved_thread_id*/ None, &agent_control)
-            .expect("new lifecycle must select an identity");
-        assert!(minted.insert(id), "fresh, child, clear and fork must select distinct IDs");
+    for history in [
+        InitialHistory::New,
+        InitialHistory::New,
+        InitialHistory::Cleared,
+        InitialHistory::Forked(Vec::new()),
+    ] {
+        let id =
+            Session::select_thread_id(&history, /*reserved_thread_id*/ None, &agent_control)
+                .expect("new lifecycle must select an identity");
+        assert!(
+            minted.insert(id),
+            "fresh, child, clear and fork must select distinct IDs"
+        );
         let reserved = ThreadId::new();
         assert_eq!(
             Session::select_thread_id(&history, Some(reserved), &agent_control).unwrap(),

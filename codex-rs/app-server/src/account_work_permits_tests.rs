@@ -5,7 +5,9 @@ use pretty_assertions::assert_eq;
 #[test_case::test_case(false; "inherited child")]
 #[test_case::test_case(true; "isolated child")]
 #[tokio::test]
-async fn detached_operation_constructs_and_starts_child_after_request_and_parent_end(isolated: bool) -> anyhow::Result<()> {
+async fn detached_operation_constructs_and_starts_child_after_request_and_parent_end(
+    isolated: bool,
+) -> anyhow::Result<()> {
     use codex_extension_api::ExtensionRegistryBuilder;
     use codex_protocol::protocol::EventMsg;
     use codex_protocol::user_input::UserInput;
@@ -15,22 +17,36 @@ async fn detached_operation_constructs_and_starts_child_after_request_and_parent
 
     let permits = AccountWorkPermits::new();
     let mut extensions = ExtensionRegistryBuilder::new();
-    extensions.turn_start_admission(Arc::new(crate::account_turn_admission::AccountTurnAdmission {
-        shutdown: crate::turn_admission::TurnAdmission::default(),
-        permits: permits.clone(),
-        work: crate::account_turn_work::AccountTurnWork::default(),
-    }));
-    extensions.turn_lifecycle_contributor(Arc::new(crate::account_turn_admission::AccountTurnLifecycle));
+    extensions.turn_start_admission(Arc::new(
+        crate::account_turn_admission::AccountTurnAdmission {
+            shutdown: crate::turn_admission::TurnAdmission::default(),
+            permits: permits.clone(),
+            work: crate::account_turn_work::AccountTurnWork::default(),
+        },
+    ));
+    extensions.turn_lifecycle_contributor(Arc::new(
+        crate::account_turn_admission::AccountTurnLifecycle,
+    ));
     let server = responses::start_mock_server().await;
-    let response = responses::mount_sse_sequence(&server, vec![
-        responses::sse_completed("child"),
-        responses::sse_completed("own-turn"),
-    ]).await;
-    let test = test_codex().with_extensions(Arc::new(extensions.build()))
-        .build_with_auto_env(&server).await?;
+    let response = responses::mount_sse_sequence(
+        &server,
+        vec![
+            responses::sse_completed("child"),
+            responses::sse_completed("own-turn"),
+        ],
+    )
+    .await;
+    let test = test_codex()
+        .with_extensions(Arc::new(extensions.build()))
+        .build_with_auto_env(&server)
+        .await?;
     let operation = crate::account_turn_admission::within_request(permits.try_acquire(), async {
-        test.thread_manager.derive_request_operation_work().unwrap().unwrap()
-    }).await;
+        test.thread_manager
+            .derive_request_operation_work()
+            .unwrap()
+            .unwrap()
+    })
+    .await;
     let retry = test.codex.admit_mcp_event_stream_retry()?.unwrap();
     drop(retry);
     crate::account_turn_admission::within_request(permits.try_acquire(), async {
@@ -38,9 +54,15 @@ async fn detached_operation_constructs_and_starts_child_after_request_and_parent
         // An idle stream's reconnect is a new producer, not a descendant
         // of whichever request happens to be polling it.
         assert!(test.codex.admit_mcp_event_stream_retry().is_err());
-    }).await;
+    })
+    .await;
     assert!(permits.try_acquire().is_none());
-    assert!(test.codex.shutdown_and_wait_with_cleanup().await.is_complete());
+    assert!(
+        test.codex
+            .shutdown_and_wait_with_cleanup()
+            .await
+            .is_complete()
+    );
 
     // There is no live originating request or turn to rediscover here.
     let mut options = codex_core::StartThreadOptions {
@@ -48,29 +70,62 @@ async fn detached_operation_constructs_and_starts_child_after_request_and_parent
         ..codex_core::StartThreadOptions::new(test.config.clone(), None)
     };
     if isolated {
-        options.thread_extension_init.insert(codex_extension_api::SessionIsolation::Isolated);
+        options
+            .thread_extension_init
+            .insert(codex_extension_api::SessionIsolation::Isolated);
     }
     let child = test.thread_manager.start_thread(options).await?;
-    let input = || codex_core::TurnInputRequest::user_input(vec![UserInput::Text {
-        text: "consolidate".to_owned(),
-        text_elements: Vec::new(),
-    }]);
-    assert!(matches!(child.thread.start_turn_if_idle(input()).await?,
-        codex_core::StartIfIdleSubmission::NotSubmitted { .. }));
-    assert!(matches!(child.thread.start_turn_if_idle_from_operation(input(), operation.as_ref()).await?,
-        codex_core::StartIfIdleSubmission::Started { .. }));
-    wait_for_event(&child.thread, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    let input = || {
+        codex_core::TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "consolidate".to_owned(),
+            text_elements: Vec::new(),
+        }])
+    };
+    assert!(matches!(
+        child.thread.start_turn_if_idle(input()).await?,
+        codex_core::StartIfIdleSubmission::NotSubmitted { .. }
+    ));
+    assert!(matches!(
+        child
+            .thread
+            .start_turn_if_idle_from_operation(input(), operation.as_ref())
+            .await?,
+        codex_core::StartIfIdleSubmission::Started { .. }
+    ));
+    wait_for_event(&child.thread, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
     assert_eq!(response.requests().len(), 1);
-    assert_eq!(permits.admitted_count(), 1, "completed child must hold no idle turn permit");
+    assert_eq!(
+        permits.admitted_count(),
+        1,
+        "completed child must hold no idle turn permit"
+    );
     drop(operation);
     assert_eq!(permits.admitted_count(), 0);
     permits.reopen();
-    assert!(matches!(child.thread.start_turn_if_idle(input()).await?,
-        codex_core::StartIfIdleSubmission::Started { .. }));
-    wait_for_event(&child.thread, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    assert!(matches!(
+        child.thread.start_turn_if_idle(input()).await?,
+        codex_core::StartIfIdleSubmission::Started { .. }
+    ));
+    wait_for_event(&child.thread, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
     assert_eq!(response.requests().len(), 2);
-    assert_eq!(permits.admitted_count(), 0, "own-admitted child must release before shutdown");
-    assert!(child.thread.shutdown_and_wait_with_cleanup().await.is_complete());
+    assert_eq!(
+        permits.admitted_count(),
+        0,
+        "own-admitted child must release before shutdown"
+    );
+    assert!(
+        child
+            .thread
+            .shutdown_and_wait_with_cleanup()
+            .await
+            .is_complete()
+    );
     Ok(())
 }
 
@@ -86,25 +141,46 @@ async fn operation_outlives_origin_loop_and_derives_child_during_drain() {
     };
     let parent = codex_extension_api::ExtensionData::new("parent");
     let (ended, termination) = tokio::sync::oneshot::channel();
-    let mut turn = admission.admit_turn_work(&parent, Box::pin(async move {
-        let _ = termination.await;
-    })).unwrap().unwrap();
+    let mut turn = admission
+        .admit_turn_work(
+            &parent,
+            Box::pin(async move {
+                let _ = termination.await;
+            }),
+        )
+        .unwrap()
+        .unwrap();
     turn.bind_submission("parent-turn");
     turn.retain_until_terminal();
-    let operation = admission.derive_operation_work(&parent, "parent-turn").unwrap().unwrap();
+    let operation = admission
+        .derive_operation_work(&parent, "parent-turn")
+        .unwrap()
+        .unwrap();
     permits.close();
     ended.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(1), registry.observe_terminated()).await.unwrap();
-    assert_eq!(permits.admitted_count(), 1, "loop exit must not retire the operation");
+    tokio::time::timeout(Duration::from_secs(1), registry.observe_terminated())
+        .await
+        .unwrap();
+    assert_eq!(
+        permits.admitted_count(),
+        1,
+        "loop exit must not retire the operation"
+    );
 
     let descendant = operation.derive_operation().unwrap();
     drop(operation);
     let child = codex_extension_api::ExtensionData::new("child");
-    let mut child_turn = descendant.derive_turn_work(&child, Box::pin(std::future::pending())).unwrap();
+    let mut child_turn = descendant
+        .derive_turn_work(&child, Box::pin(std::future::pending()))
+        .unwrap();
     child_turn.bind_submission("child-turn");
     child_turn.retain_until_terminal();
     drop(descendant);
-    assert_eq!(permits.admitted_count(), 1, "accepted child owns independent custody");
+    assert_eq!(
+        permits.admitted_count(),
+        1,
+        "accepted child owns independent custody"
+    );
     admission.turn_work_terminal(&child, "child-turn");
     assert_eq!(permits.admitted_count(), 0);
 }
@@ -121,9 +197,13 @@ async fn optional_background_admission_is_fresh_even_inside_an_admitted_request(
     let operation = admission.admit_operation_work().unwrap().unwrap();
     crate::account_turn_admission::within_request(permits.try_acquire(), async {
         permits.close();
-        assert!(matches!(admission.admit_operation_work(), Err(codex_extension_api::TurnWorkRefused::RetryAfter(_))));
+        assert!(matches!(
+            admission.admit_operation_work(),
+            Err(codex_extension_api::TurnWorkRefused::RetryAfter(_))
+        ));
         assert_eq!(permits.admitted_count(), 2);
-    }).await;
+    })
+    .await;
     assert_eq!(permits.admitted_count(), 1);
     drop(operation);
     assert_eq!(permits.admitted_count(), 0);
@@ -142,7 +222,8 @@ async fn request_operation_capture_derives_during_drain_without_a_turn_entry() {
     let operation = crate::account_turn_admission::within_request(permits.try_acquire(), async {
         permits.close();
         admission.derive_request_operation_work().unwrap().unwrap()
-    }).await;
+    })
+    .await;
     assert_eq!(permits.admitted_count(), 1);
     assert!(permits.try_acquire().is_none());
     drop(operation);
@@ -275,23 +356,32 @@ async fn request_scope_absence_and_exhaustion_are_distinct_before_spawn() {
     let ungated = derive_request_work().unwrap();
     assert!(ungated.is_none());
     assert_eq!(
-        tasks.spawn(within_request(ungated, async {})).unwrap().await,
+        tasks
+            .spawn(within_request(ungated, async {}))
+            .unwrap()
+            .await,
         ProcessorTaskJoin::Joined
     );
     let exhausted_tasks = ProcessorTasks::default();
     within_request(permits.try_acquire(), async {
         let exhausted = ACCOUNT_WORK_CLOSED | ACCOUNT_WORK_COUNT_MASK;
         permits.inner.state.store(exhausted, Ordering::Release);
-        let result = derive_request_work()
-            .map(|work| exhausted_tasks.spawn(within_request(work, async {})));
+        let result =
+            derive_request_work().map(|work| exhausted_tasks.spawn(within_request(work, async {})));
         assert!(matches!(result, Err(TurnWorkRefused::Unavailable)));
         assert_eq!(exhausted_tasks.len(), 0);
         assert_eq!(permits.inner.state.load(Ordering::Acquire), exhausted);
         // Restore the one real guard before its scope drops.
-        permits.inner.state.store(ACCOUNT_WORK_CLOSED | 1, Ordering::Release);
+        permits
+            .inner
+            .state
+            .store(ACCOUNT_WORK_CLOSED | 1, Ordering::Release);
     })
     .await;
-    assert_eq!(permits.inner.state.load(Ordering::Acquire), ACCOUNT_WORK_CLOSED);
+    assert_eq!(
+        permits.inner.state.load(Ordering::Acquire),
+        ACCOUNT_WORK_CLOSED
+    );
 }
 
 #[tokio::test]

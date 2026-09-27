@@ -125,7 +125,10 @@ async fn guardian_history_survives_restart_and_user_fork(
         initial
             .thread_manager
             .fork_prepared_thread(
-                codex_core::StartThreadOptions::new(initial.config.clone(), /*control_endpoint*/ None),
+                codex_core::StartThreadOptions::new(
+                    initial.config.clone(),
+                    /*control_endpoint*/ None,
+                ),
                 prepared,
             )
             .await?
@@ -134,7 +137,10 @@ async fn guardian_history_survives_restart_and_user_fork(
             .thread_manager
             .fork_thread_from_history(
                 ForkSnapshot::Interrupted,
-                codex_core::StartThreadOptions::new(initial.config.clone(), /*control_endpoint*/ None),
+                codex_core::StartThreadOptions::new(
+                    initial.config.clone(),
+                    /*control_endpoint*/ None,
+                ),
                 history.clone(),
             )
             .await?

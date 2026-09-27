@@ -621,7 +621,10 @@ async fn reasoning_effort_override_websocket_prewarm_preserves_baseline(
                 .thread_manager
                 .fork_thread(
                     ForkSnapshot::Interrupted,
-                    codex_core::StartThreadOptions::new(config.clone(), /*control_endpoint*/ None),
+                    codex_core::StartThreadOptions::new(
+                        config.clone(),
+                        /*control_endpoint*/ None,
+                    ),
                     previous.codex.rollout_path().expect("rollout path"),
                 )
                 .await?;

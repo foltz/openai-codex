@@ -920,14 +920,34 @@ async fn check_v2_agent_reload(route: V2ReloadRoute) {
         V2ReloadRoute::Sender => {
             let (caller, gate) = parent_authority_tests::parent().await;
             let expired = crate::ParentTurnAuthority::capture(&caller, "ended-parent");
-            assert!(control.ensure_v2_agent_loaded(sender_config.clone(), spawned_agent.thread_id,
-                None, Some(&expired)).await.is_err());
+            assert!(
+                control
+                    .ensure_v2_agent_loaded(
+                        sender_config.clone(),
+                        spawned_agent.thread_id,
+                        None,
+                        Some(&expired)
+                    )
+                    .await
+                    .is_err()
+            );
             assert_thread_not_loaded(&harness.manager, spawned_agent.thread_id).await;
             let authority = crate::ParentTurnAuthority::capture(&caller, "live-parent");
-            control.ensure_v2_agent_loaded(sender_config, spawned_agent.thread_id,
-                None, Some(&authority)).await.expect("known v2 agent should reload");
-            assert!(gate.constructor_derivations.load(std::sync::atomic::Ordering::SeqCst) > 0,
-                "the resumed constructor must receive caller-derived work");
+            control
+                .ensure_v2_agent_loaded(
+                    sender_config,
+                    spawned_agent.thread_id,
+                    None,
+                    Some(&authority),
+                )
+                .await
+                .expect("known v2 agent should reload");
+            assert!(
+                gate.constructor_derivations
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    > 0,
+                "the resumed constructor must receive caller-derived work"
+            );
         }
         V2ReloadRoute::NestedParent => {
             let environment = parent_turn
@@ -1566,8 +1586,12 @@ async fn spawn_agent_creates_thread_and_sends_prompt() {
         .await
         .expect("thread should be registered");
     wait_for_recorded_user_message(thread.as_ref(), "spawned").await;
-    assert!(gate.constructor_derivations.load(std::sync::atomic::Ordering::SeqCst) > 0,
-        "the initial constructor must receive caller-derived work");
+    assert!(
+        gate.constructor_derivations
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0,
+        "the initial constructor must receive caller-derived work"
+    );
 }
 
 #[tokio::test]
@@ -4359,7 +4383,12 @@ async fn resume_agent_from_rollout_reads_archived_rollout_path() {
 
     let resumed_thread_id = harness
         .control
-        .resume_agent_from_rollout(harness.config.clone(), child_thread_id, SessionSource::Exec, None)
+        .resume_agent_from_rollout(
+            harness.config.clone(),
+            child_thread_id,
+            SessionSource::Exec,
+            None,
+        )
         .await
         .expect("resume should find archived rollout");
     assert_eq!(resumed_thread_id, child_thread_id);
@@ -4402,7 +4431,12 @@ async fn resume_agent_from_paginated_rollout_loads_model_context() {
 
     let resumed_thread_id = harness
         .control
-        .resume_agent_from_rollout(harness.config.clone(), child_thread_id, SessionSource::Exec, None)
+        .resume_agent_from_rollout(
+            harness.config.clone(),
+            child_thread_id,
+            SessionSource::Exec,
+            None,
+        )
         .await
         .expect("resume should load paginated model context");
     assert_eq!(resumed_thread_id, child_thread_id);

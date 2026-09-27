@@ -235,12 +235,18 @@ pub(crate) async fn run_codex_thread_one_shot(
     // Send the initial input to kick off the one-shot turn.
     let termination = io.session_loop_termination.clone();
     let host_work = match &host {
-        Some(host) => host.derive_turn_work(
-            &parent_for_admission.services.thread_extension_data,
-            &parent_turn_id,
-            &session.services.thread_extension_data,
-            Box::pin(async move { termination.await; }),
-        ).map_err(|_| CodexErr::Fatal("delegate parent has no admitted account work".to_string()))?,
+        Some(host) => host
+            .derive_turn_work(
+                &parent_for_admission.services.thread_extension_data,
+                &parent_turn_id,
+                &session.services.thread_extension_data,
+                Box::pin(async move {
+                    termination.await;
+                }),
+            )
+            .map_err(|_| {
+                CodexErr::Fatal("delegate parent has no admitted account work".to_string())
+            })?,
         None => None,
     };
     drop(parent_for_admission);
@@ -280,7 +286,10 @@ pub(crate) async fn run_codex_thread_one_shot(
                 EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_)
             );
             if should_shutdown && let Some(host) = &host {
-                host.turn_work_terminal(&child_for_evidence.services.thread_extension_data, &event.id);
+                host.turn_work_terminal(
+                    &child_for_evidence.services.thread_extension_data,
+                    &event.id,
+                );
             }
             let _ = tx_bridge.send(event).await;
             if should_shutdown {

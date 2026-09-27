@@ -28,10 +28,7 @@ pub(crate) struct ClientStartup {
 }
 
 impl ClientStartup {
-    pub(crate) fn new(
-        future: ManagedClientFuture,
-        requirement: McpAttemptRequirement,
-    ) -> Self {
+    pub(crate) fn new(future: ManagedClientFuture, requirement: McpAttemptRequirement) -> Self {
         let admission = Arc::new(Mutex::new(Admission::Unstarted));
         let admission_for_future = Arc::clone(&admission);
         let completion = async move {
@@ -53,7 +50,11 @@ impl ClientStartup {
         }
         .boxed()
         .shared();
-        Self { requirement, admission, completion }
+        Self {
+            requirement,
+            admission,
+            completion,
+        }
     }
 
     /// Must precede waking a dormant driver. A refusal leaves the Shared
@@ -66,7 +67,10 @@ impl ClientStartup {
             StartupOutcomeError::from(anyhow::anyhow!("MCP startup admission is poisoned"))
         })?;
         if matches!(*admission, Admission::Unstarted) {
-            let work = self.requirement.derive(access).map_err(StartupOutcomeError::Refused)?;
+            let work = self
+                .requirement
+                .derive(access)
+                .map_err(StartupOutcomeError::Refused)?;
             *admission = Admission::Staged(work);
         }
         Ok(())
@@ -85,7 +89,10 @@ impl ClientStartup {
     /// about to poll. It must take either the staged work or Cancelled, never
     /// start without custody. Running work retains its lease until completion.
     pub(crate) fn cancel_unstarted(&self) {
-        let mut admission = self.admission.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if matches!(*admission, Admission::Unstarted | Admission::Staged(_)) {
             *admission = Admission::Cancelled;
         }

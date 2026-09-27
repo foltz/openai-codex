@@ -193,7 +193,11 @@ impl LocalAgentControl {
         let thread = state.get_thread(agent_id).await?;
         let request = TurnInputRequest::user_input(input).on_start(start_options);
         let submission = match parent {
-            Some(parent) => thread.start_or_steer_turn_from_parent(request, parent).await,
+            Some(parent) => {
+                thread
+                    .start_or_steer_turn_from_parent(request, parent)
+                    .await
+            }
             None => thread.start_or_steer_turn(request).await,
         };
         let result = match submission {
@@ -320,11 +324,9 @@ impl LocalAgentControl {
         let child = state.get_thread(agent_id).await?;
         let work = if communication.trigger_turn {
             match parent {
-                Some(parent) => {
-                    parent.derive(&child).map_err(|_| CodexErr::InvalidRequest(
-                        "parent turn no longer admits child work".into(),
-                    ))?
-                }
+                Some(parent) => parent.derive(&child).map_err(|_| {
+                    CodexErr::InvalidRequest("parent turn no longer admits child work".into())
+                })?,
                 None => None,
             }
         } else {

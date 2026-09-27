@@ -153,9 +153,8 @@ fast_default_opt_out = true
             expected.show_server_version_notice = false;
             expected.auto_recap = false;
             expected.status_line_prefix = vec!["template:(k:{lane})".to_string()];
-            expected.status_line_variables = std::collections::HashMap::from([
-                ("lane".to_string(), "dev".to_string()),
-            ]);
+            expected.status_line_variables =
+                std::collections::HashMap::from([("lane".to_string(), "dev".to_string())]);
             expected.fullscreen_transcript = true;
             expected.vim_mode_default = true;
             expected.terminal_resize_reflow_max_rows = Some(0);

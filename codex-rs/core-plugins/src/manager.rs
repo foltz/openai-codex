@@ -1295,8 +1295,10 @@ impl PluginsManager {
             &plugins,
             visible_marketplaces,
         );
-        let state = self.remote_installed_plugins_cache_refresh_state
-            .read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = self
+            .remote_installed_plugins_cache_refresh_state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !reset_generation.is_current(&state.generation) {
             return Err(RemotePluginCatalogError::AuthChanged);
         }
@@ -1528,13 +1530,21 @@ impl PluginsManager {
 
     fn remote_installed_plugins_admission(
         &self,
-    ) -> (RemoteInstalledPluginsGeneration, crate::remote::RemotePluginBundleSyncGeneration) {
+    ) -> (
+        RemoteInstalledPluginsGeneration,
+        crate::remote::RemotePluginBundleSyncGeneration,
+    ) {
         // Match reset's lock order and capture both authorities at one boundary.
         // Otherwise reset between the two captures could pair an old callback
         // token with a new filesystem epoch.
-        let state = self.remote_installed_plugins_cache_refresh_state
-            .read().unwrap_or_else(std::sync::PoisonError::into_inner);
-        (state.generation.clone(), crate::remote::RemotePluginBundleSyncGeneration::capture(&self.codex_home))
+        let state = self
+            .remote_installed_plugins_cache_refresh_state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            state.generation.clone(),
+            crate::remote::RemotePluginBundleSyncGeneration::capture(&self.codex_home),
+        )
     }
 
     fn clear_remote_installed_plugins_cache_contents(&self) -> bool {
@@ -1624,7 +1634,12 @@ impl PluginsManager {
     ) {
         let reset_generation = self.remote_installed_plugins_generation();
         self.maybe_start_remote_installed_plugins_cache_refresh_for_generation(
-            config, auth, notify, on_effective_plugins_changed, change, reset_generation,
+            config,
+            auth,
+            notify,
+            on_effective_plugins_changed,
+            change,
+            reset_generation,
         );
     }
 
@@ -1641,8 +1656,10 @@ impl PluginsManager {
             return;
         }
 
-        let state = self.remote_installed_plugins_cache_refresh_state
-            .read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = self
+            .remote_installed_plugins_cache_refresh_state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !reset_generation.is_current(&state.generation) {
             return;
         }
@@ -1736,7 +1753,10 @@ impl PluginsManager {
         });
         if let Err(error) = admitted {
             // Rejected admission drops the future and releases its owned permit.
-            warn!(?error, "remote installed plugin bundle sync admission closed");
+            warn!(
+                ?error,
+                "remote installed plugin bundle sync admission closed"
+            );
         }
     }
 
@@ -1753,13 +1773,17 @@ impl PluginsManager {
         .await
         .map_err(|_| RemoteInstalledPluginBundleSyncError::LockTimeout)?
         .map_err(|_| RemoteInstalledPluginBundleSyncError::Superseded)?;
-        let state = self.remote_installed_plugins_cache_refresh_state
-            .read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = self
+            .remote_installed_plugins_cache_refresh_state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !reset_generation.is_current(&state.generation) {
             return Err(RemoteInstalledPluginBundleSyncError::Superseded);
         }
         Ok(RemoteInstalledPluginSyncGuard {
-            _permit: permit, reset_generation, bundle_generation,
+            _permit: permit,
+            reset_generation,
+            bundle_generation,
         })
     }
 
@@ -1776,7 +1800,10 @@ impl PluginsManager {
         let guard = self.acquire_remote_installed_plugin_sync_guard().await?;
         let (outcome, _) = self
             .reconcile_remote_installed_plugins_after_acquiring_gate(
-                config, auth, &guard.reset_generation, guard.bundle_generation.clone(),
+                config,
+                auth,
+                &guard.reset_generation,
+                guard.bundle_generation.clone(),
             )
             .await?;
         Ok(outcome)
@@ -1791,8 +1818,10 @@ impl PluginsManager {
     ) -> Result<(RemoteInstalledPluginBundleSyncOutcome, bool), RemoteInstalledPluginBundleSyncError>
     {
         let generation = {
-            let state = self.remote_installed_plugins_cache_refresh_state
-                .read().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let state = self
+                .remote_installed_plugins_cache_refresh_state
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if !reset_generation.is_current(&state.generation) {
                 return Err(RemoteInstalledPluginBundleSyncError::Superseded);
             }
@@ -1871,8 +1900,10 @@ impl PluginsManager {
         outcome
             .changed_plugins
             .sort_unstable_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
-        let state = self.remote_installed_plugins_cache_refresh_state
-            .read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = self
+            .remote_installed_plugins_cache_refresh_state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !reset_generation.is_current(&state.generation) {
             return Err(RemoteInstalledPluginBundleSyncError::Superseded);
         }
@@ -3523,8 +3554,10 @@ impl PluginsManager {
         // Reset takes the write guard. Keep this read guard through publication
         // and its synchronous callback, so acknowledgment cannot overtake either.
         // Callbacks must not recursively reset or schedule installed refreshes.
-        let state = self.remote_installed_plugins_cache_refresh_state
-            .read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = self
+            .remote_installed_plugins_cache_refresh_state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !request.reset_generation.is_current(&state.generation) {
             return;
         }
@@ -3545,8 +3578,7 @@ impl PluginsManager {
                         RemoteInstalledPluginsCacheRefreshNotify::AfterSuccessfulRefresh
                     );
                 if should_notify
-                    && let Some(on_effective_plugins_changed) =
-                        request.on_effective_plugins_changed
+                    && let Some(on_effective_plugins_changed) = request.on_effective_plugins_changed
                 {
                     on_effective_plugins_changed(request.change);
                 }
@@ -3561,8 +3593,7 @@ impl PluginsManager {
                     return;
                 };
                 if changed
-                    && let Some(on_effective_plugins_changed) =
-                        request.on_effective_plugins_changed
+                    && let Some(on_effective_plugins_changed) = request.on_effective_plugins_changed
                 {
                     on_effective_plugins_changed(EffectivePluginsChange::default());
                 }

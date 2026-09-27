@@ -342,7 +342,8 @@ impl ConfigRequestProcessor {
             &self.config_manager,
             &self.thread_manager,
             &self.applied_mcp_config_identity,
-        ).await;
+        )
+        .await;
     }
 
     async fn emit_plugin_toggle_events(
@@ -372,13 +373,13 @@ pub(super) async fn reload_user_config(
     applied_mcp_config_identity: &AppliedMcpConfigIdentity,
 ) {
     let _apply_guard = applied_mcp_config_identity.lock_apply().await;
-    let refreshed_config = match config_manager.load_latest_config(/*fallback_cwd*/ None).await {
+    let refreshed_config = match config_manager
+        .load_latest_config(/*fallback_cwd*/ None)
+        .await
+    {
         Ok(config) => config,
         Err(err) => {
-            tracing::warn!(
-                "failed to rebuild user config for runtime refresh: {}",
-                err
-            );
+            tracing::warn!("failed to rebuild user config for runtime refresh: {}", err);
             return;
         }
     };
@@ -413,9 +414,7 @@ pub(super) async fn reload_user_config(
             }
         };
         match McpConfigIdentity::from_config(&next_config) {
-            Ok(identity) if identity == candidate_identity => {
-                refreshes.push((thread, next_config))
-            }
+            Ok(identity) if identity == candidate_identity => refreshes.push((thread, next_config)),
             Ok(_) => {
                 tracing::warn!(%thread_id, "selected MCP configuration changed while reloading runtime config");
                 return;
@@ -431,7 +430,6 @@ pub(super) async fn reload_user_config(
     }
     applied_mcp_config_identity.replace(candidate_identity);
 }
-
 
 fn map_requirements_to_api(
     requirements: Option<ConfigRequirementsToml>,
@@ -912,11 +910,11 @@ mod tests {
     use codex_config::NewThreadModelDefaultsToml;
     use codex_config::WindowsRequirementsToml;
     use codex_config::types::FeedbackConfigToml;
-    use codex_protocol::config_types::ForcedLoginMethod;
     use codex_core::config::ConfigBuilder;
     use codex_core::test_support::EmptyUserInstructionsProvider;
     use codex_login::AuthManager;
     use codex_login::CodexAuth;
+    use codex_protocol::config_types::ForcedLoginMethod;
     use codex_protocol::openai_models::ReasoningEffort;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use codex_utils_path_uri::PathUri;

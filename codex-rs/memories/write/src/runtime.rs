@@ -412,9 +412,14 @@ impl MemoryStartupContext {
         } = self
             .thread_manager
             .start_thread(StartThreadOptions {
-                account_work: self.account_work.as_ref()
-                    .map(|work| work.derive_operation()).transpose()
-                    .map_err(|_| anyhow::anyhow!("memory child construction account work unavailable"))?,
+                account_work: self
+                    .account_work
+                    .as_ref()
+                    .map(|work| work.derive_operation())
+                    .transpose()
+                    .map_err(|_| {
+                        anyhow::anyhow!("memory child construction account work unavailable")
+                    })?,
                 session_source: Some(SessionSource::Internal(
                     InternalSessionSource::MemoryConsolidation,
                 )),
@@ -429,7 +434,12 @@ impl MemoryStartupContext {
             ..Default::default()
         });
         let submission = match self.account_work.as_deref() {
-            Some(work) => agent.thread.start_turn_if_idle_from_operation(request, work).await,
+            Some(work) => {
+                agent
+                    .thread
+                    .start_turn_if_idle_from_operation(request, work)
+                    .await
+            }
             None => agent.thread.start_turn_if_idle(request).await,
         };
         let submit_result = match submission {
@@ -458,24 +468,38 @@ impl MemoryStartupContext {
         let SpawnedConsolidationAgent { thread_id, thread } = agent;
         let cleanup = thread.shutdown_and_wait_with_cleanup();
         tokio::pin!(cleanup);
-        let (report, timed_out) = match tokio::time::timeout(Duration::from_secs(10), &mut cleanup).await {
+        let (report, timed_out) = match tokio::time::timeout(Duration::from_secs(10), &mut cleanup)
+            .await
+        {
             Ok(report) => (report, false),
             Err(_) => {
-                tracing::warn!("memory consolidation agent {thread_id} shutdown timed out; retaining account custody until cleanup observation completes");
+                tracing::warn!(
+                    "memory consolidation agent {thread_id} shutdown timed out; retaining account custody until cleanup observation completes"
+                );
                 // Keep the finite job's authority while driving the SAME
                 // retained cleanup. The timeout still means job failure.
                 (cleanup.await, true)
             }
         };
-        if report.cleanup == (codex_core::ThreadCleanupOutcome::Finished { persistence_failed: false }) {
+        if report.cleanup
+            == (codex_core::ThreadCleanupOutcome::Finished {
+                persistence_failed: false,
+            })
+        {
             // The owner may remove a dead child after positive cleanup even
             // when its loop panicked. Incomplete cleanup stays in the inventory.
             self.thread_manager
                 .remove_thread_if_same(&thread_id, &thread)
                 .await;
         }
-        anyhow::ensure!(!timed_out, "memory consolidation agent {thread_id} shutdown timed out");
-        anyhow::ensure!(report.is_complete(), "memory consolidation agent {thread_id} shutdown incomplete: {report:?}");
+        anyhow::ensure!(
+            !timed_out,
+            "memory consolidation agent {thread_id} shutdown timed out"
+        );
+        anyhow::ensure!(
+            report.is_complete(),
+            "memory consolidation agent {thread_id} shutdown incomplete: {report:?}"
+        );
         Ok(())
     }
 }

@@ -1550,9 +1550,9 @@ async fn eager_session_start_stop_emits_lifecycle_events_and_blocks_first_turn()
 
     test.codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
-                text: "this prompt must be stopped before sampling".to_string(),
-                text_elements: Vec::new(),
-            }]))
+            text: "this prompt must be stopped before sampling".to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
 
     let started = wait_for_event(&test.codex, |event| {

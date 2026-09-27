@@ -53,7 +53,8 @@ pub trait TurnStartAdmission: std::fmt::Debug + Send + Sync {
         &self,
         _thread_store: &crate::ExtensionData,
         _termination: crate::ExtensionFuture<'static, ()>,
-    ) -> Result<Option<Box<dyn codex_protocol::host_turn_work::HostTurnWork>>, TurnWorkRefused> {
+    ) -> Result<Option<Box<dyn codex_protocol::host_turn_work::HostTurnWork>>, TurnWorkRefused>
+    {
         Ok(None)
     }
 
@@ -66,7 +67,8 @@ pub trait TurnStartAdmission: std::fmt::Debug + Send + Sync {
         _parent_turn_id: &str,
         _child_store: &crate::ExtensionData,
         _termination: crate::ExtensionFuture<'static, ()>,
-    ) -> Result<Option<Box<dyn codex_protocol::host_turn_work::HostTurnWork>>, TurnWorkRefused> {
+    ) -> Result<Option<Box<dyn codex_protocol::host_turn_work::HostTurnWork>>, TurnWorkRefused>
+    {
         Ok(None)
     }
 

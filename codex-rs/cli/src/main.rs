@@ -1398,7 +1398,9 @@ async fn cli_main(
                         print_app_server_daemon_output(AppServerLifecycleCommand::Version).await?;
                     }
                     AppServerDaemonSubcommand::PidUpdateLoop { .. }
-                    | AppServerDaemonSubcommand::Update { from_cli: false, .. } => {
+                    | AppServerDaemonSubcommand::Update {
+                        from_cli: false, ..
+                    } => {
                         anyhow::bail!(codex_app_server_daemon::MANAGED_UPDATE_DISABLED_MESSAGE);
                     }
                 },

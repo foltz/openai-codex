@@ -1089,7 +1089,10 @@ async fn standalone_fork_retains_inherited_user_instructions(
             .await?;
         test.thread_manager
             .fork_prepared_thread(
-                codex_core::StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None),
+                codex_core::StartThreadOptions::new(
+                    test.config.clone(),
+                    /*control_endpoint*/ None,
+                ),
                 prepared,
             )
             .await?
@@ -1097,7 +1100,10 @@ async fn standalone_fork_retains_inherited_user_instructions(
         test.thread_manager
             .fork_thread_from_history(
                 ForkSnapshot::Interrupted,
-                codex_core::StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None),
+                codex_core::StartThreadOptions::new(
+                    test.config.clone(),
+                    /*control_endpoint*/ None,
+                ),
                 InitialHistory::Resumed(ResumedHistory {
                     conversation_id: worker.startup_metadata().thread_id,
                     history: Arc::new(load_context(&test, &worker).await?),

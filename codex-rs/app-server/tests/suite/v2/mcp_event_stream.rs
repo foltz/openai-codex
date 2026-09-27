@@ -110,11 +110,15 @@ async fn mcp_event_stream_waits_for_activation_forwards_events_and_cancels() -> 
                         // Reconnects may resume directly with an event, without
                         // repeating the initial activation notification.
                         if reconnect {
-                            return Sse::new(stream::once(async move {
-                                Ok::<_, Infallible>(
-                                    Event::default().event("message").data(event.to_string()),
-                                )
-                            }).chain(stream::pending())).into_response();
+                            return Sse::new(
+                                stream::once(async move {
+                                    Ok::<_, Infallible>(
+                                        Event::default().event("message").data(event.to_string()),
+                                    )
+                                })
+                                .chain(stream::pending()),
+                            )
+                            .into_response();
                         }
                         let events = stream::once(async move {
                             allow_activation.notified().await;
@@ -129,9 +133,12 @@ async fn mcp_event_stream_waits_for_activation_forwards_events_and_cancels() -> 
                         }))
                         .chain(stream::once(async move {
                             allow_reconnect.notified().await;
-                            Ok::<_, Infallible>(Event::default().event("message").data(
-                                json!({"jsonrpc": "2.0", "id": message["id"], "result": {}}).to_string(),
-                            ))
+                            Ok::<_, Infallible>(
+                                Event::default().event("message").data(
+                                    json!({"jsonrpc": "2.0", "id": message["id"], "result": {}})
+                                        .to_string(),
+                                ),
+                            )
                         }));
 
                         Sse::new(events).into_response()
@@ -260,21 +267,25 @@ async fn mcp_event_stream_waits_for_activation_forwards_events_and_cancels() -> 
     let resumed: McpServerEventStreamNotification = timeout(
         Duration::from_secs(5),
         app_server.read_notification("mcpServer/event/stream/notification"),
-    ).await??;
-    assert_eq!(resumed, McpServerEventStreamNotification {
-        subscription_id: "subscription-1".to_string(),
-        notification: McpServerEventNotification {
-            method: "notifications/events/event".to_string(),
-            params: json!({
-                "_meta": {
-                    "io.modelcontextprotocol/subscriptionId": retry_request["id"],
-                    "provider": "event-test-server",
-                },
-                "name": "issue.updated",
-                "data": { "issue": 43 },
-            }),
-        },
-    });
+    )
+    .await??;
+    assert_eq!(
+        resumed,
+        McpServerEventStreamNotification {
+            subscription_id: "subscription-1".to_string(),
+            notification: McpServerEventNotification {
+                method: "notifications/events/event".to_string(),
+                params: json!({
+                    "_meta": {
+                        "io.modelcontextprotocol/subscriptionId": retry_request["id"],
+                        "provider": "event-test-server",
+                    },
+                    "name": "issue.updated",
+                    "data": { "issue": 43 },
+                }),
+            },
+        }
+    );
 
     let _: McpServerEventStreamStopResponse = app_server
         .request(|request_id| ClientRequest::McpServerEventStreamStop {

@@ -219,7 +219,8 @@ fn set_command(handler: &mut ConfiguredHandler, command: &str) {
     let crate::engine::ConfiguredHandlerKind::Command {
         command: configured,
         ..
-    } = &mut handler.kind else {
+    } = &mut handler.kind
+    else {
         panic!("expected command hook fixture");
     };
     *configured = command.to_string();

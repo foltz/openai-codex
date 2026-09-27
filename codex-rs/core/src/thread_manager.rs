@@ -1195,7 +1195,9 @@ impl ThreadManager {
             ));
         }
         let mut request = self
-            .thread_spawn_request(options, /*forked_from_thread_id*/ None, /*startup*/ None)
+            .thread_spawn_request(
+                options, /*forked_from_thread_id*/ None, /*startup*/ None,
+            )
             .await?;
         request.deferred_clear_session_start = Some(DeferredClearSessionStart {
             predecessor_thread_id,
@@ -1498,7 +1500,10 @@ impl ThreadManager {
         // resource cleanup succeeds. Reset must still observe that exact runtime.
         // A replacement may share its thread ID, so deduplicate by Arc identity.
         for thread in self.constructions.published() {
-            if !threads.iter().any(|(_, tracked)| Arc::ptr_eq(tracked, &thread)) {
+            if !threads
+                .iter()
+                .any(|(_, tracked)| Arc::ptr_eq(tracked, &thread))
+            {
                 threads.push((thread.session.thread_id(), thread));
             }
         }
@@ -2160,14 +2165,19 @@ impl ThreadManagerState {
     }
 
     /// Spawn a new thread with optional history and register it with the manager.
-    async fn spawn_thread(self: &Arc<Self>, mut request: ThreadSpawnRequest) -> CodexResult<NewThread> {
+    async fn spawn_thread(
+        self: &Arc<Self>,
+        mut request: ThreadSpawnRequest,
+    ) -> CodexResult<NewThread> {
         // Capture while the caller's request scope is live. The retained
         // constructor runs independently and must not rediscover that scope.
         let account_work = match request.options.account_work.take() {
             Some(work) => Some(work),
             None => match self.extensions.host_admission() {
                 Some(host) => host.derive_request_operation_work().map_err(|_| {
-                    CodexErr::Fatal("request account work cannot admit thread construction".to_owned())
+                    CodexErr::Fatal(
+                        "request account work cannot admit thread construction".to_owned(),
+                    )
                 })?,
                 None => None,
             },
@@ -2401,73 +2411,76 @@ impl ThreadManagerState {
         };
         let attachment_source =
             forked_from_thread_id.filter(|_| matches!(&initial_history, InitialHistory::Forked(_)));
-        let (session, io) = Session::spawn_with_custody(SessionSpawnArgs {
-            startup,
-            config,
-            allow_provider_model_fallback,
-            instructions,
-            installation_id: self.installation_id.clone(),
-            auth_manager,
-            models_manager: Arc::clone(&self.models_manager),
-            git_root_discovery: Arc::clone(&self.git_root_discovery),
-            environment_manager: Arc::clone(&self.environment_manager),
-            skills_service: Arc::clone(&self.skills_service),
-            plugins_manager: Arc::clone(&self.plugins_manager),
-            mcp_manager,
-            code_mode_session_provider: Arc::clone(&self.code_mode_session_provider),
-            extensions,
-            host_admission: self.extensions.host_admission(),
-            initial_mcp_work,
-            conversation_history: initial_history,
-            disabled_plugin_ids,
-            requested_history_mode: history_mode,
-            fork_persistence,
-            // Keep only the manager registration internal. The session and its saved
-            // history retain Guardian's existing identity for metadata, filtering and resume.
-            session_source: match session_source {
-                SessionSource::Internal(InternalSessionSource::Guardian) => {
-                    SessionSource::SubAgent(SubAgentSource::Other(
-                        crate::guardian::GUARDIAN_REVIEWER_NAME.to_owned(),
-                    ))
-                }
-                source => source,
+        let (session, io) = Session::spawn_with_custody(
+            SessionSpawnArgs {
+                startup,
+                config,
+                allow_provider_model_fallback,
+                instructions,
+                installation_id: self.installation_id.clone(),
+                auth_manager,
+                models_manager: Arc::clone(&self.models_manager),
+                git_root_discovery: Arc::clone(&self.git_root_discovery),
+                environment_manager: Arc::clone(&self.environment_manager),
+                skills_service: Arc::clone(&self.skills_service),
+                plugins_manager: Arc::clone(&self.plugins_manager),
+                mcp_manager,
+                code_mode_session_provider: Arc::clone(&self.code_mode_session_provider),
+                extensions,
+                host_admission: self.extensions.host_admission(),
+                initial_mcp_work,
+                conversation_history: initial_history,
+                disabled_plugin_ids,
+                requested_history_mode: history_mode,
+                fork_persistence,
+                // Keep only the manager registration internal. The session and its saved
+                // history retain Guardian's existing identity for metadata, filtering and resume.
+                session_source: match session_source {
+                    SessionSource::Internal(InternalSessionSource::Guardian) => {
+                        SessionSource::SubAgent(SubAgentSource::Other(
+                            crate::guardian::GUARDIAN_REVIEWER_NAME.to_owned(),
+                        ))
+                    }
+                    source => source,
+                },
+                forked_from_thread_id,
+                parent_thread_id,
+                thread_source: thread_source.clone(),
+                originator,
+                agent_control,
+                dynamic_tools,
+                metrics_service_name,
+                inherited_environments,
+                inherited_exec_policy,
+                parent_rollout_thread_trace,
+                user_shell_override,
+                parent_trace,
+                environment_selections: environments,
+                thread_extension_init,
+                client_mcp_extensions,
+                reserved_thread_id,
+                analytics_events_client: self.analytics_events_client.clone(),
+                control_endpoint,
+                image_store: Arc::clone(&self.image_store),
+                thread_store: Arc::clone(&self.thread_store),
+                attestation_provider: self.attestation_provider.clone(),
+                external_time_provider: self.external_time_provider.clone(),
+                inherited_multi_agent_version: multi_agent_version,
+                git_enrichment_policy: if matches!(
+                    &tracked_session_source,
+                    SessionSource::Internal(InternalSessionSource::Guardian)
+                ) {
+                    GitEnrichmentPolicy::Skip
+                } else {
+                    GitEnrichmentPolicy::Fresh
+                },
+                windows_sandbox_proxy_settings_mode,
+                deferred_clear_session_start,
+                runtime_config_change_listener: self.runtime_config_change_listener.clone(),
+                runtime_config_change_gate: self.runtime_config_change_gate.clone(),
             },
-            forked_from_thread_id,
-            parent_thread_id,
-            thread_source: thread_source.clone(),
-            originator,
-            agent_control,
-            dynamic_tools,
-            metrics_service_name,
-            inherited_environments,
-            inherited_exec_policy,
-            parent_rollout_thread_trace,
-            user_shell_override,
-            parent_trace,
-            environment_selections: environments,
-            thread_extension_init,
-            client_mcp_extensions,
-            reserved_thread_id,
-            analytics_events_client: self.analytics_events_client.clone(),
-            control_endpoint,
-            image_store: Arc::clone(&self.image_store),
-            thread_store: Arc::clone(&self.thread_store),
-            attestation_provider: self.attestation_provider.clone(),
-            external_time_provider: self.external_time_provider.clone(),
-            inherited_multi_agent_version: multi_agent_version,
-            git_enrichment_policy: if matches!(
-                &tracked_session_source,
-                SessionSource::Internal(InternalSessionSource::Guardian)
-            ) {
-                GitEnrichmentPolicy::Skip
-            } else {
-                GitEnrichmentPolicy::Fresh
-            },
-            windows_sandbox_proxy_settings_mode,
-            deferred_clear_session_start,
-            runtime_config_change_listener: self.runtime_config_change_listener.clone(),
-            runtime_config_change_gate: self.runtime_config_change_gate.clone(),
-        }, Some(Arc::clone(&custody)))
+            Some(Arc::clone(&custody)),
+        )
         .await?;
         if let Some(source_thread_id) = attachment_source
             && session.live_thread().is_some()

@@ -41,7 +41,8 @@ impl Session {
             Ok(work) => Ok(codex_mcp::McpAttemptAccess::from_work(work.as_deref())),
             Err(_) => Err(codex_mcp::McpAttemptRefused),
         };
-        self.build_world_state_for_step_with_authority(step_context, access).await
+        self.build_world_state_for_step_with_authority(step_context, access)
+            .await
     }
 
     pub(crate) async fn build_world_state_for_step_with_authority(

@@ -1,8 +1,8 @@
 use super::*;
 use crate::agent::types::SpawnAgentOptions;
-use crate::config::RolloutBudgetConfig;
 use crate::config::ConfigBuilder;
 use crate::config::ConfigOverrides;
+use crate::config::RolloutBudgetConfig;
 use crate::config::test_config;
 use crate::init_state_db;
 use crate::installation_id::INSTALLATION_ID_FILENAME;
@@ -211,7 +211,10 @@ async fn thread_analytics_opt_out_overrides_shared_client() {
         {
             config.analytics_enabled = setting;
             let started = manager
-                .start_thread(StartThreadOptions::new(config.clone(), /*control_endpoint*/ None))
+                .start_thread(StartThreadOptions::new(
+                    config.clone(),
+                    /*control_endpoint*/ None,
+                ))
                 .await
                 .expect("start analytics test thread");
             let services = &started.thread.session.services;
@@ -334,13 +337,15 @@ async fn reserved_thread_id_is_used_without_changing_normal_id_generation() {
     .with_thread_id_generator(move || generated_ids[next_id.fetch_add(1, Ordering::Relaxed)]);
 
     let reserved_id = manager.reserve_thread_id();
-    let mut reserved_options = StartThreadOptions::new(config.clone(), /*control_endpoint*/ None);
+    let mut reserved_options =
+        StartThreadOptions::new(config.clone(), /*control_endpoint*/ None);
     reserved_options.reserved_thread_id = Some(reserved_id);
     let reserved = manager
         .start_thread(reserved_options)
         .await
         .expect("start reserved thread");
-    let mut resumed_options = StartThreadOptions::new(config.clone(), /*control_endpoint*/ None);
+    let mut resumed_options =
+        StartThreadOptions::new(config.clone(), /*control_endpoint*/ None);
     resumed_options.initial_history = InitialHistory::Resumed(ResumedHistory {
         conversation_id: reserved.thread_id,
         history: Arc::new(Vec::new()),
@@ -354,7 +359,10 @@ async fn reserved_thread_id_is_used_without_changing_normal_id_generation() {
         .err()
         .expect("reject reserved ID for resume");
     let generated = manager
-        .start_thread(StartThreadOptions::new(config.clone(), /*control_endpoint*/ None))
+        .start_thread(StartThreadOptions::new(
+            config.clone(),
+            /*control_endpoint*/ None,
+        ))
         .await
         .expect("start generated thread");
 
@@ -366,7 +374,6 @@ async fn reserved_thread_id_is_used_without_changing_normal_id_generation() {
     ));
     assert_eq!(generated.thread_id, generated_ids[2]);
 }
-
 
 #[test]
 fn fresh_thread_preserves_the_explicit_host_control_endpoint() {
@@ -1079,7 +1086,11 @@ fn fork_thread_accepts_legacy_usize_snapshot_argument() {
         config: Config,
         path: std::path::PathBuf,
     ) {
-        let _future = manager.fork_thread(usize::MAX, crate::StartThreadOptions::new(config, /*control_endpoint*/ None), path);
+        let _future = manager.fork_thread(
+            usize::MAX,
+            crate::StartThreadOptions::new(config, /*control_endpoint*/ None),
+            path,
+        );
     }
 
     let _: fn(&ThreadManager, Config, std::path::PathBuf) = assert_legacy_snapshot_callsite;
@@ -1479,7 +1490,10 @@ async fn spawn_internal_guardian_session_preserves_windows_sandbox_proxy_setting
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
     );
     let parent = manager
-        .start_thread(StartThreadOptions::new(config.clone(), /*control_endpoint*/ None))
+        .start_thread(StartThreadOptions::new(
+            config.clone(),
+            /*control_endpoint*/ None,
+        ))
         .await
         .expect("start parent thread");
     let reviewer = manager
@@ -1523,7 +1537,10 @@ async fn fork_internal_session_uses_only_the_selected_history() {
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
     );
     let parent = manager
-        .start_thread(StartThreadOptions::new(config.clone(), /*control_endpoint*/ None))
+        .start_thread(StartThreadOptions::new(
+            config.clone(),
+            /*control_endpoint*/ None,
+        ))
         .await
         .expect("start parent");
     let selected = vec![
@@ -1864,7 +1881,10 @@ async fn spawn_internal_session_preserves_parent_lineage_without_forking_history
             session_source: Some(SessionSource::Internal(
                 InternalSessionSource::MemoryConsolidation,
             )),
-            ..StartThreadOptions::new(parent.thread.session.get_config().await.as_ref().clone(), /*control_endpoint*/ None)
+            ..StartThreadOptions::new(
+                parent.thread.session.get_config().await.as_ref().clone(),
+                /*control_endpoint*/ None,
+            )
         })
         .await
         .expect("start child without a parent registry entry");
@@ -2921,7 +2941,9 @@ async fn metadata_update_without_result_reads_only_when_the_caller_needs_the_thr
         /*external_time_provider*/ None,
     );
     let started = manager
-        .start_thread(StartThreadOptions::new(config, /*control_endpoint*/ None))
+        .start_thread(StartThreadOptions::new(
+            config, /*control_endpoint*/ None,
+        ))
         .await
         .expect("start thread");
     started

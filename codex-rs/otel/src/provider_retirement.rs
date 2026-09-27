@@ -1,7 +1,7 @@
 use crate::OtelProvider;
 use crate::OtelShutdownError;
-use tokio::sync::Mutex;
 use std::mem::ManuallyDrop;
+use tokio::sync::Mutex;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 use tokio::time::timeout_at;
@@ -21,7 +21,9 @@ enum RetirementState {
     Pending(oneshot::Receiver<Result<(), OtelShutdownError>>),
     // Deliberately retained without a caller-side SDK destructor. Dropping an
     // unobserved/unavailable receipt leaks this provider, never proves cleanup.
-    Unavailable { _provider: ManuallyDrop<OtelProvider> },
+    Unavailable {
+        _provider: ManuallyDrop<OtelProvider>,
+    },
     Joined(Result<(), OtelRetirementError>),
     Complete(Result<(), OtelRetirementError>),
 }
@@ -54,7 +56,9 @@ impl OtelProvider {
         let log_receipt = self.log_receipt.clone();
         let state = match self.dispatch_retirement() {
             Ok(worker) => RetirementState::Pending(worker),
-            Err(provider) => RetirementState::Unavailable { _provider: provider },
+            Err(provider) => RetirementState::Unavailable {
+                _provider: provider,
+            },
         };
         OtelRetirement {
             state: Mutex::new(state),

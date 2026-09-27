@@ -426,8 +426,13 @@ async fn start_if_idle(
 
     let (turn_state, registration) = {
         let mut active_turn = session.active_turn.lock().await;
-        if session.task_admission_closed.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(CodexErr::Fatal("thread task admission is closed".to_string()));
+        if session
+            .task_admission_closed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(CodexErr::Fatal(
+                "thread task admission is closed".to_string(),
+            ));
         }
         if active_turn.is_some() || session.input_queue.preparation.is_busy() {
             return Ok(TurnInputSubmission::NotSubmitted {
@@ -442,7 +447,10 @@ async fn start_if_idle(
             });
         }
         let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
-        (Arc::clone(&active_turn.turn_state), session.input_queue.preparation.register())
+        (
+            Arc::clone(&active_turn.turn_state),
+            session.input_queue.preparation.register(),
+        )
     };
 
     if session.input_queue.has_trigger_turn_mailbox_items().await {

@@ -1916,8 +1916,7 @@ async fn orchestrator_catalog_snapshot_caches_failure() -> TestResult {
         mcp_access: Err(codex_protocol::mcp_work::McpAttemptRefused),
         environments: Vec::new(),
         payload: ToolPayload::Function {
-            arguments: serde_json::json!({"authority": {"kind": "orchestrator"}})
-                .to_string(),
+            arguments: serde_json::json!({"authority": {"kind": "orchestrator"}}).to_string(),
         },
     };
     // A refused invocation neither calls the provider nor poisons its catalog.
@@ -1951,10 +1950,7 @@ async fn orchestrator_catalog_snapshot_caches_failure() -> TestResult {
     }
 
     assert_eq!(
-        list_tool
-            .handle(call)
-            .await
-            .err(),
+        list_tool.handle(call).await.err(),
         Some(FunctionCallError::RespondToModel(
             "skills.list response budget leaves no room for discovery warnings".to_string()
         ))

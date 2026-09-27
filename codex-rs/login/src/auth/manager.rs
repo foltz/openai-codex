@@ -43,11 +43,11 @@ use super::change_state::AuthChangeState;
 use super::change_state::same_owner;
 use super::external_bearer::BearerTokenRefresher;
 use super::revoke::revoke_auth_tokens;
-use super::workload_identity::WorkloadIdentityExternalAuth;
-use super::workload_identity::WorkloadIdentitySessionError;
 pub use super::storage::ManagedAuthStorageError;
 pub use super::storage::ManagedAuthStorageFailure;
 pub use super::storage::ManagedAuthStorageSource;
+use super::workload_identity::WorkloadIdentityExternalAuth;
+use super::workload_identity::WorkloadIdentitySessionError;
 use crate::auth::AuthHeaders;
 pub use crate::auth::agent_identity::AgentIdentityAuth;
 pub use crate::auth::agent_identity::AgentIdentityAuthError;
@@ -1803,11 +1803,12 @@ pub enum AuthoritativeAuthUnavailable {
     CacheLockUnavailable,
 }
 
-
 /// Distinguishes managed-auth-transition install outcomes (Issue 05 Slice
 /// 4, R014, R064). Never carries credential material in `Debug` output.
 pub enum ManagedAdoptionInstallOutcome {
-    Installed { fingerprint: String },
+    Installed {
+        fingerprint: String,
+    },
     /// A deliberate managed logout was installed: the cache now holds no
     /// auth (R001's "deliberate logged-out state").
     LoggedOut,
@@ -2824,7 +2825,6 @@ impl AuthManager {
         }
     }
 
-
     async fn read_managed_adoption_snapshot(
         &self,
     ) -> Result<
@@ -3015,7 +3015,6 @@ impl AuthManager {
         hasher.update(account_id.as_bytes());
         format!("{:x}", hasher.finalize())
     }
-
 
     /// Checks the authoritative cache without a reload or any mutation. A
     /// missing/poisoned source is not converted to an absent account.

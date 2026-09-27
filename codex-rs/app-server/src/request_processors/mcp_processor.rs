@@ -269,9 +269,13 @@ impl McpRequestProcessor {
 
         let request_work = derive_request_work()
             .map_err(|_| internal_error("MCP OAuth account work is unavailable"))?;
-        let flow_work = request_work.as_ref().map(|work| {
-            work.try_derive().ok_or_else(|| internal_error("MCP OAuth account work is unavailable"))
-        }).transpose()?;
+        let flow_work = request_work
+            .as_ref()
+            .map(|work| {
+                work.try_derive()
+                    .ok_or_else(|| internal_error("MCP OAuth account work is unavailable"))
+            })
+            .transpose()?;
         let handle = perform_oauth_login_return_url(
             oauth_credential_name.as_ref(),
             &url,
@@ -356,32 +360,38 @@ impl McpRequestProcessor {
 
         let request_work = derive_request_work()
             .map_err(|_| internal_error("MCP status account work is unavailable"))?;
-        let _ = self.tasks.spawn(async move {
-            let (mcp_config, runtime_context) = match thread.as_ref() {
-                Some(thread) => thread.runtime_mcp_config_and_context(&config).await,
-                None => {
-                    let mcp_config = mcp_manager.runtime_config(&config).await;
-                    let runtime_context =
-                        McpRuntimeContext::new(environment_manager, config.cwd.to_path_buf());
-                    (mcp_config, runtime_context)
-                }
-            };
+        let _ = self
+            .tasks
+            .spawn(async move {
+                let (mcp_config, runtime_context) = match thread.as_ref() {
+                    Some(thread) => thread.runtime_mcp_config_and_context(&config).await,
+                    None => {
+                        let mcp_config = mcp_manager.runtime_config(&config).await;
+                        let runtime_context =
+                            McpRuntimeContext::new(environment_manager, config.cwd.to_path_buf());
+                        (mcp_config, runtime_context)
+                    }
+                };
 
-            let result = Self::list_mcp_server_status_response(
-                request.request_id.to_string(),
-                params,
-                mcp_config,
-                auth,
-                runtime_context,
-                mcp_manager,
-                thread,
-                control_endpoint,
-                codex_mcp::McpAttemptAccess::from_work(request_work.as_ref()
-                    .map(|work| work as &dyn codex_mcp::McpAttemptWork)),
-            )
-            .await;
-            outgoing.send_result(request, result).await;
-        }).map_err(|err| internal_error(format!("MCP status task admission failed: {err:?}")))?;
+                let result = Self::list_mcp_server_status_response(
+                    request.request_id.to_string(),
+                    params,
+                    mcp_config,
+                    auth,
+                    runtime_context,
+                    mcp_manager,
+                    thread,
+                    control_endpoint,
+                    codex_mcp::McpAttemptAccess::from_work(
+                        request_work
+                            .as_ref()
+                            .map(|work| work as &dyn codex_mcp::McpAttemptWork),
+                    ),
+                )
+                .await;
+                outgoing.send_result(request, result).await;
+            })
+            .map_err(|err| internal_error(format!("MCP status task admission failed: {err:?}")))?;
         Ok(())
     }
 
@@ -412,7 +422,8 @@ impl McpRequestProcessor {
             control_endpoint,
             access,
         )
-        .await.map_err(mcp_operation_error)?;
+        .await
+        .map_err(mcp_operation_error)?;
 
         let runtime_statuses = match thread {
             Some(thread) => thread.mcp_connection_statuses(&mcp_config).await,
@@ -530,20 +541,30 @@ impl McpRequestProcessor {
             let request_work = derive_request_work()
                 .map_err(|_| internal_error("MCP resource account work is unavailable"))?;
 
-            let _ = self.tasks.spawn(within_request(request_work, async move {
-                let origin_call_id =
-                    origin_call_id.filter(|_| server == codex_mcp::CODEX_APPS_MCP_SERVER_NAME);
-                let result = match origin_call_id.as_deref() {
-                    Some(call_id) => {
-                        thread
-                            .read_mcp_resource_for_call(call_id, &resource_params.uri)
-                            .await
-                    }
-                    None => thread.read_mcp_resource(&server, resource_params).await,
-                };
-                Self::send_mcp_resource_read_response(outgoing, request_id, result, origin_call_id)
+            let _ = self
+                .tasks
+                .spawn(within_request(request_work, async move {
+                    let origin_call_id =
+                        origin_call_id.filter(|_| server == codex_mcp::CODEX_APPS_MCP_SERVER_NAME);
+                    let result = match origin_call_id.as_deref() {
+                        Some(call_id) => {
+                            thread
+                                .read_mcp_resource_for_call(call_id, &resource_params.uri)
+                                .await
+                        }
+                        None => thread.read_mcp_resource(&server, resource_params).await,
+                    };
+                    Self::send_mcp_resource_read_response(
+                        outgoing,
+                        request_id,
+                        result,
+                        origin_call_id,
+                    )
                     .await;
-            })).map_err(|err| internal_error(format!("MCP resource task admission failed: {err:?}")))?;
+                }))
+                .map_err(|err| {
+                    internal_error(format!("MCP resource task admission failed: {err:?}"))
+                })?;
             return Ok(());
         }
 
@@ -568,26 +589,34 @@ impl McpRequestProcessor {
 
         let request_work = derive_request_work()
             .map_err(|_| internal_error("MCP resource account work is unavailable"))?;
-        let _ = self.tasks.spawn(async move {
-            let result = read_mcp_resource_without_thread(
-                &mcp_config,
-                auth.as_ref(),
-                runtime_context,
-                codex_apps_tools_cache,
-                tool_catalog_cache,
-                &server,
-                resource_params,
-                control_endpoint,
-                codex_mcp::McpAttemptAccess::from_work(request_work.as_ref()
-                    .map(|work| work as &dyn codex_mcp::McpAttemptWork)),
-            )
-            .await
-            .and_then(|result| serde_json::to_value(result).map_err(anyhow::Error::from));
-            Self::send_mcp_resource_read_response(
-                outgoing, request_id, result, /*origin_call_id*/ None,
-            )
-            .await;
-        }).map_err(|err| internal_error(format!("MCP resource task admission failed: {err:?}")))?;
+        let _ = self
+            .tasks
+            .spawn(async move {
+                let result = read_mcp_resource_without_thread(
+                    &mcp_config,
+                    auth.as_ref(),
+                    runtime_context,
+                    codex_apps_tools_cache,
+                    tool_catalog_cache,
+                    &server,
+                    resource_params,
+                    control_endpoint,
+                    codex_mcp::McpAttemptAccess::from_work(
+                        request_work
+                            .as_ref()
+                            .map(|work| work as &dyn codex_mcp::McpAttemptWork),
+                    ),
+                )
+                .await
+                .and_then(|result| serde_json::to_value(result).map_err(anyhow::Error::from));
+                Self::send_mcp_resource_read_response(
+                    outgoing, request_id, result, /*origin_call_id*/ None,
+                )
+                .await;
+            })
+            .map_err(|err| {
+                internal_error(format!("MCP resource task admission failed: {err:?}"))
+            })?;
         Ok(())
     }
 
@@ -627,14 +656,17 @@ impl McpRequestProcessor {
         let request_work = derive_request_work()
             .map_err(|_| internal_error("MCP tool account work is unavailable"))?;
 
-        let _ = self.tasks.spawn(within_request(request_work, async move {
-            let result = thread
-                .call_mcp_tool(&params.server, &params.tool, params.arguments, meta)
-                .await
-                .map(McpServerToolCallResponse::from)
-                .map_err(mcp_operation_error);
-            outgoing.send_result(request_id, result).await;
-        })).map_err(|err| internal_error(format!("MCP tool task admission failed: {err:?}")))?;
+        let _ = self
+            .tasks
+            .spawn(within_request(request_work, async move {
+                let result = thread
+                    .call_mcp_tool(&params.server, &params.tool, params.arguments, meta)
+                    .await
+                    .map(McpServerToolCallResponse::from)
+                    .map_err(mcp_operation_error);
+                outgoing.send_result(request_id, result).await;
+            }))
+            .map_err(|err| internal_error(format!("MCP tool task admission failed: {err:?}")))?;
         Ok(())
     }
 }

@@ -114,7 +114,8 @@ async fn zero_grant_observation_does_not_block_or_change_retirement_authority() 
         .try_add_connection_to_thread(thread_id, ConnectionId(1))
         .await
         .expect("observe");
-    let before = serde_json::to_value(manager.thread_interactive_subscription_list().await).expect("snapshot");
+    let before = serde_json::to_value(manager.thread_interactive_subscription_list().await)
+        .expect("snapshot");
     let watch = manager
         .subscribe_to_retention(thread_id)
         .await
@@ -131,7 +132,8 @@ async fn zero_grant_observation_does_not_block_or_change_retirement_authority() 
         vec![ConnectionId(1)]
     );
     assert_eq!(
-        serde_json::to_value(manager.thread_interactive_subscription_list().await).expect("snapshot"),
+        serde_json::to_value(manager.thread_interactive_subscription_list().await)
+            .expect("snapshot"),
         before
     );
 }

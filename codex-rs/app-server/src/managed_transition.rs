@@ -101,8 +101,7 @@ impl AccountWorkPermitGuard {
             .inner
             .state
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
-                ((state & ACCOUNT_WORK_COUNT_MASK) < ACCOUNT_WORK_COUNT_MASK)
-                    .then(|| state + 1)
+                ((state & ACCOUNT_WORK_COUNT_MASK) < ACCOUNT_WORK_COUNT_MASK).then(|| state + 1)
             })
             .ok()?;
         Some(Self {
@@ -1115,7 +1114,10 @@ impl ManagedTransitionCoordinator {
                     _ = &mut construction_progress => {}
                 }
             };
-            if tokio::time::timeout_at(deadline, work_finished).await.is_err() {
+            if tokio::time::timeout_at(deadline, work_finished)
+                .await
+                .is_err()
+            {
                 // Deadline elapsed. `advance` sets `retryable: true` for
                 // `Quarantined` already; no auth was ever touched and
                 // admitted work was never cancelled or killed (R013).
@@ -4524,7 +4526,9 @@ mod tests {
         // An abandoned constructor cannot rely on the later reset to poll it:
         // the coordinator must drive already-admitted work before adoption.
         *reset_inventory.parked_work.lock().unwrap() = Some(
-            coordinator.try_acquire_account_work_permit().expect("admit constructor"),
+            coordinator
+                .try_acquire_account_work_permit()
+                .expect("admit constructor"),
         );
 
         // A different account lands on disk before the transition reaches

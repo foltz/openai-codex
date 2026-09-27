@@ -75,10 +75,11 @@ impl Session {
                         }
                     }
                 };
-                let access = account_work.as_ref().map_or(
-                    codex_mcp::McpAttemptAccess::Unscoped,
-                    |work| codex_mcp::McpAttemptAccess::Admitted(work),
-                );
+                let access = account_work
+                    .as_ref()
+                    .map_or(codex_mcp::McpAttemptAccess::Unscoped, |work| {
+                        codex_mcp::McpAttemptAccess::Admitted(work)
+                    });
                 tokio::select! {
                     biased;
                     _ = shutdown.cancelled() => break,

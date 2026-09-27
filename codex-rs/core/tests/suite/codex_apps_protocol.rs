@@ -165,7 +165,10 @@ async fn apps_call_survives_catalog_restoration_while_awaiting_approval() -> any
     tools_available.store(false, Ordering::SeqCst);
     let peer = fixture
         .thread_manager
-        .start_thread(StartThreadOptions::new(fixture.config.clone(), /*control_endpoint*/ None))
+        .start_thread(StartThreadOptions::new(
+            fixture.config.clone(),
+            /*control_endpoint*/ None,
+        ))
         .await?
         .thread;
     wait_for_mcp_server(&peer, CODEX_APPS_MCP_SERVER_NAME).await?;

@@ -7656,7 +7656,9 @@ async fn account_reset_fences_late_remote_installed_success_and_auth_errors() {
         let callback_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let count = Arc::clone(&callback_count);
         let request = RemoteInstalledPluginsCacheRefreshRequest {
-            generation: manager.prepare_remote_installed_plugins_cache_generation(/*auth*/ None).unwrap(),
+            generation: manager
+                .prepare_remote_installed_plugins_cache_generation(/*auth*/ None)
+                .unwrap(),
             reset_generation: manager.remote_installed_plugins_generation(),
             service_config: RemotePluginServiceConfig::new(
                 "https://example.com".to_string(),
@@ -7686,7 +7688,9 @@ async fn account_reset_fences_late_remote_installed_success_and_auth_errors() {
         let callback_manager = Arc::downgrade(&manager);
         manager.complete_remote_installed_plugins_cache_refresh(
             RemoteInstalledPluginsCacheRefreshRequest {
-                generation: manager.prepare_remote_installed_plugins_cache_generation(/*auth*/ None).unwrap(),
+                generation: manager
+                    .prepare_remote_installed_plugins_cache_generation(/*auth*/ None)
+                    .unwrap(),
                 reset_generation: manager.remote_installed_plugins_generation(),
                 service_config: RemotePluginServiceConfig::new(
                     "https://example.com".to_string(),
@@ -7714,7 +7718,11 @@ async fn account_reset_fences_late_remote_installed_success_and_auth_errors() {
         resume_tx.send(()).unwrap();
         old_request.await.unwrap();
         assert_eq!(
-            manager.remote_installed_plugins_cache.read().unwrap().plugins,
+            manager
+                .remote_installed_plugins_cache
+                .read()
+                .unwrap()
+                .plugins,
             Some(vec![remote_installed_plugin("account-b")])
         );
         assert_eq!(callback_count.load(Ordering::SeqCst), 0);
@@ -7734,7 +7742,9 @@ fn account_reset_drops_pending_refresh_and_rejects_late_bundle_callback() {
         .unwrap()
         .in_flight = true;
     let request = |reset_generation| RemoteInstalledPluginsCacheRefreshRequest {
-        generation: manager.prepare_remote_installed_plugins_cache_generation(/*auth*/ None).unwrap(),
+        generation: manager
+            .prepare_remote_installed_plugins_cache_generation(/*auth*/ None)
+            .unwrap(),
         reset_generation,
         service_config: RemotePluginServiceConfig::new(
             "https://example.com".to_string(),
@@ -7780,7 +7790,9 @@ async fn account_reset_rejects_synchronous_remote_marketplace_result_in_flight()
     let auth_manager = test_auth_manager(Some(AuthMode::Chatgpt));
     let auth = auth_manager.auth_cached().expect("fixture auth");
     let manager = Arc::new(test_plugins_manager_with_auth_manager(
-        tmp.path().to_path_buf(), /*restriction_product*/ None, auth_manager,
+        tmp.path().to_path_buf(),
+        /*restriction_product*/ None,
+        auth_manager,
     ));
     let server = MockServer::start().await;
     let reset_manager = Arc::clone(&manager);
@@ -7815,7 +7827,11 @@ async fn account_reset_rejects_synchronous_remote_marketplace_result_in_flight()
         .await;
     assert!(matches!(result, Err(RemotePluginCatalogError::AuthChanged)));
     assert_eq!(
-        manager.remote_installed_plugins_cache.read().unwrap().plugins,
+        manager
+            .remote_installed_plugins_cache
+            .read()
+            .unwrap()
+            .plugins,
         Some(vec![remote_installed_plugin("account-b")])
     );
     assert_eq!(callbacks.load(Ordering::SeqCst), 0);
@@ -7862,27 +7878,54 @@ async fn account_reset_refuses_queued_reconcile_and_same_owner_fallback() {
     // Auth is still the same (None). A generation freshly obtained inside the
     // delayed task would therefore be admitted without the birth-time check.
     assert!(matches!(
-        manager.reconcile_remote_installed_plugins_after_acquiring_gate(
-            &config, /*auth*/ None, &reset_generation, bundle_generation,
-        ).await,
+        manager
+            .reconcile_remote_installed_plugins_after_acquiring_gate(
+                &config,
+                /*auth*/ None,
+                &reset_generation,
+                bundle_generation,
+            )
+            .await,
         Err(crate::remote::RemoteInstalledPluginBundleSyncError::Superseded)
     ));
-    manager.remote_installed_plugins_cache_refresh_state.write().unwrap().in_flight = true;
+    manager
+        .remote_installed_plugins_cache_refresh_state
+        .write()
+        .unwrap()
+        .in_flight = true;
     manager.maybe_start_remote_installed_plugins_cache_refresh_for_generation(
-        &config, /*auth*/ None,
+        &config,
+        /*auth*/ None,
         RemoteInstalledPluginsCacheRefreshNotify::IfCacheChanged,
-        /*on_effective_plugins_changed*/ None, EffectivePluginsChange::default(),
+        /*on_effective_plugins_changed*/ None,
+        EffectivePluginsChange::default(),
         reset_generation,
     );
-    assert!(manager.remote_installed_plugins_cache_refresh_state.read().unwrap().requested.is_none());
+    assert!(
+        manager
+            .remote_installed_plugins_cache_refresh_state
+            .read()
+            .unwrap()
+            .requested
+            .is_none()
+    );
     let current = manager.remote_installed_plugins_generation();
     manager.maybe_start_remote_installed_plugins_cache_refresh_for_generation(
-        &config, /*auth*/ None,
+        &config,
+        /*auth*/ None,
         RemoteInstalledPluginsCacheRefreshNotify::IfCacheChanged,
-        /*on_effective_plugins_changed*/ None, EffectivePluginsChange::default(),
+        /*on_effective_plugins_changed*/ None,
+        EffectivePluginsChange::default(),
         current,
     );
-    assert!(manager.remote_installed_plugins_cache_refresh_state.read().unwrap().requested.is_some());
+    assert!(
+        manager
+            .remote_installed_plugins_cache_refresh_state
+            .read()
+            .unwrap()
+            .requested
+            .is_some()
+    );
 }
 
 #[test]

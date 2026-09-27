@@ -418,7 +418,10 @@ async fn apps_cache_filled_during_binding_capture_reaches_the_model() -> anyhow:
             .set(std::collections::HashMap::new())?;
         let NewThread { thread: peer, .. } = test
             .thread_manager
-            .start_thread(StartThreadOptions::new(peer_config, /*control_endpoint*/ None))
+            .start_thread(StartThreadOptions::new(
+                peer_config,
+                /*control_endpoint*/ None,
+            ))
             .await?;
         wait_for_mcp_server(&peer, CODEX_APPS_MCP_SERVER_NAME).await?;
         release_waiting.send(())?;

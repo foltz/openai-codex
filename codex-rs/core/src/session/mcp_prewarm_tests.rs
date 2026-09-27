@@ -70,7 +70,11 @@ async fn mcp_background_refusal_preserves_foreground_progress_and_shutdown() {
         while session.mcp_refresh.is_pending() {
             tokio::task::yield_now().await;
         }
-        let _completed = session.mcp_refresh.acquire().await.expect("refresh gate open");
+        let _completed = session
+            .mcp_refresh
+            .acquire()
+            .await
+            .expect("refresh gate open");
     })
     .await
     .expect("reopened worker should publish the pending refresh");

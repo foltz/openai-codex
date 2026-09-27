@@ -171,7 +171,11 @@ async fn managed_reset_reports_endpoint_failure_instead_of_stale_catalog_success
             etag: None,
             client_version: Some(crate::client_version_to_whole()),
             identity: Some("account-a".to_owned()),
-            models: vec![remote_model("old-account", "old-account", /*priority*/ 0)],
+            models: vec![remote_model(
+                "old-account",
+                "old-account",
+                /*priority*/ 0,
+            )],
         })
         .await;
     assert_eq!(
@@ -190,27 +194,37 @@ async fn managed_reset_reports_endpoint_failure_instead_of_stale_catalog_success
 async fn managed_logout_reset_replaces_old_cache_without_network() {
     let home = tempdir().expect("home");
     let old = remote_model("old-account", "old-account", /*priority*/ 0);
-    let cache = Arc::new(FileModelsCache::new(home.path().join(MODEL_CACHE_FILE), DEFAULT_MODEL_CACHE_TTL));
-    cache.store(&ModelsCacheEntry {
-        fetched_at: Utc::now(),
-        etag: Some("old".to_owned()),
-        client_version: Some(crate::client_version_to_whole()),
-        identity: Some("test-provider".to_owned()),
-        models: vec![old.clone()],
-    }).await.expect("seed old disk cache");
+    let cache = Arc::new(FileModelsCache::new(
+        home.path().join(MODEL_CACHE_FILE),
+        DEFAULT_MODEL_CACHE_TTL,
+    ));
+    cache
+        .store(&ModelsCacheEntry {
+            fetched_at: Utc::now(),
+            etag: Some("old".to_owned()),
+            client_version: Some(crate::client_version_to_whole()),
+            identity: Some("test-provider".to_owned()),
+            models: vec![old.clone()],
+        })
+        .await
+        .expect("seed old disk cache");
     let endpoint = TestModelsEndpoint::without_refresh(Vec::new());
     let manager = OpenAiModelsManager::new_with_cache(
         cache.clone(),
         endpoint.clone(),
         /*auth_manager*/ None,
     );
-    assert!(manager.apply_remote_models(ModelsCacheEntry {
-        fetched_at: Utc::now(),
-        etag: None,
-        client_version: Some(crate::client_version_to_whole()),
-        identity: endpoint.identity(),
-        models: vec![old],
-    }).await);
+    assert!(
+        manager
+            .apply_remote_models(ModelsCacheEntry {
+                fetched_at: Utc::now(),
+                etag: None,
+                client_version: Some(crate::client_version_to_whole()),
+                identity: endpoint.identity(),
+                models: vec![old],
+            })
+            .await
+    );
     assert_eq!(
         manager
             .reset_for_managed_auth(DEFAULT_HTTP_CLIENT_FACTORY)
@@ -219,12 +233,18 @@ async fn managed_logout_reset_replaces_old_cache_without_network() {
     );
     let bundled = load_remote_models_from_file().expect("bundled catalog");
     assert_eq!(manager.get_remote_models().await, bundled);
-    let invalidation = cache.load(&crate::client_version_to_whole()).await
-        .expect("read disk cache").expect("reset persisted");
+    let invalidation = cache
+        .load(&crate::client_version_to_whole())
+        .await
+        .expect("read disk cache")
+        .expect("reset persisted");
     assert_eq!(invalidation.models, bundled);
     assert_eq!(endpoint.fetch_count(), 0);
     assert_eq!(invalidation.identity, None);
-    assert!(!manager.try_load_cache().await, "bundled invalidation is not a remote cache hit");
+    assert!(
+        !manager.try_load_cache().await,
+        "bundled invalidation is not a remote cache hit"
+    );
 }
 
 #[tokio::test]
@@ -293,21 +313,44 @@ async fn managed_reset_rejects_response_from_superseded_endpoint_identity() {
         fail: false,
     });
     let home = tempdir().expect("home");
-    let manager = Arc::new(openai_manager_for_tests(home.path().into(), endpoint.clone()));
+    let manager = Arc::new(openai_manager_for_tests(
+        home.path().into(),
+        endpoint.clone(),
+    ));
     let reset_manager = Arc::clone(&manager);
     let reset = tokio::spawn(async move {
-        reset_manager.reset_for_managed_auth(DEFAULT_HTTP_CLIENT_FACTORY).await
+        reset_manager
+            .reset_for_managed_auth(DEFAULT_HTTP_CLIENT_FACTORY)
+            .await
     });
-    endpoint.started.acquire().await.expect("fetch entered").forget();
+    endpoint
+        .started
+        .acquire()
+        .await
+        .expect("fetch entered")
+        .forget();
     // No AuthManager signal changes: the endpoint identity is an independent fence.
     *endpoint.identity.lock().expect("identity lock") = "account-b".to_owned();
     endpoint.release.add_permits(1);
-    assert_eq!(reset.await.expect("reset task"), Err(ManagedModelsResetError::AuthChanged));
-    assert_eq!(manager.get_remote_models().await, load_remote_models_from_file().expect("bundled"));
+    assert_eq!(
+        reset.await.expect("reset task"),
+        Err(ManagedModelsResetError::AuthChanged)
+    );
+    assert_eq!(
+        manager.get_remote_models().await,
+        load_remote_models_from_file().expect("bundled")
+    );
     let cache = FileModelsCache::new(home.path().join(MODEL_CACHE_FILE), DEFAULT_MODEL_CACHE_TTL);
-    let entry = cache.load(&crate::client_version_to_whole()).await.expect("cache read").expect("invalidation");
+    let entry = cache
+        .load(&crate::client_version_to_whole())
+        .await
+        .expect("cache read")
+        .expect("invalidation");
     assert_eq!(entry.identity, None);
-    assert_eq!(entry.models, load_remote_models_from_file().expect("bundled"));
+    assert_eq!(
+        entry.models,
+        load_remote_models_from_file().expect("bundled")
+    );
 }
 
 #[tokio::test]
@@ -317,13 +360,30 @@ async fn managed_reset_respects_disabled_api_key_discovery_without_poisoning_cac
     let endpoint = TestModelsEndpoint::without_refresh(vec![models.clone()]);
     let auth = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("test-key"));
     let manager = OpenAiModelsManager::new(home.path().into(), endpoint.clone(), Some(auth));
-    assert_eq!(manager.reset_for_managed_auth(DEFAULT_HTTP_CLIENT_FACTORY).await, Ok(()));
+    assert_eq!(
+        manager
+            .reset_for_managed_auth(DEFAULT_HTTP_CLIENT_FACTORY)
+            .await,
+        Ok(())
+    );
     assert_eq!(endpoint.fetch_count(), 0);
-    assert_eq!(manager.get_remote_models().await, load_remote_models_from_file().expect("bundled"));
+    assert_eq!(
+        manager.get_remote_models().await,
+        load_remote_models_from_file().expect("bundled")
+    );
 
     // The reset's bundled invalidation must not count as a remote cache hit.
     manager.set_api_key_model_discovery_enabled(/*enabled*/ true);
-    assert_eq!(manager.raw_model_catalog(RefreshStrategy::OnlineIfUncached, DEFAULT_HTTP_CLIENT_FACTORY).await.models, models);
+    assert_eq!(
+        manager
+            .raw_model_catalog(
+                RefreshStrategy::OnlineIfUncached,
+                DEFAULT_HTTP_CLIENT_FACTORY
+            )
+            .await
+            .models,
+        models
+    );
     assert_eq!(endpoint.fetch_count(), 1);
 }
 

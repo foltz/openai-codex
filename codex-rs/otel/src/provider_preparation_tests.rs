@@ -23,18 +23,22 @@ fn worker_preparation_failure_precedes_every_exporter_and_publication() {
         span_attributes: Default::default(),
         tracestate: Default::default(),
     };
-    let error = match OtelProvider::build_unpublished_with_worker_preparation(&settings, |provider| {
-        calls.fetch_add(1, Ordering::SeqCst);
-        assert!(provider.logger.is_none());
-        assert!(provider.tracer_provider.is_none());
-        assert!(provider.metrics.is_none());
-        provider.prepare_shutdown_worker_with_spawner(|_| {
-            Err(io::Error::new(io::ErrorKind::WouldBlock, "synthetic worker refusal"))
-        })
-    }) {
-        Ok(_) => panic!("worker refusal must fail preparation"),
-        Err(error) => error,
-    };
+    let error =
+        match OtelProvider::build_unpublished_with_worker_preparation(&settings, |provider| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            assert!(provider.logger.is_none());
+            assert!(provider.tracer_provider.is_none());
+            assert!(provider.metrics.is_none());
+            provider.prepare_shutdown_worker_with_spawner(|_| {
+                Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "synthetic worker refusal",
+                ))
+            })
+        }) {
+            Ok(_) => panic!("worker refusal must fail preparation"),
+            Err(error) => error,
+        };
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert!(error.provider.is_none());
     assert!(error.begin_retirement().is_none());

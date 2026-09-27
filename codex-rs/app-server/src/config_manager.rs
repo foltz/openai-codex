@@ -57,11 +57,17 @@ impl ConfigManager {
     ) -> Result<Config, crate::managed_transition::ResetInventoryError> {
         use crate::managed_transition::ResetInventoryError;
         let (cli, cloud, features) = {
-            let cli = self.cli_overrides.read()
+            let cli = self
+                .cli_overrides
+                .read()
                 .map_err(|_| ResetInventoryError::ConfigPublicationUnavailable)?;
-            let cloud = self.cloud_config_bundle.read()
+            let cloud = self
+                .cloud_config_bundle
+                .read()
                 .map_err(|_| ResetInventoryError::ConfigPublicationUnavailable)?;
-            let features = self.runtime_feature_enablement.read()
+            let features = self
+                .runtime_feature_enablement
+                .read()
                 .map_err(|_| ResetInventoryError::ConfigPublicationUnavailable)?;
             (cli.clone(), cloud.clone(), features.clone())
         };
@@ -81,7 +87,9 @@ impl ConfigManager {
                 continue;
             }
             if let Some(feature) = feature_for_key(&name) {
-                config.features.set_enabled(feature, enabled)
+                config
+                    .features
+                    .set_enabled(feature, enabled)
                     .map_err(|_| ResetInventoryError::ConfigLoadUnavailable)?;
             }
         }
@@ -106,8 +114,13 @@ impl ConfigManager {
         )
         .await
         .map_err(|_| ResetInventoryError::CloudConfigUnavailable)?;
-        loader.get().await.map_err(|_| ResetInventoryError::CloudConfigUnavailable)?;
-        let mut current = self.cloud_config_bundle.write()
+        loader
+            .get()
+            .await
+            .map_err(|_| ResetInventoryError::CloudConfigUnavailable)?;
+        let mut current = self
+            .cloud_config_bundle
+            .write()
             .map_err(|_| ResetInventoryError::ConfigPublicationUnavailable)?;
         *current = loader;
         Ok(())

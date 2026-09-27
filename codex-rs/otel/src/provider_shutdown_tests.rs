@@ -422,7 +422,9 @@ async fn async_batch_early_response_cannot_complete_retirement_before_exporter_d
         shutdown_worker: None,
     };
     let mut provider = provider;
-    provider.prepare_shutdown_worker().expect("prepare fixture worker");
+    provider
+        .prepare_shutdown_worker()
+        .expect("prepare fixture worker");
     let retirement = provider.begin_retirement();
     tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(2)))
         .await
@@ -502,7 +504,9 @@ async fn retained_provider_rejects_batch_hidden_log_failure() {
         shutdown_worker: None,
     };
     let mut provider = provider;
-    provider.prepare_shutdown_worker().expect("prepare fixture worker");
+    provider
+        .prepare_shutdown_worker()
+        .expect("prepare fixture worker");
     let retirement = provider.begin_retirement();
     let failure = Err(crate::OtelRetirementError::Exporter(
         crate::OtelShutdownError::Logs,
@@ -564,7 +568,9 @@ async fn retained_provider_rejects_batch_hidden_exporter_failure() {
         shutdown_worker: None,
     };
     let mut provider = provider;
-    provider.prepare_shutdown_worker().expect("prepare fixture worker");
+    provider
+        .prepare_shutdown_worker()
+        .expect("prepare fixture worker");
     let retirement = provider.begin_retirement();
     let failure = Err(crate::OtelRetirementError::Exporter(
         crate::OtelShutdownError::Traces,
@@ -963,7 +969,9 @@ async fn bounded_shutdown_preserves_exporter_failure() {
         provider, state, ..
     } = test_provider(ShutdownBehavior::Fail);
     let mut provider = provider;
-    provider.prepare_shutdown_worker().expect("prepare fixture worker");
+    provider
+        .prepare_shutdown_worker()
+        .expect("prepare fixture worker");
     let result = provider.shutdown_with_timeout(Duration::from_secs(1)).await;
     assert_eq!(result.unwrap_err().kind(), ErrorKind::Other);
     assert_eq!(state.shutdowns.load(Ordering::Relaxed), 1);
@@ -978,7 +986,9 @@ async fn retained_retirement_timeout_reobserves_same_worker() {
         ..
     } = test_provider(ShutdownBehavior::WaitForRelease);
     let mut provider = provider;
-    provider.prepare_shutdown_worker().expect("prepare fixture worker");
+    provider
+        .prepare_shutdown_worker()
+        .expect("prepare fixture worker");
     let retirement = provider.begin_retirement();
     started.recv_timeout(Duration::from_secs(1)).unwrap();
     let mut observer =
@@ -1022,7 +1032,9 @@ async fn retained_retirement_replays_exporter_failure() {
         provider, state, ..
     } = test_provider(ShutdownBehavior::Fail);
     let mut provider = provider;
-    provider.prepare_shutdown_worker().expect("prepare fixture worker");
+    provider
+        .prepare_shutdown_worker()
+        .expect("prepare fixture worker");
     let retirement = provider.begin_retirement();
     let expected = Err(crate::OtelRetirementError::Exporter(
         super::OtelShutdownError::Traces,
@@ -1042,11 +1054,15 @@ async fn retained_retirement_replays_exporter_failure() {
 
 #[tokio::test]
 async fn retained_retirement_without_worker_never_claims_cleanup_or_drops_on_caller() {
-    let TestProvider { provider, state, .. } = test_provider(ShutdownBehavior::Complete);
+    let TestProvider {
+        provider, state, ..
+    } = test_provider(ShutdownBehavior::Complete);
     let retirement = provider.begin_retirement();
     for _ in 0..2 {
         assert_eq!(
-            retirement.wait_until(tokio::time::Instant::now() + Duration::from_secs(1)).await,
+            retirement
+                .wait_until(tokio::time::Instant::now() + Duration::from_secs(1))
+                .await,
             Err(crate::OtelRetirementError::WorkerFailed),
         );
     }
@@ -1061,7 +1077,9 @@ async fn retained_retirement_worker_panic_is_sticky() {
         provider, state, ..
     } = test_provider(ShutdownBehavior::Panic);
     let mut provider = provider;
-    provider.prepare_shutdown_worker().expect("prepare fixture worker");
+    provider
+        .prepare_shutdown_worker()
+        .expect("prepare fixture worker");
     let retirement = provider.begin_retirement();
     let expected = Err(crate::OtelRetirementError::WorkerFailed);
     assert_eq!(
@@ -1086,7 +1104,9 @@ async fn retained_retirement_long_observer_survives_short_observer_timeout() {
         ..
     } = test_provider(ShutdownBehavior::WaitForRelease);
     let mut provider = provider;
-    provider.prepare_shutdown_worker().expect("prepare fixture worker");
+    provider
+        .prepare_shutdown_worker()
+        .expect("prepare fixture worker");
     let retirement = provider.begin_retirement();
     started.recv_timeout(Duration::from_secs(1)).unwrap();
     let mut short =

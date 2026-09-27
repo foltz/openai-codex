@@ -701,7 +701,9 @@ async fn status_snapshot_discloses_the_process_control_endpoint_to_an_eligible_p
     // authority transfer, without changing the endpoint-disclosure proof.
     struct StatusWork;
     impl crate::McpAttemptWork for StatusWork {
-        fn derive_attempt(&self) -> Result<Box<dyn crate::McpAttemptWork>, crate::McpAttemptRefused> {
+        fn derive_attempt(
+            &self,
+        ) -> Result<Box<dyn crate::McpAttemptWork>, crate::McpAttemptRefused> {
             Ok(Box::new(Self))
         }
     }
@@ -800,7 +802,8 @@ async fn status_snapshot_discloses_the_process_control_endpoint_to_an_eligible_p
         Some(ENDPOINT.to_string()),
         crate::McpAttemptAccess::Admitted(&StatusWork),
     )
-    .await.expect("status snapshot");
+    .await
+    .expect("status snapshot");
 
     assert!(
         endpoint_request_received.load(Ordering::SeqCst),

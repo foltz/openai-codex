@@ -91,17 +91,26 @@ impl TurnStartAdmission for AccountTurnAdmission {
         parent_store: &ExtensionData,
         parent_turn_id: &str,
     ) -> Result<Option<Box<dyn HostOperationWork>>, TurnWorkRefused> {
-        let parent = parent_store.get::<AccountTurnSession>().ok_or(TurnWorkRefused::Unavailable)?;
-        let permit = parent.derive(parent_turn_id).ok_or(TurnWorkRefused::Unavailable)?;
-        Ok(Some(Box::new(AccountOperationWork { permit, turns: self.work.clone() })))
+        let parent = parent_store
+            .get::<AccountTurnSession>()
+            .ok_or(TurnWorkRefused::Unavailable)?;
+        let permit = parent
+            .derive(parent_turn_id)
+            .ok_or(TurnWorkRefused::Unavailable)?;
+        Ok(Some(Box::new(AccountOperationWork {
+            permit,
+            turns: self.work.clone(),
+        })))
     }
 
     fn derive_request_operation_work(
         &self,
     ) -> Result<Option<Box<dyn HostOperationWork>>, TurnWorkRefused> {
         Ok(derive_request_work()?.map(|permit| {
-            Box::new(AccountOperationWork { permit, turns: self.work.clone() })
-                as Box<dyn HostOperationWork>
+            Box::new(AccountOperationWork {
+                permit,
+                turns: self.work.clone(),
+            }) as Box<dyn HostOperationWork>
         }))
     }
 
@@ -126,8 +135,12 @@ impl TurnStartAdmission for AccountTurnAdmission {
         child_store: &ExtensionData,
         termination: ExtensionFuture<'static, ()>,
     ) -> Result<Option<Box<dyn HostTurnWork>>, TurnWorkRefused> {
-        let parent = parent_store.get::<AccountTurnSession>().ok_or(TurnWorkRefused::Unavailable)?;
-        let permit = parent.derive(parent_turn_id).ok_or(TurnWorkRefused::Unavailable)?;
+        let parent = parent_store
+            .get::<AccountTurnSession>()
+            .ok_or(TurnWorkRefused::Unavailable)?;
+        let permit = parent
+            .derive(parent_turn_id)
+            .ok_or(TurnWorkRefused::Unavailable)?;
         let child = child_store.get_or_init(|| self.work.session(termination));
         let pending = child.begin(permit).ok_or(TurnWorkRefused::Unavailable)?;
         Ok(Some(Box::new(pending)))
@@ -146,7 +159,9 @@ pub(crate) struct AccountTurnLifecycle;
 
 impl TurnLifecycleContributor for AccountTurnLifecycle {
     fn on_turn_start<'a>(&'a self, input: TurnStartInput<'a>) -> ExtensionFuture<'a, ()> {
-        input.turn_store.insert(AccountTurnId(input.turn_id.to_owned()));
+        input
+            .turn_store
+            .insert(AccountTurnId(input.turn_id.to_owned()));
         Box::pin(std::future::ready(()))
     }
 

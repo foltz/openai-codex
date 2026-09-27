@@ -136,7 +136,8 @@ impl InputQueue {
         start_options: TurnStartOptions,
         work: Option<Box<dyn codex_protocol::host_turn_work::HostTurnWork>>,
     ) {
-        self.mailbox.enqueue_with_work(communication, start_options, work);
+        self.mailbox
+            .enqueue_with_work(communication, start_options, work);
     }
 
     pub(crate) async fn has_pending_mailbox_items(&self) -> bool {

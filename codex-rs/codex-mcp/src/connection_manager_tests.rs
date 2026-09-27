@@ -562,7 +562,8 @@ pub(crate) async fn create_ready_async_managed_client(tools: Vec<ToolInfo>) -> A
             create_test_managed_client(tools).await,
         ))
         .boxed()
-        .shared().into(),
+        .shared()
+        .into(),
         is_codex_apps_mcp_server: false,
         server_capabilities: Arc::new(std::sync::Mutex::new(None)),
         cached_server_info: None,
@@ -796,7 +797,8 @@ pub(crate) async fn create_test_manager_with_ready_apps_client(
                 managed_client,
             ))
             .boxed()
-            .shared().into(),
+            .shared()
+            .into(),
             is_codex_apps_mcp_server: true,
             server_capabilities: Arc::new(std::sync::Mutex::new(None)),
             cached_server_info: Some(create_test_server_info("Codex Apps")),
@@ -2364,7 +2366,10 @@ async fn capture_binding_uses_the_ready_clients_own_tools() {
     manager.insert_test_client(
         CODEX_APPS_MCP_SERVER_NAME.to_string(),
         AsyncManagedClient {
-            client: futures::future::ready(Ok(ready_client)).boxed().shared().into(),
+            client: futures::future::ready(Ok(ready_client))
+                .boxed()
+                .shared()
+                .into(),
             is_codex_apps_mcp_server: true,
             server_capabilities: Arc::new(std::sync::Mutex::new(None)),
             cached_server_info: None,
@@ -2926,7 +2931,8 @@ async fn capture_binding_skips_pending_optional_servers_after_configured_shared_
             AsyncManagedClient {
                 client: futures::future::pending::<Result<ManagedClient, StartupOutcomeError>>()
                     .boxed()
-                    .shared().into(),
+                    .shared()
+                    .into(),
                 is_codex_apps_mcp_server: false,
                 server_capabilities: Arc::new(std::sync::Mutex::new(None)),
                 cached_server_info: None,
@@ -3112,7 +3118,8 @@ async fn stable_catalog_revisions_ignore_terminal_optional_server_failures() {
         },
     ))
     .boxed()
-    .shared().into();
+    .shared()
+    .into();
     assert!(failed.client().await.is_err());
     manager.insert_test_client("failed", failed);
 
@@ -3178,7 +3185,8 @@ async fn capture_binding_shares_optional_startup_grace_across_connection_sets() 
             AsyncManagedClient {
                 client: futures::future::pending::<Result<ManagedClient, StartupOutcomeError>>()
                     .boxed()
-                    .shared().into(),
+                    .shared()
+                    .into(),
                 is_codex_apps_mcp_server: false,
                 server_capabilities: Arc::new(std::sync::Mutex::new(None)),
                 cached_server_info: None,
@@ -5385,7 +5393,10 @@ async fn runtime_retirement_skips_real_dormant_stdio_without_launching() -> anyh
             &config,
             &context,
             environment.as_ref(),
-            (&runtime_config.client_elicitation_capability, &ClientMcpExtensions::default()),
+            (
+                &runtime_config.client_elicitation_capability,
+                &ClientMcpExtensions::default(),
+            ),
             /*connection_identity*/ None,
         )
         .expect("cacheable stdio server");
@@ -5917,7 +5928,10 @@ async fn reconciliation_reuses_connection_without_relisting_regular_tools() -> a
             connection: Arc::new(McpServerConnection {
                 identity: Some(reusable_server_identity("docs", &config, &runtime_context)),
                 client: AsyncManagedClient {
-                    client: futures::future::ready(Ok(managed_client)).boxed().shared().into(),
+                    client: futures::future::ready(Ok(managed_client))
+                        .boxed()
+                        .shared()
+                        .into(),
                     is_codex_apps_mcp_server: false,
                     server_capabilities: Arc::new(std::sync::Mutex::new(None)),
                     cached_server_info: None,
@@ -6108,7 +6122,8 @@ async fn reconciliation_retries_non_oauth_authentication_failures() {
         is_authentication_required: true,
     }))
     .boxed()
-    .shared().into();
+    .shared()
+    .into();
 
     let reconciled = reconcile_reusable_server(&previous, config, runtime_context).await;
 
@@ -6760,7 +6775,8 @@ async fn reconciliation_replaces_closed_connections() -> anyhow::Result<()> {
         client: AsyncManagedClient {
             client: futures::future::ready(Ok(connected_client))
                 .boxed()
-                .shared().into(),
+                .shared()
+                .into(),
             is_codex_apps_mcp_server: false,
             server_capabilities: Arc::new(std::sync::Mutex::new(None)),
             cached_server_info: None,

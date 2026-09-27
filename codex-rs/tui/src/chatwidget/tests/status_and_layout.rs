@@ -2945,7 +2945,8 @@ async fn status_line_hostname_renders_current_machine_hostname() {
 async fn status_line_prefix_preserves_primary_enablement_and_order() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.local_settings.tui.status_line_prefix = vec!["template:(k:{lane})".to_string()];
-    chat.local_settings.tui
+    chat.local_settings
+        .tui
         .status_line_variables
         .insert("lane".to_string(), "dev".to_string());
 

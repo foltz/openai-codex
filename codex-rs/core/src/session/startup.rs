@@ -32,7 +32,8 @@ impl SessionStartup {
             let _ = io.shutdown_and_wait().await;
         } else if let Some(custody) = self.custody.get() {
             if let Some(session) = self.session.get() {
-                session.failed_initialization_persistence
+                session
+                    .failed_initialization_persistence
                     .store(true, std::sync::atomic::Ordering::Release);
             }
             // The constructor is terminal. Its retained owner joins acquisition,
@@ -44,9 +45,11 @@ impl SessionStartup {
         } else {
             if let Some(session) = self.session.get() {
                 let cleanup = session.cleanup_owner().observe(Arc::clone(session)).await;
-                if cleanup != (super::retirement::CleanupExecution::Finished {
-                    persistence_failed: false,
-                }) {
+                if cleanup
+                    != (super::retirement::CleanupExecution::Finished {
+                        persistence_failed: false,
+                    })
+                {
                     tracing::warn!(?cleanup, "managed startup runtime cleanup incomplete");
                 }
             }

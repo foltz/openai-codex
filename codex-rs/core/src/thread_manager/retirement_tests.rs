@@ -28,7 +28,10 @@ async fn cancelled_constructor_observer_preserves_original_until_drain() {
     assert!(
         owner
             .ticket()
-            .register(/*account_work*/ None, |_, _| async { panic!("closed factory ran") })
+            .register(
+                /*account_work*/ None,
+                |_, _| async { panic!("closed factory ran") }
+            )
             .is_err()
     );
     release.send(()).expect("original retained");
@@ -84,7 +87,10 @@ async fn constructor_panic_is_sticky_and_dead_ticket_refuses_birth() {
     let owner = ThreadConstructions::default();
     let ticket = owner.ticket();
     let observer = ticket
-        .register(/*account_work*/ None, |_, _| async { panic!("constructor panic") })
+        .register(
+            /*account_work*/ None,
+            |_, _| async { panic!("constructor panic") },
+        )
         .expect("admit");
     assert!(observer.await.is_err());
     let deadline = Instant::now() + Duration::from_secs(1);
@@ -100,7 +106,10 @@ async fn constructor_panic_is_sticky_and_dead_ticket_refuses_birth() {
     drop(owner);
     assert!(
         ticket
-            .register(/*account_work*/ None, |_, _| async { panic!("expired factory ran") })
+            .register(
+                /*account_work*/ None,
+                |_, _| async { panic!("expired factory ran") }
+            )
             .is_err()
     );
 }
@@ -111,24 +120,38 @@ async fn completed_constructor_compaction_preserves_prior_panic() {
     assert!(
         owner
             .ticket()
-            .register(/*account_work*/ None, |_, _| async { panic!("first constructor") })
+            .register(
+                /*account_work*/ None,
+                |_, _| async { panic!("first constructor") }
+            )
             .unwrap()
             .await
             .is_err()
     );
-    assert!(!owner.retire_completed_startup_until(Instant::now() + Duration::from_secs(1)).await);
+    assert!(
+        !owner
+            .retire_completed_startup_until(Instant::now() + Duration::from_secs(1))
+            .await
+    );
     for _ in 0..100 {
         assert!(
             owner
                 .ticket()
-                .register(/*account_work*/ None, |_, _| async { Err(CodexErr::InternalAgentDied) })
+                .register(
+                    /*account_work*/ None,
+                    |_, _| async { Err(CodexErr::InternalAgentDied) }
+                )
                 .unwrap()
                 .await
                 .is_err()
         );
         assert_eq!(owner.state.lock().unwrap().constructions.len(), 1);
     }
-    assert!(owner.retire_completed_startup_until(Instant::now() + Duration::from_secs(1)).await);
+    assert!(
+        owner
+            .retire_completed_startup_until(Instant::now() + Duration::from_secs(1))
+            .await
+    );
     assert_eq!(
         owner
             .drain_until(Instant::now() + Duration::from_secs(1))
@@ -228,7 +251,12 @@ async fn real_constructor_cancelled_before_publication_is_drained_after_close() 
         }
     }
     impl codex_extension_api::HostOperationWork for ConstructionWork {
-        fn derive_operation(&self) -> Result<Box<dyn codex_extension_api::HostOperationWork>, codex_extension_api::TurnWorkRefused> {
+        fn derive_operation(
+            &self,
+        ) -> Result<
+            Box<dyn codex_extension_api::HostOperationWork>,
+            codex_extension_api::TurnWorkRefused,
+        > {
             // Existing work may derive descendants after the request ends.
             self.0.operations.fetch_add(1, Ordering::SeqCst);
             Ok(Box::new(Self(Arc::clone(&self.0))))
@@ -237,7 +265,10 @@ async fn real_constructor_cancelled_before_publication_is_drained_after_close() 
             &self,
             _: &codex_extension_api::ExtensionData,
             _: codex_extension_api::ExtensionFuture<'static, ()>,
-        ) -> Result<Box<dyn codex_protocol::host_turn_work::HostTurnWork>, codex_extension_api::TurnWorkRefused> {
+        ) -> Result<
+            Box<dyn codex_protocol::host_turn_work::HostTurnWork>,
+            codex_extension_api::TurnWorkRefused,
+        > {
             Err(codex_extension_api::TurnWorkRefused::Unavailable)
         }
     }
@@ -247,7 +278,12 @@ async fn real_constructor_cancelled_before_publication_is_drained_after_close() 
         fn admit_turn_start(&self) -> Option<Box<dyn Send>> {
             Some(Box::new(()))
         }
-        fn derive_request_operation_work(&self) -> Result<Option<Box<dyn codex_extension_api::HostOperationWork>>, codex_extension_api::TurnWorkRefused> {
+        fn derive_request_operation_work(
+            &self,
+        ) -> Result<
+            Option<Box<dyn codex_extension_api::HostOperationWork>>,
+            codex_extension_api::TurnWorkRefused,
+        > {
             if !self.0.request_alive.load(Ordering::SeqCst) {
                 return Err(codex_extension_api::TurnWorkRefused::Unavailable);
             }
@@ -299,7 +335,10 @@ async fn real_constructor_cancelled_before_publication_is_drained_after_close() 
     let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
     extensions.turn_start_admission(Arc::new(ConstructionAdmission(Arc::clone(&host))));
     Arc::get_mut(&mut manager.state).unwrap().extensions = Arc::new(extensions.build());
-    let mut observer = Box::pin(manager.start_thread(StartThreadOptions::new(config.clone(), /*control_endpoint*/ None)));
+    let mut observer = Box::pin(manager.start_thread(StartThreadOptions::new(
+        config.clone(),
+        /*control_endpoint*/ None,
+    )));
     // Startup now has asynchronous work before loading instruction providers.
     // Drive the real constructor to the held boundary rather than assuming
     // that its first poll reaches it.
@@ -331,15 +370,32 @@ async fn real_constructor_cancelled_before_publication_is_drained_after_close() 
             }
         }
     })
-        .await
-        .expect("abandoned constructor completes before retirement");
+    .await
+    .expect("abandoned constructor completes before retirement");
     assert_eq!(host.operations.load(Ordering::SeqCst), 0);
     let startup = Arc::clone(&manager.constructions.state.lock().unwrap().constructions[0].startup);
-    assert!(!startup.is_empty(), "unpublished runtime remains owned until reset");
-    assert!(manager.shutdown_unpublished_constructions_bounded(Duration::from_secs(20)).await);
-    assert!(startup.is_empty(), "reset retires the runtime outside the lookup map");
+    assert!(
+        !startup.is_empty(),
+        "unpublished runtime remains owned until reset"
+    );
+    assert!(
+        manager
+            .shutdown_unpublished_constructions_bounded(Duration::from_secs(20))
+            .await
+    );
+    assert!(
+        startup.is_empty(),
+        "reset retires the runtime outside the lookup map"
+    );
     manager.constructions.close();
-    assert!(manager.start_thread(StartThreadOptions::new(config, /*control_endpoint*/ None)).await.is_err());
+    assert!(
+        manager
+            .start_thread(StartThreadOptions::new(
+                config, /*control_endpoint*/ None
+            ))
+            .await
+            .is_err()
+    );
     let deadline = Instant::now() + Duration::from_secs(20);
     let report = manager.constructions.drain_until(deadline).await;
     assert_eq!(
@@ -368,28 +424,43 @@ async fn managed_cancellation_terminates_constructor_before_tracker_join() {
     let server = wiremock::MockServer::start().await;
     let entered = Arc::new(tokio::sync::Notify::new());
     wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .respond_with({ let entered = Arc::clone(&entered); move |_: &wiremock::Request| {
-            entered.notify_one();
-            wiremock::ResponseTemplate::new(200).set_delay(Duration::from_secs(120))
-        } }).mount(&server).await;
+        .respond_with({
+            let entered = Arc::clone(&entered);
+            move |_: &wiremock::Request| {
+                entered.notify_one();
+                wiremock::ResponseTemplate::new(200).set_delay(Duration::from_secs(120))
+            }
+        })
+        .mount(&server)
+        .await;
     let home = tempfile::tempdir().unwrap();
     let mut config = ConfigBuilder::default()
         .codex_home(home.path().to_path_buf())
         .fallback_cwd(Some(home.path().to_path_buf()))
-        .build().await.unwrap();
+        .build()
+        .await
+        .unwrap();
     config.ephemeral = true;
-    config.mcp_servers.set(std::collections::HashMap::from([("held".to_owned(),
-        serde_json::from_value(serde_json::json!({ "url": server.uri(), "required": true,
+    config
+        .mcp_servers
+        .set(std::collections::HashMap::from([(
+            "held".to_owned(),
+            serde_json::from_value(serde_json::json!({ "url": server.uri(), "required": true,
             "startup_timeout_sec": 120, "http_headers": {"Authorization": "Bearer fixture"} }))
-            .expect("MCP fixture config"))])).unwrap();
+            .expect("MCP fixture config"),
+        )]))
+        .unwrap();
     let manager = ThreadManager::with_models_provider_and_home_for_tests(
         codex_login::CodexAuth::from_api_key("dummy"),
-        config.model_provider.clone(), config.codex_home.to_path_buf(),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
     );
     let manager = Arc::new(manager);
     let mut options = StartThreadOptions::new(config, /*control_endpoint*/ None);
-    options.thread_extension_init.insert(codex_extension_api::SessionIsolation::Isolated);
+    options
+        .thread_extension_init
+        .insert(codex_extension_api::SessionIsolation::Isolated);
     let tasks = tokio_util::task::TaskTracker::new();
     let mut start = Box::pin(manager.start_thread_until(options, std::future::pending(), &tasks));
     tokio::time::timeout(Duration::from_secs(20), async {
@@ -397,18 +468,40 @@ async fn managed_cancellation_terminates_constructor_before_tracker_join() {
             _ = entered.notified() => {},
             _ = start.as_mut() => panic!("constructor returned before release"),
         }
-    }).await.expect("constructor reaches held MCP initialize");
+    })
+    .await
+    .expect("constructor reaches held MCP initialize");
     drop(start);
     tasks.close();
-    tokio::time::timeout(Duration::from_secs(5), tasks.wait()).await
+    tokio::time::timeout(Duration::from_secs(5), tasks.wait())
+        .await
         .expect("managed lifetime joins without releasing MCP initialize");
     // Inspect before driving the drain: a frozen constructor would have no
     // terminal value even if some independent cleanup path had finished.
-    assert_eq!(manager.constructions.state.lock().unwrap().constructions.iter()
-        .map(|entry| entry.completion.peek().copied()).collect::<Vec<_>>(),
-        vec![Some(ConstructionOutcome::Returned)]);
+    assert_eq!(
+        manager
+            .constructions
+            .state
+            .lock()
+            .unwrap()
+            .constructions
+            .iter()
+            .map(|entry| entry.completion.peek().copied())
+            .collect::<Vec<_>>(),
+        vec![Some(ConstructionOutcome::Returned)]
+    );
     assert!(manager.list_thread_ids().await.is_empty());
-    assert_eq!(manager.constructions.drain_until(Instant::now() + Duration::from_secs(1)).await,
-        ConstructionDrain { finished: true, panicked: false, unavailable: false,
-            unpublished: 0, sessions: vec![] });
+    assert_eq!(
+        manager
+            .constructions
+            .drain_until(Instant::now() + Duration::from_secs(1))
+            .await,
+        ConstructionDrain {
+            finished: true,
+            panicked: false,
+            unavailable: false,
+            unpublished: 0,
+            sessions: vec![]
+        }
+    );
 }

@@ -25,10 +25,12 @@ impl CodexThread {
             return Ok(None);
         };
         host.admit_operation_work()
-            .map(|work| work.map(|work| {
-                Box::new(crate::session::McpOperationWork(work))
-                    as Box<dyn codex_mcp::McpAttemptWork>
-            }))
+            .map(|work| {
+                work.map(|work| {
+                    Box::new(crate::session::McpOperationWork(work))
+                        as Box<dyn codex_mcp::McpAttemptWork>
+                })
+            })
             .map_err(|_| anyhow::anyhow!("MCP event stream retry account work is unavailable"))
     }
 
@@ -45,8 +47,16 @@ impl CodexThread {
             SessionLoopOutcome::Cancelled => ThreadLoopOutcome::Cancelled,
             SessionLoopOutcome::Panicked => ThreadLoopOutcome::Panicked,
         };
-        let cleanup = self.session.cleanup_owner().observe(std::sync::Arc::clone(&self.session)).await;
-        ThreadRetirementReport { ordinary, session_loop, cleanup: ThreadCleanupOutcome::from(cleanup) }
+        let cleanup = self
+            .session
+            .cleanup_owner()
+            .observe(std::sync::Arc::clone(&self.session))
+            .await;
+        ThreadRetirementReport {
+            ordinary,
+            session_loop,
+            cleanup: ThreadCleanupOutcome::from(cleanup),
+        }
     }
 
     /// Start an idle child using an operation's still-live authority, even
@@ -62,16 +72,31 @@ impl CodexThread {
             Box::pin(self.termination_receipt()),
         ) {
             Ok(work) => work,
-            Err(_) => return Ok(StartIfIdleSubmission::NotSubmitted {
-                reason: NotSubmittedReason::ServerDraining,
-            }),
+            Err(_) => {
+                return Ok(StartIfIdleSubmission::NotSubmitted {
+                    reason: NotSubmittedReason::ServerDraining,
+                });
+            }
         };
-        self.session.services.agent_control
-            .ensure_execution_capacity_for_turn_start(self).await?;
-        match self.io.submit_turn_input(request, TurnInputMode::StartIfIdle, Some(work)).await? {
-            TurnInputSubmission::Started { turn_id } => Ok(StartIfIdleSubmission::Started { turn_id }),
-            TurnInputSubmission::NotSubmitted { reason } => Ok(StartIfIdleSubmission::NotSubmitted { reason }),
-            TurnInputSubmission::Steered { .. } => unreachable!("start-if-idle submission cannot steer"),
+        self.session
+            .services
+            .agent_control
+            .ensure_execution_capacity_for_turn_start(self)
+            .await?;
+        match self
+            .io
+            .submit_turn_input(request, TurnInputMode::StartIfIdle, Some(work))
+            .await?
+        {
+            TurnInputSubmission::Started { turn_id } => {
+                Ok(StartIfIdleSubmission::Started { turn_id })
+            }
+            TurnInputSubmission::NotSubmitted { reason } => {
+                Ok(StartIfIdleSubmission::NotSubmitted { reason })
+            }
+            TurnInputSubmission::Steered { .. } => {
+                unreachable!("start-if-idle submission cannot steer")
+            }
         }
     }
 }

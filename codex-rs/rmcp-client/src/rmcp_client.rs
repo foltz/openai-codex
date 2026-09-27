@@ -12,9 +12,9 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
-use anyhow::Context;
 use crate::retirement::ManagedRunningService;
 use crate::retirement::RmcpClientRetirement;
+use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use codex_api::SharedAuthProvider;
@@ -1249,13 +1249,14 @@ impl RmcpClient {
         let ticket = retirement.reserve_attempt()?;
         let recipe = transport_recipe.clone();
         let phase = ticket.start_phase(move |ticket| async move {
-            let result = match Self::create_pending_transport(&recipe, ticket.shutdown.clone()).await {
-                Ok(transport) => Ok(PendingConnection::new(transport, ticket)),
-                // A launcher error alone does not prove it never created a
-                // resource. Keep the attempt incomplete unless its ownership
-                // boundary supplies positive no-resource evidence.
-                Err(error) => Err(error),
-            };
+            let result =
+                match Self::create_pending_transport(&recipe, ticket.shutdown.clone()).await {
+                    Ok(transport) => Ok(PendingConnection::new(transport, ticket)),
+                    // A launcher error alone does not prove it never created a
+                    // resource. Keep the attempt incomplete unless its ownership
+                    // boundary supplies positive no-resource evidence.
+                    Err(error) => Err(error),
+                };
             Arc::new(StdMutex::new(Some(result)))
         })?;
         let result = phase
@@ -1452,10 +1453,7 @@ impl RmcpClient {
         pending_transport: PendingConnection,
         initialize_context: &InitializeContext,
         timeout: Option<Duration>,
-    ) -> Result<(
-        Arc<ManagedRunningService>,
-        Option<OAuthRuntime>,
-    )> {
+    ) -> Result<(Arc<ManagedRunningService>, Option<OAuthRuntime>)> {
         // Request IDs and remembered cancellations belong to this connection, including
         // when a failed initialization or expired HTTP session creates a new transport.
         let send_elicitation = Arc::clone(&initialize_context.send_elicitation);

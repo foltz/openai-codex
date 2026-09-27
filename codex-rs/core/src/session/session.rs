@@ -659,7 +659,10 @@ impl Session {
         agent_control: &LocalAgentControl,
     ) -> anyhow::Result<ThreadId> {
         match (initial_history, reserved_thread_id) {
-            (InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_), Some(id)) => Ok(id),
+            (
+                InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_),
+                Some(id),
+            ) => Ok(id),
             (InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_), None) => {
                 Ok(agent_control.generate_thread_id())
             }
@@ -921,7 +924,8 @@ impl Session {
             }
             None => reserved_thread_id,
         };
-        let thread_id = Self::select_thread_id(&initial_history, reserved_thread_id, &agent_control)?;
+        let thread_id =
+            Self::select_thread_id(&initial_history, reserved_thread_id, &agent_control)?;
         let isolation = thread_extension_init
             .get::<codex_extension_api::SessionIsolation>()
             .map(|policy| *policy)

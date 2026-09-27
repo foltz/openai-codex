@@ -97,7 +97,9 @@ impl SessionStartupCustody {
     pub(super) fn retain_persistence(&self, thread_id: ThreadId, live_thread: LiveThread) {
         self.retain_persistence_guard(
             thread_id,
-            Arc::new(tokio::sync::Mutex::new(LiveThreadInitGuard::new(Some(live_thread)))),
+            Arc::new(tokio::sync::Mutex::new(LiveThreadInitGuard::new(Some(
+                live_thread,
+            )))),
         );
     }
 

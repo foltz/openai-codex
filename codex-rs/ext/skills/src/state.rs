@@ -212,8 +212,7 @@ impl SkillsThreadState {
         cache
             .catalog
             .get_or_try_init(|| async {
-                let mcp_access =
-                    mcp_access.map_err(|_| SkillProviderError::admission_refused())?;
+                let mcp_access = mcp_access.map_err(|_| SkillProviderError::admission_refused())?;
                 match providers
                     .list_orchestrator_for_turn(query, Ok(mcp_access))
                     .await

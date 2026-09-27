@@ -56,7 +56,10 @@ impl MailboxPreparationSlot {
             cancellation: CancellationToken::new(),
             completed: CancellationToken::new(),
         });
-        self.state.lock().expect("mailbox preparation poisoned").current = Some(Arc::clone(&preparation));
+        self.state
+            .lock()
+            .expect("mailbox preparation poisoned")
+            .current = Some(Arc::clone(&preparation));
         MailboxPreparation {
             slot: Arc::clone(&self.state),
             preparation,
@@ -98,7 +101,11 @@ impl MailboxPreparation {
 impl Drop for MailboxPreparation {
     fn drop(&mut self) {
         let mut state = self.slot.lock().expect("mailbox preparation poisoned");
-        if state.current.as_ref().is_some_and(|current| Arc::ptr_eq(current, &self.preparation)) {
+        if state
+            .current
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &self.preparation))
+        {
             state.current.take();
         }
         self.preparation.completed.cancel();
@@ -107,7 +114,11 @@ impl Drop for MailboxPreparation {
 
 impl Drop for MailboxReplacement<'_> {
     fn drop(&mut self) {
-        let mut state = self.slot.state.lock().expect("mailbox preparation poisoned");
+        let mut state = self
+            .slot
+            .state
+            .lock()
+            .expect("mailbox preparation poisoned");
         state.replacing -= 1;
         if state.replacing == 0 {
             self.wake.notify_one();

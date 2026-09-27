@@ -402,7 +402,9 @@ impl LocalAgentControl {
         let account_work = parent_authority
             .map(crate::ParentTurnAuthority::derive_operation)
             .transpose()
-            .map_err(|_| CodexErr::Fatal("parent account work cannot admit agent construction".to_owned()))?
+            .map_err(|_| {
+                CodexErr::Fatal("parent account work cannot admit agent construction".to_owned())
+            })?
             .flatten();
         let parent = if let Some(parent) = parent {
             let turn = parent
@@ -646,10 +648,14 @@ impl LocalAgentControl {
         options: SpawnAgentOptions,
     ) -> CodexResult<LiveAgent> {
         let state = self.upgrade()?;
-        let account_work = options.parent_authority.as_ref()
+        let account_work = options
+            .parent_authority
+            .as_ref()
             .map(crate::ParentTurnAuthority::derive_operation)
             .transpose()
-            .map_err(|_| CodexErr::Fatal("parent account work cannot admit agent construction".to_owned()))?
+            .map_err(|_| {
+                CodexErr::Fatal("parent account work cannot admit agent construction".to_owned())
+            })?
             .flatten();
         let multi_agent_version = state
             .effective_multi_agent_version_for_spawn(
@@ -755,7 +761,9 @@ impl LocalAgentControl {
                 ))
                 .await?
             }
-            (None, _, _) => Box::pin(state.spawn_new_thread(config.clone(), self.clone(), account_work)).await?,
+            (None, _, _) => {
+                Box::pin(state.spawn_new_thread(config.clone(), self.clone(), account_work)).await?
+            }
         };
         agent_metadata.agent_id = Some(new_thread.thread_id);
         reservation.commit(agent_metadata.clone());
@@ -817,8 +825,13 @@ impl LocalAgentControl {
         };
         match initial_input {
             SpawnInitialInput::UserInput(input) => {
-                self.send_input(new_thread.thread_id, input, start_options, options.parent_authority.as_ref())
-                    .await?;
+                self.send_input(
+                    new_thread.thread_id,
+                    input,
+                    start_options,
+                    options.parent_authority.as_ref(),
+                )
+                .await?;
             }
             SpawnInitialInput::InterAgentCommunication(communication, context) => {
                 self.send_inter_agent_communication_after_capacity_check(
@@ -1190,13 +1203,19 @@ impl LocalAgentControl {
         let account_work = parent_authority
             .map(crate::ParentTurnAuthority::derive_operation)
             .transpose()
-            .map_err(|_| CodexErr::Fatal("parent account work cannot admit agent construction".to_owned()))?
+            .map_err(|_| {
+                CodexErr::Fatal("parent account work cannot admit agent construction".to_owned())
+            })?
             .flatten();
         let root_depth = thread_spawn_depth(&session_source).unwrap_or(0);
-        let (resumed_thread_id, resumed_multi_agent_version) = Box::pin(
-            self.resume_single_agent_from_rollout(config.clone(), thread_id, session_source, account_work.as_deref()),
-        )
-        .await?;
+        let (resumed_thread_id, resumed_multi_agent_version) =
+            Box::pin(self.resume_single_agent_from_rollout(
+                config.clone(),
+                thread_id,
+                session_source,
+                account_work.as_deref(),
+            ))
+            .await?;
         let state = self.upgrade()?;
         if config.multi_agent_version_from_features() == MultiAgentVersion::V2
             || resumed_multi_agent_version == MultiAgentVersion::V2
@@ -1275,7 +1294,9 @@ impl LocalAgentControl {
         let account_work = account_work
             .map(|work| work.derive_operation())
             .transpose()
-            .map_err(|_| CodexErr::Fatal("account work cannot admit resumed agent construction".to_owned()))?;
+            .map_err(|_| {
+                CodexErr::Fatal("account work cannot admit resumed agent construction".to_owned())
+            })?;
         let stored_thread = state
             .read_stored_thread(ReadThreadParams {
                 thread_id,

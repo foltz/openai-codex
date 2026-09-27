@@ -204,7 +204,8 @@ impl<C: Sync> ExtensionRegistry<C> {
         &self,
         thread_store: &crate::ExtensionData,
         termination: crate::ExtensionFuture<'static, ()>,
-    ) -> Result<Option<Box<dyn codex_protocol::host_turn_work::HostTurnWork>>, crate::TurnWorkRefused> {
+    ) -> Result<Option<Box<dyn codex_protocol::host_turn_work::HostTurnWork>>, crate::TurnWorkRefused>
+    {
         match &self.turn_start_admission {
             Some(admission) => admission.admit_turn_work(thread_store, termination),
             None => Ok(None),
@@ -218,9 +219,12 @@ impl<C: Sync> ExtensionRegistry<C> {
         parent_turn_id: &str,
         child_store: &crate::ExtensionData,
         termination: crate::ExtensionFuture<'static, ()>,
-    ) -> Result<Option<Box<dyn codex_protocol::host_turn_work::HostTurnWork>>, crate::TurnWorkRefused> {
+    ) -> Result<Option<Box<dyn codex_protocol::host_turn_work::HostTurnWork>>, crate::TurnWorkRefused>
+    {
         match &self.turn_start_admission {
-            Some(admission) => admission.derive_turn_work(parent_store, parent_turn_id, child_store, termination),
+            Some(admission) => {
+                admission.derive_turn_work(parent_store, parent_turn_id, child_store, termination)
+            }
             None => Ok(None),
         }
     }

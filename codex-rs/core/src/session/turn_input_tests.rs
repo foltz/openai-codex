@@ -129,7 +129,11 @@ async fn retired_session_cannot_report_started_for_new_turn_input(mode: TurnInpu
     )
     .await
     .expect_err("closed task admission must refuse, not report Started");
-    assert!(error.to_string().contains("thread task admission is closed"));
+    assert!(
+        error
+            .to_string()
+            .contains("thread task admission is closed")
+    );
     assert!(session.active_turn.lock().await.is_none());
 }
 

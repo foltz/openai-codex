@@ -567,9 +567,8 @@ async fn start_app_server(
         log_db,
         state_db.clone(),
         environment_manager,
-        embedded_host.ok_or_else(|| {
-            color_eyre::eyre::eyre!("embedded app-server host was not retained")
-        })?,
+        embedded_host
+            .ok_or_else(|| color_eyre::eyre::eyre!("embedded app-server host was not retained"))?,
     )
     .await
     .map(AppServerClient::InProcess)

@@ -2,8 +2,8 @@
 
 use crate::CodexThread;
 use crate::session::session::Session;
-use codex_extension_api::TurnWorkRefused;
 use codex_extension_api::HostOperationWork;
+use codex_extension_api::TurnWorkRefused;
 use codex_protocol::host_turn_work::HostTurnWork;
 use std::sync::Arc;
 use std::sync::Weak;
@@ -24,7 +24,10 @@ impl std::fmt::Debug for ParentTurnAuthority {
 
 impl ParentTurnAuthority {
     pub(crate) fn capture(session: &Arc<Session>, turn_id: &str) -> Self {
-        Self { session: Arc::downgrade(session), turn_id: turn_id.to_owned() }
+        Self {
+            session: Arc::downgrade(session),
+            turn_id: turn_id.to_owned(),
+        }
     }
 
     /// Capture finite constructor work while the exact parent turn is live.

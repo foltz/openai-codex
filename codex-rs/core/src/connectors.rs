@@ -349,14 +349,20 @@ pub async fn list_accessible_connectors_with_authority(
     let mut tools = if let Some(tools) = refreshed_tools {
         tools
     } else {
-        mcp_runtime.latest_list_all_tools_with_authority(access).await
+        mcp_runtime
+            .latest_list_all_tools_with_authority(access)
+            .await
     };
     let mut should_reload_tools = false;
     let codex_apps_ready = if refreshed_tools_succeeded {
         true
     } else if let Some(cfg) = mcp_servers.get(CODEX_APPS_MCP_SERVER_NAME) {
         let immediate_ready = mcp_runtime
-            .latest_wait_for_server_ready_with_authority(CODEX_APPS_MCP_SERVER_NAME, Duration::ZERO, access)
+            .latest_wait_for_server_ready_with_authority(
+                CODEX_APPS_MCP_SERVER_NAME,
+                Duration::ZERO,
+                access,
+            )
             .await;
         if immediate_ready {
             true
@@ -366,7 +372,11 @@ pub async fn list_accessible_connectors_with_authority(
                 .startup_timeout_sec
                 .unwrap_or(CONNECTORS_READY_TIMEOUT_ON_EMPTY_TOOLS);
             let ready = mcp_runtime
-                .latest_wait_for_server_ready_with_authority(CODEX_APPS_MCP_SERVER_NAME, timeout, access)
+                .latest_wait_for_server_ready_with_authority(
+                    CODEX_APPS_MCP_SERVER_NAME,
+                    timeout,
+                    access,
+                )
                 .await;
             should_reload_tools = ready;
             ready
@@ -377,7 +387,9 @@ pub async fn list_accessible_connectors_with_authority(
         false
     };
     if should_reload_tools {
-        tools = mcp_runtime.latest_list_all_tools_with_authority(access).await;
+        tools = mcp_runtime
+            .latest_list_all_tools_with_authority(access)
+            .await;
     }
     if codex_apps_ready {
         cancel_token.cancel();

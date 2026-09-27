@@ -175,7 +175,13 @@ async fn clear_read_real_chain_survives_restart_and_cold_resume() -> Result<()> 
     assert_eq!(read_transition(&mut client, 9, &a).await?, none);
     // Fixture control only: these WebSocket clients are never trusted-interactive.
     // The trusted disconnect/move regression lives in thread_state's unit tests.
-    send_request(&mut client, "kcf/thread/interactiveSubscription/list", 10, Some(json!({}))).await?;
+    send_request(
+        &mut client,
+        "kcf/thread/interactiveSubscription/list",
+        10,
+        Some(json!({})),
+    )
+    .await?;
     assert_eq!(
         read_response_for_id(&mut client, 10).await?.result["entries"],
         json!([])
@@ -282,7 +288,13 @@ async fn clear_read_is_concurrent_with_hook_and_complete_after_requester_disconn
     .await??;
     // Non-discriminating for disconnect: this observer was never entitled.
     // clear_moves_no_subscription_for_disconnected_requester covers trusted cleanup.
-    send_request(&mut observer, "kcf/thread/interactiveSubscription/list", 4, Some(json!({}))).await?;
+    send_request(
+        &mut observer,
+        "kcf/thread/interactiveSubscription/list",
+        4,
+        Some(json!({})),
+    )
+    .await?;
     assert_eq!(
         read_response_for_id(&mut observer, 4).await?.result["entries"],
         json!([])

@@ -134,7 +134,9 @@ where
         let style = if use_theme_colors
             && matches!(
                 segment.display_class,
-                StatusLineDisplayClass::BuiltIn(StatusLineItem::ThreadName | StatusLineItem::ThreadTitle)
+                StatusLineDisplayClass::BuiltIn(
+                    StatusLineItem::ThreadName | StatusLineItem::ThreadTitle
+                )
             )
             && let Some(thread_id) = thread_id
         {

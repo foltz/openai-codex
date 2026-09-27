@@ -17,8 +17,8 @@ pub use codex_app_server_transport::AppServerTransport;
 pub(crate) use codex_app_server_transport::CHANNEL_CAPACITY;
 pub(crate) use codex_app_server_transport::ConnectionId;
 pub(crate) use codex_app_server_transport::ConnectionOrigin;
-pub(crate) use codex_app_server_transport::DaemonShutdownAccess;
 pub(crate) use codex_app_server_transport::ConnectionProvenance;
+pub(crate) use codex_app_server_transport::DaemonShutdownAccess;
 pub(crate) use codex_app_server_transport::OutgoingMessage;
 pub(crate) use codex_app_server_transport::QueuedOutgoingMessage;
 pub(crate) use codex_app_server_transport::RemoteControlEnableError;
@@ -57,7 +57,11 @@ impl ConnectionState {
     ) -> Self {
         // The transport boundary explicitly classifies the principal's owner;
         // upstream connection authentication remains on its separate RPC gate.
-        let mut session = ConnectionSessionState::with_provenance(origin, provenance, RetentionPrincipalId::connection_owned());
+        let mut session = ConnectionSessionState::with_provenance(
+            origin,
+            provenance,
+            RetentionPrincipalId::connection_owned(),
+        );
         let mut rpc_gate = crate::connection_rpc_gate::ConnectionRpcGate::new();
         rpc_gate.auth = auth;
         session.rpc_gate = Arc::new(rpc_gate);
@@ -226,12 +230,10 @@ mod provenance_tests {
         let connection = ConnectionState::new(
             ConnectionOrigin::WebSocket,
             /*auth*/ None,
-            ConnectionProvenance::UnixPeerExecutable(
-                PeerExecutableIdentity::FileIdentity {
-                    device: 1,
-                    inode: 2,
-                },
-            ),
+            ConnectionProvenance::UnixPeerExecutable(PeerExecutableIdentity::FileIdentity {
+                device: 1,
+                inode: 2,
+            }),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(RwLock::new(HashSet::new())),

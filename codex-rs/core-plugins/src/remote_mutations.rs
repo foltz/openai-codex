@@ -169,16 +169,20 @@ impl PluginsManager {
         )
         .await
         .map_err(|err| resolved(Error::Bundle(err)))?
-        .ok_or_else(|| resolved(Error::Sync {
-            context: "remote plugin install superseded by account reset",
-            source: RemoteInstalledPluginBundleSyncError::Superseded,
-        }))?;
+        .ok_or_else(|| {
+            resolved(Error::Sync {
+                context: "remote plugin install superseded by account reset",
+                source: RemoteInstalledPluginBundleSyncError::Superseded,
+            })
+        })?;
         // Reset observes already admitted backend mutation work, but a download
         // that outlives its epoch cannot begin a new backend installation.
-        let _lease = bundle_generation.begin_commit().ok_or_else(|| resolved(Error::Sync {
-            context: "remote plugin install superseded by account reset",
-            source: RemoteInstalledPluginBundleSyncError::Superseded,
-        }))?;
+        let _lease = bundle_generation.begin_commit().ok_or_else(|| {
+            resolved(Error::Sync {
+                context: "remote plugin install superseded by account reset",
+                source: RemoteInstalledPluginBundleSyncError::Superseded,
+            })
+        })?;
         let install_result = if let Some(install_attempt_id) = install_attempt_id.as_deref() {
             remote::install_remote_plugin_with_install_attempt_id(
                 &service,
@@ -284,24 +288,29 @@ impl PluginsManager {
             &plugin_id.marketplace_name,
             &plugin_id.plugin_name,
         );
-        let cache_removal_error =
-            match remote::uninstall_remote_plugin_for_generation(
-                &service, auth, self.codex_home.clone(), target, bundle_generation,
-            )
-                .await
-            {
-                Ok(()) => None,
-                Err(err @ RemotePluginCatalogError::CacheRemove(_)) => Some(err),
-                Err(source) => {
-                    return Err(resolved(Error::Catalog {
-                        context: "uninstall remote plugin",
-                        source,
-                    }));
-                }
-            };
+        let cache_removal_error = match remote::uninstall_remote_plugin_for_generation(
+            &service,
+            auth,
+            self.codex_home.clone(),
+            target,
+            bundle_generation,
+        )
+        .await
+        {
+            Ok(()) => None,
+            Err(err @ RemotePluginCatalogError::CacheRemove(_)) => Some(err),
+            Err(source) => {
+                return Err(resolved(Error::Catalog {
+                    context: "uninstall remote plugin",
+                    source,
+                }));
+            }
+        };
         let effective_plugins_changed = {
-            let state = self.remote_installed_plugins_cache_refresh_state
-                .read().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let state = self
+                .remote_installed_plugins_cache_refresh_state
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if !reset_generation.is_current(&state.generation) {
                 return Err(resolved(Error::Sync {
                     context: "remote plugin uninstall superseded by account reset",

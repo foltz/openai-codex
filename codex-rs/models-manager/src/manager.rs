@@ -412,8 +412,7 @@ impl ModelsManager for OpenAiModelsManager {
                 && !self.endpoint_client.has_command_auth()
                 && (!self.endpoint_client.supports_api_key_models()
                     || !self.api_key_model_discovery_enabled.load(Ordering::SeqCst));
-            let should_refresh =
-                !api_key_discovery_disabled && self.should_refresh_models().await;
+            let should_refresh = !api_key_discovery_disabled && self.should_refresh_models().await;
             if auth_changes
                 .as_ref()
                 .is_some_and(|changes| changes.has_changed().unwrap_or(true))
@@ -423,15 +422,19 @@ impl ModelsManager for OpenAiModelsManager {
             if !should_refresh {
                 return Ok(());
             }
-            let ModelsEndpointResponse { models, etag, identity } = self
+            let ModelsEndpointResponse {
+                models,
+                etag,
+                identity,
+            } = self
                 .endpoint_client
                 .list_models(&client_version, http_client_factory)
                 .await
                 .map_err(|_| ManagedModelsResetError::Endpoint)?;
             if Some(&identity) != self.endpoint_client.identity().as_ref()
                 || auth_changes
-                .as_ref()
-                .is_some_and(|changes| changes.has_changed().unwrap_or(true))
+                    .as_ref()
+                    .is_some_and(|changes| changes.has_changed().unwrap_or(true))
             {
                 return Err(ManagedModelsResetError::AuthChanged);
             }

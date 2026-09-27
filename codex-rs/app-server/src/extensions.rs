@@ -123,7 +123,9 @@ pub(crate) fn thread_extensions(
     );
     // Release logical turn custody only after every other stop/abort callback,
     // matching the terminal-event boundary rather than the start of teardown.
-    builder.turn_lifecycle_contributor(Arc::new(crate::account_turn_admission::AccountTurnLifecycle));
+    builder.turn_lifecycle_contributor(Arc::new(
+        crate::account_turn_admission::AccountTurnLifecycle,
+    ));
     Arc::new(builder.build())
 }
 

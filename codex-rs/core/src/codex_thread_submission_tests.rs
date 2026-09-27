@@ -59,7 +59,11 @@ impl TurnStartAdmission for Admission {
     }
 }
 
-async fn fixture() -> (CodexThread, async_channel::Receiver<Submission>, Arc<Admission>) {
+async fn fixture() -> (
+    CodexThread,
+    async_channel::Receiver<Submission>,
+    Arc<Admission>,
+) {
     let (mut session, turn) = make_session_and_context().await;
     let gate = Arc::new(Admission::default());
     let mut extensions = ExtensionRegistryBuilder::new();
@@ -95,8 +99,11 @@ async fn fixture() -> (CodexThread, async_channel::Receiver<Submission>, Arc<Adm
         session_loop_termination: completed_session_loop_termination(),
     };
     let thread = CodexThread::new(
-        Arc::new(session), io, ThreadStartupMetadata::from(&configured),
-        /*rollout_path*/ None, SessionSource::Exec,
+        Arc::new(session),
+        io,
+        ThreadStartupMetadata::from(&configured),
+        /*rollout_path*/ None,
+        SessionSource::Exec,
     );
     (thread, rx_sub, gate)
 }
@@ -118,7 +125,12 @@ fn trace() -> W3cTraceContext {
 #[tokio::test]
 async fn traced_compact_and_review_keep_trace_and_one_queued_lease() {
     let (thread, rx, gate) = fixture().await;
-    for op in [Op::Compact, Op::Review { review_request: review() }] {
+    for op in [
+        Op::Compact,
+        Op::Review {
+            review_request: review(),
+        },
+    ] {
         let calls_before = gate.calls.load(Ordering::SeqCst);
         let dropped_before = gate.dropped.load(Ordering::SeqCst);
         let is_compact = matches!(&op, Op::Compact);
@@ -147,7 +159,12 @@ async fn traced_compact_and_review_keep_trace_and_one_queued_lease() {
 #[tokio::test]
 async fn direct_compact_and_review_admit_exactly_once() {
     let (thread, rx, gate) = fixture().await;
-    for op in [Op::Compact, Op::Review { review_request: review() }] {
+    for op in [
+        Op::Compact,
+        Op::Review {
+            review_request: review(),
+        },
+    ] {
         let before = gate.calls.load(Ordering::SeqCst);
         thread.submit(op).await.unwrap();
         let queued = rx.recv().await.unwrap();
@@ -162,8 +179,16 @@ async fn direct_compact_and_review_admit_exactly_once() {
 async fn refused_traced_work_does_not_enqueue_and_interrupt_still_passes() {
     let (thread, rx, gate) = fixture().await;
     gate.closed.store(true, Ordering::SeqCst);
-    for op in [Op::Compact, Op::Review { review_request: review() }] {
-        let error = thread.submit_with_trace(op, Some(trace())).await.unwrap_err();
+    for op in [
+        Op::Compact,
+        Op::Review {
+            review_request: review(),
+        },
+    ] {
+        let error = thread
+            .submit_with_trace(op, Some(trace()))
+            .await
+            .unwrap_err();
         assert!(matches!(error.details(),
             codex_protocol::error::CodexErrorDetails::Fatal(message)
                 if message == "account work admission is closed"));
@@ -171,7 +196,10 @@ async fn refused_traced_work_does_not_enqueue_and_interrupt_still_passes() {
     }
     assert_eq!(gate.calls.load(Ordering::SeqCst), 2);
     assert_eq!(gate.dropped.load(Ordering::SeqCst), 0);
-    thread.submit_with_trace(Op::Interrupt, Some(trace())).await.unwrap();
+    thread
+        .submit_with_trace(Op::Interrupt, Some(trace()))
+        .await
+        .unwrap();
     let queued = rx.recv().await.unwrap();
     assert!(matches!(queued.op, Op::Interrupt));
     assert_eq!(queued.trace, Some(trace()));

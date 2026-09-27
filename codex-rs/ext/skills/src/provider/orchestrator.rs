@@ -83,7 +83,11 @@ impl SkillProvider for OrchestratorSkillProvider {
             for _ in 0..MAX_RESOURCE_PAGES {
                 let page = match tokio::time::timeout_at(
                     discovery_deadline,
-                    client.list_resources_with_authority(CODEX_APPS_MCP_SERVER_NAME, cursor.clone(), access),
+                    client.list_resources_with_authority(
+                        CODEX_APPS_MCP_SERVER_NAME,
+                        cursor.clone(),
+                        access,
+                    ),
                 )
                 .await
                 {
@@ -206,10 +210,16 @@ impl SkillProvider for OrchestratorSkillProvider {
                     "session MCP resource client is not configured",
                 ));
             };
-            let access = request.mcp_access.map_err(|_| SkillProviderError::admission_refused())?;
+            let access = request
+                .mcp_access
+                .map_err(|_| SkillProviderError::admission_refused())?;
             let result = tokio::time::timeout(
                 ORCHESTRATOR_SKILL_READ_TIMEOUT,
-                client.read_resource_with_authority(CODEX_APPS_MCP_SERVER_NAME, request.resource.as_str(), access),
+                client.read_resource_with_authority(
+                    CODEX_APPS_MCP_SERVER_NAME,
+                    request.resource.as_str(),
+                    access,
+                ),
             )
             .await
             .map_err(|_| {

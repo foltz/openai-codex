@@ -82,7 +82,10 @@ impl<'call> ToolExecutor<ToolCall<'call>> for ListTool {
         Box::pin(async move {
             let args: ListArgs = parse_args(&call)?;
             let response_byte_budget = call.response_byte_budget(MAX_SKILL_RESPONSE_BYTES);
-            let catalog = self.context.catalog(&call.turn_id, args.authority, call.mcp_access).await;
+            let catalog = self
+                .context
+                .catalog(&call.turn_id, args.authority, call.mcp_access)
+                .await;
             let mut omitted_oversized_entry = false;
             let canonical_skills = catalog
                 .entries

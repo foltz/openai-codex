@@ -6,7 +6,12 @@ use tokio::sync::oneshot;
 
 fn session(registry: &AccountTurnWork) -> (AccountTurnSession, oneshot::Sender<()>) {
     let (ended, termination) = oneshot::channel();
-    let session = registry.session(async move { let _ = termination.await; }.boxed());
+    let session = registry.session(
+        async move {
+            let _ = termination.await;
+        }
+        .boxed(),
+    );
     (session, ended)
 }
 
@@ -15,10 +20,16 @@ fn logical_terminal_releases_all_matching_leases_but_not_another_turn() {
     let registry = AccountTurnWork::default();
     let permits = AccountWorkPermits::new();
     let (session, _ended) = session(&registry);
-    session.begin(permits.try_acquire().unwrap()).unwrap().bind("one".into());
+    session
+        .begin(permits.try_acquire().unwrap())
+        .unwrap()
+        .bind("one".into());
     let child = session.derive("one").unwrap();
     session.begin(child).unwrap().bind("one".into());
-    session.begin(permits.try_acquire().unwrap()).unwrap().bind("two".into());
+    session
+        .begin(permits.try_acquire().unwrap())
+        .unwrap()
+        .bind("two".into());
     assert_eq!(permits.admitted_count(), 3);
     session.terminal("one");
     session.terminal("one");
@@ -51,7 +62,10 @@ fn failed_submission_drops_only_its_pending_slot() {
     let registry = AccountTurnWork::default();
     let permits = AccountWorkPermits::new();
     let (session, _ended) = session(&registry);
-    session.begin(permits.try_acquire().unwrap()).unwrap().bind("running".into());
+    session
+        .begin(permits.try_acquire().unwrap())
+        .unwrap()
+        .bind("running".into());
     let failed = session.begin(permits.try_acquire().unwrap()).unwrap();
     drop(failed);
     assert_eq!(permits.admitted_count(), 1);
@@ -64,12 +78,17 @@ async fn cancelled_drain_observation_preserves_work_until_loop_termination() {
     let registry = AccountTurnWork::default();
     let permits = AccountWorkPermits::new();
     let (session, ended) = session(&registry);
-    session.begin(permits.try_acquire().unwrap()).unwrap().bind("suspended".into());
+    session
+        .begin(permits.try_acquire().unwrap())
+        .unwrap()
+        .bind("suspended".into());
     assert!(registry.observe_terminated().now_or_never().is_none());
     drop(session);
     assert_eq!(permits.admitted_count(), 1);
     ended.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(1), registry.observe_terminated()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), registry.observe_terminated())
+        .await
+        .unwrap();
     assert_eq!(permits.admitted_count(), 0);
 }
 
@@ -79,10 +98,16 @@ async fn old_loop_cannot_release_recovered_turn_in_a_new_loop() {
     let permits = AccountWorkPermits::new();
     let (old, old_ended) = session(&registry);
     let (new, _new_ended) = session(&registry);
-    old.begin(permits.try_acquire().unwrap()).unwrap().bind("same-turn-id".into());
-    new.begin(permits.try_acquire().unwrap()).unwrap().bind("same-turn-id".into());
+    old.begin(permits.try_acquire().unwrap())
+        .unwrap()
+        .bind("same-turn-id".into());
+    new.begin(permits.try_acquire().unwrap())
+        .unwrap()
+        .bind("same-turn-id".into());
     old_ended.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(1), registry.observe_terminated()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), registry.observe_terminated())
+        .await
+        .unwrap();
     old.terminal("same-turn-id");
     assert_eq!(permits.admitted_count(), 1);
     assert!(old.begin(permits.try_acquire().unwrap()).is_none());
@@ -96,11 +121,16 @@ async fn terminated_parent_cannot_derive_before_drain_observes_its_receipt() {
     let registry = AccountTurnWork::default();
     let permits = AccountWorkPermits::new();
     let (parent, ended) = session(&registry);
-    parent.begin(permits.try_acquire().unwrap()).unwrap().bind("parent".into());
+    parent
+        .begin(permits.try_acquire().unwrap())
+        .unwrap()
+        .bind("parent".into());
     ended.send(()).unwrap();
     assert!(parent.derive("parent").is_none());
     assert_eq!(permits.admitted_count(), 1);
-    tokio::time::timeout(Duration::from_secs(1), registry.observe_terminated()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), registry.observe_terminated())
+        .await
+        .unwrap();
     assert_eq!(permits.admitted_count(), 0);
 }
 
@@ -112,8 +142,13 @@ async fn drain_observer_notices_a_session_registered_after_it_started() {
     tokio::pin!(observe);
     assert!(observe.as_mut().now_or_never().is_none());
     let (session, ended) = session(&registry);
-    session.begin(permits.try_acquire().unwrap()).unwrap().bind("late".into());
+    session
+        .begin(permits.try_acquire().unwrap())
+        .unwrap()
+        .bind("late".into());
     ended.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(1), observe).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), observe)
+        .await
+        .unwrap();
     assert_eq!(permits.admitted_count(), 0);
 }

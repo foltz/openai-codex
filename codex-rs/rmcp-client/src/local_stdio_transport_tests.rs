@@ -8,7 +8,11 @@ async fn direct_close_timeout_preserves_exit_observer_in_both_protocol_modes() {
         let gate = directory.path().join("exit");
         let mut command = Command::new("/bin/sh");
         command
-            .args(["-c", "while [ ! -e \"$1\" ]; do sleep 0.01; done", "test-child"])
+            .args([
+                "-c",
+                "while [ ! -e \"$1\" ]; do sleep 0.01; done",
+                "test-child",
+            ])
             .arg(&gate);
         let (mut transport, _) =
             LocalStdioTransport::spawn(command, "test-server".to_string(), protocol_mode)
@@ -16,10 +20,17 @@ async fn direct_close_timeout_preserves_exit_observer_in_both_protocol_modes() {
         let mut observer = transport.exit_observer();
         let supervisor = observer.supervisor.abort_handle.clone();
         assert_eq!(
-            transport.close().await.expect_err("live child must time out").kind(),
+            transport
+                .close()
+                .await
+                .expect_err("live child must time out")
+                .kind(),
             io::ErrorKind::TimedOut
         );
-        assert!(!supervisor.is_finished(), "timeout must retain terminal observation");
+        assert!(
+            !supervisor.is_finished(),
+            "timeout must retain terminal observation"
+        );
         std::fs::write(gate, b"exit").expect("release owned child");
         tokio::time::resume();
         tokio::time::timeout(Duration::from_secs(5), observer.wait())
@@ -43,7 +54,10 @@ async fn final_local_observer_drop_aborts_the_child_supervisor() {
         let supervisor = observer.supervisor.abort_handle.clone();
         drop(transport);
         tokio::task::yield_now().await;
-        assert!(!supervisor.is_finished(), "a remaining observer owns the child");
+        assert!(
+            !supervisor.is_finished(),
+            "a remaining observer owns the child"
+        );
         drop(observer);
         let stopped = tokio::time::timeout(Duration::from_secs(1), async {
             while !supervisor.is_finished() {

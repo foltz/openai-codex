@@ -1529,9 +1529,12 @@ mod tests {
         .await
         {
             Ok(_) => panic!("inherited append should fail"),
-            Err(_) => {},
+            Err(_) => {}
         };
-        assert!(guard.as_ref().is_some(), "opened live thread remains in custody");
+        assert!(
+            guard.as_ref().is_some(),
+            "opened live thread remains in custody"
+        );
 
         guard
             .discard_with_result()

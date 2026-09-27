@@ -271,8 +271,8 @@ mod token_budget;
 pub(crate) mod turn;
 pub(crate) mod turn_context;
 mod turn_input;
-mod turn_work;
 mod turn_suspension;
+mod turn_work;
 mod world_state;
 use self::code_mode_warning::unsupported_code_mode_warning;
 #[cfg(test)]
@@ -1111,9 +1111,12 @@ impl Session {
         let mut termination = session_loop_termination_from_handle(session_loop_handle);
         // Publish the join-only fallback before this loop can admit mailbox
         // work. It retains no submission sender or session-cleanup owner.
-        session.services.thread_extension_data.insert(
-            turn_work::SessionLoopWorkReceipt(termination.completion.clone()),
-        );
+        session
+            .services
+            .thread_extension_data
+            .insert(turn_work::SessionLoopWorkReceipt(
+                termination.completion.clone(),
+            ));
         termination.cleanup_owner = Some(cleanup_owner);
         let io = SessionIo {
             tx_sub,
@@ -4778,7 +4781,8 @@ impl Session {
             Ok(work) => Ok(codex_mcp::McpAttemptAccess::from_work(work.as_deref())),
             Err(_) => Err(codex_mcp::McpAttemptRefused),
         };
-        self.record_context_updates_with_authority(step_context, access).await
+        self.record_context_updates_with_authority(step_context, access)
+            .await
     }
 
     pub(crate) async fn record_context_updates_with_authority(
@@ -4795,12 +4799,17 @@ impl Session {
         let turn_context_changed = reference_context_item.as_ref() != Some(&turn_context_item);
         let should_inject_full_context = reference_context_item.is_none();
         let world_state = Arc::new(
-            self.build_world_state_for_step_with_authority(step_context, access).await?
+            self.build_world_state_for_step_with_authority(step_context, access)
+                .await?,
         );
         // Full initial context resets the baseline; later turns persist only its changes.
         let (mut context_items, world_state_item) = if should_inject_full_context {
             let context_items = self
-                .build_initial_context_with_world_state_and_authority(step_context, world_state.as_ref(), access)
+                .build_initial_context_with_world_state_and_authority(
+                    step_context,
+                    world_state.as_ref(),
+                    access,
+                )
                 .await;
             let snapshot = world_state.snapshot();
             self.state

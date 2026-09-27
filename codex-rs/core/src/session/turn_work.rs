@@ -62,10 +62,15 @@ impl Session {
     }
 
     pub(crate) fn turn_work_termination(&self) -> BoxFuture<'static, ()> {
-        let receipt = self.services.thread_extension_data.get::<SessionLoopWorkReceipt>();
+        let receipt = self
+            .services
+            .thread_extension_data
+            .get::<SessionLoopWorkReceipt>();
         Box::pin(async move {
             match receipt {
-                Some(receipt) => { receipt.0.clone().await; }
+                Some(receipt) => {
+                    receipt.0.clone().await;
+                }
                 // A session constructed without a submission loop has no
                 // positive termination evidence. Never invent a clean fallback.
                 None => std::future::pending().await,

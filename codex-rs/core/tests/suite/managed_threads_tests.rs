@@ -103,7 +103,8 @@ async fn dropping_startup_before_receiving_the_agent_finishes_cleanup() -> anyho
     }
     let server = responses::start_mock_server().await;
     let fixture = test_codex().build_with_auto_env(&server).await?;
-    let mut options = StartThreadOptions::new(fixture.config.clone(), /*control_endpoint*/ None);
+    let mut options =
+        StartThreadOptions::new(fixture.config.clone(), /*control_endpoint*/ None);
     let thread_id = fixture.thread_manager.reserve_thread_id();
     options.reserved_thread_id = Some(thread_id);
     options.environments = Some(fixture.codex.environment_selections().await);
@@ -149,7 +150,8 @@ async fn owner_cancellation_closes_agent_and_preserves_history_and_parent() -> a
 
     let server = responses::start_mock_server().await;
     let fixture = test_codex().build_with_auto_env(&server).await?;
-    let mut options = StartThreadOptions::new(fixture.config.clone(), /*control_endpoint*/ None);
+    let mut options =
+        StartThreadOptions::new(fixture.config.clone(), /*control_endpoint*/ None);
     options.environments = Some(fixture.codex.environment_selections().await);
     options
         .thread_extension_init
@@ -161,7 +163,8 @@ async fn owner_cancellation_closes_agent_and_preserves_history_and_parent() -> a
         .start_thread_until(options, cancelled.clone().cancelled_owned(), &tasks)
         .await?;
     // A failed startup with the same ID must leave the original agent's writer intact.
-    let mut duplicate = StartThreadOptions::new(fixture.config.clone(), /*control_endpoint*/ None);
+    let mut duplicate =
+        StartThreadOptions::new(fixture.config.clone(), /*control_endpoint*/ None);
     duplicate.reserved_thread_id = Some(agent.thread_id);
     duplicate.environments = Some(fixture.codex.environment_selections().await);
     duplicate
@@ -265,7 +268,8 @@ async fn startup_allowlist_controls_advertising_and_execution(
         })
         .build_with_auto_env(&server)
         .await?;
-    let mut options = StartThreadOptions::new(fixture.config.clone(), /*control_endpoint*/ None);
+    let mut options =
+        StartThreadOptions::new(fixture.config.clone(), /*control_endpoint*/ None);
     options.environments = Some(fixture.codex.environment_selections().await);
     options
         .thread_extension_init
@@ -378,7 +382,8 @@ async fn startup_tool_policy_controls_additional_permission_parameters(
         })
         .build_with_auto_env(&server)
         .await?;
-    let mut options = StartThreadOptions::new(fixture.config.clone(), /*control_endpoint*/ None);
+    let mut options =
+        StartThreadOptions::new(fixture.config.clone(), /*control_endpoint*/ None);
     options.environments = Some(fixture.codex.environment_selections().await);
     options
         .thread_extension_init

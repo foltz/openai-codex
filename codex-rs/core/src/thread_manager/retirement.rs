@@ -112,11 +112,16 @@ impl ThreadConstructions {
         loop {
             let changed = self.activity.notified();
             let pending = {
-                let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if state.closed {
                     return;
                 }
-                state.constructions.iter()
+                state
+                    .constructions
+                    .iter()
                     .filter(|entry| entry.account_dependent && entry.completion.peek().is_none())
                     .map(|entry| entry.completion.clone())
                     .collect::<Vec<_>>()
@@ -140,9 +145,13 @@ impl ThreadConstructions {
             };
             // Reset concerns current resources, not the historical panic bit
             // retained for the permanent manager-retirement report.
-            let finished = state.constructions.iter()
+            let finished = state
+                .constructions
+                .iter()
                 .all(|entry| entry.completion.peek() == Some(&ConstructionOutcome::Returned));
-            let startup = state.constructions.iter()
+            let startup = state
+                .constructions
+                .iter()
                 .filter(|entry| entry.completion.peek().is_some())
                 .map(|entry| Arc::clone(&entry.startup))
                 .collect::<Vec<_>>();
@@ -152,8 +161,11 @@ impl ThreadConstructions {
             // Like reusable bulk thread shutdown, bound this observation of
             // retained legacy cleanup. Do not latch an account-reset deadline
             // into the separate permanent-manager retirement transaction.
-            tokio::time::timeout_at(deadline, startup.shutdown_legacy()).await.unwrap_or(false)
-        })).await;
+            tokio::time::timeout_at(deadline, startup.shutdown_legacy())
+                .await
+                .unwrap_or(false)
+        }))
+        .await;
         finished && results.into_iter().all(|complete| complete)
     }
 

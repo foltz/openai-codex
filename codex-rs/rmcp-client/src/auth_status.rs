@@ -347,16 +347,19 @@ mod tests {
         // latency. Production correctly charges construction to LOCAL's budget;
         // prime both redirect-policy pools before starting that unchanged budget.
         for redirect_policy in [HttpRedirectPolicy::Follow, HttpRedirectPolicy::Stop] {
-            let response = http_client.http_request(HttpRequestParams {
-                method: "GET".to_owned(),
-                url: format!("{origin}/client-warmup"),
-                headers: Vec::new(),
-                body: None,
-                timeout_ms: None,
-                redirect_policy,
-                request_id: "discovery-fixture-warmup".to_owned(),
-                stream_response: false,
-            }).await.expect("warm discovery client through the local fixture");
+            let response = http_client
+                .http_request(HttpRequestParams {
+                    method: "GET".to_owned(),
+                    url: format!("{origin}/client-warmup"),
+                    headers: Vec::new(),
+                    body: None,
+                    timeout_ms: None,
+                    redirect_policy,
+                    request_id: "discovery-fixture-warmup".to_owned(),
+                    stream_response: false,
+                })
+                .await
+                .expect("warm discovery client through the local fixture");
             assert_eq!(response.status, StatusCode::NOT_FOUND.as_u16());
         }
     }

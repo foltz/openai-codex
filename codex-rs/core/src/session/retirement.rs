@@ -101,14 +101,16 @@ impl SessionCleanupOwner {
     }
 
     pub(crate) async fn observe(&self, session: Arc<Session>) -> CleanupExecution {
-        self.observe_sequence(session, CleanupSequence::Ordinary).await
+        self.observe_sequence(session, CleanupSequence::Ordinary)
+            .await
     }
 
     /// Retain suspension's stop/flush/close sequence in the same owner used by
     /// loop termination and population retirement. Ordinary cleanup may observe
     /// this receipt, but cannot substitute for suspension's stricter sequence.
     pub(super) async fn observe_suspension(&self, session: Arc<Session>) -> CleanupExecution {
-        self.observe_sequence(session, CleanupSequence::Suspension).await
+        self.observe_sequence(session, CleanupSequence::Suspension)
+            .await
     }
 
     async fn observe_sequence(
@@ -182,10 +184,7 @@ impl SessionCleanupOwner {
                             }
                         }
                     };
-                    match AssertUnwindSafe(cleanup)
-                        .catch_unwind()
-                        .await
-                    {
+                    match AssertUnwindSafe(cleanup).catch_unwind().await {
                         Ok(result) => result,
                         Err(_) => CleanupExecution::Panicked,
                     }

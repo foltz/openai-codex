@@ -24,12 +24,16 @@ pub(crate) struct McpBindingClients {
 }
 
 impl McpBindingClients {
-    pub(crate) fn new(clients: HashMap<String, (Arc<ManagedClient>, crate::McpAttemptRequirement)>) -> Self {
+    pub(crate) fn new(
+        clients: HashMap<String, (Arc<ManagedClient>, crate::McpAttemptRequirement)>,
+    ) -> Self {
         Self { clients }
     }
 
     pub(crate) fn client(&self, server: &str) -> Option<Arc<ManagedClient>> {
-        self.clients.get(server).map(|(client, _)| Arc::clone(client))
+        self.clients
+            .get(server)
+            .map(|(client, _)| Arc::clone(client))
     }
 
     pub(crate) async fn list_resources(
@@ -127,7 +131,9 @@ impl McpBindingClients {
             let client = Arc::clone(&managed.client);
             let timeout = managed.tool_timeout;
             let Ok(work) = requirement.derive(access) else {
-                warn!("MCP resource template listing account work is unavailable for '{server_name}'");
+                warn!(
+                    "MCP resource template listing account work is unavailable for '{server_name}'"
+                );
                 continue;
             };
             join_set.spawn(async move {

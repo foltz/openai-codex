@@ -545,10 +545,6 @@ impl StdioServerProcessHandle {
         }
     }
 
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "the async attempt lock serializes bounded termination observations, not shared runtime state"
-    )]
     pub(crate) async fn terminate(&self) -> io::Result<()> {
         self.terminate_until(tokio::time::Instant::now() + PROCESS_RETIREMENT_TIMEOUT)
             .await

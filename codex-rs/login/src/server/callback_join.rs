@@ -38,6 +38,10 @@ impl CallbackJoin {
         Self(Mutex::new(State::Running(handle)))
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "exclusive join polling retains custody across observer cancellation; the callback never takes this lock"
+    )]
     pub(super) async fn take_result(&self) -> io::Result<LoginCallbackResult> {
         let mut state = self.0.lock().await;
         Self::observe(&mut state).await;
@@ -49,6 +53,10 @@ impl CallbackJoin {
             .unwrap_or_else(|| Err(io::Error::other("login callback result already consumed")))
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "exclusive join polling retains custody across observer cancellation; the callback never takes this lock"
+    )]
     pub(super) async fn wait(&self) -> CallbackOutcome {
         let mut state = self.0.lock().await;
         Self::observe(&mut state).await;

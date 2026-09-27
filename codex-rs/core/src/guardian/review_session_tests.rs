@@ -1066,6 +1066,7 @@ async fn prewarm_test_session(
     let context = setup::prepare_prewarm(
         Arc::clone(&params.parent_session),
         Arc::clone(params.parent_context.turn()),
+        /*account_work*/ None,
     )
     .await
     .unwrap();

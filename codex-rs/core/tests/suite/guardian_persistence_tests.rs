@@ -292,6 +292,50 @@ async fn guardian_saves_each_completed_review_before_releasing_its_action() -> a
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn guardian_stop_joins_retained_acquisition_without_resuming_constructor() -> anyhow::Result<()> {
+    use codex_extension_api::HostOperationWork;
+    use codex_extension_api::TurnStartAdmission;
+    use codex_extension_api::TurnWorkRefused;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    #[derive(Debug, Default)]
+    struct Counts {
+        active: AtomicUsize,
+        derived: AtomicUsize,
+    }
+    #[derive(Debug)]
+    struct Work(Arc<Counts>);
+    impl Drop for Work {
+        fn drop(&mut self) {
+            self.0.active.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    impl HostOperationWork for Work {
+        fn derive_operation(&self) -> Result<Box<dyn HostOperationWork>, TurnWorkRefused> {
+            self.0.active.fetch_add(1, Ordering::SeqCst);
+            self.0.derived.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(Self(Arc::clone(&self.0))))
+        }
+        fn derive_turn_work(
+            &self,
+            _: &codex_extension_api::ExtensionData,
+            _: codex_extension_api::ExtensionFuture<'static, ()>,
+        ) -> Result<Box<dyn codex_protocol::host_turn_work::HostTurnWork>, TurnWorkRefused> {
+            Err(TurnWorkRefused::Unavailable)
+        }
+    }
+    #[derive(Debug)]
+    struct Admission(Arc<Counts>);
+    impl TurnStartAdmission for Admission {
+        fn admit_turn_start(&self) -> Option<Box<dyn Send>> {
+            Some(Box::new(()))
+        }
+        fn admit_operation_work(&self) -> Result<Option<Box<dyn HostOperationWork>>, TurnWorkRefused> {
+            self.0.active.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(Box::new(Work(Arc::clone(&self.0)))))
+        }
+    }
+
     let server = responses::start_mock_server().await;
     let (saves, _pending_saves) = mpsc::unbounded_channel();
     let gate = Arc::new(ReviewerCreationGate {
@@ -301,19 +345,29 @@ async fn guardian_stop_joins_retained_acquisition_without_resuming_constructor()
         inner: InMemoryThreadStore::default(), reviewer: Mutex::new(ReviewerSaves::default()),
         saves, creation_gate: Some(Arc::clone(&gate)),
     });
+    let counts = Arc::new(Counts::default());
+    let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
+    extensions.turn_start_admission(Arc::new(Admission(Arc::clone(&counts))));
     let test = test_codex().with_thread_store(store.clone())
+        .with_extensions(Arc::new(extensions.build()))
         .with_history_mode(ThreadHistoryMode::Legacy)
         .with_config(|config| {
             config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
             config.approvals_reviewer = ApprovalsReviewer::AutoReview;
         }).build_with_auto_env(&server).await?;
     timeout(Duration::from_secs(20), gate.entered.notified()).await.expect("reviewer acquisition entered");
+    // Guardian's background prewarm must transfer authority through the managed
+    // spawn into both the retained constructor and its initial MCP publication.
+    // Neither the parent constructor nor auth-only prewarm derives this work.
+    assert!(counts.derived.load(Ordering::SeqCst) >= 2);
+    assert!(counts.active.load(Ordering::SeqCst) >= 2);
     let mut shutdown = Box::pin(test.codex.shutdown_and_wait());
     // Cancellation may release the constructor, but must not abandon an
     // acquisition that could already own a writer. Parent join stays pending.
     assert!(timeout(Duration::from_millis(300), shutdown.as_mut()).await.is_err());
     gate.release.add_permits(1);
     timeout(Duration::from_secs(20), shutdown).await??;
+    assert_eq!(counts.active.load(Ordering::SeqCst), 0);
     assert_eq!(store.reviewer.lock().await.operations, vec!["create", "discard"]);
     let report = test.thread_manager.begin_shutdown(tokio::time::Instant::now() + Duration::from_secs(10))
         .expect("begin manager retirement").wait().await.expect("drain constructor");

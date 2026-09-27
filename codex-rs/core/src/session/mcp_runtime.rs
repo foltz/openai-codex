@@ -388,7 +388,13 @@ impl Session {
             desired.environments.ready_environment_handles(),
         );
         McpRuntimeInput {
-            attempt_requirement: codex_mcp::McpAttemptRequirement::Ungated,
+            attempt_requirement: if self.services.host_admission.as_ref()
+                .is_some_and(|host| host.requires_account_work())
+            {
+                codex_mcp::McpAttemptRequirement::Required
+            } else {
+                codex_mcp::McpAttemptRequirement::Ungated
+            },
             startup_work: None,
             startup_policy: if matches!(desired.session_source, SessionSource::SubAgent(_)) {
                 McpStartupPolicy::LazyWhenCached

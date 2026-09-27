@@ -10,6 +10,14 @@
 pub trait TurnStartAdmission: std::fmt::Debug + Send + Sync {
     fn admit_turn_start(&self) -> Option<Box<dyn Send>>;
 
+    /// Whether this host requires explicit account custody for MCP startup.
+    /// Shutdown-only admission hosts remain ungated. Account-gated hosts must
+    /// implement operation admission/derivation and return work or refuse;
+    /// missing request scope may return no work, but cannot authorize startup.
+    fn requires_account_work(&self) -> bool {
+        false
+    }
+
     /// Acquire fresh admission for a finite background operation without a
     /// turn-registry entry or an ambient request-scope lookup. A caller must
     /// move the returned custody into the actual operation.

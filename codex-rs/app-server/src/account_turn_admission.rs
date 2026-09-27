@@ -71,6 +71,10 @@ impl AccountTurnAdmission {
 }
 
 impl TurnStartAdmission for AccountTurnAdmission {
+    fn requires_account_work(&self) -> bool {
+        true
+    }
+
     fn admit_turn_start(&self) -> Option<Box<dyn Send>> {
         self.shutdown.admit_turn_start()
     }

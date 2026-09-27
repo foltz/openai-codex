@@ -9447,8 +9447,14 @@ async fn mcp_policy_changes_schedule_runtime_refresh() {
 
 #[tokio::test]
 async fn mcp_refresh_detects_shared_auth_manager_changes() {
-    let (session, _turn_context) = make_session_and_context().await;
-    let session = Arc::new(session);
+    let codex_home = tempfile::tempdir().expect("create temp dir");
+    let (session, _turn_context, _rx_event) = make_session_and_context_with_auth_config_home_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        codex_home.path(),
+        |_| {},
+    )
+    .await;
 
     assert_eq!(
         session.services.plugins_manager.auth_mode(),

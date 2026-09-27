@@ -18,6 +18,7 @@ use crate::catalog::SkillAuthority;
 use crate::catalog::SkillCatalog;
 use crate::catalog::SkillCatalogEntry;
 use crate::catalog::SkillPackageId;
+use crate::catalog::SkillProviderError;
 use crate::catalog::SkillProviderResult;
 use crate::catalog::SkillReadResult;
 use crate::catalog::SkillResourceId;
@@ -199,25 +200,37 @@ impl SkillsThreadState {
         &self,
         providers: &SkillProviders,
         query: SkillListQuery,
+        mcp_access: Result<codex_mcp::McpAttemptAccess<'_>, codex_mcp::McpAttemptRefused>,
     ) -> SkillCatalog {
         if !query.include_orchestrator_skills {
             return SkillCatalog::default();
         }
 
         let cache = self.orchestrator_cache(query.mcp_resources.as_deref());
+        // Admission refusal is invocation-specific, not a catalog failure. Keep
+        // ordinary failures cached as before, but let a later admitted call retry.
         cache
             .catalog
-            .get_or_init(|| async {
-                providers
-                    .list_orchestrator_for_turn(query)
+            .get_or_try_init(|| async {
+                let mcp_access =
+                    mcp_access.map_err(|_| SkillProviderError::admission_refused())?;
+                match providers
+                    .list_orchestrator_for_turn(query, Ok(mcp_access))
                     .await
-                    .unwrap_or_else(|err| SkillCatalog {
+                {
+                    Err(err) if err.admission_refused => Err(err),
+                    result => Ok(result.unwrap_or_else(|err| SkillCatalog {
                         warnings: vec![err.message],
                         ..Default::default()
-                    })
+                    })),
+                }
             })
             .await
-            .clone()
+            .cloned()
+            .unwrap_or_else(|err| SkillCatalog {
+                warnings: vec![err.message],
+                ..Default::default()
+            })
     }
 
     pub(crate) async fn read_skill(

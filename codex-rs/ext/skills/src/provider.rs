@@ -12,6 +12,8 @@ use codex_exec_server::ExecutorCapabilityDiscoverySnapshot;
 use codex_exec_server::FileSystemSandboxContext;
 use codex_exec_server::ResolvedSelectedCapabilityRoot;
 use codex_mcp::McpResourceClient;
+use codex_mcp::McpAttemptAccess;
+use codex_mcp::McpAttemptRefused;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 
 use crate::catalog::SkillAuthority;
@@ -45,6 +47,7 @@ pub struct SkillListQuery {
 
 #[derive(Clone, Debug)]
 pub struct SkillReadRequest<'a> {
+    pub mcp_access: Result<McpAttemptAccess<'a>, McpAttemptRefused>,
     // TODO(anp): Replace the marker with callback-scoped environment access.
     pub _lifetime: PhantomData<&'a ()>,
     pub authority: SkillAuthority,
@@ -72,7 +75,11 @@ pub type SkillProviderFuture<'a, T> =
 /// provider must be read or searched through the same provider/authority rather
 /// than converted into an ambient local path.
 pub trait SkillProvider: Send + Sync {
-    fn list(&self, query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog>;
+    fn list<'a>(
+        &'a self,
+        query: SkillListQuery,
+        mcp_access: Result<McpAttemptAccess<'a>, McpAttemptRefused>,
+    ) -> SkillProviderFuture<'a, SkillCatalog>;
 
     fn read<'a>(
         &'a self,

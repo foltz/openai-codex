@@ -432,6 +432,7 @@ fn tool_call(tool_name: ToolName, arguments: serde_json::Value) -> ToolCall<'sta
         source: ToolCallSource::Direct,
         conversation_history: ConversationHistory::default(),
         turn_item_emitter: Arc::new(NoopTurnItemEmitter),
+        mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
         environments: Vec::new(),
         payload: ToolPayload::Function {
             arguments: arguments.to_string(),

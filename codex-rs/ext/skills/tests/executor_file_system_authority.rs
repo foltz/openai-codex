@@ -321,6 +321,7 @@ async fn windows_executor_skill_read_requires_a_requested_sandbox() {
     );
     let error = provider
         .read(SkillReadRequest {
+            mcp_access: Ok(codex_mcp::McpAttemptAccess::Unscoped),
             _lifetime: PhantomData,
             authority: SkillAuthority::new(SkillSourceKind::Executor, "windows-root"),
             package: SkillPackageId("skill://windows-root/C:/skill".into()),
@@ -340,6 +341,7 @@ async fn windows_executor_skill_read_requires_a_requested_sandbox() {
     sandbox.windows_sandbox_selection = WindowsSandboxSelection::Mxc;
     let error = provider
         .read(SkillReadRequest {
+            mcp_access: Ok(codex_mcp::McpAttemptAccess::Unscoped),
             _lifetime: PhantomData,
             authority: SkillAuthority::new(SkillSourceKind::Executor, "windows-root"),
             package: SkillPackageId("skill://windows-root/C:/skill".into()),
@@ -397,7 +399,7 @@ async fn selected_root_id_distinguishes_identical_executor_paths() {
             include_orchestrator_skills: false,
             mcp_resources: None,
             executor_capability_discovery: None,
-        })
+        }, Ok(codex_mcp::McpAttemptAccess::Unscoped))
         .await
         .expect("list executor skills");
 
@@ -487,7 +489,7 @@ async fn executor_discovery_preserves_posix_and_windows_locator_alias_roots() {
                 include_orchestrator_skills: false,
                 mcp_resources: None,
                 executor_capability_discovery: Some(discovery),
-            })
+            }, Ok(codex_mcp::McpAttemptAccess::Unscoped))
             .await
             .expect("list executor skills");
         let resource = format!("{alias_root}/skill/SKILL.md");
@@ -607,14 +609,14 @@ async fn executor_discovery_routes_produce_equivalent_catalog_metadata() {
     };
 
     let direct = provider
-        .list(query(None))
+        .list(query(None), Ok(codex_mcp::McpAttemptAccess::Unscoped))
         .await
         .expect("list directly discovered executor skills");
     let discovery = ExecutorCapabilityDiscoveryCache::new(manager)
         .snapshot(&executor_roots, &Default::default())
         .await;
     let bundled = provider
-        .list(query(Some(discovery.clone())))
+        .list(query(Some(discovery.clone())), Ok(codex_mcp::McpAttemptAccess::Unscoped))
         .await
         .expect("list bundled executor skills");
 
@@ -689,7 +691,7 @@ async fn executor_discovery_routes_produce_equivalent_catalog_metadata() {
         }
         for discovery in [None, Some(discovery.clone())] {
             let actual = configured
-                .list(query(discovery))
+                .list(query(discovery), Ok(codex_mcp::McpAttemptAccess::Unscoped))
                 .await
                 .expect("list configured executor skills");
             assert_eq!(comparable_entries(&actual), comparable_entries(&expected));
@@ -756,7 +758,7 @@ async fn pre_discovered_executor_catalog_snapshot() {
             include_orchestrator_skills: false,
             mcp_resources: None,
             executor_capability_discovery: Some(executor_capability_discovery),
-        })
+        }, Ok(codex_mcp::McpAttemptAccess::Unscoped))
         .await
         .expect("list pre-discovered executor skills");
 
@@ -873,7 +875,7 @@ async fn direct_executor_discovery_preserves_hidden_nested_and_probed_metadata()
             include_orchestrator_skills: false,
             mcp_resources: None,
             executor_capability_discovery: None,
-        })
+        }, Ok(codex_mcp::McpAttemptAccess::Unscoped))
         .await
         .expect("list directly discovered executor skills");
 
@@ -933,13 +935,14 @@ async fn high_level_discovery_reuses_materialized_skill_contents_for_reads() {
             include_orchestrator_skills: false,
             mcp_resources: None,
             executor_capability_discovery: Some(executor_capability_discovery),
-        })
+        }, Ok(codex_mcp::McpAttemptAccess::Unscoped))
         .await
         .expect("list executor skills");
     let [entry] = catalog.entries.as_slice() else {
         panic!("expected exactly one skill");
     };
     let request = SkillReadRequest {
+        mcp_access: Ok(codex_mcp::McpAttemptAccess::Unscoped),
         _lifetime: PhantomData,
         authority: entry.authority.clone(),
         package: entry.id.clone(),

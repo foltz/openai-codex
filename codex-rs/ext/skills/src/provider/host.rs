@@ -34,7 +34,11 @@ impl HostSkillProvider {
 }
 
 impl SkillProvider for HostSkillProvider {
-    fn list(&self, query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog> {
+    fn list<'a>(
+        &'a self,
+        query: SkillListQuery,
+        _mcp_access: Result<codex_mcp::McpAttemptAccess<'a>, codex_mcp::McpAttemptRefused>,
+    ) -> SkillProviderFuture<'a, SkillCatalog> {
         Box::pin(async move {
             let Some(host_snapshot) = query.host_snapshot else {
                 return Err(SkillProviderError::new(

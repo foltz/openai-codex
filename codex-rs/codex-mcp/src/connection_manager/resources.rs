@@ -245,6 +245,10 @@ impl McpConnectionSet {
             .connection
             .client_with_authority(access)
             .await
+            .map_err(|error| match error {
+                crate::rmcp_client::StartupOutcomeError::Refused(refused) => anyhow::Error::new(refused),
+                error => anyhow::Error::new(error),
+            })
             .context("failed to get client")?;
         Ok((client, view.tool_timeout))
     }

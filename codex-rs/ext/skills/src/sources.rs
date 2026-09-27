@@ -1,5 +1,7 @@
 use std::fmt;
 use std::sync::Arc;
+use codex_mcp::McpAttemptAccess;
+use codex_mcp::McpAttemptRefused;
 
 use crate::catalog::SkillCatalog;
 use crate::catalog::SkillProviderError;
@@ -114,13 +116,14 @@ impl SkillProviders {
     }
 
     pub(crate) async fn list_for_turn(&self, query: SkillListQuery) -> SkillCatalog {
-        self.list_matching(&query, |source| source.should_list(&query))
+        self.list_matching(&query, |source| source.should_list(&query), Ok(McpAttemptAccess::Unscoped))
             .await
     }
 
     pub(crate) async fn list_orchestrator_for_turn(
         &self,
         query: SkillListQuery,
+        mcp_access: Result<McpAttemptAccess<'_>, McpAttemptRefused>,
     ) -> SkillProviderResult<SkillCatalog> {
         let mut catalog = SkillCatalog::default();
 
@@ -129,11 +132,12 @@ impl SkillProviders {
             .iter()
             .filter(|source| source.kind == SkillSourceKind::Orchestrator)
         {
-            let source_catalog = source.provider.list(query.clone()).await.map_err(|err| {
-                SkillProviderError::new(format!(
+            let source_catalog = source.provider.list(query.clone(), mcp_access).await.map_err(|mut err| {
+                err.message = format!(
                     "{} skills unavailable: {}",
                     source.label, err.message
-                ))
+                );
+                err
             })?;
             catalog.extend(source_catalog);
         }
@@ -142,12 +146,12 @@ impl SkillProviders {
     }
 
     pub(crate) async fn list_executor_for_turn(&self, query: SkillListQuery) -> SkillCatalog {
-        self.list_matching(&query, |source| source.kind == SkillSourceKind::Executor)
+        self.list_matching(&query, |source| source.kind == SkillSourceKind::Executor, Ok(McpAttemptAccess::Unscoped))
             .await
     }
 
     pub(crate) async fn list_host_for_turn(&self, query: SkillListQuery) -> SkillCatalog {
-        self.list_matching(&query, |source| source.kind == SkillSourceKind::Host)
+        self.list_matching(&query, |source| source.kind == SkillSourceKind::Host, Ok(McpAttemptAccess::Unscoped))
             .await
     }
 
@@ -155,13 +159,14 @@ impl SkillProviders {
         &self,
         query: &SkillListQuery,
         should_list: impl Fn(&SkillProviderSource) -> bool,
+        mcp_access: Result<McpAttemptAccess<'_>, McpAttemptRefused>,
     ) -> SkillCatalog {
         let mut catalog = SkillCatalog::default();
 
         for source in self.sources.iter().filter(|source| should_list(source)) {
             extend_catalog(
                 &mut catalog,
-                source.provider.list(query.clone()).await,
+                source.provider.list(query.clone(), mcp_access).await,
                 source.label.as_str(),
             );
         }

@@ -204,7 +204,12 @@ struct SkillToolContext {
 }
 
 impl SkillToolContext {
-    async fn catalog(&self, turn_id: &str, authority: SkillToolAuthoritySelector) -> SkillCatalog {
+    async fn catalog(
+        &self,
+        turn_id: &str,
+        authority: SkillToolAuthoritySelector,
+        mcp_access: Result<codex_mcp::McpAttemptAccess<'_>, codex_mcp::McpAttemptRefused>,
+    ) -> SkillCatalog {
         match authority {
             SkillToolAuthoritySelector::Orchestrator => {
                 if !self.orchestrator_available {
@@ -224,6 +229,7 @@ impl SkillToolContext {
                             mcp_resources: self.mcp_resources.clone(),
                             executor_capability_discovery: None,
                         },
+                        mcp_access,
                     )
                     .await
             }

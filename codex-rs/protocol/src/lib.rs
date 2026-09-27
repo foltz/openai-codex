@@ -32,6 +32,7 @@ pub mod local_media;
 pub mod mcp;
 pub mod mcp_approval_meta;
 pub mod mcp_policy;
+pub mod mcp_work;
 pub mod memory_citation;
 mod memory_version;
 pub use memory_version::MemoryVersion;

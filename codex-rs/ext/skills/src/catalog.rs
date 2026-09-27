@@ -333,12 +333,21 @@ pub struct SkillSearchMatch {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SkillProviderError {
     pub message: String,
+    pub(crate) admission_refused: bool,
 }
 
 impl SkillProviderError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            admission_refused: false,
+        }
+    }
+
+    pub(crate) fn admission_refused() -> Self {
+        Self {
+            message: codex_mcp::McpAttemptRefused.to_string(),
+            admission_refused: true,
         }
     }
 }

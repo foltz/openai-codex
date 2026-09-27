@@ -7,8 +7,12 @@ use super::*;
 struct FailedReads(StaticSkillProvider);
 
 impl SkillProvider for FailedReads {
-    fn list(&self, query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog> {
-        self.0.list(query)
+    fn list<'a>(
+        &'a self,
+        query: SkillListQuery,
+        mcp_access: Result<codex_mcp::McpAttemptAccess<'a>, codex_mcp::McpAttemptRefused>,
+    ) -> SkillProviderFuture<'a, SkillCatalog> {
+        self.0.list(query, mcp_access)
     }
 
     fn read<'a>(

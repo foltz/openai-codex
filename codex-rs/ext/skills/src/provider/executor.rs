@@ -84,7 +84,11 @@ pub(crate) fn attribute_executor_plugins(
 }
 
 impl SkillProvider for ExecutorSkillProvider {
-    fn list(&self, query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog> {
+    fn list<'a>(
+        &'a self,
+        query: SkillListQuery,
+        _mcp_access: Result<codex_mcp::McpAttemptAccess<'a>, codex_mcp::McpAttemptRefused>,
+    ) -> SkillProviderFuture<'a, SkillCatalog> {
         Box::pin(async move {
             if let Some(discovery) = query.executor_capability_discovery {
                 return Ok(self.list_from_discovery(&discovery));

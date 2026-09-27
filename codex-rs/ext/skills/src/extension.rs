@@ -588,7 +588,7 @@ impl<C> SkillsExtension<C> {
         let mut catalog = self.providers.list_for_turn(query).await;
         if include_orchestrator_skills {
             let orchestrator_catalog = thread_state
-                .orchestrator_catalog_snapshot(&self.providers, orchestrator_query)
+                .orchestrator_catalog_snapshot(&self.providers, orchestrator_query, Ok(codex_mcp::McpAttemptAccess::Unscoped))
                 .await;
             catalog.extend(orchestrator_catalog);
         }
@@ -607,6 +607,7 @@ impl<C> SkillsExtension<C> {
             .read_skill(
                 &self.providers,
                 SkillReadRequest {
+                    mcp_access: Ok(codex_mcp::McpAttemptAccess::Unscoped),
                     _lifetime: PhantomData,
                     authority: entry.authority.clone(),
                     package: entry.id.clone(),

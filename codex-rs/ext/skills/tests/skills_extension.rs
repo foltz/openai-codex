@@ -1653,6 +1653,7 @@ async fn skills_list_only_returns_model_visible_bounded_metadata() -> TestResult
         source: ToolCallSource::Direct,
         conversation_history: ConversationHistory::default(),
         turn_item_emitter: Arc::new(NoopTurnItemEmitter),
+        mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
         environments: Vec::new(),
         payload: payload.clone(),
     };
@@ -1813,6 +1814,7 @@ async fn skills_list_only_returns_model_visible_bounded_metadata() -> TestResult
             source: ToolCallSource::Direct,
             conversation_history: ConversationHistory::default(),
             turn_item_emitter: Arc::new(NoopTurnItemEmitter),
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             environments: Vec::new(),
             payload: insufficient_budget_payload,
         })
@@ -1877,6 +1879,33 @@ async fn orchestrator_catalog_snapshot_caches_failure() -> TestResult {
     assert!(initial_fragments.is_empty());
     assert!(event_rx.try_recv().is_err());
 
+    let tools = registry.tool_contributors()[0].tools(&session_store, &thread_store);
+    let list_tool = tools
+        .iter()
+        .find(|tool| tool.tool_name().name == "list")
+        .ok_or("skills.list tool should be registered")?;
+    let mut call = ToolCall {
+        turn_id: "turn-1".to_string(),
+        call_id: "unavailable-skills".to_string(),
+        tool_name: list_tool.tool_name(),
+        model: "gpt-test".to_string(),
+        codex_turn_metadata: None,
+        truncation_policy: TruncationPolicy::Bytes(64),
+        source: ToolCallSource::Direct,
+        conversation_history: ConversationHistory::default(),
+        turn_item_emitter: Arc::new(NoopTurnItemEmitter),
+        mcp_access: Err(codex_protocol::mcp_work::McpAttemptRefused),
+        environments: Vec::new(),
+        payload: ToolPayload::Function {
+            arguments: serde_json::json!({"authority": {"kind": "orchestrator"}})
+                .to_string(),
+        },
+    };
+    // A refused invocation neither calls the provider nor poisons its catalog.
+    assert!(list_tool.handle(call.clone()).await.is_err());
+    assert_eq!(0, list_calls.load(Ordering::Relaxed));
+    call.mcp_access = Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped);
+
     for turn_id in ["turn-1", "turn-2"] {
         let fragments = registry.turn_input_contributors()[0]
             .contribute(
@@ -1901,29 +1930,9 @@ async fn orchestrator_catalog_snapshot_caches_failure() -> TestResult {
         assert_eq!(warning.message, PROVIDER_WARNING);
     }
 
-    let tools = registry.tool_contributors()[0].tools(&session_store, &thread_store);
-    let list_tool = tools
-        .iter()
-        .find(|tool| tool.tool_name().name == "list")
-        .ok_or("skills.list tool should be registered")?;
     assert_eq!(
         list_tool
-            .handle(ToolCall {
-                turn_id: "turn-1".to_string(),
-                call_id: "unavailable-skills".to_string(),
-                tool_name: list_tool.tool_name(),
-                model: "gpt-test".to_string(),
-                codex_turn_metadata: None,
-                truncation_policy: TruncationPolicy::Bytes(64),
-                source: ToolCallSource::Direct,
-                conversation_history: ConversationHistory::default(),
-                turn_item_emitter: Arc::new(NoopTurnItemEmitter),
-                environments: Vec::new(),
-                payload: ToolPayload::Function {
-                    arguments: serde_json::json!({"authority": {"kind": "orchestrator"}})
-                        .to_string(),
-                },
-            })
+            .handle(call)
             .await
             .err(),
         Some(FunctionCallError::RespondToModel(
@@ -2585,7 +2594,11 @@ fn expected_catalog_metric_samples(catalog_surface: &str, count: i64) -> Vec<Rec
 }
 
 impl SkillProvider for StaticSkillProvider {
-    fn list(&self, _query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog> {
+    fn list<'a>(
+        &'a self,
+        _query: SkillListQuery,
+        _mcp_access: Result<codex_mcp::McpAttemptAccess<'a>, codex_mcp::McpAttemptRefused>,
+    ) -> SkillProviderFuture<'a, SkillCatalog> {
         let list_call = self
             .list_calls
             .as_ref()

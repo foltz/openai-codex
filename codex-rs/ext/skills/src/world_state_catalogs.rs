@@ -195,7 +195,7 @@ impl<'a> CatalogContext<'a> {
         CatalogContribution {
             catalog: self
                 .thread_state
-                .orchestrator_catalog_snapshot(self.providers, query)
+                .orchestrator_catalog_snapshot(self.providers, query, Ok(codex_mcp::McpAttemptAccess::Unscoped))
                 .await,
             status: CatalogStatus::Enabled,
         }

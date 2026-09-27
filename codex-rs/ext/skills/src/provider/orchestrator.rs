@@ -51,7 +51,11 @@ impl OrchestratorSkillProvider {
 }
 
 impl SkillProvider for OrchestratorSkillProvider {
-    fn list(&self, query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog> {
+    fn list<'a>(
+        &'a self,
+        query: SkillListQuery,
+        mcp_access: Result<codex_mcp::McpAttemptAccess<'a>, codex_mcp::McpAttemptRefused>,
+    ) -> SkillProviderFuture<'a, SkillCatalog> {
         Box::pin(async move {
             let Some(client) = query.mcp_resources else {
                 return Ok(SkillCatalog::default());
@@ -59,6 +63,7 @@ impl SkillProvider for OrchestratorSkillProvider {
             if !client.has_server(CODEX_APPS_MCP_SERVER_NAME).await {
                 return Ok(SkillCatalog::default());
             }
+            let access = mcp_access.map_err(|_| SkillProviderError::admission_refused())?;
 
             let _discovery_timer =
                 codex_otel::start_global_timer(ORCHESTRATOR_SKILL_DISCOVERY_DURATION_METRIC, &[])
@@ -78,11 +83,14 @@ impl SkillProvider for OrchestratorSkillProvider {
             for _ in 0..MAX_RESOURCE_PAGES {
                 let page = match tokio::time::timeout_at(
                     discovery_deadline,
-                    client.list_resources(CODEX_APPS_MCP_SERVER_NAME, cursor.clone()),
+                    client.list_resources_with_authority(CODEX_APPS_MCP_SERVER_NAME, cursor.clone(), access),
                 )
                 .await
                 {
                     Ok(result) => result.map_err(|err| {
+                        if err.is::<codex_mcp::McpAttemptRefused>() {
+                            return SkillProviderError::admission_refused();
+                        }
                         SkillProviderError::new(format!(
                             "failed to list orchestrator skill resources: {err:#}"
                         ))
@@ -198,9 +206,10 @@ impl SkillProvider for OrchestratorSkillProvider {
                     "session MCP resource client is not configured",
                 ));
             };
+            let access = request.mcp_access.map_err(|_| SkillProviderError::admission_refused())?;
             let result = tokio::time::timeout(
                 ORCHESTRATOR_SKILL_READ_TIMEOUT,
-                client.read_resource(CODEX_APPS_MCP_SERVER_NAME, request.resource.as_str()),
+                client.read_resource_with_authority(CODEX_APPS_MCP_SERVER_NAME, request.resource.as_str(), access),
             )
             .await
             .map_err(|_| {

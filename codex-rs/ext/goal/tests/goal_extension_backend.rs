@@ -1930,6 +1930,7 @@ fn tool_call(tool_name: &str, call_id: &str, arguments: serde_json::Value) -> To
         source: ToolCallSource::Direct,
         conversation_history: codex_extension_api::ConversationHistory::default(),
         turn_item_emitter: Arc::new(NoopTurnItemEmitter),
+        mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
         environments: Vec::new(),
         payload: ToolPayload::Function {
             arguments: arguments.to_string(),

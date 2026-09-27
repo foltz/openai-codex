@@ -817,29 +817,54 @@ async fn cleared_and_control_threads_keep_operational_other_idle_unload() -> Res
     let predecessor = start_thread_with_config(&mut client, 2, config.clone()).await?;
     send_clear(&mut client, 3, &predecessor).await?;
     let (response, _) = read_clear_outcome(&mut client, 3).await?;
-    wait_for_thread_closed(&mut client, &predecessor).await?;
+    // Neither subscription retains its runtime. Observe both closures without
+    // assuming an order between the predecessor and its unretained successor.
+    timeout(Duration::from_secs(10), async {
+        let mut pending = std::collections::BTreeSet::from([
+            predecessor.as_str(),
+            response.successor_thread.id.as_str(),
+        ]);
+        while !pending.is_empty() {
+            if let JSONRPCMessage::Notification(notification) = read_jsonrpc_message(&mut client).await?
+                && notification.method == "thread/closed"
+                && let Some(thread_id) = notification.params.as_ref()
+                    .and_then(|params| params.get("threadId"))
+                    .and_then(serde_json::Value::as_str)
+            {
+                pending.remove(thread_id);
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    }).await.context("timed out waiting for cleared and successor thread unload")??;
 
     let control = start_thread_with_config(&mut client, 4, config).await?;
     assert_unsubscribe_status(&mut client, 5, &control, "unsubscribed").await?;
     wait_for_thread_closed(&mut client, &control).await?;
 
-    let payloads = wait_for_hook_payloads(&hook_log, 3).await?;
+    let payloads = wait_for_hook_payloads(&hook_log, 4).await?;
+    let mut observed = payloads.iter().map(|payload| {
+        (
+            payload["session_id"].as_str().unwrap_or_default(),
+            payload["reason"].as_str().unwrap_or_default(),
+        )
+    }).collect::<Vec<_>>();
+    // Preserve the causal order for A, without imposing cross-thread ordering.
     assert_eq!(
-        payloads
-            .iter()
-            .map(|payload| {
-                (
-                    payload["session_id"].as_str().unwrap_or_default(),
-                    payload["reason"].as_str().unwrap_or_default(),
-                )
-            })
-            .collect::<Vec<_>>(),
+        observed.iter().filter(|(id, _)| *id == predecessor).copied().collect::<Vec<_>>(),
         vec![
             (predecessor.as_str(), "clear"),
             (predecessor.as_str(), "other"),
-            (control.as_str(), "other"),
         ]
     );
+    let mut expected = vec![
+        (predecessor.as_str(), "clear"),
+        (predecessor.as_str(), "other"),
+        (response.successor_thread.id.as_str(), "other"),
+        (control.as_str(), "other"),
+    ];
+    observed.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(observed, expected);
     assert_eq!(response.predecessor_thread_id, predecessor);
 
     process.kill().await.context("failed to stop app-server")?;

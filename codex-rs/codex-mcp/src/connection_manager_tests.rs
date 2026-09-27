@@ -3811,9 +3811,24 @@ async fn list_all_tools_blocks_while_client_is_pending_without_cached_tools() {
         },
     );
 
+    let (startup_trigger, startup_receiver) = tokio::sync::watch::channel(false);
+    Arc::get_mut(
+        &mut manager
+            .servers
+            .get_mut(CODEX_APPS_MCP_SERVER_NAME)
+            .expect("test server exists")
+            .connection,
+    )
+    .expect("fixture owns the connection")
+    .startup_trigger = Some(startup_trigger);
+
     let timeout_result =
         tokio::time::timeout(Duration::from_millis(10), manager.list_all_tools()).await;
     assert!(timeout_result.is_err());
+    assert!(
+        *startup_receiver.borrow(),
+        "uncached discovery must wake the retained startup driver before polling"
+    );
 }
 
 #[tokio::test]

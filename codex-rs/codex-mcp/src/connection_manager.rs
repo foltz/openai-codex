@@ -172,7 +172,23 @@ impl McpServerView {
         &self,
         tool_plugin_context: &ToolPluginContext,
     ) -> Result<Vec<ToolInfo>, StartupOutcomeError> {
-        let tools = self.connection.client.listed_tools().await?;
+        let connection = &self.connection;
+        // Cached discovery must stay dormant. A cache miss, however, starts
+        // real work: wake its retained driver before polling the shared startup
+        // so progress does not depend on the lifetime of this listing request.
+        let tools = if !connection.client.startup_complete.load(Ordering::Acquire)
+            && let Some(startup_tools) = connection.client.cached_tools()
+        {
+            startup_tools
+        } else {
+            match connection.client().await {
+                Ok(client) => client.listed_tools().await,
+                Err(error) if connection.client.is_codex_apps_mcp_server => {
+                    connection.client.cached_tools().ok_or(error)?
+                }
+                Err(error) => return Err(error),
+            }
+        };
         let tools = filter_tools(tools, &self.tool_filter);
         Ok(if self.connection.client.is_codex_apps_mcp_server {
             prepare_codex_apps_tools_for_model(tools, tool_plugin_context)

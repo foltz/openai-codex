@@ -675,21 +675,6 @@ impl AsyncManagedClient {
                     .and_then(|cache| cache.current_tools_or(fallback))
             })
     }
-
-    pub(crate) async fn listed_tools(&self) -> Result<Vec<ToolInfo>, StartupOutcomeError> {
-        // Plugin provenance is resolved per-session rather than stored in shared cache payloads.
-        if !self.startup_complete.load(Ordering::Acquire)
-            && let Some(startup_tools) = self.cached_tools()
-        {
-            Ok(startup_tools)
-        } else {
-            match self.client().await {
-                Ok(client) => Ok(client.listed_tools().await),
-                Err(error) if self.is_codex_apps_mcp_server => self.cached_tools().ok_or(error),
-                Err(error) => Err(error),
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone, thiserror::Error)]

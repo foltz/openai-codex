@@ -129,6 +129,7 @@ impl Session {
         mcp_projection: McpRuntimeProjection,
         resolved_environments: &TurnEnvironmentSnapshot,
         mcp_runtime_cwd: PathBuf,
+        access: codex_mcp::McpAttemptAccess<'_>,
     ) -> anyhow::Result<()> {
         let cwd = AbsolutePathBuf::from_absolute_path(mcp_runtime_cwd)
             .unwrap_or_else(|_| session_configuration.cwd().clone());
@@ -152,19 +153,23 @@ impl Session {
             disabled_plugin_ids: session_configuration.disabled_plugin_ids.clone(),
             control_endpoint: session_configuration.control_endpoint.clone(),
         };
-        self.publish_mcp_runtime(
+        self.publish_mcp_runtime_with_authority(
             &desired,
             mcp_projection,
             /*ready_selected_capability_roots*/ &[],
             Some(self.mcp_elicitation_reviewer()),
+            access,
         )
         .instrument(info_span!(
             "session_init.mcp_manager_init",
             otel.name = "session_init.mcp_manager_init",
         ))
-        .await;
+        .await?;
 
-        self.services.mcp_runtime.validate_required_servers().await
+        self.services
+            .mcp_runtime
+            .validate_required_servers_with_authority(access)
+            .await
     }
 
     /// Adds effective executor-owned configuration from this exact thread snapshot.

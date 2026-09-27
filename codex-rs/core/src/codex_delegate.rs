@@ -66,6 +66,9 @@ pub(crate) async fn run_codex_thread_interactive(
         ));
     }
     config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
+    let initial_mcp_work = parent_session
+        .turn_mcp_work(&parent_ctx)
+        .map_err(|error| CodexErr::Fatal(error.to_string()))?;
     config.model_provider.supports_websockets &= parent_session
         .services
         .model_client
@@ -102,6 +105,7 @@ pub(crate) async fn run_codex_thread_interactive(
         code_mode_session_provider: parent_session.services.code_mode_service.session_provider(),
         extensions,
         host_admission: parent_session.services.host_admission.clone(),
+        initial_mcp_work,
         conversation_history,
         disabled_plugin_ids: None,
         requested_history_mode: None,

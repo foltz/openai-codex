@@ -2153,6 +2153,24 @@ impl ThreadManagerState {
                 None => None,
             },
         };
+        // The registry keeps construction custody; initial MCP publication
+        // needs an owned descendant because a later observer may poll the
+        // retained constructor outside the original request scope.
+        let initial_mcp_work = account_work
+            .as_deref()
+            .map(|work| {
+                work.derive_operation()
+                    .map(|work| {
+                        Box::new(crate::session::McpOperationWork(work))
+                            as Box<dyn codex_mcp::McpAttemptWork>
+                    })
+                    .map_err(|_| {
+                        CodexErr::Fatal(
+                            "construction account work cannot admit MCP startup".to_owned(),
+                        )
+                    })
+            })
+            .transpose()?;
         let state = Arc::clone(self);
         let stop = request.startup.as_ref().map(|startup| startup.stop.clone());
         self.constructions
@@ -2160,7 +2178,8 @@ impl ThreadManagerState {
                 if let Some(startup) = request.startup.as_ref() {
                     let _ = startup.custody.set(Arc::clone(&custody));
                 }
-                let start = state.spawn_thread_owned(request, custody, publication);
+                let start =
+                    state.spawn_thread_owned(request, custody, publication, initial_mcp_work);
                 match stop {
                     Some(stop) => tokio::select! {
                         biased;
@@ -2178,6 +2197,7 @@ impl ThreadManagerState {
         request: ThreadSpawnRequest,
         custody: Arc<crate::session::startup_custody::SessionStartupCustody>,
         publication: retirement::ConstructionPublication,
+        initial_mcp_work: Option<Box<dyn codex_mcp::McpAttemptWork>>,
     ) -> CodexResult<NewThread> {
         let ThreadSpawnRequest {
             startup,
@@ -2378,6 +2398,7 @@ impl ThreadManagerState {
             code_mode_session_provider: Arc::clone(&self.code_mode_session_provider),
             extensions,
             host_admission: self.extensions.host_admission(),
+            initial_mcp_work,
             conversation_history: initial_history,
             disabled_plugin_ids,
             requested_history_mode: history_mode,

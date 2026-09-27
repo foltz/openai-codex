@@ -803,6 +803,7 @@ impl Session {
         code_mode_session_provider: Arc<dyn codex_code_mode::CodeModeSessionProvider>,
         extensions: Arc<codex_extension_api::ExtensionRegistry<crate::config::Config>>,
         host_admission: Option<Arc<dyn codex_extension_api::TurnStartAdmission>>,
+        initial_mcp_work: Option<Box<dyn codex_mcp::McpAttemptWork>>,
         mut thread_extension_init: ExtensionDataInit,
         client_mcp_extensions: ClientMcpExtensions,
         agent_control: LocalAgentControl,
@@ -1945,8 +1946,13 @@ impl Session {
                 mcp_projection,
                 &resolved_environments,
                 mcp_runtime_cwd,
+                initial_mcp_work.as_deref().map_or(
+                    codex_mcp::McpAttemptAccess::Unscoped,
+                    codex_mcp::McpAttemptAccess::Admitted,
+                ),
             )
             .await?;
+            drop(initial_mcp_work);
             sess.start_mcp_prewarm_worker(mcp_prewarm_rx, mcp_auth_changes);
             sess.schedule_startup_prewarm(sess.get_prompt_base_instructions().await.text)
                 .await;

@@ -358,6 +358,8 @@ impl Session {
             desired.environments.ready_environment_handles(),
         );
         McpRuntimeInput {
+            attempt_requirement: codex_mcp::McpAttemptRequirement::Ungated,
+            startup_work: None,
             startup_policy: if matches!(desired.session_source, SessionSource::SubAgent(_)) {
                 McpStartupPolicy::LazyWhenCached
             } else {

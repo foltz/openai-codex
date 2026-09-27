@@ -128,10 +128,23 @@ impl McpServerConnection {
     }
 
     pub(crate) async fn client(&self) -> Result<ManagedClient, StartupOutcomeError> {
+        self.client_with_authority(crate::McpAttemptAccess::Unscoped).await
+    }
+
+    pub(crate) async fn client_with_authority(
+        &self,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Result<ManagedClient, StartupOutcomeError> {
+        // Stage before waking the retained driver. No await may separate these
+        // operations: a dropped activator must leave a live terminal poller.
+        if self.client.cancel_token.is_cancelled() {
+            self.client.client.cancel_unstarted();
+        }
+        self.client.client.admit(access)?;
         if let Some(startup_trigger) = &self.startup_trigger {
             startup_trigger.send_replace(true);
         }
-        self.client.client().await
+        self.client.client_with_authority(access).await
     }
 
     async fn shutdown(&self) {
@@ -244,6 +257,8 @@ impl McpConnectionSet {
     ) -> Self {
         let trusted_access = TrustedAccessContext::from_runtime(&input);
         let McpRuntimeInput {
+            attempt_requirement,
+            startup_work,
             startup_policy,
             config,
             plugins_available: _,
@@ -264,6 +279,7 @@ impl McpConnectionSet {
             canonical_thread_id,
             control_endpoint,
         } = input;
+        let startup_access = crate::McpAttemptAccess::from_work(startup_work.as_deref());
         let store_mode = config.mcp_oauth_credentials_store_mode;
         let keyring_backend_kind = config.auth_keyring_backend_kind;
         let oauth_refresh_mode = config.oauth_refresh_mode;
@@ -518,7 +534,14 @@ impl McpConnectionSet {
                 } else {
                     None
                 };
-                if reusable_pending_startup
+                let reuse_work = if reusable_pending_startup {
+                    attempt_requirement.derive(startup_access)
+                } else {
+                    Ok(None)
+                };
+                if connection.client.client.requirement == attempt_requirement
+                    && reuse_work.is_ok()
+                    && (reusable_pending_startup
                     || unchanged_auth_failure.is_some()
                     || connection
                         .reusable_client(&connection_identity)
@@ -528,7 +551,7 @@ impl McpConnectionSet {
                                 && expected_protocol_mode.is_some_and(|expected| {
                                     client.client.protocol_mode() == expected
                                 })
-                        })
+                        }))
                 {
                     let pending_client =
                         reusable_pending_startup.then(|| connection.client.clone());
@@ -581,12 +604,14 @@ impl McpConnectionSet {
                             (server_name, Err(error))
                         });
                     } else if let Some(client) = pending_client {
+                        let reuse_work = reuse_work.ok().flatten();
                         let publication_gate = publication_gate.clone();
                         join_set.spawn(async move {
                             if !publication_gate.wait().await {
                                 return (server_name, Err(StartupOutcomeError::Cancelled));
                             }
-                            (server_name, client.client().await)
+                            let access = crate::McpAttemptAccess::from_work(reuse_work.as_deref());
+                            (server_name, client.client_with_authority(access).await)
                         });
                     } else {
                         reused_ready.push(server_name);
@@ -654,6 +679,7 @@ impl McpConnectionSet {
                 connection_identity.control_endpoint.clone(),
                 retirement_owner.lower(),
                 retirement_owner.task_ticket(),
+                attempt_requirement,
             );
             let defer_startup = allow_deferred_startup
                 && !tool_plugin_context.is_selected_plugin_mcp_server(&server_name)
@@ -672,6 +698,21 @@ impl McpConnectionSet {
                 (Some(trigger), Some(receiver))
             } else {
                 (None, None)
+            };
+            let driver_work = if defer_startup {
+                // Apps is never dormant: only the regular tool-catalog cache
+                // participates in deferral. Dormant drivers cannot reconnect.
+                None
+            } else {
+                match attempt_requirement.derive(startup_access) {
+                    Ok(work) => work,
+                    Err(error) => {
+                        warn!(server = %server_name, %error, "MCP startup not admitted");
+                        cancel_token.cancel();
+                        async_managed_client.client.cancel_unstarted();
+                        continue;
+                    }
+                }
             };
             servers.insert(
                 server_name.clone(),
@@ -694,6 +735,7 @@ impl McpConnectionSet {
             let submit_id = startup_submit_id.clone();
             let publication_gate = publication_gate.clone();
             let outcome_server_name = server_name.clone();
+            let client_on_registration_failure = async_managed_client.clone();
             let startup = async move {
                 if let Some(mut startup_receiver) = startup_receiver
                     && tokio::select! {
@@ -701,9 +743,11 @@ impl McpConnectionSet {
                         () = cancel_token.cancelled() => true,
                     }
                 {
+                    async_managed_client.client.cancel_unstarted();
                     return (server_name, Err(StartupOutcomeError::Cancelled));
                 }
                 if !publication_gate.wait().await {
+                    async_managed_client.client.cancel_unstarted();
                     return (server_name, Err(StartupOutcomeError::Cancelled));
                 }
                 if let Some(tx_event) = tx_event.as_ref() {
@@ -717,7 +761,8 @@ impl McpConnectionSet {
                     )
                     .await;
                 }
-                let mut outcome = async_managed_client.client().await;
+                let access = crate::McpAttemptAccess::from_work(driver_work.as_deref());
+                let mut outcome = async_managed_client.client_with_authority(access).await;
                 if cancel_token.is_cancelled() {
                     outcome = Err(StartupOutcomeError::Cancelled);
                 }
@@ -793,7 +838,7 @@ impl McpConnectionSet {
                 }
 
                 if matches!(&outcome, Err(StartupOutcomeError::Failed { .. })) {
-                    async_managed_client.reconnect_failed_startup().await;
+                    async_managed_client.reconnect_failed_startup_with_authority(access).await;
                 }
 
                 (server_name, outcome)
@@ -807,6 +852,9 @@ impl McpConnectionSet {
                 // The registry retains the original future even if this driver
                 // or the initial summary is cancelled.
                 tokio::spawn(startup);
+            } else {
+                client_on_registration_failure.cancel_token.cancel();
+                client_on_registration_failure.client.cancel_unstarted();
             }
             if defer_startup {
                 // Dormant servers must not hold the initial startup summary open.
@@ -1001,11 +1049,20 @@ impl McpConnectionSet {
     }
 
     pub async fn wait_for_server_ready(&self, server_name: &str, timeout: Duration) -> bool {
+        self.wait_for_server_ready_with_authority(server_name, timeout, crate::McpAttemptAccess::Unscoped).await
+    }
+
+    pub(crate) async fn wait_for_server_ready_with_authority(
+        &self,
+        server_name: &str,
+        timeout: Duration,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> bool {
         let Some(view) = self.servers.get(server_name) else {
             return false;
         };
 
-        match tokio::time::timeout(timeout, view.connection.client()).await {
+        match tokio::time::timeout(timeout, view.connection.client_with_authority(access)).await {
             Ok(Ok(_)) => true,
             Ok(Err(_)) | Err(_) => false,
         }

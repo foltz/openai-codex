@@ -288,6 +288,8 @@ async fn list_accessible_connectors_with_custody(
         codex_mcp::host_owned_codex_apps_enabled(&mcp_config, auth.as_ref())
             .then(|| Arc::clone(&auth_manager));
     let input = McpRuntimeInput {
+        attempt_requirement: codex_mcp::McpAttemptRequirement::Ungated,
+        startup_work: None,
         startup_policy: McpStartupPolicy::Eager,
         config: Arc::clone(&mcp_config),
         plugins_available: false,

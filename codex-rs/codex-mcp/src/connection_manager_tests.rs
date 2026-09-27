@@ -1,4 +1,8 @@
 use super::*;
+
+#[cfg(unix)]
+#[path = "connection_manager_attempt_work_tests.rs"]
+mod attempt_work_tests;
 use crate::McpBinding;
 use crate::client_tool_catalog::ClientToolCatalog;
 use crate::elicitation::ElicitationLifecycle;
@@ -2036,6 +2040,8 @@ async fn read_only_apps_discovery_never_uses_a_shared_writable_catalog() -> anyh
             /*previous*/ None,
             McpPublicationGate::already_published(),
             McpRuntimeInput {
+                attempt_requirement: crate::McpAttemptRequirement::Ungated,
+                startup_work: None,
                 startup_policy: McpStartupPolicy::Eager,
                 config: Arc::new(config),
                 plugins_available: false,
@@ -2111,6 +2117,8 @@ async fn hosted_apps_protocol_mode_is_independent_of_generic_mode() -> anyhow::R
             /*previous*/ None,
             McpPublicationGate::already_published(),
             McpRuntimeInput {
+                attempt_requirement: crate::McpAttemptRequirement::Ungated,
+                startup_work: None,
                 startup_policy: McpStartupPolicy::Eager,
                 config: Arc::new(config),
                 plugins_available: false,
@@ -2219,6 +2227,8 @@ async fn codex_apps_extension_does_not_share_host_owned_tools_cache() -> anyhow:
             /*previous*/ None,
             McpPublicationGate::already_published(),
             McpRuntimeInput {
+                attempt_requirement: crate::McpAttemptRequirement::Ungated,
+                startup_work: None,
                 startup_policy: McpStartupPolicy::Eager,
                 config: Arc::new(config),
                 plugins_available: false,
@@ -4646,6 +4656,8 @@ async fn executor_owned_chatgpt_mcp_accepts_only_safe_explicit_authorization() -
             /*previous*/ None,
             McpPublicationGate::already_published(),
             McpRuntimeInput {
+                attempt_requirement: crate::McpAttemptRequirement::Ungated,
+                startup_work: None,
                 startup_policy: McpStartupPolicy::Eager,
                 config: Arc::new(runtime_config.clone()),
                 plugins_available: false,
@@ -4766,6 +4778,8 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
         /*previous*/ None,
         McpPublicationGate::already_published(),
         McpRuntimeInput {
+            attempt_requirement: crate::McpAttemptRequirement::Ungated,
+            startup_work: None,
             startup_policy: McpStartupPolicy::Eager,
             config: Arc::new(crate::mcp::tests::test_mcp_config(
                 codex_home.path().to_path_buf(),
@@ -5168,6 +5182,8 @@ fn retirement_runtime_input(
         .server_permission_profiles
         .insert("docs".to_string(), PermissionProfile::default());
     McpRuntimeInput {
+        attempt_requirement: crate::McpAttemptRequirement::Ungated,
+        startup_work: None,
         startup_policy: policy,
         config: Arc::new(runtime_config),
         plugins_available: false,
@@ -5513,6 +5529,8 @@ async fn reconcile_reusable_server_with_mcp_config(
         Some(previous),
         McpPublicationGate::already_published(),
         McpRuntimeInput {
+            attempt_requirement: crate::McpAttemptRequirement::Ungated,
+            startup_work: None,
             startup_policy: McpStartupPolicy::Eager,
             config: Arc::new(mcp_config),
             plugins_available: false,
@@ -6476,6 +6494,8 @@ async fn reconciliation_replaces_connection_when_protocol_mode_changes() {
         Some(&previous),
         McpPublicationGate::already_published(),
         McpRuntimeInput {
+            attempt_requirement: crate::McpAttemptRequirement::Ungated,
+            startup_work: None,
             startup_policy: McpStartupPolicy::Eager,
             config: Arc::new(mcp_config),
             plugins_available: false,
@@ -6536,6 +6556,8 @@ async fn reconciliation_reuses_legacy_stdio_server_when_modern_protocol_is_enabl
         Some(&previous),
         McpPublicationGate::already_published(),
         McpRuntimeInput {
+            attempt_requirement: crate::McpAttemptRequirement::Ungated,
+            startup_work: None,
             startup_policy: McpStartupPolicy::Eager,
             config: Arc::new(mcp_config),
             plugins_available: false,

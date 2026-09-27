@@ -13,6 +13,14 @@ pub(crate) struct AccountOperationWork {
     pub(crate) turns: AccountTurnWork,
 }
 
+impl codex_mcp::McpAttemptWork for AccountWorkPermitGuard {
+    fn derive_attempt(&self) -> Result<Box<dyn codex_mcp::McpAttemptWork>, codex_mcp::McpAttemptRefused> {
+        self.try_derive()
+            .map(|work| Box::new(work) as Box<dyn codex_mcp::McpAttemptWork>)
+            .ok_or(codex_mcp::McpAttemptRefused)
+    }
+}
+
 impl std::fmt::Debug for AccountOperationWork {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("AccountOperationWork")

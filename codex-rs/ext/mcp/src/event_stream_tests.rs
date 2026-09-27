@@ -155,6 +155,8 @@ impl Fixture {
         config.mcp_server_catalog = catalog.build();
         let config = Arc::new(config);
         let runtime_input = || McpRuntimeInput {
+            attempt_requirement: codex_mcp::McpAttemptRequirement::Ungated,
+            startup_work: None,
             canonical_thread_id: None,
             startup_policy: McpStartupPolicy::Eager,
             config: Arc::clone(&config),

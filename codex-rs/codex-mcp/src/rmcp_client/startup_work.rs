@@ -22,7 +22,7 @@ enum Admission {
 /// not retained in the reusable startup factory or memoized result.
 #[derive(Clone)]
 pub(crate) struct ClientStartup {
-    requirement: McpAttemptRequirement,
+    pub(crate) requirement: McpAttemptRequirement,
     admission: Arc<Mutex<Admission>>,
     completion: ManagedClientFuture,
 }

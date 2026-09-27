@@ -74,6 +74,11 @@ pub enum McpStartupPolicy {
 
 /// Configuration and owning-thread state needed to materialize an MCP runtime.
 pub struct McpRuntimeInput {
+    /// Uncounted policy retained by connections, independently of this call.
+    pub attempt_requirement: crate::McpAttemptRequirement,
+    /// Finite construction authority. Drivers derive their own work before
+    /// detaching; dormant connections must not retain this input.
+    pub startup_work: Option<Box<dyn crate::McpAttemptWork>>,
     pub startup_policy: McpStartupPolicy,
     pub config: Arc<McpConfig>,
     pub plugins_available: bool,
@@ -693,8 +698,17 @@ impl McpRuntime {
     }
 
     pub async fn latest_wait_for_server_ready(&self, server: &str, timeout: Duration) -> bool {
+        self.latest_wait_for_server_ready_with_authority(server, timeout, crate::McpAttemptAccess::Unscoped).await
+    }
+
+    pub async fn latest_wait_for_server_ready_with_authority(
+        &self,
+        server: &str,
+        timeout: Duration,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> bool {
         self.latest_connections()
-            .wait_for_server_ready(server, timeout)
+            .wait_for_server_ready_with_authority(server, timeout, access)
             .await
     }
 

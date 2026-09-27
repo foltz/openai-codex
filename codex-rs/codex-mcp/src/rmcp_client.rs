@@ -563,6 +563,7 @@ impl AsyncManagedClient {
         control_endpoint: Option<String>,
         retirement: codex_rmcp_client::RmcpClientRetirement,
         retirement_ticket: crate::runtime_retirement::RuntimeTaskTicket,
+        attempt_requirement: McpAttemptRequirement,
     ) -> Self {
         let is_codex_apps_mcp_server = server_name == CODEX_APPS_MCP_SERVER_NAME;
         let reconnect_server_name = server_name.clone();
@@ -601,13 +602,13 @@ impl AsyncManagedClient {
             canonical_thread_id,
             control_endpoint,
         });
-        let client = ClientStartup::new(startup.start(), McpAttemptRequirement::Ungated);
+        let client = ClientStartup::new(startup.start(), attempt_requirement);
         let startup_reconnect = is_codex_apps_mcp_server.then(|| {
             let startup = Arc::clone(&startup);
             Arc::new(
                 CodexAppsStartupReconnect::new(
                     Arc::new(move || startup.start()),
-                    McpAttemptRequirement::Ungated,
+                    attempt_requirement,
                 )
                     .with_retirement_ticket(retirement_ticket)
                     .with_startup_status_context(

@@ -25,6 +25,15 @@ pub enum McpAttemptAccess<'a> {
     Admitted(&'a dyn McpAttemptWork),
 }
 
+impl<'a> McpAttemptAccess<'a> {
+    pub fn from_work(work: Option<&'a dyn McpAttemptWork>) -> Self {
+        match work {
+            Some(work) => Self::Admitted(work),
+            None => Self::Unscoped,
+        }
+    }
+}
+
 /// No new attempt was admitted. The caller may retry with valid authority;
 /// this is not a memoized startup failure or a reason to discard cached tools.
 #[derive(Clone, Copy, Debug, thiserror::Error)]

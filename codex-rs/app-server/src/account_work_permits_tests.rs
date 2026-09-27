@@ -306,6 +306,10 @@ async fn refused_processor_registration_releases_captured_account_work() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::async_yields_async,
+    reason = "returning task receipts ends the parent request scope before observing descendant panic or cancellation"
+)]
 async fn transferred_request_scope_releases_on_panic_and_task_cancellation() {
     use crate::account_turn_admission::derive_request_work;
     use crate::account_turn_admission::within_request;

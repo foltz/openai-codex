@@ -448,6 +448,10 @@ async fn interrupted_mailbox_preparation_restores_mail_without_rearming_the_wake
 }
 
 #[tokio::test]
+#[expect(
+    clippy::async_yields_async,
+    reason = "returning each once-polled off-loop replacement lets the test cancel it while its witness is still pending"
+)]
 async fn off_loop_replacers_wait_without_owning_slots_and_release_mail_on_cancel() {
     let (mut session, _) = tests::make_session_and_context().await;
     let pause = Arc::new(PausedStart {
@@ -671,6 +675,10 @@ async fn interrupted_registration_defers_new_trigger_and_idle_start_until_owner_
 }
 
 #[tokio::test]
+#[expect(
+    clippy::async_yields_async,
+    reason = "the off-loop task returns its parked replacement so the test can finish the idle owner before awaiting it"
+)]
 async fn replacement_observes_idle_start_completion_without_cancelling_its_input() {
     let (mut session, _) = tests::make_session_and_context().await;
     let pause = Arc::new(PausedStart {

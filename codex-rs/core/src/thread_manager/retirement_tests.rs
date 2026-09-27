@@ -229,7 +229,9 @@ async fn real_constructor_cancelled_before_publication_is_drained_after_close() 
     }
     impl codex_extension_api::HostOperationWork for ConstructionWork {
         fn derive_operation(&self) -> Result<Box<dyn codex_extension_api::HostOperationWork>, codex_extension_api::TurnWorkRefused> {
-            Err(codex_extension_api::TurnWorkRefused::Unavailable)
+            // Existing work may derive descendants after the request ends.
+            self.0.operations.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(Self(Arc::clone(&self.0))))
         }
         fn derive_turn_work(
             &self,
@@ -312,7 +314,7 @@ async fn real_constructor_cancelled_before_publication_is_drained_after_close() 
     assert_eq!(provider.entered.load(Ordering::SeqCst), 1);
     drop(observer);
     host.request_alive.store(false, Ordering::SeqCst);
-    assert_eq!(host.operations.load(Ordering::SeqCst), 1);
+    assert_eq!(host.operations.load(Ordering::SeqCst), 2);
     assert!(manager.list_thread_ids().await.is_empty());
     release
         .send(())
@@ -320,9 +322,13 @@ async fn real_constructor_cancelled_before_publication_is_drained_after_close() 
     // Account progress must finish counted construction without initiating
     // thread shutdown, which only happens after account adoption.
     tokio::time::timeout(Duration::from_secs(20), async {
-        tokio::select! {
-            _ = host.released.notified() => {},
-            _ = manager.drive_admitted_constructions() => panic!("progress observer stopped"),
+        let progress = manager.drive_admitted_constructions();
+        tokio::pin!(progress);
+        while host.operations.load(Ordering::SeqCst) != 0 {
+            tokio::select! {
+                _ = host.released.notified() => {},
+                _ = &mut progress => panic!("progress observer stopped"),
+            }
         }
     })
         .await

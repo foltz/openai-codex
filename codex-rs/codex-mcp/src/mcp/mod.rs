@@ -435,7 +435,17 @@ pub async fn read_mcp_resource(
     server: &str,
     params: ReadResourceRequestParams,
     control_endpoint: Option<String>,
+    access: crate::McpAttemptAccess<'_>,
 ) -> anyhow::Result<ReadResourceResult> {
+    let startup_work = match access {
+        crate::McpAttemptAccess::Unscoped => None,
+        crate::McpAttemptAccess::Admitted(work) => Some(work.derive_attempt()?),
+    };
+    let attempt_requirement = if startup_work.is_some() {
+        crate::McpAttemptRequirement::Required
+    } else {
+        crate::McpAttemptRequirement::Ungated
+    };
     let mut mcp_servers = effective_mcp_servers(config, auth);
     mcp_servers.retain(|name, _| name == server);
     let cancel_token = CancellationToken::new();
@@ -444,8 +454,8 @@ pub async fn read_mcp_resource(
         /*previous*/ None,
         McpPublicationGate::already_published(),
         McpRuntimeInput {
-            attempt_requirement: crate::McpAttemptRequirement::Ungated,
-            startup_work: None,
+            attempt_requirement,
+            startup_work,
             startup_policy: McpStartupPolicy::Eager,
             config: Arc::new(runtime_config),
             plugins_available: false,
@@ -473,7 +483,7 @@ pub async fn read_mcp_resource(
     )
     .await;
 
-    let result = manager.read_resource(server, params).await;
+    let result = manager.read_resource_with_authority(server, params, access).await;
     cancel_token.cancel();
     result
 }
@@ -499,10 +509,20 @@ pub async fn collect_mcp_server_status_snapshot_with_detail(
     tool_catalog_cache: crate::McpToolCatalogCache,
     detail: McpSnapshotDetail,
     control_endpoint: Option<String>,
-) -> McpServerStatusSnapshot {
+    access: crate::McpAttemptAccess<'_>,
+) -> anyhow::Result<McpServerStatusSnapshot> {
+    let startup_work = match access {
+        crate::McpAttemptAccess::Unscoped => None,
+        crate::McpAttemptAccess::Admitted(work) => Some(work.derive_attempt()?),
+    };
+    let attempt_requirement = if startup_work.is_some() {
+        crate::McpAttemptRequirement::Required
+    } else {
+        crate::McpAttemptRequirement::Ungated
+    };
     let mcp_servers = effective_mcp_servers(config, auth);
     if mcp_servers.is_empty() {
-        return McpServerStatusSnapshot {
+        return Ok(McpServerStatusSnapshot {
             server_infos: HashMap::new(),
             server_capabilities: HashMap::new(),
             tools_by_server: HashMap::new(),
@@ -511,7 +531,7 @@ pub async fn collect_mcp_server_status_snapshot_with_detail(
             resource_templates: HashMap::new(),
             auth_statuses: HashMap::new(),
             server_names: Vec::new(),
-        };
+        });
     }
 
     let auth_status_entries = compute_auth_statuses(
@@ -531,8 +551,8 @@ pub async fn collect_mcp_server_status_snapshot_with_detail(
         /*previous*/ None,
         McpPublicationGate::already_published(),
         McpRuntimeInput {
-            attempt_requirement: crate::McpAttemptRequirement::Ungated,
-            startup_work: None,
+            attempt_requirement,
+            startup_work,
             startup_policy: McpStartupPolicy::Eager,
             config: Arc::new(runtime_config),
             plugins_available: false,
@@ -562,12 +582,13 @@ pub async fn collect_mcp_server_status_snapshot_with_detail(
         auth_status_entries,
         server_names,
         detail,
+        access,
     )
     .await;
 
     cancel_token.cancel();
 
-    snapshot
+    Ok(snapshot)
 }
 
 /// The Responses API requires tool names to match `^[a-zA-Z0-9_-]+$`.
@@ -794,16 +815,17 @@ async fn collect_mcp_server_status_snapshot_from_manager(
     auth_status_entries: HashMap<String, crate::mcp::auth::McpAuthStatusEntry>,
     server_names: Vec<String>,
     detail: McpSnapshotDetail,
+    access: crate::McpAttemptAccess<'_>,
 ) -> McpServerStatusSnapshot {
     let ((server_infos, (tools, tools_errors)), resources, resource_templates) = tokio::join!(
         async {
-            let server_infos = mcp_connection_manager.list_available_server_infos().await;
-            let tools = mcp_connection_manager.list_tools_with_errors().await;
+            let server_infos = mcp_connection_manager.list_available_server_infos_with_authority(access).await;
+            let tools = mcp_connection_manager.list_tools_with_errors_with_authority(access).await;
             (server_infos, tools)
         },
         async {
             if detail.include_resources() {
-                mcp_connection_manager.list_all_resources(|_| true).await
+                mcp_connection_manager.list_all_resources_with_authority(|_| true, access).await
             } else {
                 HashMap::new()
             }
@@ -811,7 +833,7 @@ async fn collect_mcp_server_status_snapshot_from_manager(
         async {
             if detail.include_resources() {
                 mcp_connection_manager
-                    .list_all_resource_templates(|_| true)
+                    .list_all_resource_templates_with_authority(|_| true, access)
                     .await
             } else {
                 HashMap::new()

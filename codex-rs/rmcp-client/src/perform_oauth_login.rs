@@ -257,6 +257,7 @@ pub async fn perform_oauth_login_return_url(
     global_callback_url: Option<&str>,
     http_client: Arc<dyn HttpClient>,
     redirect_mode: StreamableHttpRedirectMode,
+    operation_work: Option<Box<dyn Send>>,
 ) -> Result<OauthLoginHandle> {
     let http_context = OAuthHttpContext {
         http_headers,
@@ -284,7 +285,7 @@ pub async fn perform_oauth_login_return_url(
     .await?;
 
     let authorization_url = flow.authorization_url();
-    let (completion, task) = flow.spawn();
+    let (completion, task) = flow.spawn(operation_work);
 
     Ok(OauthLoginHandle::new(authorization_url, completion, task))
 }
@@ -863,11 +864,14 @@ impl OauthLoginFlow {
         result
     }
 
-    fn spawn(self) -> (oneshot::Receiver<Result<()>>, JoinHandle<()>) {
+    fn spawn(self, operation_work: Option<Box<dyn Send>>) -> (oneshot::Receiver<Result<()>>, JoinHandle<()>) {
         let server_name = self.server_name.clone();
         let (tx, rx) = oneshot::channel();
 
         let task = tokio::spawn(async move {
+            // The observer's Drop only requests abort. Keep finite host work
+            // inside the actual flow until completion or task destruction.
+            let _operation_work = operation_work;
             let result = self.finish(/*emit_browser_url*/ false).await;
             if let Err(err) = &result {
                 eprintln!("Failed to complete OAuth login for '{server_name}': {err:#}");

@@ -137,12 +137,19 @@ impl McpConnectionSet {
 
     #[instrument(level = "trace", skip_all, fields(mcp_server_count = self.servers.len()))]
     pub(crate) async fn list_tools_with_errors(&self) -> (Vec<ToolInfo>, HashMap<String, String>) {
+        self.list_tools_with_errors_with_authority(crate::McpAttemptAccess::Unscoped).await
+    }
+
+    pub(crate) async fn list_tools_with_errors_with_authority(
+        &self,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> (Vec<ToolInfo>, HashMap<String, String>) {
         let mut tools = Vec::new();
         let mut errors = HashMap::new();
         let mut available_server_count = 0;
         let mut unavailable_server_count = 0;
         let server_results = join_all(self.servers.iter().map(|(server_name, view)| async move {
-            view.connection.client.reconnect_failed_startup().await;
+            view.connection.client.reconnect_failed_startup_with_authority(access).await;
             let has_cached_tools = view.connection.client.has_cached_tools();
             let startup_complete = view
                 .connection
@@ -150,7 +157,7 @@ impl McpConnectionSet {
                 .startup_complete
                 .load(Ordering::Acquire);
             let server_tools = view
-                .listed_tools(&self.tool_plugin_context)
+                .listed_tools(&self.tool_plugin_context, access)
                 .instrument(trace_span!(
                     "list_tools_for_server",
                     server_name = %server_name,

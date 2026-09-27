@@ -184,6 +184,7 @@ impl McpServerView {
     async fn listed_tools(
         &self,
         tool_plugin_context: &ToolPluginContext,
+        access: crate::McpAttemptAccess<'_>,
     ) -> Result<Vec<ToolInfo>, StartupOutcomeError> {
         let connection = &self.connection;
         // Cached discovery must stay dormant. A cache miss, however, starts
@@ -194,7 +195,7 @@ impl McpServerView {
         {
             startup_tools
         } else {
-            match connection.client().await {
+            match connection.client_with_authority(access).await {
                 Ok(client) => client.listed_tools().await,
                 Err(error) if connection.client.is_codex_apps_mcp_server => {
                     connection.client.cached_tools().ok_or(error)?
@@ -1153,6 +1154,13 @@ impl McpConnectionSet {
     /// Codex Apps metadata may come from its existing cache; regular MCP server information is
     /// connection-specific, so pending regular clients are awaited.
     pub(crate) async fn list_available_server_infos(&self) -> HashMap<String, McpServerInfo> {
+        self.list_available_server_infos_with_authority(crate::McpAttemptAccess::Unscoped).await
+    }
+
+    pub(crate) async fn list_available_server_infos_with_authority(
+        &self,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> HashMap<String, McpServerInfo> {
         let mut server_infos = HashMap::new();
         for (server_name, view) in &self.servers {
             let client = &view.connection.client;
@@ -1162,7 +1170,7 @@ impl McpConnectionSet {
                 server_infos.insert(server_name.clone(), server_info);
                 continue;
             }
-            match view.connection.client().await {
+            match view.connection.client_with_authority(access).await {
                 Ok(managed_client) => {
                     server_infos.insert(server_name.clone(), managed_client.server_info);
                 }

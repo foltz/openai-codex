@@ -1,5 +1,7 @@
 use super::thread_input::ensure_direct_input_allowed;
 use super::*;
+use crate::account_turn_admission::derive_request_work;
+use crate::account_turn_admission::within_request;
 use crate::mcp_config_identity::AppliedMcpConfigIdentity;
 use crate::mcp_config_identity::McpConfigIdentity;
 use crate::processor_task_retirement::ProcessorTasks;
@@ -265,6 +267,11 @@ impl McpRequestProcessor {
                     internal_error(format!("failed to resolve MCP OAuth callback: {err}"))
                 })?;
 
+        let request_work = derive_request_work()
+            .map_err(|_| internal_error("MCP OAuth account work is unavailable"))?;
+        let flow_work = request_work.as_ref().map(|work| {
+            work.try_derive().ok_or_else(|| internal_error("MCP OAuth account work is unavailable"))
+        }).transpose()?;
         let handle = perform_oauth_login_return_url(
             oauth_credential_name.as_ref(),
             &url,
@@ -282,6 +289,7 @@ impl McpRequestProcessor {
             mcp_config.mcp_oauth_callback_url.as_deref(),
             http_client,
             redirect_mode,
+            flow_work.map(|work| Box::new(work) as Box<dyn Send>),
         )
         .await
         .map_err(|err| internal_error(format!("failed to login to MCP server '{name}': {err}")))?;
@@ -293,7 +301,7 @@ impl McpRequestProcessor {
 
         let _ = self
             .tasks
-            .spawn(async move {
+            .spawn(within_request(request_work, async move {
                 let (success, error) = match handle.wait().await {
                     Ok(()) => (true, None),
                     Err(err) => (false, Some(err.to_string())),
@@ -311,7 +319,7 @@ impl McpRequestProcessor {
                     },
                 );
                 outgoing.send_server_notification(notification).await;
-            })
+            }))
             .map_err(|err| internal_error(format!("MCP OAuth task admission failed: {err:?}")))?;
 
         Ok(McpServerOauthLoginResponse { authorization_url })
@@ -346,6 +354,8 @@ impl McpRequestProcessor {
         let control_endpoint = self.control_endpoint.clone();
         let environment_manager = self.thread_manager.environment_manager();
 
+        let request_work = derive_request_work()
+            .map_err(|_| internal_error("MCP status account work is unavailable"))?;
         let _ = self.tasks.spawn(async move {
             let (mcp_config, runtime_context) = match thread.as_ref() {
                 Some(thread) => thread.runtime_mcp_config_and_context(&config).await,
@@ -366,6 +376,8 @@ impl McpRequestProcessor {
                 mcp_manager,
                 thread,
                 control_endpoint,
+                codex_mcp::McpAttemptAccess::from_work(request_work.as_ref()
+                    .map(|work| work as &dyn codex_mcp::McpAttemptWork)),
             )
             .await;
             outgoing.send_result(request, result).await;
@@ -382,6 +394,7 @@ impl McpRequestProcessor {
         mcp_manager: Arc<McpManager>,
         thread: Option<Arc<codex_core::CodexThread>>,
         control_endpoint: Option<String>,
+        access: codex_mcp::McpAttemptAccess<'_>,
     ) -> Result<ListMcpServerStatusResponse, JSONRPCErrorError> {
         let detail = match params.detail.unwrap_or(McpServerStatusDetail::Full) {
             McpServerStatusDetail::Full => McpSnapshotDetail::Full,
@@ -397,8 +410,9 @@ impl McpRequestProcessor {
             mcp_manager.tool_catalog_cache(),
             detail,
             control_endpoint,
+            access,
         )
-        .await;
+        .await.map_err(mcp_operation_error)?;
 
         let runtime_statuses = match thread {
             Some(thread) => thread.mcp_connection_statuses(&mcp_config).await,
@@ -513,8 +527,10 @@ impl McpRequestProcessor {
         if let Some(thread_id) = thread_id {
             let (_, thread) = self.load_thread(&thread_id).await?;
             let request_id = request_id.clone();
+            let request_work = derive_request_work()
+                .map_err(|_| internal_error("MCP resource account work is unavailable"))?;
 
-            let _ = self.tasks.spawn(async move {
+            let _ = self.tasks.spawn(within_request(request_work, async move {
                 let origin_call_id =
                     origin_call_id.filter(|_| server == codex_mcp::CODEX_APPS_MCP_SERVER_NAME);
                 let result = match origin_call_id.as_deref() {
@@ -527,7 +543,7 @@ impl McpRequestProcessor {
                 };
                 Self::send_mcp_resource_read_response(outgoing, request_id, result, origin_call_id)
                     .await;
-            }).map_err(|err| internal_error(format!("MCP resource task admission failed: {err:?}")))?;
+            })).map_err(|err| internal_error(format!("MCP resource task admission failed: {err:?}")))?;
             return Ok(());
         }
 
@@ -550,6 +566,8 @@ impl McpRequestProcessor {
             McpRuntimeContext::new(Arc::clone(&environment_manager), config.cwd.to_path_buf());
         let request_id = request_id.clone();
 
+        let request_work = derive_request_work()
+            .map_err(|_| internal_error("MCP resource account work is unavailable"))?;
         let _ = self.tasks.spawn(async move {
             let result = read_mcp_resource_without_thread(
                 &mcp_config,
@@ -560,6 +578,8 @@ impl McpRequestProcessor {
                 &server,
                 resource_params,
                 control_endpoint,
+                codex_mcp::McpAttemptAccess::from_work(request_work.as_ref()
+                    .map(|work| work as &dyn codex_mcp::McpAttemptWork)),
             )
             .await
             .and_then(|result| serde_json::to_value(result).map_err(anyhow::Error::from));
@@ -604,15 +624,17 @@ impl McpRequestProcessor {
         ensure_direct_input_allowed(thread.as_ref()).await?;
         let meta = with_mcp_tool_call_thread_id_meta(params.meta, &thread_id);
         let request_id = request_id.clone();
+        let request_work = derive_request_work()
+            .map_err(|_| internal_error("MCP tool account work is unavailable"))?;
 
-        let _ = self.tasks.spawn(async move {
+        let _ = self.tasks.spawn(within_request(request_work, async move {
             let result = thread
                 .call_mcp_tool(&params.server, &params.tool, params.arguments, meta)
                 .await
                 .map(McpServerToolCallResponse::from)
                 .map_err(mcp_operation_error);
             outgoing.send_result(request_id, result).await;
-        }).map_err(|err| internal_error(format!("MCP tool task admission failed: {err:?}")))?;
+        })).map_err(|err| internal_error(format!("MCP tool task admission failed: {err:?}")))?;
         Ok(())
     }
 }

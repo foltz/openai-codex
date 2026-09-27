@@ -76,6 +76,7 @@ async fn status_snapshot_only_downgrades_oauth_authentication_failures() {
         auth_status_entries,
         server_names,
         McpSnapshotDetail::ToolsAndAuthOnly,
+        crate::McpAttemptAccess::Unscoped,
     )
     .await;
 
@@ -696,6 +697,14 @@ async fn effective_mcp_servers_preserve_runtime_servers() {
 /// startup.
 #[tokio::test]
 async fn status_snapshot_discloses_the_process_control_endpoint_to_an_eligible_provider() {
+    // Exercise the production gated status path, including its first-poll
+    // authority transfer, without changing the endpoint-disclosure proof.
+    struct StatusWork;
+    impl crate::McpAttemptWork for StatusWork {
+        fn derive_attempt(&self) -> Result<Box<dyn crate::McpAttemptWork>, crate::McpAttemptRefused> {
+            Ok(Box::new(Self))
+        }
+    }
     const ENDPOINT: &str = "unix:///tmp/kcf-status-control.sock";
     let server = MockServer::start().await;
     let endpoint_request_received = Arc::new(AtomicBool::new(false));
@@ -789,8 +798,9 @@ async fn status_snapshot_discloses_the_process_control_endpoint_to_an_eligible_p
         crate::McpToolCatalogCache::default(),
         McpSnapshotDetail::ToolsAndAuthOnly,
         Some(ENDPOINT.to_string()),
+        crate::McpAttemptAccess::Admitted(&StatusWork),
     )
-    .await;
+    .await.expect("status snapshot");
 
     assert!(
         endpoint_request_received.load(Ordering::SeqCst),

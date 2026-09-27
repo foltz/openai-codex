@@ -1,6 +1,7 @@
 use super::*;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionFuture;
+use codex_extension_api::HostOperationWork;
 use codex_extension_api::TurnStartAdmission;
 use codex_extension_api::TurnWorkRefused;
 use codex_protocol::host_turn_work::HostTurnWork;
@@ -10,10 +11,26 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 #[derive(Debug)]
-struct ParentGate {
+pub(super) struct ParentGate {
     parent_store: String,
     calls: AtomicUsize,
     events: Arc<Mutex<Vec<String>>>,
+    pub(super) constructor_derivations: Arc<AtomicUsize>,
+}
+
+#[derive(Debug)]
+struct ConstructorWork(Arc<AtomicUsize>);
+
+impl HostOperationWork for ConstructorWork {
+    fn derive_operation(&self) -> Result<Box<dyn HostOperationWork>, TurnWorkRefused> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(Self(Arc::clone(&self.0))))
+    }
+
+    fn derive_turn_work(&self, _: &ExtensionData, _: ExtensionFuture<'static, ()>)
+        -> Result<Box<dyn HostTurnWork>, TurnWorkRefused> {
+        Err(TurnWorkRefused::Unavailable)
+    }
 }
 
 #[derive(Debug)]
@@ -34,6 +51,12 @@ impl Drop for ChildWork {
 
 impl TurnStartAdmission for ParentGate {
     fn admit_turn_start(&self) -> Option<Box<dyn Send>> { None }
+    fn derive_operation_work(&self, parent: &ExtensionData, turn: &str)
+        -> Result<Option<Box<dyn HostOperationWork>>, TurnWorkRefused> {
+        assert_eq!(parent.level_id(), self.parent_store);
+        if turn != "live-parent" { return Err(TurnWorkRefused::Unavailable); }
+        Ok(Some(Box::new(ConstructorWork(Arc::clone(&self.constructor_derivations)))))
+    }
     fn admit_turn_work(&self, _store: &ExtensionData, _end: ExtensionFuture<'static, ()>)
         -> Result<Option<Box<dyn HostTurnWork>>, TurnWorkRefused> {
         Err(TurnWorkRefused::Unavailable)
@@ -48,12 +71,13 @@ impl TurnStartAdmission for ParentGate {
     }
 }
 
-async fn parent() -> (Arc<crate::session::session::Session>, Arc<ParentGate>) {
+pub(super) async fn parent() -> (Arc<crate::session::session::Session>, Arc<ParentGate>) {
     let (mut session, _) = crate::session::tests::make_session_and_context().await;
     let gate = Arc::new(ParentGate {
         parent_store: session.services.thread_extension_data.level_id().to_owned(),
         calls: AtomicUsize::new(0),
         events: Arc::new(Mutex::new(Vec::new())),
+        constructor_derivations: Arc::new(AtomicUsize::new(0)),
     });
     let mut extensions = codex_extension_api::ExtensionRegistryBuilder::<Config>::new();
     extensions.turn_start_admission(gate.clone());
@@ -98,6 +122,8 @@ async fn expired_parent_refuses_input_and_trigger_but_queue_only_has_no_lease() 
     let (id, child) = harness.start_thread().await;
     let (parent, gate) = parent().await;
     let authority = crate::ParentTurnAuthority::capture(&parent, "ended-parent");
+    harness.control.ensure_v2_agent_loaded(harness.config.clone(), id, None, Some(&authority))
+        .await.unwrap();
     assert!(harness.control.send_input(id, text_input("refused"), Default::default(),
         Some(&authority)).await.is_err());
     let mail = |trigger| InterAgentCommunication::new(AgentPath::root(), AgentPath::root(),
@@ -113,6 +139,7 @@ async fn expired_parent_refuses_input_and_trigger_but_queue_only_has_no_lease() 
         }
     }).await.unwrap();
     assert_eq!(gate.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(gate.constructor_derivations.load(Ordering::SeqCst), 0);
     assert!(!child.session.input_queue.reserve_mailbox().has_turn_work());
     let weak = Arc::downgrade(&parent);
     drop(parent);

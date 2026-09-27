@@ -44,6 +44,7 @@ use codex_core_plugins::PluginsManager;
 use codex_exec_server::EnvironmentManager;
 use codex_extension_api::ExtensionDataInit;
 use codex_extension_api::ExtensionRegistry;
+use codex_extension_api::HostOperationWork;
 use codex_extension_api::LoadedUserInstructions;
 use codex_extension_api::ThreadInstructionsProvider;
 use codex_extension_api::UserInstructionsProvider;
@@ -409,6 +410,7 @@ fn effective_originator_value(
 }
 
 pub(crate) struct ResumeThreadWithHistoryOptions {
+    pub(crate) account_work: Option<Box<dyn HostOperationWork>>,
     pub(crate) config: Config,
     pub(crate) initial_history: InitialHistory,
     pub(crate) agent_control: LocalAgentControl,
@@ -1350,7 +1352,7 @@ impl ThreadManager {
         let config = parent.session.get_config().await.as_ref().clone();
         let agent_control = parent.session.services.agent_control.clone();
         agent_control
-            .ensure_v2_agent_loaded(config, child_thread_id, Some(parent))
+            .ensure_v2_agent_loaded(config, child_thread_id, Some(parent), None)
             .await
     }
 
@@ -1997,6 +1999,7 @@ impl ThreadManagerState {
         self: &Arc<Self>,
         config: Config,
         agent_control: LocalAgentControl,
+        account_work: Option<Box<dyn HostOperationWork>>,
     ) -> CodexResult<NewThread> {
         Box::pin(self.spawn_new_thread_with_source(
             config,
@@ -2010,6 +2013,7 @@ impl ThreadManagerState {
             /*inherited_environments*/ None,
             /*inherited_exec_policy*/ None,
             /*environments*/ None,
+            account_work,
         ))
         .await
     }
@@ -2028,9 +2032,11 @@ impl ThreadManagerState {
         inherited_environments: Option<TurnEnvironmentSnapshot>,
         inherited_exec_policy: Option<Arc<crate::exec_policy::ExecPolicyManager>>,
         environments: Option<Vec<TurnEnvironmentSelection>>,
+        account_work: Option<Box<dyn HostOperationWork>>,
     ) -> CodexResult<NewThread> {
         let client_mcp_extensions = self.client_mcp_extensions_for_child(parent_thread_id).await;
         let options = StartThreadOptions {
+            account_work,
             history_mode,
             session_source: Some(session_source),
             thread_source,
@@ -2053,6 +2059,7 @@ impl ThreadManagerState {
         options: ResumeThreadWithHistoryOptions,
     ) -> CodexResult<NewThread> {
         let ResumeThreadWithHistoryOptions {
+            account_work,
             config,
             initial_history,
             agent_control,
@@ -2080,6 +2087,7 @@ impl ThreadManagerState {
             thread_source,
             environments,
             client_mcp_extensions,
+            account_work,
             ..StartThreadOptions::new(config, None)
         };
         let mut request =
@@ -2106,9 +2114,11 @@ impl ThreadManagerState {
         inherited_exec_policy: Option<Arc<crate::exec_policy::ExecPolicyManager>>,
         environments: Option<Vec<TurnEnvironmentSelection>>,
         thread_extension_init: ExtensionDataInit,
+        account_work: Option<Box<dyn HostOperationWork>>,
     ) -> CodexResult<NewThread> {
         let client_mcp_extensions = self.client_mcp_extensions_for_child(parent_thread_id).await;
         let options = StartThreadOptions {
+            account_work,
             initial_history,
             history_mode,
             session_source: Some(session_source),

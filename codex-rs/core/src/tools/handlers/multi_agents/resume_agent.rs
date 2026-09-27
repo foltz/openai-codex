@@ -207,6 +207,7 @@ async fn try_resume_closed_agent(
             /*agent_role*/ None,
             /*task_name*/ None,
         )?,
+        Some(&crate::ParentTurnAuthority::capture(session, &turn.sub_id)),
     ))
     .await
     .map(|_| ())

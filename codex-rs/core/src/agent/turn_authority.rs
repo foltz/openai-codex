@@ -3,6 +3,7 @@
 use crate::CodexThread;
 use crate::session::session::Session;
 use codex_extension_api::TurnWorkRefused;
+use codex_extension_api::HostOperationWork;
 use codex_protocol::host_turn_work::HostTurnWork;
 use std::sync::Arc;
 use std::sync::Weak;
@@ -24,6 +25,19 @@ impl std::fmt::Debug for ParentTurnAuthority {
 impl ParentTurnAuthority {
     pub(crate) fn capture(session: &Arc<Session>, turn_id: &str) -> Self {
         Self { session: Arc::downgrade(session), turn_id: turn_id.to_owned() }
+    }
+
+    /// Capture finite constructor work while the exact parent turn is live.
+    /// The returned owner can cross retained polling and task boundaries;
+    /// this weak provenance itself remains uncounted.
+    pub(crate) fn derive_operation(
+        &self,
+    ) -> Result<Option<Box<dyn HostOperationWork>>, TurnWorkRefused> {
+        let parent = self.session.upgrade().ok_or(TurnWorkRefused::Unavailable)?;
+        let Some(host) = &parent.services.host_admission else {
+            return Ok(None);
+        };
+        host.derive_operation_work(&parent.services.thread_extension_data, &self.turn_id)
     }
 
     pub(crate) fn derive(

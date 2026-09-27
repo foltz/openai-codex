@@ -45,26 +45,42 @@ impl Session {
     }
 
     /// Waits on this session's refreshed server before tool execution is admitted.
-    pub(crate) async fn wait_for_mcp_server(self: &Arc<Self>, server: &str) {
-        self.refresh_mcp_if_dirty().await;
+    pub(crate) async fn wait_for_mcp_server(
+        self: &Arc<Self>,
+        turn: &TurnContext,
+        server: &str,
+    ) -> anyhow::Result<()> {
+        let work = self.turn_mcp_work(turn)?;
+        let access = work.as_deref().map_or(
+            codex_mcp::McpAttemptAccess::Unscoped,
+            codex_mcp::McpAttemptAccess::Admitted,
+        );
+        self.refresh_mcp_if_dirty_with_authority(access).await?;
         self.services
             .mcp_runtime
-            .wait_for_server_startup(server)
+            .wait_for_server_startup_with_authority(server, access)
             .await;
+        Ok(())
     }
 
     /// Captures this session's current MCP client and catalog for one tool call.
     pub(crate) async fn prepare_mcp_call(
         self: &Arc<Self>,
+        turn: &TurnContext,
         server: &str,
         tool: &str,
-    ) -> Option<PreparedMcpCall> {
-        self.refresh_mcp_if_dirty().await;
-        self.services
+    ) -> anyhow::Result<Option<PreparedMcpCall>> {
+        let work = self.turn_mcp_work(turn)?;
+        let access = work.as_deref().map_or(
+            codex_mcp::McpAttemptAccess::Unscoped,
+            codex_mcp::McpAttemptAccess::Admitted,
+        );
+        self.refresh_mcp_if_dirty_with_authority(access).await?;
+        Ok(self.services
             .mcp_runtime
-            .current_binding_for_call(server)
-            .await?
-            .prepare_call(server, tool)
+            .current_binding_for_call_with_authority(server, access)
+            .await
+            .and_then(|binding| binding.prepare_call(server, tool)))
     }
 
     pub(super) async fn latest_mcp_desired_state(

@@ -9,6 +9,7 @@ use crate::function_tool::FunctionCallError;
 use crate::mcp_tool_call::handle_mcp_tool_call;
 use crate::original_image_detail::can_request_original_image_detail;
 use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 use crate::tools::context::McpToolOutput;
 use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
@@ -180,10 +181,12 @@ impl McpHandler {
         let prepared_mcp_call = invocation
             .session
             .prepare_mcp_call(
+                &invocation.turn,
                 &self.tool_info.server_name,
                 self.tool_info.tool.name.as_ref(),
             )
-            .await;
+            .await
+            .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
         // Use the executed call's binding; a later catalog refresh must not change eligibility.
         let result_metadata_capture_allowed = invocation
             .session
@@ -282,11 +285,18 @@ impl CoreToolRuntime for McpHandler {
         )
     }
 
-    fn wait_until_ready<'a>(&'a self, session: &'a Arc<Session>) -> Option<BoxFuture<'a, ()>> {
+    fn wait_until_ready<'a>(
+        &'a self,
+        session: &'a Arc<Session>,
+        turn: &'a TurnContext,
+    ) -> Option<BoxFuture<'a, ()>> {
         Some(Box::pin(async move {
-            session
-                .wait_for_mcp_server(&self.tool_info.server_name)
-                .await;
+            if let Err(error) = session
+                .wait_for_mcp_server(turn, &self.tool_info.server_name)
+                .await
+            {
+                tracing::warn!("MCP tool readiness failed: {error:#}");
+            }
         }))
     }
 

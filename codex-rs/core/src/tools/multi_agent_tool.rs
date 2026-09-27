@@ -2,6 +2,7 @@
 //! Parameter schemas retain harness-owned encryption annotations; execution is unchanged.
 
 use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 use crate::tools::context::ToolInvocation;
 use crate::tools::registry::CoreToolRuntime;
 use codex_tools::JsonSchema;
@@ -124,8 +125,12 @@ impl ToolExecutor<ToolInvocation> for MultiAgentV2ToolOverrides {
 }
 
 impl CoreToolRuntime for MultiAgentV2ToolOverrides {
-    fn wait_until_ready<'a>(&'a self, session: &'a Arc<Session>) -> Option<BoxFuture<'a, ()>> {
-        self.handler.wait_until_ready(session)
+    fn wait_until_ready<'a>(
+        &'a self,
+        session: &'a Arc<Session>,
+        turn: &'a TurnContext,
+    ) -> Option<BoxFuture<'a, ()>> {
+        self.handler.wait_until_ready(session, turn)
     }
 
     fn matches_kind(&self, payload: &crate::tools::context::ToolPayload) -> bool {

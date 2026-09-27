@@ -62,7 +62,11 @@ impl ToolExecutor<ToolInvocation> for ReadinessTestHandler {
 }
 
 impl CoreToolRuntime for ReadinessTestHandler {
-    fn wait_until_ready<'a>(&'a self, _session: &'a Arc<Session>) -> Option<BoxFuture<'a, ()>> {
+    fn wait_until_ready<'a>(
+        &'a self,
+        _session: &'a Arc<Session>,
+        _turn: &'a TurnContext,
+    ) -> Option<BoxFuture<'a, ()>> {
         Some(Box::pin(async {
             self.readiness_waits.fetch_add(1, Ordering::Relaxed);
         }))
@@ -374,7 +378,7 @@ fn registry_allows_identical_names_in_different_namespaces() {
 
 #[tokio::test]
 async fn readiness_selects_exact_tool_with_registry_owned_exposure() {
-    let (session, _turn) = crate::session::tests::make_session_and_context().await;
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
     let session = Arc::new(session);
     let plain_name = codex_tools::ToolName::plain("echo");
     let namespaced_name = codex_tools::ToolName::namespaced("mcp__server__", "echo");
@@ -382,7 +386,7 @@ async fn readiness_selects_exact_tool_with_registry_owned_exposure() {
         TestHandler {
             tool_name: plain_name.clone(),
         }
-        .wait_until_ready(&session)
+        .wait_until_ready(&session, &turn)
         .is_none()
     );
     let plain_readiness_waits = Arc::new(AtomicUsize::new(0));
@@ -405,7 +409,7 @@ async fn readiness_selects_exact_tool_with_registry_owned_exposure() {
     registry
         .tool(&plain_name)
         .expect("plain runtime should be registered")
-        .wait_until_ready(&session)
+        .wait_until_ready(&session, &turn)
         .expect("plain runtime should provide a readiness wait")
         .await;
     assert_eq!(
@@ -419,7 +423,7 @@ async fn readiness_selects_exact_tool_with_registry_owned_exposure() {
     registry
         .tool(&namespaced_name)
         .expect("namespaced runtime should be registered")
-        .wait_until_ready(&session)
+        .wait_until_ready(&session, &turn)
         .expect("namespaced runtime should forward its readiness wait")
         .await;
     assert_eq!(

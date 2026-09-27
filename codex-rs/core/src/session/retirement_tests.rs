@@ -919,6 +919,10 @@ async fn ordinary_observer_replays_suspension_persistence_failure() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "polling suspension cleanup while admission is locked proves cancellation retains the same receipt"
+)]
 async fn cancelled_suspension_observer_retains_its_cleanup_sequence() {
     let (session, _) = super::super::tests::make_session_and_context().await;
     let session = Arc::new(session);

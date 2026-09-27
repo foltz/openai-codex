@@ -410,6 +410,10 @@ async fn processor_thread_shutdown_facade_retains_first_attempt() -> Result<()> 
 }
 
 #[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "the fixture exclusively observes worker shutdown under its owner lock before testing background custody"
+)]
 async fn background_drain_timeout_retains_work_and_reobserves_completion() -> Result<()> {
     use super::ProcessorBackgroundShutdown;
     use crate::models_refresh_worker::ModelsRefreshShutdown;

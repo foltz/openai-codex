@@ -4362,13 +4362,14 @@ mod tests {
             assert_eq!(success.phase, ManagedTransitionPhase::Succeeded);
             assert_eq!(success.auth_revision, original.auth_revision);
             assert_eq!(resets.calls.load(Ordering::SeqCst), 3);
-            let state = coordinator.state.lock().await;
-            assert!(state.pending_reset.is_none());
-            assert!(
-                state.auth_authority_available,
-                "successful pending-reset recovery must restore the authority latch"
-            );
-            drop(state);
+            {
+                let state = coordinator.state.lock().await;
+                assert!(state.pending_reset.is_none());
+                assert!(
+                    state.auth_authority_available,
+                    "successful pending-reset recovery must restore the authority latch"
+                );
+            }
             assert!(coordinator.try_acquire_account_work_permit().is_some());
             assert_eq!(
                 coordinator

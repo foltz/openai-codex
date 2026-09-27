@@ -9,6 +9,10 @@ use pretty_assertions::assert_eq;
 use std::sync::Arc;
 
 #[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "holding the lifecycle table proves independent runtime cleanup and retained observation after cancellation"
+)]
 async fn processor_shutdown_lifecycle_lock_cannot_starve_runtime_cleanup() {
     let (_home, manager, config) = crate::request_processors::thread_shutdown_fixture().await;
     let started = manager
@@ -208,6 +212,10 @@ async fn acquisition_and_retirement_claim_have_one_atomic_winner() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "polling both contenders while their authority lock is held establishes deterministic FIFO race order"
+)]
 async fn production_claim_and_acquire_have_one_winner_in_both_lock_orders() {
     for acquire_first in [true, false] {
         let (_home, core, config) = crate::request_processors::thread_shutdown_fixture().await;

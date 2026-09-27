@@ -1520,17 +1520,17 @@ mod tests {
         ));
         let thread_id = ThreadId::default();
         let mut guard = crate::LiveThreadInitGuard::default();
-        match LiveThread::create_with_inherited_model_context(
-            store,
-            create_thread_params(thread_id),
-            &[user_message_item("inherited")],
-            &mut guard,
-        )
-        .await
-        {
-            Ok(_) => panic!("inherited append should fail"),
-            Err(_) => {}
-        };
+        assert!(
+            LiveThread::create_with_inherited_model_context(
+                store,
+                create_thread_params(thread_id),
+                &[user_message_item("inherited")],
+                &mut guard,
+            )
+            .await
+            .is_err(),
+            "inherited append should fail"
+        );
         assert!(
             guard.as_ref().is_some(),
             "opened live thread remains in custody"

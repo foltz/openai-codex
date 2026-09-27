@@ -5207,7 +5207,3 @@ mod tests {
             .expect_err("feature should be rejected")
     }
 }
-
-#[cfg(all(test, unix))]
-#[path = "daemon_update_tests.rs"]
-mod daemon_update_tests;

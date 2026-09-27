@@ -258,6 +258,7 @@ async fn guardian_review_event_ingests_custom_fact_with_optional_target_item() {
                     capabilities: Some(InitializeCapabilities {
                         experimental_api: false,
                         request_attestation: false,
+                        interactive_client: false,
                         opt_out_notification_methods: None,
                         mcp_server_openai_form_elicitation: false,
                         extensions: None,

@@ -1407,14 +1407,15 @@ mod tests {
 
         manager.remove_connection(connection).await;
 
-        let state = manager.state.lock().await;
-        assert!(!state.retention_grants_by_thread.contains_key(&thread_id));
-        assert!(
-            !state
-                .retention_threads_by_principal
-                .contains_key(&principal)
-        );
-        drop(state);
+        {
+            let state = manager.state.lock().await;
+            assert!(!state.retention_grants_by_thread.contains_key(&thread_id));
+            assert!(
+                !state
+                    .retention_threads_by_principal
+                    .contains_key(&principal)
+            );
+        }
         assert_eq!(
             manager
                 .release_retention(thread_id, principal, &grant_id)

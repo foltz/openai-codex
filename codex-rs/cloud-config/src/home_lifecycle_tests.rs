@@ -53,6 +53,10 @@ async fn completion_rechecks_generation_even_if_work_returns_ready() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "the fixture holds publication custody across a blocked write to prove reset waits for it"
+)]
 async fn reset_waits_for_an_admitted_publication_even_after_its_caller_drops() {
     let lifecycle = Arc::new(HomeLifecycle::default());
     let (entered, started) = tokio::sync::oneshot::channel();

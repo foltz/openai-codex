@@ -141,6 +141,7 @@ async fn compaction_event_ingests_custom_fact() {
                     capabilities: Some(InitializeCapabilities {
                         experimental_api: false,
                         request_attestation: false,
+                        interactive_client: false,
                         opt_out_notification_methods: None,
                         mcp_server_openai_form_elicitation: false,
                         extensions: None,

@@ -63,6 +63,7 @@ impl Session {
                 })
                 .await;
         }
+        self.finish_isolated_turn_work(turn_store.level_id());
     }
 
     pub(crate) async fn emit_thread_idle_lifecycle_if_idle(&self, cause: ThreadIdleCause) {
@@ -107,6 +108,7 @@ impl Session {
                 })
                 .await;
         }
+        self.finish_isolated_turn_work(turn_store.level_id());
     }
 
     pub(crate) async fn emit_turn_error_lifecycle(

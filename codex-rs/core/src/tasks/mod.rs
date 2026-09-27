@@ -585,8 +585,7 @@ impl Session {
             let mut host_work = if mailbox.has_turn_work() {
                 None
             } else {
-                match self.services.extensions.admit_turn_work(
-                    &self.services.thread_extension_data,
+                match self.admit_turn_work(
                     self.turn_work_termination(),
                 ) {
                     Ok(work) => work,

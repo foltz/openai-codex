@@ -2,8 +2,10 @@ use super::*;
 use futures::FutureExt;
 use pretty_assertions::assert_eq;
 
+#[test_case::test_case(false; "inherited child")]
+#[test_case::test_case(true; "isolated child")]
 #[tokio::test]
-async fn detached_operation_constructs_and_starts_child_after_request_and_parent_end() -> anyhow::Result<()> {
+async fn detached_operation_constructs_and_starts_child_after_request_and_parent_end(isolated: bool) -> anyhow::Result<()> {
     use codex_extension_api::ExtensionRegistryBuilder;
     use codex_protocol::protocol::EventMsg;
     use codex_protocol::user_input::UserInput;
@@ -20,7 +22,10 @@ async fn detached_operation_constructs_and_starts_child_after_request_and_parent
     }));
     extensions.turn_lifecycle_contributor(Arc::new(crate::account_turn_admission::AccountTurnLifecycle));
     let server = responses::start_mock_server().await;
-    let response = responses::mount_sse_once(&server, responses::sse_completed("child")).await;
+    let response = responses::mount_sse_sequence(&server, vec![
+        responses::sse_completed("child"),
+        responses::sse_completed("own-turn"),
+    ]).await;
     let test = test_codex().with_extensions(Arc::new(extensions.build()))
         .build_with_auto_env(&server).await?;
     let operation = crate::account_turn_admission::within_request(permits.try_acquire(), async {
@@ -38,10 +43,14 @@ async fn detached_operation_constructs_and_starts_child_after_request_and_parent
     assert!(test.codex.shutdown_and_wait_with_cleanup().await.is_complete());
 
     // There is no live originating request or turn to rediscover here.
-    let child = test.thread_manager.start_thread(codex_core::StartThreadOptions {
+    let mut options = codex_core::StartThreadOptions {
         account_work: Some(operation.derive_operation().unwrap()),
         ..codex_core::StartThreadOptions::new(test.config.clone(), None)
-    }).await?;
+    };
+    if isolated {
+        options.thread_extension_init.insert(codex_extension_api::SessionIsolation::Isolated);
+    }
+    let child = test.thread_manager.start_thread(options).await?;
     let input = || codex_core::TurnInputRequest::user_input(vec![UserInput::Text {
         text: "consolidate".to_owned(),
         text_elements: Vec::new(),
@@ -52,10 +61,16 @@ async fn detached_operation_constructs_and_starts_child_after_request_and_parent
         codex_core::StartIfIdleSubmission::Started { .. }));
     wait_for_event(&child.thread, |event| matches!(event, EventMsg::TurnComplete(_))).await;
     assert_eq!(response.requests().len(), 1);
-    assert!(child.thread.shutdown_and_wait_with_cleanup().await.is_complete());
-    assert_eq!(permits.admitted_count(), 1, "only the finite operation remains");
+    assert_eq!(permits.admitted_count(), 1, "completed child must hold no idle turn permit");
     drop(operation);
     assert_eq!(permits.admitted_count(), 0);
+    permits.reopen();
+    assert!(matches!(child.thread.start_turn_if_idle(input()).await?,
+        codex_core::StartIfIdleSubmission::Started { .. }));
+    wait_for_event(&child.thread, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    assert_eq!(response.requests().len(), 2);
+    assert_eq!(permits.admitted_count(), 0, "own-admitted child must release before shutdown");
+    assert!(child.thread.shutdown_and_wait_with_cleanup().await.is_complete());
     Ok(())
 }
 

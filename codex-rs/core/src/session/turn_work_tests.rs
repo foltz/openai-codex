@@ -159,6 +159,7 @@ async fn mailbox_retries_after_reopen_without_an_unrelated_submission(reopen: bo
     builder.turn_start_admission(gate.clone());
     builder.turn_lifecycle_contributor(start.clone());
     session.services.extensions = Arc::new(builder.build());
+    session.services.host_admission = session.services.extensions.host_admission();
     let models = Arc::new(RefreshCounter {
         inner: Arc::clone(&session.services.models_manager),
         calls: AtomicUsize::new(0),
@@ -204,6 +205,7 @@ async fn refused_mailbox_start_preserves_mail_without_model_refresh(trigger: boo
     let mut builder = codex_extension_api::ExtensionRegistryBuilder::<crate::config::Config>::new();
     builder.turn_start_admission(Arc::new(Gate { closed: true, events: Arc::clone(&events) }));
     session.services.extensions = Arc::new(builder.build());
+    session.services.host_admission = session.services.extensions.host_admission();
     let models = Arc::new(RefreshCounter { inner: Arc::clone(&session.services.models_manager), calls: AtomicUsize::new(0) });
     session.services.models_manager = models.clone();
     if !trigger {
@@ -231,6 +233,7 @@ async fn mailbox_preparation_owns_its_admission(carried: bool) {
     builder.turn_start_admission(Arc::new(Gate { closed: carried, events: Arc::clone(&events) }));
     builder.turn_lifecycle_contributor(hold.clone());
     session.services.extensions = Arc::new(builder.build());
+    session.services.host_admission = session.services.extensions.host_admission();
     let session = Arc::new(session);
     let mail = InterAgentCommunication::new(codex_protocol::AgentPath::root(), codex_protocol::AgentPath::root(), Vec::new(), "queued".into(), /*trigger_turn*/ true);
     let work = carried.then(|| Box::new(Work { events: Arc::clone(&events), retained: false }) as Box<dyn HostTurnWork>);
@@ -257,6 +260,7 @@ async fn installed_mailbox_turn_transfers_fresh_work_to_terminal_custody() {
     builder.turn_start_admission(Arc::new(Gate { closed: false, events: Arc::clone(&events) }));
     builder.turn_lifecycle_contributor(Arc::new(HoldRunningTurn));
     session.services.extensions = Arc::new(builder.build());
+    session.services.host_admission = session.services.extensions.host_admission();
     let session = Arc::new(session);
     let mail = InterAgentCommunication::new(codex_protocol::AgentPath::root(), codex_protocol::AgentPath::root(), Vec::new(), "queued".into(), /*trigger_turn*/ true);
     session.input_queue.enqueue_mailbox_communication(mail, Default::default()).await;

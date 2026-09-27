@@ -368,8 +368,7 @@ impl CodexThread {
         // Traced app-server requests must retain the same account-work custody
         // as direct submissions before crossing into the session loop.
         let op = if matches!(&op, Op::Compact | Op::Review { .. }) {
-            match self.session.services.extensions.admit_turn_work(
-                &self.session.services.thread_extension_data,
+            match self.session.admit_turn_work(
                 Box::pin(self.termination_receipt()),
             ).map_err(|_| CodexErr::Fatal("account work admission is closed".to_string()))? {
                 Some(work) => {
@@ -470,8 +469,7 @@ impl CodexThread {
         &self,
         request: RecoverTurnRequest,
     ) -> CodexResult<StartIfIdleSubmission> {
-        let host_work = match self.session.services.extensions.admit_turn_work(
-            &self.session.services.thread_extension_data,
+        let host_work = match self.session.admit_turn_work(
             Box::pin(self.termination_receipt()),
         ) {
             Ok(work) => work,
@@ -587,8 +585,7 @@ impl CodexThread {
         let host_work = if matches!(mode, TurnInputMode::Steer { .. }) {
             None
         } else {
-            match self.session.services.extensions.admit_turn_work(
-                &self.session.services.thread_extension_data,
+            match self.session.admit_turn_work(
                 Box::pin(self.termination_receipt()),
             ) {
                 Ok(work) => work,

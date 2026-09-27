@@ -3,6 +3,8 @@
 
 use super::Session;
 use super::SessionLoopOutcome;
+use codex_extension_api::TurnWorkRefused;
+use codex_protocol::host_turn_work::HostTurnWork;
 use futures::future::BoxFuture;
 use futures::future::Shared;
 
@@ -36,6 +38,29 @@ impl MailboxWorkRetry {
 pub(super) struct SessionLoopWorkReceipt(pub(super) Shared<BoxFuture<'static, SessionLoopOutcome>>);
 
 impl Session {
+    /// Contributor isolation must not bypass the process host's admission.
+    pub(crate) fn admit_turn_work(
+        &self,
+        termination: BoxFuture<'static, ()>,
+    ) -> Result<Option<Box<dyn HostTurnWork>>, TurnWorkRefused> {
+        match &self.services.host_admission {
+            Some(host) => host.admit_turn_work(&self.services.thread_extension_data, termination),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) fn finish_isolated_turn_work(&self, turn_id: &str) {
+        // Non-isolated sessions already forward through their host lifecycle
+        // contributor. Isolated sessions have no such contributor, and a
+        // public resumed turn may have no owner forwarding its terminal event.
+        if self.services.extensions.host_admission().is_none()
+            && let Some(host) = &self.services.host_admission
+        {
+            // Logical terminal only, not evidence of physical task cleanup.
+            host.turn_work_terminal(&self.services.thread_extension_data, turn_id);
+        }
+    }
+
     pub(crate) fn turn_work_termination(&self) -> BoxFuture<'static, ()> {
         let receipt = self.services.thread_extension_data.get::<SessionLoopWorkReceipt>();
         Box::pin(async move {

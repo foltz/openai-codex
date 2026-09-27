@@ -65,6 +65,7 @@ async fn fixture() -> (CodexThread, async_channel::Receiver<Submission>, Arc<Adm
     let mut extensions = ExtensionRegistryBuilder::new();
     extensions.turn_start_admission(gate.clone());
     session.services.extensions = Arc::new(extensions.build());
+    session.services.host_admission = session.services.extensions.host_admission();
     let configured = SessionConfiguredEvent {
         session_id: session.session_id(),
         thread_id: session.thread_id,

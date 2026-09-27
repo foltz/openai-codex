@@ -84,6 +84,7 @@ pub(crate) struct InputQueue {
     /// a submission sender, this cannot keep that loop's channel open.
     pub(crate) completion_wake: tokio::sync::Notify,
     pub(crate) work_retry: super::turn_work::MailboxWorkRetry,
+    pub(crate) preparation: crate::tasks::MailboxPreparationSlot,
 }
 
 impl InputQueue {
@@ -94,6 +95,7 @@ impl InputQueue {
             activity_tx,
             completion_wake: tokio::sync::Notify::new(),
             work_retry: super::turn_work::MailboxWorkRetry::default(),
+            preparation: crate::tasks::MailboxPreparationSlot::default(),
         }
     }
 

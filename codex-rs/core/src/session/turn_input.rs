@@ -508,7 +508,7 @@ async fn start_if_idle(
         }
     }
     session
-        .start_task(turn_context, task_input, RegularTask::new())
+        .start_reserved_task(turn_context, task_input, RegularTask::new(), turn_state)
         .await?;
     Ok(TurnInputSubmission::Started {
         turn_id: submission_id,

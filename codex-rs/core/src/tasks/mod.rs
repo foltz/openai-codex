@@ -1,5 +1,6 @@
 mod compact;
 mod lifecycle;
+mod preparation;
 mod regular;
 mod retirement;
 mod review;
@@ -61,6 +62,7 @@ use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 pub(crate) use compact::CompactTask;
+pub(crate) use preparation::MailboxPreparationSlot;
 pub(crate) use regular::RegularTask;
 pub(crate) use retirement::TaskAbortHandle;
 pub(crate) use retirement::TaskJoinOutcome;
@@ -75,6 +77,11 @@ const TASK_COMPACT_METRIC: &str = "codex.task.compact";
 static ACTIVE_TURNS: Gauge = Gauge::new("core.turns.active");
 
 pub(crate) type SessionTaskResult = CodexResult<Option<String>>;
+
+enum TaskReservation {
+    New,
+    Existing(Arc<Mutex<TurnState>>),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InterruptedTurnHistoryMarker {
@@ -303,6 +310,7 @@ impl Session {
         input: Vec<TurnInput>,
         task: T,
     ) -> CodexResult<()> {
+        self.input_queue.preparation.cancel_for_replacement();
         self.abort_all_tasks(TurnAbortReason::Replaced).await;
         self.clear_connector_selection().await;
         self.start_task(turn_context, input, task).await
@@ -315,7 +323,20 @@ impl Session {
         task: T,
     ) -> CodexResult<()> {
         let mailbox = self.input_queue.reserve_mailbox();
-        self.start_task_with_mailbox(turn_context, input, task, mailbox).await
+        self.start_task_with_mailbox(turn_context, input, task, mailbox, TaskReservation::New).await
+    }
+
+    pub(crate) async fn start_reserved_task<T: SessionTask>(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        input: Vec<TurnInput>,
+        task: T,
+        turn_state: Arc<Mutex<TurnState>>,
+    ) -> CodexResult<()> {
+        let mailbox = self.input_queue.reserve_mailbox();
+        self.start_task_with_mailbox(
+            turn_context, input, task, mailbox, TaskReservation::Existing(turn_state),
+        ).await
     }
 
     #[expect(
@@ -328,7 +349,36 @@ impl Session {
         input: Vec<TurnInput>,
         task: T,
         mut mailbox: crate::session::MailboxReservation,
+        reservation: TaskReservation,
     ) -> CodexResult<()> {
+        let turn_state = {
+            let mut active = self.active_turn.lock().await;
+            if self.task_admission_closed.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(CodexErr::Fatal("thread task admission is closed".to_string()));
+            }
+            if active.as_ref().is_some_and(|turn| turn.task.is_some()) {
+                return Err(CodexErr::Fatal("thread already has an active task".to_string()));
+            }
+            match reservation {
+                TaskReservation::New => {
+                    // Preparation can register while replacement awaits the
+                    // old task's abort. Cancel under the registration lock
+                    // before replacing its task-less slot. A distinct identity
+                    // prevents the cancelled owner from clearing our slot.
+                    self.input_queue.preparation.cancel_for_replacement();
+                    let turn = ActiveTurn::default();
+                    let turn_state = Arc::clone(&turn.turn_state);
+                    *active = Some(turn);
+                    turn_state
+                }
+                TaskReservation::Existing(expected) => {
+                    if !active.as_ref().is_some_and(|turn| Arc::ptr_eq(&turn.turn_state, &expected)) {
+                        return Err(CodexErr::Fatal("thread task reservation changed".to_string()));
+                    }
+                    expected
+                }
+            }
+        };
         self.activate_plugin_selection(&turn_context).await;
         // Inherited or recovered roots are applied before task start. Otherwise this
         // task owns its turn, including background work. Later mail cannot change it.
@@ -352,30 +402,21 @@ impl Session {
         let done = Arc::new(Notify::new());
 
         mailbox.append(self.input_queue.reserve_mailbox());
-        let turn_state = {
-            let mut active = self.active_turn.lock().await;
-            if self
-                .task_admission_closed
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
-                return Err(CodexErr::Fatal("thread task admission is closed".to_string()));
-            }
-            if active.as_ref().is_some_and(|turn| turn.task.is_some()) {
-                return Err(CodexErr::Fatal("thread already has an active task".to_string()));
-            }
-            let turn = active.get_or_insert_with(ActiveTurn::default);
-            debug_assert!(turn.task.is_none());
-            Arc::clone(&turn.turn_state)
-        };
         turn_state.lock().await.token_usage_at_turn_start = token_usage_at_turn_start.clone();
-        // This phase has no fallible refresh or authority lookup. Any future
-        // pre-registration refusal must also preserve reservation cleanup.
-        self.emit_turn_start_lifecycle(
+        // This phase is currently infallible. Keep owner-only cleanup if a
+        // future contributor preparation makes it refuse before installation.
+        if let Err(error) = self.emit_turn_start_lifecycle(
             turn_context.as_ref(),
             Some(&token_usage_at_turn_start),
             codex_extension_api::TurnStartPhase::BeforeTaskRegistration,
         )
-        .await?;
+        .await {
+            drop(mailbox);
+            if self.clear_task_reservation(&turn_state).await {
+                self.input_queue.completion_wake.notify_one();
+            }
+            return Err(error);
+        }
 
         let mut active = self.active_turn.lock().await;
         if self
@@ -520,7 +561,7 @@ impl Session {
             return;
         }
 
-        let (turn_state, mut mailbox, host_work) = {
+        let (turn_state, mut mailbox, host_work, preparation) = {
             let mut active_turn = self.active_turn.lock().await;
             if self
                 .task_admission_closed
@@ -562,9 +603,14 @@ impl Session {
                 work.bind_submission(&sub_id);
             }
             let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
-            (Arc::clone(&active_turn.turn_state), mailbox, host_work)
+            (Arc::clone(&active_turn.turn_state), mailbox, host_work,
+                self.input_queue.preparation.register())
         };
 
+        // The loop polls this future alongside dispatch. Cancel the entire
+        // preparation, including discovery and commit lock waits, before it
+        // can resume callbacks after a replacer has started its own turn.
+        let prepare = async {
         self.services
             .models_manager
             .refresh_after_auth_change(self.get_config().await.http_client_factory())
@@ -577,7 +623,7 @@ impl Session {
             .as_ref()
             .is_none_or(|turn| turn.task.is_some() || !Arc::ptr_eq(&turn.turn_state, &turn_state))
         {
-            return;
+            return false;
         }
         mailbox.append(self.input_queue.reserve_mailbox());
         let (mut start_options, initiating_agent_path) = mailbox.start_metadata();
@@ -614,11 +660,41 @@ impl Session {
         self.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
             .await;
         // Commit to the actual installed turn only after final admission.
-        if self.start_task_with_mailbox(turn_context, Vec::new(), RegularTask::new(), mailbox)
-            .await.is_ok()
-            && let Some(work) = host_work
-        {
-            work.retain_until_terminal();
+        self.start_task_with_mailbox(
+            turn_context, Vec::new(), RegularTask::new(), mailbox,
+            TaskReservation::Existing(Arc::clone(&turn_state)),
+        ).await.is_ok()
+        };
+        let started = tokio::select! {
+            biased;
+            _ = preparation.cancelled() => false,
+            started = prepare => started,
+        };
+        if started {
+            if let Some(work) = host_work {
+                work.retain_until_terminal();
+            }
+        } else {
+            // The losing future is already dropped: its private mail and
+            // carried authority are restored before this cleanup can wake it.
+            let cleared = self.clear_task_reservation(&turn_state).await;
+            if (cleared || preparation.was_replaced())
+                && !self.task_admission_closed.load(std::sync::atomic::Ordering::Acquire)
+            {
+                self.input_queue.completion_wake.notify_one();
+            }
+        }
+    }
+
+    async fn clear_task_reservation(&self, expected: &Arc<Mutex<TurnState>>) -> bool {
+        let mut active = self.active_turn.lock().await;
+        if active.as_ref().is_some_and(|turn| {
+            turn.task.is_none() && Arc::ptr_eq(&turn.turn_state, expected)
+        }) {
+            active.take();
+            true
+        } else {
+            false
         }
     }
 
@@ -695,7 +771,9 @@ impl Session {
         self.input_queue.clear_pending(&active_turn).await;
 
         if reason == TurnAbortReason::Interrupted {
-            self.maybe_start_turn_for_pending_work().await;
+            // Guardian interruption runs in a separate task. Only the
+            // submission loop may poll preparation alongside replacement.
+            self.input_queue.completion_wake.notify_one();
         }
 
         true

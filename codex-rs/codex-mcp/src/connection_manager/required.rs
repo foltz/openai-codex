@@ -13,6 +13,10 @@ impl McpConnectionSet {
     /// The manager must already be reachable through [`crate::McpRuntime`] so
     /// startup-time elicitation can resolve while validation waits.
     pub(crate) async fn validate_required_servers(&self) -> Result<()> {
+        self.validate_required_servers_with_authority(crate::McpAttemptAccess::Unscoped).await
+    }
+
+    pub(crate) async fn validate_required_servers_with_authority(&self, access: crate::McpAttemptAccess<'_>) -> Result<()> {
         let failures = async {
             let mut failures = Vec::new();
             for server_name in &self.required_servers {
@@ -28,7 +32,7 @@ impl McpConnectionSet {
                     continue;
                 }
 
-                match view.connection.client().await {
+                match view.connection.client_with_authority(access).await {
                     Ok(_) => {}
                     Err(error) => failures.push(McpStartupFailure {
                         server: server_name.clone(),

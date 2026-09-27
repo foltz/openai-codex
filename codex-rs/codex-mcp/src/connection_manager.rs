@@ -1016,10 +1016,18 @@ impl McpConnectionSet {
     }
 
     pub(crate) async fn wait_for_server_startup(&self, server_name: &str) -> bool {
+        self.wait_for_server_startup_with_authority(server_name, crate::McpAttemptAccess::Unscoped).await
+    }
+
+    pub(crate) async fn wait_for_server_startup_with_authority(
+        &self,
+        server_name: &str,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> bool {
         let Some(view) = self.servers.get(server_name) else {
             return false;
         };
-        view.connection.client.ready_transport().is_some() || view.connection.client().await.is_ok()
+        view.connection.client.ready_transport().is_some() || view.connection.client_with_authority(access).await.is_ok()
     }
 
     /// Stop all MCP clients owned by this manager and terminate stdio server processes.
@@ -1077,9 +1085,24 @@ impl McpConnectionSet {
         tool: &str,
         environment_id: Option<&str>,
         arguments: Option<serde_json::Value>,
+        meta: Option<serde_json::Value>,
+        requested_timeout: Option<Duration>,
+        wait_for_server: bool,
+    ) -> Result<CallToolResult> {
+        self.call_tool_with_authority(server, tool, environment_id, arguments, meta, requested_timeout, wait_for_server, crate::McpAttemptAccess::Unscoped).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn call_tool_with_authority(
+        &self,
+        server: &str,
+        tool: &str,
+        environment_id: Option<&str>,
+        arguments: Option<serde_json::Value>,
         mut meta: Option<serde_json::Value>,
         requested_timeout: Option<Duration>,
         wait_for_server: bool,
+        access: crate::McpAttemptAccess<'_>,
     ) -> Result<CallToolResult> {
         let view = self
             .servers
@@ -1100,7 +1123,7 @@ impl McpConnectionSet {
         }
         let client = if wait_for_server {
             view.connection
-                .client()
+                .client_with_authority(access)
                 .await
                 .context("failed to get client")?
         } else {

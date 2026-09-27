@@ -5150,6 +5150,8 @@ while IFS= read -r request; do
     case "$request" in
         *'"initialize"'*) result='{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"retirement-proof","version":"1"}}' ;;
         *'"tools/list"'*) result='{"tools":[{"name":"proof","description":"retirement proof","inputSchema":{"type":"object"}}]}' ;;
+        *'"resources/list"'*) result='{"resources":[{"uri":"test://proof","name":"proof"}]}' ;;
+        *'"resources/templates/list"'*) result='{"resourceTemplates":[{"uriTemplate":"test://{id}","name":"proof-template"}]}' ;;
         *) result='{}' ;;
     esac
     printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$result"

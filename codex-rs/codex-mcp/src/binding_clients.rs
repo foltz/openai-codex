@@ -19,16 +19,17 @@ use crate::rmcp_client::ManagedClient;
 
 /// The ready clients captured for one model step.
 pub(crate) struct McpBindingClients {
-    clients: HashMap<String, Arc<ManagedClient>>,
+    // Only uncounted requirements may survive on an idle binding.
+    clients: HashMap<String, (Arc<ManagedClient>, crate::McpAttemptRequirement)>,
 }
 
 impl McpBindingClients {
-    pub(crate) fn new(clients: HashMap<String, Arc<ManagedClient>>) -> Self {
+    pub(crate) fn new(clients: HashMap<String, (Arc<ManagedClient>, crate::McpAttemptRequirement)>) -> Self {
         Self { clients }
     }
 
     pub(crate) fn client(&self, server: &str) -> Option<Arc<ManagedClient>> {
-        self.clients.get(server).cloned()
+        self.clients.get(server).map(|(client, _)| Arc::clone(client))
     }
 
     pub(crate) async fn list_resources(
@@ -80,9 +81,10 @@ impl McpBindingClients {
     pub(crate) async fn list_all_resources(
         &self,
         include_server: impl Fn(&str) -> bool,
+        access: crate::McpAttemptAccess<'_>,
     ) -> HashMap<String, Vec<Resource>> {
         let mut join_set = JoinSet::new();
-        for (server_name, managed) in self
+        for (server_name, (managed, requirement)) in self
             .clients
             .iter()
             .filter(|(server_name, _)| include_server(server_name))
@@ -90,7 +92,12 @@ impl McpBindingClients {
             let server_name = server_name.clone();
             let client = Arc::clone(&managed.client);
             let timeout = managed.tool_timeout;
+            let Ok(work) = requirement.derive(access) else {
+                warn!("MCP resource listing account work is unavailable for '{server_name}'");
+                continue;
+            };
             join_set.spawn(async move {
+                let _work = work;
                 let resources = collect_paginated("resources/list", timeout, |params| {
                     let client = Arc::clone(&client);
                     async move {
@@ -108,9 +115,10 @@ impl McpBindingClients {
     pub(crate) async fn list_all_resource_templates(
         &self,
         include_server: impl Fn(&str) -> bool,
+        access: crate::McpAttemptAccess<'_>,
     ) -> HashMap<String, Vec<ResourceTemplate>> {
         let mut join_set = JoinSet::new();
-        for (server_name, managed) in self
+        for (server_name, (managed, requirement)) in self
             .clients
             .iter()
             .filter(|(server_name, _)| include_server(server_name))
@@ -118,7 +126,12 @@ impl McpBindingClients {
             let server_name = server_name.clone();
             let client = Arc::clone(&managed.client);
             let timeout = managed.tool_timeout;
+            let Ok(work) = requirement.derive(access) else {
+                warn!("MCP resource template listing account work is unavailable for '{server_name}'");
+                continue;
+            };
             join_set.spawn(async move {
+                let _work = work;
                 let templates = collect_paginated("resources/templates/list", timeout, |params| {
                     let client = Arc::clone(&client);
                     async move {

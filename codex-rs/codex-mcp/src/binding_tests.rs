@@ -100,7 +100,7 @@ async fn test_step(
     });
     let clients = Arc::new(McpBindingClients::new(HashMap::from([(
         SERVER_NAME.to_string(),
-        Arc::clone(&managed_client),
+        (Arc::clone(&managed_client), crate::McpAttemptRequirement::Ungated),
     )])));
     let connections = Arc::new(McpConnectionSet::empty(/*prefix_mcp_tool_names*/ true));
     let mut config = crate::mcp::tests::test_mcp_config(std::env::temp_dir());

@@ -217,6 +217,17 @@ impl McpConnectionSet {
         required_servers: &[String],
         required_plugins: &HashSet<String>,
     ) -> McpBinding {
+        self.capture_binding_with_authority(config, plugins_available, required_servers, required_plugins, crate::McpAttemptAccess::Unscoped).await
+    }
+
+    pub(crate) async fn capture_binding_with_authority(
+        self: &Arc<Self>,
+        config: Arc<crate::McpConfig>,
+        plugins_available: bool,
+        required_servers: &[String],
+        required_plugins: &HashSet<String>,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> McpBinding {
         let mut listed_tools = Vec::new();
         let mut clients = HashMap::new();
         let optional_mcp_startup_grace = config.optional_mcp_startup_grace;
@@ -254,7 +265,7 @@ impl McpConnectionSet {
                             optional_mcp_startup_grace,
                         );
                     }
-                    let _ = view.connection.client().await;
+                    let _ = view.connection.client_with_authority(access).await;
                 } else if !must_wait_for_startup {
                     let optional_startup_deadline = if view.connection.startup_is_dormant() {
                         tokio::time::Instant::now() + optional_mcp_startup_grace
@@ -275,7 +286,7 @@ impl McpConnectionSet {
                             )
                         })
                         .unwrap_or(optional_startup_deadline);
-                    if tokio::time::timeout_at(startup_deadline, view.connection.client())
+                    if tokio::time::timeout_at(startup_deadline, view.connection.client_with_authority(access))
                         .await
                         .is_err()
                     {
@@ -283,7 +294,7 @@ impl McpConnectionSet {
                     }
                     return (server_name, view, cached_tools);
                 }
-                let _ = view.connection.client().await;
+                let _ = view.connection.client_with_authority(access).await;
                 return (server_name, view, cached_tools);
             }
             (server_name, view, None)
@@ -298,8 +309,8 @@ impl McpConnectionSet {
             {
                 (None, view.connection.client.cached_tools_or(cached_tools)?)
             } else {
-                view.connection.client.reconnect_failed_startup().await;
-                let Ok(mut client) = view.connection.client().await else {
+                view.connection.client.reconnect_failed_startup_with_authority(access).await;
+                let Ok(mut client) = view.connection.client_with_authority(access).await else {
                     trace!(server_name = %server_name, "omitting MCP server without an exact ready client");
                     return None;
                 };
@@ -379,7 +390,10 @@ impl McpConnectionSet {
         let clients = Arc::new(McpBindingClients::new(
             clients
                 .into_iter()
-                .map(|(server_name, (client, _))| (server_name, client))
+                .map(|(server_name, (client, _))| {
+                    let requirement = self.servers[&server_name].connection.client.client.requirement;
+                    (server_name, (client, requirement))
+                })
                 .collect(),
         ));
         McpBinding::new(
@@ -419,12 +433,20 @@ impl McpConnectionSet {
         &self,
         config: &crate::McpConfig,
     ) -> Result<CodexAppsToolSnapshot> {
+        self.refresh_codex_apps_client_catalog_with_authority(config, crate::McpAttemptAccess::Unscoped).await
+    }
+
+    pub(crate) async fn refresh_codex_apps_client_catalog_with_authority(
+        &self,
+        config: &crate::McpConfig,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Result<CodexAppsToolSnapshot> {
         let refresh_start = Instant::now();
         let view = self
             .servers
             .get(CODEX_APPS_MCP_SERVER_NAME)
             .ok_or_else(|| anyhow!("unknown MCP server '{CODEX_APPS_MCP_SERVER_NAME}'"))?;
-        let (tools, _) = self.refresh_codex_apps_tool_catalog().await?;
+        let (tools, _) = self.refresh_codex_apps_tool_catalog(access).await?;
         let server_has_permission = config
             .permission_profile_for_server(CODEX_APPS_MCP_SERVER_NAME)
             .is_some();
@@ -453,12 +475,16 @@ impl McpConnectionSet {
 
     /// Refreshes Apps tools and returns the prepared shared-cache winner for discovery.
     pub async fn refresh_codex_apps_tools_for_discovery(&self) -> Result<Vec<ToolInfo>> {
+        self.refresh_codex_apps_tools_for_discovery_with_authority(crate::McpAttemptAccess::Unscoped).await
+    }
+
+    pub(crate) async fn refresh_codex_apps_tools_for_discovery_with_authority(&self, access: crate::McpAttemptAccess<'_>) -> Result<Vec<ToolInfo>> {
         let refresh_start = Instant::now();
         let view = self
             .servers
             .get(CODEX_APPS_MCP_SERVER_NAME)
             .ok_or_else(|| anyhow!("unknown MCP server '{CODEX_APPS_MCP_SERVER_NAME}'"))?;
-        let (_, tools) = self.refresh_codex_apps_tool_catalog().await?;
+        let (_, tools) = self.refresh_codex_apps_tool_catalog(access).await?;
         let tools = prepare_codex_apps_tools_for_model(
             filter_tools(tools, &view.tool_filter),
             &self.tool_plugin_context,
@@ -479,14 +505,14 @@ impl McpConnectionSet {
     }
 
     /// Publishes the exact client catalog and returns both raw inventories.
-    async fn refresh_codex_apps_tool_catalog(&self) -> Result<(Vec<ToolInfo>, Vec<ToolInfo>)> {
+    async fn refresh_codex_apps_tool_catalog(&self, access: crate::McpAttemptAccess<'_>) -> Result<(Vec<ToolInfo>, Vec<ToolInfo>)> {
         let view = self
             .servers
             .get(CODEX_APPS_MCP_SERVER_NAME)
             .ok_or_else(|| anyhow!("unknown MCP server '{CODEX_APPS_MCP_SERVER_NAME}'"))?;
         let managed_client = view
             .connection
-            .client()
+            .client_with_authority(access)
             .await
             .context("failed to get client")?;
         let (tools, list_start) = managed_client

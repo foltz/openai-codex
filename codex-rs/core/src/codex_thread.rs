@@ -1090,12 +1090,13 @@ impl CodexThread {
         server: &str,
         params: ReadResourceRequestParams,
     ) -> anyhow::Result<serde_json::Value> {
+        let work = self.session.request_mcp_work()?;
         self.session.refresh_mcp_if_dirty().await;
         let result = self
             .session
             .services
             .mcp_runtime
-            .latest_read_resource(server, params)
+            .latest_read_resource_with_authority(server, params, codex_mcp::McpAttemptAccess::from_work(work.as_deref()))
             .await?;
 
         Ok(serde_json::to_value(result)?)
@@ -1107,12 +1108,13 @@ impl CodexThread {
         call_id: &str,
         uri: &str,
     ) -> anyhow::Result<serde_json::Value> {
+        let work = self.session.request_mcp_work()?;
         self.session.refresh_mcp_if_dirty().await;
         let result = self
             .session
             .services
             .mcp_runtime
-            .read_resource_for_call(self.session.thread_id, call_id, uri)
+            .read_resource_for_call_with_authority(self.session.thread_id, call_id, uri, codex_mcp::McpAttemptAccess::from_work(work.as_deref()))
             .await?;
 
         Ok(serde_json::to_value(result)?)
@@ -1124,6 +1126,7 @@ impl CodexThread {
         arguments: serde_json::Value,
         meta: Option<serde_json::Value>,
     ) -> anyhow::Result<codex_mcp::McpEventStream> {
+        let work = self.session.request_mcp_work()?;
         let meta = match meta.as_ref() {
             Some(serde_json::Value::Object(meta)) => Some(meta),
             Some(other) => {
@@ -1134,7 +1137,7 @@ impl CodexThread {
         let _ = self.session.services.auth_manager.auth().await;
         self.session.refresh_mcp_if_dirty().await;
         codex_mcp::McpResourceClient::new(Arc::clone(&self.session.services.mcp_runtime))
-            .open_event_stream(name, &arguments, meta)
+            .open_event_stream_with_authority(name, &arguments, meta, codex_mcp::McpAttemptAccess::from_work(work.as_deref()))
             .await
     }
 
@@ -1145,13 +1148,15 @@ impl CodexThread {
         arguments: Option<serde_json::Value>,
         meta: Option<serde_json::Value>,
     ) -> anyhow::Result<CallToolResult> {
+        let work = self.session.request_mcp_work()?;
         self.session.refresh_mcp_if_dirty().await;
         self.session
             .services
             .mcp_runtime
-            .latest_call_tool(
+            .latest_call_tool_with_authority(
                 server, tool, /*environment_id*/ None, arguments, meta,
                 /*requested_timeout*/ None, /*wait_for_server*/ true,
+                codex_mcp::McpAttemptAccess::from_work(work.as_deref()),
             )
             .await
     }

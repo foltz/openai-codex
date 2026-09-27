@@ -163,7 +163,16 @@ impl McpConnectionSet {
         server: &str,
         params: Option<PaginatedRequestParams>,
     ) -> Result<ListResourcesResult> {
-        let (managed, timeout) = self.client_by_name(server).await?;
+        self.list_resources_with_authority(server, params, crate::McpAttemptAccess::Unscoped).await
+    }
+
+    pub(crate) async fn list_resources_with_authority(
+        &self,
+        server: &str,
+        params: Option<PaginatedRequestParams>,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Result<ListResourcesResult> {
+        let (managed, timeout) = self.client_by_name_with_authority(server, access).await?;
         managed
             .client
             .list_resources(params, timeout)
@@ -176,7 +185,16 @@ impl McpConnectionSet {
         server: &str,
         params: Option<PaginatedRequestParams>,
     ) -> Result<ListResourceTemplatesResult> {
-        let (managed, timeout) = self.client_by_name(server).await?;
+        self.list_resource_templates_with_authority(server, params, crate::McpAttemptAccess::Unscoped).await
+    }
+
+    pub(crate) async fn list_resource_templates_with_authority(
+        &self,
+        server: &str,
+        params: Option<PaginatedRequestParams>,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Result<ListResourceTemplatesResult> {
+        let (managed, timeout) = self.client_by_name_with_authority(server, access).await?;
         managed
             .client
             .list_resource_templates(params, timeout)

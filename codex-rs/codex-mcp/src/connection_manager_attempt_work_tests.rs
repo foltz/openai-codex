@@ -91,12 +91,13 @@ async fn dormant_connection_counts_only_activation_and_driver_outlives_waiter() 
     let connection = &connections.servers["docs"].connection;
     assert!(connection.startup_is_dormant());
     assert!(matches!(connection.client().await, Err(StartupOutcomeError::Refused(_))));
+    assert!(runtime.current_binding_for_call("docs").await.is_none());
     assert!(connection.startup_is_dormant());
     // The activator can disappear after the first poll. Its derived attempt
     // must continue under the retained driver, without pinning the idle client.
     live.fetch_add(1, Ordering::SeqCst);
     let work = Work(Arc::clone(&live));
-    let mut observer = Box::pin(connection.client_with_authority(McpAttemptAccess::Admitted(&work)));
+    let mut observer = Box::pin(runtime.current_binding_for_call_with_authority("docs", McpAttemptAccess::Admitted(&work)));
     assert!(futures::poll!(&mut observer).is_pending());
     drop(observer);
     drop(work);
@@ -107,6 +108,22 @@ async fn dormant_connection_counts_only_activation_and_driver_outlives_waiter() 
     }).await.expect("retained driver completed startup");
     assert!(connection.client.ready_client().is_some());
     assert!(marker.exists());
+    live.fetch_add(1, Ordering::SeqCst);
+    let work = Work(Arc::clone(&live));
+    let access = McpAttemptAccess::Admitted(&work);
+    let binding = runtime.current_binding_with_authority(access).await.expect("ready binding");
+    assert_eq!(binding.list_all_resources(|_| true).await, HashMap::new());
+    assert_eq!(binding.list_all_resource_templates(|_| true).await, HashMap::new());
+    let resources = binding.list_all_resources_with_authority(|_| true, access).await;
+    let templates = binding.list_all_resource_templates_with_authority(|_| true, access).await;
+    assert_eq!(serde_json::to_value(resources)?, serde_json::json!({
+        "docs": [{"uri": "test://proof", "name": "proof"}]
+    }));
+    assert_eq!(serde_json::to_value(templates)?, serde_json::json!({
+        "docs": [{"uriTemplate": "test://{id}", "name": "proof-template"}]
+    }));
+    drop(work);
+    assert_eq!(live.load(Ordering::SeqCst), 0, "ready bindings retain no work");
     runtime.shutdown().await;
     Ok(())
 }

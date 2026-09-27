@@ -93,6 +93,20 @@ impl<C> GoalExtension<C> {
             goal_config: Arc::new(goal_config),
         }
     }
+
+    async fn clear_continuation_deferral_after_turn(&self, thread_id: ThreadId) {
+        // Preparation can be refused before installation. Only an installed
+        // turn's terminal callback consumes the fork's continuation deferral.
+        // A crash before that callback deliberately leaves the goal deferred.
+        if let Err(err) = self
+            .state_dbs
+            .thread_goals()
+            .clear_thread_goal_continuation_deferral(thread_id)
+            .await
+        {
+            tracing::warn!("failed to clear deferred goal continuation: {err}");
+        }
+    }
 }
 
 impl<C> ThreadLifecycleContributor<C> for GoalExtension<C>
@@ -239,15 +253,6 @@ where
                 return;
             };
 
-            if let Err(err) = self
-                .state_dbs
-                .thread_goals()
-                .clear_thread_goal_continuation_deferral(runtime.thread_id())
-                .await
-            {
-                tracing::warn!("failed to clear deferred goal continuation: {err}");
-            }
-
             let accounting = runtime.accounting_state();
             accounting.start_turn(
                 input.turn_id,
@@ -306,6 +311,8 @@ where
             if !runtime.is_enabled() {
                 return;
             }
+
+            self.clear_continuation_deferral_after_turn(runtime.thread_id()).await;
 
             let turn_id = input.turn_store.level_id();
             if let Some(expected_goal_id) =
@@ -373,6 +380,8 @@ where
             if !runtime.is_enabled() {
                 return;
             }
+
+            self.clear_continuation_deferral_after_turn(runtime.thread_id()).await;
 
             let turn_id = input.turn_store.level_id();
             input.thread_store.remove::<TurnStartOptions>();

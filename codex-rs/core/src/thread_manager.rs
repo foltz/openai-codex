@@ -1482,17 +1482,26 @@ impl ThreadManager {
         self.remove_thread_if_matches(thread_id, expected).await
     }
 
-    /// Tries to shut down all tracked threads concurrently within the provided timeout.
-    /// Threads that complete shutdown are removed from the manager; incomplete shutdowns
-    /// remain tracked so callers can retry or inspect them later.
+    /// Tries to shut down all tracked runtimes concurrently within the provided timeout.
+    /// Includes runtimes removed from lookup while their cleanup remains unproven.
+    /// Positive shutdown removes only the exact runtime from lookup; incomplete
+    /// cleanup stays owned by the retained population for subsequent observation.
     pub async fn shutdown_all_threads_bounded(&self, timeout: Duration) -> ThreadShutdownReport {
-        let threads = {
+        let mut threads = {
             let threads = self.state.threads.read().await;
             threads
                 .iter()
                 .map(|(thread_id, thread)| (*thread_id, Arc::clone(thread)))
                 .collect::<Vec<_>>()
         };
+        // Resume and managed lifetime teardown can remove a lookup entry before
+        // resource cleanup succeeds. Reset must still observe that exact runtime.
+        // A replacement may share its thread ID, so deduplicate by Arc identity.
+        for thread in self.constructions.published() {
+            if !threads.iter().any(|(_, tracked)| Arc::ptr_eq(tracked, &thread)) {
+                threads.push((thread.session.thread_id(), thread));
+            }
+        }
 
         let mut shutdowns = threads
             .into_iter()

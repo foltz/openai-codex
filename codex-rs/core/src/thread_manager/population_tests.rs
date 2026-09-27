@@ -216,11 +216,24 @@ async fn failed_cleanup_remains_owned_after_loop_join() {
         SessionLoopOutcome::Panicked
     );
     let weak = Arc::downgrade(&started.thread);
+    let thread_id = started.thread_id;
     drop(manager.remove_thread(&started.thread_id).await);
     drop(started);
     assert_eq!(manager.constructions.published().len(), 1);
     assert!(weak.upgrade().is_some());
     assert_eq!(manager.constructions.state.lock().unwrap().compacted, 0);
+
+    // Lookup absence must not let account reset overlook failed resource cleanup.
+    // Re-observation retains the same failure rather than inventing a clean retry.
+    for _ in 0..2 {
+        let report = manager.shutdown_all_threads_bounded(Duration::from_secs(5)).await;
+        assert_eq!(report, crate::ThreadShutdownReport {
+            completed: Vec::new(),
+            submit_failed: vec![thread_id],
+            timed_out: Vec::new(),
+        });
+        assert!(weak.upgrade().is_some());
+    }
 }
 
 #[tokio::test]

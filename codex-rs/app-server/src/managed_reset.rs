@@ -1,8 +1,10 @@
 //! Process-owned managed-auth reset inventory. Every stage must acknowledge
 //! completion before the coordinator can reopen account-work admission.
 //!
-//! This is not a whole-host shutdown receipt: the upstream/KCF retirement
-//! censuses retain their own documented exclusions, including event streams.
+//! This is not a whole-host shutdown receipt. Existing event-stream cancellation
+//! is covered by its managed transport's local retirement, not a detached task
+//! join or remote DELETE acknowledgement. User-owned command-hook effects stay
+//! outside this process's account-work admission boundary.
 
 use crate::config_manager::ConfigManager;
 use crate::managed_transition::ResetInventory;

@@ -9,6 +9,7 @@ use codex_app_server_protocol::DynamicToolCallResponse;
 use codex_app_server_protocol::DynamicToolFunctionSpec;
 use codex_app_server_protocol::DynamicToolSpec;
 use codex_app_server_protocol::ItemStartedNotification;
+use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::ThreadClosedNotification;
 use codex_app_server_protocol::ThreadItem;
@@ -39,7 +40,7 @@ use tokio::time::timeout;
 
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 #[tokio::test]
-async fn thread_unsubscribe_keeps_thread_loaded_until_idle_timeout() -> Result<()> {
+async fn thread_resubscribe_does_not_retain_idle_thread() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     MockResponsesConfig::new(&server.uri())
@@ -113,51 +114,43 @@ async fn thread_unsubscribe_keeps_thread_loaded_until_idle_timeout() -> Result<(
         .await?;
     assert_eq!(resume.thread.id, thread_id);
 
-    // Resubscribing cancels the pending unload, even after the original deadline.
-    assert!(
-        timeout(
-            std::time::Duration::from_millis(2200),
-            mcp.read_stream_until_notification_message("thread/closed"),
-        )
-        .await
-        .is_err()
-    );
-    let _: ThreadUnsubscribeResponse = mcp
-        .request(|request_id| ClientRequest::ThreadUnsubscribe {
-            request_id,
-            params: ThreadUnsubscribeParams {
-                thread_id: thread_id.clone(),
-            },
-        })
-        .await?;
-    // Losing the last subscriber starts a fresh countdown.
-    assert!(
-        timeout(
-            std::time::Duration::from_millis(250),
-            mcp.read_stream_until_notification_message("thread/closed"),
-        )
-        .await
-        .is_err()
-    );
-
-    let closed: ThreadClosedNotification =
-        timeout(DEFAULT_READ_TIMEOUT, mcp.read_notification("thread/closed")).await??;
+    // Subscriptions observe but do not retain. Collect both unload notifications
+    // without requiring an ordering between them.
+    let (closed, status) = timeout(DEFAULT_READ_TIMEOUT, async {
+        let mut closed = None;
+        let mut status = None;
+        loop {
+            if let JSONRPCMessage::Notification(notification) = mcp.read_next_message().await? {
+                match notification.method.as_str() {
+                    "thread/closed" => {
+                        let value: ThreadClosedNotification =
+                            serde_json::from_value(notification.params.unwrap_or_default())?;
+                        if value.thread_id == thread_id {
+                            closed = Some(value);
+                        }
+                    }
+                    "thread/status/changed" => {
+                        let value: ThreadStatusChangedNotification =
+                            serde_json::from_value(notification.params.unwrap_or_default())?;
+                        if value.thread_id == thread_id && value.status == ThreadStatus::NotLoaded {
+                            status = Some(value);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if closed.is_some() && status.is_some() {
+                return anyhow::Ok((closed.unwrap(), status.unwrap()));
+            }
+        }
+    })
+    .await??;
     assert_eq!(
         closed,
         ThreadClosedNotification {
             thread_id: thread_id.clone()
         }
     );
-    let status = timeout(DEFAULT_READ_TIMEOUT, async {
-        loop {
-            let status: ThreadStatusChangedNotification =
-                mcp.read_notification("thread/status/changed").await?;
-            if status.status == ThreadStatus::NotLoaded {
-                return anyhow::Ok(status);
-            }
-        }
-    })
-    .await??;
     assert_eq!(
         status,
         ThreadStatusChangedNotification {
@@ -194,7 +187,7 @@ async fn thread_unsubscribe_keeps_thread_loaded_until_idle_timeout() -> Result<(
     Ok(())
 }
 
-#[test_case(0; "zero_delay")]
+// Zero-delay idle threads may unload before turn/start: subscriptions do not retain.
 #[test_case(1; "one_second_delay")]
 #[tokio::test]
 async fn thread_unsubscribe_during_turn_keeps_turn_running(delay_secs: u64) -> Result<()> {
@@ -256,7 +249,7 @@ async fn thread_unsubscribe_during_turn_keeps_turn_running(delay_secs: u64) -> R
         .await?;
     let thread_id = thread.id;
 
-    // A subscribed, idle thread stays loaded even with no unload delay.
+    // The thread remains loaded during the configured idle grace period.
     assert!(
         timeout(
             std::time::Duration::from_millis(250),

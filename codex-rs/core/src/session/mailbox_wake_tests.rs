@@ -204,8 +204,11 @@ async fn replaced_mailbox_preparation_stops_before_overwriting_installed_task() 
         let active = session.active_turn.lock().await;
         assert_eq!(active.as_ref().unwrap().task.as_ref().unwrap().turn_context.sub_id, "replacement");
     }
-    assert_eq!(session.input_queue.drain_mailbox_input_items().await.0,
+    // The witness restores before the winner's final mailbox capture, so the
+    // installed turn owns the batch exactly once, rather than leaving it queued.
+    assert_eq!(session.input_queue.take_pending_input_for_turn_state(winner_state.as_ref()).await,
         vec![TurnInput::InterAgentCommunication(mail)]);
+    assert!(session.input_queue.drain_mailbox_input_items().await.0.is_empty());
     session.close_task_admission().await;
     session.abort_all_tasks(codex_protocol::protocol::TurnAbortReason::Interrupted).await;
     let _ = session.task_joins.shutdown_until(tokio::time::Instant::now() + Duration::from_secs(5)).await;

@@ -66,6 +66,7 @@ mod doctor;
 mod exec_server_args_tests;
 mod exec_server_auth;
 mod exec_server_telemetry;
+mod managed_auth_cmd;
 mod marketplace_cmd;
 mod mcp_cmd;
 mod mcp_login;
@@ -165,6 +166,10 @@ enum Subcommand {
 
     /// Remove stored authentication credentials.
     Logout(LogoutCommand),
+
+    /// Run the repository-owned, same-image managed authentication client.
+    #[clap(hide = true, name = "__managed-auth-transition")]
+    ManagedAuthTransition(managed_auth_cmd::ManagedAuthCommand),
 
     /// Manage external MCP servers for Codex.
     Mcp(McpCli),
@@ -1631,6 +1636,14 @@ async fn cli_main(
             );
             run_logout(logout_cli.config_overrides).await;
         }
+        Some(Subcommand::ManagedAuthTransition(command)) => {
+            reject_remote_mode_for_subcommand(
+                root_remote.as_deref(),
+                root_remote_auth_token_env.as_deref(),
+                "__managed-auth-transition",
+            )?;
+            managed_auth_cmd::run(command).await?;
+        }
         Some(Subcommand::Completion(completion_cli)) => {
             reject_remote_mode_for_subcommand(
                 root_remote.as_deref(),
@@ -2561,6 +2574,7 @@ fn unsupported_subcommand_name_for_strict_config(
         Some(Subcommand::App(_)) => Some("app"),
         Some(Subcommand::Login(_)) => Some("login"),
         Some(Subcommand::Logout(_)) => Some("logout"),
+        Some(Subcommand::ManagedAuthTransition(_)) => Some("__managed-auth-transition"),
         Some(Subcommand::Completion(_)) => Some("completion"),
         Some(Subcommand::Update) => Some("update"),
         Some(Subcommand::Cloud(_)) => Some("cloud"),

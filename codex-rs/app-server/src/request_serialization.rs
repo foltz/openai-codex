@@ -158,6 +158,18 @@ pub(crate) struct RequestSerializationQueues {
 }
 
 impl RequestSerializationQueues {
+    #[cfg(test)]
+    pub(crate) async fn pending_count_for_tests(
+        &self,
+        key: &RequestSerializationQueueKey,
+    ) -> usize {
+        self.inner
+            .lock()
+            .await
+            .get(key)
+            .map_or(0, |queue| queue.requests.len())
+    }
+
     /// Release requests whose connection closed while they waited in a queue.
     pub(crate) async fn discard_closed(&self) {
         let mut queues = self.inner.lock().await;

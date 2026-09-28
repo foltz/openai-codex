@@ -53,6 +53,11 @@ const EXPERIMENTAL_CLIENT_METHOD_DEPENDENCY_TYPES: &[&str] = &[
     "BedrockEnvironmentCredential",
     "EnvironmentShellInfo",
     "EnvironmentStatusKind",
+    "ManagedTransitionIntent",
+    "ManagedTransitionPhase",
+    "ManagedTransitionRefusal",
+    "ManagedTransitionRefusalKind",
+    "ManagedTransitionStatus",
     "RemoteControlClient",
     "RemoteControlClientsListOrder",
     "ThreadBackgroundTerminal",
@@ -2481,6 +2486,86 @@ mod tests {
             optional_nullable_offenders.is_empty(),
             "Generated TypeScript has optional nullable fields outside *Params types (disallowed '?: T | null'):\n{optional_nullable_offenders:?}"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn stable_exports_filter_managed_transition_dependency_types() -> Result<()> {
+        let output_dir = tempfile::tempdir()?;
+        let typescript_dir = output_dir.path().join("typescript");
+        let json_dir = output_dir.path().join("json");
+        generate_ts_with_options(
+            &typescript_dir,
+            /*prettier*/ None,
+            GenerateTsOptions::default(),
+        )?;
+        generate_json_with_experimental(&json_dir, /*experimental_api*/ false)?;
+
+        let experimental_output_dir = tempfile::tempdir()?;
+        let experimental_typescript_dir = experimental_output_dir.path().join("typescript");
+        let experimental_json_dir = experimental_output_dir.path().join("json");
+        generate_ts_with_options(
+            &experimental_typescript_dir,
+            /*prettier*/ None,
+            GenerateTsOptions {
+                experimental_api: true,
+                ..Default::default()
+            },
+        )?;
+        generate_json_with_experimental(&experimental_json_dir, /*experimental_api*/ true)?;
+
+        for type_name in [
+            "ManagedTransitionIntent",
+            "ManagedTransitionPhase",
+            "ManagedTransitionRefusal",
+            "ManagedTransitionRefusalKind",
+            "ManagedTransitionStatus",
+        ] {
+            assert!(
+                !typescript_dir
+                    .join("v2")
+                    .join(format!("{type_name}.ts"))
+                    .exists()
+            );
+            assert!(
+                experimental_typescript_dir
+                    .join("v2")
+                    .join(format!("{type_name}.ts"))
+                    .exists()
+            );
+        }
+
+        let stable_typescript_index =
+            fs::read_to_string(typescript_dir.join("v2").join("index.ts"))?;
+        assert!(!stable_typescript_index.contains("ManagedTransition"));
+
+        let experimental_typescript_index =
+            fs::read_to_string(experimental_typescript_dir.join("v2").join("index.ts"))?;
+        let stable_json_bundle =
+            read_json_value(&json_dir.join("codex_app_server_protocol.v2.schemas.json"))?;
+        let experimental_json_bundle = read_json_value(
+            &experimental_json_dir.join("codex_app_server_protocol.v2.schemas.json"),
+        )?;
+        let stable_json_definitions = stable_json_bundle["definitions"]
+            .as_object()
+            .context("stable v2 bundle should include definitions")?;
+        let experimental_json_definitions = experimental_json_bundle["definitions"]
+            .as_object()
+            .context("experimental v2 bundle should include definitions")?;
+        assert!(stable_json_definitions.contains_key("ThreadStartParams"));
+        assert!(experimental_json_definitions.contains_key("ThreadStartParams"));
+        for type_name in [
+            "ManagedTransitionIntent",
+            "ManagedTransitionPhase",
+            "ManagedTransitionRefusal",
+            "ManagedTransitionRefusalKind",
+            "ManagedTransitionStatus",
+        ] {
+            assert!(!stable_json_definitions.contains_key(type_name));
+            assert!(experimental_typescript_index.contains(type_name));
+            assert!(experimental_json_definitions.contains_key(type_name));
+        }
 
         Ok(())
     }

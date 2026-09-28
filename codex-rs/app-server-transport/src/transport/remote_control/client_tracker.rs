@@ -249,6 +249,7 @@ impl ClientTracker {
                         write_complete_tx: None,
                     };
                     tokio::select! {
+                        biased;
                         _ = shutdown.cancelled() => true,
                         result = server_event_tx.send(server_envelope) => result.is_ok(),
                     }
@@ -269,6 +270,7 @@ impl ClientTracker {
     ) -> (ClientId, StreamId) {
         loop {
             let (event, write_complete_tx) = tokio::select! {
+                biased;
                 _ = disconnect_token.cancelled() => {
                     break;
                 }
@@ -290,6 +292,7 @@ impl ClientTracker {
                 }
             };
             let send_result = tokio::select! {
+                biased;
                 _ = disconnect_token.cancelled() => {
                     break;
                 }
@@ -567,6 +570,97 @@ mod tests {
             } => assert_eq!(closed_connection_id, connection_id),
             other => panic!("expected connection closed, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn outbound_cancellation_wins_even_when_blocked_queue_becomes_ready() {
+        let (events, mut events_rx) = mpsc::channel(1);
+        events
+            .send(QueuedServerEnvelope {
+                event: ServerEvent::Pong {
+                    status: PongStatus::Unknown,
+                },
+                client_id: ClientId("prefill".to_string()),
+                stream_id: StreamId("prefill".to_string()),
+                write_complete_tx: None,
+            })
+            .await
+            .expect("queue should prefill");
+        let (_writer, writer_rx) = mpsc::channel(1);
+        let (status, status_rx) = watch::channel(PongStatus::Unknown);
+        status
+            .send(PongStatus::Active)
+            .expect("status should become ready");
+        let cancel = CancellationToken::new();
+        let client_id = ClientId("client-a".to_string());
+        let stream_id = StreamId("stream-a".to_string());
+        let worker = ClientTracker::run_client_outbound(
+            client_id.clone(),
+            stream_id.clone(),
+            events,
+            writer_rx,
+            status_rx,
+            cancel.clone(),
+        );
+        tokio::pin!(worker);
+        // First poll consumes the status update and reaches the full queue send.
+        assert!(futures::poll!(worker.as_mut()).is_pending());
+        cancel.cancel();
+        events_rx.recv().await.expect("prefill should drain");
+        assert_eq!(
+            futures::poll!(worker.as_mut()),
+            std::task::Poll::Ready((client_id, stream_id))
+        );
+        assert!(
+            events_rx.try_recv().is_err(),
+            "cancelled cycle cannot emit once queue capacity returns"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_joins_unknown_ping_response_without_forwarding_after_cancellation() {
+        let (events, mut events_rx) = mpsc::channel(1);
+        events
+            .send(QueuedServerEnvelope {
+                event: ServerEvent::Pong {
+                    status: PongStatus::Unknown,
+                },
+                client_id: ClientId("prefill".to_string()),
+                stream_id: StreamId("prefill".to_string()),
+                write_complete_tx: None,
+            })
+            .await
+            .expect("queue should prefill");
+        let (transport_events, _transport_rx) = mpsc::channel(1);
+        let mut tracker = ClientTracker::new(events, transport_events, &CancellationToken::new());
+        tracker
+            .handle_message(ClientEnvelope {
+                event: ClientEvent::Ping,
+                client_id: ClientId("unknown".to_string()),
+                stream_id: Some(StreamId("unknown-stream".to_string())),
+                seq_id: None,
+                cursor: None,
+            })
+            .await
+            .expect("unknown ping should queue response");
+        assert_eq!(tracker.cleanup.snapshot().len(), 1);
+        assert!(
+            timeout(Duration::from_secs(1), tracker.shutdown())
+                .await
+                .expect("cancelled pong must join despite full queue")
+        );
+        assert!(
+            tracker
+                .cleanup
+                .snapshot()
+                .iter()
+                .all(|receipt| receipt.peek() == Some(&true))
+        );
+        events_rx.recv().await.expect("prefill should remain");
+        assert!(
+            events_rx.try_recv().is_err(),
+            "old pong must not survive reset acknowledgement"
+        );
     }
 
     #[tokio::test]

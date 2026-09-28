@@ -13,6 +13,10 @@ use codex_app_server_protocol::StartManagedTransitionResponse;
 use codex_config::types::AuthCredentialsStoreMode;
 use tempfile::TempDir;
 
+#[cfg(unix)]
+#[path = "managed_transition_process.rs"]
+mod process_proofs;
+
 fn start_params(process_instance_id: String) -> StartManagedTransitionParams {
     StartManagedTransitionParams {
         contract_version: MANAGED_AUTH_TRANSITION_CONTRACT_VERSION,

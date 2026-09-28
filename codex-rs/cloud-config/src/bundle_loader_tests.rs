@@ -7,6 +7,27 @@ use std::sync::atomic::AtomicUsize;
 
 struct UnexpectedFetch(AtomicUsize);
 
+#[tokio::test]
+async fn exhausted_generation_never_wraps_or_reopens_ordinary_construction() {
+    let home = tempfile::tempdir().expect("home");
+    let lifecycle = home_lifecycle(home.path()).expect("lifecycle");
+    lifecycle.generation.store(u64::MAX, Ordering::Release);
+    for _ in 0..2 {
+        assert!(
+            managed_cloud_config_bundle_loader(
+                AuthManager::from_auth_for_testing(CodexAuth::from_api_key("test-key")),
+                "http://127.0.0.1:1".to_owned(),
+                home.path().to_path_buf(),
+                HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(lifecycle.generation.load(Ordering::Acquire), u64::MAX);
+        assert!(lifecycle.owners.lock().expect("owners").retiring);
+    }
+}
+
 impl BundleClient for UnexpectedFetch {
     async fn get_bundle(
         &self,

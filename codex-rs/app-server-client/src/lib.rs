@@ -903,15 +903,19 @@ mod tests {
     }
 
     async fn build_test_config_for_codex_home(codex_home: &Path) -> Config {
+        // These local client tests exercise requests and shutdown, not marketplace
+        // availability. Network-bound plugin warmup has dedicated retirement tests.
+        let overrides = vec![("features.plugins".to_string(), toml::Value::Boolean(false))];
         match ConfigBuilder::default()
             .codex_home(codex_home.to_path_buf())
+            .cli_overrides(overrides.clone())
             .build()
             .await
         {
             Ok(config) => config,
             Err(_) => Config::load_default_with_cli_overrides_for_codex_home(
                 codex_home.to_path_buf(),
-                Vec::new(),
+                overrides,
             )
             .await
             .expect("default config should load"),

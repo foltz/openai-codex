@@ -14,12 +14,36 @@ use codex_app_server_protocol::WarningNotification;
 
 impl App {
     pub(super) async fn shutdown_current_thread(&mut self, app_server: &mut AppServerSession) {
+        self.shutdown_current_thread_except(app_server, None).await;
+    }
+
+    /// A resume has already subscribed and retained its target. Preserve that
+    /// target when it is the former primary or an existing side thread.
+    pub(super) async fn shutdown_current_thread_except(
+        &mut self,
+        app_server: &mut AppServerSession,
+        retained_target: Option<ThreadId>,
+    ) {
         let side_thread_ids: Vec<ThreadId> = self.side_threads.keys().copied().collect();
         for side_thread_id in side_thread_ids {
-            self.discard_side_thread(app_server, side_thread_id).await;
+            if Some(side_thread_id) != retained_target {
+                self.discard_side_thread(app_server, side_thread_id).await;
+            }
         }
-        if let Some(thread_id) = self.chat_widget.thread_id() {
-            if let Err(err) = app_server.thread_unsubscribe(thread_id).await {
+        let displayed = self.chat_widget.thread_id();
+        let mut leaving = Vec::new();
+        if let Some(primary) = self.primary_thread_id
+            && Some(primary) != displayed
+        {
+            leaving.push(primary);
+        }
+        if let Some(displayed) = displayed {
+            leaving.push(displayed);
+        }
+        for thread_id in leaving {
+            if Some(thread_id) != retained_target
+                && let Err(err) = app_server.thread_unsubscribe(thread_id).await
+            {
                 tracing::warn!("failed to unsubscribe thread {thread_id}: {err}");
             }
             self.abort_thread_event_listener(thread_id);
@@ -1358,7 +1382,7 @@ impl App {
         }
 
         match app_server
-            .resume_thread(self.config.clone(), thread_id, self.resume_model_settings())
+            .observe_thread(self.config.clone(), thread_id, self.resume_model_settings())
             .await
         {
             Ok(started) => {

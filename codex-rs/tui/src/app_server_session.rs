@@ -5,6 +5,8 @@
 
 mod fs;
 mod history;
+mod retention;
+pub(crate) use retention::RetentionClient;
 
 pub(crate) use history::HISTORY_ITEM_PAGE_LIMIT;
 pub(crate) use history::HISTORY_ITEM_SCAN_LIMIT;
@@ -157,6 +159,12 @@ pub(crate) enum ForkGoalContinuation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResumePurpose {
+    Adopt,
+    Observe,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ForkPresentation {
     Regular,
     SideConversation,
@@ -264,6 +272,9 @@ pub(crate) struct AppServerBootstrap {
 pub(crate) struct AppServerSession {
     client: AppServerClient,
     next_request_id: i64,
+    retention: RetentionClient,
+    retention_warnings:
+        tokio::sync::mpsc::UnboundedReceiver<codex_app_server_protocol::WarningNotification>,
     history_pagination: HashMap<ThreadId, history::ThreadHistoryPagination>,
     remote_cwd_override: Option<PathBuf>,
     thread_params_mode: ThreadParamsMode,
@@ -335,7 +346,10 @@ pub(crate) enum TurnPermissionsOverride {
 
 impl AppServerSession {
     pub(crate) fn new(client: AppServerClient, thread_params_mode: ThreadParamsMode) -> Self {
+        let (retention, retention_warnings) = RetentionClient::new();
         Self {
+            retention,
+            retention_warnings,
             client,
             next_request_id: 1,
             history_pagination: HashMap::new(),
@@ -580,7 +594,32 @@ impl AppServerSession {
     }
 
     pub(crate) async fn next_event(&mut self) -> Option<AppServerEvent> {
-        self.client.next_event().await
+        tokio::select! {
+            biased;
+            Some(warning) = self.retention_warnings.recv() => Some(AppServerEvent::ServerNotification(Box::new(codex_app_server_protocol::ServerNotification::Warning(warning)))),
+            event = self.client.next_event() => event,
+        }
+    }
+
+    pub(crate) fn retention_client(&self) -> RetentionClient {
+        self.retention.clone()
+    }
+
+    pub(crate) async fn retain_clear_successor(
+        &self,
+        thread_id: &str,
+    ) -> Option<retention::PendingRetention> {
+        match self
+            .retention
+            .retain_thread(self.request_handle(), thread_id.to_string())
+            .await
+        {
+            Ok(retention) => Some(retention),
+            Err(error) => {
+                self.retention.warn_clear(thread_id, &error);
+                None
+            }
+        }
     }
 
     #[cfg(test)]
@@ -619,7 +658,14 @@ impl AppServerSession {
         if history_support == ThreadHistorySupport::LegacyOnly {
             self.history_support = ThreadHistorySupport::LegacyOnly;
         }
-        started_thread_from_start_response(response, config, self.thread_params_mode()).await
+        let retention = self
+            .retention
+            .retain_thread(self.request_handle(), response.thread.id.clone())
+            .await?;
+        let started =
+            started_thread_from_start_response(response, config, self.thread_params_mode()).await?;
+        retention.commit();
+        Ok(started)
     }
 
     pub(crate) async fn resume_thread(
@@ -627,6 +673,27 @@ impl AppServerSession {
         config: Config,
         thread_id: ThreadId,
         model_settings: ResumeModelSettings,
+    ) -> Result<AppServerStartedThread> {
+        self.resume_thread_with_purpose(config, thread_id, model_settings, ResumePurpose::Adopt)
+            .await
+    }
+
+    pub(crate) async fn observe_thread(
+        &mut self,
+        config: Config,
+        thread_id: ThreadId,
+        model_settings: ResumeModelSettings,
+    ) -> Result<AppServerStartedThread> {
+        self.resume_thread_with_purpose(config, thread_id, model_settings, ResumePurpose::Observe)
+            .await
+    }
+
+    async fn resume_thread_with_purpose(
+        &mut self,
+        config: Config,
+        thread_id: ThreadId,
+        model_settings: ResumeModelSettings,
+        purpose: ResumePurpose,
     ) -> Result<AppServerStartedThread> {
         let request_id = self.next_request_id();
         let session_config = if model_settings == ResumeModelSettings::RestoreFromThread {
@@ -675,6 +742,14 @@ impl AppServerSession {
                 ));
             }
         };
+        let retention = match purpose {
+            ResumePurpose::Adopt => Some(
+                self.retention
+                    .retain_thread(self.request_handle(), response.thread.id.clone())
+                    .await?,
+            ),
+            ResumePurpose::Observe => None,
+        };
         self.hydrate_initial_thread_history(
             &mut response.thread,
             response.turns_backwards_cursor.clone(),
@@ -690,6 +765,9 @@ impl AppServerSession {
             started_thread_from_resume_response(response, &config, self.thread_params_mode())
                 .await?;
         started.session.fork_parent_title = fork_parent_title;
+        if let Some(retention) = retention {
+            retention.commit();
+        }
         Ok(started)
     }
 
@@ -807,6 +885,10 @@ impl AppServerSession {
                 ));
             }
         };
+        let retention = self
+            .retention
+            .retain_thread(self.request_handle(), response.thread.id.clone())
+            .await?;
         let mut response = response;
         if presentation == ForkPresentation::Regular
             && !response.thread.ephemeral
@@ -829,6 +911,7 @@ impl AppServerSession {
         let mut started =
             started_thread_from_fork_response(response, &config, self.thread_params_mode()).await?;
         started.session.fork_parent_title = fork_parent.and_then(|thread| thread.name);
+        retention.commit();
         Ok(started)
     }
 
@@ -1490,6 +1573,7 @@ impl AppServerSession {
 
 pub(crate) async fn start_thread_with_request_handle(
     request_handle: AppServerRequestHandle,
+    retention_client: RetentionClient,
     config: Config,
     thread_params_mode: ThreadParamsMode,
     remote_cwd_override: Option<PathBuf>,
@@ -1508,7 +1592,12 @@ pub(crate) async fn start_thread_with_request_handle(
             .map_err(|err| {
                 bootstrap_request_error("thread/start failed during TUI bootstrap", err)
             })?;
-    started_thread_from_start_response(response, &config, thread_params_mode).await
+    let retention = retention_client
+        .retain_thread(request_handle, response.thread.id.clone())
+        .await?;
+    let started = started_thread_from_start_response(response, &config, thread_params_mode).await?;
+    retention.commit();
+    Ok(started)
 }
 
 pub(crate) fn status_account_display_from_auth_mode(

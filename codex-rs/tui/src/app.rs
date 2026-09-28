@@ -647,11 +647,13 @@ fn spawn_startup_thread_start(
     app_event_tx: AppEventSender,
 ) {
     let request_handle = app_server.request_handle();
+    let retention_client = app_server.retention_client();
     let thread_params_mode = app_server.thread_params_mode();
     let remote_cwd_override = app_server.remote_cwd_override().map(Path::to_path_buf);
     tokio::spawn(async move {
         let result = crate::app_server_session::start_thread_with_request_handle(
             request_handle,
+            retention_client,
             config,
             thread_params_mode,
             remote_cwd_override,

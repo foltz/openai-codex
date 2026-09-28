@@ -369,7 +369,7 @@ impl App {
         }
 
         let (session, turns, live_attached) = match app_server
-            .resume_thread(self.config.clone(), thread_id, self.resume_model_settings())
+            .observe_thread(self.config.clone(), thread_id, self.resume_model_settings())
             .await
         {
             Ok(started) => {
@@ -792,6 +792,9 @@ impl App {
                 return;
             }
         };
+        let retention = app_server
+            .retain_clear_successor(&response.successor_thread.id)
+            .await;
         let session = self
             .session_state_for_thread_read(successor_thread_id, &response.successor_thread)
             .await;
@@ -847,6 +850,9 @@ impl App {
                 "Failed to attach to clear successor app-server thread: {err}"
             ));
         } else {
+            if let Some(retention) = retention {
+                retention.commit();
+            }
             if let Some(err) = name_error {
                 self.chat_widget.add_error_message(err);
             }
@@ -1145,7 +1151,8 @@ impl App {
         {
             Ok(resumed) => {
                 let resumed_thread_id = resumed.session.thread_id;
-                self.shutdown_current_thread(app_server).await;
+                self.shutdown_current_thread_except(app_server, Some(resumed_thread_id))
+                    .await;
                 self.config = resume_config;
                 tui.set_notification_settings(
                     self.config.tui_notifications.method,

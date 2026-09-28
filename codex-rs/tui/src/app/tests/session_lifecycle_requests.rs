@@ -46,6 +46,8 @@ enum HistoryCapabilities {
     LegacyOnly,
     LegacyOnlyUnsupportedVariant,
     ForkHydrationFails,
+    RetentionIneligible,
+    ClearRetentionUnavailable,
 }
 
 /// Returns and resets `(thread/loaded/list, thread/read)` request counts.
@@ -99,6 +101,7 @@ async fn start_recording_app_server_with_history(
         /*log_db*/ None,
         state_db,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Arc::new(codex_app_server_client::InProcessHost::default()),
     )
     .await?;
     let codex_home = config.codex_home.display().to_string();
@@ -155,7 +158,23 @@ async fn start_recording_app_server_with_history(
                             .expect("request recorder lock")
                             .iter()
                             .any(|recorded| recorded.method == "thread/fork");
-                    let response = if matches!(
+                    let refuse_retention = request.method == "thread/retention/acquire"
+                        && (history_capabilities == HistoryCapabilities::RetentionIneligible
+                            || (history_capabilities
+                                == HistoryCapabilities::ClearRetentionUnavailable
+                                && request_sink
+                                    .lock()
+                                    .expect("request recorder lock")
+                                    .iter()
+                                    .any(|request| request.method == "thread/clear")));
+                    let response = if refuse_retention {
+                        JSONRPCMessage::Response(JSONRPCResponse {
+                            id: request_id,
+                            result: serde_json::json!({"status": "refused", "reason":
+                                if history_capabilities == HistoryCapabilities::RetentionIneligible { "ineligiblePrincipal" } else { "authorityUnavailable" }
+                            }),
+                        })
+                    } else if matches!(
                         history_capabilities,
                         HistoryCapabilities::LegacyOnly
                             | HistoryCapabilities::LegacyOnlyUnsupportedVariant
@@ -1380,12 +1399,14 @@ fn clear_session_uses_exact_displayed_thread_before_unsubscribe_and_attaches_suc
                 .enable_all()
                 .build()?;
             runtime.block_on(async {
-                let mut app = make_test_app().await;
+                for capabilities in [HistoryCapabilities::Current, HistoryCapabilities::RetentionIneligible, HistoryCapabilities::ClearRetentionUnavailable] {
+                let (mut app, mut app_events, _op_rx) = make_test_app_with_channels().await;
                 let codex_home = tempdir()?;
                 app.config.codex_home = codex_home.path().to_path_buf().abs();
                 app.config.sqlite = SqliteConfig::new_for_testing(codex_home.path().abs());
-                let (mut app_server, requests, proxy) = start_recording_app_server(
+                let (mut app_server, requests, proxy) = start_recording_app_server_with_history(
                     &app.config,
+                    capabilities,
                     /*blocked_thread_list*/ None,
                     /*failed_thread_name*/ None,
                 )
@@ -1449,8 +1470,31 @@ fn clear_session_uses_exact_displayed_thread_before_unsubscribe_and_attaches_suc
                     successor.to_string()
                 );
 
+                assert_eq!(app.primary_thread_id, Some(successor));
+                while app_events.try_recv().is_ok() {}
+                app.handle_app_server_event(&app_server, codex_app_server_client::AppServerEvent::ServerNotification(Box::new(thread_closed_notification(predecessor)))).await;
+                assert_eq!(app.current_displayed_thread_id(), Some(successor));
+                assert_eq!(app.primary_thread_id, Some(successor));
+                while let Ok(event) = app_events.try_recv() {
+                    assert!(!matches!(event, AppEvent::Exit(_) | AppEvent::FatalExitRequest(_)), "stale predecessor closure requested exit");
+                }
+                if capabilities != HistoryCapabilities::Current {
+                    let event = app_server.next_event().await.expect("retention warning");
+                    let codex_app_server_client::AppServerEvent::ServerNotification(notification) = event else { panic!("expected warning") };
+                    let ServerNotification::Warning(warning) = *notification else { panic!("expected warning") };
+                    if capabilities == HistoryCapabilities::RetentionIneligible {
+                        insta::assert_snapshot!(warning.message, @"This connection cannot retain idle sessions. Idle retirement may close the CLI.");
+                        assert!(tokio::time::timeout(Duration::from_millis(50), app_server.next_event()).await.is_err(), "warning repeated on the same connection");
+                    } else {
+                        assert!(warning.message.contains("Clear completed"));
+                        assert!(warning.message.contains(&successor.to_string()));
+                        assert!(warning.message.contains("AuthorityUnavailable"));
+                        assert!(warning.message.contains("may already be closed"));
+                    }
+                }
                 app_server.shutdown().await?;
                 proxy.await??;
+                }
                 Ok(())
             })
         })?
@@ -1927,4 +1971,45 @@ fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
         })?
         .join()
         .expect("session lifecycle request test thread")
+}
+
+#[test]
+fn resume_cleanup_releases_old_primary_unless_it_is_the_adopted_target() -> Result<()> {
+    std::thread::Builder::new().stack_size(8 * 1024 * 1024).spawn(|| {
+        tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(async {
+            for target in ["none", "primary", "displayed-inactive"] {
+                let preserve_primary = target == "primary";
+                let preserve_displayed = target == "displayed-inactive";
+                let mut app = make_test_app().await;
+                let home = tempdir()?;
+                app.config.codex_home = home.path().to_path_buf().abs();
+                app.config.sqlite = SqliteConfig::new_for_testing(home.path().abs());
+                let (mut server, requests, proxy) = start_recording_app_server(&app.config, None, None).await?;
+                let primary = server.start_thread(&app.config).await?.session.thread_id;
+                let child = server.start_thread(&app.config).await?;
+                let child_id = child.session.thread_id;
+                app.primary_thread_id = Some(primary);
+                app.active_thread_id = if preserve_displayed { None } else { Some(child_id) };
+                app.chat_widget.handle_thread_session(child.session);
+                let retained_target = if preserve_displayed { Some(child_id) } else { preserve_primary.then_some(primary) };
+                app.shutdown_current_thread_except(&mut server, retained_target).await;
+                let unsubscribed = recorded_params(&requests, "thread/unsubscribe");
+                assert_eq!(unsubscribed.iter().any(|p| p["threadId"] == child_id.to_string()), !preserve_displayed);
+                assert_eq!(unsubscribed.iter().any(|p| p["threadId"] == primary.to_string()), !preserve_primary);
+                let probe: codex_app_server_protocol::ThreadRetentionAcquireResponse = server.request_handle().request_typed(ClientRequest::ThreadRetentionAcquire {
+                    request_id: codex_app_server_protocol::RequestId::String("probe-primary".to_string()),
+                    params: codex_app_server_protocol::ThreadRetentionAcquireParams { thread_id: primary.to_string() },
+                }).await?;
+                assert_eq!(matches!(probe, codex_app_server_protocol::ThreadRetentionAcquireResponse::AlreadyHeld { .. }), preserve_primary);
+                let probe: codex_app_server_protocol::ThreadRetentionAcquireResponse = server.request_handle().request_typed(ClientRequest::ThreadRetentionAcquire {
+                    request_id: codex_app_server_protocol::RequestId::String("probe-displayed".to_string()),
+                    params: codex_app_server_protocol::ThreadRetentionAcquireParams { thread_id: child_id.to_string() },
+                }).await?;
+                assert_eq!(matches!(probe, codex_app_server_protocol::ThreadRetentionAcquireResponse::AlreadyHeld { .. }), preserve_displayed);
+                server.shutdown().await?;
+                proxy.await??;
+            }
+            Ok(())
+        })
+    })?.join().expect("resume cleanup test thread")
 }

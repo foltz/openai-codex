@@ -1335,24 +1335,26 @@ client_request_definitions! {
         response: v2::CancelLoginAccountResponse,
     },
 
+    // The coordinator owns transition admission. Its long-running start must
+    // not queue independent read/cancel requests behind drain or reset work.
     #[experimental("account/managedAuthTransition")]
     ManagedTransitionStart => "account/managedAuthTransition/start" {
         params: v2::StartManagedTransitionParams,
-        serialization: global("managed-account-transition"),
+        serialization: None,
         response: v2::StartManagedTransitionResponse,
     },
 
     #[experimental("account/managedAuthTransition")]
     ManagedTransitionRead => "account/managedAuthTransition/read" {
         params: v2::ReadManagedTransitionParams,
-        serialization: global_shared_read("managed-account-transition"),
+        serialization: None,
         response: v2::ReadManagedTransitionResponse,
     },
 
     #[experimental("account/managedAuthTransition")]
     ManagedTransitionCancel => "account/managedAuthTransition/cancel" {
         params: v2::CancelManagedTransitionParams,
-        serialization: global("managed-account-transition"),
+        serialization: None,
         response: v2::CancelManagedTransitionResponse,
     },
 

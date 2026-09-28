@@ -204,6 +204,10 @@ impl AccountWorkPermits {
 #[path = "account_work_permits_tests.rs"]
 mod account_work_permits_tests;
 
+#[cfg(test)]
+#[path = "effective_plugin_change_custody_tests.rs"]
+mod effective_plugin_change_custody_tests;
+
 #[derive(Clone)]
 pub(crate) struct ManagedTransitionCoordinator {
     state: Arc<Mutex<CoordinatorState>>,

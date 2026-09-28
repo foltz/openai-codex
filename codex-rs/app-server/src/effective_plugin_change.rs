@@ -193,7 +193,3 @@ pub(crate) async fn trust_materialized_plugin_hooks(
 #[cfg(test)]
 #[path = "effective_plugin_change_tests.rs"]
 mod tests;
-
-#[cfg(test)]
-#[path = "effective_plugin_change_custody_tests.rs"]
-mod custody_tests;

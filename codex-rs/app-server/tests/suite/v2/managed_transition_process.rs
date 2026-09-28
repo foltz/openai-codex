@@ -10,6 +10,7 @@ use app_test_support::MockResponsesConfig;
 use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::write_chatgpt_auth;
 use codex_config::types::AuthCredentialsStoreMode;
+use codex_http_client::HttpClientBuilder;
 use futures::SinkExt;
 use futures::StreamExt;
 use serde_json::Value;
@@ -287,7 +288,8 @@ async fn mock_backend() -> wiremock::MockServer {
 }
 
 async fn assert_models_backend_restored(server: &wiremock::MockServer) -> Result<()> {
-    let response = reqwest::Client::new()
+    let response = HttpClientBuilder::new()
+        .build_direct()?
         .get(format!("{}/v1/models?client_version=0.0.0", server.uri()))
         .bearer_auth("fixture-token-b")
         .timeout(WAIT)

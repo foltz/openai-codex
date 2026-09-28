@@ -193,7 +193,8 @@ printf '{release}' > "$root/auto-update-version"
         assert!(!old_updater.is_starting_or_running().await.unwrap());
         let new_updater =
             crate::backend::pid_update_loop_backend(selected.backend_paths(&daemon_settings));
-        assert_eq!(new_updater.is_starting_or_running().await.unwrap(), running);
+        // Managed builds preserve migration but never restart the self-updater.
+        assert!(!new_updater.is_starting_or_running().await.unwrap());
         new_updater.stop().await.unwrap();
         new_backend.stop().await.unwrap();
         if let Some(server) = server {

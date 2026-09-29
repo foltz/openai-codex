@@ -1513,7 +1513,7 @@ impl MessageProcessor {
         event_stream_ready: Option<McpEventStreamReady>,
         managed_transition_caller_authorized: bool,
     ) -> BoxFuture<'static, Result<(), JSONRPCErrorError>> {
-        // Clear, resume and fork construct sessions inline. Select them before polling
+        // Clear, resume, fork and revert construct sessions inline. Select them before polling
         // the general dispatcher, which has a multi-MiB debug poll frame.
         // Every path stays inside the same serialized, account-admitted request task.
         match codex_request {
@@ -1593,6 +1593,35 @@ impl MessageProcessor {
                         app_server_client_name,
                         client_version,
                         client_mcp_extensions,
+                    )
+                    .await
+                {
+                    Ok(Some(response)) => {
+                        self.outgoing.send_response_as(request_id, response).await;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.outgoing.send_error(request_id, error).await;
+                    }
+                }
+                Ok(())
+            }),
+            ClientRequest::ThreadRevert { request_id, params } => Box::pin(async move {
+                let _request_context = request_context;
+                let _event_stream_ready = event_stream_ready;
+                let app_server_client_name = session.app_server_client_name().map(str::to_string);
+                let client_version = session.client_version().map(str::to_string);
+                let request_id = ConnectionRequestId {
+                    connection_id: connection_request_id.connection_id,
+                    request_id,
+                };
+                match self
+                    .thread_processor
+                    .thread_revert(
+                        request_id.clone(),
+                        params,
+                        app_server_client_name,
+                        client_version,
                     )
                     .await
                 {
@@ -2025,15 +2054,8 @@ impl MessageProcessor {
                     .thread_background_terminals_terminate(params)
                     .await
             }
-            ClientRequest::ThreadRevert { params, .. } => {
-                self.thread_processor
-                    .thread_revert(
-                        request_id.clone(),
-                        params,
-                        app_server_client_name.clone(),
-                        client_version.clone(),
-                    )
-                    .await
+            ClientRequest::ThreadRevert { .. } => {
+                unreachable!("revert is selected by the synchronous request factory")
             }
             ClientRequest::ThreadList { params, .. } => {
                 self.thread_processor.thread_list(params).await

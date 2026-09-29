@@ -2,6 +2,7 @@
 use super::*;
 use codex_app_server_protocol::ThreadRetentionAcquireParams;
 use codex_app_server_protocol::ThreadRetentionAcquireResponse;
+use pretty_assertions::assert_eq;
 
 async fn probe(
     server: &mut AppServerSession,

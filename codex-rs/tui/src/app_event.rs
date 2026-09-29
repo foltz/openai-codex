@@ -47,7 +47,6 @@ use strum_macros::IntoStaticStr;
 use uuid::Uuid;
 
 use crate::app_command::AppCommand;
-use crate::app_server_session::AppServerStartedThread;
 use crate::bottom_pane::ApprovalRequest;
 use crate::bottom_pane::StatusLineConfigEntry;
 use crate::bottom_pane::TerminalTitleItem;

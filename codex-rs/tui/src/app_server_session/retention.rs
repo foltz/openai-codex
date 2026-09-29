@@ -125,10 +125,12 @@ impl RetentionClient {
                         *state = ReleaseState::Indeterminate;
                         "; restart the client to re-adopt this session"
                     };
+                    let message =
+                        format!("thread retention failed for {thread_id}: {error}{recovery}");
                     (
-                        Err(color_eyre::eyre::eyre!(
-                            "thread retention failed for {thread_id}: {error}{recovery}"
-                        )),
+                        // Reconnect inspects the typed cause; do not erase it
+                        // when adding the retention-specific recovery message.
+                        Err(color_eyre::Report::new(error).wrap_err(message)),
                         None,
                     )
                 }

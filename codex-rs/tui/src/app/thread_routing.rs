@@ -48,7 +48,10 @@ impl App {
         app_server: &mut AppServerSession,
         retained_target: Option<ThreadId>,
     ) {
-        self.stop_realtime_conversation(app_server).await;
+        // Re-adopting the displayed thread does not leave its voice session.
+        if retained_target.is_none() || retained_target != self.chat_widget.thread_id() {
+            self.stop_realtime_conversation(app_server).await;
+        }
         let side_thread_ids: Vec<ThreadId> = self.side_threads.keys().copied().collect();
         for side_thread_id in side_thread_ids {
             if Some(side_thread_id) != retained_target {

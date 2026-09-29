@@ -26,7 +26,7 @@ fn shared_search_specs_preserve_results_and_release_the_source() {
             definition: "start: \"patch\"".to_string(),
         },
     };
-    for spec in [
+    for (spec, expected_names) in [
         ToolSpec::Function(function.clone()),
         ToolSpec::Freeform(custom.clone()),
         ToolSpec::Namespace(ResponsesApiNamespace {
@@ -37,12 +37,24 @@ fn shared_search_specs_preserve_results_and_release_the_source() {
                 ResponsesApiNamespaceTool::Custom(custom),
             ],
         }),
-    ] {
-        let expected =
+    ]
+    .into_iter()
+    .zip([
+        vec!["functions", "lookup", "functionslookup"],
+        vec!["functions", "patch", "functionspatch"],
+        vec![
+            "example",
+            "lookup",
+            "examplelookup",
+            "patch",
+            "examplepatch",
+        ],
+    ]) {
+        let normalized =
             ToolSearchInfo::from_spec("query".to_string(), spec.clone(), /*source_info*/ None)
-                .unwrap()
-                .entry
-                .to_loadable_spec();
+                .unwrap();
+        assert_eq!(normalized.entry.name_candidates(), expected_names);
+        let expected = normalized.entry.to_loadable_spec();
         let spec = Arc::new(spec);
         let weak = Arc::downgrade(&spec);
         let info = ToolSearchInfo::from_shared_spec(
@@ -52,6 +64,7 @@ fn shared_search_specs_preserve_results_and_release_the_source() {
         )
         .unwrap();
         drop(spec);
+        assert_eq!(info.entry.name_candidates(), expected_names);
         assert!(
             weak.upgrade().is_some(),
             "search retains the original spec rather than a deep copy"

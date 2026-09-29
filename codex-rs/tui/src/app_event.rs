@@ -515,7 +515,7 @@ pub(crate) enum AppEvent {
 
     /// Result of the fresh startup thread that is attached after the input UI is live.
     StartupThreadStarted {
-        result: color_eyre::Result<AppServerStartedThread>,
+        result: color_eyre::Result<crate::app_server_session::PendingStartupThread>,
     },
 
     /// Register a tool-created or resumed background thread and its overview metadata.

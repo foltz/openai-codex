@@ -381,7 +381,7 @@ impl App {
         }
 
         let (session, turns, live_attached) = match app_server
-            .resume_thread(
+            .observe_thread(
                 &self.local_settings,
                 self.config.clone(),
                 thread_id,
@@ -820,11 +820,11 @@ impl App {
     pub(super) async fn handle_startup_thread_started(
         &mut self,
         app_server: &mut AppServerSession,
-        result: Result<AppServerStartedThread>,
+        result: Result<crate::app_server_session::PendingStartupThread>,
     ) -> Result<()> {
         if !self.pending_startup_thread_start {
             if let Ok(started) = result {
-                let thread_id = started.session.thread_id;
+                let thread_id = started.started.session.thread_id;
                 if let Err(err) = app_server.thread_unsubscribe(thread_id).await {
                     tracing::warn!(
                         thread_id = %thread_id,
@@ -840,7 +840,7 @@ impl App {
         self.chat_widget
             .set_queue_submissions_until_session_configured(/*queue*/ false);
         match result {
-            Ok(started) => {
+            Ok(crate::app_server_session::PendingStartupThread { started, retention }) => {
                 self.chat_widget.mark_fresh_task_for_sparkle(&started);
                 let thread_id = started.session.thread_id;
                 if started.task_tools_available {
@@ -894,6 +894,7 @@ impl App {
                 let recovery_was_pending = self.chat_widget.hold_rate_limit_recovery();
                 self.enqueue_primary_thread_session(started.session, started.turns)
                     .await?;
+                retention.commit();
                 self.apply_backend_banner_fallback(app_server).await;
                 if let Some(notice) = self.pending_server_version_notice.take() {
                     self.chat_widget.add_server_version_warning(notice);

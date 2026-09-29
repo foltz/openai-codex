@@ -27,6 +27,12 @@ use color_eyre::eyre::Result;
 // Bound recovery to recent messages when item paging is unavailable.
 const READ_ONLY_HISTORY_TURN_LIMIT: u32 = 100;
 
+#[derive(Clone, Copy)]
+enum ResumePurpose {
+    Adopt,
+    Observe,
+}
+
 impl AppServerSession {
     /// Read a conflicting thread without taking its writer lease. This is a snapshot, not an
     /// attachment: the caller must not route turns through this session.
@@ -138,6 +144,41 @@ impl AppServerSession {
         thread_id: ThreadId,
         model_settings: ResumeModelSettings,
     ) -> Result<AppServerStartedThread> {
+        self.resume_thread_with_purpose(
+            local_settings,
+            config,
+            thread_id,
+            model_settings,
+            ResumePurpose::Adopt,
+        )
+        .await
+    }
+
+    pub(crate) async fn observe_thread(
+        &mut self,
+        local_settings: &crate::local_settings::LocalSettings,
+        config: Config,
+        thread_id: ThreadId,
+        model_settings: ResumeModelSettings,
+    ) -> Result<AppServerStartedThread> {
+        self.resume_thread_with_purpose(
+            local_settings,
+            config,
+            thread_id,
+            model_settings,
+            ResumePurpose::Observe,
+        )
+        .await
+    }
+
+    async fn resume_thread_with_purpose(
+        &mut self,
+        local_settings: &crate::local_settings::LocalSettings,
+        config: Config,
+        thread_id: ThreadId,
+        model_settings: ResumeModelSettings,
+        purpose: ResumePurpose,
+    ) -> Result<AppServerStartedThread> {
         let session_config = if matches!(
             model_settings,
             ResumeModelSettings::RestoreFromThread | ResumeModelSettings::PreserveExistingThread
@@ -214,6 +255,14 @@ impl AppServerSession {
                 ));
             }
         };
+        let retention = match purpose {
+            ResumePurpose::Adopt => Some(
+                self.retention
+                    .retain_thread(self.request_handle(), response.thread.id.clone())
+                    .await?,
+            ),
+            ResumePurpose::Observe => None,
+        };
         self.hydrate_initial_thread_history(
             &mut response.thread,
             response.turns_backwards_cursor.clone(),
@@ -237,6 +286,9 @@ impl AppServerSession {
         if self.task_tools_available(thread_id) {
             self.remember_task_tool_thread(thread_id);
             started.task_tools_available = true;
+        }
+        if let Some(retention) = retention {
+            retention.commit();
         }
         Ok(started)
     }

@@ -261,6 +261,7 @@ async fn fresh_startup_uses_server_defaults_with_explicit_and_managed_precedence
         let selected_model = startup_model(&config, &bootstrap, /*server_defaults_read*/ true);
         let started = crate::app_server_session::start_thread_with_request_handle(
             server.request_handle(),
+            server.retention_client(),
             &crate::local_settings::LocalSettings::from(&config),
             config,
             server.thread_params_mode(),
@@ -268,6 +269,11 @@ async fn fresh_startup_uses_server_defaults_with_explicit_and_managed_precedence
             server.thread_tool_transport(),
         )
         .await?;
+        let crate::app_server_session::PendingStartupThread {
+            started: started,
+            retention,
+        } = started;
+        retention.commit();
         assert_eq!(selected_model, expected_model, "{choice}");
         let starts = recorded_params(&requests, "thread/start");
         assert_eq!(starts.len(), 1, "{choice}");
@@ -351,6 +357,7 @@ async fn fresh_startup_reads_destination_and_cleared_model_uses_catalog() -> Res
         assert_ne!(selected_model, "stale-client-model");
         let started = crate::app_server_session::start_thread_with_request_handle(
             server.request_handle(),
+            server.retention_client(),
             &crate::local_settings::LocalSettings::from(&config),
             config,
             server.thread_params_mode(),
@@ -358,6 +365,11 @@ async fn fresh_startup_reads_destination_and_cleared_model_uses_catalog() -> Res
             server.thread_tool_transport(),
         )
         .await?;
+        let crate::app_server_session::PendingStartupThread {
+            started: started,
+            retention,
+        } = started;
+        retention.commit();
         assert_eq!(started.session.model, selected_model);
         let starts = recorded_params(&requests, "thread/start");
         assert_eq!(starts.len(), 1);

@@ -350,7 +350,7 @@ async fn a_command_pending_on_fresh_astra_start_can_finish_before_the_sparkle() 
         app.pending_startup_thread_start = true;
         app.chat_widget.handle_paste(command.into());
         let mut server = crate::start_embedded_app_server_for_picker(&app.config).await?;
-        app.handle_startup_thread_started(&mut server, Ok(started("gpt-6-astra")))
+        app.handle_startup_thread_started(&mut server, Ok(started("gpt-6-astra").into()))
             .await?;
         assert_eq!(
             (
@@ -710,7 +710,7 @@ async fn early_input_and_real_work_consume_the_sparkle() -> Result<()> {
         let mut server = crate::start_embedded_app_server_for_picker(&app.config).await?;
         let thread = started("gpt-6-astra");
         let thread_id = thread.session.thread_id;
-        app.handle_startup_thread_started(&mut server, Ok(thread))
+        app.handle_startup_thread_started(&mut server, Ok(thread.into()))
             .await?;
         if scenario == "turn" {
             app.handle_app_server_event(

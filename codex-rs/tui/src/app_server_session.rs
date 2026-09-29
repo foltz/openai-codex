@@ -8,6 +8,8 @@ mod fs;
 mod history;
 mod models;
 mod realtime;
+mod retention;
+pub(crate) use retention::RetentionClient;
 mod rollout_history;
 mod thread_list;
 
@@ -319,6 +321,9 @@ pub(crate) struct AppServerBootstrap {
 
 pub(crate) struct AppServerSession {
     client: AppServerClient,
+    retention: RetentionClient,
+    retention_warnings:
+        tokio::sync::mpsc::UnboundedReceiver<codex_app_server_protocol::WarningNotification>,
     next_request_id: i64,
     history_pagination: HashMap<ThreadId, history::ThreadHistoryPagination>,
     task_tool_threads: HashSet<ThreadId>,
@@ -427,8 +432,11 @@ impl AppServerSession {
     }
 
     pub(crate) fn new(client: AppServerClient, thread_params_mode: ThreadParamsMode) -> Self {
+        let (retention, retention_warnings) = RetentionClient::new();
         Self {
             client,
+            retention,
+            retention_warnings,
             next_request_id: 1,
             history_pagination: HashMap::new(),
             task_tool_threads: HashSet::new(),
@@ -803,7 +811,32 @@ impl AppServerSession {
     }
 
     pub(crate) async fn next_event(&mut self) -> Option<AppServerEvent> {
-        self.client.next_event().await
+        tokio::select! {
+            biased;
+            Some(warning) = self.retention_warnings.recv() => Some(AppServerEvent::ServerNotification(Box::new(codex_app_server_protocol::ServerNotification::Warning(warning)))),
+            event = self.client.next_event() => event,
+        }
+    }
+
+    pub(crate) fn retention_client(&self) -> RetentionClient {
+        self.retention.clone()
+    }
+
+    pub(crate) async fn retain_clear_successor(
+        &self,
+        thread_id: &str,
+    ) -> Option<retention::PendingRetention> {
+        match self
+            .retention
+            .retain_thread(self.request_handle(), thread_id.to_string())
+            .await
+        {
+            Ok(retention) => Some(retention),
+            Err(error) => {
+                self.retention.warn_clear(thread_id, &error);
+                None
+            }
+        }
     }
 
     #[cfg(test)]
@@ -859,6 +892,10 @@ impl AppServerSession {
         if history_support == ThreadHistorySupport::LegacyOnly {
             self.history_support = ThreadHistorySupport::LegacyOnly;
         }
+        let retention = self
+            .retention
+            .retain_thread(self.request_handle(), response.thread.id.clone())
+            .await?;
         let mut started = started_thread_from_start_response(
             response,
             local_settings,
@@ -870,6 +907,7 @@ impl AppServerSession {
         if task_tools_available {
             self.remember_task_tool_thread(started.session.thread_id);
         }
+        retention.commit();
         Ok(started)
     }
 
@@ -1061,6 +1099,10 @@ impl AppServerSession {
                 ));
             }
         };
+        let retention = self
+            .retention
+            .retain_thread(self.request_handle(), response.thread.id.clone())
+            .await?;
         let mut response = response;
         if presentation == ForkPresentation::Regular
             && !response.thread.ephemeral
@@ -1093,6 +1135,7 @@ impl AppServerSession {
             started.task_tools_available = true;
             self.remember_task_tool_thread(started.session.thread_id);
         }
+        retention.commit();
         Ok(started)
     }
 
@@ -1756,12 +1799,13 @@ impl AppServerSession {
 
 pub(crate) async fn start_thread_with_request_handle(
     request_handle: AppServerRequestHandle,
+    retention_client: RetentionClient,
     local_settings: &LocalSettings,
     config: Config,
     thread_params_mode: ThreadParamsMode,
     remote_cwd_override: Option<PathBuf>,
     thread_tool_transport: ThreadToolTransport,
-) -> Result<AppServerStartedThread> {
+) -> Result<PendingStartupThread> {
     let request_id = RequestId::String(format!("startup-thread-start-{}", Uuid::new_v4()));
     let mut params = thread_start_params_from_config(
         &config,
@@ -1777,11 +1821,22 @@ pub(crate) async fn start_thread_with_request_handle(
             .map_err(|err| {
                 bootstrap_request_error("thread/start failed during TUI bootstrap", err)
             })?;
+    let retention = retention_client
+        .retain_thread(request_handle, response.thread.id.clone())
+        .await?;
     let mut started =
         started_thread_from_start_response(response, local_settings, &config, thread_params_mode)
             .await?;
     started.task_tools_available = task_tools_available;
-    Ok(started)
+    Ok(PendingStartupThread { started, retention })
+}
+
+/// Unique startup custody travels through event delivery, separately from the
+/// cloneable presentation data. Abandoned delivery releases only a new grant.
+#[derive(Debug)]
+pub(crate) struct PendingStartupThread {
+    pub(crate) started: AppServerStartedThread,
+    pub(crate) retention: retention::PendingRetention,
 }
 
 pub(crate) fn status_account_display_from_auth_mode(

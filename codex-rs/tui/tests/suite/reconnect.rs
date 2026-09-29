@@ -109,6 +109,10 @@ async fn automatic_reconnect_restores_draft_and_routes_new_notifications() -> Re
                             "sandbox": {"type": "readOnly"}, "reasoningEffort": null})
                     }
                     "thread/read" => json!({"thread": thread}),
+                    "thread/retention/acquire" => {
+                        json!({"status": "acquired", "grantId": format!("connection-{connection}")})
+                    }
+                    "thread/retention/release" => json!({"status": "released"}),
                     "thread/goal/get" => json!({"goal": null}),
                     "skills/list" => json!({"data": []}),
                     _ => {

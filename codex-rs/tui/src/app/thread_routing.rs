@@ -1664,7 +1664,7 @@ impl App {
         }
 
         match app_server
-            .resume_thread(
+            .observe_thread(
                 &self.local_settings,
                 self.config.clone(),
                 thread_id,

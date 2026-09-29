@@ -912,18 +912,21 @@ async fn fresh_startup_thread_drains_buffered_approval_before_draft_handoff() ->
     let mut app_server =
         crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref()).await?;
 
-    let control = Box::pin(app.handle_event(
-        &mut tui,
-        &mut app_server,
-        AppEvent::StartupThreadStarted {
-            result: Ok(AppServerStartedThread {
-                session: test_thread_session(thread_id, test_path_buf("/tmp/project")),
-                turns: Vec::new(),
-                blocks_direct_input: false,
-                task_tools_available: false,
-            }),
-        },
-    ))
+    let control = Box::pin(
+        app.handle_event(
+            &mut tui,
+            &mut app_server,
+            AppEvent::StartupThreadStarted {
+                result: Ok(AppServerStartedThread {
+                    session: test_thread_session(thread_id, test_path_buf("/tmp/project")),
+                    turns: Vec::new(),
+                    blocks_direct_input: false,
+                    task_tools_available: false,
+                }
+                .into()),
+            },
+        ),
+    )
     .await?;
 
     assert!(matches!(control, AppRunControl::Continue));
@@ -1138,7 +1141,8 @@ async fn startup_thread_started_submits_queued_startup_input() {
             turns: Vec::new(),
             blocks_direct_input: false,
             task_tools_available: false,
-        }),
+        }
+        .into()),
     )
     .await
     .expect("startup thread should attach");
@@ -1176,7 +1180,8 @@ async fn fresh_startup_notice_follows_session_attachment() {
             turns: Vec::new(),
             blocks_direct_input: false,
             task_tools_available: false,
-        }),
+        }
+        .into()),
     )
     .await
     .expect("startup thread should attach");
@@ -1335,7 +1340,8 @@ async fn startup_thread_started_discards_another_threads_buffered_events() {
             turns: Vec::new(),
             blocks_direct_input: false,
             task_tools_available: false,
-        }),
+        }
+        .into()),
     )
     .await
     .expect("startup thread should attach");
@@ -1384,7 +1390,8 @@ async fn startup_thread_started_does_not_replay_resolved_approval() -> Result<()
             turns: Vec::new(),
             blocks_direct_input: false,
             task_tools_available: false,
-        }),
+        }
+        .into()),
     )
     .await?;
 
@@ -1526,7 +1533,8 @@ fn stale_startup_thread_started_removes_local_routing_state() -> Result<()> {
                     turns: Vec::new(),
                     blocks_direct_input: false,
                     task_tools_available: false,
-                }),
+                }
+                .into()),
             )
             .await?;
 

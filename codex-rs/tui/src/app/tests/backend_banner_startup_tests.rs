@@ -54,7 +54,7 @@ async fn backend_banner_fallback_applies_before_initial_and_queued_startup_promp
     let thread_id = started.session.thread_id;
     requests.lock().unwrap().clear();
     while events.try_recv().is_ok() {}
-    app.handle_startup_thread_started(&mut server, Ok(started))
+    app.handle_startup_thread_started(&mut server, Ok(started.into()))
         .await?;
     assert_eq!(app.active_thread_id, Some(thread_id));
     let submissions = std::iter::from_fn(|| events.try_recv().ok())

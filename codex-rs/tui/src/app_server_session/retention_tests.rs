@@ -117,6 +117,17 @@ async fn interactive_start_paths_retain_and_unsubscribe_releases() -> Result<()>
     let mut session = crate::start_embedded_app_server_for_picker(&config).await?;
     let started = session.start_thread(&config).await?;
     let thread_id = started.session.thread_id;
+    // A second explicitly owned blank does not end the first one's ownership.
+    // A raw subscribed start, in contrast, has no adoption grant.
+    let hidden = session.start_thread(&config).await?.session.thread_id;
+    let passive: codex_app_server_protocol::ThreadStartResponse = session
+        .request_handle()
+        .request_typed(ClientRequest::ThreadStart {
+            request_id: session.next_request_id(),
+            params: codex_app_server_protocol::ThreadStartParams::default(),
+        })
+        .await?;
+    let passive_id = ThreadId::from_string(&passive.thread.id)?;
     assert_eq!(
         config.thread_unload_delay,
         std::time::Duration::from_secs(5)
@@ -124,6 +135,14 @@ async fn interactive_start_paths_retain_and_unsubscribe_releases() -> Result<()>
     // The adopted thread must survive idle for more than the configured deadline.
     tokio::time::sleep(std::time::Duration::from_secs(6)).await;
     let grant_id = held_grant(&mut session, thread_id).await?;
+    held_grant(&mut session, hidden).await?;
+    assert_eq!(
+        session
+            .thread_read(passive_id, /*include_turns*/ false)
+            .await?
+            .status,
+        codex_app_server_protocol::ThreadStatus::NotLoaded
+    );
     // Repeated adoption is idempotent and retains the exact existing grant.
     session
         .retention

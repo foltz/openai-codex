@@ -128,6 +128,9 @@ async fn interactive_start_paths_retain_and_unsubscribe_releases() -> Result<()>
         })
         .await?;
     let passive_id = ThreadId::from_string(&passive.thread.id)?;
+    let loaded = session.thread_loaded_list(Default::default()).await?;
+    assert_eq!(loaded.next_cursor, None);
+    assert!(loaded.data.contains(&passive_id.to_string()));
     assert_eq!(
         config.thread_unload_delay,
         std::time::Duration::from_secs(5)
@@ -136,12 +139,18 @@ async fn interactive_start_paths_retain_and_unsubscribe_releases() -> Result<()>
     tokio::time::sleep(std::time::Duration::from_secs(6)).await;
     let grant_id = held_grant(&mut session, thread_id).await?;
     held_grant(&mut session, hidden).await?;
+    // An unloaded blank has no persisted record for thread/read. Inspect
+    // loaded membership directly, including both retained positive controls.
+    let loaded = session.thread_loaded_list(Default::default()).await?;
+    assert_eq!(loaded.next_cursor, None);
     assert_eq!(
-        session
-            .thread_read(passive_id, /*include_turns*/ false)
-            .await?
-            .status,
-        codex_app_server_protocol::ThreadStatus::NotLoaded
+        loaded
+            .data
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        [thread_id.to_string(), hidden.to_string()]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
     );
     // Repeated adoption is idempotent and retains the exact existing grant.
     session

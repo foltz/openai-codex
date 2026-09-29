@@ -19,12 +19,13 @@ use super::source::run_external_agent_config_source_prompt;
 pub(crate) const EXTERNAL_AGENT_CONFIG_MIGRATION_NO_ITEMS_MESSAGE: &str =
     "No compatible setup was found to import.";
 pub(crate) const EXTERNAL_AGENT_CONFIG_MIGRATION_REMOTE_UNAVAILABLE_MESSAGE: &str = "Import from other apps is unavailable in remote sessions. Start Codex locally and run /import.";
-pub(crate) const EXTERNAL_AGENT_CONFIG_MIGRATION_DAEMON_UNAVAILABLE_MESSAGE: &str = "Import from other apps is unavailable while Codex is connected to the local app-server daemon. Stop the daemon, restart Codex, and run /import.";
+pub(crate) const EXTERNAL_AGENT_CONFIG_MIGRATION_DAEMON_UNAVAILABLE_MESSAGE: &str = "Import from other apps is unavailable while Codex is connected to the local app-server daemon. Restart with `codex --no-daemon` and run /import.";
 
 pub(crate) enum ExternalAgentConfigMigrationFlowOutcome {
     Started(Vec<Line<'static>>),
     NoItems,
     Cancelled,
+    TerminalError(std::io::Error),
 }
 
 struct DetectedExternalAgentConfigSource {
@@ -312,10 +313,11 @@ pub(crate) async fn handle_external_agent_config_migration_prompt(
             .iter()
             .map(|detected| detected.source)
             .collect::<Vec<_>>();
-        let Some(source) = run_external_agent_config_source_prompt(tui, &sources).await else {
-            return Ok(ExternalAgentConfigMigrationFlowOutcome::Cancelled);
-        };
-        source
+        match run_external_agent_config_source_prompt(tui, &sources).await {
+            Ok(Some(source)) => source,
+            Ok(None) => return Ok(ExternalAgentConfigMigrationFlowOutcome::Cancelled),
+            Err(err) => return Ok(ExternalAgentConfigMigrationFlowOutcome::TerminalError(err)),
+        }
     };
     let Some(detected_source) = detected_sources
         .into_iter()
@@ -337,7 +339,7 @@ pub(crate) async fn handle_external_agent_config_migration_prompt(
         )
         .await
         {
-            ExternalAgentConfigMigrationOutcome::Proceed(items) => {
+            Ok(ExternalAgentConfigMigrationOutcome::Proceed(items)) => {
                 selected_items = items.clone();
                 match app_server
                     .external_agent_config_import(
@@ -367,9 +369,10 @@ pub(crate) async fn handle_external_agent_config_migration_prompt(
                     }
                 }
             }
-            ExternalAgentConfigMigrationOutcome::Skip => {
+            Ok(ExternalAgentConfigMigrationOutcome::Skip) => {
                 return Ok(ExternalAgentConfigMigrationFlowOutcome::Cancelled);
             }
+            Err(err) => return Ok(ExternalAgentConfigMigrationFlowOutcome::TerminalError(err)),
         }
     }
 }

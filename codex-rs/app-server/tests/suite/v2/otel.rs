@@ -48,7 +48,7 @@ async fn account_switch_reloads_telemetry_collectors_and_preserves_trace_context
             .email(INITIAL_EMAIL),
         AuthCredentialsStoreMode::File,
     )?;
-    write_models_cache(codex_home.path())?;
+    write_models_cache(codex_home.path()).await?;
 
     let mut app_server = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -129,6 +129,10 @@ async fn account_switch_reloads_telemetry_collectors_and_preserves_trace_context
         next_metrics.contains("codex.thread.started"),
         "the next account's metrics did not reach its collector: {next_metrics}"
     );
+    assert!(
+        next_metrics.contains("is_worktree"),
+        "the thread-start worktree tag did not reach its collector: {next_metrics}"
+    );
 
     Ok(())
 }
@@ -153,11 +157,14 @@ async fn managed_trace_route_preserves_explicit_request_spawn_and_submission_par
     write_otel_config(home.path(), &format!("{}/trace-test", collector.uri()))?;
     let config_path = home.path().join("config.toml");
     let config = std::fs::read_to_string(&config_path)?;
+    // Detached snapshot work retains the request span while running the login
+    // shell. This fixture tests parent selection, not shell-profile completion.
+    let config = format!("{config}\n[features]\nshell_snapshot = false\n");
     std::fs::write(
         config_path,
         config.replace("http://127.0.0.1:1/v1", &format!("{}/v1", model.uri())),
     )?;
-    write_models_cache(home.path())?;
+    write_models_cache(home.path()).await?;
     let mut server = TestAppServer::builder()
         .with_codex_home(home.path())
         .with_env_overrides(&[("TRACEPARENT", Some(PARENT_TRACEPARENT))])
@@ -237,7 +244,7 @@ async fn managed_trace_route_preserves_explicit_request_spawn_and_submission_par
         ("thread/start", start_trace),
         ("thread_spawn", start_trace),
         ("turn/start", turn_trace),
-        ("op.dispatch.user_input", turn_trace),
+        ("op.dispatch.turn_input", turn_trace),
     ] {
         assert!(
             spans

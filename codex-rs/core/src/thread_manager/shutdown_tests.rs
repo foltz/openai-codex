@@ -43,7 +43,6 @@ fn runtime_retirement_requires_all_three_positive_receipts() {
                 ThreadCleanupOutcome::TaskJoinFailed,
                 ThreadCleanupOutcome::ConversationShutdownFailed,
                 ThreadCleanupOutcome::CodeModeShutdownFailed,
-                ThreadCleanupOutcome::GuardianFailed,
             ] {
                 let outcome = RuntimeOutcome::Retirement(ThreadRetirementReport {
                     ordinary,
@@ -127,6 +126,10 @@ async fn manager_shutdown_owns_removed_and_loaded_threads_before_first_poll() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "holding the lookup lock is the discriminator proving independent runtime cleanup"
+)]
 async fn manager_shutdown_does_not_let_lookup_lock_starve_runtime_cleanup() {
     let (_home, manager, config) = manager().await;
     let started = manager
@@ -280,7 +283,7 @@ async fn manager_incomplete_report_keeps_failed_start_custody_after_future_retur
 async fn manager_shutdown_drives_admitted_constructor_after_its_observer_is_cancelled() {
     struct HeldInstructions(Mutex<Option<tokio::sync::oneshot::Receiver<()>>>);
     impl codex_extension_api::UserInstructionsProvider for HeldInstructions {
-        fn load_user_instructions(&self) -> codex_extension_api::LoadUserInstructionsFuture<'_> {
+        fn load_user_instructions(&self) -> codex_extension_api::LoadInstructionsFuture<'_> {
             let held = self.0.lock().unwrap().take().unwrap();
             Box::pin(async move {
                 held.await.unwrap();

@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use clap::Parser;
 use codex_app_server::AppServerCodeModeHostArgs;
 use codex_app_server::AppServerRuntimeOptions;
@@ -12,6 +14,13 @@ use codex_protocol::protocol::SessionSource;
 use codex_utils_cli::CliConfigOverrides;
 use std::path::PathBuf;
 
+#[cfg(all(
+    target_os = "linux",
+    target_env = "musl",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[cfg(all(debug_assertions, unix))]
 use futures::SinkExt;
 #[cfg(all(debug_assertions, unix))]
@@ -65,23 +74,23 @@ struct AppServerArgs {
     /// Hidden helper used only by the Unix-peer entitlement integration test.
     /// It connects through the production protocol as this exact binary.
     #[cfg(all(debug_assertions, unix))]
-    #[arg(long = "interactive-attachment-peer-helper", hide = true)]
-    interactive_attachment_peer_helper: Option<PathBuf>,
+    #[arg(long = "interactive-subscription-peer-helper", hide = true)]
+    interactive_subscription_peer_helper: Option<PathBuf>,
 
     #[cfg(all(debug_assertions, unix))]
     #[arg(
-        long = "interactive-attachment-peer-helper-expect-unproven",
+        long = "interactive-subscription-peer-helper-expect-unproven",
         hide = true
     )]
-    interactive_attachment_peer_helper_expect_unproven: bool,
+    interactive_subscription_peer_helper_expect_unproven: bool,
 
     /// Enable remote control for this app-server process without changing persistence.
     #[arg(long = "remote-control", hide = true)]
     remote_control: bool,
 
-    /// Enable process-only PSP routing for first-party ChatGPT requests.
+    /// Save loaded threads during managed daemon shutdown.
     #[arg(long, hide = true)]
-    psp: bool,
+    managed_daemon: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -97,17 +106,17 @@ fn main() -> anyhow::Result<()> {
             #[cfg(debug_assertions)]
             disable_plugin_startup_tasks_for_tests,
             #[cfg(all(debug_assertions, unix))]
-            interactive_attachment_peer_helper,
+            interactive_subscription_peer_helper,
             #[cfg(all(debug_assertions, unix))]
-            interactive_attachment_peer_helper_expect_unproven,
+            interactive_subscription_peer_helper_expect_unproven,
             remote_control,
-            psp,
+            managed_daemon,
         } = AppServerArgs::parse();
         #[cfg(all(debug_assertions, unix))]
-        if let Some(socket_path) = interactive_attachment_peer_helper {
-            return run_interactive_attachment_peer_helper(
+        if let Some(socket_path) = interactive_subscription_peer_helper {
+            return run_interactive_subscription_peer_helper(
                 socket_path,
-                interactive_attachment_peer_helper_expect_unproven,
+                interactive_subscription_peer_helper_expect_unproven,
             )
             .await;
         }
@@ -123,7 +132,7 @@ fn main() -> anyhow::Result<()> {
         let auth = auth.try_into_settings()?;
         let mut runtime_options = AppServerRuntimeOptions {
             code_mode_host_transport: code_mode_host.into(),
-            psp,
+            managed_daemon,
             ..Default::default()
         };
         #[cfg(debug_assertions)]
@@ -137,7 +146,7 @@ fn main() -> anyhow::Result<()> {
                 (false, false) => codex_app_server::RemoteControlStartupMode::ResolvePersisted,
             };
 
-        run_main_with_transport_options(
+        let exit = run_main_with_transport_options(
             arg0_paths,
             config_overrides,
             loader_overrides,
@@ -149,12 +158,16 @@ fn main() -> anyhow::Result<()> {
             runtime_options,
         )
         .await?;
+        if exit == codex_app_server::AppServerExit::Forced {
+            // Runtime teardown can wait forever for blocked rollout I/O.
+            std::process::exit(0);
+        }
         Ok(())
     })
 }
 
 #[cfg(all(debug_assertions, unix))]
-async fn run_interactive_attachment_peer_helper(
+async fn run_interactive_subscription_peer_helper(
     socket_path: PathBuf,
     expect_unproven: bool,
 ) -> anyhow::Result<()> {
@@ -228,19 +241,19 @@ async fn run_interactive_attachment_peer_helper(
     let snapshot = request(
         &mut websocket,
         3,
-        "thread/attachment/list",
+        "kcf/thread/interactiveSubscription/list",
         serde_json::json!({}),
     )
     .await?;
     let entries = snapshot["entries"]
         .as_array()
-        .ok_or_else(|| anyhow::anyhow!("attachment list did not return entries"))?;
+        .ok_or_else(|| anyhow::anyhow!("subscription list did not return entries"))?;
     let contains_thread = entries
         .iter()
         .any(|entry| entry["threadId"].as_str() == Some(thread_id));
     anyhow::ensure!(
         contains_thread != expect_unproven,
-        "unexpected attachment entitlement: expect_unproven={expect_unproven}, entries={entries:?}"
+        "unexpected subscription entitlement: expect_unproven={expect_unproven}, entries={entries:?}"
     );
     Ok(())
 }

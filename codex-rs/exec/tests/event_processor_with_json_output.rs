@@ -169,6 +169,7 @@ fn turn_started_emits_turn_started_event() {
 fn command_execution_started_and_completed_translate_to_thread_events() {
     let mut processor = EventProcessorWithJsonOutput::new(/*last_message_path*/ None);
     let command_item = ThreadItem::CommandExecution {
+        model_context: None,
         id: "cmd-1".to_string(),
         command: "ls".to_string(),
         cwd: test_path_buf("/tmp/project").abs().into(),
@@ -211,6 +212,7 @@ fn command_execution_started_and_completed_translate_to_thread_events() {
     let completed = processor.collect_thread_events(ServerNotification::ItemCompleted(
         ItemCompletedNotification {
             item: ThreadItem::CommandExecution {
+                model_context: None,
                 id: "cmd-1".to_string(),
                 command: "ls".to_string(),
                 cwd: test_path_buf("/tmp/project").abs().into(),
@@ -305,6 +307,8 @@ fn unsupported_items_do_not_consume_synthetic_ids() {
                 text: "hello".to_string(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
+                questions: None,
             },
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
@@ -395,12 +399,69 @@ fn web_search_completion_preserves_query_and_action() {
                             query: Some("rust async await".to_string()),
                             queries: None,
                         },
+                        results: None,
                     }),
                 },
             })],
             status: CodexStatus::Running,
         }
     );
+}
+
+#[test]
+fn web_search_page_actions_and_results_survive_json_output() {
+    let url = "https://example.com/docs";
+    for (action, expected_action) in [
+        (
+            ApiWebSearchAction::OpenPage {
+                url: Some(url.to_string()),
+            },
+            json!({"type": "open_page", "url": url}),
+        ),
+        (
+            ApiWebSearchAction::FindInPage {
+                url: Some(url.to_string()),
+                pattern: Some("configuration".to_string()),
+            },
+            json!({"type": "find_in_page", "url": url, "pattern": "configuration"}),
+        ),
+    ] {
+        for results in [
+            None,
+            Some(vec![]),
+            Some(vec![json!({"url": url, "content": "configuration"})]),
+            Some(vec![json!({"url": url, "error": {"status": 404}})]),
+        ] {
+            let mut processor = EventProcessorWithJsonOutput::new(/*last_message_path*/ None);
+            let collected = processor.collect_thread_events(ServerNotification::ItemCompleted(
+                ItemCompletedNotification {
+                    item: ThreadItem::WebSearch(ApiWebSearchItem {
+                        id: "search-1".to_string(),
+                        query: url.to_string(),
+                        action: Some(action.clone()),
+                        results: results.clone(),
+                    }),
+                    thread_id: "thread-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    completed_at_ms: 0,
+                },
+            ));
+
+            let mut expected_item = json!({
+                "id": "search-1",
+                "type": "web_search",
+                "query": url,
+                "action": expected_action,
+            });
+            if let Some(results) = results {
+                expected_item["results"] = json!(results);
+            }
+            assert_eq!(
+                serde_json::to_value(collected.events).expect("serialize web search events"),
+                json!([{"type": "item.completed", "item": expected_item}]),
+            );
+        }
+    }
 }
 
 #[test]
@@ -447,6 +508,7 @@ fn web_search_start_and_completion_reuse_item_id() {
                         id: "search-1".to_string(),
                         query: String::new(),
                         action: WebSearchAction::Other,
+                        results: None,
                     }),
                 },
             })],
@@ -466,6 +528,7 @@ fn web_search_start_and_completion_reuse_item_id() {
                             query: Some("rust async await".to_string()),
                             queries: None,
                         },
+                        results: None,
                     }),
                 },
             })],
@@ -488,6 +551,7 @@ fn mcp_tool_call_begin_and_end_emit_item_events() {
                 arguments: json!({ "key": "value" }),
                 app_context: None,
                 mcp_app_resource_uri: None,
+                mcp_app_ui: None,
                 plugin_id: None,
                 read_only_hint: None,
                 result: None,
@@ -508,6 +572,7 @@ fn mcp_tool_call_begin_and_end_emit_item_events() {
                 arguments: json!({ "key": "value" }),
                 app_context: None,
                 mcp_app_resource_uri: None,
+                mcp_app_ui: None,
                 plugin_id: None,
                 read_only_hint: None,
                 result: Some(Box::new(McpToolCallResult {
@@ -582,6 +647,7 @@ fn mcp_tool_call_failure_sets_failed_status() {
                 arguments: json!({ "param": 42 }),
                 app_context: None,
                 mcp_app_resource_uri: None,
+                mcp_app_ui: None,
                 plugin_id: None,
                 read_only_hint: None,
                 result: None,
@@ -633,6 +699,7 @@ fn mcp_tool_call_defaults_arguments_and_preserves_structured_content() {
                 arguments: serde_json::Value::Null,
                 app_context: None,
                 mcp_app_resource_uri: None,
+                mcp_app_ui: None,
                 plugin_id: None,
                 read_only_hint: None,
                 result: None,
@@ -653,6 +720,7 @@ fn mcp_tool_call_defaults_arguments_and_preserves_structured_content() {
                 arguments: serde_json::Value::Null,
                 app_context: None,
                 mcp_app_resource_uri: None,
+                mcp_app_ui: None,
                 plugin_id: None,
                 read_only_hint: None,
                 result: Some(Box::new(McpToolCallResult {
@@ -926,6 +994,8 @@ fn agent_message_item_updates_final_message() {
                 text: "hello".to_string(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
+                questions: None,
             },
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
@@ -961,6 +1031,8 @@ fn agent_message_item_started_is_ignored() {
                 text: "hello".to_string(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
+                questions: None,
             },
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
@@ -1311,6 +1383,8 @@ fn turn_completion_recovers_final_message_from_turn_items() {
                     text: "final answer".to_string(),
                     phase: None,
                     memory_citation: None,
+                    delivery: None,
+                    questions: None,
                 }],
                 status: TurnStatus::Completed,
                 error: None,
@@ -1340,6 +1414,7 @@ fn turn_completion_reconciles_started_items_from_turn_items() {
     let started =
         processor.collect_thread_events(ServerNotification::ItemStarted(ItemStartedNotification {
             item: ThreadItem::CommandExecution {
+                model_context: None,
                 id: "cmd-1".to_string(),
                 command: "ls".to_string(),
                 cwd: test_path_buf("/tmp/project").abs().into(),
@@ -1382,6 +1457,7 @@ fn turn_completion_reconciles_started_items_from_turn_items() {
                 id: "turn-1".to_string(),
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: vec![ThreadItem::CommandExecution {
+                    model_context: None,
                     id: "cmd-1".to_string(),
                     command: "ls".to_string(),
                     cwd: test_path_buf("/tmp/project").abs().into(),
@@ -1438,6 +1514,8 @@ fn turn_completion_overwrites_stale_final_message_from_turn_items() {
                 text: "stale answer".to_string(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
+                questions: None,
             },
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
@@ -1456,6 +1534,8 @@ fn turn_completion_overwrites_stale_final_message_from_turn_items() {
                     text: "final answer".to_string(),
                     phase: None,
                     memory_citation: None,
+                    delivery: None,
+                    questions: None,
                 }],
                 status: TurnStatus::Completed,
                 error: None,
@@ -1488,6 +1568,8 @@ fn turn_completion_preserves_streamed_final_message_when_turn_items_are_empty() 
                 text: "streamed answer".to_string(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
+                questions: None,
             },
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
@@ -1534,6 +1616,8 @@ fn failed_turn_clears_stale_final_message() {
                 text: "partial answer".to_string(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
+                questions: None,
             },
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
@@ -1553,6 +1637,7 @@ fn failed_turn_clears_stale_final_message() {
                 items: Vec::new(),
                 status: TurnStatus::Failed,
                 error: Some(TurnError {
+                    misalignment: None,
                     message: "turn failed".to_string(),
                     additional_details: None,
                     codex_error_info: None,
@@ -1609,6 +1694,7 @@ fn turn_failure_prefers_structured_error_message() {
 
     let error = processor.collect_thread_events(ServerNotification::Error(ErrorNotification {
         error: TurnError {
+            misalignment: None,
             message: "backend failed".to_string(),
             codex_error_info: None,
             additional_details: Some("request id abc".to_string()),

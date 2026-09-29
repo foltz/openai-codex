@@ -19,7 +19,7 @@ use tracing::warn;
 
 use crate::elicitation_client_service::ElicitationClientService;
 use crate::event_notification_transport::capture_event_notifications;
-use crate::oauth::OAuthPersistor;
+use crate::oauth::OAuthRuntime;
 use crate::retirement::AcknowledgedTransport;
 use crate::retirement::ManagedRunningService;
 use crate::retirement::PhysicalAttemptTicket;
@@ -47,7 +47,7 @@ pub(super) struct PendingConnection {
     handshake: Handshake,
     receipt: TransportCloseReceipt,
     ticket: PhysicalAttemptTicket,
-    pub(super) oauth: Option<OAuthPersistor>,
+    pub(super) oauth: Option<OAuthRuntime>,
     pub(super) retryable: bool,
 }
 
@@ -87,12 +87,16 @@ impl PendingConnection {
             ),
             PendingTransport::StreamableHttpWithOAuth {
                 transport,
-                oauth_persistor,
+                oauth_runtime,
             } => Self::bind(
                 transport,
                 ticket,
                 /*process*/ None,
-                Some(oauth_persistor),
+                Some(oauth_runtime),
+                /*retryable*/ true,
+            ),
+            PendingTransport::StreamableHttpWithAccessTokenOnly { transport } => Self::bind(
+                transport, ticket, /*process*/ None, /*oauth*/ None,
                 /*retryable*/ true,
             ),
         }
@@ -102,7 +106,7 @@ impl PendingConnection {
         transport: T,
         ticket: PhysicalAttemptTicket,
         process: Option<StdioServerProcessHandle>,
-        oauth: Option<OAuthPersistor>,
+        oauth: Option<OAuthRuntime>,
         retryable: bool,
     ) -> Self {
         let (transport, receipt) = AcknowledgedTransport::new(transport);
@@ -124,19 +128,30 @@ impl PendingConnection {
         lifecycle: ClientLifecycleMode,
         timeout: Option<Duration>,
         initialize_deadline: Option<InitializeDeadlineGuard>,
-    ) -> Result<(Arc<ManagedRunningService>, Option<OAuthPersistor>)> {
+    ) -> Result<(Arc<ManagedRunningService>, Option<OAuthRuntime>)> {
         let ticket = self.ticket.clone();
         let phase = ticket.start_phase(move |ticket| async move {
             // This guard belongs to the retained phase, not its cancellable
             // observer. HTTP requests keep the original handshake budget.
             let _initialize_deadline = initialize_deadline;
             let handshake = (self.handshake)(service, lifecycle);
-            let result = match timeout {
-                Some(duration) => match tokio::time::timeout(duration, handshake).await {
-                    Ok(result) => result.map_err(|source| anyhow::Error::from(HandshakeError { source })),
-                    Err(_) => Err(anyhow!("timed out handshaking with MCP server after {duration:?}")),
-                },
-                None => handshake.await.map_err(|source| anyhow::Error::from(HandshakeError { source })),
+            let handshake_with_timeout = async move {
+                match timeout {
+                    Some(duration) => match tokio::time::timeout(duration, handshake).await {
+                        Ok(result) => result.map_err(|source| anyhow::Error::from(HandshakeError { source })),
+                        Err(_) => Err(anyhow!("timed out handshaking with MCP server after {duration:?}")),
+                    },
+                    None => handshake.await.map_err(|source| anyhow::Error::from(HandshakeError { source })),
+                }
+            };
+            // Cancel inside the retained phase: dropping the handshake returns
+            // its acknowledged transport before the phase is marked terminal.
+            // Transport creation remains separately retained until acquisition
+            // finishes; arbitrary factories are not assumed cancellation-safe.
+            let result = tokio::select! {
+                biased;
+                _ = ticket.shutdown.cancelled() => Err(anyhow!("MCP handshake cancelled by retirement")),
+                result = handshake_with_timeout => result,
             };
             let result = match result {
                 Ok(service) => {
@@ -146,7 +161,7 @@ impl PendingConnection {
                     Ok((service, self.oauth))
                 }
                 Err(error) => {
-                    if let Some(runtime) = self.oauth.as_ref()
+                    if let Some(OAuthRuntime::Legacy(runtime)) = self.oauth.as_ref()
                         && let Err(persist_error) = runtime.persist_if_needed().await
                     {
                         warn!("failed to persist OAuth tokens after failed initialize: {persist_error}");

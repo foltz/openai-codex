@@ -142,6 +142,9 @@ impl LocalTraceRoute {
 impl opentelemetry::trace::Tracer for LocalTraceRoute {
     type Span = BoxedSpan;
     fn build_with_context(&self, builder: SpanBuilder, parent: &Context) -> Self::Span {
+        // Consume before SDK callbacks so a reentrant build cannot reuse it.
+        let root_parent = crate::root_span_context::take_build_parent();
+        let parent = root_parent.as_ref().unwrap_or(parent);
         self.with_tracer(|selected| {
             let tracer = match selected {
                 Some(tracer) => BoxedTracer::new(Box::new(tracer.clone())),
@@ -168,7 +171,7 @@ where
 
     fn on_new_span(
         &self,
-        _attrs: &tracing::span::Attributes<'_>,
+        attrs: &tracing::span::Attributes<'_>,
         id: &tracing::span::Id,
         ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
@@ -180,7 +183,15 @@ where
                 .get()
                 .and_then(tracing::dispatcher::WeakDispatch::upgrade)
         {
-            let _ = tracing_opentelemetry::get_otel_context(&mut span.extensions_mut(), &dispatch);
+            let parent = if attrs.is_root() {
+                crate::root_span_context::take_root_parent()
+            } else {
+                None
+            };
+            crate::root_span_context::with_root_build_parent(parent, || {
+                let _ =
+                    tracing_opentelemetry::get_otel_context(&mut span.extensions_mut(), &dispatch);
+            });
         }
     }
 }

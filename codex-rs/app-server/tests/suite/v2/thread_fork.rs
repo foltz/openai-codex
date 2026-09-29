@@ -10,14 +10,25 @@ use app_test_support::create_mock_responses_server_sequence_unchecked;
 use app_test_support::rollout_path;
 use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
+use codex_app_server_protocol::ActivePermissionProfile;
 use codex_app_server_protocol::ApprovalsReviewer;
+use codex_app_server_protocol::AskForApproval;
 use codex_app_server_protocol::ClientRequest;
+use codex_app_server_protocol::DeprecationNoticeNotification;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::SandboxMode;
+use codex_app_server_protocol::SandboxPolicy;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::SessionSource;
+use codex_app_server_protocol::ThreadAttachmentAddParams;
+use codex_app_server_protocol::ThreadAttachmentAddResponse;
+use codex_app_server_protocol::ThreadAttachmentListParams;
+use codex_app_server_protocol::ThreadAttachmentListResponse;
+use codex_app_server_protocol::ThreadAttachmentRemoveParams;
+use codex_app_server_protocol::ThreadAttachmentRemoveResponse;
 use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
 use codex_app_server_protocol::ThreadHistoryMode;
@@ -89,6 +100,7 @@ const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 async fn list_threads(mcp: &mut TestAppServer) -> Result<ThreadListResponse> {
     let list_id = mcp
         .send_thread_list_request(ThreadListParams {
+            originators: None,
             cursor: None,
             limit: Some(50),
             sort_key: None,
@@ -97,6 +109,7 @@ async fn list_threads(mcp: &mut TestAppServer) -> Result<ThreadListResponse> {
             source_kinds: None,
             archived: None,
             section_id: None,
+            project_id: None,
             cwd: None,
             use_state_db_only: false,
             search_term: None,
@@ -304,6 +317,115 @@ async fn paginated_thread_fork_preserves_persisted_approvals_reviewer() -> Resul
     assert_thread_fork_preserves_persisted_approvals_reviewer(ThreadHistoryMode::Paginated).await
 }
 
+#[tokio::test]
+async fn thread_fork_preserves_persisted_permission_profile_and_honors_overrides() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+
+    for history_mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
+        let codex_home = TempDir::new()?;
+        MockResponsesConfig::new(&server.uri())
+            .with_root_config("default_permissions = \":danger-full-access\"")
+            .with_extra_config("[permissions.dev]\nextends = \":read-only\"")
+            .write(codex_home.path())?;
+
+        let source_thread_id = {
+            let mut mcp = TestAppServer::builder()
+                .with_codex_home(codex_home.path())
+                .without_managed_config()
+                .build_initialized()
+                .await?;
+            let start_id = mcp
+                .send_thread_start_request_with_auto_env(ThreadStartParams {
+                    history_mode: Some(history_mode),
+                    approval_policy: Some(AskForApproval::OnRequest),
+                    permissions: Some("dev".to_string()),
+                    ..Default::default()
+                })
+                .await?;
+            let ThreadStartResponse { thread, .. } =
+                timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(start_id)).await??;
+            timeout(
+                DEFAULT_READ_TIMEOUT,
+                mcp.start_turn_and_wait_for_completion(TurnStartParams {
+                    thread_id: thread.id.clone(),
+                    input: vec![UserInput::Text {
+                        text: "persist permission profile".to_string(),
+                        text_elements: Vec::new(),
+                    }],
+                    ..Default::default()
+                }),
+            )
+            .await??;
+            thread.id
+        };
+
+        let mut mcp = TestAppServer::builder()
+            .with_codex_home(codex_home.path())
+            .without_managed_config()
+            .build_initialized()
+            .await?;
+        let fork_id = mcp
+            .send_thread_fork_request(ThreadForkParams {
+                thread_id: source_thread_id.clone(),
+                ..Default::default()
+            })
+            .await?;
+        let ThreadForkResponse {
+            approval_policy,
+            sandbox,
+            active_permission_profile,
+            ..
+        } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(fork_id)).await??;
+        assert!(matches!(sandbox, SandboxPolicy::ReadOnly { .. }));
+        assert_eq!(approval_policy, AskForApproval::OnRequest);
+        assert_eq!(
+            active_permission_profile,
+            Some(ActivePermissionProfile {
+                id: "dev".to_string(),
+                extends: Some(":read-only".to_string()),
+            })
+        );
+
+        let fork_id = mcp
+            .send_thread_fork_request(ThreadForkParams {
+                thread_id: source_thread_id.clone(),
+                approval_policy: Some(AskForApproval::Never),
+                sandbox: Some(SandboxMode::DangerFullAccess),
+                ..Default::default()
+            })
+            .await?;
+        let ThreadForkResponse {
+            approval_policy,
+            sandbox,
+            active_permission_profile,
+            ..
+        } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(fork_id)).await??;
+        assert!(matches!(sandbox, SandboxPolicy::DangerFullAccess));
+        assert_eq!(approval_policy, AskForApproval::Never);
+        assert_eq!(active_permission_profile, None);
+
+        let fork_id = mcp
+            .send_thread_fork_request(ThreadForkParams {
+                thread_id: source_thread_id,
+                permissions: Some(":workspace".to_string()),
+                ..Default::default()
+            })
+            .await?;
+        let ThreadForkResponse {
+            sandbox,
+            active_permission_profile,
+            ..
+        } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(fork_id)).await??;
+        assert!(matches!(sandbox, SandboxPolicy::WorkspaceWrite { .. }));
+        assert_eq!(
+            active_permission_profile,
+            Some(ActivePermissionProfile::new(":workspace"))
+        );
+    }
+
+    Ok(())
+}
+
 async fn assert_thread_fork_preserves_persisted_approvals_reviewer(
     history_mode: ThreadHistoryMode,
 ) -> Result<()> {
@@ -320,6 +442,7 @@ async fn assert_thread_fork_preserves_persisted_approvals_reviewer(
         let start_id = mcp
             .send_thread_start_request_with_auto_env(ThreadStartParams {
                 history_mode: Some(history_mode),
+                permissions: Some(":workspace".to_string()),
                 ..Default::default()
             })
             .await?;
@@ -359,7 +482,9 @@ async fn assert_thread_fork_preserves_persisted_approvals_reviewer(
                     text: "switch to auto-review".to_string(),
                     text_elements: Vec::new(),
                 }],
+                approval_policy: Some(AskForApproval::OnRequest),
                 approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
+                permissions: Some(":read-only".to_string()),
                 ..Default::default()
             })
             .await?;
@@ -383,9 +508,17 @@ async fn assert_thread_fork_preserves_persisted_approvals_reviewer(
                 })
                 .await?;
             let ThreadForkResponse {
-                approvals_reviewer, ..
+                approval_policy,
+                approvals_reviewer,
+                active_permission_profile,
+                ..
             } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(fork_id)).await??;
+            assert_eq!(approval_policy, AskForApproval::OnRequest);
             assert_eq!(approvals_reviewer, ApprovalsReviewer::AutoReview);
+            assert_eq!(
+                active_permission_profile,
+                Some(ActivePermissionProfile::new(":read-only"))
+            );
         }
 
         (thread.id, turn.id)
@@ -408,24 +541,41 @@ async fn assert_thread_fork_preserves_persisted_approvals_reviewer(
     )
     .await??;
     let ThreadForkResponse {
-        approvals_reviewer, ..
+        approval_policy,
+        approvals_reviewer,
+        active_permission_profile,
+        ..
     } = to_response(fork_resp)?;
 
+    assert_eq!(approval_policy, AskForApproval::OnRequest);
     assert_eq!(approvals_reviewer, ApprovalsReviewer::AutoReview);
+    assert_eq!(
+        active_permission_profile,
+        Some(ActivePermissionProfile::new(":read-only"))
+    );
 
     if matches!(history_mode, ThreadHistoryMode::Paginated) {
         let fork_id = mcp
             .send_thread_fork_request(ThreadForkParams {
                 thread_id: source_thread_id,
                 last_turn_id: Some(source_turn_id),
+                approval_policy: Some(AskForApproval::Never),
                 approvals_reviewer: Some(ApprovalsReviewer::User),
                 ..Default::default()
             })
             .await?;
         let ThreadForkResponse {
-            approvals_reviewer, ..
+            approval_policy,
+            approvals_reviewer,
+            active_permission_profile,
+            ..
         } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(fork_id)).await??;
+        assert_eq!(approval_policy, AskForApproval::Never);
         assert_eq!(approvals_reviewer, ApprovalsReviewer::User);
+        assert_eq!(
+            active_permission_profile,
+            Some(ActivePermissionProfile::new(":read-only"))
+        );
     }
 
     Ok(())
@@ -491,6 +641,75 @@ async fn assert_thread_fork_at_named_boundary_keeps_only_terminal_prefix(
     }
 
     let original_contents = std::fs::read_to_string(source_path.as_path())?;
+    // Membership added after the requested history cutoff must still be inherited.
+    let attachment: ThreadAttachmentAddResponse = mcp
+        .request(|request_id| ClientRequest::ThreadAttachmentAdd {
+            request_id,
+            params: ThreadAttachmentAddParams {
+                thread_id: source_thread_id.clone(),
+                attachment_type: "pull_request".to_string(),
+                identity_key: "openai/codex#123".to_string(),
+                payload: json!({"url": "https://github.com/openai/codex/pull/123"}),
+            },
+        })
+        .await?;
+    let sqlite = codex_state::SqliteConfig::new_for_testing(codex_home.path().abs());
+    let pool = sqlite.open_read_write_pool(&sqlite.state_db_path()).await?;
+    sqlx::query(
+        "CREATE TRIGGER fail_fork_attachment_copy BEFORE INSERT ON thread_attachments \
+         BEGIN SELECT RAISE(FAIL, 'attachment copy failure'); END",
+    )
+    .execute(&pool)
+    .await?;
+    let fork_without_attachments: ThreadForkResponse = mcp
+        .request(|request_id| ClientRequest::ThreadFork {
+            request_id,
+            params: ThreadForkParams {
+                thread_id: source_thread_id.clone(),
+                last_turn_id: Some(turn_ids[1].clone()),
+                ..Default::default()
+            },
+        })
+        .await?;
+    assert_eq!(
+        fork_without_attachments
+            .thread
+            .turns
+            .iter()
+            .map(|turn| turn.id.clone())
+            .collect::<Vec<_>>(),
+        turn_ids[..2]
+    );
+    assert!(
+        fork_without_attachments
+            .thread
+            .path
+            .as_ref()
+            .expect("durable fork path")
+            .exists()
+    );
+    let without_attachments: ThreadAttachmentListResponse = mcp
+        .request(|request_id| ClientRequest::ThreadAttachmentList {
+            request_id,
+            params: ThreadAttachmentListParams {
+                thread_id: fork_without_attachments.thread.id.clone(),
+                cursor: None,
+                limit: None,
+            },
+        })
+        .await?;
+    assert!(without_attachments.data.is_empty());
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT id FROM threads WHERE id = ?")
+            .bind(&fork_without_attachments.thread.id)
+            .fetch_one(&pool)
+            .await?,
+        fork_without_attachments.thread.id
+    );
+    sqlx::query("DROP TRIGGER fail_fork_attachment_copy")
+        .execute(&pool)
+        .await?;
+    pool.close().await;
     let fork_id = mcp
         .send_thread_fork_request(ThreadForkParams {
             thread_id: source_thread_id.clone(),
@@ -502,6 +721,66 @@ async fn assert_thread_fork_at_named_boundary_keeps_only_terminal_prefix(
         thread: forked_thread,
         ..
     } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(fork_id)).await??;
+
+    let started = loop {
+        let notification = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("thread/started"),
+        )
+        .await??;
+        let started: ThreadStartedNotification =
+            serde_json::from_value(notification.params.expect("params must be present"))?;
+        if started.thread.id == forked_thread.id {
+            break started;
+        }
+    };
+    assert!(started.thread.turns.is_empty());
+    assert_eq!(
+        started.thread.forked_from_id,
+        Some(source_thread_id.clone())
+    );
+
+    let copied: ThreadAttachmentListResponse = mcp
+        .request(|request_id| ClientRequest::ThreadAttachmentList {
+            request_id,
+            params: ThreadAttachmentListParams {
+                thread_id: started.thread.id,
+                cursor: None,
+                limit: None,
+            },
+        })
+        .await?;
+    assert_eq!(copied.data.len(), 1);
+    assert_ne!(copied.data[0].id, attachment.attachment.id);
+    assert_eq!(
+        copied.data[0],
+        codex_app_server_protocol::ThreadAttachment {
+            id: copied.data[0].id.clone(),
+            created_at: copied.data[0].created_at,
+            ..attachment.attachment.clone()
+        }
+    );
+    let _: ThreadAttachmentRemoveResponse = mcp
+        .request(|request_id| ClientRequest::ThreadAttachmentRemove {
+            request_id,
+            params: ThreadAttachmentRemoveParams {
+                thread_id: forked_thread.id.clone(),
+                attachment_type: attachment.attachment.attachment_type.clone(),
+                identity_key: attachment.attachment.identity_key.clone(),
+            },
+        })
+        .await?;
+    let parent_attachments: ThreadAttachmentListResponse = mcp
+        .request(|request_id| ClientRequest::ThreadAttachmentList {
+            request_id,
+            params: ThreadAttachmentListParams {
+                thread_id: source_thread_id.clone(),
+                cursor: None,
+                limit: None,
+            },
+        })
+        .await?;
+    assert_eq!(parent_attachments.data, vec![attachment.attachment]);
 
     assert_eq!(
         forked_thread
@@ -543,20 +822,6 @@ async fn assert_thread_fork_at_named_boundary_keeps_only_terminal_prefix(
     }
     assert!(!forked_contents.contains(turn_ids[2].as_str()));
 
-    let started = loop {
-        let notification = timeout(
-            DEFAULT_READ_TIMEOUT,
-            mcp.read_stream_until_notification_message("thread/started"),
-        )
-        .await??;
-        let started: ThreadStartedNotification =
-            serde_json::from_value(notification.params.expect("params must be present"))?;
-        if started.thread.id == forked_thread.id {
-            break started;
-        }
-    };
-    assert!(started.thread.turns.is_empty());
-
     if history_mode == ThreadHistoryMode::Paginated {
         let before_fork_id = mcp
             .send_thread_fork_request(ThreadForkParams {
@@ -597,7 +862,7 @@ async fn assert_thread_fork_at_named_boundary_keeps_only_terminal_prefix(
             .request(|request_id| ClientRequest::ThreadFork {
                 request_id,
                 params: ThreadForkParams {
-                    thread_id: forked_thread.id,
+                    thread_id: forked_thread.id.clone(),
                     before_turn_id: Some(completed.turn.id),
                     ephemeral: true,
                     exclude_turns: true,
@@ -607,6 +872,33 @@ async fn assert_thread_fork_at_named_boundary_keeps_only_terminal_prefix(
             .await?;
         assert_eq!(ephemeral_fork.preview, "first");
     }
+
+    // Resuming a fork must not copy its parent's attachments again after an explicit removal.
+    mcp.shutdown_gracefully().await?;
+    let mut resumed = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+    let _: ThreadResumeResponse = resumed
+        .request(|request_id| ClientRequest::ThreadResume {
+            request_id,
+            params: ThreadResumeParams {
+                thread_id: forked_thread.id.clone(),
+                ..Default::default()
+            },
+        })
+        .await?;
+    let after_resume: ThreadAttachmentListResponse = resumed
+        .request(|request_id| ClientRequest::ThreadAttachmentList {
+            request_id,
+            params: ThreadAttachmentListParams {
+                thread_id: forked_thread.id,
+                cursor: None,
+                limit: None,
+            },
+        })
+        .await?;
+    assert!(after_resume.data.is_empty());
 
     Ok(())
 }
@@ -970,6 +1262,7 @@ async fn thread_fork_can_cut_before_unfinished_stored_turn() -> Result<()> {
         &source_path,
         &RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
             turn_id: unfinished_turn_id.to_string(),
+            root_turn_id: None,
             trace_id: None,
             started_at: None,
             model_context_window: None,
@@ -1244,6 +1537,7 @@ async fn thread_fork_creates_reference_backed_paginated_thread() -> Result<()> {
     for item in [
         RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
             turn_id: "turn-1".to_string(),
+            root_turn_id: None,
             trace_id: None,
             started_at: Some(10),
             model_context_window: None,
@@ -1311,6 +1605,19 @@ async fn thread_fork_creates_reference_backed_paginated_thread() -> Result<()> {
         .find(|request| request.url.path().ends_with("/responses"))
         .expect("forked turn response request");
     let request_body = response_request.body_json::<Value>()?;
+    let turn_metadata: Value = serde_json::from_str(
+        request_body["client_metadata"]["x-codex-turn-metadata"]
+            .as_str()
+            .expect("forked turn metadata"),
+    )?;
+    assert_eq!(
+        turn_metadata["forked_from_thread_id"].as_str(),
+        Some(conversation_id.as_str())
+    );
+    assert_eq!(
+        turn_metadata["forked_from_ordinal_exclusive"].as_u64(),
+        Some(history_base.end_ordinal_exclusive)
+    );
     let model_input = request_body["input"]
         .as_array()
         .expect("response input array");
@@ -1364,6 +1671,132 @@ async fn thread_fork_creates_reference_backed_paginated_thread() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn thread_fork_accepts_resumed_rollout_under_symlinked_sessions_root() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    let external = TempDir::new()?;
+    let external_sessions = external.path().join("sessions");
+    std::fs::create_dir_all(external_sessions.as_path())?;
+    std::os::unix::fs::symlink(
+        external_sessions.as_path(),
+        codex_home.path().join("sessions"),
+    )?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+
+    let conversation_id = create_fake_paginated_rollout(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        "Saved user message",
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+    let source_path = rollout_path(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        conversation_id.as_str(),
+    );
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized()
+        .await?;
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: conversation_id.clone(),
+            path: Some(source_path),
+            ..Default::default()
+        })
+        .await?;
+    let _: ThreadResumeResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
+
+    let fork_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: conversation_id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let ThreadForkResponse { thread, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(fork_id)).await??;
+
+    assert_eq!(thread.forked_from_id, Some(conversation_id));
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_fork_warns_for_paginated_full_history_hydration() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+
+    let conversation_id = create_fake_paginated_rollout(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        "Saved user message",
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized()
+        .await?;
+
+    let fork_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: conversation_id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let _: DeprecationNoticeNotification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_notification("deprecationNotice"),
+    )
+    .await??;
+    let _: ThreadForkResponse = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(fork_id)).await??;
+
+    mcp.clear_message_buffer();
+    let metadata_fork_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: conversation_id.clone(),
+            exclude_turns: true,
+            ..Default::default()
+        })
+        .await?;
+    let _: ThreadForkResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(metadata_fork_id)).await??;
+    assert!(
+        !mcp.pending_notification_methods()
+            .contains(&"deprecationNotice".to_string())
+    );
+
+    mcp.clear_message_buffer();
+    let invalid_fork_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: conversation_id,
+            last_turn_id: Some("turn-1".to_string()),
+            before_turn_id: Some("turn-1".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let _: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(invalid_fork_id)),
+    )
+    .await??;
+    assert!(
+        !mcp.pending_notification_methods()
+            .contains(&"deprecationNotice".to_string())
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn thread_fork_freezes_active_paginated_turn_as_interrupted() -> Result<()> {
     assert_thread_fork_freezes_active_paginated_turn_as_interrupted(MultiAgentVersion::V1).await
@@ -1401,15 +1834,18 @@ async fn assert_thread_fork_freezes_active_paginated_turn_as_interrupted(
     let source_path = rollout_path(codex_home.path(), "2025-01-05T12-00-00", &source_thread_id);
     let source_id = ThreadId::from_string(source_thread_id.as_str())?;
     let user_response_item = |id: &str| {
-        RolloutItem::ResponseItem(ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputText {
-                text: format!("{id} model input"),
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        })
+        RolloutItem::ResponseItem(
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: format!("{id} model input"),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            }
+            .into(),
+        )
     };
     let completed_user_item = |id: &str, completed_at_ms| {
         RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
@@ -1431,6 +1867,7 @@ async fn assert_thread_fork_freezes_active_paginated_turn_as_interrupted(
         source_path.as_path(),
         &RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
             turn_id: "active-turn".to_string(),
+            root_turn_id: None,
             trace_id: None,
             started_at: Some(10),
             model_context_window: None,
@@ -1498,9 +1935,14 @@ async fn assert_thread_fork_freezes_active_paginated_turn_as_interrupted(
         .await?;
     let forked_thread_id = forked_thread.id.clone();
     let forked_path = forked_thread.path.expect("forked rollout path");
+    let history_base = read_session_meta_line(forked_path.as_path())
+        .await?
+        .meta
+        .history_base
+        .expect("fork history base");
     let child_rollout = std::fs::read_to_string(forked_path.as_path())?
         .lines()
-        .map(serde_json::from_str::<RolloutLine>)
+        .map(codex_rollout::parse_rollout_line)
         .collect::<Result<Vec<_>, _>>()?;
     assert!(matches!(
         child_rollout.as_slice(),
@@ -1511,17 +1953,18 @@ async fn assert_thread_fork_freezes_active_paginated_turn_as_interrupted(
                 ..
             },
             RolloutLine {
-                item: RolloutItem::ResponseItem(codex_protocol::models::ResponseItem::Message {
-                    role,
-                    ..
-                }),
+                item: RolloutItem::ResponseItem(response_item),
                 ..
             },
             RolloutLine {
                 item: RolloutItem::EventMsg(EventMsg::TurnAborted(aborted)),
                 ..
             },
-        ] if role == expected_marker_role && aborted.turn_id.as_deref() == Some("active-turn")
+        ] if matches!(
+            &response_item.item,
+            codex_protocol::models::ResponseItem::Message { role, .. }
+                if role == expected_marker_role
+        ) && aborted.turn_id.as_deref() == Some("active-turn")
     ));
 
     append_rollout_item_to_path(source_path.as_path(), &user_response_item("after-fork")).await?;
@@ -1728,6 +2171,19 @@ async fn assert_thread_fork_freezes_active_paginated_turn_as_interrupted(
         .find(|request| request.url.path().ends_with("/responses"))
         .expect("cold-resumed model request")
         .body_json::<Value>()?;
+    let turn_metadata: Value = serde_json::from_str(
+        request_body["client_metadata"]["x-codex-turn-metadata"]
+            .as_str()
+            .expect("cold-resumed turn metadata"),
+    )?;
+    assert_eq!(
+        turn_metadata["forked_from_thread_id"].as_str(),
+        Some(source_thread_id.as_str())
+    );
+    assert_eq!(
+        turn_metadata["forked_from_ordinal_exclusive"].as_u64(),
+        Some(history_base.end_ordinal_exclusive)
+    );
     let model_input = request_body["input"].as_array().expect("model input");
     assert!(model_input.iter().any(|item| {
         item["role"] == expected_marker_role

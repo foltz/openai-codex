@@ -17,7 +17,9 @@ use ratatui::prelude::Widget;
 use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::widgets::Clear;
+use ratatui::widgets::Paragraph;
 use ratatui::widgets::WidgetRef;
+use ratatui::widgets::Wrap;
 use tokio_stream::StreamExt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,12 +49,16 @@ impl ExternalAgentConfigMigrationSource {
 pub(crate) async fn run_external_agent_config_source_prompt(
     tui: &mut Tui,
     sources: &[ExternalAgentConfigMigrationSource],
-) -> Option<ExternalAgentConfigMigrationSource> {
+) -> std::io::Result<Option<ExternalAgentConfigMigrationSource>> {
     let mut screen = ExternalAgentConfigSourceScreen::new(tui.frame_requester(), sources);
-    let _ = tui.draw(u16::MAX, |frame| {
+    if let Err(err) = tui.draw(u16::MAX, |frame| {
         frame.render_widget_ref(&screen, frame.area());
-    });
+    }) {
+        tracing::warn!("failed to draw config migration source prompt: {err}");
+        return Ok(None);
+    }
 
+    tui.discard_pending_input_before_interactive_screen()?;
     let events = tui.event_stream();
     tokio::pin!(events);
 
@@ -61,8 +67,8 @@ pub(crate) async fn run_external_agent_config_source_prompt(
             let _ = tui.screen_size_for_event(&event);
             match event {
                 TuiEvent::Key(key_event) => screen.handle_key(key_event),
-                TuiEvent::Paste(_) => {}
-                TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) => {
+                TuiEvent::Paste(_) | TuiEvent::FocusLost | TuiEvent::Mouse(_) => {}
+                TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) | TuiEvent::FocusGained => {
                     let _ = tui.draw(u16::MAX, |frame| {
                         frame.render_widget_ref(&screen, frame.area());
                     });
@@ -73,7 +79,7 @@ pub(crate) async fn run_external_agent_config_source_prompt(
         }
     }
 
-    screen.selection()
+    Ok(screen.selection())
 }
 
 struct ExternalAgentConfigSourceScreen {
@@ -160,12 +166,14 @@ impl WidgetRef for &ExternalAgentConfigSourceScreen {
         Clear.render(area, buf);
         let mut column = ColumnRenderable::new();
         column.push("");
-        column.push("Choose an import source".bold());
+        column.push(Paragraph::new("Choose an import source".bold()).wrap(Wrap { trim: false }));
         column.push("");
         column.push(
-            Line::from("Select the app whose setup you want to import.".dim()).inset(Insets::tlbr(
-                /*top*/ 0, /*left*/ 2, /*bottom*/ 0, /*right*/ 0,
-            )),
+            Paragraph::new("Select the app whose setup you want to import.".dim())
+                .wrap(Wrap { trim: false })
+                .inset(Insets::tlbr(
+                    /*top*/ 0, /*left*/ 2, /*bottom*/ 0, /*right*/ 0,
+                )),
         );
         column.push("");
         for (index, source) in self.sources.iter().enumerate() {
@@ -175,18 +183,19 @@ impl WidgetRef for &ExternalAgentConfigSourceScreen {
                 " "
             };
             let label = Span::from(format!("{prefix} {}. {}", index + 1, source.label()));
-            column.push(Line::from(if index == self.highlighted_idx {
-                label.cyan()
+            column.push(if index == self.highlighted_idx {
+                Line::from(label).style(crate::bottom_pane::selection_style())
             } else {
-                label
-            }));
+                Line::from(label)
+            });
         }
         column.push("");
         column.push(
             Line::from(vec![
-                "Press ".dim(),
                 key_hint::plain(KeyCode::Enter).into(),
-                " to continue".dim(),
+                " continue · ".dim(),
+                key_hint::plain(KeyCode::Esc).into(),
+                " cancel".dim(),
             ])
             .inset(Insets::tlbr(
                 /*top*/ 0, /*left*/ 2, /*bottom*/ 0, /*right*/ 0,

@@ -5,6 +5,88 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::Notify;
 
+#[tokio::test]
+async fn managed_legacy_cleanup_in_progress_is_retained_as_incomplete() {
+    use crate::config::ConfigBuilder;
+    use crate::thread_manager::StartThreadOptions;
+    use crate::thread_manager::ThreadManager;
+    let home = tempfile::tempdir().unwrap();
+    let mut config = ConfigBuilder::default()
+        .codex_home(home.path().to_path_buf())
+        .fallback_cwd(Some(home.path().to_path_buf()))
+        .build()
+        .await
+        .unwrap();
+    config.ephemeral = true;
+    let manager = Arc::new(ThreadManager::with_models_provider_and_home_for_tests(
+        codex_login::CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    ));
+    let stop = tokio_util::sync::CancellationToken::new();
+    let tasks = tokio_util::task::TaskTracker::new();
+    let mut options = StartThreadOptions::new(config.clone(), /*control_endpoint*/ None);
+    options
+        .thread_extension_init
+        .insert(codex_extension_api::SessionIsolation::Isolated);
+    let started = manager
+        .start_thread_until(options, stop.clone().cancelled_owned(), &tasks)
+        .await
+        .unwrap();
+    let weak = Arc::downgrade(&started.thread);
+    let refresh = started.thread.session.mcp_refresh.acquire().await.unwrap();
+    stop.cancel();
+    tasks.close();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !started
+            .thread
+            .session
+            .task_admission_closed
+            .load(Ordering::Acquire)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("legacy common cleanup entered; refresh gate prevents completion");
+    assert!(started.thread.observed_terminal_cleanup().is_none());
+    assert!(matches!(
+        started
+            .thread
+            .begin_retirement(Instant::now() + Duration::from_secs(5)),
+        Err(crate::ThreadRetirementError::LegacyCleanupStarted)
+    ));
+    let report = manager
+        .begin_shutdown(Instant::now() + Duration::from_secs(5))
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert!(!report.is_complete());
+    assert!(weak.upgrade().is_some());
+    drop(refresh);
+    tokio::time::timeout(Duration::from_secs(5), tasks.wait())
+        .await
+        .expect("cleanup joins");
+    assert_eq!(
+        started.thread.observed_terminal_cleanup(),
+        Some(super::super::SessionLoopOutcome::Normal)
+    );
+    drop(started);
+    // Registration compacts completed population before refusing the closed
+    // manager. The retained shutdown report itself remains incomplete.
+    assert!(
+        manager
+            .start_thread(StartThreadOptions::new(
+                config, /*control_endpoint*/ None
+            ))
+            .await
+            .is_err()
+    );
+    assert!(weak.upgrade().is_none());
+}
+
 #[derive(Clone, Copy)]
 enum ThreadLoopFixture {
     Ordinary,
@@ -88,7 +170,7 @@ async fn exact_thread_fixture_with(
     crate::CodexThread::new(
         session,
         io,
-        configured,
+        crate::thread_startup_metadata::ThreadStartupMetadata::from(&configured),
         None,
         codex_protocol::protocol::SessionSource::Exec,
     )
@@ -211,14 +293,15 @@ async fn exact_thread_idle_commit_refuses_busy_or_active_admission_without_effec
     ));
     assert!(!thread.session.task_admission_closed.load(Ordering::Acquire));
     let deadline = Instant::now() + Duration::from_secs(3);
-    let mut active = thread.session.active_turn.lock().await;
-    assert!(matches!(
-        thread.try_begin_idle_retirement(deadline),
-        Err(crate::ThreadRetirementError::TaskAdmissionBusy)
-    ));
-    assert!(!thread.session.task_admission_closed.load(Ordering::Acquire));
-    *active = Some(crate::state::ActiveTurn::default());
-    drop(active);
+    {
+        let mut active = thread.session.active_turn.lock().await;
+        assert!(matches!(
+            thread.try_begin_idle_retirement(deadline),
+            Err(crate::ThreadRetirementError::TaskAdmissionBusy)
+        ));
+        assert!(!thread.session.task_admission_closed.load(Ordering::Acquire));
+        *active = Some(crate::state::ActiveTurn::default());
+    }
     assert!(matches!(
         thread.try_begin_idle_retirement(deadline),
         Err(crate::ThreadRetirementError::ActiveWork)
@@ -336,6 +419,7 @@ async fn exact_thread_full_submission_queue_freezes_births_before_waiting() {
         .io
         .submit(codex_protocol::protocol::Op::RunUserShellCommand {
             command: "queued work must not start".to_string(),
+            timeout_ms: None,
         })
         .await
         .expect("fill queue");
@@ -372,6 +456,10 @@ async fn exact_thread_full_submission_queue_freezes_births_before_waiting() {
 }
 
 #[tokio::test(start_paused = true)]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "the test keeps admission locked until the shutdown observer deadline expires"
+)]
 async fn exact_thread_expired_observer_does_not_resume_shutdown_enqueue() {
     let thread = exact_thread_fixture(ThreadLoopFixture::Hung).await;
     let active = thread.session.active_turn.lock().await;
@@ -407,7 +495,6 @@ async fn failed_common_api_receipt_never_projects_shutdown_complete() {
         CleanupExecution::ConversationShutdownFailed,
         CleanupExecution::CodeModeShutdownFailed,
         CleanupExecution::McpPrewarmFailed,
-        CleanupExecution::GuardianFailed,
     ] {
         let (session, _, events) = super::super::tests::make_session_and_context_with_rx().await;
         let owner = session.cleanup_owner();
@@ -604,6 +691,10 @@ async fn auxiliary_startup_is_joined_and_cannot_restart_after_cleanup() {
 }
 
 #[tokio::test(start_paused = true)]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "blocked common cleanup is the discriminator for independent MCP retirement"
+)]
 async fn blocked_common_cleanup_does_not_starve_mcp_retirement() {
     let (session, _) = super::super::tests::make_session_and_context().await;
     let session = Arc::new(session);
@@ -704,6 +795,14 @@ async fn failed_initialization_discard_remains_the_original_common_receipt_after
     // actual failed-initialization discard path without starting cleanup twice.
     release.notify_one();
     assert_eq!(
+        owner.observe(Arc::clone(&session)).await,
+        CleanupExecution::TimedOut,
+    );
+    assert!(
+        common.peek().is_none(),
+        "even a ready stop hook must not resume common cleanup after expiry",
+    );
+    assert_eq!(
         common.await,
         CleanupExecution::Finished {
             persistence_failed: false
@@ -736,6 +835,10 @@ async fn expired_cleanup_does_not_start_and_cannot_refresh_its_budget() {
 }
 
 #[tokio::test(start_paused = true)]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "the held admission lock keeps cleanup pending while its deadline is tightened"
+)]
 async fn tightening_deadline_wakes_an_existing_cleanup_observer() {
     let (session, _) = super::super::tests::make_session_and_context().await;
     let session = Arc::new(session);
@@ -774,6 +877,121 @@ async fn legacy_cleanup_cannot_be_relabelled_as_deadline_bound() {
     assert_eq!(
         owner.bind_deadline(Instant::now()),
         Err(DeadlineBindingError::LegacyCleanupStarted)
+    );
+}
+
+#[tokio::test]
+async fn suspension_cannot_relabel_an_ordinary_cleanup_receipt() {
+    let (session, _) = super::super::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let owner = session.cleanup_owner();
+    let ordinary = owner.observe(Arc::clone(&session)).await;
+    assert_eq!(
+        ordinary,
+        CleanupExecution::Finished {
+            persistence_failed: false
+        }
+    );
+    assert_eq!(
+        owner.observe_suspension(session).await,
+        CleanupExecution::AuthorityUnavailable
+    );
+    assert_eq!(owner.completed(), Some(ordinary));
+}
+
+#[tokio::test]
+async fn ordinary_observer_replays_suspension_persistence_failure() {
+    let (session, _) = super::super::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    // This fixture has no writer. Ordinary cleanup permits that, but suspension
+    // must refuse it, and later observers must not replace that failed receipt.
+    assert!(session.live_thread().is_none());
+    let owner = session.cleanup_owner();
+    let result = owner.observe_suspension(Arc::clone(&session)).await;
+    assert_eq!(
+        result,
+        CleanupExecution::Finished {
+            persistence_failed: true
+        }
+    );
+    assert_eq!(owner.completed(), Some(result));
+    assert_eq!(owner.observe(session).await, result);
+}
+
+#[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "polling suspension cleanup while admission is locked proves cancellation retains the same receipt"
+)]
+async fn cancelled_suspension_observer_retains_its_cleanup_sequence() {
+    let (session, _) = super::super::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let owner = session.cleanup_owner();
+    {
+        let _guard = session.active_turn.lock().await;
+        let mut observer = Box::pin(owner.observe_suspension(Arc::clone(&session)));
+        assert!(futures::poll!(observer.as_mut()).is_pending());
+        drop(observer);
+        assert_eq!(owner.completed(), None);
+    }
+    // Resuming through the ordinary entry point must still use suspension's
+    // strict writer requirement, not construct a second common cleanup.
+    assert_eq!(
+        owner.observe(session).await,
+        CleanupExecution::Finished {
+            persistence_failed: true
+        }
+    );
+}
+
+#[tokio::test]
+async fn bound_suspension_common_waits_for_producer_join_before_persistence() {
+    let (session, _) = super::super::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let owner = session.cleanup_owner();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let task = tokio::task::spawn_blocking(move || {
+        let _ = entered_tx.send(());
+        let _ = release_rx.recv();
+    });
+    let _task = session.task_joins.register(task);
+    entered_rx
+        .await
+        .expect("producer entered and cannot be aborted mid-write");
+    owner
+        .bind_deadline(Instant::now() + Duration::from_secs(20))
+        .expect("bind");
+    let mut observer = Box::pin(owner.observe_suspension(Arc::clone(&session)));
+    assert!(futures::poll!(observer.as_mut()).is_pending());
+    let common = owner
+        .state
+        .lock()
+        .expect("state")
+        .common_completion
+        .clone()
+        .expect("common");
+    // Observe common alone: waiting only in the owner's parallel task driver
+    // would allow this sequence to reach persistence while the producer lives.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), common.clone())
+            .await
+            .is_err()
+    );
+    release_tx.send(()).expect("release producer");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), common)
+            .await
+            .expect("joined"),
+        CleanupExecution::Finished {
+            persistence_failed: true
+        }
+    );
+    assert_eq!(
+        observer.await,
+        CleanupExecution::Finished {
+            persistence_failed: true
+        }
     );
 }
 

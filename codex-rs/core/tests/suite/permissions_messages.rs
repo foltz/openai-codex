@@ -1,11 +1,8 @@
 use anyhow::Result;
 use codex_config::ConfigLayerStack;
 use codex_core::ForkSnapshot;
+use codex_core::TurnInputRequest;
 use codex_core::config::Constrained;
-use codex_core::context::ApprovalPromptContext;
-use codex_core::context::ContextualUserFragment;
-use codex_core::context::PermissionsInstructions;
-use codex_core::load_exec_policy;
 use codex_models_manager::model_info::model_info_from_slug;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ApprovalMessages;
@@ -15,7 +12,7 @@ use codex_protocol::openai_models::PermissionMessages;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::Op;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use core_test_support::responses::ResponsesRequest;
@@ -46,18 +43,13 @@ fn model_with_approval_messages(
 ) -> codex_protocol::openai_models::ModelInfo {
     let mut model = model_info_from_slug(slug);
     model.model_messages = Some(ModelMessages {
-        instructions_template: None,
-        instructions_variables: None,
         approvals: Some(ApprovalMessages {
             on_request: Some(on_request.to_string()),
             on_request_auto_review: Some(on_request_auto_review.to_string()),
             never: None,
             unless_trusted: None,
         }),
-        collaboration_modes: None,
-        auto_review: None,
-        permissions: None,
-        token_budget: None,
+        ..Default::default()
     });
     model
 }
@@ -68,13 +60,8 @@ fn model_with_permission_messages(
 ) -> codex_protocol::openai_models::ModelInfo {
     let mut model = model_info_from_slug(slug);
     model.model_messages = Some(ModelMessages {
-        instructions_template: None,
-        instructions_variables: None,
-        approvals: None,
-        collaboration_modes: None,
-        auto_review: None,
         permissions: Some(permissions),
-        token_budget: None,
+        ..Default::default()
     });
     model
 }
@@ -84,16 +71,10 @@ async fn submit_text_turn(
     text: &str,
 ) -> Result<()> {
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: text.to_string(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: text.to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
     Ok(())
@@ -171,7 +152,7 @@ async fn model_change_appends_new_catalog_approval_message() -> Result<()> {
 
     core_test_support::submit_thread_settings(
         &test.codex,
-        codex_protocol::protocol::ThreadSettingsOverrides {
+        ThreadSettingsOverrides {
             model: Some(second_slug.to_string()),
             ..Default::default()
         },
@@ -226,13 +207,8 @@ async fn catalog_non_on_request_approval_messages_are_sent_in_initial_permission
         let model_slug = "catalog-non-on-request-approvals-model";
         let mut model = model_info_from_slug(model_slug);
         model.model_messages = Some(ModelMessages {
-            instructions_template: None,
-            instructions_variables: None,
             approvals: Some(approvals),
-            collaboration_modes: None,
-            auto_review: None,
-            permissions: None,
-            token_budget: None,
+            ..Default::default()
         });
         let mut builder = test_codex()
             .with_model(model_slug)
@@ -304,7 +280,7 @@ async fn catalog_permission_message_is_sent_initially_and_after_model_change() -
 
     core_test_support::submit_thread_settings(
         &test.codex,
-        codex_protocol::protocol::ThreadSettingsOverrides {
+        ThreadSettingsOverrides {
             model: Some(second_slug.to_string()),
             ..Default::default()
         },
@@ -393,16 +369,10 @@ async fn permissions_message_sent_once_on_start() -> Result<()> {
     let test = builder.build(&server).await?;
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
@@ -433,22 +403,16 @@ async fn permissions_message_added_on_override_change() -> Result<()> {
     let test = builder.build(&server).await?;
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello 1".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello 1".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     core_test_support::submit_thread_settings(
         &test.codex,
-        codex_protocol::protocol::ThreadSettingsOverrides {
+        ThreadSettingsOverrides {
             approval_policy: Some(AskForApproval::Never),
             ..Default::default()
         },
@@ -456,16 +420,10 @@ async fn permissions_message_added_on_override_change() -> Result<()> {
     .await?;
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello 2".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello 2".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
@@ -502,30 +460,18 @@ async fn permissions_message_not_added_when_no_change() -> Result<()> {
     let test = builder.build(&server).await?;
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello 1".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello 1".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello 2".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello 2".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
@@ -562,22 +508,16 @@ async fn permissions_message_omitted_when_disabled() -> Result<()> {
     let test = builder.build(&server).await?;
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello 1".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello 1".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     core_test_support::submit_thread_settings(
         &test.codex,
-        codex_protocol::protocol::ThreadSettingsOverrides {
+        ThreadSettingsOverrides {
             approval_policy: Some(AskForApproval::Never),
             ..Default::default()
         },
@@ -585,16 +525,10 @@ async fn permissions_message_omitted_when_disabled() -> Result<()> {
     .await?;
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello 2".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello 2".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
@@ -638,22 +572,16 @@ async fn resume_replays_permissions_messages() -> Result<()> {
 
     initial
         .codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello 1".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello 1".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&initial.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     core_test_support::submit_thread_settings(
         &initial.codex,
-        codex_protocol::protocol::ThreadSettingsOverrides {
+        ThreadSettingsOverrides {
             approval_policy: Some(AskForApproval::Never),
             ..Default::default()
         },
@@ -662,32 +590,20 @@ async fn resume_replays_permissions_messages() -> Result<()> {
 
     initial
         .codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello 2".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello 2".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&initial.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let resumed = builder.restart(&server, &initial).await?;
     resumed
         .codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "after resume".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "after resume".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&resumed.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
@@ -737,22 +653,16 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
 
     initial
         .codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello 1".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello 1".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&initial.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     core_test_support::submit_thread_settings(
         &initial.codex,
-        codex_protocol::protocol::ThreadSettingsOverrides {
+        ThreadSettingsOverrides {
             approval_policy: Some(AskForApproval::Never),
             ..Default::default()
         },
@@ -761,16 +671,10 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
 
     initial
         .codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello 2".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello 2".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&initial.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
@@ -783,16 +687,10 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
     let resumed = builder.restart(&server, &initial).await?;
     resumed
         .codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "after resume".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "after resume".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&resumed.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
@@ -810,24 +708,19 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
         .thread_manager
         .fork_thread(
             ForkSnapshot::Interrupted,
-            fork_config.clone(),
+            codex_core::StartThreadOptions::new(
+                fork_config.clone(),
+                /*control_endpoint*/ None,
+            ),
             rollout_path,
-            /*thread_source*/ None,
-            /*parent_trace*/ None,
         )
         .await?;
     forked
         .thread
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "after fork".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "after fork".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&forked.thread, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
@@ -856,13 +749,13 @@ async fn permissions_message_includes_writable_roots() -> Result<()> {
     )
     .await;
     let writable = TempDir::new()?;
-    let writable_root = AbsolutePathBuf::try_from(writable.path())?;
+    let writable_root = AbsolutePathBuf::try_from(writable.path().canonicalize()?)?;
     let writable_root_for_config = writable_root.clone();
     let permission_profile = PermissionProfile::workspace_write_with(
         std::slice::from_ref(&writable_root),
         NetworkSandboxPolicy::Restricted,
-        /*exclude_tmpdir_env_var*/ false,
-        /*exclude_slash_tmp*/ false,
+        /*exclude_tmpdir_env_var*/ true,
+        /*exclude_slash_tmp*/ true,
     );
 
     let mut builder = test_codex().with_config(move |config| {
@@ -879,43 +772,31 @@ async fn permissions_message_includes_writable_roots() -> Result<()> {
     let test = builder.build(&server).await?;
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let permissions = permissions_texts(&req.single_request());
-    let normalize_line_endings = |s: &str| s.replace("\r\n", "\n");
-    let exec_policy = load_exec_policy(&test.config.config_layer_stack).await?;
-    let permission_profile = test.config.permissions.effective_permission_profile();
-    let expected = PermissionsInstructions::from_permission_profile(
-        &permission_profile,
-        AskForApproval::OnRequest,
-        ApprovalPromptContext::new(
-            test.config.approvals_reviewer,
-            /*messages*/ None,
-            /*permission_messages*/ None,
-        ),
-        &exec_policy,
-        test.config.cwd.as_path(),
-        /*exec_permission_approvals_enabled*/ false,
-        /*request_permissions_tool_enabled*/ false,
-    )
-    .render();
-    let expected_normalized = normalize_line_endings(&expected);
-    let actual_normalized: Vec<String> = permissions
+    assert_eq!(permissions.len(), 1);
+    let mut writable_roots = [
+        AbsolutePathBuf::try_from(test.config.cwd.as_path().canonicalize()?)?,
+        writable_root,
+    ];
+    writable_roots.sort();
+    let writable_roots = writable_roots
         .iter()
-        .map(|s| normalize_line_endings(s))
-        .collect();
-    assert_eq!(actual_normalized, vec![expected_normalized]);
+        .map(|root| format!("`{}`", root.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let expected = format!(" The writable roots are {writable_roots}.");
+    let actual = permissions[0]
+        .lines()
+        .filter(|line| line.starts_with(" The writable root"))
+        .collect::<Vec<_>>();
+    assert_eq!(actual, vec![expected.as_str()]);
 
     Ok(())
 }

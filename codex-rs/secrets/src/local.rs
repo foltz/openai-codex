@@ -41,6 +41,7 @@ const SECRETS_VERSION: u8 = 1;
 const LOCAL_SECRETS_FILENAME: &str = "local.age";
 const CODEX_AUTH_SECRETS_FILENAME: &str = "codex_auth.age";
 const MCP_OAUTH_SECRETS_FILENAME: &str = "mcp_oauth.age";
+const GATEWAY_OAUTH_SECRETS_FILENAME: &str = "gateway_oauth.age";
 static MCP_OAUTH_CACHE: Mutex<Option<CachedMcpSecrets>> = Mutex::new(None);
 
 /// Selects the local encrypted file used by a `LocalSecretsBackend`.
@@ -53,6 +54,8 @@ pub enum LocalSecretsNamespace {
     CodexAuth,
     /// OAuth credentials for external MCP servers.
     McpOAuth,
+    /// Gateway OAuth credentials, isolated from primary auth in file and encryption key.
+    GatewayOAuth,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -148,7 +151,7 @@ impl LocalSecretsBackend {
             .codex_home
             .canonicalize()
             .context("failed to resolve existing secrets storage")?;
-        let account = compute_keyring_account(&canonical_home);
+        let account = compute_keyring_account(&canonical_home, self.namespace);
         let passphrase = self
             .keyring_store
             .load(keyring_service(), &account)
@@ -208,6 +211,7 @@ impl LocalSecretsBackend {
             LocalSecretsNamespace::ManagedSecrets => LOCAL_SECRETS_FILENAME,
             LocalSecretsNamespace::CodexAuth => CODEX_AUTH_SECRETS_FILENAME,
             LocalSecretsNamespace::McpOAuth => MCP_OAUTH_SECRETS_FILENAME,
+            LocalSecretsNamespace::GatewayOAuth => GATEWAY_OAUTH_SECRETS_FILENAME,
         };
         self.secrets_dir().join(filename)
     }
@@ -287,7 +291,7 @@ impl LocalSecretsBackend {
     }
 
     fn load_or_create_passphrase(&self) -> Result<SecretString> {
-        let account = compute_keyring_account(&self.codex_home);
+        let account = compute_keyring_account(&self.codex_home, self.namespace);
         let loaded = self
             .keyring_store
             .load(keyring_service(), &account)
@@ -483,7 +487,10 @@ mod tests {
         let name = SecretName::new("TEST_SECRET")?;
         assert_eq!(backend.get_existing(&SecretScope::Global, &name)?, None);
         assert!(!backend.secrets_path().exists());
-        assert!(!keyring.contains(&compute_keyring_account(home.path())));
+        assert!(!keyring.contains(&compute_keyring_account(
+            home.path(),
+            LocalSecretsNamespace::ManagedSecrets
+        )));
         Ok(())
     }
 
@@ -495,7 +502,7 @@ mod tests {
         let name = SecretName::new("TEST_SECRET")?;
         backend.set(&SecretScope::Global, &name, "secret-sentinel")?;
         let ciphertext = fs::read(backend.secrets_path())?;
-        let account = compute_keyring_account(home.path());
+        let account = compute_keyring_account(home.path(), LocalSecretsNamespace::ManagedSecrets);
         keyring.delete(keyring_service(), &account)?;
         assert!(backend.get_existing(&SecretScope::Global, &name).is_err());
         assert_eq!(keyring.saved_value(&account), None);
@@ -515,7 +522,7 @@ mod tests {
             Some("secret-sentinel".into())
         );
         let ciphertext = fs::read(backend.secrets_path())?;
-        let account = compute_keyring_account(home.path());
+        let account = compute_keyring_account(home.path(), LocalSecretsNamespace::ManagedSecrets);
         keyring.set_error(
             &account,
             KeyringError::Invalid("secret-error-sentinel".into(), "load".into()),
@@ -557,7 +564,8 @@ mod tests {
     fn set_fails_when_keyring_is_unavailable() -> Result<()> {
         let codex_home = tempfile::tempdir().expect("tempdir");
         let keyring = Arc::new(MockKeyringStore::default());
-        let account = compute_keyring_account(codex_home.path());
+        let account =
+            compute_keyring_account(codex_home.path(), LocalSecretsNamespace::ManagedSecrets);
         keyring.set_error(
             &account,
             KeyringError::Invalid("error".into(), "load".into()),
@@ -625,14 +633,20 @@ mod tests {
         );
         let mcp_backend = LocalSecretsBackend::new_with_namespace(
             codex_home.path().to_path_buf(),
-            keyring,
+            keyring.clone(),
             LocalSecretsNamespace::McpOAuth,
+        );
+        let gateway_backend = LocalSecretsBackend::new_with_namespace(
+            codex_home.path().to_path_buf(),
+            keyring.clone(),
+            LocalSecretsNamespace::GatewayOAuth,
         );
         let scope = SecretScope::Global;
         let name = SecretName::new("TEST_SECRET")?;
 
         codex_auth_backend.set(&scope, &name, "codex-auth-value")?;
         mcp_backend.set(&scope, &name, "mcp-value")?;
+        gateway_backend.set(&scope, &name, "gateway-value")?;
 
         assert_eq!(
             codex_auth_backend.get(&scope, &name)?,
@@ -664,6 +678,23 @@ mod tests {
                 .exists()
         );
         assert!(!codex_home.path().join("secrets").join("local.age").exists());
+        assert!(
+            codex_home
+                .path()
+                .join("secrets/gateway_oauth.age")
+                .is_file()
+        );
+        // Primary-auth key removal must not make the independent gateway file unreadable.
+        keyring
+            .delete(
+                keyring_service(),
+                &compute_keyring_account(codex_home.path(), LocalSecretsNamespace::CodexAuth),
+            )
+            .expect("remove primary secrets key");
+        assert_eq!(
+            gateway_backend.get(&scope, &name)?,
+            Some("gateway-value".to_string())
+        );
         Ok(())
     }
 

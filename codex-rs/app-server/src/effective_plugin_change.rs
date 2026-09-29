@@ -50,6 +50,7 @@ pub(crate) fn effective_plugins_changed_callback(
         if let Err(err) = tasks.spawn_unverified(async move {
             let _permit = refresh_permit;
             refresh_thread_manager.invalidate_mcp_runtimes().await;
+            refresh_thread_manager.refresh_hook_runtimes().await;
         }) {
             warn!(?err, "effective-plugin refresh task admission closed");
         }
@@ -114,7 +115,7 @@ fn hook_trusted_hash_edit(hook_key: &str, current_hash: &str) -> ConfigEdit {
     }
 }
 
-async fn trust_materialized_plugin_hooks(
+pub(crate) async fn trust_materialized_plugin_hooks(
     materializations: Vec<RemotePluginMaterialization>,
     auth_manager: &AuthManager,
     thread_manager: &ThreadManager,

@@ -76,17 +76,25 @@ async fn discover_root(
         error: None,
     };
 
+    if let Some(sandbox) = sandbox
+        && let Err(error) = sandbox.validate_file_system_paths_for_current_host()
+    {
+        discovery.error = Some(format!("failed to inspect capability root {path}: {error}"));
+        return discovery;
+    }
+
     #[cfg(target_os = "windows")]
     if sandbox.is_some_and(|context| {
-        context.should_run_in_sandbox()
-            && context.windows_sandbox_level
-                == codex_protocol::config_types::WindowsSandboxLevel::Disabled
+        context.should_read_from_sandbox() && !context.windows_sandbox_is_requested()
     }) {
         discovery.error = Some("filesystem sandbox is unavailable on this executor".to_string());
         return discovery;
     }
 
-    match file_system.get_metadata(&path, sandbox).await {
+    match file_system
+        .get_metadata(&path, Default::default(), sandbox)
+        .await
+    {
         Ok(metadata) if metadata.is_directory => {}
         Ok(_) => {
             discovery.error = Some(format!("capability root {path} is not a directory"));
@@ -329,7 +337,10 @@ async fn read_optional_text_file(
     budget: &mut BundleBudget,
     warnings: &mut Vec<String>,
 ) -> Option<CapabilityTextFile> {
-    let metadata = match file_system.get_metadata(&path, sandbox).await {
+    let metadata = match file_system
+        .get_metadata(&path, Default::default(), sandbox)
+        .await
+    {
         Ok(metadata) if metadata.is_file => metadata,
         Ok(_) => return None,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
@@ -354,49 +365,32 @@ async fn read_optional_text_file(
         ));
         return None;
     }
-    let contents = if sandbox.is_some_and(FileSystemSandboxContext::should_run_in_sandbox) {
-        match file_system.read_file(&path, sandbox).await {
-            Ok(contents) if contents.len() <= MAX_FILE_BYTES && budget.can_add(contents.len()) => {
-                contents
-            }
-            Ok(_) => {
-                warnings.push(format!("capability file {path} exceeded its read limit"));
-                return None;
-            }
-            Err(error) => {
-                warnings.push(format!("failed to read capability file {path}: {error}"));
-                return None;
-            }
+    let mut stream = match file_system.read_file_stream(&path, sandbox).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            warnings.push(format!("failed to read capability file {path}: {error}"));
+            return None;
         }
-    } else {
-        let mut stream = match file_system.read_file_stream(&path, sandbox).await {
-            Ok(stream) => stream,
+    };
+    let mut contents = Vec::with_capacity(size);
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
             Err(error) => {
                 warnings.push(format!("failed to read capability file {path}: {error}"));
                 return None;
             }
         };
-        let mut contents = Vec::with_capacity(size);
-        while let Some(chunk) = stream.next().await {
-            let chunk = match chunk {
-                Ok(chunk) => chunk,
-                Err(error) => {
-                    warnings.push(format!("failed to read capability file {path}: {error}"));
-                    return None;
-                }
-            };
-            let Some(new_len) = contents.len().checked_add(chunk.len()) else {
-                warnings.push(format!("capability file {path} exceeded its read limit"));
-                return None;
-            };
-            if new_len > MAX_FILE_BYTES || !budget.can_add(new_len) {
-                warnings.push(format!("capability file {path} exceeded its read limit"));
-                return None;
-            }
-            contents.extend_from_slice(&chunk);
+        let Some(new_len) = contents.len().checked_add(chunk.len()) else {
+            warnings.push(format!("capability file {path} exceeded its read limit"));
+            return None;
+        };
+        if new_len > MAX_FILE_BYTES || !budget.can_add(new_len) {
+            warnings.push(format!("capability file {path} exceeded its read limit"));
+            return None;
         }
-        contents
-    };
+        contents.extend_from_slice(&chunk);
+    }
     let contents = match String::from_utf8(contents) {
         Ok(contents) => contents,
         Err(error) => {

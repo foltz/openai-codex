@@ -194,6 +194,7 @@ pub(crate) async fn run_websocket_connection<M, SinkError, StreamError>(
         .send(TransportEvent::ConnectionOpened {
             connection_id,
             origin: ConnectionOrigin::WebSocket,
+            auth: None,
             provenance,
             writer: writer_tx,
             disconnect_sender: Some(disconnect_token.clone()),

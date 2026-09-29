@@ -7,26 +7,27 @@ use pretty_assertions::assert_eq;
 
 #[tokio::test]
 async fn managed_config_load_refuses_each_poisoned_input() {
-    for input in 0..4 {
-        let home = tempfile::tempdir().unwrap();
+    // The upstream thread loader is immutable; only these three inputs can
+    // be poisoned. Do not restore the historical mutable-loader design.
+    for input in 0..3 {
+        let home = tempfile::tempdir().expect("home");
         let manager = manager(home.path());
         let poison = manager.clone();
         assert!(
             std::thread::spawn(move || match input {
                 0 => {
-                    let _guard = poison.cli_overrides.write().unwrap();
+                    let _guard = poison.cli_overrides.write().expect("cli lock");
                     panic!("cli");
                 }
                 1 => {
-                    let _guard = poison.cloud_config_bundle.write().unwrap();
+                    let _guard = poison.cloud_config_bundle.write().expect("cloud lock");
                     panic!("cloud");
                 }
                 2 => {
-                    let _guard = poison.thread_config_loader.write().unwrap();
-                    panic!("thread");
-                }
-                3 => {
-                    let _guard = poison.runtime_feature_enablement.write().unwrap();
+                    let _guard = poison
+                        .runtime_feature_enablement
+                        .write()
+                        .expect("feature lock");
                     panic!("features");
                 }
                 _ => unreachable!(),
@@ -55,7 +56,7 @@ fn manager(home: &Path) -> ConfigManager {
 
 #[tokio::test]
 async fn managed_cloud_reset_publishes_resolved_absence_over_old_loader() {
-    let home = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().expect("home");
     let manager = manager(home.path());
     manager
         .reset_managed_cloud_config(
@@ -64,19 +65,19 @@ async fn managed_cloud_reset_publishes_resolved_absence_over_old_loader() {
             HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
         )
         .await
-        .unwrap();
-    let loader = manager.cloud_config_bundle.read().unwrap().clone();
-    assert!(loader.get().await.unwrap().is_none());
+        .expect("reset");
+    let loader = manager.cloud_config_bundle.read().expect("loader").clone();
+    assert_eq!(loader.get().await.expect("resolved absence"), None);
 }
 
 #[tokio::test]
 async fn managed_cloud_reset_refuses_poisoned_publication() {
-    let home = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().expect("home");
     let manager = manager(home.path());
     let publication = Arc::clone(&manager.cloud_config_bundle);
     assert!(
         std::thread::spawn(move || {
-            let _guard = publication.write().unwrap();
+            let _guard = publication.write().expect("publication");
             panic!("poison publication");
         })
         .join()

@@ -11,6 +11,8 @@ use codex_protocol::protocol::SessionSource;
 use base64::Engine;
 use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::ModelProviderAuthInfo;
+use codex_protocol::shell_environment::OPENAI_FEDERATION_RULE_ID_ENV_VAR;
+use codex_protocol::shell_environment::OPENAI_IDENTITY_TOKEN_FILE_ENV_VAR;
 use pretty_assertions::assert_eq;
 use serde::Serialize;
 use serde_json::json;
@@ -31,6 +33,31 @@ const WORKSPACE_ID_ALLOWED: &str = "123e4567-e89b-42d3-a456-426614174000";
 const WORKSPACE_ID_SECOND_ALLOWED: &str = "123e4567-e89b-42d3-a456-426614174001";
 const WORKSPACE_ID_DISALLOWED: &str = "123e4567-e89b-42d3-a456-426614174002";
 
+#[test]
+fn header_auth_exposes_a_valid_chatgpt_account_id() {
+    for (account_id_header, expected_account_id) in [
+        (
+            Some(WORKSPACE_ID_ALLOWED.as_bytes()),
+            Some(WORKSPACE_ID_ALLOWED),
+        ),
+        (None, None),
+        (Some(b""), None),
+        (Some(b" account "), None),
+        (Some(&[0xff]), None),
+    ] {
+        let mut headers = http::HeaderMap::new();
+        if let Some(account_id_header) = account_id_header {
+            headers.insert(
+                "chatgpt-account-id",
+                http::HeaderValue::from_bytes(account_id_header).expect("valid header bytes"),
+            );
+        }
+
+        let auth = CodexAuth::Headers(AuthHeaders::new(headers));
+        assert_eq!(auth.get_account_id().as_deref(), expected_account_id);
+    }
+}
+
 #[tokio::test]
 async fn managed_account_projection_is_exact_guarded_and_credential_free() {
     let home = tempdir().unwrap();
@@ -45,10 +72,10 @@ async fn managed_account_projection_is_exact_guarded_and_credential_free() {
     .unwrap();
     let manager = AuthManager::new(
         home.path().to_path_buf(),
-        false,
+        /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
-        None,
-        None,
+        /*forced_chatgpt_workspace_id*/ None,
+        /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::default(),
         crate::test_support::transport_default_auth_route_config(),
     )
@@ -451,6 +478,7 @@ async fn stored_agent_identity_jwt_keeps_auth_json_unchanged() -> anyhow::Result
             agent_identity: Some(AgentIdentityStorage::Jwt(agent_identity.clone())),
             personal_access_token: None,
             bedrock_api_key: None,
+            bedrock_access_keys: None,
         },
         AuthCredentialsStoreMode::File,
         AuthKeyringBackendKind::Direct,
@@ -530,6 +558,7 @@ async fn login_with_access_token_writes_only_personal_access_token() {
             agent_identity: None,
             personal_access_token: Some("at-login-test".to_string()),
             bedrock_api_key: None,
+            bedrock_access_keys: None,
         }
     );
     assert_eq!(auth.resolved_mode(), AuthMode::PersonalAccessToken);
@@ -1149,6 +1178,7 @@ async fn pro_account_with_no_api_key_uses_chatgpt_auth() {
             agent_identity: None,
             personal_access_token: None,
             bedrock_api_key: None,
+            bedrock_access_keys: None,
         },
         auth_dot_json
     );
@@ -1197,6 +1227,7 @@ fn logout_removes_auth_file() -> Result<(), std::io::Error> {
         agent_identity: None,
         personal_access_token: None,
         bedrock_api_key: None,
+        bedrock_access_keys: None,
     };
     super::save_auth(
         dir.path(),
@@ -1358,6 +1389,44 @@ async fn external_bearer_only_auth_manager_returns_none_when_command_fails() {
 }
 
 #[tokio::test]
+async fn unauthorized_recovery_retries_provider_command_after_initial_failure() {
+    let script = ProviderAuthScript::new(&["provider-token"]).unwrap();
+    std::fs::write(script.tempdir.path().join("fail-once"), "").unwrap();
+    let manager = AuthManager::external_bearer_only(script.auth_config());
+    let mut recovery = manager.unauthorized_recovery();
+
+    assert_eq!(manager.auth().await, None);
+    assert_eq!(manager.auth_cached(), None);
+    assert!(recovery.has_next());
+    assert_eq!(recovery.unavailable_reason(), "ready");
+
+    let result = recovery
+        .next()
+        .await
+        .expect("external refresh should succeed");
+
+    assert_eq!(result.auth_state_changed(), Some(true));
+    assert_eq!(
+        manager.auth_cached(),
+        Some(CodexAuth::from_api_key("provider-token"))
+    );
+    assert!(!recovery.has_next());
+    assert_eq!(recovery.unavailable_reason(), "recovery_exhausted");
+    recovery.next().await.expect_err("recovery is bounded");
+}
+
+#[test]
+fn unauthorized_recovery_without_an_external_provider_still_requires_refreshable_auth() {
+    for auth in [None, Some(CodexAuth::from_api_key("static-token"))] {
+        let manager = AuthManager::from_optional_auth_for_testing(auth);
+        let recovery = manager.unauthorized_recovery();
+
+        assert!(!recovery.has_next());
+        assert_eq!(recovery.unavailable_reason(), "not_chatgpt_auth");
+    }
+}
+
+#[tokio::test]
 async fn unauthorized_recovery_uses_external_refresh_for_bearer_manager() {
     let script = ProviderAuthScript::new(&["provider-token", "refreshed-provider-token"]).unwrap();
     let mut auth_config = script.auth_config();
@@ -1400,6 +1469,138 @@ impl ExternalAuth for StaticExternalAuth {
     }
 }
 
+struct RefreshingExternalAuth {
+    initial: CodexAuth,
+    refreshed: CodexAuth,
+}
+
+impl ExternalAuth for RefreshingExternalAuth {
+    fn resolve(&self) -> ExternalAuthFuture<'_, CodexAuth> {
+        Box::pin(async { Ok(self.initial.clone()) })
+    }
+
+    fn refresh(&self, _context: ExternalAuthRefreshContext) -> ExternalAuthFuture<'_, CodexAuth> {
+        Box::pin(async { Ok(self.refreshed.clone()) })
+    }
+}
+
+fn external_header_auth(account_id: Option<&'static str>) -> CodexAuth {
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::AUTHORIZATION,
+        http::HeaderValue::from_static("Bearer external"),
+    );
+    if let Some(account_id) = account_id {
+        headers.insert(
+            "chatgpt-account-id",
+            http::HeaderValue::from_static(account_id),
+        );
+    }
+    CodexAuth::Headers(AuthHeaders::new(headers))
+}
+
+struct FailingExternalAuth {
+    auth: CodexAuth,
+    resolve_count: AtomicUsize,
+}
+
+impl ExternalAuth for FailingExternalAuth {
+    fn resolve(&self) -> ExternalAuthFuture<'_, CodexAuth> {
+        let resolve_count = self.resolve_count.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            if resolve_count == 0 {
+                Ok(self.auth.clone())
+            } else {
+                Err(std::io::Error::other("external auth failed"))
+            }
+        })
+    }
+
+    fn refresh(&self, _context: ExternalAuthRefreshContext) -> ExternalAuthFuture<'_, CodexAuth> {
+        Box::pin(async { Err(std::io::Error::other("external auth failed")) })
+    }
+
+    fn classify_error(&self, error: std::io::Error) -> RefreshTokenError {
+        RefreshTokenError::Permanent(RefreshTokenFailedError::new(
+            RefreshTokenFailedReason::Other,
+            error.to_string(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn external_auth_keeps_cached_credentials_after_permanent_reload_failure() {
+    let manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("seed"));
+    let auth = CodexAuth::from_api_key("configured-token");
+    let external_auth = Arc::new(FailingExternalAuth {
+        auth: auth.clone(),
+        resolve_count: AtomicUsize::new(0),
+    });
+    manager
+        .set_external_auth(external_auth.clone())
+        .await
+        .expect("external auth should install");
+
+    assert_eq!(external_auth.resolve_count.load(Ordering::SeqCst), 1);
+
+    assert_eq!(manager.auth().await, Some(auth.clone()));
+    assert_eq!(external_auth.resolve_count.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        manager
+            .refresh_failure_for_auth(&auth)
+            .expect("permanent failure should be recorded")
+            .to_string(),
+        "external auth failed"
+    );
+
+    assert_eq!(manager.auth().await, Some(auth));
+    assert_eq!(external_auth.resolve_count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn replacing_external_auth_clears_permanent_failure() {
+    let manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("seed"));
+    let auth = CodexAuth::from_api_key("external-token");
+    manager
+        .set_external_auth(Arc::new(FailingExternalAuth {
+            auth: auth.clone(),
+            resolve_count: AtomicUsize::new(0),
+        }))
+        .await
+        .expect("external auth should install");
+
+    assert_eq!(manager.auth().await, Some(auth.clone()));
+    assert!(manager.refresh_failure_for_auth(&auth).is_some());
+
+    manager
+        .set_external_auth(Arc::new(StaticExternalAuth(auth.clone())))
+        .await
+        .expect("replacement external auth should install");
+
+    manager
+        .refresh_token_from_authority()
+        .await
+        .expect("replacement external auth should refresh");
+    assert_eq!(manager.auth_cached(), Some(auth));
+}
+
+#[tokio::test]
+async fn runtime_external_auth_uses_provider_error_classification() {
+    let manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("seed"));
+    manager
+        .set_external_auth(Arc::new(FailingExternalAuth {
+            auth: CodexAuth::from_api_key("runtime-token"),
+            resolve_count: AtomicUsize::new(0),
+        }))
+        .await
+        .expect("runtime auth should install");
+
+    assert!(matches!(
+        manager.refresh_token_from_authority().await,
+        Err(RefreshTokenError::Permanent(_))
+    ));
+}
+
 #[tokio::test]
 async fn external_auth_provider_can_install_headers() {
     let mut headers = http::HeaderMap::new();
@@ -1439,6 +1640,106 @@ async fn external_auth_provider_can_install_headers() {
     );
 }
 
+#[tokio::test]
+async fn external_header_auth_obeys_workspace_policy() {
+    for (account_id, should_succeed) in [
+        (Some(WORKSPACE_ID_ALLOWED), true),
+        (Some(WORKSPACE_ID_DISALLOWED), false),
+        (None, false),
+    ] {
+        let auth = external_header_auth(account_id);
+        let expected_auth = should_succeed.then_some(auth.clone());
+        let manager = AuthManager::from_optional_auth_for_testing(/*auth*/ None);
+        manager.set_forced_chatgpt_workspace_id(Some(vec![WORKSPACE_ID_ALLOWED.to_string()]));
+
+        let result = manager
+            .set_external_auth(Arc::new(StaticExternalAuth(auth)))
+            .await;
+
+        assert_eq!(result.is_ok(), should_succeed, "account ID: {account_id:?}");
+        assert_eq!(manager.auth_cached(), expected_auth);
+    }
+}
+
+#[tokio::test]
+async fn external_header_auth_rejects_a_disallowed_workspace_on_refresh() {
+    let allowed_auth = external_header_auth(Some(WORKSPACE_ID_ALLOWED));
+    let disallowed_auth = external_header_auth(Some(WORKSPACE_ID_DISALLOWED));
+    let manager = AuthManager::from_optional_auth_for_testing(/*auth*/ None);
+    manager.set_forced_chatgpt_workspace_id(Some(vec![WORKSPACE_ID_ALLOWED.to_string()]));
+    manager
+        .set_external_auth(Arc::new(RefreshingExternalAuth {
+            initial: allowed_auth.clone(),
+            refreshed: disallowed_auth,
+        }))
+        .await
+        .expect("initial external header auth should install");
+
+    manager
+        .refresh_token_from_authority()
+        .await
+        .expect_err("external header auth from a disallowed workspace must not replace the cache");
+
+    assert_eq!(manager.auth_cached(), Some(allowed_auth));
+}
+
+#[tokio::test]
+async fn workload_identity_auth_is_immutable_and_process_local() {
+    let codex_home = tempdir().expect("tempdir");
+    let mut manager = AuthManager::from_auth_for_testing_with_home(
+        CodexAuth::from_api_key("seed"),
+        codex_home.path().to_path_buf(),
+    );
+    Arc::get_mut(&mut manager)
+        .expect("test manager should not be shared yet")
+        .workload_identity_selected = true;
+    let access_token = fake_jwt_for_auth_file_params(&AuthFileParams {
+        openai_api_key: None,
+        chatgpt_plan_type: Some("enterprise".to_string()),
+        chatgpt_account_id: Some("workspace-one".to_string()),
+    })
+    .expect("fake access token");
+    let auth =
+        CodexAuth::from_external_chatgpt_tokens(&access_token, "workspace-one", Some("enterprise"))
+            .expect("external ChatGPT auth");
+
+    manager
+        .install_external_auth(Arc::new(StaticExternalAuth(auth.clone())))
+        .await
+        .expect("workload identity auth should install");
+    manager.clear_external_auth();
+
+    assert!(manager.has_external_auth());
+    assert_eq!(manager.auth().await, Some(auth.clone()));
+    assert!(matches!(
+        manager
+            .set_external_auth(Arc::new(StaticExternalAuth(auth.clone())))
+            .await,
+        Err(RefreshTokenError::Permanent(_))
+    ));
+
+    let logout_error = manager
+        .logout()
+        .await
+        .expect_err("workload identity auth must not be logged out");
+    assert_eq!(logout_error.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(manager.has_external_auth());
+    assert_eq!(manager.auth_cached(), Some(auth));
+
+    assert!(!get_auth_file(codex_home.path()).exists());
+    let ephemeral_storage = create_auth_storage(
+        codex_home.path().to_path_buf(),
+        AuthCredentialsStoreMode::Ephemeral,
+        AuthKeyringBackendKind::default(),
+    );
+    assert!(
+        ephemeral_storage
+            .load()
+            .expect("load ephemeral auth")
+            .is_some()
+    );
+}
+
 struct ProviderAuthScript {
     tempdir: TempDir,
     command: String,
@@ -1464,6 +1765,10 @@ impl ProviderAuthScript {
             std::fs::write(
                 &script_path,
                 r#"#!/bin/sh
+if [ -f fail-once ]; then
+    rm fail-once
+    exit 1
+fi
 first_line=$(sed -n '1p' tokens.txt)
 printf '%s\n' "$first_line"
 tail -n +2 tokens.txt > tokens.next
@@ -1486,6 +1791,10 @@ mv tokens.next tokens.txt
                 &script_path,
                 r#"@echo off
 setlocal EnableExtensions DisableDelayedExpansion
+if exist fail-once (
+    del fail-once
+    exit /b 1
+)
 set "first_line="
 <tokens.txt set /p "first_line="
 if not defined first_line exit /b 1
@@ -1684,6 +1993,94 @@ impl Drop for EnvVarGuard {
 
 fn remove_access_token_env_var() -> EnvVarGuard {
     EnvVarGuard::remove(CODEX_ACCESS_TOKEN_ENV_VAR)
+}
+
+struct TestAuthManagerConfig(AuthConfig);
+
+impl AuthManagerConfig for TestAuthManagerConfig {
+    fn codex_home(&self) -> PathBuf {
+        self.0.codex_home.clone()
+    }
+
+    fn cli_auth_credentials_store_mode(&self) -> AuthCredentialsStoreMode {
+        self.0.auth_credentials_store_mode
+    }
+
+    fn auth_keyring_backend_kind(&self) -> AuthKeyringBackendKind {
+        self.0.keyring_backend_kind
+    }
+
+    fn forced_login_method(&self) -> Option<ForcedLoginMethod> {
+        self.0.forced_login_method
+    }
+
+    fn forced_chatgpt_workspace_id(&self) -> Option<Vec<String>> {
+        self.0.forced_chatgpt_workspace_id.clone()
+    }
+
+    fn managed_auth_policy(&self) -> ManagedAuthPolicy {
+        self.0.managed_auth_policy.clone()
+    }
+
+    fn chatgpt_base_url(&self) -> String {
+        self.0
+            .chatgpt_base_url
+            .clone()
+            .expect("test config should include a ChatGPT base URL")
+    }
+
+    fn auth_route_config(&self) -> AuthRouteConfig {
+        self.0.auth_route_config.clone()
+    }
+}
+
+fn test_auth_manager_config(codex_home: &Path) -> TestAuthManagerConfig {
+    TestAuthManagerConfig(AuthConfig {
+        codex_home: codex_home.to_path_buf(),
+        auth_credentials_store_mode: AuthCredentialsStoreMode::File,
+        keyring_backend_kind: AuthKeyringBackendKind::Direct,
+        forced_login_method: Some(ForcedLoginMethod::Chatgpt),
+        chatgpt_base_url: Some("https://chatgpt-staging.com/backend-api".to_string()),
+        forced_chatgpt_workspace_id: Some(vec!["forced-workspace".to_string()]),
+        managed_auth_policy: ManagedAuthPolicy {
+            allowed_login_methods: Some(vec![ForcedLoginMethod::Chatgpt]),
+            allowed_chatgpt_workspaces: Some(vec![
+                "forced-workspace".to_string(),
+                "managed-workspace".to_string(),
+            ]),
+        },
+        auth_route_config: AuthRouteConfig::from_http_client_factory(HttpClientFactory::new(
+            OutboundProxyPolicy::RespectSystemProxy,
+        )),
+    })
+}
+
+#[test]
+fn auth_config_from_preserves_all_fields() {
+    let codex_home = tempdir().expect("tempdir");
+    let config = test_auth_manager_config(codex_home.path());
+
+    assert_eq!(auth_config_from(&config), config.0);
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn shared_from_config_prefers_workload_identity_to_explicit_access_token() {
+    let codex_home = tempdir().expect("tempdir");
+    let config = test_auth_manager_config(codex_home.path());
+    let _access_token_guard = EnvVarGuard::set(CODEX_ACCESS_TOKEN_ENV_VAR, "at-explicit");
+    let _rule_guard = EnvVarGuard::set(OPENAI_FEDERATION_RULE_ID_ENV_VAR, "rule-one");
+    let _assertion_file_guard = EnvVarGuard::remove(OPENAI_IDENTITY_TOKEN_FILE_ENV_VAR);
+
+    let error = AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false)
+        .await
+        .expect_err("partial workload identity config should fail closed");
+
+    assert!(
+        error
+            .to_string()
+            .contains(OPENAI_IDENTITY_TOKEN_FILE_ENV_VAR)
+    );
 }
 
 #[tokio::test]
@@ -2005,7 +2402,9 @@ async fn auth_manager_rejects_disallowed_stored_and_external_auth() {
     .await;
     config.managed_auth_policy.allowed_login_methods = Some(vec![ForcedLoginMethod::Chatgpt]);
     let manager =
-        AuthManager::shared_from_auth_config(config, /*enable_codex_api_key_env*/ false).await;
+        AuthManager::shared_from_auth_config(config, /*enable_codex_api_key_env*/ false)
+            .await
+            .expect("auth manager");
 
     assert_eq!(manager.auth().await, None);
     assert!(
@@ -2034,7 +2433,9 @@ async fn api_only_policy_rejects_access_tokens_before_hydration() {
     .await;
     config.managed_auth_policy.allowed_login_methods = Some(vec![ForcedLoginMethod::Api]);
     let manager =
-        AuthManager::shared_from_auth_config(config, /*enable_codex_api_key_env*/ false).await;
+        AuthManager::shared_from_auth_config(config, /*enable_codex_api_key_env*/ false)
+            .await
+            .expect("auth manager");
 
     assert_eq!(manager.auth().await, None);
     assert!(
@@ -2067,7 +2468,9 @@ async fn workspace_policy_rejects_agent_identity_before_hydration() {
     config.managed_auth_policy.allowed_chatgpt_workspaces =
         Some(vec![WORKSPACE_ID_ALLOWED.to_string()]);
     let manager =
-        AuthManager::shared_from_auth_config(config, /*enable_codex_api_key_env*/ false).await;
+        AuthManager::shared_from_auth_config(config, /*enable_codex_api_key_env*/ false)
+            .await
+            .expect("auth manager");
 
     assert_eq!(manager.auth().await, None);
     drop(access_token_guard);
@@ -2086,6 +2489,7 @@ async fn workspace_policy_rejects_agent_identity_before_hydration() {
                 agent_identity: Some(stored_agent_identity),
                 personal_access_token: None,
                 bedrock_api_key: None,
+                bedrock_access_keys: None,
             },
             AuthCredentialsStoreMode::File,
             AuthKeyringBackendKind::Direct,
@@ -2100,7 +2504,9 @@ async fn workspace_policy_rejects_agent_identity_before_hydration() {
         config.managed_auth_policy.allowed_chatgpt_workspaces =
             Some(vec![WORKSPACE_ID_ALLOWED.to_string()]);
         let manager =
-            AuthManager::shared_from_auth_config(config, /*enable_codex_api_key_env*/ false).await;
+            AuthManager::shared_from_auth_config(config, /*enable_codex_api_key_env*/ false)
+                .await
+                .expect("auth manager");
         assert_eq!(manager.auth().await, None);
     }
 
@@ -2136,7 +2542,9 @@ async fn workspace_policy_checks_the_selected_request_account() {
     )
     .await;
     let manager =
-        AuthManager::shared_from_auth_config(config, /*enable_codex_api_key_env*/ false).await;
+        AuthManager::shared_from_auth_config(config, /*enable_codex_api_key_env*/ false)
+            .await
+            .expect("auth manager");
 
     assert_eq!(manager.auth().await, None);
 }
@@ -2323,6 +2731,7 @@ async fn enforce_login_restrictions_logs_out_for_agent_identity_workspace_mismat
             agent_identity: Some(AgentIdentityStorage::Jwt(agent_identity)),
             personal_access_token: None,
             bedrock_api_key: None,
+            bedrock_access_keys: None,
         },
         AuthCredentialsStoreMode::File,
         AuthKeyringBackendKind::default(),
@@ -2742,20 +3151,6 @@ fn authoritative_cached_auth_distinguishes_initial_failure_from_logged_out() {
     let manager =
         AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
     assert!(manager.authoritative_auth_cached().is_ok());
-    let expected = manager
-        .authoritative_auth_cached()
-        .unwrap()
-        .and_then(|auth| auth.get_account_id())
-        .as_deref()
-        .map(AuthManager::managed_account_fingerprint);
-    assert_eq!(
-        manager.authoritative_managed_auth_fingerprint(),
-        Ok(expected)
-    );
-    manager.set_cached_auth(None);
-    assert_eq!(manager.authoritative_managed_auth_fingerprint(), Ok(None));
-    manager.set_cached_auth(Some(CodexAuth::from_api_key("excluded-secret")));
-    assert_eq!(manager.authoritative_managed_auth_fingerprint(), Ok(None));
     manager
         .inner
         .write()
@@ -2763,10 +3158,6 @@ fn authoritative_cached_auth_distinguishes_initial_failure_from_logged_out() {
         .initial_load_failed = true;
     assert_eq!(
         manager.authoritative_auth_cached(),
-        Err(AuthoritativeAuthUnavailable::InitialLoadFailed)
-    );
-    assert_eq!(
-        manager.authoritative_managed_auth_fingerprint(),
         Err(AuthoritativeAuthUnavailable::InitialLoadFailed)
     );
 }
@@ -2789,10 +3180,6 @@ fn authoritative_cached_auth_reports_cache_lock_unavailable_when_poisoned() {
         manager.authoritative_auth_cached(),
         Err(AuthoritativeAuthUnavailable::CacheLockUnavailable),
         "a poisoned cache lock must fail closed as unavailable, never as logged-out"
-    );
-    assert_eq!(
-        manager.authoritative_managed_auth_fingerprint(),
-        Err(AuthoritativeAuthUnavailable::CacheLockUnavailable)
     );
 }
 
@@ -2850,6 +3237,7 @@ fn write_api_key_auth_file(codex_home: &Path, api_key: &str) {
         agent_identity: None,
         personal_access_token: None,
         bedrock_api_key: None,
+        bedrock_access_keys: None,
     };
     super::save_auth(
         codex_home,
@@ -2954,6 +3342,7 @@ async fn install_managed_logout_clears_the_cache_and_publishes_a_revision() {
     let previous = manager.auth_cached();
     assert!(previous.is_some(), "precondition: an auth was cached");
     let revisions = manager.auth_change_receiver();
+    let owner_before = *manager.auth_change_state_receiver().borrow();
     let precondition = manager
         .capture_managed_adoption_precondition(Some(&AuthManager::managed_account_fingerprint(
             "managed-before-logout",
@@ -2966,123 +3355,22 @@ async fn install_managed_logout_clears_the_cache_and_publishes_a_revision() {
         "expected LoggedOut, got {outcome:?}"
     );
     assert_eq!(manager.auth_cached(), None);
+    assert!(manager.is_managed_auth_change(*manager.auth_change_receiver().borrow()));
+    assert_eq!(
+        *manager.auth_change_state_receiver().borrow(),
+        AuthChangeState {
+            generation: owner_before.generation + 1,
+            owner_generation: owner_before.owner_generation + 1,
+        }
+    );
     assert!(
         revisions.has_changed().unwrap_or(false),
         "logout must publish an auth-change signal like any other adoption"
     );
-    assert!(manager.is_managed_auth_change(*revisions.borrow()));
     assert!(
         get_auth_file(codex_home.path()).exists(),
         "managed logout must never touch the durable store -- the writer boundary is separately owned"
     );
-}
-
-#[tokio::test]
-async fn managed_auth_origin_precedes_notification_and_does_not_tag_ordinary_changes() {
-    let home = tempdir().unwrap();
-    let write_account = |account: &str| {
-        write_managed_auth_file(
-            AuthFileParams {
-                openai_api_key: None,
-                chatgpt_plan_type: Some("pro".to_owned()),
-                chatgpt_account_id: Some(account.to_owned()),
-            },
-            home.path(),
-        )
-        .unwrap();
-    };
-    write_account("origin-a");
-    let manager = AuthManager::new(
-        home.path().to_path_buf(),
-        /*enable_codex_api_key_env*/ false,
-        AuthCredentialsStoreMode::File,
-        /*forced_chatgpt_workspace_id*/ None,
-        /*chatgpt_base_url*/ None,
-        AuthKeyringBackendKind::default(),
-        crate::test_support::transport_default_auth_route_config(),
-    )
-    .await;
-    let mut changes = manager.auth_change_receiver();
-    assert!(!manager.is_managed_auth_change(*changes.borrow()));
-    let before = manager
-        .capture_managed_adoption_precondition(Some(&AuthManager::managed_account_fingerprint(
-            "origin-a",
-        )))
-        .unwrap();
-    write_account("origin-b");
-    let intended = AuthManager::managed_account_fingerprint("origin-b");
-    let prepared = manager
-        .prepare_managed_adoption(Some(&intended), &before)
-        .await
-        .unwrap();
-    assert!(matches!(
-        manager.install_prepared_managed_adoption(&prepared, &before),
-        ManagedAdoptionInstallOutcome::Installed { .. }
-    ));
-    changes.changed().await.unwrap();
-    let managed = *changes.borrow_and_update();
-    assert!(manager.is_managed_auth_change(managed));
-
-    // Equal-auth adoption remains silent and commands must not require a new
-    // watch notification or an origin tag as admission authority.
-    let same = manager
-        .capture_managed_adoption_precondition(Some(&intended))
-        .unwrap();
-    let prepared = manager
-        .prepare_managed_adoption(Some(&intended), &same)
-        .await
-        .unwrap();
-    assert!(matches!(
-        manager.install_prepared_managed_adoption(&prepared, &same),
-        ManagedAdoptionInstallOutcome::Installed { .. }
-    ));
-    assert!(!changes.has_changed().unwrap());
-    assert_eq!(*changes.borrow(), managed);
-
-    write_account("origin-c");
-    // reload's legacy bool uses CodexAuth equality; the watch uses the richer
-    // auths_equal_for_refresh comparison. Observe the actual revision below.
-    manager.reload().await;
-    let ordinary = *changes.borrow_and_update();
-    assert!(ordinary > managed);
-    assert!(!manager.is_managed_auth_change(ordinary));
-
-    let before = manager
-        .capture_managed_adoption_precondition(Some(&AuthManager::managed_account_fingerprint(
-            "origin-c",
-        )))
-        .unwrap();
-    write_account("origin-d");
-    let prepared = manager
-        .prepare_managed_adoption(
-            Some(&AuthManager::managed_account_fingerprint("origin-d")),
-            &before,
-        )
-        .await
-        .unwrap();
-    write_account("origin-e");
-    assert!(matches!(
-        manager.install_prepared_managed_adoption(&prepared, &before),
-        ManagedAdoptionInstallOutcome::SourceChanged
-    ));
-    assert_eq!(*changes.borrow(), ordinary);
-    assert!(!manager.is_managed_auth_change(ordinary));
-
-    assert!(matches!(
-        manager.install_managed_logout(manager.auth_cached(), &before),
-        ManagedAdoptionInstallOutcome::LoggedOut
-    ));
-    let logout = *changes.borrow();
-    assert!(logout > ordinary);
-    assert!(manager.is_managed_auth_change(logout));
-    assert!(!manager.is_managed_auth_change(managed));
-    // Coalescing this managed logout with a newer ordinary reload still leaves
-    // the latest notification classified as ordinary.
-    manager.reload().await;
-    changes.changed().await.unwrap();
-    let latest = *changes.borrow_and_update();
-    assert!(latest > logout);
-    assert!(!manager.is_managed_auth_change(latest));
 }
 
 /// R014's manager-owned CAS: installing must refuse rather than
@@ -3174,6 +3462,75 @@ async fn managed_admission_and_logout_refuse_absent_or_api_key_current_auth() {
 }
 
 #[tokio::test]
+async fn managed_adoption_preserves_upstream_credential_and_owner_generations() {
+    for (next_account, owner_delta) in [("owner-a", 0), ("owner-b", 1)] {
+        let home = tempdir().unwrap();
+        let write_account = |account: &str, plan: &str| {
+            write_managed_auth_file(
+                AuthFileParams {
+                    openai_api_key: None,
+                    chatgpt_plan_type: Some(plan.to_owned()),
+                    chatgpt_account_id: Some(account.to_owned()),
+                },
+                home.path(),
+            )
+            .unwrap();
+        };
+        write_account("owner-a", "pro");
+        let manager = AuthManager::new(
+            home.path().to_path_buf(),
+            /*enable_codex_api_key_env*/ false,
+            AuthCredentialsStoreMode::File,
+            /*forced_chatgpt_workspace_id*/ None,
+            /*chatgpt_base_url*/ None,
+            AuthKeyringBackendKind::default(),
+            crate::test_support::transport_default_auth_route_config(),
+        )
+        .await;
+        let before = *manager.auth_change_state_receiver().borrow();
+        let precondition = manager
+            .capture_managed_adoption_precondition(Some(&AuthManager::managed_account_fingerprint(
+                "owner-a",
+            )))
+            .unwrap();
+        // Changing the ID token forces a credential change even for the same owner.
+        write_account(next_account, "plus");
+        let prepared = manager
+            .prepare_managed_adoption(
+                Some(&AuthManager::managed_account_fingerprint(next_account)),
+                &precondition,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            manager.install_prepared_managed_adoption(&prepared, &precondition),
+            ManagedAdoptionInstallOutcome::Installed { .. }
+        ));
+        let after = *manager.auth_change_state_receiver().borrow();
+        let managed_revision = *manager.auth_change_receiver().borrow();
+        assert!(manager.is_managed_auth_change(managed_revision));
+        assert!(!manager.is_managed_auth_change(0));
+        assert_eq!(
+            after,
+            AuthChangeState {
+                generation: before.generation + 1,
+                owner_generation: before.owner_generation + owner_delta,
+            }
+        );
+        // A refused reuse must not publish another owner or credential change.
+        assert!(matches!(
+            manager.install_prepared_managed_adoption(&prepared, &precondition),
+            ManagedAdoptionInstallOutcome::IntendedResultMismatch
+        ));
+        assert_eq!(*manager.auth_change_state_receiver().borrow(), after);
+        manager.set_cached_auth(None);
+        let ordinary_revision = *manager.auth_change_receiver().borrow();
+        assert!(ordinary_revision > managed_revision);
+        assert!(!manager.is_managed_auth_change(ordinary_revision));
+    }
+}
+
+#[tokio::test]
 async fn prepared_managed_candidate_refuses_changed_source_and_installs_only_once() {
     let home = tempdir().unwrap();
     let write_account = |account: &str| {
@@ -3205,34 +3562,6 @@ async fn prepared_managed_candidate_refuses_changed_source_and_installs_only_onc
         .unwrap();
     write_account("prepared-b");
     let original_b = std::fs::read(get_auth_file(home.path())).unwrap();
-    let abandoned = manager
-        .prepare_managed_adoption(
-            Some(&AuthManager::managed_account_fingerprint("prepared-b")),
-            &precondition,
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        manager
-            .prepared_managed_adoptions
-            .lock()
-            .unwrap()
-            .candidates
-            .len(),
-        1
-    );
-    // The handle has no strong credential owner: only AuthManager owns the
-    // store, and dropping a capability eagerly removes its private candidate.
-    assert_eq!(Arc::strong_count(&manager.prepared_managed_adoptions), 1);
-    drop(abandoned);
-    assert!(
-        manager
-            .prepared_managed_adoptions
-            .lock()
-            .unwrap()
-            .candidates
-            .is_empty()
-    );
     let prepared = manager
         .prepare_managed_adoption(
             Some(&AuthManager::managed_account_fingerprint("prepared-b")),
@@ -3240,20 +3569,6 @@ async fn prepared_managed_candidate_refuses_changed_source_and_installs_only_onc
         )
         .await
         .unwrap();
-    let wrong_manager = AuthManager::from_auth_for_testing(manager.auth_cached().unwrap());
-    assert!(matches!(
-        wrong_manager.install_prepared_managed_adoption(&prepared, &precondition),
-        ManagedAdoptionInstallOutcome::IntendedResultMismatch
-    ));
-    assert_eq!(
-        manager
-            .prepared_managed_adoptions
-            .lock()
-            .unwrap()
-            .candidates
-            .len(),
-        1
-    );
     let revision = *manager.auth_change_receiver().borrow();
     write_account("unexpected-c");
     assert!(matches!(
@@ -3296,32 +3611,10 @@ async fn prepared_managed_candidate_refuses_changed_source_and_installs_only_onc
         )
         .await
         .unwrap();
-    let outcomes = std::thread::scope(|scope| {
-        let first =
-            scope.spawn(|| manager.install_prepared_managed_adoption(&prepared, &precondition));
-        let second =
-            scope.spawn(|| manager.install_prepared_managed_adoption(&prepared, &precondition));
-        [first.join().unwrap(), second.join().unwrap()]
-    });
-    assert_eq!(outcomes.iter().filter(|outcome| matches!(outcome, ManagedAdoptionInstallOutcome::Installed { fingerprint } if fingerprint == &AuthManager::managed_account_fingerprint("prepared-b"))).count(), 1);
-    assert_eq!(
-        outcomes
-            .iter()
-            .filter(|outcome| matches!(
-                outcome,
-                ManagedAdoptionInstallOutcome::IntendedResultMismatch
-            ))
-            .count(),
-        1
-    );
-    assert!(
-        manager
-            .prepared_managed_adoptions
-            .lock()
-            .unwrap()
-            .candidates
-            .is_empty()
-    );
+    assert!(matches!(
+        manager.install_prepared_managed_adoption(&prepared, &precondition),
+        ManagedAdoptionInstallOutcome::Installed { .. }
+    ));
     assert_eq!(
         manager.auth_cached().unwrap().get_account_id().as_deref(),
         Some("prepared-b")
@@ -3425,42 +3718,4 @@ async fn managed_adoption_outcomes_never_debug_print_credential_material() {
         !rendered.contains("opaque-account"),
         "debug output must not expose the source account identifier"
     );
-}
-
-#[test]
-fn prepared_handle_cannot_keep_credentials_alive_after_manager_drop() {
-    let manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("secret-sentinel"));
-    let handle = PreparedManagedAdoption {
-        id: 7,
-        store: Arc::downgrade(&manager.prepared_managed_adoptions),
-    };
-    assert_eq!(Arc::strong_count(&manager.prepared_managed_adoptions), 1);
-    drop(manager);
-    assert!(handle.store.upgrade().is_none());
-    assert!(!format!("{handle:?}").contains("secret-sentinel"));
-}
-
-#[test]
-fn poisoned_prepared_store_is_terminal_and_never_rearmed() {
-    let manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("secret-sentinel"));
-    let handle = PreparedManagedAdoption {
-        id: 1,
-        store: Arc::downgrade(&manager.prepared_managed_adoptions),
-    };
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _guard = manager.prepared_managed_adoptions.lock().unwrap();
-        panic!("intentional prepared-store poison");
-    }));
-    let precondition = ManagedAdoptionPrecondition {
-        revision: 0,
-        fingerprint: String::new(),
-    };
-    for _ in 0..2 {
-        assert!(matches!(
-            manager.install_prepared_managed_adoption(&handle, &precondition),
-            ManagedAdoptionInstallOutcome::CacheLockUnavailable
-        ));
-    }
-    drop(handle);
-    assert!(manager.prepared_managed_adoptions.is_poisoned());
 }

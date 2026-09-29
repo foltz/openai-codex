@@ -6,10 +6,12 @@
 )]
 
 use crate::DbTelemetry;
+use crate::kcf_migrations::KCF_STATE_MIGRATOR;
 use crate::migrations::repair_legacy_recency_migration_version;
 use crate::runtime::RuntimeDbInitError;
 use crate::telemetry;
 use crate::telemetry::DbKind;
+use anyhow::Context;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use log::LevelFilter;
 use sqlx::ConnectOptions;
@@ -80,6 +82,12 @@ const MEMORIES_DB: RuntimeDbSpec = RuntimeDbSpec {
     migrate_phase: "migrate_memories",
 };
 
+const MEMORIES_V2_DB: RuntimeDbSpec = RuntimeDbSpec {
+    label: "memories v2 DB",
+    filename: "memories_v2_1.sqlite",
+    ..MEMORIES_DB
+};
+
 const QUEUE_DB: RuntimeDbSpec = RuntimeDbSpec {
     label: "queue DB",
     filename: QUEUE_DB_FILENAME,
@@ -96,11 +104,12 @@ const THREAD_HISTORY_DB: RuntimeDbSpec = RuntimeDbSpec {
     migrate_phase: "migrate_thread_history",
 };
 
-const RUNTIME_DBS: [RuntimeDbSpec; 6] = [
+const RUNTIME_DBS: [RuntimeDbSpec; 7] = [
     STATE_DB,
     LOGS_DB,
     GOALS_DB,
     MEMORIES_DB,
+    MEMORIES_V2_DB,
     QUEUE_DB,
     THREAD_HISTORY_DB,
 ];
@@ -148,6 +157,19 @@ impl SqliteConfig {
     /// Return the path to the memories database.
     pub fn memories_db_path(&self) -> PathBuf {
         MEMORIES_DB.path(self.home())
+    }
+
+    pub(crate) fn memories_v2_db_path(&self) -> PathBuf {
+        MEMORIES_V2_DB.path(self.home())
+    }
+
+    pub(crate) async fn open_memories_v2_db(&self) -> anyhow::Result<SqlitePool> {
+        self.open_runtime_db(
+            MEMORIES_V2_DB,
+            &crate::migrations::runtime_memories_migrator(),
+            /*telemetry_override*/ None,
+        )
+        .await
     }
 
     /// Return the path to the durable user-message queue database.
@@ -255,7 +277,16 @@ impl SqliteConfig {
             if matches!(spec.kind, DbKind::State) {
                 repair_legacy_recency_migration_version(&pool, migrator).await?;
             }
-            migrator.run(&pool).await.map_err(anyhow::Error::from)
+            migrator.run(&pool).await?;
+            if matches!(spec.kind, DbKind::State) {
+                // Each script is transactional, not the two-ledger sequence.
+                // Do not publish the pool if KCF fails after upstream commits.
+                KCF_STATE_MIGRATOR
+                    .run(&pool)
+                    .await
+                    .context("failed to migrate KCF state schema")?;
+            }
+            Ok::<(), anyhow::Error>(())
         }
         .await;
         telemetry::record_init_result(
@@ -291,12 +322,19 @@ impl SqliteConfig {
     }
 
     /// Open an existing Codex SQLite database without creating or modifying it.
-    pub async fn open_read_only_pool(&self, path: &Path) -> Result<SqlitePool, Error> {
-        let options = SqliteConnectOptions::new()
+    pub async fn open_read_only_pool(
+        &self,
+        path: &Path,
+        busy_timeout: Option<Duration>,
+    ) -> Result<SqlitePool, Error> {
+        let mut options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(false)
             .read_only(true)
             .log_statements(LevelFilter::Off);
+        if let Some(busy_timeout) = busy_timeout {
+            options = options.busy_timeout(busy_timeout);
+        }
         SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(options)

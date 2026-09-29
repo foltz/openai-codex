@@ -42,6 +42,7 @@ use std::error::Error;
 use std::io;
 use std::mem::ManuallyDrop;
 use std::sync::Mutex;
+use std::sync::mpsc;
 use std::time::Duration;
 use tracing::debug;
 use tracing_subscriber::Layer;
@@ -49,6 +50,10 @@ use tracing_subscriber::registry::LookupSpan;
 
 const ENV_ATTRIBUTE: &str = "env";
 const HOST_NAME_ATTRIBUTE: &str = "host.name";
+
+#[cfg(test)]
+#[path = "provider_preparation_tests.rs"]
+mod preparation_tests;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ResourceKind {
@@ -61,6 +66,7 @@ pub struct OtelProvider {
     pub tracer_provider: Option<SdkTracerProvider>,
     pub tracer: Option<Tracer>,
     pub metrics: Option<MetricsClient>,
+    shutdown_worker: Option<mpsc::SyncSender<ShutdownWorker>>,
     pub(crate) trace_receipt: Option<crate::trace_exporter_retirement::ExporterReceipt>,
     pub(crate) log_receipt: Option<crate::trace_exporter_retirement::ExporterReceipt>,
     shutdown_result: Mutex<Option<Result<(), OtelShutdownError>>>,
@@ -82,6 +88,11 @@ pub enum OtelShutdownError {
 struct ShutdownWorker {
     provider: ManuallyDrop<OtelProvider>,
     completed_tx: tokio::sync::oneshot::Sender<Result<(), OtelShutdownError>>,
+}
+
+struct ShutdownWorkerStartup {
+    worker_rx: mpsc::Receiver<ShutdownWorker>,
+    ready_tx: mpsc::SyncSender<()>,
 }
 
 #[derive(Debug)]
@@ -137,37 +148,74 @@ impl OtelProvider {
         result
     }
 
-    /// Shuts down exporters on a detached thread within an external time budget.
-    pub async fn shutdown_with_timeout(self, timeout: Duration) -> io::Result<()> {
-        self.shutdown_with_timeout_and_spawner(timeout, |worker| {
+    /// Starts the detached shutdown worker before shutdown-time resource pressure.
+    fn prepare_shutdown_worker(&mut self) -> io::Result<()> {
+        self.prepare_shutdown_worker_with_spawner(|startup| {
             std::thread::Builder::new()
                 .name("codex-otel-shutdown".to_string())
                 .spawn(move || {
+                    if startup.ready_tx.send(()).is_err() {
+                        return;
+                    }
+                    let Ok(worker) = startup.worker_rx.recv() else {
+                        return;
+                    };
                     let provider = ManuallyDrop::into_inner(worker.provider);
                     let result = provider.shutdown_checked();
                     drop(provider);
                     let _ = worker.completed_tx.send(result);
                 })
         })
-        .await
     }
 
-    async fn shutdown_with_timeout_and_spawner<F>(
-        self,
-        timeout: Duration,
-        spawn: F,
-    ) -> io::Result<()>
+    fn prepare_shutdown_worker_with_spawner<F>(&mut self, spawn: F) -> io::Result<()>
     where
-        F: FnOnce(ShutdownWorker) -> io::Result<std::thread::JoinHandle<()>>,
+        F: FnOnce(ShutdownWorkerStartup) -> io::Result<std::thread::JoinHandle<()>>,
     {
+        if self.shutdown_worker.is_some() {
+            return Ok(());
+        }
+
+        let (worker_tx, worker_rx) = mpsc::sync_channel(/*bound*/ 1);
+        let (ready_tx, ready_rx) = mpsc::sync_channel(/*bound*/ 1);
+        let startup = ShutdownWorkerStartup {
+            worker_rx,
+            ready_tx,
+        };
+        let _shutdown_worker = spawn(startup)?;
+        ready_rx.recv().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "telemetry shutdown worker stopped before initializing",
+            )
+        })?;
+        self.shutdown_worker = Some(worker_tx);
+        Ok(())
+    }
+
+    /// Shuts down exporters on a prepared detached thread within a time budget.
+    pub async fn shutdown_with_timeout(mut self, timeout: Duration) -> io::Result<()> {
+        let Some(worker_tx) = self.shutdown_worker.take() else {
+            // Best-effort shutdown must not run a potentially blocking destructor
+            // when its worker could not be prepared.
+            let _provider = ManuallyDrop::new(self);
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "telemetry shutdown worker was not initialized",
+            ));
+        };
+
         let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
-        // A failed spawn drops its closure on the caller. Keep the provider
-        // from synchronously running its potentially blocking destructor.
         let worker = ShutdownWorker {
             provider: ManuallyDrop::new(self),
             completed_tx,
         };
-        let _shutdown_worker = spawn(worker)?;
+        worker_tx.send(worker).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "telemetry shutdown worker stopped before receiving the provider",
+            )
+        })?;
 
         match tokio::time::timeout(timeout, completed_rx).await {
             Ok(Ok(result)) => result.map_err(io::Error::other),
@@ -182,7 +230,26 @@ impl OtelProvider {
         }
     }
 
-    pub fn from(settings: &OtelSettings) -> Result<Option<Self>, Box<dyn Error>> {
+    /// Transfer to the birth-prepared worker without creating a shutdown-time
+    /// thread. Failed dispatch retains the provider without invoking SDK Drop
+    /// on the caller; the managed receipt must report that ownership incomplete.
+    pub(crate) fn dispatch_retirement(
+        mut self,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<(), OtelShutdownError>>, ManuallyDrop<Self>>
+    {
+        let Some(worker_tx) = self.shutdown_worker.take() else {
+            return Err(ManuallyDrop::new(self));
+        };
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        let worker = ShutdownWorker {
+            provider: ManuallyDrop::new(self),
+            completed_tx,
+        };
+        worker_tx.send(worker).map_err(|error| error.0.provider)?;
+        Ok(completed_rx)
+    }
+
+    pub fn try_new(settings: &OtelSettings) -> Result<Option<Self>, Box<dyn Error>> {
         let crate::PreparedOtelProvider {
             mut provider,
             tracestate,
@@ -209,6 +276,13 @@ impl OtelProvider {
     // reloader needs to retain a candidate before attempting logger publication.
     pub(crate) fn build_unpublished(
         settings: &OtelSettings,
+    ) -> Result<Option<Self>, crate::OtelPreparationError> {
+        Self::build_unpublished_with_worker_preparation(settings, Self::prepare_shutdown_worker)
+    }
+
+    fn build_unpublished_with_worker_preparation(
+        settings: &OtelSettings,
+        prepare_worker: impl FnOnce(&mut Self) -> io::Result<()>,
     ) -> Result<Option<Self>, crate::OtelPreparationError> {
         let log_enabled = !matches!(settings.exporter, OtelExporter::None);
         let trace_enabled = !matches!(settings.trace_exporter, OtelExporter::None);
@@ -239,7 +313,11 @@ impl OtelProvider {
             trace_receipt: None,
             log_receipt: None,
             shutdown_result: Mutex::new(None),
+            shutdown_worker: None,
         };
+        // Prepare the shutdown vehicle before any SDK owner is constructed.
+        // A spawn/ready failure therefore cannot strand a partial exporter.
+        prepare_worker(&mut provider).map_err(crate::OtelPreparationError::before_resources)?;
         let construction = (|| -> Result<(), Box<dyn Error>> {
             provider.metrics = if matches!(metric_exporter, OtelExporter::None) {
                 None
@@ -348,7 +426,14 @@ impl OtelProvider {
     }
 
     pub fn trace_export_filter(meta: &tracing::Metadata<'_>) -> bool {
-        meta.is_span() || is_trace_safe_target(meta.target())
+        let target = meta.target();
+        if meta.is_span() {
+            // h2 creates explicit-root spans that escape the SDK's telemetry suppression.
+            // Exporting them would make OTLP transport generate more OTLP exports.
+            target != "h2" && !target.starts_with("h2::")
+        } else {
+            is_trace_safe_target(target)
+        }
     }
 
     pub fn metrics(&self) -> Option<&MetricsClient> {
@@ -652,9 +737,15 @@ mod tests {
     use super::*;
     use crate::metrics::API_CALL_COUNT_METRIC;
     use crate::metrics::API_CALL_DURATION_METRIC;
+    use crate::metrics::EXEC_SERVER_CLIENT_REQUEST_COUNT_METRIC;
     use crate::metrics::MetricsExporter;
+    use crate::metrics::RESPONSES_API_ENGINE_IAPI_TTFT_DURATION_METRIC;
+    use crate::metrics::RESPONSES_API_ENGINE_SERVICE_TBT_DURATION_METRIC;
+    use crate::metrics::RESPONSES_API_ENGINE_SERVICE_TTFT_DURATION_METRIC;
     use crate::metrics::TOOL_CALL_COUNT_METRIC;
     use crate::metrics::TOOL_CALL_DURATION_METRIC;
+    use crate::metrics::TURN_COST_MICROUSD_METRIC;
+    use crate::metrics::TURN_TOKEN_USAGE_METRIC;
     use opentelemetry_sdk::metrics::InMemoryMetricExporter;
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
@@ -760,7 +851,7 @@ mod tests {
     }
 
     #[test]
-    fn statsig_runtime_only_metrics_are_not_exported() -> Result<(), Box<dyn Error>> {
+    fn statsig_disabled_metrics_are_not_exported() -> Result<(), Box<dyn Error>> {
         let exporter = InMemoryMetricExporter::default();
         let mut config = MetricsConfig::otlp(
             "test",
@@ -773,8 +864,32 @@ mod tests {
 
         metrics.counter(API_CALL_COUNT_METRIC, /*inc*/ 1, &[])?;
         metrics.record_duration(API_CALL_DURATION_METRIC, Duration::from_millis(100), &[])?;
+        metrics.counter_with_description(
+            EXEC_SERVER_CLIENT_REQUEST_COUNT_METRIC,
+            "Client-side exec-server RPC attempts.",
+            /*inc*/ 1,
+            &[("method", "fs/readFile")],
+        )?;
+        metrics.counter("codex.conversation.turn.count", /*inc*/ 1, &[])?;
+        metrics.record_duration(
+            RESPONSES_API_ENGINE_IAPI_TTFT_DURATION_METRIC,
+            Duration::from_millis(100),
+            &[],
+        )?;
+        metrics.record_duration(
+            RESPONSES_API_ENGINE_SERVICE_TBT_DURATION_METRIC,
+            Duration::from_millis(100),
+            &[],
+        )?;
+        metrics.record_duration(
+            RESPONSES_API_ENGINE_SERVICE_TTFT_DURATION_METRIC,
+            Duration::from_millis(100),
+            &[],
+        )?;
         metrics.counter(TOOL_CALL_COUNT_METRIC, /*inc*/ 1, &[])?;
         metrics.record_duration(TOOL_CALL_DURATION_METRIC, Duration::from_millis(25), &[])?;
+        metrics.counter(TURN_COST_MICROUSD_METRIC, /*inc*/ 1, &[])?;
+        metrics.histogram(TURN_TOKEN_USAGE_METRIC, /*value*/ 100, &[])?;
         metrics.counter("codex.turns", /*inc*/ 1, &[])?;
         metrics.shutdown()?;
 

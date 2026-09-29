@@ -23,6 +23,7 @@ use rmcp::service::TxJsonRpcMessage;
 use rmcp::transport::Transport;
 use tokio::sync::watch;
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 /// Credential-free outcome for one reserved physical connection attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -57,6 +58,7 @@ pub struct RegistrationClosed;
 #[derive(Default)]
 struct RegistryState {
     closed: bool,
+    shutdown: CancellationToken,
     attempts: Vec<Arc<Attempt>>,
 }
 
@@ -94,6 +96,7 @@ struct AttemptState {
 pub(crate) struct PhysicalAttemptTicket {
     attempt: Weak<Attempt>,
     registry: Weak<Mutex<RegistryState>>,
+    pub(crate) shutdown: CancellationToken,
 }
 
 impl PhysicalAttemptTicket {
@@ -220,6 +223,7 @@ impl RmcpClientRetirement {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.closed = true;
+        state.shutdown.cancel();
         for attempt in &state.attempts {
             let mut attempt = attempt
                 .state
@@ -254,6 +258,7 @@ impl RmcpClientRetirement {
         let ticket = PhysicalAttemptTicket {
             attempt: Arc::downgrade(&attempt),
             registry: Arc::downgrade(&self.state),
+            shutdown: registry.shutdown.clone(),
         };
         registry.attempts.push(attempt);
         Ok(ticket)
@@ -612,6 +617,10 @@ impl<T> Drop for AcknowledgedTransport<T> {
 impl<T: Transport<RoleClient>> Transport<RoleClient> for AcknowledgedTransport<T> {
     type Error = T::Error;
 
+    #[expect(
+        clippy::expect_used,
+        reason = "inner is initialized by new and taken only by Drop; these &mut methods cannot run afterwards"
+    )]
     fn send(
         &mut self,
         item: TxJsonRpcMessage<RoleClient>,
@@ -622,6 +631,10 @@ impl<T: Transport<RoleClient>> Transport<RoleClient> for AcknowledgedTransport<T
             .send(item)
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "inner is initialized by new and taken only by Drop; these &mut methods cannot run afterwards"
+    )]
     fn receive(&mut self) -> impl Future<Output = Option<RxJsonRpcMessage<RoleClient>>> + Send {
         self.inner
             .as_mut()
@@ -629,6 +642,10 @@ impl<T: Transport<RoleClient>> Transport<RoleClient> for AcknowledgedTransport<T
             .receive()
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "inner is initialized by new and taken only by Drop; these &mut methods cannot run afterwards"
+    )]
     async fn close(&mut self) -> Result<(), Self::Error> {
         let result = self
             .inner
@@ -705,7 +722,7 @@ impl<S: Service<RoleClient>> ServiceLeaseOwner<S> {
     }
 }
 
-/// Erases the local handler type while forwarding upstream MRTR helpers intact.
+/// Erases the local handler type while retaining a lease across tool continuations.
 trait ServiceOperations: Send + Sync {
     fn close_gate(&self);
     fn call_tool(
@@ -725,21 +742,28 @@ impl<S: Service<RoleClient>> ServiceOperations for Arc<ServiceLeaseOwner<S>> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .closing = true;
     }
+    #[expect(
+        clippy::expect_used,
+        reason = "acquire initializes the lease service, which is taken only when the lease drops"
+    )]
     fn call_tool(
         &self,
         params: rmcp::model::CallToolRequestParams,
     ) -> BoxFuture<'_, Result<rmcp::model::CallToolResult, rmcp::service::ServiceError>> {
         async move {
             let lease = self.acquire()?;
-            lease
-                .service
-                .as_ref()
-                .expect("live operation lease")
-                .call_tool(params)
-                .await
+            crate::tool_input::call_tool(
+                lease.service.as_ref().expect("live operation lease"),
+                params,
+            )
+            .await
         }
         .boxed()
     }
+    #[expect(
+        clippy::expect_used,
+        reason = "acquire initializes the lease service, which is taken only when the lease drops"
+    )]
     fn read_resource(
         &self,
         params: rmcp::model::ReadResourceRequestParams,

@@ -7,6 +7,13 @@ use super::*;
 
 impl Session {
     pub(crate) fn request_mcp_runtime_refresh(&self) {
+        // Plugin changes can reuse connections but still change their skill resources.
+        self.services.mcp_runtime.invalidate_resource_caches();
+        self.request_mcp_runtime_reprojection();
+    }
+
+    /// Reproject contributor state without invalidating cached MCP resources.
+    pub(crate) fn request_mcp_runtime_reprojection(&self) {
         self.mark_mcp_runtime_dirty();
         self.schedule_mcp_prewarm();
     }
@@ -19,7 +26,7 @@ impl Session {
         let session = Arc::downgrade(self);
         let shutdown = self.mcp_prewarm_shutdown.clone();
         let worker = self.services.runtime_handle.spawn(async move {
-            loop {
+            'worker: loop {
                 let auth_changed = tokio::select! {
                     biased;
                     _ = shutdown.cancelled() => break,
@@ -36,16 +43,51 @@ impl Session {
                         true
                     },
                 };
-                let Some(session) = session.upgrade() else {
+                let Some(mut current) = session.upgrade() else {
                     break;
                 };
                 if auth_changed {
-                    session.mark_mcp_runtime_dirty();
+                    current.mark_mcp_runtime_dirty();
                 }
+                // Background admission precedes the refresh semaphore and claim.
+                // Waiting for reopen must not block admitted foreground work or
+                // keep a session alive without any operation in progress.
+                let account_work = loop {
+                    let admission = current
+                        .services
+                        .host_admission
+                        .as_ref()
+                        .map_or(Ok(None), |host| host.admit_operation_work());
+                    match admission {
+                        Ok(work) => break work.map(super::mcp_work::McpOperationWork),
+                        Err(codex_extension_api::TurnWorkRefused::Unavailable) => continue 'worker,
+                        Err(codex_extension_api::TurnWorkRefused::RetryAfter(retry)) => {
+                            drop(current);
+                            tokio::select! {
+                                biased;
+                                _ = shutdown.cancelled() => break 'worker,
+                                _ = retry => {},
+                            }
+                            let Some(resumed) = session.upgrade() else {
+                                break 'worker;
+                            };
+                            current = resumed;
+                        }
+                    }
+                };
+                let access = account_work
+                    .as_ref()
+                    .map_or(codex_mcp::McpAttemptAccess::Unscoped, |work| {
+                        codex_mcp::McpAttemptAccess::Admitted(work)
+                    });
                 tokio::select! {
                     biased;
                     _ = shutdown.cancelled() => break,
-                    _ = session.refresh_mcp_if_dirty() => {},
+                    result = current.refresh_mcp_if_dirty_with_authority(access) => {
+                        if let Err(error) = result {
+                            warn!("background MCP runtime refresh failed: {error:#}");
+                        }
+                    },
                 }
             }
         });

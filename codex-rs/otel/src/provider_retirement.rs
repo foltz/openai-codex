@@ -1,7 +1,8 @@
 use crate::OtelProvider;
 use crate::OtelShutdownError;
+use std::mem::ManuallyDrop;
 use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
+use tokio::sync::oneshot;
 use tokio::time::Instant;
 use tokio::time::timeout_at;
 
@@ -17,7 +18,12 @@ pub enum OtelRetirementError {
 }
 
 enum RetirementState {
-    Pending(JoinHandle<Result<(), OtelShutdownError>>),
+    Pending(oneshot::Receiver<Result<(), OtelShutdownError>>),
+    // Deliberately retained without a caller-side SDK destructor. Dropping an
+    // unobserved/unavailable receipt leaks this provider, never proves cleanup.
+    Unavailable {
+        _provider: ManuallyDrop<OtelProvider>,
+    },
     Joined(Result<(), OtelRetirementError>),
     Complete(Result<(), OtelRetirementError>),
 }
@@ -43,18 +49,19 @@ impl OtelProvider {
         }
     }
 
-    /// Transfer this provider to one blocking shutdown worker. Call only after
+    /// Transfer this provider to its birth-prepared shutdown worker. Call only after
     /// removing its publication routes; this does not clear process globals.
     pub fn begin_retirement(self) -> OtelRetirement {
         let trace_receipt = self.trace_receipt.clone();
         let log_receipt = self.log_receipt.clone();
-        let worker = tokio::task::spawn_blocking(move || {
-            let result = self.shutdown_checked();
-            drop(self);
-            result
-        });
+        let state = match self.dispatch_retirement() {
+            Ok(worker) => RetirementState::Pending(worker),
+            Err(provider) => RetirementState::Unavailable {
+                _provider: provider,
+            },
+        };
         OtelRetirement {
-            state: Mutex::new(RetirementState::Pending(worker)),
+            state: Mutex::new(state),
             trace_receipt,
             log_receipt,
         }
@@ -63,10 +70,10 @@ impl OtelProvider {
 
 impl OtelRetirement {
     /// Observe the same worker under an absolute deadline. Cancellation drops
-    /// only the borrow of its JoinHandle, never the stored handle itself.
+    /// only the borrow of its receiver, never the stored receiver itself.
     #[expect(
         clippy::await_holding_invalid_type,
-        reason = "exclusive JoinHandle polling right; cancellation drops the guard, not the retained worker, and the worker never locks this mutex"
+        reason = "exclusive receiver polling right; cancellation drops the guard, not the retained observation, and the worker never locks this mutex"
     )]
     pub async fn wait_until(&self, deadline: Instant) -> Result<(), OtelRetirementError> {
         let mut state = timeout_at(deadline, self.state.lock())
@@ -74,6 +81,9 @@ impl OtelRetirement {
             .map_err(|_| OtelRetirementError::TimedOut)?;
         if let RetirementState::Complete(result) = *state {
             return result;
+        }
+        if matches!(*state, RetirementState::Unavailable { .. }) {
+            return Err(OtelRetirementError::WorkerFailed);
         }
         if let RetirementState::Pending(worker) = &mut *state {
             if Instant::now() >= deadline {

@@ -11,9 +11,13 @@ use crate::branch_summary;
 use crate::chatwidget::limit_label_for_window;
 use crate::chatwidget::rate_limits::get_limits_duration;
 use crate::legacy_core::config::Config;
+use crate::model_catalog::LUNA_RESERVE_MODEL;
+use crate::status::format_credit_micros;
+use crate::status::format_estimated_usd_micros;
 use crate::status::format_tokens_compact;
 use codex_app_server_protocol::AskForApproval;
 use codex_config::ConfigLayerSource;
+use codex_config::os_host_name;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::models::PermissionProfile;
@@ -22,8 +26,9 @@ use codex_utils_sandbox_summary::summarize_permission_profile;
 use super::status_state::TerminalTitleStatusKind;
 
 /// Items shown in the terminal title when the user has not configured a
-/// custom selection. Intentionally minimal: activity indicator + project name.
-pub(super) const DEFAULT_TERMINAL_TITLE_ITEMS: [&str; 2] = ["activity", "project-name"];
+/// custom selection. Unnamed threads omit the name until generation starts.
+pub(super) const DEFAULT_TERMINAL_TITLE_ITEMS: [&str; 3] =
+    ["activity", "thread-name", "project-name"];
 
 /// Braille-pattern dot-spinner frames for the terminal title animation.
 pub(super) const TERMINAL_TITLE_SPINNER_FRAMES: [&str; 10] =
@@ -77,6 +82,20 @@ impl StatusSurfaceSelections {
         self.status_line_items
             .iter()
             .any(|entry| entry.built_in() == Some(StatusLineItem::WorkspaceHeadline))
+    }
+
+    fn uses_thread_usage(&self) -> bool {
+        self.status_line_items.iter().any(|entry| {
+            matches!(
+                entry.built_in(),
+                Some(StatusLineItem::ThreadCredits | StatusLineItem::EstimatedThreadCost)
+            )
+        }) || self.terminal_title_items.iter().any(|item| {
+            matches!(
+                item,
+                TerminalTitleItem::ThreadCredits | TerminalTitleItem::EstimatedThreadCost
+            )
+        })
     }
 }
 
@@ -181,6 +200,12 @@ impl ChatWidget {
         } else {
             self.request_status_line_workspace_headline_if_due(Instant::now());
         }
+
+        if selections.uses_thread_usage() {
+            self.ensure_thread_usage_requested();
+        } else {
+            self.cancel_thread_usage_polling();
+        }
     }
 
     fn refresh_status_line_from_selections(&mut self, selections: &StatusSurfaceSelections) {
@@ -195,7 +220,7 @@ impl ChatWidget {
         }
 
         let mut segments = Vec::new();
-        let status_line_variables = self.config.tui_status_line_variables.clone();
+        let status_line_variables = self.local_settings.tui.status_line_variables.clone();
         for entry in &selections.status_line_items {
             match entry.render(&status_line_variables, |item| {
                 self.status_line_value_for_item(item)
@@ -210,7 +235,8 @@ impl ChatWidget {
 
         self.set_status_line(status_line_from_segments(
             segments,
-            self.config.tui_status_line_use_colors,
+            self.local_settings.tui.status_line_use_colors,
+            self.thread_id,
         ));
         let hyperlink_url = selections
             .status_line_items
@@ -240,11 +266,15 @@ impl ChatWidget {
     /// Empty selections clear the managed title. Non-empty selections render the
     /// current values in configured order, skip unavailable segments, and cache
     /// the last successfully written title so redundant OSC writes are avoided.
-    /// When the `activity` item is present in an animated running state, this also
-    /// schedules the next frame so the title animation keeps advancing.
+    /// Animated titles record their next refresh for the foreground loop, independently
+    /// of full TUI redraws.
     fn refresh_terminal_title_from_selections(&mut self, selections: &StatusSurfaceSelections) {
         self.last_terminal_title_requires_action =
             self.terminal_title_shows_action_required_with_selections(selections);
+        let now = Instant::now();
+        self.terminal_title_next_refresh = self
+            .terminal_title_animation_interval_with_selections(selections)
+            .map(|interval| now + interval);
         if selections.terminal_title_items.is_empty() {
             if let Err(err) = self.clear_managed_terminal_title() {
                 tracing::debug!(error = %err, "failed to clear terminal title");
@@ -252,13 +282,8 @@ impl ChatWidget {
             return;
         }
 
-        let now = Instant::now();
         let title = self.terminal_title_text_for_selections(selections, now);
-        let animation_interval = self.terminal_title_animation_interval_with_selections(selections);
         if self.last_terminal_title == title {
-            if let Some(interval) = animation_interval {
-                self.frame_requester.schedule_frame_in(interval);
-            }
             return;
         }
         match title {
@@ -281,10 +306,6 @@ impl ChatWidget {
                 }
             }
         }
-
-        if let Some(interval) = animation_interval {
-            self.frame_requester.schedule_frame_in(interval);
-        }
     }
 
     /// Recomputes both status surfaces from one shared config snapshot.
@@ -294,6 +315,8 @@ impl ChatWidget {
     /// warnings once, synchronizes shared cached state (such as git-branch
     /// lookup), then renders each surface from that shared snapshot.
     pub(crate) fn refresh_status_surfaces(&mut self) {
+        self.bottom_pane
+            .set_luna_reserve_active(self.current_model() == LUNA_RESERVE_MODEL);
         let selections = self.status_surface_selections();
         self.warn_invalid_terminal_title_items_once(&selections.invalid_terminal_title_items);
         self.sync_status_surface_shared_state(&selections);
@@ -323,7 +346,12 @@ impl ChatWidget {
         now: Instant,
     ) -> Option<String> {
         if self.terminal_title_shows_action_required_with_selections(selections) {
-            return Some(self.action_required_terminal_title_text(selections, now));
+            let title = self.action_required_terminal_title_text(selections, now);
+            return Some(if self.realtime_microphone_is_listening() {
+                format!("● {title}")
+            } else {
+                title
+            });
         }
 
         let mut previous = None;
@@ -358,7 +386,7 @@ impl ChatWidget {
     }
 
     fn action_required_terminal_title_prefix_at(&self, now: Instant) -> &'static str {
-        if !self.config.animations {
+        if !(self.local_settings.tui.animations && self.local_settings.tui.effects.title) {
             return TERMINAL_TITLE_ACTION_REQUIRED_PREFIX;
         }
 
@@ -385,7 +413,31 @@ impl ChatWidget {
         &self,
         selections: &StatusSurfaceSelections,
     ) -> Option<Duration> {
-        if self.config.animations
+        if self.local_settings.tui.animations
+            && self.local_settings.tui.effects.progress
+            && self.status_state.thread_title_generation_pending
+            && (selections.status_line_items.iter().any(|entry| {
+                matches!(
+                    entry.built_in(),
+                    Some(
+                        StatusLineItem::ThreadName
+                            | StatusLineItem::ThreadTitle
+                            | StatusLineItem::SessionId
+                    )
+                )
+            }) || selections.terminal_title_items.iter().any(|item| {
+                matches!(
+                    item,
+                    TerminalTitleItem::ThreadName
+                        | TerminalTitleItem::Thread
+                        | TerminalTitleItem::SessionId
+                )
+            }))
+        {
+            return Some(TERMINAL_TITLE_SPINNER_INTERVAL);
+        }
+        if self.local_settings.tui.animations
+            && self.local_settings.tui.effects.title
             && self.terminal_title_shows_action_required_with_selections(selections)
         {
             return Some(TERMINAL_TITLE_ACTION_REQUIRED_INTERVAL);
@@ -425,19 +477,23 @@ impl ChatWidget {
             return (Vec::new(), invalid, false);
         }
         let (mut prefix, prefix_invalid) =
-            parse_status_line_entries(self.config.tui_status_line_prefix.clone());
+            parse_status_line_entries(self.local_settings.tui.status_line_prefix.clone());
         prefix.extend(primary);
         invalid.extend(prefix_invalid);
         (prefix, invalid, true)
     }
 
     pub(super) fn configured_status_line_items(&self) -> Vec<String> {
-        self.config.tui_status_line.clone().unwrap_or_else(|| {
-            DEFAULT_STATUS_LINE_ITEMS
-                .iter()
-                .map(ToString::to_string)
-                .collect()
-        })
+        self.local_settings
+            .tui
+            .status_line
+            .clone()
+            .unwrap_or_else(|| {
+                DEFAULT_STATUS_LINE_ITEMS
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect()
+            })
     }
 
     /// Parses configured terminal-title ids into known items and collects unknown ids.
@@ -449,12 +505,16 @@ impl ChatWidget {
 
     /// Returns the configured terminal-title ids, or the default ordering when unset.
     pub(super) fn configured_terminal_title_items(&self) -> Vec<String> {
-        self.config.tui_terminal_title.clone().unwrap_or_else(|| {
-            DEFAULT_TERMINAL_TITLE_ITEMS
-                .iter()
-                .map(ToString::to_string)
-                .collect()
-        })
+        self.local_settings
+            .tui
+            .terminal_title
+            .clone()
+            .unwrap_or_else(|| {
+                DEFAULT_TERMINAL_TITLE_ITEMS
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect()
+            })
     }
 
     fn status_line_cwd(&self) -> &Path {
@@ -677,7 +737,7 @@ impl ChatWidget {
     /// Returning `None` means "omit this item for now", not "configuration error". Callers rely on
     /// this to keep partially available status lines readable while waiting for session, token, or
     /// git metadata.
-    pub(super) fn status_line_value_for_item(&mut self, item: StatusLineItem) -> Option<String> {
+    pub(super) fn status_line_value(&mut self, item: StatusLineItem) -> Option<String> {
         match item {
             StatusLineItem::ModelName => Some(self.model_display_name().to_string()),
             StatusLineItem::ModelWithReasoning => Some(self.model_with_reasoning_display_name()),
@@ -689,6 +749,7 @@ impl ChatWidget {
                 ))
             }
             StatusLineItem::ProjectRoot => self.status_line_project_root_name(),
+            StatusLineItem::Hostname => os_host_name(),
             StatusLineItem::GitBranch => self.status_line_branch.clone(),
             StatusLineItem::PullRequestNumber => self
                 .status_line_git_summary
@@ -756,26 +817,41 @@ impl ChatWidget {
                     format_tokens_compact(self.status_line_total_usage().output_tokens)
                 )
             }),
+            StatusLineItem::ThreadCredits => self
+                .estimated_thread_usage()
+                .map(|usage| usage.estimated_usage_credits_micros)
+                .map(|credits| format!("{} credits", format_credit_micros(credits))),
+            StatusLineItem::EstimatedThreadCost => self
+                .estimated_thread_usage()
+                .and_then(|usage| usage.estimated_usage_usd_micros)
+                .and_then(format_estimated_usd_micros),
             StatusLineItem::SessionId => self.thread_id.map(|id| id.to_string()),
-            StatusLineItem::FastMode => Some(
-                if self.current_service_tier() == Some(ServiceTier::Fast.request_value()) {
-                    "Fast on".to_string()
-                } else {
-                    "Fast off".to_string()
-                },
-            ),
-            StatusLineItem::RawOutput => self.raw_output_mode().then(|| "raw output".to_string()),
-            StatusLineItem::ThreadTitle => self.thread_name.as_ref().map_or_else(
-                || self.thread_id.map(|id| id.to_string()),
-                |name| {
-                    let trimmed = name.trim();
-                    if trimmed.is_empty() {
-                        self.thread_id.map(|id| id.to_string())
+            StatusLineItem::FastMode => self
+                .model_catalog
+                .try_list_models()
+                .ok()
+                .and_then(|models| {
+                    models
+                        .into_iter()
+                        .find(|preset| preset.model == self.current_model())
+                })
+                .is_none_or(|preset| preset.supports_fast_mode())
+                .then(|| {
+                    if self.current_service_tier() == Some(ServiceTier::Fast.request_value()) {
+                        "Fast on".to_string()
                     } else {
-                        Some(trimmed.to_string())
+                        "Fast off".to_string()
                     }
-                },
-            ),
+                }),
+            StatusLineItem::RawOutput => self.raw_output_mode().then(|| "raw output".to_string()),
+            StatusLineItem::ThreadName => {
+                self.thread_name.as_deref().and_then(normalize_thread_name)
+            }
+            StatusLineItem::ThreadTitle => self
+                .thread_name
+                .as_deref()
+                .and_then(normalize_thread_name)
+                .or_else(|| self.thread_id.map(|id| id.to_string())),
             StatusLineItem::WorkspaceHeadline => self.status_line_workspace_headline.clone(),
             StatusLineItem::TaskProgress => self.terminal_title_task_progress(),
         }
@@ -799,6 +875,8 @@ impl ChatWidget {
             StatusSurfacePreviewItem::Status => return Some(self.run_state_status_text()),
             StatusSurfacePreviewItem::TaskProgress => return self.terminal_title_task_progress(),
             StatusSurfacePreviewItem::CurrentDir => StatusLineItem::CurrentDir,
+            StatusSurfacePreviewItem::Hostname => StatusLineItem::Hostname,
+            StatusSurfacePreviewItem::ThreadName => StatusLineItem::ThreadName,
             StatusSurfacePreviewItem::ThreadTitle => StatusLineItem::ThreadTitle,
             StatusSurfacePreviewItem::GitBranch => StatusLineItem::GitBranch,
             StatusSurfacePreviewItem::PullRequestNumber => StatusLineItem::PullRequestNumber,
@@ -814,6 +892,8 @@ impl ChatWidget {
             StatusSurfacePreviewItem::UsedTokens => StatusLineItem::UsedTokens,
             StatusSurfacePreviewItem::TotalInputTokens => StatusLineItem::TotalInputTokens,
             StatusSurfacePreviewItem::TotalOutputTokens => StatusLineItem::TotalOutputTokens,
+            StatusSurfacePreviewItem::ThreadCredits => StatusLineItem::ThreadCredits,
+            StatusSurfacePreviewItem::EstimatedThreadCost => StatusLineItem::EstimatedThreadCost,
             StatusSurfacePreviewItem::SessionId => StatusLineItem::SessionId,
             StatusSurfacePreviewItem::FastMode => StatusLineItem::FastMode,
             StatusSurfacePreviewItem::RawOutput => StatusLineItem::RawOutput,
@@ -842,9 +922,17 @@ impl ChatWidget {
             )),
             TerminalTitleItem::Spinner => self.terminal_title_spinner_text_at(now),
             TerminalTitleItem::Status => Some(self.run_state_status_text()),
-            TerminalTitleItem::Thread => self
-                .status_line_value_for_item(StatusLineItem::ThreadTitle)
-                .map(|value| Self::truncate_terminal_title_part(value, /*max_chars*/ 48)),
+            TerminalTitleItem::Thread | TerminalTitleItem::ThreadName => {
+                let item = if item == TerminalTitleItem::ThreadName {
+                    StatusLineItem::ThreadName
+                } else {
+                    StatusLineItem::ThreadTitle
+                };
+                let value = self
+                    .status_line_value(item)
+                    .map(|value| Self::truncate_terminal_title_part(value, /*max_chars*/ 48));
+                self.with_thread_title_progress(value, now)
+            }
             TerminalTitleItem::GitBranch => self.status_line_branch.as_ref().map(|branch| {
                 Self::truncate_terminal_title_part(branch.clone(), /*max_chars*/ 32)
             }),
@@ -872,9 +960,18 @@ impl ChatWidget {
             TerminalTitleItem::TotalOutputTokens => self
                 .status_line_value_for_item(StatusLineItem::TotalOutputTokens)
                 .map(|value| Self::truncate_terminal_title_part(value, /*max_chars*/ 32)),
-            TerminalTitleItem::SessionId => self
-                .status_line_value_for_item(StatusLineItem::SessionId)
+            TerminalTitleItem::ThreadCredits => self
+                .status_line_value_for_item(StatusLineItem::ThreadCredits)
                 .map(|value| Self::truncate_terminal_title_part(value, /*max_chars*/ 32)),
+            TerminalTitleItem::EstimatedThreadCost => self
+                .status_line_value_for_item(StatusLineItem::EstimatedThreadCost)
+                .map(|value| Self::truncate_terminal_title_part(value, /*max_chars*/ 32)),
+            TerminalTitleItem::SessionId => {
+                let value = self
+                    .status_line_value(StatusLineItem::SessionId)
+                    .map(|value| Self::truncate_terminal_title_part(value, /*max_chars*/ 32));
+                self.with_thread_title_progress(value, now)
+            }
             TerminalTitleItem::FastMode => self
                 .status_line_value_for_item(StatusLineItem::FastMode)
                 .map(|value| Self::truncate_terminal_title_part(value, /*max_chars*/ 32)),
@@ -943,18 +1040,21 @@ impl ChatWidget {
     }
 
     pub(super) fn terminal_title_spinner_text_at(&self, now: Instant) -> Option<String> {
-        if !self.config.animations {
-            return None;
+        let spinner = (self.local_settings.tui.animations
+            && self.local_settings.tui.effects.progress
+            && self.terminal_title_has_active_progress())
+        .then(|| self.terminal_title_spinner_frame_at(now));
+        if self.realtime_microphone_is_listening() {
+            return Some(match spinner {
+                Some(frame) => format!("● {frame}"),
+                None => "●".to_string(),
+            });
         }
 
-        if !self.terminal_title_has_active_progress() {
-            return None;
-        }
-
-        Some(self.terminal_title_spinner_frame_at(now).to_string())
+        spinner.map(str::to_string)
     }
 
-    fn terminal_title_spinner_frame_at(&self, now: Instant) -> &'static str {
+    pub(super) fn terminal_title_spinner_frame_at(&self, now: Instant) -> &'static str {
         let elapsed = now.saturating_duration_since(self.terminal_title_animation_origin);
         let frame_index =
             (elapsed.as_millis() / TERMINAL_TITLE_SPINNER_INTERVAL.as_millis()) as usize;
@@ -962,11 +1062,15 @@ impl ChatWidget {
     }
 
     fn terminal_title_uses_activity(&self) -> bool {
-        self.config.tui_terminal_title.as_ref().is_none_or(|items| {
-            items
-                .iter()
-                .any(|item| item == "activity" || item == "spinner")
-        })
+        self.local_settings
+            .tui
+            .terminal_title
+            .as_ref()
+            .is_none_or(|items| {
+                items
+                    .iter()
+                    .any(|item| item == "activity" || item == "spinner")
+            })
     }
 
     fn terminal_title_has_active_progress(&self) -> bool {
@@ -978,20 +1082,24 @@ impl ChatWidget {
     }
 
     pub(super) fn should_animate_terminal_title_spinner(&self) -> bool {
-        self.config.animations
+        self.local_settings.tui.animations
+            && self.local_settings.tui.effects.progress
             && self.terminal_title_uses_activity()
             && self.terminal_title_has_active_progress()
     }
 
     pub(super) fn should_animate_terminal_title_action_required(&self) -> bool {
-        self.config.animations && self.terminal_title_shows_action_required()
+        self.local_settings.tui.animations
+            && self.local_settings.tui.effects.title
+            && self.terminal_title_shows_action_required()
     }
 
     fn should_animate_terminal_title_spinner_with_selections(
         &self,
         selections: &StatusSurfaceSelections,
     ) -> bool {
-        self.config.animations
+        self.local_settings.tui.animations
+            && self.local_settings.tui.effects.progress
             && selections
                 .terminal_title_items
                 .contains(&TerminalTitleItem::Spinner)
@@ -1130,9 +1238,11 @@ fn permissions_display(config: &Config) -> String {
     }
 
     let permission_profile = config.permissions.effective_permission_profile();
-    let workspace_roots = config.effective_workspace_roots();
-    let summary =
-        summarize_permission_profile(&permission_profile, &config.cwd, workspace_roots.as_slice());
+    let summary = summarize_permission_profile(
+        &permission_profile,
+        &PathUri::from_abs_path(&config.cwd),
+        &config.effective_workspace_roots(),
+    );
     if let Some(details) = summary.strip_prefix("read-only")
         && !details.contains("(network access enabled)")
     {

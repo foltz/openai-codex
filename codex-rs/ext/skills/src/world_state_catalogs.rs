@@ -3,14 +3,15 @@ use std::sync::Arc;
 use codex_extension_api::ContextualUserFragment;
 use codex_extension_api::ExtensionEventSink;
 use codex_extension_api::ExtensionWarning;
+use codex_extension_api::SelectedPluginSnapshot;
 use codex_extension_api::WorldStateContributionInput;
 use codex_extension_api::WorldStateSectionContribution;
-use codex_protocol::openai_models::ModelInfo;
 
 use crate::HostSkillsSnapshot;
 use crate::SkillsExtensionConfig;
 use crate::catalog::SkillCatalog;
 use crate::provider::SkillListQuery;
+use crate::provider::attribute_executor_plugins;
 use crate::render::AvailableSkillsRender;
 use crate::render::RenderedSkillCatalogs;
 use crate::render::SkillMetadataBudget;
@@ -100,13 +101,9 @@ impl<'a> CatalogContext<'a> {
     ) -> Option<Self> {
         let thread_state = input.thread_store.get::<SkillsThreadState>()?;
         let config = thread_state.config();
-        let model_info = input.thread_store.get::<ModelInfo>();
-        let include_usage = model_info
-            .as_deref()
-            .is_some_and(|model_info| model_info.include_skills_usage_instructions);
-        let context_window = model_info
-            .as_deref()
-            .and_then(ModelInfo::resolved_context_window);
+        let include_usage = input.model_info.include_skills_usage_instructions;
+        let context_window = input.model_info.resolved_context_window();
+        let metadata_budget = skill_metadata_budget(context_window, config.max_context_tokens);
         let emitted_warnings = input
             .turn_store
             .get_or_init(EmittedCatalogBudgetWarnings::default);
@@ -127,7 +124,7 @@ impl<'a> CatalogContext<'a> {
             input,
             thread_state,
             config,
-            metadata_budget: skill_metadata_budget(context_window),
+            metadata_budget,
             include_usage,
             warning_emitter,
         })
@@ -166,10 +163,13 @@ impl<'a> CatalogContext<'a> {
     }
 
     async fn discover_executor_catalog(&self, query: SkillListQuery) -> CatalogContribution {
-        let catalog = self
+        let mut catalog = self
             .thread_state
             .executor_catalog_snapshot(self.providers, query)
             .await;
+        if let Some(selected_plugins) = self.input.turn_store.get::<SelectedPluginSnapshot>() {
+            attribute_executor_plugins(&mut catalog, &selected_plugins);
+        }
         self.input
             .turn_store
             .insert(ExecutorSkillsStepState(catalog.clone()));
@@ -195,7 +195,7 @@ impl<'a> CatalogContext<'a> {
         CatalogContribution {
             catalog: self
                 .thread_state
-                .orchestrator_catalog_snapshot(self.providers, query)
+                .orchestrator_catalog_snapshot(self.providers, query, self.input.mcp_access)
                 .await,
             status: CatalogStatus::Enabled,
         }

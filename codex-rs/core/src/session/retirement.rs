@@ -24,7 +24,6 @@ pub(crate) enum CleanupExecution {
     TaskJoinFailed,
     ConversationShutdownFailed,
     CodeModeShutdownFailed,
-    GuardianFailed,
 }
 
 #[derive(Clone, Debug)]
@@ -36,11 +35,18 @@ enum McpCleanup {
 #[derive(Clone, Copy)]
 pub(super) enum CleanupMode {
     Legacy,
-    DeadlineBound(Instant),
+    DeadlineBound,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CleanupSequence {
+    Ordinary,
+    Suspension,
 }
 
 #[derive(Default)]
 struct CleanupState {
+    sequence: Option<CleanupSequence>,
     completion: Option<Shared<BoxFuture<'static, CleanupExecution>>>,
     mcp_completion: Option<Shared<BoxFuture<'static, McpCleanup>>>,
     task_completion: Option<Shared<BoxFuture<'static, crate::tasks::TaskJoinOutcome>>>,
@@ -95,11 +101,37 @@ impl SessionCleanupOwner {
     }
 
     pub(crate) async fn observe(&self, session: Arc<Session>) -> CleanupExecution {
+        self.observe_sequence(session, CleanupSequence::Ordinary)
+            .await
+    }
+
+    /// Retain suspension's stop/flush/close sequence in the same owner used by
+    /// loop termination and population retirement. Ordinary cleanup may observe
+    /// this receipt, but cannot substitute for suspension's stricter sequence.
+    pub(super) async fn observe_suspension(&self, session: Arc<Session>) -> CleanupExecution {
+        self.observe_sequence(session, CleanupSequence::Suspension)
+            .await
+    }
+
+    async fn observe_sequence(
+        &self,
+        session: Arc<Session>,
+        sequence: CleanupSequence,
+    ) -> CleanupExecution {
         let completion = {
             let Ok(mut state) = self.state.lock() else {
                 return CleanupExecution::AuthorityUnavailable;
             };
+            if sequence == CleanupSequence::Suspension
+                && state.completion.is_some()
+                && state.sequence != Some(CleanupSequence::Suspension)
+            {
+                // Another sequence already owns cleanup. Never execute a
+                // second sequence or claim it supplied suspension's flush.
+                return CleanupExecution::AuthorityUnavailable;
+            }
             if state.completion.is_none() {
+                state.sequence = Some(sequence);
                 let mcp = state.deadline.map(|deadline| {
                     let session = Arc::clone(&session);
                     async move {
@@ -136,16 +168,23 @@ impl SessionCleanupOwner {
                     .shared()
                 });
                 state.task_completion = tasks.clone();
-                let mode = if let Some(deadline) = state.deadline {
-                    CleanupMode::DeadlineBound(deadline)
+                let mode = if state.deadline.is_some() {
+                    CleanupMode::DeadlineBound
                 } else {
                     CleanupMode::Legacy
                 };
                 let common = async move {
-                    match AssertUnwindSafe(super::handlers::cleanup_session(&session, mode))
-                        .catch_unwind()
-                        .await
-                    {
+                    let cleanup = async {
+                        match sequence {
+                            CleanupSequence::Ordinary => {
+                                super::handlers::cleanup_session(&session, mode).await
+                            }
+                            CleanupSequence::Suspension => {
+                                super::turn_suspension::cleanup_suspended_session(&session).await
+                            }
+                        }
+                    };
+                    match AssertUnwindSafe(cleanup).catch_unwind().await {
                         Ok(result) => result,
                         Err(_) => CleanupExecution::Panicked,
                     }

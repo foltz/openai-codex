@@ -160,7 +160,9 @@ impl TracingHarness {
             _codex_home: codex_home,
             processor,
             outgoing_rx,
-            session: Arc::new(ConnectionSessionState::new()),
+            session: Arc::new(ConnectionSessionState::new(
+                crate::transport::ConnectionOrigin::Stdio,
+            )),
             tracing,
             telemetry,
         };
@@ -277,7 +279,9 @@ async fn build_test_processor(
 ) {
     let (outgoing_tx, outgoing_rx) = mpsc::channel(16);
     let auth_manager =
-        AuthManager::shared_from_config(config.as_ref(), /*enable_codex_api_key_env*/ false).await;
+        AuthManager::shared_from_config(config.as_ref(), /*enable_codex_api_key_env*/ false)
+            .await
+            .expect("test auth manager");
     let config_manager = ConfigManager::new(
         config.codex_home.to_path_buf(),
         Vec::new(),
@@ -302,7 +306,7 @@ async fn build_test_processor(
                     &config,
                     "test",
                     Some(crate::OTEL_SERVICE_NAME),
-                    false,
+                    /*default_analytics_enabled*/ false,
                 )
                 .expect("prepare actual telemetry provider"),
             );
@@ -315,7 +319,7 @@ async fn build_test_processor(
                 routes,
                 config_manager.clone(),
                 Arc::clone(&auth_manager),
-                false,
+                /*default_analytics_enabled*/ false,
                 cancel.clone(),
             );
             (
@@ -345,6 +349,9 @@ async fn build_test_processor(
         state_db: None,
         config_warnings: Vec::new(),
         session_source: SessionSource::VSCode,
+        user_verification: Arc::new(crate::user_verification::Service::new(Arc::clone(
+            &auth_manager,
+        ))),
         auth_manager,
         installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
         code_mode_session_provider: None,
@@ -353,7 +360,7 @@ async fn build_test_processor(
         // Keep this retirement fixture deterministic: startup plugin refresh
         // workers are exercised by their own ownership tests and would add an
         // unrelated admitted population to the background-drain assertion.
-        plugin_startup_tasks: crate::PluginStartupTasks::Skip,
+        plugin_startup_tasks: None,
         managed_transition_control_socket_endpoint: None,
         managed_transition_process_instance_id: None,
         control_endpoint: None,
@@ -403,6 +410,10 @@ async fn processor_thread_shutdown_facade_retains_first_attempt() -> Result<()> 
 }
 
 #[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "the fixture exclusively observes worker shutdown under its owner lock before testing background custody"
+)]
 async fn background_drain_timeout_retains_work_and_reobserves_completion() -> Result<()> {
     use super::ProcessorBackgroundShutdown;
     use crate::models_refresh_worker::ModelsRefreshShutdown;
@@ -917,6 +928,7 @@ async fn turn_start_jsonrpc_span_parents_core_turn_spans() -> Result<()> {
             ClientRequest::TurnStart {
                 request_id: RequestId::Integer(3),
                 params: TurnStartParams {
+                    disabled_plugin_ids: None,
                     environments: None,
                     thread_id,
                     client_user_message_id: None,
@@ -924,6 +936,8 @@ async fn turn_start_jsonrpc_span_parents_core_turn_spans() -> Result<()> {
                         text: "hello".to_string(),
                         text_elements: Vec::new(),
                     }],
+                    turn_trigger: None,
+                    tool_output: None,
                     responsesapi_client_metadata: None,
                     additional_context: None,
                     cwd: None,
@@ -934,12 +948,14 @@ async fn turn_start_jsonrpc_span_parents_core_turn_spans() -> Result<()> {
                     approvals_reviewer: None,
                     model: None,
                     service_tier: None,
+                    service_tier_for_turn: None,
                     effort: None,
                     summary: None,
                     personality: None,
                     output_schema: None,
                     collaboration_mode: None,
                     multi_agent_mode: None,
+                    cyber_access_program: None,
                 },
             },
             Some(remote_trace),
@@ -951,7 +967,7 @@ async fn turn_start_jsonrpc_span_parents_core_turn_spans() -> Result<()> {
                 && span_attr(span, "rpc.method") == Some("turn/start")
                 && span.span_context.trace_id() == remote_trace_id
         }) && spans.iter().any(|span| {
-            span_attr(span, "codex.op") == Some("user_input")
+            span_attr(span, "codex.op") == Some("turn_input")
                 && span.span_context.trace_id() == remote_trace_id
         })
     })
@@ -960,8 +976,8 @@ async fn turn_start_jsonrpc_span_parents_core_turn_spans() -> Result<()> {
     let server_request_span =
         find_rpc_span_with_trace(&spans, SpanKind::Server, "turn/start", remote_trace_id);
     let core_turn_span =
-        find_span_with_trace(&spans, remote_trace_id, "codex.op=user_input", |span| {
-            span_attr(span, "codex.op") == Some("user_input")
+        find_span_with_trace(&spans, remote_trace_id, "codex.op=turn_input", |span| {
+            span_attr(span, "codex.op") == Some("turn_input")
         });
 
     assert_eq!(server_request_span.parent_span_id, remote_parent_span_id);
@@ -1088,21 +1104,20 @@ fn managed_transition_dispatch_paths_refuse_before_authorization_without_reservi
 
 /// End-to-end proof that a real managed-auth adoption, driven through the
 /// actual production-wired `MessageProcessor` (not a synthetic
-/// `ResetInventory` double), genuinely resets the account-derived surfaces
-/// this session's Slice 4 work newly wired -- specifically
-/// `PluginsManager::auth_mode`, which is a bare field rather than a
-/// self-isolating account-keyed cache, so nothing but an explicit reset
-/// call could ever make it correct after adoption. Wire authorization is
+/// `ResetInventory` double), completes the composed reset for the new account.
+/// Upstream's PluginsManager reads the shared AuthManager directly instead of
+/// retaining a separate auth-mode snapshot. The cloud request checks the new
+/// account identity, while the terminal status checks the transition result.
+/// Wire authorization is
 /// bypassed the same way the sibling test above does, via
 /// `managed_transition_coordinator.start_dispatch` directly -- that gate
 /// is a separate, already-covered concern
 /// (`managed_transition_dispatch_paths_refuse_before_authorization_without_reserving_state`).
 #[test]
 #[serial(app_server_tracing)]
-fn managed_transition_adoption_resets_plugins_manager_auth_mode_for_the_new_account() -> Result<()>
-{
+fn managed_transition_adoption_completes_reset_with_shared_plugin_auth() -> Result<()> {
     run_current_thread_test_with_stack(
-        "managed_transition_adoption_resets_plugins_manager_auth_mode_for_the_new_account",
+        "managed_transition_adoption_completes_reset_with_shared_plugin_auth",
         async {
             let codex_home = TempDir::new()?;
             app_test_support::write_chatgpt_auth(
@@ -1137,21 +1152,14 @@ fn managed_transition_adoption_resets_plugins_manager_auth_mode_for_the_new_acco
                 )
                 .mount(&harness._server)
                 .await;
-            // A stale plugin projection is repaired by the actual reset,
-            // independently of the eligible managed account in AuthManager.
-            harness
-                .processor
-                .thread_manager_for_tests()
-                .plugins_manager()
-                .set_auth_mode(None);
             assert_eq!(
                 harness
                     .processor
                     .thread_manager_for_tests()
                     .plugins_manager()
                     .auth_mode(),
-                None,
-                "no auth is installed yet, so the plugins manager must not already believe otherwise"
+                Some(codex_protocol::auth::AuthMode::Chatgpt),
+                "plugins must read the initially installed account through the shared manager"
             );
 
             let process_instance_id = harness
@@ -1183,7 +1191,7 @@ fn managed_transition_adoption_resets_plugins_manager_auth_mode_for_the_new_acco
                 harness._codex_home.path(),
                 app_test_support::ChatGptAuthFixture::new("access-token")
                     .account_id("managed-adoption-account")
-                    .plan_type("business"),
+                    .plan_type("enterprise"),
                 codex_config::types::AuthCredentialsStoreMode::File,
             )
             .expect("write real chatgpt auth.json for adoption");
@@ -1196,10 +1204,23 @@ fn managed_transition_adoption_resets_plugins_manager_auth_mode_for_the_new_acco
             let StartManagedTransitionResponse::Accepted { status } = status else {
                 panic!("expected the real production coordinator to accept and complete adoption");
             };
-            harness._server.verify().await;
             assert_eq!(
                 status.phase,
                 codex_app_server_protocol::ManagedTransitionPhase::Succeeded
+            );
+            assert_eq!(
+                (
+                    status.prior_auth_fingerprint,
+                    status.result_auth_fingerprint
+                ),
+                (
+                    Some(AuthManager::managed_account_fingerprint(
+                        "prior-managed-account"
+                    )),
+                    Some(AuthManager::managed_account_fingerprint(
+                        "managed-adoption-account"
+                    )),
+                )
             );
 
             assert_eq!(
@@ -1209,7 +1230,7 @@ fn managed_transition_adoption_resets_plugins_manager_auth_mode_for_the_new_acco
                     .plugins_manager()
                     .auth_mode(),
                 Some(codex_protocol::auth::AuthMode::Chatgpt),
-                "ProductionResetInventory must have re-derived PluginsManager's auth mode from the newly-adopted account"
+                "plugins must still read the adopted account's mode from the shared manager"
             );
 
             harness.shutdown().await;

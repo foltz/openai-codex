@@ -4,6 +4,7 @@ use std::time::Duration;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_protocol::mcp::Resource;
 use codex_protocol::mcp::ResourceContent;
+use codex_protocol::protocol::SkillScope;
 use url::Url;
 
 use crate::catalog::SkillAuthority;
@@ -50,7 +51,11 @@ impl OrchestratorSkillProvider {
 }
 
 impl SkillProvider for OrchestratorSkillProvider {
-    fn list(&self, query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog> {
+    fn list<'a>(
+        &'a self,
+        query: SkillListQuery,
+        mcp_access: Result<codex_mcp::McpAttemptAccess<'a>, codex_mcp::McpAttemptRefused>,
+    ) -> SkillProviderFuture<'a, SkillCatalog> {
         Box::pin(async move {
             let Some(client) = query.mcp_resources else {
                 return Ok(SkillCatalog::default());
@@ -58,6 +63,7 @@ impl SkillProvider for OrchestratorSkillProvider {
             if !client.has_server(CODEX_APPS_MCP_SERVER_NAME).await {
                 return Ok(SkillCatalog::default());
             }
+            let access = mcp_access.map_err(|_| SkillProviderError::admission_refused())?;
 
             let _discovery_timer =
                 codex_otel::start_global_timer(ORCHESTRATOR_SKILL_DISCOVERY_DURATION_METRIC, &[])
@@ -77,11 +83,18 @@ impl SkillProvider for OrchestratorSkillProvider {
             for _ in 0..MAX_RESOURCE_PAGES {
                 let page = match tokio::time::timeout_at(
                     discovery_deadline,
-                    client.list_resources(CODEX_APPS_MCP_SERVER_NAME, cursor.clone()),
+                    client.list_resources_with_authority(
+                        CODEX_APPS_MCP_SERVER_NAME,
+                        cursor.clone(),
+                        access,
+                    ),
                 )
                 .await
                 {
                     Ok(result) => result.map_err(|err| {
+                        if err.is::<codex_mcp::McpAttemptRefused>() {
+                            return SkillProviderError::admission_refused();
+                        }
                         SkillProviderError::new(format!(
                             "failed to list orchestrator skill resources: {err:#}"
                         ))
@@ -173,7 +186,10 @@ impl SkillProvider for OrchestratorSkillProvider {
         })
     }
 
-    fn read(&self, request: SkillReadRequest) -> SkillProviderFuture<'_, SkillReadResult> {
+    fn read<'a>(
+        &'a self,
+        request: SkillReadRequest<'a>,
+    ) -> SkillProviderFuture<'a, SkillReadResult> {
         Box::pin(async move {
             if request.authority
                 != SkillAuthority::new(SkillSourceKind::Orchestrator, CODEX_APPS_MCP_SERVER_NAME)
@@ -194,9 +210,16 @@ impl SkillProvider for OrchestratorSkillProvider {
                     "session MCP resource client is not configured",
                 ));
             };
+            let access = request
+                .mcp_access
+                .map_err(|_| SkillProviderError::admission_refused())?;
             let result = tokio::time::timeout(
                 ORCHESTRATOR_SKILL_READ_TIMEOUT,
-                client.read_resource(CODEX_APPS_MCP_SERVER_NAME, request.resource.as_str()),
+                client.read_resource_with_authority(
+                    CODEX_APPS_MCP_SERVER_NAME,
+                    request.resource.as_str(),
+                    access,
+                ),
             )
             .await
             .map_err(|_| {
@@ -253,7 +276,8 @@ fn catalog_entry_from_resource(resource: &Resource) -> Option<SkillCatalogEntry>
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(true);
     let skill_name = normalized_label(meta.get("skill_name")?.as_str()?, MAX_SKILL_NAME_CHARS)?;
-    let name = if meta.get("source").and_then(|value| value.as_str()) == Some("user") {
+    let user_owned = meta.get("source").and_then(|value| value.as_str()) == Some("user");
+    let name = if user_owned {
         skill_name
     } else {
         let plugin_name =
@@ -265,7 +289,7 @@ fn catalog_entry_from_resource(resource: &Resource) -> Option<SkillCatalogEntry>
     let description = normalized_description(resource.description.as_deref().unwrap_or_default())?;
     let main_prompt = main_prompt_uri(uri);
 
-    let entry = SkillCatalogEntry::new(
+    let mut entry = SkillCatalogEntry::new(
         SkillPackageId(uri.to_string()),
         SkillAuthority::new(SkillSourceKind::Orchestrator, CODEX_APPS_MCP_SERVER_NAME),
         name,
@@ -274,6 +298,15 @@ fn catalog_entry_from_resource(resource: &Resource) -> Option<SkillCatalogEntry>
     )
     .with_display_path(uri)
     .with_alias_root(format!("skill://{namespace}"));
+    entry.plugin_id = meta
+        .get("plugin_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    entry.canonical_skill_id = meta
+        .get("skill_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    entry.analytics_scope = user_owned.then_some(SkillScope::User);
 
     Some(if allow_implicit_invocation {
         entry

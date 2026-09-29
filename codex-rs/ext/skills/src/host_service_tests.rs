@@ -172,7 +172,6 @@ async fn skills_for_config_with_stack(
         cwd.path().abs(),
         effective_skill_roots.to_vec(),
         config_layer_stack.clone(),
-        bundled_skills_enabled_from_stack(config_layer_stack),
     );
     skills_service
         .snapshot_for_config(&skills_input, Some(Arc::clone(&LOCAL_FS)))
@@ -209,6 +208,88 @@ async fn skills_for_config_reuses_cache_for_same_effective_config() {
 }
 
 #[tokio::test]
+async fn skills_for_config_bounds_plugin_generations_and_preserves_live_snapshots() {
+    let codex_home = tempfile::tempdir().expect("tempdir");
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let skill_path = write_plugin_skill(
+        &codex_home,
+        "test",
+        "sample",
+        "search",
+        "search",
+        "initial description",
+    );
+    let plugin_root = plugin_skill_root_for_skill_path(&skill_path, "sample@test", "sample");
+    let base_input = HostSkillsLoadInput::new(
+        cwd.path().abs(),
+        vec![plugin_root],
+        config_stack(&codex_home, "[skills.bundled]\nenabled = false\n"),
+    );
+    let skills_service = HostSkillsService::new(
+        codex_home.path().abs(),
+        /*bundled_skills_enabled*/ false,
+    );
+    let mut generations = Vec::new();
+    let mut recent = None;
+    let mut held_snapshot = None;
+    let mut held_skills = Vec::new();
+
+    // Reloads allocate new handles even when roots repeat, as they do after a rollback.
+    for generation in 0..CONFIG_SKILLS_CACHE_CAPACITY + 2 {
+        fs::write(
+            &skill_path,
+            format!("---\nname: search\ndescription: generation {generation}\n---\n\n# Body\n"),
+        )
+        .expect("write updated skill");
+        let owner = Arc::new(TestPluginSkillSnapshotCache::default());
+        generations.push(Arc::downgrade(&owner));
+        let input = base_input
+            .clone()
+            .with_plugin_skill_snapshots(Some(SkillRootSnapshots::new(owner)));
+        let snapshot = skills_service
+            .snapshot_for_config(&input, Some(Arc::clone(&LOCAL_FS)))
+            .await;
+
+        if generation == 0 {
+            recent = Some((input, snapshot));
+        } else if generation == 1 {
+            held_skills = snapshot.outcome().skills.clone();
+            held_snapshot = Some(snapshot);
+        }
+        if generation == CONFIG_SKILLS_CACHE_CAPACITY - 1 {
+            let (input, snapshot) = recent.as_ref().expect("first generation");
+            let reused = skills_service
+                .snapshot_for_config(input, Some(Arc::clone(&LOCAL_FS)))
+                .await;
+            assert!(std::ptr::eq(snapshot.outcome(), reused.outcome()));
+        }
+    }
+    drop(recent);
+
+    let retained_generations = generations
+        .iter()
+        .enumerate()
+        .filter_map(|(generation, owner)| owner.upgrade().map(|_| generation))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        retained_generations,
+        std::iter::once(/*value*/ 0)
+            .chain(3..CONFIG_SKILLS_CACHE_CAPACITY + 2)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        held_snapshot
+            .expect("evicted live snapshot")
+            .outcome()
+            .skills,
+        held_skills
+    );
+
+    skills_service.clear_cache();
+    assert_eq!(generations.iter().filter_map(Weak::upgrade).count(), 0);
+}
+
+#[tokio::test]
 async fn watchable_skill_root_paths_exclude_plugin_and_system_roots() {
     let codex_home = tempfile::tempdir().expect("tempdir");
     let cwd = tempfile::tempdir().expect("tempdir");
@@ -226,7 +307,6 @@ async fn watchable_skill_root_paths_exclude_plugin_and_system_roots() {
         cwd.path().abs(),
         vec![plugin_skill_root.clone()],
         config_layer_stack,
-        /*bundled_skills_enabled*/ true,
     );
     let skills_service = HostSkillsService::new(
         codex_home.path().abs(),
@@ -262,7 +342,6 @@ async fn snapshot_for_config_merges_extension_host_and_legacy_plugin_roots() {
         cwd.path().abs(),
         vec![plugin_skill_root],
         config_layer_stack,
-        /*bundled_skills_enabled*/ false,
     );
     let skills_service = HostSkillsService::new(
         codex_home.path().abs(),
@@ -356,12 +435,7 @@ async fn skills_list_snapshots_share_host_roots_only_within_one_request() {
     );
     let request = skills_service.for_request();
     let input = |cwd: &TempDir, config_layer_stack| {
-        HostSkillsLoadInput::new(
-            cwd.path().abs(),
-            Vec::new(),
-            config_layer_stack,
-            /*bundled_skills_enabled*/ true,
-        )
+        HostSkillsLoadInput::new(cwd.path().abs(), Vec::new(), config_layer_stack)
     };
 
     write_user_skill(&codex_home, "first", "first-skill", "first skill");
@@ -434,7 +508,6 @@ async fn skills_for_config_refreshes_cache_when_remote_plugin_id_changes() {
         cwd.path().abs(),
         vec![plugin_skill_root.clone()],
         config_layer_stack.clone(),
-        bundled_skills_enabled_from_stack(&config_layer_stack),
     )
     .with_plugin_skill_snapshots(Some(test_plugin_skill_snapshots()));
     let plugin_snapshot = skills_service
@@ -504,12 +577,8 @@ async fn set_extra_roots_replaces_runtime_roots_and_clears_cache() {
         /*bundled_skills_enabled*/ true,
     );
 
-    let skills_input = HostSkillsLoadInput::new(
-        cwd.path().abs(),
-        Vec::new(),
-        config_layer_stack.clone(),
-        bundled_skills_enabled_from_stack(&config_layer_stack),
-    );
+    let skills_input =
+        HostSkillsLoadInput::new(cwd.path().abs(), Vec::new(), config_layer_stack.clone());
     let empty_snapshot = skills_service
         .for_request()
         .snapshot_for_cwd(
@@ -699,12 +768,8 @@ async fn skills_for_cwd_loads_repo_and_user_roots_with_local_fs() {
         ConfigRequirementsToml::default(),
     )
     .expect("valid config layer stack");
-    let skills_input = HostSkillsLoadInput::new(
-        cwd.path().abs(),
-        Vec::new(),
-        config_layer_stack.clone(),
-        bundled_skills_enabled_from_stack(&config_layer_stack),
-    );
+    let skills_input =
+        HostSkillsLoadInput::new(cwd.path().abs(), Vec::new(), config_layer_stack.clone());
     let skills_service = HostSkillsService::new(
         codex_home.path().abs(),
         /*bundled_skills_enabled*/ true,
@@ -770,12 +835,8 @@ async fn skills_for_cwd_without_fs_skips_repo_roots() {
         ConfigRequirementsToml::default(),
     )
     .expect("valid config layer stack");
-    let skills_input = HostSkillsLoadInput::new(
-        cwd.path().abs(),
-        Vec::new(),
-        config_layer_stack.clone(),
-        bundled_skills_enabled_from_stack(&config_layer_stack),
-    );
+    let skills_input =
+        HostSkillsLoadInput::new(cwd.path().abs(), Vec::new(), config_layer_stack.clone());
     let skills_service = HostSkillsService::new(
         codex_home.path().abs(),
         /*bundled_skills_enabled*/ true,
@@ -843,12 +904,8 @@ async fn skills_for_cwd_uses_cached_result_until_force_reload() {
         codex_home.path().abs(),
         /*bundled_skills_enabled*/ true,
     );
-    let base_input = HostSkillsLoadInput::new(
-        cwd.path().abs(),
-        Vec::new(),
-        config_layer_stack.clone(),
-        bundled_skills_enabled_from_stack(&config_layer_stack),
-    );
+    let base_input =
+        HostSkillsLoadInput::new(cwd.path().abs(), Vec::new(), config_layer_stack.clone());
     let config_input = base_input
         .clone()
         .with_plugin_skill_snapshots(Some(test_plugin_skill_snapshots()));
@@ -929,12 +986,7 @@ async fn skills_for_config_ignores_cwd_cache_when_session_flags_reenable_skill()
         codex_home.path().abs(),
         /*bundled_skills_enabled*/ true,
     );
-    let parent_input = HostSkillsLoadInput::new(
-        cwd.path().abs(),
-        Vec::new(),
-        parent_stack.clone(),
-        bundled_skills_enabled_from_stack(&parent_stack),
-    );
+    let parent_input = HostSkillsLoadInput::new(cwd.path().abs(), Vec::new(), parent_stack.clone());
 
     let parent_snapshot = skills_service
         .for_request()

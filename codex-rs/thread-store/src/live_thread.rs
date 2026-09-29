@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -15,6 +16,7 @@ use crate::AppendThreadItemsParams;
 use crate::CreateThreadParams;
 use crate::LoadThreadHistoryParams;
 use crate::LocalThreadStore;
+use crate::PersistContext;
 use crate::ReadThreadParams;
 use crate::ResumeThreadParams;
 use crate::StoredThread;
@@ -22,6 +24,7 @@ use crate::StoredThreadHistory;
 use crate::ThreadMetadataPatch;
 use crate::ThreadStore;
 use crate::ThreadStoreError;
+use crate::ThreadStoreFuture;
 use crate::ThreadStoreResult;
 use crate::UpdateThreadMetadataParams;
 use crate::thread_metadata_sync::ThreadMetadataSync;
@@ -40,23 +43,49 @@ pub struct LiveThread {
     persistence_telemetry: RolloutPersistenceTelemetry,
 }
 
-pub struct InheritedModelContextInitError {
-    pub error: ThreadStoreError,
-    pub live_thread: Option<LiveThread>,
-}
-
-/// Owns a live thread while session initialization is still fallible.
+/// Owns persistence acquisition and its live thread while initialization is still fallible.
 ///
 /// If initialization returns early after persistence has been opened, dropping this guard discards
 /// the live writer without forcing lazy in-memory state to become durable. Call [`commit`] once the
-/// session owns the live thread for normal operation.
+/// session owns the live thread for normal operation. Cancellation leaves an in-flight acquisition
+/// owned by the guard: cleanup waits for it to finish before discarding any acquired writer.
+#[derive(Default)]
 pub struct LiveThreadInitGuard {
     live_thread: Option<LiveThread>,
+    acquiring: Option<ThreadStoreFuture<'static, LiveThread>>,
 }
 
 impl LiveThreadInitGuard {
     pub fn new(live_thread: Option<LiveThread>) -> Self {
-        Self { live_thread }
+        Self {
+            live_thread,
+            acquiring: None,
+        }
+    }
+
+    /// Retains the operation even if the caller stops waiting. Store operations may install a
+    /// writer before returning or delegate to another runtime, so they cannot simply be dropped.
+    pub async fn acquire(
+        &mut self,
+        acquisition: impl Future<Output = ThreadStoreResult<LiveThread>> + Send + 'static,
+    ) -> ThreadStoreResult<LiveThread> {
+        assert!(self.live_thread.is_none() && self.acquiring.is_none());
+        self.acquiring = Some(Box::pin(acquisition));
+        self.finish_acquisition().await?;
+        self.live_thread
+            .clone()
+            .ok_or_else(|| ThreadStoreError::Internal {
+                message: "persistence acquisition returned no live thread".to_owned(),
+            })
+    }
+
+    async fn finish_acquisition(&mut self) -> ThreadStoreResult<()> {
+        if let Some(acquiring) = self.acquiring.as_mut() {
+            let result = acquiring.await;
+            self.acquiring = None;
+            self.live_thread = Some(result?);
+        }
+        Ok(())
     }
 
     pub fn as_ref(&self) -> Option<&LiveThread> {
@@ -68,6 +97,7 @@ impl LiveThreadInitGuard {
     }
 
     pub async fn discard(&mut self) {
+        let _ = self.finish_acquisition().await;
         let Some(live_thread) = self.live_thread.take() else {
             return;
         };
@@ -75,19 +105,37 @@ impl LiveThreadInitGuard {
             warn!("failed to discard thread persistence for failed session init: {err}");
         }
     }
+
+    /// Finish retained acquisition and report disposal to an external cleanup owner.
+    /// The caller must retain this guard until the returned future is terminal.
+    pub async fn discard_with_result(&mut self) -> ThreadStoreResult<()> {
+        self.finish_acquisition().await?;
+        let Some(live_thread) = self.live_thread.take() else {
+            return Ok(());
+        };
+        live_thread.discard().await
+    }
 }
 
 impl Drop for LiveThreadInitGuard {
     fn drop(&mut self) {
-        let Some(live_thread) = self.live_thread.take() else {
+        if self.live_thread.is_none() && self.acquiring.is_none() {
             return;
-        };
+        }
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             warn!("failed to discard thread persistence for failed session init: no Tokio runtime");
             return;
         };
+        let acquiring = self.acquiring.take();
+        let live_thread = self.live_thread.take();
         handle.spawn(async move {
-            if let Err(err) = live_thread.discard().await {
+            let live_thread = match acquiring {
+                Some(acquiring) => acquiring.await.ok(),
+                None => live_thread,
+            };
+            if let Some(live_thread) = live_thread
+                && let Err(err) = live_thread.discard().await
+            {
                 warn!("failed to discard thread persistence for failed session init: {err}");
             }
         });
@@ -118,70 +166,26 @@ impl LiveThread {
     /// projection can distinguish inherited context from the child's own records immediately.
     pub async fn create_with_inherited_model_context(
         thread_store: Arc<dyn ThreadStore>,
-        params: CreateThreadParams,
-        inherited_model_context: &[RolloutItem],
-    ) -> ThreadStoreResult<Self> {
-        match Self::create_with_inherited_model_context_retaining_on_error(
-            thread_store,
-            params,
-            inherited_model_context,
-        )
-        .await
-        {
-            Ok(live_thread) => Ok(live_thread),
-            Err(failure) => {
-                if let Some(live_thread) = failure.live_thread
-                    && let Err(discard_err) = live_thread.discard().await
-                {
-                    warn!(
-                        "failed to discard thread persistence after inherited context append failed: {discard_err}"
-                    );
-                }
-                Err(failure.error)
-            }
-        }
-    }
-
-    /// Custody-aware construction preserves the opened live thread when the
-    /// inherited prefix fails, allowing its caller to own disposal evidence.
-    pub async fn create_with_inherited_model_context_retaining_on_error(
-        thread_store: Arc<dyn ThreadStore>,
         mut params: CreateThreadParams,
         inherited_model_context: &[RolloutItem],
-    ) -> Result<Self, InheritedModelContextInitError> {
+        guard: &mut LiveThreadInitGuard,
+    ) -> ThreadStoreResult<Self> {
         let persisted_prefix_item_count =
             persisted_rollout_items(inherited_model_context, params.history_mode).len();
         params.subagent_history_start_ordinal = Some(
             u64::try_from(persisted_prefix_item_count)
-                .map_err(|_| InheritedModelContextInitError {
-                    error: ThreadStoreError::Internal {
-                        message: "inherited model context is too large".to_string(),
-                    },
-                    live_thread: None,
+                .map_err(|_| ThreadStoreError::Internal {
+                    message: "inherited model context is too large".to_string(),
                 })?
                 .checked_add(1)
-                .ok_or_else(|| InheritedModelContextInitError {
-                    error: ThreadStoreError::Internal {
-                        message: "inherited model context is too large".to_string(),
-                    },
-                    live_thread: None,
+                .ok_or_else(|| ThreadStoreError::Internal {
+                    message: "inherited model context is too large".to_string(),
                 })?,
         );
-        let live_thread = Self::create(thread_store, params).await.map_err(|error| {
-            InheritedModelContextInitError {
-                error,
-                live_thread: None,
-            }
-        })?;
-        if let Err(error) = live_thread
+        let live_thread = guard.acquire(Self::create(thread_store, params)).await?;
+        live_thread
             .persist_appended_items(inherited_model_context)
-            .await
-        {
-            return Err(InheritedModelContextInitError {
-                error,
-                live_thread: Some(live_thread),
-            });
-        }
+            .await?;
         Ok(live_thread)
     }
 
@@ -295,8 +299,14 @@ impl LiveThread {
         Ok(items)
     }
 
-    pub async fn persist(&self) -> ThreadStoreResult<()> {
-        self.thread_store.persist_thread(self.thread_id).await?;
+    pub async fn persist(&self, context: PersistContext) -> ThreadStoreResult<()> {
+        if context.allows_background_persistence() {
+            self.flush_pending_metadata_update_for_existing_history()
+                .await?;
+        }
+        self.thread_store
+            .persist_thread(self.thread_id, context)
+            .await?;
         self.flush_pending_metadata_update().await
     }
 
@@ -307,9 +317,19 @@ impl LiveThread {
     }
 
     pub async fn shutdown(&self) -> ThreadStoreResult<()> {
-        self.flush_pending_metadata_update_for_existing_history()
-            .await?;
-        self.thread_store.shutdown_thread(self.thread_id).await
+        let metadata_result = self
+            .flush_pending_metadata_update_for_existing_history()
+            .await;
+        let shutdown_result = self.thread_store.shutdown_thread(self.thread_id).await;
+        match (metadata_result, shutdown_result) {
+            (Err(metadata_error), Err(shutdown_error)) => Err(ThreadStoreError::Internal {
+                message: format!(
+                    "thread metadata update failed: {metadata_error}; thread shutdown failed: {shutdown_error}"
+                ),
+            }),
+            (Err(metadata_error), Ok(())) => Err(metadata_error),
+            (Ok(()), result) => result,
+        }
     }
 
     pub async fn discard(&self) -> ThreadStoreResult<()> {
@@ -361,19 +381,31 @@ impl LiveThread {
         Ok(())
     }
 
+    /// Updates metadata while preserving this API's materialized-thread contract.
+    ///
+    /// Stores may successfully return no thread for a no-op update, so this reads the thread as a
+    /// fallback in that case.
     pub async fn update_metadata(
         &self,
         patch: ThreadMetadataPatch,
         include_archived: bool,
     ) -> ThreadStoreResult<StoredThread> {
         self.flush_pending_metadata_update().await?;
-        self.thread_store
+        let updated = self
+            .thread_store
             .update_thread_metadata(UpdateThreadMetadataParams {
                 thread_id: self.thread_id,
                 patch,
                 include_archived,
             })
-            .await
+            .await?;
+        match updated {
+            Some(thread) => Ok(thread),
+            None => {
+                self.read_thread(include_archived, /*include_history*/ false)
+                    .await
+            }
+        }
     }
 
     /// Returns the live local rollout path for legacy local-only callers.

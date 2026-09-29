@@ -6,11 +6,13 @@ pub(crate) mod metrics;
 mod prepared_provider;
 pub(crate) mod provider;
 mod provider_retirement;
+mod root_span_context;
 pub(crate) mod trace_context;
 mod trace_exporter_retirement;
 
 mod otlp;
 mod targets;
+mod tool_result;
 
 use crate::metrics::Result as MetricsResult;
 use codex_protocol::auth::AuthMode;
@@ -39,6 +41,7 @@ pub use crate::provider::OtelProvider;
 pub use crate::provider::OtelShutdownError;
 pub use crate::provider_retirement::OtelRetirement;
 pub use crate::provider_retirement::OtelRetirementError;
+pub use crate::root_span_context::root_span_with_w3c_parent;
 pub use crate::trace_context::context_from_w3c_trace_context;
 pub use crate::trace_context::current_span_trace_id;
 pub use crate::trace_context::current_span_w3c_trace_context;
@@ -70,7 +73,9 @@ pub enum TelemetryAuthMode {
 impl From<AuthMode> for TelemetryAuthMode {
     fn from(mode: AuthMode) -> Self {
         match mode {
-            AuthMode::ApiKey | AuthMode::BedrockApiKey => Self::ApiKey,
+            AuthMode::ApiKey | AuthMode::BedrockApiKey | AuthMode::BedrockAccessKeys => {
+                Self::ApiKey
+            }
             AuthMode::Chatgpt
             | AuthMode::ChatgptAuthTokens
             | AuthMode::Headers
@@ -78,6 +83,17 @@ impl From<AuthMode> for TelemetryAuthMode {
             | AuthMode::PersonalAccessToken => Self::Chatgpt,
         }
     }
+}
+
+/// Install externally managed, non-Statsig process-global metrics.
+///
+/// Call this once during single-threaded startup, before any instruments are
+/// registered. Keep the returned handle to flush and shut down the exporter
+/// owned by this installation.
+/// Returns a routing error if publication cannot be acquired or this handle
+/// has already been installed; neither case silently acknowledges installation.
+pub fn install_global_metrics(metrics: MetricsClient) -> MetricsResult<MetricsClient> {
+    crate::metrics::install_global(metrics)
 }
 
 /// Start a metrics timer using the globally installed metrics client.

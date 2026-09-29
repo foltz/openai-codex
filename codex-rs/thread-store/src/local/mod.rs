@@ -7,19 +7,32 @@ mod live_writer;
 mod model_context;
 mod move_thread_to_section;
 mod paginated_fork;
+mod pending_thread_metadata;
+mod projects;
 mod read_thread;
+mod revert_thread;
 mod rollout_migration;
 // This lands before the reader PRs that consume the shared lineage resolver.
 #[allow(dead_code)]
 mod rollout_lineage;
 mod search_threads;
+mod thread_attachments;
 mod thread_history;
 mod thread_history_materialization;
+mod thread_rollout_resolver;
 mod thread_sections;
 mod unarchive_thread;
 mod update_thread_metadata;
-mod writer_lock;
 
+#[cfg(test)]
+#[path = "compression_writer_tests.rs"]
+mod compression_writer_tests;
+#[cfg(test)]
+#[path = "daybreak_metadata_tests.rs"]
+mod daybreak_metadata_tests;
+#[cfg(test)]
+#[path = "pending_thread_metadata_tests.rs"]
+mod pending_thread_metadata_tests;
 #[cfg(test)]
 mod test_support;
 
@@ -27,6 +40,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_rollout::RolloutRecorder;
 use codex_rollout::StateDbHandle;
+use codex_rollout::WriterLockCoordinator;
 use codex_state::SqliteConfig;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -39,34 +53,52 @@ use tokio::sync::OwnedRwLockReadGuard;
 use tokio::sync::OwnedRwLockWriteGuard;
 use tokio::sync::RwLock;
 
+use crate::AddThreadAttachmentOutcome;
+use crate::AddThreadAttachmentParams;
 use crate::AppendThreadItemsParams;
 use crate::ArchiveThreadParams;
 use crate::ArchiveThreadsParams;
+use crate::CreateProjectParams;
 use crate::CreateThreadParams;
 use crate::CreateThreadSectionParams;
+use crate::CreatedProject;
 use crate::DeleteThreadParams;
 use crate::DeleteThreadSectionParams;
 use crate::DeleteThreadsParams;
+use crate::DeletedProject;
 use crate::ItemPage;
 use crate::ListItemsParams;
+use crate::ListProjectsParams;
+use crate::ListThreadAttachmentsParams;
 use crate::ListThreadSectionsParams;
 use crate::ListThreadsParams;
+use crate::ListTimelineParams;
 use crate::ListTurnsParams;
 use crate::LoadThreadHistoryParams;
+use crate::MoveProjectParams;
 use crate::MoveThreadToSectionParams;
+use crate::PersistContext;
 use crate::PrepareForkParams;
 use crate::PreparedFork;
+use crate::ProjectMoveOutcome;
 use crate::ReadThreadByRolloutPathParams;
 use crate::ReadThreadParams;
+use crate::RemoveThreadAttachmentOutcome;
+use crate::RemoveThreadAttachmentParams;
 use crate::RenameThreadSectionParams;
 use crate::ResumeThreadParams;
+use crate::RevertThreadParams;
 use crate::SearchThreadOccurrencesParams;
 use crate::SearchThreadsParams;
 use crate::StoredModelContext;
+use crate::StoredProject;
+use crate::StoredProjectsPage;
 use crate::StoredThread;
 use crate::StoredThreadHistory;
 use crate::StoredThreadSection;
 use crate::StoredThreadSectionsPage;
+use crate::ThreadAttachmentPage;
+use crate::ThreadMetadataPatch;
 use crate::ThreadOccurrenceSearchPage;
 use crate::ThreadPage;
 use crate::ThreadSearchPage;
@@ -74,11 +106,13 @@ use crate::ThreadStore;
 use crate::ThreadStoreError;
 use crate::ThreadStoreFuture;
 use crate::ThreadStoreResult;
+use crate::TimelinePage;
 use crate::TurnPage;
+use crate::UpdateProjectParams;
 use crate::UpdateThreadMetadataParams;
-use crate::local::writer_lock::WriterLockCoordinator;
-use crate::local::writer_lock::WriterLockGuard;
+use crate::UpdatedProject;
 
+pub use rollout_migration::RolloutMigrationFailureReason;
 pub use rollout_migration::RolloutMigrationMode;
 pub use rollout_migration::RolloutMigrationOptions;
 pub use rollout_migration::RolloutMigrationOutcome;
@@ -103,14 +137,23 @@ pub use rollout_migration::RolloutMigrationStatus;
 pub struct LocalThreadStore {
     pub(super) config: LocalThreadStoreConfig,
     live_recorders: Arc<Mutex<HashMap<ThreadId, LiveRecorderEntry>>>,
+    pending_thread_metadata: pending_thread_metadata::PendingThreadMetadataRegistry,
     live_writer_locks: Arc<LiveWriterLocks>,
     writer_lock_coordinator: Arc<WriterLockCoordinator>,
     state_db: Option<StateDbHandle>,
     thread_history_db: Arc<OnceCell<sqlx::SqlitePool>>,
+    thread_data_cleanup: Option<Arc<ThreadDataCleanup>>,
 }
+
+type ThreadDataCleanup = dyn Fn(Vec<ThreadId>) -> ThreadStoreFuture<'static, ()> + Send + Sync;
+
+type WriterLockGuard = Arc<codex_rollout::WriterLockGuard>;
 
 struct LiveRecorderEntry {
     recorder: RolloutRecorder,
+    // Rollout projection rows are keyed by immutable rollout ID, not the stable thread ID used
+    // to find this live writer.
+    rollout_id: ThreadId,
     // Local rollout files are materialized lazily, but metadata updates can arrive before the
     // canonical SessionMeta is durable. Retain the mode captured when live persistence was opened
     // so missing SQLite rows can still be seeded.
@@ -211,11 +254,25 @@ impl LocalThreadStore {
         Self {
             config,
             live_recorders: Arc::new(Mutex::new(HashMap::new())),
+            pending_thread_metadata:
+                pending_thread_metadata::PendingThreadMetadataRegistry::default(),
             live_writer_locks: Arc::new(LiveWriterLocks::default()),
             writer_lock_coordinator,
             state_db,
             thread_history_db: Arc::new(OnceCell::new()),
+            thread_data_cleanup: None,
         }
+    }
+
+    /// Adds cleanup for host-owned durable data when threads are permanently deleted.
+    /// Runs after reference and writer checks, under the lifecycle locks, before deleting rollouts.
+    /// Cleanup must be idempotent: later deletion steps can fail and the caller may retry.
+    pub fn with_thread_data_cleanup(
+        mut self,
+        cleanup: impl Fn(Vec<ThreadId>) -> ThreadStoreFuture<'static, ()> + Send + Sync + 'static,
+    ) -> Self {
+        self.thread_data_cleanup = Some(Arc::new(cleanup));
+        self
     }
 
     /// Return the state DB handle used by local rollout writers.
@@ -272,6 +329,23 @@ impl LocalThreadStore {
         Ok(())
     }
 
+    fn acquire_writer_lock(&self, thread_id: ThreadId) -> ThreadStoreResult<WriterLockGuard> {
+        self.writer_lock_coordinator
+            .acquire(thread_id)
+            .map(Arc::new)
+            .map_err(|err| {
+                if err.kind() == std::io::ErrorKind::WouldBlock {
+                    ThreadStoreError::Conflict {
+                        message: err.to_string(),
+                    }
+                } else {
+                    ThreadStoreError::Internal {
+                        message: err.to_string(),
+                    }
+                }
+            })
+    }
+
     async fn acquire_writer_locks(
         &self,
         thread_ids: &[ThreadId],
@@ -281,7 +355,7 @@ impl LocalThreadStore {
             if self.live_recorders.lock().await.contains_key(&thread_id) {
                 continue;
             }
-            writer_locks.push(self.writer_lock_coordinator.acquire(thread_id)?);
+            writer_locks.push(self.acquire_writer_lock(thread_id)?);
         }
         Ok(writer_locks)
     }
@@ -290,6 +364,7 @@ impl LocalThreadStore {
         &self,
         thread_id: ThreadId,
         recorder: RolloutRecorder,
+        rollout_id: ThreadId,
         history_mode: ThreadHistoryMode,
         writer_lock: WriterLockGuard,
     ) -> ThreadStoreResult<()> {
@@ -300,6 +375,7 @@ impl LocalThreadStore {
             Entry::Vacant(entry) => {
                 entry.insert(LiveRecorderEntry {
                     recorder,
+                    rollout_id,
                     history_mode,
                     writer_lock,
                 });
@@ -374,6 +450,14 @@ impl LocalThreadStore {
         thread_history::list_items(self, params).await
     }
 
+    /// Lists bounded ordinary and realtime items from the rollout projection.
+    pub async fn list_timeline(
+        &self,
+        params: ListTimelineParams,
+    ) -> ThreadStoreResult<TimelinePage> {
+        thread_history::list_timeline(self, params).await
+    }
+
     /// Searches projection-backed visible messages within one paginated thread.
     pub async fn search_thread_occurrences(
         &self,
@@ -392,6 +476,46 @@ impl ThreadStore for LocalThreadStore {
         Box::pin(async move { live_writer::create_thread(self, params).await })
     }
 
+    fn stage_pending_thread_metadata(
+        &self,
+        thread_id: ThreadId,
+        patch: ThreadMetadataPatch,
+    ) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move {
+            if self.state_db.is_none() {
+                return Err(ThreadStoreError::InvalidRequest {
+                    message: "pending thread metadata requires a state db".to_string(),
+                });
+            }
+            if patch.rollout_path.is_some() {
+                return Err(ThreadStoreError::InvalidRequest {
+                    message: "pending thread metadata cannot set rollout_path".to_string(),
+                });
+            }
+            self.pending_thread_metadata.stage(thread_id, patch).await
+        })
+    }
+
+    fn read_pending_thread_metadata(
+        &self,
+        thread_id: ThreadId,
+    ) -> ThreadStoreFuture<'_, Option<ThreadMetadataPatch>> {
+        Box::pin(async move {
+            Ok(self
+                .pending_thread_metadata
+                .lock(thread_id)
+                .await
+                .and_then(|metadata| metadata.clone()))
+        })
+    }
+
+    fn remove_pending_thread_metadata(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move {
+            self.pending_thread_metadata.remove(thread_id).await;
+            Ok(())
+        })
+    }
+
     fn resume_thread(&self, params: ResumeThreadParams) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move { live_writer::resume_thread(self, params).await })
     }
@@ -400,7 +524,11 @@ impl ThreadStore for LocalThreadStore {
         Box::pin(async move { live_writer::append_items(self, params).await })
     }
 
-    fn persist_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
+    fn persist_thread(
+        &self,
+        thread_id: ThreadId,
+        _context: PersistContext,
+    ) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move { live_writer::persist_thread(self, thread_id).await })
     }
 
@@ -432,6 +560,10 @@ impl ThreadStore for LocalThreadStore {
 
     fn prepare_fork(&self, params: PrepareForkParams) -> ThreadStoreFuture<'_, PreparedFork> {
         Box::pin(async move { paginated_fork::prepare(self, params).await })
+    }
+
+    fn revert_thread(&self, params: RevertThreadParams) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move { revert_thread::revert(self, params).await })
     }
 
     fn read_thread(&self, params: ReadThreadParams) -> ThreadStoreFuture<'_, StoredThread> {
@@ -483,6 +615,83 @@ impl ThreadStore for LocalThreadStore {
         Box::pin(async move { thread_sections::delete_thread_section(self, params).await })
     }
 
+    fn supports_thread_attachments(&self) -> bool {
+        self.state_db.is_some()
+    }
+
+    fn copy_thread_attachments(
+        &self,
+        source_thread_id: ThreadId,
+        destination_thread_id: ThreadId,
+    ) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move {
+            thread_attachments::copy_thread_attachments(
+                self,
+                source_thread_id,
+                destination_thread_id,
+            )
+            .await
+        })
+    }
+
+    fn add_thread_attachment(
+        &self,
+        params: AddThreadAttachmentParams,
+    ) -> ThreadStoreFuture<'_, AddThreadAttachmentOutcome> {
+        Box::pin(async move { thread_attachments::add_thread_attachment(self, params).await })
+    }
+
+    fn list_thread_attachments(
+        &self,
+        params: ListThreadAttachmentsParams,
+    ) -> ThreadStoreFuture<'_, ThreadAttachmentPage> {
+        Box::pin(async move { thread_attachments::list_thread_attachments(self, params).await })
+    }
+
+    fn remove_thread_attachment(
+        &self,
+        params: RemoveThreadAttachmentParams,
+    ) -> ThreadStoreFuture<'_, RemoveThreadAttachmentOutcome> {
+        Box::pin(async move { thread_attachments::remove_thread_attachment(self, params).await })
+    }
+
+    fn supports_projects(&self) -> bool {
+        self.state_db.is_some()
+    }
+
+    fn list_projects(
+        &self,
+        params: ListProjectsParams,
+    ) -> ThreadStoreFuture<'_, StoredProjectsPage> {
+        Box::pin(async move { projects::list_projects(self, params).await })
+    }
+
+    fn read_project(&self, project_id: String) -> ThreadStoreFuture<'_, Option<StoredProject>> {
+        Box::pin(async move { projects::read_project(self, project_id).await })
+    }
+
+    fn create_project(&self, params: CreateProjectParams) -> ThreadStoreFuture<'_, CreatedProject> {
+        Box::pin(async move { projects::create_project(self, params).await })
+    }
+
+    fn update_project(
+        &self,
+        params: UpdateProjectParams,
+    ) -> ThreadStoreFuture<'_, Option<UpdatedProject>> {
+        Box::pin(async move { projects::update_project(self, params).await })
+    }
+
+    fn move_project(
+        &self,
+        params: MoveProjectParams,
+    ) -> ThreadStoreFuture<'_, Option<ProjectMoveOutcome>> {
+        Box::pin(async move { projects::move_project(self, params).await })
+    }
+
+    fn delete_project(&self, project_id: String) -> ThreadStoreFuture<'_, Option<DeletedProject>> {
+        Box::pin(async move { projects::delete_project(self, project_id).await })
+    }
+
     fn supports_paginated_history_lists(&self) -> bool {
         self.state_db.is_some()
     }
@@ -493,6 +702,10 @@ impl ThreadStore for LocalThreadStore {
 
     fn list_items(&self, params: ListItemsParams) -> ThreadStoreFuture<'_, ItemPage> {
         Box::pin(LocalThreadStore::list_items(self, params))
+    }
+
+    fn list_timeline(&self, params: ListTimelineParams) -> ThreadStoreFuture<'_, TimelinePage> {
+        Box::pin(LocalThreadStore::list_timeline(self, params))
     }
 
     fn search_threads(
@@ -512,8 +725,12 @@ impl ThreadStore for LocalThreadStore {
     fn update_thread_metadata(
         &self,
         params: UpdateThreadMetadataParams,
-    ) -> ThreadStoreFuture<'_, StoredThread> {
-        Box::pin(async move { update_thread_metadata::update_thread_metadata(self, params).await })
+    ) -> ThreadStoreFuture<'_, Option<StoredThread>> {
+        Box::pin(async move {
+            update_thread_metadata::update_thread_metadata(self, params)
+                .await
+                .map(Some)
+        })
     }
 
     fn move_thread_to_section(
@@ -559,6 +776,8 @@ impl ThreadStore for LocalThreadStore {
 
 #[cfg(test)]
 mod tests {
+    #[path = "acquisition_tests.rs"]
+    mod acquisition_tests;
     use std::sync::Arc;
 
     use codex_protocol::ThreadId;
@@ -615,7 +834,7 @@ mod tests {
             .await
             .expect("append live item");
         store
-            .persist_thread(thread_id)
+            .persist_thread(thread_id, PersistContext::Standard)
             .await
             .expect("persist live thread");
         store
@@ -814,6 +1033,8 @@ mod tests {
         let turn_context = |model: &str, approval_policy| {
             RolloutItem::TurnContext(TurnContextItem {
                 turn_id: Some("turn-1".to_string()),
+                root_turn_id: None,
+                disabled_plugin_ids: None,
                 cwd: serde_json::from_value(serde_json::json!(cwd)).expect("absolute cwd"),
                 workspace_roots: None,
                 current_date: None,
@@ -822,6 +1043,7 @@ mod tests {
                 approvals_reviewer: None,
                 sandbox_policy: SandboxPolicy::DangerFullAccess,
                 permission_profile: None,
+                active_permission_profile: None,
                 network: None,
                 file_system_sandbox_policy: None,
                 model: model.to_string(),
@@ -831,19 +1053,26 @@ mod tests {
                 multi_agent_version: None,
                 multi_agent_mode: None,
                 realtime_active: None,
+                cyber_access_program: None,
                 effort: None,
                 summary: ReasoningSummary::Auto,
             })
         };
 
+        let mut guard = crate::LiveThreadInitGuard::default();
         let live_thread = LiveThread::create_with_inherited_model_context(
             store,
             params,
             &[turn_context("parent-model", AskForApproval::Never)],
+            &mut guard,
         )
         .await
         .expect("create live thread with inherited context");
-        live_thread.persist().await.expect("persist thread");
+        guard.commit();
+        live_thread
+            .persist(PersistContext::Standard)
+            .await
+            .expect("persist thread");
         let inherited_metadata = runtime
             .get_thread(thread_id)
             .await
@@ -895,6 +1124,7 @@ mod tests {
             .append_items(&[RolloutItem::EventMsg(EventMsg::TurnStarted(
                 TurnStartedEvent {
                     turn_id: "turn-1".to_string(),
+                    root_turn_id: None,
                     trace_id: None,
                     started_at: None,
                     model_context_window: None,
@@ -917,13 +1147,20 @@ mod tests {
                     message: "commentary".to_string(),
                     phase: Some(MessagePhase::Commentary),
                     memory_citation: None,
+                    delivery: None,
+                    questions: None,
                 })),
-                RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
-                    id: None,
-                    call_id: "call-1".to_string(),
-                    output: FunctionCallOutputPayload::from_text("tool output".to_string()),
-                    internal_chat_message_metadata_passthrough: None,
-                }),
+                RolloutItem::ResponseItem(
+                    ResponseItem::FunctionCallOutput {
+                        id: None,
+                        call_id: Some("call-1".to_string()),
+                        name: None,
+                        namespace: None,
+                        output: FunctionCallOutputPayload::from_text("tool output".to_string()),
+                        internal_chat_message_metadata_passthrough: None,
+                    }
+                    .into(),
+                ),
                 RolloutItem::EventMsg(EventMsg::TokenCount(
                     codex_protocol::protocol::TokenCountEvent {
                         info: None,
@@ -1231,6 +1468,20 @@ mod tests {
                 .live_rollout_path(thread_id)
                 .await
                 .expect("load rollout path");
+            {
+                let recorder = store
+                    .live_recorders
+                    .lock()
+                    .await
+                    .get(&thread_id)
+                    .expect("live recorder")
+                    .recorder
+                    .clone();
+                recorder
+                    .record_canonical_items(&[user_message_item("deferred item to discard")])
+                    .await
+                    .expect("queue deferred item without materializing it");
+            }
             assert!(!rollout_path.exists());
 
             let lock_path = home
@@ -1268,22 +1519,25 @@ mod tests {
             /*state_db*/ None,
         ));
         let thread_id = ThreadId::default();
-        let failure = match LiveThread::create_with_inherited_model_context_retaining_on_error(
-            store,
-            create_thread_params(thread_id),
-            &[user_message_item("inherited")],
-        )
-        .await
-        {
-            Ok(_) => panic!("inherited append should fail"),
-            Err(failure) => failure,
-        };
-        let live_thread = failure
-            .live_thread
-            .expect("opened live thread must return to its caller");
+        let mut guard = crate::LiveThreadInitGuard::default();
+        assert!(
+            LiveThread::create_with_inherited_model_context(
+                store,
+                create_thread_params(thread_id),
+                &[user_message_item("inherited")],
+                &mut guard,
+            )
+            .await
+            .is_err(),
+            "inherited append should fail"
+        );
+        assert!(
+            guard.as_ref().is_some(),
+            "opened live thread remains in custody"
+        );
 
-        live_thread
-            .discard()
+        guard
+            .discard_with_result()
             .await
             .expect("returned live thread remains disposable");
         assert!(
@@ -1314,7 +1568,7 @@ mod tests {
             .await
             .expect("append initial item");
         first_store
-            .persist_thread(thread_id)
+            .persist_thread(thread_id, PersistContext::Standard)
             .await
             .expect("persist initial thread");
         first_store
@@ -1374,7 +1628,7 @@ mod tests {
                 .await
                 .expect("create live thread");
             primary
-                .persist_thread(thread_id)
+                .persist_thread(thread_id, PersistContext::Standard)
                 .await
                 .expect("persist thread for resume");
             let rollout_path = primary
@@ -1866,6 +2120,7 @@ mod tests {
             history_base: None,
             subagent_history_start_ordinal: None,
             initial_window_id: uuid::Uuid::now_v7().to_string(),
+            runtime_workspace_roots: None,
             metadata: thread_metadata(),
         }
     }

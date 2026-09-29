@@ -3,6 +3,7 @@ use std::sync::Arc;
 use codex_exec_server_protocol::ExecutorCapabilityDiscoverySnapshot;
 use codex_protocol::ThreadId;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
+use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use serde_json::Value;
 
@@ -11,14 +12,18 @@ use crate::ExtensionMetrics;
 
 /// Host state available while an extension contributes one sampling step's World State.
 pub struct WorldStateContributionInput<'a> {
+    /// Invocation-only MCP authority; refusal must not become ungated access.
+    pub mcp_access: Result<codex_mcp::McpAttemptAccess<'a>, codex_mcp::McpAttemptRefused>,
     pub thread_id: ThreadId,
     pub turn_id: &'a str,
+    /// Resolved model metadata captured for this sampling step, retained across discovery.
+    pub model_info: &'a ModelInfo,
     pub environments: &'a [TurnEnvironmentSelection],
     /// Selected roots whose stable environments are ready in this sampling step.
     pub ready_selected_capability_roots: &'a [SelectedCapabilityRoot],
     /// Executor-materialized capability files shared by all consumers in this exact step.
     pub executor_capability_discovery: Option<&'a ExecutorCapabilityDiscoverySnapshot>,
-    /// Metrics bound to the effective model for this turn.
+    /// Metrics bound to the captured model for this sampling step.
     pub extension_metrics: Option<Arc<dyn ExtensionMetrics>>,
     pub session_store: &'a ExtensionData,
     pub thread_store: &'a ExtensionData,

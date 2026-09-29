@@ -1,6 +1,6 @@
 use crate::StartThreadOptions;
 use crate::ThreadManager;
-use crate::agent::AgentControl;
+use crate::agent::LocalAgentControl;
 use crate::codex_thread::CodexThread;
 use crate::config::Config;
 use crate::config::test_config;
@@ -114,7 +114,7 @@ async fn interrupted_v2_agent_is_lost_after_residency_eviction() {
     mark_thread_completed(second.thread.as_ref()).await;
 
     let err = control
-        .ensure_v2_agent_loaded(config, first.thread_id)
+        .ensure_v2_agent_loaded(config, first.thread_id, /*parent*/ None, None)
         .await
         .expect_err("evicted interrupted agent should stay lost");
     match err.details() {
@@ -134,7 +134,7 @@ async fn interrupted_v2_agent_is_lost_after_residency_eviction() {
 }
 
 async fn spawn_v2_subagent(
-    control: &AgentControl,
+    control: &LocalAgentControl,
     state: &Arc<ThreadManagerState>,
     config: Config,
     parent_thread_id: ThreadId,
@@ -153,6 +153,7 @@ async fn spawn_v2_subagent(
             /*inherited_environments*/ None,
             /*inherited_exec_policy*/ None,
             /*environments*/ None,
+            /*account_work*/ None,
         )
         .await
         .expect("spawn v2 subagent")

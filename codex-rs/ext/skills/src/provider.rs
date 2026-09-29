@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -10,6 +11,8 @@ use crate::HostSkillsSnapshot;
 use codex_exec_server::ExecutorCapabilityDiscoverySnapshot;
 use codex_exec_server::FileSystemSandboxContext;
 use codex_exec_server::ResolvedSelectedCapabilityRoot;
+use codex_mcp::McpAttemptAccess;
+use codex_mcp::McpAttemptRefused;
 use codex_mcp::McpResourceClient;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 
@@ -22,6 +25,7 @@ use crate::catalog::SkillResourceId;
 use crate::catalog::SkillSearchResult;
 
 pub use executor::ExecutorSkillProvider;
+pub(crate) use executor::attribute_executor_plugins;
 pub use host::HostSkillProvider;
 pub use orchestrator::OrchestratorSkillProvider;
 
@@ -42,7 +46,10 @@ pub struct SkillListQuery {
 }
 
 #[derive(Clone, Debug)]
-pub struct SkillReadRequest {
+pub struct SkillReadRequest<'a> {
+    pub mcp_access: Result<McpAttemptAccess<'a>, McpAttemptRefused>,
+    // TODO(anp): Replace the marker with callback-scoped environment access.
+    pub _lifetime: PhantomData<&'a ()>,
     pub authority: SkillAuthority,
     pub package: SkillPackageId,
     pub resource: SkillResourceId,
@@ -68,9 +75,16 @@ pub type SkillProviderFuture<'a, T> =
 /// provider must be read or searched through the same provider/authority rather
 /// than converted into an ambient local path.
 pub trait SkillProvider: Send + Sync {
-    fn list(&self, query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog>;
+    fn list<'a>(
+        &'a self,
+        query: SkillListQuery,
+        mcp_access: Result<McpAttemptAccess<'a>, McpAttemptRefused>,
+    ) -> SkillProviderFuture<'a, SkillCatalog>;
 
-    fn read(&self, request: SkillReadRequest) -> SkillProviderFuture<'_, SkillReadResult>;
+    fn read<'a>(
+        &'a self,
+        request: SkillReadRequest<'a>,
+    ) -> SkillProviderFuture<'a, SkillReadResult>;
 
     fn search(&self, request: SkillSearchRequest) -> SkillProviderFuture<'_, SkillSearchResult>;
 }

@@ -22,6 +22,7 @@ struct AppsWorkTicket {
     tasks: ProcessorTaskTicket,
     runtimes: AppsRuntimeTicket,
     shutdown: CancellationToken,
+    account_work: Option<Box<dyn codex_mcp::McpAttemptWork>>,
 }
 
 pub(super) use read::APP_READ_MAX_IDS;
@@ -31,7 +32,6 @@ pub(crate) struct AppsRequestProcessor {
     thread_manager: Arc<ThreadManager>,
     outgoing: Arc<OutgoingMessageSender>,
     config_manager: ConfigManager,
-    workspace_settings_cache: Arc<workspace_settings::WorkspaceSettingsCache>,
     shutdown_token: CancellationToken,
     _shutdown_drop_guard: DropGuard,
     tasks: ProcessorTasks,
@@ -44,7 +44,6 @@ impl AppsRequestProcessor {
         thread_manager: Arc<ThreadManager>,
         outgoing: Arc<OutgoingMessageSender>,
         config_manager: ConfigManager,
-        workspace_settings_cache: Arc<workspace_settings::WorkspaceSettingsCache>,
         shutdown_token: CancellationToken,
     ) -> Self {
         let shutdown_drop_guard = shutdown_token.clone().drop_guard();
@@ -53,7 +52,6 @@ impl AppsRequestProcessor {
             thread_manager,
             outgoing,
             config_manager,
-            workspace_settings_cache,
             shutdown_token,
             _shutdown_drop_guard: shutdown_drop_guard,
             tasks: ProcessorTasks::default(),
@@ -109,18 +107,6 @@ impl AppsRequestProcessor {
             return Ok(Some(response));
         }
 
-        if !self
-            .workspace_codex_plugins_enabled(&config, auth.as_ref())
-            .await
-        {
-            let response = AppsListResponse {
-                data: Vec::new(),
-                next_cursor: None,
-            };
-            record_legacy_apps_installed_duration(installed_start, reload);
-            return Ok(Some(response));
-        }
-
         let request = request_id.clone();
         let outgoing = Arc::clone(&self.outgoing);
         let environment_manager = self.thread_manager.environment_manager();
@@ -131,6 +117,9 @@ impl AppsRequestProcessor {
             tasks: self.tasks.ticket(),
             runtimes: self.runtimes.ticket(),
             shutdown: shutdown_token.clone(),
+            account_work: crate::account_turn_admission::derive_request_work()
+                .map_err(|_| internal_error("app-list account work unavailable"))?
+                .map(|work| Box::new(work) as Box<dyn codex_mcp::McpAttemptWork>),
         };
         let _receipt = self
             .tasks
@@ -280,6 +269,20 @@ impl AppsRequestProcessor {
             .reserve()
             .map_err(|_| internal_error("app-list runtime admission unavailable"))?;
         let shutdown = work.shutdown.clone();
+        // Both children can outlive the response task, including its timeout
+        // and cancellation. Derive before spawning, never inside an unscoped task.
+        let accessible_work = work
+            .account_work
+            .as_deref()
+            .map(codex_mcp::McpAttemptWork::derive_attempt)
+            .transpose()
+            .map_err(|_| internal_error("app discovery account work unavailable"))?;
+        let directory_work = work
+            .account_work
+            .as_deref()
+            .map(codex_mcp::McpAttemptWork::derive_attempt)
+            .transpose()
+            .map_err(|_| internal_error("app directory account work unavailable"))?;
         // Cancellation is safe only because external runtime custody was
         // registered above, before this task or its constructor can run.
         let _accessible_receipt = work
@@ -288,12 +291,13 @@ impl AppsRequestProcessor {
                 let result = tokio::select! {
                     biased;
                     _ = shutdown.cancelled() => return,
-                    result = codex_core::connectors::list_accessible_connectors_in_retirement(
+                    result = codex_core::connectors::list_accessible_connectors_with_authority(
                         &accessible_config,
                         force_refetch,
                         Arc::clone(&environment_manager),
                         mcp_manager,
-                        retirement,
+                        Some(retirement),
+                        codex_mcp::McpAttemptAccess::from_work(accessible_work.as_deref()),
                     ) => result,
                 }
                 .map_err(|err| format!("failed to load accessible apps: {err}"));
@@ -306,6 +310,7 @@ impl AppsRequestProcessor {
         let _directory_receipt = work
             .tasks
             .spawn(async move {
+                let _account_work = directory_work;
                 let result = connectors::list_all_connectors_with_options(
                     &all_config,
                     force_refetch,
@@ -441,26 +446,19 @@ impl AppsRequestProcessor {
             .map_err(|err| internal_error(format!("failed to reload config: {err}")))
     }
 
-    async fn workspace_codex_plugins_enabled(
-        &self,
-        config: &Config,
-        auth: Option<&CodexAuth>,
-    ) -> bool {
-        match workspace_settings::codex_plugins_enabled_for_workspace(
-            config,
-            auth,
-            Some(&self.workspace_settings_cache),
-        )
-        .await
-        {
-            Ok(enabled) => enabled,
-            Err(err) => {
-                warn!(
-                    "failed to fetch workspace Codex plugins setting; allowing Codex plugins: {err:#}"
-                );
-                true
-            }
-        }
+    async fn load_apps_config(&self, thread_id: Option<&str>) -> Result<Config, JSONRPCErrorError> {
+        let Some(thread_id) = thread_id else {
+            return self.load_latest_config(/*fallback_cwd*/ None).await;
+        };
+        let (_, thread) = self.load_thread(thread_id).await?;
+        let thread_config = thread.config().await;
+        self.config_manager
+            .load_latest_config_with_session_layers(
+                &thread_config.config_layer_stack,
+                &thread_config.cwd,
+            )
+            .await
+            .map_err(|err| internal_error(format!("failed to reload config: {err}")))
     }
 }
 

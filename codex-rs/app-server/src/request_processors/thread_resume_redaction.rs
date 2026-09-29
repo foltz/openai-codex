@@ -73,6 +73,8 @@ mod tests {
                 text: "kept".to_string(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
+                questions: None,
             },
             ThreadItem::McpToolCall {
                 id: "mcp-1".to_string(),
@@ -88,6 +90,7 @@ mod tests {
                     action_name: Some("lookup".to_string()),
                 }),
                 mcp_app_resource_uri: Some("ui://widget/lookup.html".to_string()),
+                mcp_app_ui: None,
                 plugin_id: Some("sample@test".to_string()),
                 read_only_hint: None,
                 result: Some(Box::new(McpToolCallResult {
@@ -107,7 +110,10 @@ mod tests {
                 revised_prompt: Some("revised".to_string()),
                 result: "base64-result".to_string(),
                 transparent_background: None,
+                failure: None,
                 saved_path: Some(test_path_buf("/tmp/ig-1.png").abs()),
+                imagegen_request_id: None,
+                generation_id: None,
             }),
         ]);
 
@@ -121,6 +127,8 @@ mod tests {
                 text: "kept".to_string(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
+                questions: None,
             }
         );
         assert_eq!(
@@ -139,6 +147,7 @@ mod tests {
                     action_name: Some("lookup".to_string()),
                 }),
                 mcp_app_resource_uri: Some("ui://widget/lookup.html".to_string()),
+                mcp_app_ui: None,
                 plugin_id: Some("sample@test".to_string()),
                 read_only_hint: None,
                 result: Some(Box::new(redacted_mcp_tool_call_result())),
@@ -158,6 +167,7 @@ mod tests {
             arguments: serde_json::json!({"secret":"argument"}),
             app_context: None,
             mcp_app_resource_uri: None,
+            mcp_app_ui: None,
             plugin_id: None,
             read_only_hint: None,
             result: None,
@@ -179,6 +189,7 @@ mod tests {
                 arguments: JsonValue::String(REDACTED_PAYLOAD.to_string()),
                 app_context: None,
                 mcp_app_resource_uri: None,
+                mcp_app_ui: None,
                 plugin_id: None,
                 read_only_hint: None,
                 result: None,
@@ -192,6 +203,8 @@ mod tests {
 
     fn test_thread(items: Vec<ThreadItem>) -> Thread {
         Thread {
+            originator: None,
+            environments: None,
             id: "thread-1".to_string(),
             extra: None,
             session_id: "session-1".to_string(),
@@ -201,8 +214,12 @@ mod tests {
             ephemeral: false,
             section: None,
             section_entered_at: None,
+            project_id: None,
+            daybreak_enabled: None,
             history_mode: Default::default(),
             model_provider: "mock_provider".to_string(),
+            model: None,
+            reasoning_effort: None,
             created_at: 0,
             updated_at: 0,
             recency_at: Some(0),

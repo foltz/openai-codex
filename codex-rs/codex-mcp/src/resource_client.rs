@@ -8,18 +8,24 @@ use anyhow::anyhow;
 use codex_protocol::mcp::Resource;
 use codex_protocol::mcp::ResourceContent;
 use codex_rmcp_client::CancellableEventStreamRequest;
+use codex_rmcp_client::RmcpClient;
+use rmcp::model::GetMeta;
 use rmcp::model::PaginatedRequestParams;
 use rmcp::model::ReadResourceRequestParams;
 use rmcp::model::ServerResult;
 use rmcp::service::ServiceError;
 use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Map;
 use serde_json::Value;
 use serde_json::json;
 use tokio::runtime::Handle;
+use tokio::sync::watch;
 
+use crate::McpEventStreamOpener;
 use crate::McpRuntime;
 use crate::connection_manager::McpConnectionSet;
+use crate::connection_manager::McpServerConnection;
 use crate::mcp::CODEX_APPS_MCP_SERVER_NAME;
 
 /// One page of resources returned by an MCP server.
@@ -29,6 +35,18 @@ pub struct McpResourcePage {
     pub resources: Vec<Resource>,
     /// Opaque cursor to supply when requesting the next page.
     pub next_cursor: Option<String>,
+}
+
+/// Parameters for one Codex Apps resource page.
+///
+/// Keep `mime_type` when requesting a continuation page: the server applies
+/// the filter to each request separately.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexAppsResourceListParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    pub mime_type: String,
 }
 
 /// Contents returned after reading one MCP resource.
@@ -66,10 +84,34 @@ pub struct McpEventNotification {
 pub struct McpEventStream {
     request: Option<CancellableEventStreamRequest>,
     runtime_handle: Handle,
-    _connections: Arc<McpConnectionSet>,
+    client: Option<Arc<RmcpClient>>,
+    cancel_event_streams_on_server_removal: watch::Receiver<()>,
 }
 
 impl McpEventStream {
+    pub(crate) async fn open(
+        client: Arc<RmcpClient>,
+        cancel_event_streams_on_server_removal: watch::Receiver<()>,
+        event_name: &str,
+        arguments: &Value,
+        request_meta: Option<&Map<String, Value>>,
+    ) -> Result<Self> {
+        let mut params = json!({ "name": event_name, "arguments": arguments });
+        if let Some(request_meta) = request_meta {
+            params["_meta"] = Value::Object(request_meta.clone());
+        }
+        let request = client
+            .send_event_stream_request(Some(params))
+            .await
+            .context("events/stream request failed")?;
+        Ok(Self {
+            request: Some(request),
+            runtime_handle: Handle::current(),
+            client: Some(client),
+            cancel_event_streams_on_server_removal,
+        })
+    }
+
     /// Receives the next raw lifecycle notification for this subscription.
     pub async fn recv(&mut self) -> Result<Option<McpEventNotification>> {
         let Some(request) = self.request.as_mut() else {
@@ -79,54 +121,59 @@ impl McpEventStream {
         tokio::select! {
             biased;
 
-            notification = request.notifications.recv() => {
-                match notification {
-                    Some(notification) => Ok(Some(McpEventNotification {
-                        method: notification.method,
-                        params: notification.params,
-                    })),
-                    None => {
-                        let response = (&mut request.handle.rx).await;
-                        self.request = None;
-                        match response {
-                            Ok(Ok(_)) | Ok(Err(ServiceError::Cancelled { .. })) => Ok(None),
-                            Ok(Err(error)) => Err(error.into()),
-                            Err(error) => Err(error.into()),
-                        }
-                    }
+            Ok(()) = self.cancel_event_streams_on_server_removal.changed() => {
+                self.cancel();
+                Err(anyhow!("hosted MCP event server was removed"))
+            }
+            Some(notification) = request.notifications.recv() => {
+                let metadata = notification.get_meta().0.0.clone();
+                let mut params = notification.params;
+                if !metadata.is_empty() {
+                    params.get_or_insert_with(|| json!({}))["_meta"] = Value::Object(metadata);
                 }
+                Ok(Some(McpEventNotification {
+                    method: notification.method,
+                    params,
+                }))
             }
             response = &mut request.handle.rx => {
                 self.request = None;
+                self.client = None;
 
                 match response {
-                    Ok(Ok(_)) | Ok(Err(ServiceError::Cancelled { .. })) => Ok(None),
+                    Ok(Ok(_))
+                    | Ok(Err(ServiceError::Cancelled { .. }))
+                    | Ok(Err(ServiceError::TransportClosed))
+                    | Err(_) => Ok(None),
                     Ok(Err(error)) => Err(error.into()),
-                    Err(error) => Err(error.into()),
                 }
             }
         }
     }
-}
 
-impl Drop for McpEventStream {
-    fn drop(&mut self) {
+    fn cancel(&mut self) {
         if let Some(CancellableEventStreamRequest {
             handle,
             notifications,
         }) = self.request.take()
         {
             drop(notifications);
-            let connections = Arc::clone(&self._connections);
+            let client = self.client.take();
             self.runtime_handle.spawn(async move {
                 let _ = tokio::time::timeout(
                     Duration::from_secs(30),
                     handle.cancel(Some("event subscription closed".to_string())),
                 )
                 .await;
-                drop(connections);
+                drop(client);
             });
         }
+    }
+}
+
+impl Drop for McpEventStream {
+    fn drop(&mut self) {
+        self.cancel();
     }
 }
 
@@ -154,6 +201,43 @@ impl PartialEq for McpResourceClientCacheKey {
 
 impl Eq for McpResourceClientCacheKey {}
 
+/// Identity of one server's resource cache across MCP runtime publications.
+///
+/// Survives publications that reuse the same connection until resource caches are explicitly
+/// invalidated. The key does not keep superseded connections alive.
+#[derive(Clone)]
+pub struct McpResourceServerCacheKey {
+    pub(crate) connection: Weak<McpServerConnection>,
+    pub(crate) generation: u64,
+}
+
+impl PartialEq for McpResourceServerCacheKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.connection.ptr_eq(&other.connection) && self.generation == other.generation
+    }
+}
+
+impl Eq for McpResourceServerCacheKey {}
+
+/// Opaque auth scope and server availability, independent of connection-set rebuilds.
+/// This is for fixed, host-owned sources; it does not fingerprint arbitrary server config.
+#[derive(Clone)]
+pub struct McpResourceClientAuthKey {
+    pub(crate) generation: Arc<()>,
+    pub(crate) server: String,
+    pub(crate) available: bool,
+}
+
+impl PartialEq for McpResourceClientAuthKey {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.generation, &other.generation)
+            && self.server == other.server
+            && self.available == other.available
+    }
+}
+
+impl Eq for McpResourceClientAuthKey {}
+
 impl std::fmt::Debug for McpResourceClient {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -173,6 +257,17 @@ impl McpResourceClient {
         McpResourceClientCacheKey(Arc::downgrade(&self.runtime.latest_connections()))
     }
 
+    /// Returns a server's resource cache identity without starting its connection.
+    pub fn server_cache_key(&self, server: &str) -> Option<McpResourceServerCacheKey> {
+        self.runtime.resource_cache_key(server)
+    }
+
+    /// Tracks published auth and source availability without invalidating on unrelated
+    /// environment changes. This key contains no credentials.
+    pub fn auth_cache_key_for_server(&self, server: &str) -> McpResourceClientAuthKey {
+        self.runtime.auth_cache_key_for_server(server)
+    }
+
     /// Returns whether this client can address the named server.
     ///
     /// This does not wait for server startup.
@@ -186,13 +281,66 @@ impl McpResourceClient {
         server: &str,
         cursor: Option<String>,
     ) -> Result<McpResourcePage> {
+        self.list_resources_with_authority(server, cursor, crate::McpAttemptAccess::Unscoped)
+            .await
+    }
+
+    pub async fn list_resources_with_authority(
+        &self,
+        server: &str,
+        cursor: Option<String>,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Result<McpResourcePage> {
         let params =
             cursor.map(|cursor| PaginatedRequestParams::default().with_cursor(Some(cursor)));
         let result = self
             .runtime
             .latest_connections()
-            .list_resources(server, params)
+            .list_resources_with_authority(server, params, access)
             .await?;
+        let resources = result
+            .resources
+            .into_iter()
+            .map(resource_from_rmcp)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(McpResourcePage {
+            resources,
+            next_cursor: result.next_cursor,
+        })
+    }
+
+    /// Lists one Codex Apps resource page using plugin-service's top-level `mimeType` parameter.
+    pub async fn list_codex_apps_resources(
+        &self,
+        params: CodexAppsResourceListParams,
+    ) -> Result<McpResourcePage> {
+        self.list_codex_apps_resources_with_authority(params, crate::McpAttemptAccess::Unscoped)
+            .await
+    }
+
+    pub async fn list_codex_apps_resources_with_authority(
+        &self,
+        params: CodexAppsResourceListParams,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Result<McpResourcePage> {
+        let params = serde_json::to_value(params)
+            .context("failed to serialize Codex Apps resource params")?;
+        let connections = self.runtime.latest_host_owned_codex_apps_connections()?;
+        let (managed, timeout) = connections
+            .client_by_name_with_authority(CODEX_APPS_MCP_SERVER_NAME, access)
+            .await?;
+        let result = managed
+            .client
+            .send_custom_request_with_timeout("resources/list", Some(params), timeout)
+            .await
+            .context("resources/list failed for `codex_apps`")?;
+        let result = match result {
+            ServerResult::ListResourcesResult(result) => result,
+            ServerResult::CustomResult(result) => result
+                .result_as::<rmcp::model::ListResourcesResult>()
+                .context("resources/list returned invalid resources")?,
+            _ => return Err(anyhow!("resources/list returned an unexpected MCP result")),
+        };
         let resources = result
             .resources
             .into_iter()
@@ -206,11 +354,21 @@ impl McpResourceClient {
 
     /// Reads one resource from the named server.
     pub async fn read_resource(&self, server: &str, uri: &str) -> Result<McpResourceReadResult> {
+        self.read_resource_with_authority(server, uri, crate::McpAttemptAccess::Unscoped)
+            .await
+    }
+
+    pub async fn read_resource_with_authority(
+        &self,
+        server: &str,
+        uri: &str,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Result<McpResourceReadResult> {
         let params = ReadResourceRequestParams::new(uri.to_string());
         let result = self
             .runtime
             .latest_connections()
-            .read_resource(server, params)
+            .read_resource_with_authority(server, params, access)
             .await?;
         let contents = result
             .contents
@@ -220,18 +378,28 @@ impl McpResourceClient {
         Ok(McpResourceReadResult { contents })
     }
 
-    /// Lists the events advertised by the hosted Plugin Runtime.
+    /// Lists the events advertised by the MCP event server.
     pub async fn list_events(&self) -> Result<McpEventCatalogSnapshot> {
-        let connections = self.runtime.latest_connections();
+        self.list_events_with_authority(crate::McpAttemptAccess::Unscoped)
+            .await
+    }
+
+    pub async fn list_events_with_authority(
+        &self,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Result<McpEventCatalogSnapshot> {
+        let (connections, _) = self
+            .runtime
+            .latest_connections_for_event_server(CODEX_APPS_MCP_SERVER_NAME)?;
         let cache_key = McpResourceClientCacheKey(Arc::downgrade(&connections));
         let (managed, request_timeout) = connections
-            .client_by_name(CODEX_APPS_MCP_SERVER_NAME)
+            .client_by_name_with_authority(CODEX_APPS_MCP_SERVER_NAME, access)
             .await?;
         let result = managed
             .client
             .send_custom_request_with_timeout("events/list", /*params*/ None, request_timeout)
             .await
-            .context("events/list failed for hosted Plugin Runtime")?;
+            .context("events/list request failed")?;
         let ServerResult::CustomResult(result) = result else {
             return Err(anyhow!("events/list returned an unexpected MCP result"));
         };
@@ -252,29 +420,46 @@ impl McpResourceClient {
         arguments: &Value,
         request_meta: Option<&Map<String, Value>>,
     ) -> Result<McpEventStream> {
-        let mut params = json!({
-            "name": event_name,
-            "arguments": arguments,
-        });
-        if let Some(request_meta) = request_meta {
-            params["_meta"] = Value::Object(request_meta.clone());
-        }
+        self.open_event_stream_with_authority(
+            event_name,
+            arguments,
+            request_meta,
+            crate::McpAttemptAccess::Unscoped,
+        )
+        .await
+    }
 
-        let connections = self.runtime.latest_connections();
+    pub async fn open_event_stream_with_authority(
+        &self,
+        event_name: &str,
+        arguments: &Value,
+        request_meta: Option<&Map<String, Value>>,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Result<McpEventStream> {
+        let (connections, cancel_event_streams_on_server_removal) = self
+            .runtime
+            .latest_connections_for_event_server(CODEX_APPS_MCP_SERVER_NAME)?;
         let (managed, _) = connections
-            .client_by_name(CODEX_APPS_MCP_SERVER_NAME)
+            .client_by_name_with_authority(CODEX_APPS_MCP_SERVER_NAME, access)
             .await?;
-        let request = managed
-            .client
-            .send_event_stream_request(Some(params))
-            .await
-            .context("events/stream failed for hosted Plugin Runtime")?;
+        McpEventStream::open(
+            managed.client,
+            cancel_event_streams_on_server_removal,
+            event_name,
+            arguments,
+            request_meta,
+        )
+        .await
+    }
 
-        Ok(McpEventStream {
-            request: Some(request),
-            runtime_handle: Handle::current(),
-            _connections: connections,
-        })
+    /// Creates an event stream opener using the task's event server settings.
+    pub fn event_stream_opener(&self) -> Result<McpEventStreamOpener> {
+        self.runtime.event_stream_opener()
+    }
+
+    /// Forwards event server removal to the owner of the task's subscriptions.
+    pub fn forward_event_server_removals_to(&self, cancellation: watch::Sender<()>) {
+        self.runtime.forward_event_server_removals_to(cancellation);
     }
 }
 

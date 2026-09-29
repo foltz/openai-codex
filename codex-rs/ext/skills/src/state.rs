@@ -2,11 +2,14 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::Weak;
 
+use codex_exec_server::Environment;
 use codex_exec_server::FileSystemSandboxContext;
 use codex_extension_api::ExtensionMetrics;
+use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_mcp::McpResourceClient;
-use codex_mcp::McpResourceClientCacheKey;
+use codex_mcp::McpResourceServerCacheKey;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use tokio::sync::OnceCell;
 
@@ -15,13 +18,16 @@ use crate::catalog::SkillAuthority;
 use crate::catalog::SkillCatalog;
 use crate::catalog::SkillCatalogEntry;
 use crate::catalog::SkillPackageId;
+use crate::catalog::SkillProviderError;
 use crate::catalog::SkillProviderResult;
 use crate::catalog::SkillReadResult;
 use crate::catalog::SkillResourceId;
 use crate::catalog::SkillSourceKind;
 use crate::provider::SkillListQuery;
 use crate::provider::SkillReadRequest;
+use crate::shadow_selection_experiment::RecentSkillInvocations;
 use crate::shadow_selection_experiment::ShadowSelectionTurnState;
+use crate::shadow_selection_experiment::ShadowTaskContext;
 use crate::sources::SkillProviders;
 
 const MAX_CACHED_ORCHESTRATOR_RESOURCES: usize = 100;
@@ -39,6 +45,9 @@ pub(crate) struct SkillsThreadState {
     executor_discovery_cache: Mutex<Option<CachedExecutorDiscoveryCatalog>>,
     orchestrator_cache: Mutex<Option<Arc<OrchestratorGenerationCache>>>,
     shadow_selection_turn: Mutex<Option<ShadowSelectionTurn>>,
+    pub(crate) executor_read_snapshot: Mutex<Option<ExecutorReadSnapshot>>,
+    pub(crate) recent_skill_invocations: Arc<RecentSkillInvocations>,
+    pub(crate) shadow_task_context: Arc<ShadowTaskContext>,
 }
 
 impl SkillsThreadState {
@@ -50,6 +59,9 @@ impl SkillsThreadState {
             executor_discovery_cache: Mutex::new(None),
             orchestrator_cache: Mutex::new(None),
             shadow_selection_turn: Mutex::new(None),
+            executor_read_snapshot: Mutex::new(None),
+            recent_skill_invocations: Arc::new(RecentSkillInvocations::default()),
+            shadow_task_context: Arc::new(ShadowTaskContext::default()),
         }
     }
 
@@ -100,10 +112,9 @@ impl SkillsThreadState {
 
     /// Returns catalogs for stable selected roots.
     ///
-    /// The first catalog returned for a root remains cached until this thread state is dropped.
-    /// Environment availability only controls whether the root is projected into the current
-    /// step; it never invalidates the cache. There is intentionally no filesystem watcher or
-    /// content-based invalidation because selected environment roots are treated as stable.
+    /// Successful catalogs, including empty or warning-bearing catalogs, remain cached until
+    /// this thread state is dropped. Catalogs backed by failed discovery are not cached, so
+    /// later steps can recover. There is no filesystem watcher because selected roots are stable.
     #[tracing::instrument(
         name = "skills.executor.catalog_snapshot",
         level = "info",
@@ -137,6 +148,10 @@ impl SkillsThreadState {
         providers: &SkillProviders,
         query: SkillListQuery,
     ) -> SkillCatalog {
+        let discovery_failed = query
+            .executor_capability_discovery
+            .as_ref()
+            .is_some_and(|discovery| discovery.roots().iter().any(|root| root.result.is_err()));
         let sandbox_contexts = query
             .executor_capability_discovery
             .as_ref()
@@ -155,6 +170,9 @@ impl SkillsThreadState {
         }
         let roots = query.executor_roots.clone();
         let discovered = providers.list_executor_for_turn(query).await;
+        if discovery_failed {
+            return discovered;
+        }
         let mut cache = self
             .executor_discovery_cache
             .lock()
@@ -182,31 +200,42 @@ impl SkillsThreadState {
         &self,
         providers: &SkillProviders,
         query: SkillListQuery,
+        mcp_access: Result<codex_mcp::McpAttemptAccess<'_>, codex_mcp::McpAttemptRefused>,
     ) -> SkillCatalog {
         if !query.include_orchestrator_skills {
             return SkillCatalog::default();
         }
 
         let cache = self.orchestrator_cache(query.mcp_resources.as_deref());
+        // Admission refusal is invocation-specific, not a catalog failure. Keep
+        // ordinary failures cached as before, but let a later admitted call retry.
         cache
             .catalog
-            .get_or_init(|| async {
-                providers
-                    .list_orchestrator_for_turn(query)
+            .get_or_try_init(|| async {
+                let mcp_access = mcp_access.map_err(|_| SkillProviderError::admission_refused())?;
+                match providers
+                    .list_orchestrator_for_turn(query, Ok(mcp_access))
                     .await
-                    .unwrap_or_else(|err| SkillCatalog {
+                {
+                    Err(err) if err.admission_refused => Err(err),
+                    result => Ok(result.unwrap_or_else(|err| SkillCatalog {
                         warnings: vec![err.message],
                         ..Default::default()
-                    })
+                    })),
+                }
             })
             .await
-            .clone()
+            .cloned()
+            .unwrap_or_else(|err| SkillCatalog {
+                warnings: vec![err.message],
+                ..Default::default()
+            })
     }
 
     pub(crate) async fn read_skill(
         &self,
         providers: &SkillProviders,
-        request: SkillReadRequest,
+        request: SkillReadRequest<'_>,
     ) -> SkillProviderResult<SkillReadResult> {
         if request.authority.kind != SkillSourceKind::Orchestrator {
             return providers.read(request).await;
@@ -243,7 +272,8 @@ impl SkillsThreadState {
             .orchestrator_cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let cache_key = mcp_resources.map(McpResourceClient::cache_key);
+        let cache_key =
+            mcp_resources.and_then(|client| client.server_cache_key(CODEX_APPS_MCP_SERVER_NAME));
         if let Some(cache) = cache
             .as_ref()
             .filter(|cache| cache.mcp_cache_key == cache_key)
@@ -293,6 +323,17 @@ impl SkillsThreadState {
     }
 }
 
+/// One bounded executor resource, retained for continuations until replacement or thread drop.
+/// Interleaved resources may evict it; misses reread and validate the content-bound cursor.
+pub(crate) struct ExecutorReadSnapshot {
+    pub(crate) authority: SkillAuthority,
+    pub(crate) package: SkillPackageId,
+    // Named environments can be replaced; do not reuse their old resource or keep them alive.
+    pub(crate) environment: Weak<Environment>,
+    pub(crate) sandbox: Option<FileSystemSandboxContext>,
+    pub(crate) result: Arc<SkillReadResult>,
+}
+
 struct ShadowSelectionTurn {
     turn_id: String,
     state: Arc<ShadowSelectionTurnState>,
@@ -310,7 +351,7 @@ struct CachedExecutorDiscoveryCatalog {
 }
 
 struct OrchestratorGenerationCache {
-    mcp_cache_key: Option<McpResourceClientCacheKey>,
+    mcp_cache_key: Option<McpResourceServerCacheKey>,
     catalog: OnceCell<SkillCatalog>,
     resources: Mutex<OrchestratorResourceCache>,
 }
@@ -322,8 +363,8 @@ struct SkillReadCacheKey {
     resource: SkillResourceId,
 }
 
-impl From<&SkillReadRequest> for SkillReadCacheKey {
-    fn from(request: &SkillReadRequest) -> Self {
+impl From<&SkillReadRequest<'_>> for SkillReadCacheKey {
+    fn from(request: &SkillReadRequest<'_>) -> Self {
         Self {
             authority: request.authority.clone(),
             package: request.package.clone(),

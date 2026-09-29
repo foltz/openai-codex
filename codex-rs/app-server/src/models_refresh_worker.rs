@@ -1,15 +1,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use codex_http_client::HttpClientFactory;
 use codex_models_manager::manager::RefreshStrategy;
-use codex_models_manager::manager::SharedModelsManager;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-const MODELS_REFRESH_INTERVAL: Duration = Duration::from_secs(3 * 60);
+use crate::model_catalog::ModelCatalog;
+
+const MODELS_REFRESH_INTERVAL: Duration = Duration::from_secs(4 * 60 + 30);
 
 #[derive(Debug)]
 pub(crate) struct ModelsRefreshWorker {
@@ -39,6 +39,10 @@ impl ModelsRefreshWorker {
     /// Observe the actual worker, retaining its join on timeout/cancellation.
     /// This mutex is the exclusive join poll right, not a worker dependency;
     /// the worker never needs it to finish. No timeout aborts an active fetch.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "exclusive join polling retains custody across observer cancellation; the worker never takes this lock"
+    )]
     pub(crate) async fn shutdown_until(&self, deadline: Instant) -> ModelsRefreshShutdown {
         if let Ok(completion) = self.completion.try_lock()
             && let RefreshCompletion::Finished(outcome) = &*completion
@@ -79,19 +83,15 @@ impl Drop for ModelsRefreshWorker {
     }
 }
 
-pub(crate) fn spawn(
-    models_manager: &SharedModelsManager,
-    http_client_factory: HttpClientFactory,
-) -> ModelsRefreshWorker {
-    spawn_with_interval(models_manager, http_client_factory, MODELS_REFRESH_INTERVAL)
+pub(crate) fn spawn(model_catalog: &Arc<ModelCatalog>) -> ModelsRefreshWorker {
+    spawn_with_interval(model_catalog, MODELS_REFRESH_INTERVAL)
 }
 
 fn spawn_with_interval(
-    models_manager: &SharedModelsManager,
-    http_client_factory: HttpClientFactory,
+    model_catalog: &Arc<ModelCatalog>,
     refresh_interval: Duration,
 ) -> ModelsRefreshWorker {
-    let models_manager = Arc::downgrade(models_manager);
+    let model_catalog = Arc::downgrade(model_catalog);
     let shutdown = CancellationToken::new();
     let worker_shutdown = shutdown.clone();
     let task = tokio::spawn(async move {
@@ -99,13 +99,14 @@ fn spawn_with_interval(
             if worker_shutdown.is_cancelled() {
                 break;
             }
-            let Some(models_manager) = models_manager.upgrade() else {
+            let Some(model_catalog) = model_catalog.upgrade() else {
                 break;
             };
-            models_manager
-                .list_models(RefreshStrategy::Online, http_client_factory.clone())
-                .await;
-            drop(models_manager);
+            if let Err(err) = model_catalog.list_models(RefreshStrategy::Online).await {
+                // Parser diagnostics can include provider credentials from the source TOML.
+                tracing::warn!(error_kind = ?err.kind(), "model catalog refresh blocked by provider requirements");
+            }
+            drop(model_catalog);
 
             tokio::select! {
                 _ = worker_shutdown.cancelled() => break,

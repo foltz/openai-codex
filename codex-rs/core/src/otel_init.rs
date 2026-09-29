@@ -20,7 +20,7 @@ pub fn build_provider(
     service_name_override: Option<&str>,
     default_analytics_enabled: bool,
 ) -> Result<Option<OtelProvider>, Box<dyn Error>> {
-    OtelProvider::from(&provider_settings(
+    OtelProvider::try_new(&provider_settings(
         config,
         service_version,
         service_name_override,

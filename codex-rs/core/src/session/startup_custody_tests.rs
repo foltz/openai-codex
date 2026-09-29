@@ -3,6 +3,57 @@ use crate::codex_thread::ThreadCleanupOutcome;
 use crate::codex_thread::ThreadLoopOutcome;
 use crate::codex_thread::ThreadShutdownOutcome;
 
+#[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "the fixture retains exclusive acquisition custody while cancellation drops only its observer"
+)]
+async fn cancelled_acquisition_remains_owned_until_its_writer_is_disposed() {
+    let (mut session, _) = crate::session::tests::make_session_and_context().await;
+    crate::session::tests::open_thread_persistence(&mut session).await;
+    let live_thread = session.live_thread().expect("writer").clone();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let guard = Arc::new(tokio::sync::Mutex::new(LiveThreadInitGuard::default()));
+    let custody = SessionStartupCustody::default();
+    custody.retain_persistence_guard(session.thread_id, Arc::clone(&guard));
+    let mut acquisition = Box::pin(async {
+        let release = Arc::clone(&release);
+        guard
+            .lock()
+            .await
+            .acquire(async move {
+                release.notified().await;
+                Ok(live_thread)
+            })
+            .await
+    });
+    assert!(futures::poll!(acquisition.as_mut()).is_pending());
+    drop(acquisition);
+    assert!(!custody.is_empty(), "pending acquisition is still custody");
+
+    let mut cleanup =
+        Box::pin(custody.shutdown_until(Instant::now() + std::time::Duration::from_secs(3)));
+    assert!(futures::poll!(cleanup.as_mut()).is_pending());
+    release.notify_one();
+    assert_eq!(
+        cleanup.await,
+        StartupCleanup::BeforeLoop(CleanupExecution::Finished {
+            persistence_failed: false,
+        }),
+    );
+    assert!(custody.is_empty());
+    assert!(guard.lock().await.as_ref().is_none());
+    assert!(
+        session
+            .live_thread()
+            .expect("same writer")
+            .discard()
+            .await
+            .is_err(),
+        "the retained acquisition's writer was actually disposed",
+    );
+}
+
 #[test]
 fn loop_cleanup_requires_the_canonical_complete_report() {
     for ordinary in [
@@ -93,10 +144,11 @@ async fn pre_session_transfer_is_atomic_and_poison_is_fail_closed() {
     let transfer = SessionStartupCustody::default();
     transfer.retain_persistence(session.thread_id, live_thread.clone());
     assert!(transfer.retain(&session));
-    let state = transfer.state.lock().expect("startup state");
-    assert!(state.persistence.is_none());
-    assert!(state.session.is_some());
-    drop(state);
+    {
+        let state = transfer.state.lock().expect("startup state");
+        assert!(state.persistence.is_none());
+        assert!(state.session.is_some());
+    }
 
     let poisoned = SessionStartupCustody::default();
     poisoned.retain_persistence(session.thread_id, live_thread);
@@ -119,6 +171,10 @@ async fn pre_session_transfer_is_atomic_and_poison_is_fail_closed() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "the shared test disposal receipt exclusively owns the persistence guard through discard"
+)]
 async fn concurrent_disposal_observers_replay_the_same_success() {
     let (mut session, _) = crate::session::tests::make_session_and_context().await;
     crate::session::tests::open_thread_persistence(&mut session).await;
@@ -129,11 +185,11 @@ async fn concurrent_disposal_observers_replay_the_same_success() {
     {
         let mut state = custody.state.lock().expect("startup state");
         let release = Arc::clone(&release);
-        let live_thread = state
+        let guard = state
             .persistence
             .as_ref()
             .expect("retained persistence")
-            .live_thread
+            .guard
             .clone();
         state
             .persistence
@@ -142,7 +198,7 @@ async fn concurrent_disposal_observers_replay_the_same_success() {
             .disposal = Some(PersistenceDisposal {
             receipt: async move {
                 release.notified().await;
-                live_thread.discard().await.is_ok()
+                guard.lock().await.discard_with_result().await.is_ok()
             }
             .boxed()
             .shared(),
@@ -212,6 +268,10 @@ async fn expired_bounded_observation_cannot_start_disposal_through_legacy() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "the retained legacy test receipt exclusively owns the persistence guard through discard"
+)]
 async fn legacy_disposal_remains_legacy_after_bounded_refusal() {
     let (mut session, _) = crate::session::tests::make_session_and_context().await;
     crate::session::tests::open_thread_persistence(&mut session).await;
@@ -224,12 +284,12 @@ async fn legacy_disposal_remains_legacy_after_bounded_refusal() {
     {
         let mut state = custody.state.lock().expect("startup state");
         let persistence = state.persistence.as_mut().expect("retained persistence");
-        let live_thread = persistence.live_thread.clone();
+        let guard = Arc::clone(&persistence.guard);
         let release = Arc::clone(&release);
         persistence.disposal = Some(PersistenceDisposal {
             receipt: async move {
                 release.notified().await;
-                live_thread.discard().await.is_ok()
+                guard.lock().await.discard_with_result().await.is_ok()
             }
             .boxed()
             .shared(),

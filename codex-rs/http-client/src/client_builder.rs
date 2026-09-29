@@ -7,7 +7,11 @@
 
 use http::HeaderMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
+
+use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
 
 use crate::BuildCustomCaTransportError;
 use crate::BuildRouteAwareHttpClientError;
@@ -29,10 +33,19 @@ use crate::with_chatgpt_cloudflare_cookie_store;
 pub struct HttpClientBuilder {
     default_headers: Option<HeaderMap>,
     follow_redirects: bool,
+    redirect_observed: Option<Arc<AtomicBool>>,
     connect_timeout: Option<Duration>,
     chatgpt_cloudflare_cookie_store: bool,
     chatgpt_cookie_store: Option<Arc<ChatGptCookieStore>>,
     request_logging: RequestLogging,
+    tls_backend: TlsBackend,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum TlsBackend {
+    #[default]
+    TransportDefault,
+    Rustls,
 }
 
 impl HttpClientFactory {
@@ -81,8 +94,20 @@ impl HttpClientBuilder {
         self
     }
 
+    /// Marks the supplied flag when a redirect is encountered, preserving the default policy.
+    /// Use a fresh flag for each operation whose retry safety depends on its redirect history.
+    pub fn with_redirect_tracking(mut self, redirect_observed: Arc<AtomicBool>) -> Self {
+        self.redirect_observed = Some(redirect_observed);
+        self
+    }
+
     pub(crate) fn follows_redirects(&self) -> bool {
         self.follow_redirects
+    }
+
+    pub(crate) fn with_rustls_tls(mut self) -> Self {
+        self.tls_backend = TlsBackend::Rustls;
+        self
     }
 
     /// Limits only connection establishment, not the request as a whole.
@@ -260,11 +285,20 @@ impl HttpClientBuilder {
 
     fn base_reqwest_builder(self) -> reqwest::ClientBuilder {
         let mut builder = reqwest::Client::builder();
+        if self.tls_backend == TlsBackend::Rustls {
+            ensure_rustls_crypto_provider();
+            builder = builder.use_rustls_tls();
+        }
         if let Some(default_headers) = self.default_headers {
             builder = builder.default_headers(default_headers);
         }
         if !self.follow_redirects {
             builder = builder.redirect(reqwest::redirect::Policy::none());
+        } else if let Some(redirect_observed) = self.redirect_observed {
+            builder = builder.redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                redirect_observed.store(/*val*/ true, Ordering::Relaxed);
+                reqwest::redirect::Policy::default().redirect(attempt)
+            }));
         }
         if let Some(connect_timeout) = self.connect_timeout {
             builder = builder.connect_timeout(connect_timeout);
@@ -284,10 +318,12 @@ impl Default for HttpClientBuilder {
         Self {
             default_headers: None,
             follow_redirects: true,
+            redirect_observed: None,
             connect_timeout: None,
             chatgpt_cloudflare_cookie_store: false,
             chatgpt_cookie_store: None,
             request_logging: RequestLogging::Enabled,
+            tls_backend: TlsBackend::TransportDefault,
         }
     }
 }

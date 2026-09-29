@@ -14,25 +14,17 @@ use crate::transport::ConnectionProvenance;
 use crate::transport::remote_control::QueuedServerEnvelope;
 use codex_app_server_protocol::JSONRPCMessage;
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 use tokio::sync::mpsc;
-use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tokio::time::Duration;
 use tokio::time::Instant;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::TaskTracker;
 use tracing::info;
 use tracing::warn;
 
 const REMOTE_CONTROL_CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-// Cleanup remains independent of its caller, but cannot wait indefinitely for
-// an app-server event consumer that has stopped draining its queue.
-const REMOTE_CONTROL_CONNECTION_CLOSED_SEND_TIMEOUT: Duration = Duration::from_secs(1);
 pub(crate) const REMOTE_CONTROL_IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 #[cfg(not(test))]
 const REMOTE_CONTROL_TRANSPORT_EVENT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -51,15 +43,15 @@ struct ClientState {
 }
 
 pub(crate) struct ClientTracker {
+    pub(super) auth: Option<crate::ConnectionAuth>,
     clients: HashMap<(ClientId, StreamId), ClientState>,
     legacy_stream_ids: HashMap<ClientId, StreamId>,
     join_set: JoinSet<(ClientId, StreamId)>,
-    unknown_pong_workers: JoinSet<()>,
-    connection_closed_workers: TaskTracker,
-    connection_closed_failed: Arc<AtomicBool>,
     server_event_tx: mpsc::Sender<QueuedServerEnvelope>,
     transport_event_tx: mpsc::Sender<TransportEvent>,
     shutdown_token: CancellationToken,
+    cleanup: super::retirement::Retirement,
+    workers_clean: bool,
 }
 
 impl ClientTracker {
@@ -69,49 +61,46 @@ impl ClientTracker {
         shutdown_token: &CancellationToken,
     ) -> Self {
         Self {
+            auth: None,
             clients: HashMap::new(),
             legacy_stream_ids: HashMap::new(),
             join_set: JoinSet::new(),
-            unknown_pong_workers: JoinSet::new(),
-            connection_closed_workers: TaskTracker::new(),
-            connection_closed_failed: Arc::new(AtomicBool::new(false)),
             server_event_tx,
             transport_event_tx,
             shutdown_token: shutdown_token.child_token(),
+            cleanup: super::retirement::Retirement::default(),
+            workers_clean: true,
         }
     }
 
     pub(crate) async fn bookkeep_join_set(&mut self) -> Option<(ClientId, StreamId)> {
         while let Some(join_result) = self.join_set.join_next().await {
-            let Ok(client_key) = join_result else {
-                continue;
-            };
-            return Some(client_key);
+            match join_result {
+                Ok(client_key) => return Some(client_key),
+                Err(error) => self.workers_clean &= error.is_cancelled(),
+            }
         }
         futures::future::pending().await
     }
 
-    /// Returns whether every required connection-closed event was delivered.
-    /// A stopped socket with undelivered cleanup is not a successful auth reset.
     pub(crate) async fn shutdown(&mut self) -> bool {
         self.shutdown_token.cancel();
 
         while let Some(client_key) = self.clients.keys().next().cloned() {
-            if let Some(client) = self.remove_client(&client_key) {
-                client.disconnect_token.cancel();
-                drop(self.spawn_connection_closed(client.connection_id));
-            }
+            let _ = self.close_client(&client_key).await;
         }
 
         self.drain_join_set().await;
-        while self.unknown_pong_workers.join_next().await.is_some() {}
-        self.connection_closed_workers.close();
-        self.connection_closed_workers.wait().await;
-        !self.connection_closed_failed.load(Ordering::Acquire)
+        self.cleanup.observe().await && self.workers_clean
     }
 
     async fn drain_join_set(&mut self) {
-        while self.join_set.join_next().await.is_some() {}
+        while let Some(result) = self.join_set.join_next().await {
+            // Joined cancellation proves the worker stopped. Only a panic
+            // leaves its execution unclean; required close delivery is tracked
+            // separately and is never excused by a worker's cancellation.
+            self.workers_clean &= result.is_ok() || result.is_err_and(|error| error.is_cancelled());
+        }
     }
 
     pub(crate) async fn handle_message(
@@ -191,6 +180,7 @@ impl ClientTracker {
                 self.send_transport_event(TransportEvent::ConnectionOpened {
                     connection_id,
                     origin: ConnectionOrigin::RemoteControl,
+                    auth: self.auth.clone(),
                     provenance: ConnectionProvenance::Unproven,
                     writer: writer_tx,
                     disconnect_sender: Some(disconnect_token.clone()),
@@ -248,9 +238,8 @@ impl ClientTracker {
                 }
 
                 let server_event_tx = self.server_event_tx.clone();
-                let shutdown_token = self.shutdown_token.clone();
-                while self.unknown_pong_workers.try_join_next().is_some() {}
-                self.unknown_pong_workers.spawn(async move {
+                let shutdown = self.shutdown_token.clone();
+                drop(self.cleanup.track(tokio::spawn(async move {
                     let server_envelope = QueuedServerEnvelope {
                         event: ServerEvent::Pong {
                             status: PongStatus::Unknown,
@@ -261,10 +250,10 @@ impl ClientTracker {
                     };
                     tokio::select! {
                         biased;
-                        _ = shutdown_token.cancelled() => {}
-                        _ = server_event_tx.send(server_envelope) => {}
+                        _ = shutdown.cancelled() => true,
+                        result = server_event_tx.send(server_envelope) => result.is_ok(),
                     }
-                });
+                })));
                 Ok(())
             }
             ClientEvent::ClientClosed => self.close_client(&client_key).await,
@@ -412,15 +401,12 @@ impl ClientTracker {
     }
 
     async fn send_connection_closed(&self, connection_id: ConnectionId) -> Result<(), Stopped> {
-        // Worker shutdown can abort the caller. The tracker owns the cleanup
-        // independently and joins it before acknowledging an auth-cycle reset.
+        // Worker shutdown can abort the caller; detach the cleanup event before awaiting it.
         match self.spawn_connection_closed(connection_id).await {
-            Ok(result) => result,
-            Err(err) => {
-                self.connection_closed_failed.store(true, Ordering::Release);
+            true => Ok(()),
+            false => {
                 warn!(
                     transport_event = "connection_closed",
-                    ?err,
                     "remote control transport event forwarding task failed"
                 );
                 Err(Stopped)
@@ -428,40 +414,25 @@ impl ClientTracker {
         }
     }
 
-    fn spawn_connection_closed(
-        &self,
-        connection_id: ConnectionId,
-    ) -> oneshot::Receiver<Result<(), Stopped>> {
+    fn spawn_connection_closed(&self, connection_id: ConnectionId) -> super::retirement::Receipt {
         info!(
             connection_id = ?connection_id,
             "forwarding remote control connection closed transport event"
         );
         let transport_event_tx = self.transport_event_tx.clone();
-        let failed = self.connection_closed_failed.clone();
-        let (completion_tx, completion_rx) = oneshot::channel();
-        // Unlike JoinSet, dropping this tracker does not abort forwarding if
-        // the caller owning ClientTracker is cancelled. Normal runtime shutdown
-        // still closes and awaits every tracked forwarder before reset ack.
-        self.connection_closed_workers.spawn(async move {
-            let result = timeout(
-                REMOTE_CONTROL_CONNECTION_CLOSED_SEND_TIMEOUT,
-                transport_event_tx.send(TransportEvent::ConnectionClosed { connection_id }),
-            )
-            .await;
-            let result = match result {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(_)) | Err(_) => {
-                    failed.store(true, Ordering::Release);
+        self.cleanup.track(tokio::spawn(async move {
+            transport_event_tx
+                .send(TransportEvent::ConnectionClosed { connection_id })
+                .await
+                .map_err(|_| {
                     warn!(
                         transport_event = "connection_closed",
-                        "remote control connection cleanup was not delivered before its deadline"
+                        "remote control transport event receiver dropped"
                     );
-                    Err(Stopped)
-                }
-            };
-            let _ = completion_tx.send(result);
-        });
-        completion_rx
+                    Stopped
+                })
+                .is_ok()
+        }))
     }
 }
 
@@ -470,6 +441,7 @@ fn transport_event_name(event: &TransportEvent) -> &'static str {
         TransportEvent::ConnectionOpened { .. } => "connection_opened",
         TransportEvent::ConnectionClosed { .. } => "connection_closed",
         TransportEvent::IncomingMessage { .. } => "incoming_message",
+        TransportEvent::DaemonShutdown => "daemon_shutdown",
     }
 }
 
@@ -484,6 +456,10 @@ fn remote_control_message_starts_connection(message: &JSONRPCMessage) -> bool {
 fn remote_control_client_is_alive(client: &ClientState, now: Instant) -> bool {
     now.duration_since(client.last_activity_at) < REMOTE_CONTROL_CLIENT_IDLE_TIMEOUT
 }
+
+#[cfg(test)]
+#[path = "client_tracker_retirement_tests.rs"]
+mod retirement_tests;
 
 #[cfg(test)]
 mod tests {
@@ -597,62 +573,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_joins_connection_closed_cleanup_after_its_caller_is_dropped() {
-        let (server_event_tx, _server_event_rx) = mpsc::channel(1);
-        let (events, mut events_rx) = mpsc::channel(1);
-        events
-            .send(TransportEvent::ConnectionClosed {
-                connection_id: ConnectionId(1),
-            })
-            .await
-            .expect("queue should prefill");
-        let mut tracker = ClientTracker::new(server_event_tx, events, &CancellationToken::new());
-        drop(tracker.spawn_connection_closed(ConnectionId(2)));
-        let shutdown = tracker.shutdown();
-        tokio::pin!(shutdown);
-        assert!(
-            futures::poll!(shutdown.as_mut()).is_pending(),
-            "cleanup still owns a blocked event; shutdown must wait"
-        );
-        assert!(matches!(
-            events_rx.recv().await,
-            Some(TransportEvent::ConnectionClosed {
-                connection_id: ConnectionId(1)
-            })
-        ));
-        assert!(matches!(
-            events_rx.recv().await,
-            Some(TransportEvent::ConnectionClosed {
-                connection_id: ConnectionId(2)
-            })
-        ));
-        assert!(shutdown.await);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn blocked_connection_cleanup_times_out_and_shutdown_reports_failure() {
-        let (server_event_tx, _server_event_rx) = mpsc::channel(1);
-        let (events, _events_rx) = mpsc::channel(1);
-        events
-            .send(TransportEvent::ConnectionClosed {
-                connection_id: ConnectionId(1),
-            })
-            .await
-            .expect("queue should prefill");
-        let mut tracker = ClientTracker::new(server_event_tx, events, &CancellationToken::new());
-        drop(tracker.spawn_connection_closed(ConnectionId(2)));
-        assert!(
-            !timeout(Duration::from_secs(2), tracker.shutdown())
-                .await
-                .expect("cleanup must finish within its own deadline")
-        );
-        assert!(
-            !tracker.shutdown().await,
-            "failed cleanup remains unproved on retry"
-        );
-    }
-
-    #[tokio::test]
     async fn outbound_cancellation_wins_even_when_blocked_queue_becomes_ready() {
         let (events, mut events_rx) = mpsc::channel(1);
         events
@@ -723,13 +643,19 @@ mod tests {
             })
             .await
             .expect("unknown ping should queue response");
-        assert_eq!(tracker.unknown_pong_workers.len(), 1);
+        assert_eq!(tracker.cleanup.snapshot().len(), 1);
         assert!(
             timeout(Duration::from_secs(1), tracker.shutdown())
                 .await
                 .expect("cancelled pong must join despite full queue")
         );
-        assert!(tracker.unknown_pong_workers.is_empty());
+        assert!(
+            tracker
+                .cleanup
+                .snapshot()
+                .iter()
+                .all(|receipt| receipt.peek() == Some(&true))
+        );
         events_rx.recv().await.expect("prefill should remain");
         assert!(
             events_rx.try_recv().is_err(),
@@ -790,12 +716,9 @@ mod tests {
             .await
             .expect("writer should accept queued message");
 
-        assert!(
-            timeout(Duration::from_secs(1), client_tracker.shutdown())
-                .await
-                .expect("shutdown should not hang on blocked server forwarding")
-        );
-        assert!(client_tracker.join_set.is_empty());
+        timeout(Duration::from_secs(1), client_tracker.shutdown())
+            .await
+            .expect("shutdown should not hang on blocked server forwarding");
     }
 
     #[tokio::test]

@@ -1,103 +1,49 @@
 use crate::backend::BackendBundleClient;
+use crate::backend::BundleClient;
+use crate::home_lifecycle::HomeLifecycle;
+use crate::home_lifecycle::HomeOwners;
+use crate::home_lifecycle::home_lifecycle;
+use crate::home_lifecycle::lifecycle_error;
 use crate::service::CLOUD_CONFIG_BUNDLE_TIMEOUT;
 use crate::service::CloudConfigBundleService;
 use codex_config::CloudConfigBundleLoadError;
-use codex_config::CloudConfigBundleLoadErrorCode;
 use codex_config::CloudConfigBundleLoader;
 use codex_http_client::HttpClientFactory;
 use codex_login::AuthConfig;
 use codex_login::AuthManager;
-use std::collections::HashMap;
+use std::future::Future;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use tokio::task::JoinHandle;
+use tokio::task::AbortHandle;
 
-#[derive(Default)]
-struct HomeOwners {
-    tasks: Vec<JoinHandle<()>>,
-    refresh_abort: Option<tokio::task::AbortHandle>,
-    retiring: bool,
-    failed_owner: bool,
+fn refresher_task_slot() -> &'static Mutex<Option<AbortHandle>> {
+    static REFRESHER_TASK: OnceLock<Mutex<Option<AbortHandle>>> = OnceLock::new();
+    REFRESHER_TASK.get_or_init(|| Mutex::new(None))
 }
 
-impl HomeOwners {
-    fn reap_finished(&mut self) {
-        use std::future::Future;
-        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
-        self.tasks.retain_mut(|task| {
-            if !task.is_finished() {
-                return true;
-            }
-            match std::pin::Pin::new(task).poll(&mut context) {
-                std::task::Poll::Ready(Ok(())) => false,
-                std::task::Poll::Ready(Err(error)) => {
-                    // Requested cancellation is terminal proof; panic is not a
-                    // successful retirement and must be surfaced once observed.
-                    self.failed_owner |= !error.is_cancelled();
-                    false
-                }
-                std::task::Poll::Pending => true,
-            }
-        });
+pub(crate) fn replace_refresh_task(slot: &Mutex<Option<AbortHandle>>, next: AbortHandle) {
+    let mut guard = slot.lock().unwrap_or_else(|err| {
+        tracing::warn!("cloud config bundle refresher task slot was poisoned");
+        err.into_inner()
+    });
+    if let Some(previous) = guard.replace(next) {
+        previous.abort();
     }
 }
 
-#[derive(Default)]
-struct HomeLifecycle {
-    owners: Mutex<HomeOwners>,
-    publication: Arc<tokio::sync::Mutex<()>>,
-    generation: Arc<AtomicU64>,
-    reset: tokio::sync::Mutex<()>,
+struct CloudConfigBundleLoaderLifetime<C> {
+    service: Arc<CloudConfigBundleService<C>>,
+    refresh_task: AbortHandle,
 }
 
-enum LoadMode {
-    Ordinary,
-    Managed,
-}
-
-fn home_lifecycle(
-    home: &std::path::Path,
-) -> Result<Arc<HomeLifecycle>, CloudConfigBundleLoadError> {
-    let home = codex_config::AbsolutePathBuf::resolve_path_against_base(home, "/");
-    // Canonicalize the existing ancestor even when the home has not yet been
-    // created. Symlink aliases must never get independent publication fences.
-    let mut ancestor = home.to_path_buf();
-    let mut suffix = Vec::new();
-    let canonical = loop {
-        match std::fs::canonicalize(&ancestor) {
-            Ok(path) => break path,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                suffix.push(
-                    ancestor
-                        .file_name()
-                        .ok_or_else(|| lifecycle_error("cloud home identity unavailable"))?
-                        .to_owned(),
-                );
-                if !ancestor.pop() {
-                    return Err(lifecycle_error("cloud home identity unavailable"));
-                }
-            }
-            Err(_) => return Err(lifecycle_error("cloud home identity unavailable")),
-        }
-    };
-    let mut identity = canonical;
-    for part in suffix.into_iter().rev() {
-        identity.push(part);
+impl<C> Drop for CloudConfigBundleLoaderLifetime<C> {
+    fn drop(&mut self) {
+        self.refresh_task.abort();
     }
-    static HOMES: OnceLock<Mutex<HashMap<PathBuf, Arc<HomeLifecycle>>>> = OnceLock::new();
-    let mut homes = HOMES
-        .get_or_init(Mutex::default)
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    Ok(homes.entry(identity).or_default().clone())
-}
-
-fn lifecycle_error(message: &'static str) -> CloudConfigBundleLoadError {
-    CloudConfigBundleLoadError::new(CloudConfigBundleLoadErrorCode::Internal, None, message)
 }
 
 pub fn cloud_config_bundle_loader(
@@ -106,40 +52,7 @@ pub fn cloud_config_bundle_loader(
     codex_home: PathBuf,
     http_client_factory: HttpClientFactory,
 ) -> CloudConfigBundleLoader {
-    let lifecycle = match home_lifecycle(&codex_home) {
-        Ok(lifecycle) => lifecycle,
-        Err(error) => return CloudConfigBundleLoader::new(async move { Err(error) }),
-    };
-    let mut owners = lifecycle
-        .owners
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if owners.retiring {
-        return CloudConfigBundleLoader::new(async {
-            Err(lifecycle_error("cloud reset is still retiring prior work"))
-        });
-    }
-    start_loader(
-        auth_manager,
-        chatgpt_base_url,
-        codex_home,
-        http_client_factory,
-        &lifecycle,
-        &mut owners,
-        LoadMode::Ordinary,
-    )
-}
-
-fn start_loader(
-    auth_manager: Arc<AuthManager>,
-    chatgpt_base_url: String,
-    codex_home: PathBuf,
-    http_client_factory: HttpClientFactory,
-    lifecycle: &HomeLifecycle,
-    owners: &mut HomeOwners,
-    mode: LoadMode,
-) -> CloudConfigBundleLoader {
-    let mut service = CloudConfigBundleService::new(
+    let service = CloudConfigBundleService::new(
         auth_manager,
         Arc::new(BackendBundleClient::new(
             chatgpt_base_url,
@@ -148,36 +61,209 @@ fn start_loader(
         codex_home,
         CLOUD_CONFIG_BUNDLE_TIMEOUT,
     );
-    service.publication = lifecycle.publication.clone();
-    service.generation = lifecycle.generation.clone();
-    service.expected_generation = lifecycle.generation.load(Ordering::Acquire);
-    service.strict_cache_publication = matches!(mode, LoadMode::Managed);
-    let refresh_service = service.clone();
-    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-    let task = tokio::spawn(async move {
-        let _ = result_tx.send(service.load_startup_bundle_with_timeout().await);
-    });
-    let refresh_task =
-        tokio::spawn(async move { refresh_service.refresh_cache_in_background().await });
-    if let Some(existing) = owners.refresh_abort.replace(refresh_task.abort_handle()) {
-        existing.abort();
+    match registered_loader(service, Some(refresher_task_slot())) {
+        Ok((loader, _)) => loader,
+        Err(error) => CloudConfigBundleLoader::new(async move { Err(error) }),
     }
-    owners.reap_finished();
-    owners.tasks.push(task);
-    owners.tasks.push(refresh_task);
-    CloudConfigBundleLoader::new(async move {
-        result_rx
-            .await
-            .map_err(|_| lifecycle_error("cloud config bundle owner stopped"))?
-    })
 }
 
-/// Retires prior same-home startup and refresh owners, including detached cache
-/// writes, before constructing a new loader. Callers must await `get()` before
-/// publishing the returned loader as an acknowledged configuration reset.
+#[cfg(test)]
+pub(crate) fn cloud_config_bundle_loader_for_service<C>(
+    service: CloudConfigBundleService<C>,
+) -> Result<(CloudConfigBundleLoader, AbortHandle), CloudConfigBundleLoadError>
+where
+    C: BundleClient + 'static,
+{
+    registered_loader(service, /*replacement_slot*/ None)
+}
+
+fn registered_loader<C: BundleClient + 'static>(
+    service: CloudConfigBundleService<C>,
+    replacement_slot: Option<&Mutex<Option<AbortHandle>>>,
+) -> Result<(CloudConfigBundleLoader, AbortHandle), CloudConfigBundleLoadError> {
+    let birth = LoaderBirth::capture(&service.codex_home)?;
+    registered_loader_at_birth(service, replacement_slot, birth)
+}
+
+struct LoaderBirth {
+    lifecycle: Arc<HomeLifecycle>,
+    generation: u64,
+}
+
+impl LoaderBirth {
+    fn capture(home: &Path) -> Result<Self, CloudConfigBundleLoadError> {
+        let lifecycle = home_lifecycle(home)?;
+        let owners = lifecycle
+            .owners
+            .lock()
+            .map_err(|_| lifecycle_error("cloud owner lock unavailable"))?;
+        if owners.retiring {
+            return Err(lifecycle_error("cloud reset is still retiring prior work"));
+        }
+        let generation = lifecycle.generation.load(Ordering::Acquire);
+        drop(owners);
+        Ok(Self {
+            lifecycle,
+            generation,
+        })
+    }
+}
+
+fn registered_loader_at_birth<C: BundleClient + 'static>(
+    service: CloudConfigBundleService<C>,
+    replacement_slot: Option<&Mutex<Option<AbortHandle>>>,
+    birth: LoaderBirth,
+) -> Result<(CloudConfigBundleLoader, AbortHandle), CloudConfigBundleLoadError> {
+    let lifecycle = birth.lifecycle;
+    let mut owners = lifecycle
+        .owners
+        .lock()
+        .map_err(|_| lifecycle_error("cloud owner lock unavailable"))?;
+    if owners.retiring || lifecycle.generation.load(Ordering::Acquire) != birth.generation {
+        return Err(lifecycle_error("cloud reset is still retiring prior work"));
+    }
+    let result = start_loader(service, &lifecycle, &mut owners);
+    // Keep registration and global replacement in one admission interval, so
+    // a delayed old constructor cannot replace the managed reset's refresher.
+    if let Some(slot) = replacement_slot {
+        replace_refresh_task(slot, result.1.clone());
+    }
+    Ok(result)
+}
+
+fn start_loader<C: BundleClient + 'static>(
+    mut service: CloudConfigBundleService<C>,
+    lifecycle: &Arc<HomeLifecycle>,
+    owners: &mut HomeOwners,
+) -> (CloudConfigBundleLoader, AbortHandle) {
+    service.publication = Arc::clone(&lifecycle.publication);
+    service.generation = Arc::clone(&lifecycle.generation);
+    service.expected_generation = lifecycle.generation.load(Ordering::Acquire);
+    let expected_generation = service.expected_generation;
+    let service = Arc::new(service);
+    let background_service = Arc::clone(&service);
+    let refresh_task = tokio::spawn(async move {
+        let _ = background_service.get_latest().await;
+        background_service.refresh_cache_in_background().await;
+    });
+    let abort_handle = refresh_task.abort_handle();
+    owners.reap_finished();
+    owners.tasks.push(refresh_task);
+    let lifetime = Arc::new(CloudConfigBundleLoaderLifetime {
+        service,
+        refresh_task: abort_handle.clone(),
+    });
+
+    let lifecycle = Arc::clone(lifecycle);
+    let loader = CloudConfigBundleLoader::from_getter(move || {
+        let lifetime = Arc::clone(&lifetime);
+        let lifecycle = Arc::clone(&lifecycle);
+        async move {
+            lifecycle
+                .load(expected_generation, lifetime.service.get_latest())
+                .await
+        }
+    });
+    (loader, abort_handle)
+}
+
+pub async fn cloud_config_bundle_loader_for_storage(
+    auth_config: AuthConfig,
+    enable_codex_api_key_env: bool,
+) -> std::io::Result<CloudConfigBundleLoader> {
+    storage_loader(
+        auth_config.codex_home.clone(),
+        cloud_config_bundle_service_for_storage(auth_config, enable_codex_api_key_env),
+        StorageMode::Cached,
+    )
+    .await
+}
+
+/// Fetches directly from the network on each load, without reading or writing
+/// the disk cache or starting a background refresher.
+pub async fn cloud_config_bundle_loader_for_storage_without_cache(
+    auth_config: AuthConfig,
+    enable_codex_api_key_env: bool,
+) -> std::io::Result<CloudConfigBundleLoader> {
+    storage_loader(
+        auth_config.codex_home.clone(),
+        cloud_config_bundle_service_for_storage(auth_config, enable_codex_api_key_env),
+        StorageMode::Uncached,
+    )
+    .await
+}
+
+enum StorageMode {
+    Cached,
+    Uncached,
+}
+
+async fn storage_loader<C: BundleClient + 'static>(
+    home: PathBuf,
+    construct: impl Future<Output = std::io::Result<CloudConfigBundleService<C>>>,
+    mode: StorageMode,
+) -> std::io::Result<CloudConfigBundleLoader> {
+    // Capture before AuthManager construction can read an old identity and
+    // suspend. Never stamp that snapshot with a later reset's generation.
+    let birth = LoaderBirth::capture(&home).map_err(std::io::Error::other)?;
+    let service = construct.await?;
+    match mode {
+        StorageMode::Cached => {
+            registered_loader_at_birth(service, Some(refresher_task_slot()), birth)
+                .map(|(loader, _)| loader)
+        }
+        StorageMode::Uncached => uncached_loader_at_birth(service, birth),
+    }
+    .map_err(std::io::Error::other)
+}
+
+#[cfg(test)]
+pub(crate) fn uncached_loader<C: BundleClient + 'static>(
+    service: CloudConfigBundleService<C>,
+) -> Result<CloudConfigBundleLoader, CloudConfigBundleLoadError> {
+    let birth = LoaderBirth::capture(&service.codex_home)?;
+    uncached_loader_at_birth(service, birth)
+}
+
+fn uncached_loader_at_birth<C: BundleClient + 'static>(
+    service: CloudConfigBundleService<C>,
+    birth: LoaderBirth,
+) -> Result<CloudConfigBundleLoader, CloudConfigBundleLoadError> {
+    let mut service = service.without_cache();
+    let lifecycle = birth.lifecycle;
+    let owners = lifecycle
+        .owners
+        .lock()
+        .map_err(|_| lifecycle_error("cloud owner lock unavailable"))?;
+    if owners.retiring || lifecycle.generation.load(Ordering::Acquire) != birth.generation {
+        return Err(lifecycle_error("cloud reset is still retiring prior work"));
+    }
+    service.publication = Arc::clone(&lifecycle.publication);
+    service.generation = Arc::clone(&lifecycle.generation);
+    service.expected_generation = lifecycle.generation.load(Ordering::Acquire);
+    let expected_generation = service.expected_generation;
+    let service = Arc::new(service);
+    drop(owners);
+    Ok(CloudConfigBundleLoader::from_getter(move || {
+        let service = Arc::clone(&service);
+        let lifecycle = Arc::clone(&lifecycle);
+        async move {
+            lifecycle
+                .load(
+                    expected_generation,
+                    service.load_startup_bundle_with_timeout(),
+                )
+                .await
+        }
+    }))
+}
+
+/// Retires this process's prior same-home cloud owners and cache publications.
+/// The caller must successfully await `get()` before publishing this strict
+/// loader as an acknowledged configuration reset.
 #[expect(
     clippy::await_holding_invalid_type,
-    reason = "serializes same-home reset observers while retained owners and publication leases drain; those workers never acquire the reset mutex"
+    reason = "serializes same-home reset and installation; getters and writers never take the reset lock"
 )]
 pub async fn managed_cloud_config_bundle_loader(
     auth_manager: Arc<AuthManager>,
@@ -189,85 +275,44 @@ pub async fn managed_cloud_config_bundle_loader(
     let _reset = tokio::time::timeout(CLOUD_CONFIG_BUNDLE_TIMEOUT, lifecycle.reset.lock())
         .await
         .map_err(|_| lifecycle_error("cloud reset ownership timed out"))?;
-    {
-        let mut owners = lifecycle
-            .owners
-            .lock()
-            .map_err(|_| lifecycle_error("cloud owner lock unavailable"))?;
-        owners.retiring = true;
-        lifecycle
-            .generation
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-                value.checked_add(1)
-            })
-            .map_err(|_| lifecycle_error("cloud generation exhausted"))?;
-        for task in &owners.tasks {
-            task.abort();
-        }
-    }
-    // Keep handles registered until completion. A timeout/cancel leaves retiring
-    // set, so ordinary calls cannot bypass this barrier; a managed retry can join.
-    tokio::time::timeout(CLOUD_CONFIG_BUNDLE_TIMEOUT, async {
-        loop {
-            let done = {
-                let mut owners = lifecycle
-                    .owners
-                    .lock()
-                    .map_err(|_| lifecycle_error("cloud owner lock unavailable"))?;
-                owners.reap_finished();
-                owners.tasks.is_empty()
-            };
-            if done {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        }
-        let _publication = lifecycle.publication.lock().await;
-        Ok::<(), CloudConfigBundleLoadError>(())
-    })
-    .await
-    .map_err(|_| lifecycle_error("cloud retirement timed out"))??;
+    lifecycle.retire_owners().await?;
+    let mut service = CloudConfigBundleService::new(
+        auth_manager,
+        Arc::new(BackendBundleClient::new(
+            chatgpt_base_url,
+            http_client_factory,
+        )),
+        codex_home,
+        CLOUD_CONFIG_BUNDLE_TIMEOUT,
+    );
+    service.strict_cache_publication = true;
     let mut owners = lifecycle
         .owners
         .lock()
         .map_err(|_| lifecycle_error("cloud owner lock unavailable"))?;
-    if std::mem::take(&mut owners.failed_owner) {
-        return Err(lifecycle_error(
-            "cloud prior owner failed during retirement",
-        ));
-    }
-    owners.tasks.clear();
-    owners.refresh_abort = None;
+    let (loader, refresh_task) = start_loader(service, &lifecycle, &mut owners);
+    replace_refresh_task(refresher_task_slot(), refresh_task);
     owners.retiring = false;
-    Ok(start_loader(
-        auth_manager,
-        chatgpt_base_url,
-        codex_home,
-        http_client_factory,
-        &lifecycle,
-        &mut owners,
-        LoadMode::Managed,
-    ))
+    Ok(loader)
 }
 
-pub async fn cloud_config_bundle_loader_for_storage(
+async fn cloud_config_bundle_service_for_storage(
     auth_config: AuthConfig,
     enable_codex_api_key_env: bool,
-) -> CloudConfigBundleLoader {
-    let codex_home = auth_config.codex_home.clone();
-    let chatgpt_base_url = auth_config
-        .chatgpt_base_url
-        .clone()
-        .unwrap_or_else(|| "https://chatgpt.com/backend-api/".to_string());
-    let http_client_factory = auth_config.auth_route_config.http_client_factory().clone();
+) -> std::io::Result<CloudConfigBundleService<BackendBundleClient>> {
     let auth_manager =
-        AuthManager::shared_from_auth_config(auth_config, enable_codex_api_key_env).await;
-    cloud_config_bundle_loader(
+        AuthManager::shared_from_auth_config(auth_config.clone(), enable_codex_api_key_env).await?;
+    Ok(CloudConfigBundleService::new(
         auth_manager,
-        chatgpt_base_url,
-        codex_home,
-        http_client_factory,
-    )
+        Arc::new(BackendBundleClient::new(
+            auth_config
+                .chatgpt_base_url
+                .unwrap_or_else(|| "https://chatgpt.com/backend-api/".to_string()),
+            auth_config.auth_route_config.http_client_factory().clone(),
+        )),
+        auth_config.codex_home,
+        CLOUD_CONFIG_BUNDLE_TIMEOUT,
+    ))
 }
 
 #[cfg(test)]

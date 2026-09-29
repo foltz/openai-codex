@@ -6,10 +6,12 @@
 mod backend;
 mod bundle_loader;
 mod cache;
+mod home_lifecycle;
 mod metrics;
 mod service;
 mod validation;
 
 pub use bundle_loader::cloud_config_bundle_loader;
 pub use bundle_loader::cloud_config_bundle_loader_for_storage;
+pub use bundle_loader::cloud_config_bundle_loader_for_storage_without_cache;
 pub use bundle_loader::managed_cloud_config_bundle_loader;

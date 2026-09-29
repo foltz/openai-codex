@@ -108,6 +108,10 @@ async fn print_response<T: Serialize>(response: T) -> Result<()> {
     Ok(())
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "start arguments are validated before connecting and matched by the same action"
+)]
 pub(crate) async fn run(command: ManagedAuthCommand) -> Result<()> {
     let ManagedAuthCommand {
         socket_path,

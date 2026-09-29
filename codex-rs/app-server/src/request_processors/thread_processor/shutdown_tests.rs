@@ -86,6 +86,7 @@ async fn fixture_with_extensions(
             config.codex_home.clone(),
         )),
         /*analytics_events_client*/ None,
+        codex_core::passthrough_image_store(),
         codex_core::thread_store_from_config(&config, /*state_db*/ None),
         /*agent_graph_store*/ None,
         "processor-thread-retirement-test".to_string(),

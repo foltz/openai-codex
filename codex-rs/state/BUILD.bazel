@@ -4,6 +4,7 @@ codex_rust_crate(
     name = "state",
     compile_data = glob([
         "goals_migrations/**",
+        "kcf_migrations/**",
         "logs_migrations/**",
         "memory_migrations/**",
         "migrations/**",

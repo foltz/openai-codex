@@ -1,58 +1,38 @@
-//! Bounded, compatibility-aware transport for modern locally spawned MCP servers.
+//! Protocol framing and child lifetime for locally spawned MCP servers.
+//!
+//! Process creation is platform-specific; protocol selection and shutdown are shared.
 
 use std::future::Future;
 use std::io;
-use std::process::Stdio;
 use std::sync::Arc;
 
-use memchr::memchr;
+use codex_utils_pty::Command;
+use futures::FutureExt;
 use rmcp::service::RoleClient;
 use rmcp::service::RxJsonRpcMessage;
 use rmcp::service::TxJsonRpcMessage;
 use rmcp::transport::Transport;
 use rmcp::transport::async_rw::AsyncRwTransport;
-use tokio::io::AsyncBufReadExt;
-use tokio::io::AsyncWriteExt;
-use tokio::io::BufReader;
 use tokio::process::ChildStderr;
 use tokio::process::ChildStdin;
 use tokio::process::ChildStdout;
-use tokio::process::Command;
-use tokio::sync::Mutex;
 use tokio::sync::watch;
 use tokio::task::AbortHandle;
-use tracing::debug;
-use tracing::warn;
 
-use crate::incoming_jsonrpc::deserialize_incoming_jsonrpc_message;
-
-/// Match the existing executor stdio transport and the production MCP limit.
-pub(crate) const MAX_MCP_STDIO_LINE_BYTES: usize = 8 * 1024 * 1024;
+use crate::bounded_stdio_transport::BoundedStdioTransport;
+use crate::protocol_mode::McpProtocolMode;
 
 pub(super) struct LocalStdioTransport {
-    stdin: Arc<Mutex<Option<ChildStdin>>>,
-    stdout: BufReader<ChildStdout>,
-    pending_line: Vec<u8>,
-    program_name: String,
     process_id: Option<u32>,
     exit_observer: LocalProcessExitObserver,
+    transport: StdioTransport,
 }
 
-/// Compatibility transport for legacy MCP servers. It retains rmcp's standard
-/// AsyncRw framing and error behavior while sharing the local exit observer
-/// with the modern bounded transport.
-pub(super) struct LegacyLocalStdioTransport {
-    transport: AsyncRwTransport<RoleClient, ChildStdout, ChildStdin>,
-    process_id: Option<u32>,
-    exit_observer: LocalProcessExitObserver,
-}
-
-struct SpawnedLocalStdioProcess {
-    stdin: ChildStdin,
-    stdout: ChildStdout,
-    stderr: Option<ChildStderr>,
-    process_id: Option<u32>,
-    exit_observer: LocalProcessExitObserver,
+enum StdioTransport {
+    /// Preserve rmcp's existing framing for servers using the initialize handshake.
+    Legacy(AsyncRwTransport<RoleClient, ChildStdout, ChildStdin>),
+    /// Bound frames and skip messages unknown to the client during 2026-07-28 discovery.
+    V20260728(BoundedStdioTransport),
 }
 
 /// One terminal observation for a locally spawned stdio process.
@@ -119,19 +99,45 @@ impl LocalStdioTransport {
     pub(super) fn spawn(
         command: Command,
         program_name: String,
+        protocol_mode: McpProtocolMode,
     ) -> io::Result<(Self, Option<ChildStderr>)> {
-        let process = spawn_local_stdio_process(command)?;
-
+        let mut child = command.spawn()?;
+        let process_id = child.id();
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("MCP server stdin was not piped"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("MCP server stdout was not piped"))?;
+        let stderr = child.stderr.take();
+        let transport = match protocol_mode {
+            McpProtocolMode::Legacy => StdioTransport::Legacy(AsyncRwTransport::new(stdout, stdin)),
+            McpProtocolMode::V20260728 => {
+                StdioTransport::V20260728(BoundedStdioTransport::new(stdin, stdout, program_name))
+            }
+        };
+        let (exit_tx, exit_rx) = watch::channel(LocalProcessExit::Pending);
+        let supervisor = tokio::spawn(async move {
+            let terminal = match child.wait().await {
+                Ok(_) => LocalProcessExit::Exited,
+                Err(error) => LocalProcessExit::Failed(Arc::from(error.to_string())),
+            };
+            let _ = exit_tx.send(terminal);
+        });
         Ok((
             Self {
-                stdin: Arc::new(Mutex::new(Some(process.stdin))),
-                stdout: BufReader::new(process.stdout),
-                pending_line: Vec::new(),
-                program_name,
-                process_id: process.process_id,
-                exit_observer: process.exit_observer,
+                process_id,
+                exit_observer: LocalProcessExitObserver {
+                    state: exit_rx,
+                    supervisor: Arc::new(LocalProcessSupervisor {
+                        abort_handle: supervisor.abort_handle(),
+                    }),
+                },
+                transport,
             },
-            process.stderr,
+            stderr,
         ))
     }
 
@@ -143,168 +149,43 @@ impl LocalStdioTransport {
         self.exit_observer.clone()
     }
 
-    pub(super) async fn close_input(&self) {
-        self.stdin.lock().await.take();
-    }
-
-    /// Finish transport shutdown after the process handle has already proved
-    /// terminal exit. The process-level retirement bound owns the deadline;
-    /// this path only closes stdin and consumes the retained observation.
-    pub(super) async fn close_after_terminal_observation(&self) -> io::Result<()> {
-        self.close_input().await;
+    /// The process owner has already proved exit under its absolute deadline.
+    /// Close either framing mode and consume the retained terminal observation
+    /// without introducing a second relative process timeout.
+    pub(super) async fn close_after_terminal_observation(&mut self) -> io::Result<()> {
+        match &mut self.transport {
+            StdioTransport::Legacy(transport) => transport.close().await?,
+            StdioTransport::V20260728(transport) => transport.close().await?,
+        }
         self.exit_observer.clone().wait().await
     }
-
-    async fn receive_message(&mut self) -> Option<RxJsonRpcMessage<RoleClient>> {
-        loop {
-            let bytes = match self.stdout.fill_buf().await {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    warn!(
-                        "Failed to read MCP server stdout ({}): {error}",
-                        self.program_name
-                    );
-                    return None;
-                }
-            };
-
-            if bytes.is_empty() {
-                if self.pending_line.is_empty() {
-                    return None;
-                }
-                return self.decode_pending_message();
-            }
-
-            let newline = memchr(b'\n', bytes);
-            let content_len = newline.unwrap_or(bytes.len());
-            if content_len > MAX_MCP_STDIO_LINE_BYTES.saturating_sub(self.pending_line.len()) {
-                warn!(
-                    "MCP stdio line exceeds {MAX_MCP_STDIO_LINE_BYTES} bytes ({}); closing transport",
-                    self.program_name
-                );
-                self.pending_line.clear();
-                return None;
-            }
-
-            self.pending_line.extend_from_slice(&bytes[..content_len]);
-            let consumed = content_len + usize::from(newline.is_some());
-            self.stdout.consume(consumed);
-
-            if newline.is_some()
-                && let Some(message) = self.decode_pending_message()
-            {
-                return Some(message);
-            }
-        }
-    }
-
-    fn decode_pending_message(&mut self) -> Option<RxJsonRpcMessage<RoleClient>> {
-        let line = std::mem::take(&mut self.pending_line);
-        let line = line.strip_suffix(b"\r").unwrap_or(&line);
-        match deserialize_incoming_jsonrpc_message(line) {
-            Ok(message) => Some(message),
-            Err(error) => {
-                debug!(
-                    "Failed to parse local MCP server message ({}): {error}",
-                    self.program_name
-                );
-                None
-            }
-        }
-    }
-}
-
-impl LegacyLocalStdioTransport {
-    pub(super) fn spawn(command: Command) -> io::Result<(Self, Option<ChildStderr>)> {
-        let process = spawn_local_stdio_process(command)?;
-        Ok((
-            Self {
-                transport: AsyncRwTransport::new(process.stdout, process.stdin),
-                process_id: process.process_id,
-                exit_observer: process.exit_observer,
-            },
-            process.stderr,
-        ))
-    }
-
-    pub(super) fn id(&self) -> Option<u32> {
-        self.process_id
-    }
-
-    pub(super) fn exit_observer(&self) -> LocalProcessExitObserver {
-        self.exit_observer.clone()
-    }
-}
-
-fn spawn_local_stdio_process(mut command: Command) -> io::Result<SpawnedLocalStdioProcess> {
-    command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command.spawn()?;
-    let process_id = child.id();
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| io::Error::other("MCP server stdin was not piped"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::other("MCP server stdout was not piped"))?;
-    let stderr = child.stderr.take();
-    let (exit_tx, exit_rx) = watch::channel(LocalProcessExit::Pending);
-    let supervisor = tokio::spawn(async move {
-        let terminal = match child.wait().await {
-            Ok(_) => LocalProcessExit::Exited,
-            Err(error) => LocalProcessExit::Failed(Arc::from(error.to_string())),
-        };
-        let _ = exit_tx.send(terminal);
-    });
-
-    Ok(SpawnedLocalStdioProcess {
-        stdin,
-        stdout,
-        stderr,
-        process_id,
-        exit_observer: LocalProcessExitObserver {
-            state: exit_rx,
-            supervisor: Arc::new(LocalProcessSupervisor {
-                abort_handle: supervisor.abort_handle(),
-            }),
-        },
-    })
 }
 
 impl Transport<RoleClient> for LocalStdioTransport {
     type Error = io::Error;
 
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "complete JSON-RPC frames must hold the stdin lock across writes"
-    )]
     fn send(
         &mut self,
         item: TxJsonRpcMessage<RoleClient>,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
-        let stdin = Arc::clone(&self.stdin);
-        async move {
-            let mut message = serde_json::to_vec(&item).map_err(io::Error::other)?;
-            message.push(b'\n');
-            let mut guard = stdin.lock().await;
-            let stdin = guard
-                .as_mut()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "MCP stdin closed"))?;
-            stdin.write_all(&message).await?;
-            stdin.flush().await
+    ) -> impl Future<Output = io::Result<()>> + Send + 'static {
+        match &mut self.transport {
+            StdioTransport::Legacy(transport) => transport.send(item).boxed(),
+            StdioTransport::V20260728(transport) => transport.send(item).boxed(),
         }
     }
 
     fn receive(&mut self) -> impl Future<Output = Option<RxJsonRpcMessage<RoleClient>>> + Send {
-        self.receive_message()
+        match &mut self.transport {
+            StdioTransport::Legacy(transport) => transport.receive().boxed(),
+            StdioTransport::V20260728(transport) => transport.receive().boxed(),
+        }
     }
 
-    async fn close(&mut self) -> Result<(), Self::Error> {
-        self.close_input().await;
+    async fn close(&mut self) -> io::Result<()> {
+        match &mut self.transport {
+            StdioTransport::Legacy(transport) => transport.close().await?,
+            StdioTransport::V20260728(transport) => transport.close().await?,
+        }
         let mut exit_observer = self.exit_observer.clone();
         match tokio::time::timeout(
             super::stdio_server_launcher::PROCESS_RETIREMENT_TIMEOUT,
@@ -321,120 +202,6 @@ impl Transport<RoleClient> for LocalStdioTransport {
     }
 }
 
-impl Transport<RoleClient> for LegacyLocalStdioTransport {
-    type Error = io::Error;
-
-    fn send(
-        &mut self,
-        item: TxJsonRpcMessage<RoleClient>,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
-        self.transport.send(item)
-    }
-
-    fn receive(&mut self) -> impl Future<Output = Option<RxJsonRpcMessage<RoleClient>>> + Send {
-        self.transport.receive()
-    }
-
-    async fn close(&mut self) -> Result<(), Self::Error> {
-        self.transport.close().await
-    }
-}
-
 #[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-    use std::time::Duration;
-
-    #[tokio::test]
-    async fn final_local_observer_drop_aborts_the_child_supervisor() {
-        let mut command = Command::new("sleep");
-        command.arg("30").kill_on_drop(true);
-        let (transport, _) = LocalStdioTransport::spawn(command, "test-server".to_string())
-            .expect("spawn test child");
-        let observer = transport.exit_observer();
-        let supervisor = observer.supervisor.abort_handle.clone();
-        drop(transport);
-        tokio::task::yield_now().await;
-        assert!(
-            !supervisor.is_finished(),
-            "a remaining observer owns the child"
-        );
-        drop(observer);
-        let stopped = tokio::time::timeout(Duration::from_secs(1), async {
-            while !supervisor.is_finished() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await;
-        // Also clean up the child if this negative control detects a regression.
-        supervisor.abort();
-        stopped.expect("the last observer must not detach its child supervisor");
-    }
-
-    #[tokio::test]
-    async fn modern_local_exit_observer_waits_for_child_exit() {
-        let mut command = Command::new("sh");
-        command.args(["-c", "exit 0"]);
-        let (transport, _) = LocalStdioTransport::spawn(command, "test-server".to_string())
-            .expect("spawn test child");
-
-        let mut observer = transport.exit_observer();
-        tokio::time::timeout(Duration::from_secs(1), observer.wait())
-            .await
-            .expect("child should exit promptly")
-            .expect("observer should report terminal exit");
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn direct_modern_close_timeout_preserves_the_exit_observer() {
-        let directory = tempfile::tempdir().expect("test gate directory");
-        let gate = directory.path().join("exit");
-        let mut command = Command::new("sh");
-        command
-            .args([
-                "-c",
-                "while [ ! -e \"$1\" ]; do sleep 0.01; done",
-                "test-child",
-            ])
-            .arg(&gate)
-            .kill_on_drop(true);
-        let (mut transport, _) = LocalStdioTransport::spawn(command, "test-server".to_string())
-            .expect("spawn test child");
-        let mut observer = transport.exit_observer();
-        let supervisor = observer.supervisor.abort_handle.clone();
-
-        assert_eq!(
-            transport
-                .close()
-                .await
-                .expect_err("live child must time out")
-                .kind(),
-            io::ErrorKind::TimedOut
-        );
-        assert!(
-            !supervisor.is_finished(),
-            "a direct timeout must retain the sole terminal observer"
-        );
-
-        std::fs::write(gate, b"exit").expect("release owned child");
-        tokio::time::resume();
-        tokio::time::timeout(std::time::Duration::from_secs(5), observer.wait())
-            .await
-            .expect("child exit observation completes")
-            .expect("real child exit remains observable after timeout");
-        observer.wait().await.expect("terminal receipt replays");
-    }
-
-    #[tokio::test]
-    async fn legacy_local_exit_observer_waits_for_child_exit() {
-        let mut command = Command::new("sh");
-        command.args(["-c", "exit 0"]);
-        let (transport, _) = LegacyLocalStdioTransport::spawn(command).expect("spawn test child");
-
-        let mut observer = transport.exit_observer();
-        tokio::time::timeout(Duration::from_secs(1), observer.wait())
-            .await
-            .expect("child should exit promptly")
-            .expect("observer should report terminal exit");
-    }
-}
+#[path = "local_stdio_transport_tests.rs"]
+mod tests;

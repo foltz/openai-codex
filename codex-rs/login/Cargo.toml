@@ -21,6 +21,7 @@ codex-protocol = { workspace = true }
 codex-secrets = { workspace = true }
 codex-terminal-detection = { workspace = true }
 codex-utils-template = { workspace = true }
+codex-workload-identity = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
@@ -33,6 +34,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
+tiny_http = { workspace = true }
 tokio = { workspace = true, features = [
     "io-std",
     "macros",
@@ -55,7 +57,6 @@ pretty_assertions = { workspace = true }
 regex-lite = { workspace = true }
 serial_test = { workspace = true }
 tempfile = { workspace = true }
-tiny_http = { workspace = true }
 tracing-subscriber = { workspace = true }
 wiremock = { workspace = true }
 

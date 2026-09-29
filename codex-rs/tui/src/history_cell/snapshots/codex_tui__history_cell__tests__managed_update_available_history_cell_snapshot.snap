@@ -4,7 +4,7 @@ assertion_line: 1197
 expression: rendered
 ---
 ╭───────────────────────────────────────────────────────────────╮
-│ ✨ Update available! 0.0.0 -> 9.9.9                           │
+│ ✨ Update available! 0.156.1 -> 9.9.9                         │
 │ Managed Codex updates use the release and promotion workflow. │
 │                                                               │
 │ See full release notes:                                       │

@@ -7,6 +7,7 @@ use super::connection_handling_websocket::read_response_for_id;
 use super::connection_handling_websocket::send_initialize_request;
 use super::connection_handling_websocket::send_request;
 use super::connection_handling_websocket::spawn_websocket_server;
+use super::connection_handling_websocket::spawn_websocket_server_with_args;
 use super::connection_handling_websocket::spawn_websocket_server_with_env;
 use anyhow::Context;
 use anyhow::Result;
@@ -48,6 +49,8 @@ use tokio::time::timeout;
 
 #[path = "thread_clear_read.rs"]
 mod clear_read;
+#[path = "thread_clear_recovery.rs"]
+mod clear_recovery;
 
 #[derive(Debug)]
 enum ClearEvidence {
@@ -145,16 +148,22 @@ async fn clear_successor_preserves_thread_source_after_preview_and_cold_resume()
         "user"
     );
 
-    // This WebSocket observer has no trusted interactive attachment. Its
-    // attachment state must not turn a persisted user classification into null.
-    send_request(&mut client, "thread/attachment/list", 8, Some(json!({}))).await?;
-    let attachments = read_response_for_id(&mut client, 8).await?;
-    let entries = attachments.result["entries"]
+    // This WebSocket observer has no trusted interactive subscription. Its
+    // subscription state must not turn a persisted user classification into null.
+    send_request(
+        &mut client,
+        "kcf/thread/interactiveSubscription/list",
+        8,
+        Some(json!({})),
+    )
+    .await?;
+    let subscriptions = read_response_for_id(&mut client, 8).await?;
+    let entries = subscriptions.result["entries"]
         .as_array()
-        .context("attachment entries")?;
+        .context("subscription entries")?;
     assert!(!entries.iter().any(|entry| {
         entry["threadId"] == successor
-            && entry["interactiveAttachmentCount"]
+            && entry["interactiveSubscriptionCount"]
                 .as_u64()
                 .unwrap_or_default()
                 > 0
@@ -792,12 +801,10 @@ async fn cleared_and_control_threads_keep_operational_other_idle_unload() -> Res
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri(), "never")?;
     let hook_log = write_lifecycle_logging_hooks(codex_home.path())?;
-    let (mut process, bind_addr) = spawn_websocket_server_with_env(
+    let (mut process, bind_addr) = spawn_websocket_server_with_args(
         codex_home.path(),
-        &[(
-            "CODEX_APP_SERVER_THREAD_UNLOADING_DELAY_MS_FOR_TESTS",
-            "500",
-        )],
+        "ws://127.0.0.1:0",
+        &["-c".to_string(), "thread_unload_delay_secs=1".to_string()],
     )
     .await?;
     let mut client = connect_websocket(bind_addr).await?;
@@ -810,29 +817,66 @@ async fn cleared_and_control_threads_keep_operational_other_idle_unload() -> Res
     let predecessor = start_thread_with_config(&mut client, 2, config.clone()).await?;
     send_clear(&mut client, 3, &predecessor).await?;
     let (response, _) = read_clear_outcome(&mut client, 3).await?;
-    wait_for_thread_closed(&mut client, &predecessor).await?;
+    // Neither subscription retains its runtime. Observe both closures without
+    // assuming an order between the predecessor and its unretained successor.
+    timeout(Duration::from_secs(10), async {
+        let mut pending = std::collections::BTreeSet::from([
+            predecessor.as_str(),
+            response.successor_thread.id.as_str(),
+        ]);
+        while !pending.is_empty() {
+            if let JSONRPCMessage::Notification(notification) =
+                read_jsonrpc_message(&mut client).await?
+                && notification.method == "thread/closed"
+                && let Some(thread_id) = notification
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.get("threadId"))
+                    .and_then(serde_json::Value::as_str)
+            {
+                pending.remove(thread_id);
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .context("timed out waiting for cleared and successor thread unload")??;
 
     let control = start_thread_with_config(&mut client, 4, config).await?;
     assert_unsubscribe_status(&mut client, 5, &control, "unsubscribed").await?;
     wait_for_thread_closed(&mut client, &control).await?;
 
-    let payloads = wait_for_hook_payloads(&hook_log, 3).await?;
+    let payloads = wait_for_hook_payloads(&hook_log, 4).await?;
+    let mut observed = payloads
+        .iter()
+        .map(|payload| {
+            (
+                payload["session_id"].as_str().unwrap_or_default(),
+                payload["reason"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect::<Vec<_>>();
+    // Preserve the causal order for A, without imposing cross-thread ordering.
     assert_eq!(
-        payloads
+        observed
             .iter()
-            .map(|payload| {
-                (
-                    payload["session_id"].as_str().unwrap_or_default(),
-                    payload["reason"].as_str().unwrap_or_default(),
-                )
-            })
+            .filter(|(id, _)| *id == predecessor)
+            .copied()
             .collect::<Vec<_>>(),
         vec![
             (predecessor.as_str(), "clear"),
             (predecessor.as_str(), "other"),
-            (control.as_str(), "other"),
         ]
     );
+    let mut expected = vec![
+        (predecessor.as_str(), "clear"),
+        (predecessor.as_str(), "other"),
+        (response.successor_thread.id.as_str(), "other"),
+        (control.as_str(), "other"),
+    ];
+    observed.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(observed, expected);
     assert_eq!(response.predecessor_thread_id, predecessor);
 
     process.kill().await.context("failed to stop app-server")?;

@@ -29,10 +29,12 @@ use codex_utils_pty::ExecCommandSession;
 use codex_utils_pty::ProcessSignal as PtyProcessSignal;
 use codex_utils_pty::SpawnedPty;
 
+use super::UNIFIED_EXEC_OUTPUT_MAX_BYTES;
 use super::UNIFIED_EXEC_OUTPUT_MAX_TOKENS;
 use super::UnifiedExecError;
 use super::head_tail_buffer::HeadTailBuffer;
 use super::process_state::ProcessState;
+use crate::shell_snapshot::ShellSnapshotFile;
 
 const EARLY_EXIT_GRACE_PERIOD: Duration = Duration::from_millis(150);
 pub(crate) trait SpawnLifecycle: std::fmt::Debug + Send + Sync {
@@ -56,11 +58,10 @@ pub(crate) struct NoopSpawnLifecycle;
 
 impl SpawnLifecycle for NoopSpawnLifecycle {}
 
-pub(crate) type OutputBuffer = Arc<Mutex<HeadTailBuffer>>;
 /// Shared output state exposed to polling and streaming consumers.
 #[derive(Clone)]
-pub(crate) struct OutputHandles {
-    pub(crate) output_buffer: OutputBuffer,
+pub(crate) struct OutputHandles<const MAX_BYTES: usize = UNIFIED_EXEC_OUTPUT_MAX_BYTES> {
+    pub(crate) output_buffer: Arc<Mutex<HeadTailBuffer<MAX_BYTES>>>,
     pub(crate) output_notify: Arc<Notify>,
     pub(crate) output_closed: Arc<AtomicBool>,
     pub(crate) output_closed_notify: Arc<Notify>,
@@ -97,7 +98,10 @@ pub(crate) struct UnifiedExecProcess {
     state_rx: watch::Receiver<ProcessState>,
     output_task: Option<JoinHandle<()>>,
     sandbox_type: SandboxType,
+    timed_out: AtomicBool,
     _spawn_lifecycle: Option<SpawnLifecycleHandle>,
+    // The shell may still need to replay this file after process startup returns.
+    pub(crate) _shell_snapshot: Option<Arc<ShellSnapshotFile>>,
 }
 
 impl std::fmt::Debug for UnifiedExecProcess {
@@ -137,7 +141,9 @@ impl UnifiedExecProcess {
             state_rx,
             output_task: None,
             sandbox_type,
+            timed_out: AtomicBool::new(false),
             _spawn_lifecycle: spawn_lifecycle,
+            _shell_snapshot: None,
         }
     }
 
@@ -195,6 +201,9 @@ impl UnifiedExecProcess {
     }
 
     pub(super) fn exit_code(&self) -> Option<i32> {
+        if self.timed_out() {
+            return Some(124);
+        }
         let state = self.state_rx.borrow().clone();
         match &self.process_handle {
             ProcessHandle::Local(process_handle) => {
@@ -202,6 +211,14 @@ impl UnifiedExecProcess {
             }
             ProcessHandle::ExecServer(_) => state.exit_code,
         }
+    }
+
+    pub(super) fn mark_timed_out(&self) {
+        self.timed_out.store(true, Ordering::Release);
+    }
+
+    pub(super) fn timed_out(&self) -> bool {
+        self.timed_out.load(Ordering::Acquire)
     }
 
     fn finish_termination(&self) {
@@ -259,9 +276,9 @@ impl UnifiedExecProcess {
         self.terminate();
     }
 
-    async fn snapshot_output(&self) -> Vec<Vec<u8>> {
+    async fn snapshot_output(&self) -> Vec<u8> {
         let guard = self.output.output_buffer.lock().await;
-        guard.snapshot_chunks()
+        guard.to_bytes()
     }
 
     pub(crate) fn sandbox_type(&self) -> SandboxType {
@@ -279,13 +296,9 @@ impl UnifiedExecProcess {
         )
         .await;
 
-        let collected_chunks = self.snapshot_output().await;
-        let mut aggregated: Vec<u8> = Vec::new();
-        for chunk in collected_chunks {
-            aggregated.extend_from_slice(&chunk);
-        }
-        let aggregated_text = String::from_utf8_lossy(&aggregated).to_string();
-        self.check_for_sandbox_denial_with_text(&aggregated_text)
+        let aggregated = self.snapshot_output().await;
+        let aggregated_text = String::from_utf8_lossy(&aggregated);
+        self.check_for_sandbox_denial_with_text(aggregated_text.as_ref())
             .await?;
 
         Ok(())
@@ -505,7 +518,7 @@ impl UnifiedExecProcess {
                     for chunk in chunks.into_iter().filter(|chunk| chunk.seq > last_seq) {
                         let bytes = chunk.chunk.into_inner();
                         let mut guard = output_buffer.lock().await;
-                        guard.push_chunk(bytes.clone());
+                        guard.push_chunk(&bytes);
                         drop(guard);
                         let _ = output_tx.send(bytes);
                         output_notify.notify_waiters();
@@ -548,7 +561,7 @@ impl UnifiedExecProcess {
                         last_seq = chunk.seq;
                         let bytes = chunk.chunk.into_inner();
                         let mut guard = output_buffer.lock().await;
-                        guard.push_chunk(bytes.clone());
+                        guard.push_chunk(&bytes);
                         drop(guard);
                         let _ = output_tx.send(bytes);
                         output_notify.notify_waiters();
@@ -609,7 +622,7 @@ impl UnifiedExecProcess {
                 match receiver.recv().await {
                     Ok(chunk) => {
                         let mut guard = output_buffer.lock().await;
-                        guard.push_chunk(chunk.clone());
+                        guard.push_chunk(&chunk);
                         drop(guard);
                         let _ = output_tx.send(chunk);
                         output_notify.notify_waiters();

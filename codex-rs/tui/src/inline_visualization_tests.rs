@@ -23,6 +23,24 @@ fn context_with_fragment(fragment: &str) -> (TempDir, InlineVisualizationContext
 }
 
 #[test]
+fn unterminated_visualization_preview_uses_the_stream_context() {
+    let (codex_home, context) = context_with_fragment("<div>chart</div>");
+    let mut controller = StreamController::new_with_inline_visualizations(
+        Some(80),
+        codex_home.path(),
+        HistoryRenderMode::Rich,
+        Some(context),
+    );
+    controller.push("::codex-inline-vis{file=\"chart.html\"}");
+    let lines = crate::terminal_hyperlinks::visible_lines(controller.current_tail_lines());
+    assert_eq!(
+        line_text(&lines[0]),
+        "Open chart visualization in the browser"
+    );
+    assert_eq!(controller.queued_lines(), 0);
+}
+
+#[test]
 fn granted_visualization_root_overrides_thread_id_derived_root() {
     let codex_home = tempfile::tempdir().expect("temp codex home");
     let granted_context = InlineVisualizationContext::new(codex_home.path(), ThreadId::new())
@@ -244,11 +262,36 @@ fn viewer_reuses_path_and_refreshes_static_document() {
     let (_codex_home, context) = context_with_fragment("<div>first</div>");
     let first_url = context.link_for("chart.html").expect("first viewer link");
     let viewer_path = first_url.to_file_path().expect("viewer file path");
+    let original_viewer_metadata = fs::metadata(&viewer_path).expect("read viewer metadata");
     assert!(
         fs::read_to_string(&viewer_path)
             .expect("read first viewer")
             .contains("first")
     );
+
+    let reused_url = context.link_for("chart.html").expect("reused viewer link");
+
+    assert_eq!(reused_url, first_url);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            fs::metadata(&viewer_path)
+                .expect("read reused viewer metadata")
+                .ino(),
+            original_viewer_metadata.ino()
+        );
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        assert_eq!(
+            fs::metadata(&viewer_path)
+                .expect("read reused viewer metadata")
+                .creation_time(),
+            original_viewer_metadata.creation_time()
+        );
+    }
 
     fs::write(context.thread_dir.join("chart.html"), "<div>second</div>").expect("update fragment");
     let second_url = context.link_for("chart.html").expect("second viewer link");
@@ -301,7 +344,10 @@ fn finalized_agent_cell_replays_visualization_link() {
         .flat_map(|line| &line.line.spans)
         .find(|span| span.content.starts_with("file://"))
         .expect("visualization URL span");
-    assert_eq!(url_span.style, Style::new().cyan().underlined());
+    assert_eq!(
+        url_span.style,
+        Style::new().fg(crate::style::accent_color()).underlined()
+    );
     let destinations = lines
         .iter()
         .flat_map(|line| &line.hyperlinks)

@@ -43,7 +43,24 @@ pub enum ThreadCleanupOutcome {
     TaskJoinFailed,
     ConversationShutdownFailed,
     CodeModeShutdownFailed,
-    GuardianFailed,
+}
+
+impl From<CleanupExecution> for ThreadCleanupOutcome {
+    fn from(cleanup: CleanupExecution) -> Self {
+        match cleanup {
+            CleanupExecution::Finished { persistence_failed } => {
+                Self::Finished { persistence_failed }
+            }
+            CleanupExecution::Panicked => Self::Panicked,
+            CleanupExecution::TimedOut => Self::TimedOut,
+            CleanupExecution::AuthorityUnavailable => Self::AuthorityUnavailable,
+            CleanupExecution::McpFailed => Self::McpFailed,
+            CleanupExecution::McpPrewarmFailed => Self::McpPrewarmFailed,
+            CleanupExecution::TaskJoinFailed => Self::TaskJoinFailed,
+            CleanupExecution::ConversationShutdownFailed => Self::ConversationShutdownFailed,
+            CleanupExecution::CodeModeShutdownFailed => Self::CodeModeShutdownFailed,
+        }
+    }
 }
 
 /// Independent facts needed by the lifecycle owner; no fallback emits a
@@ -281,26 +298,7 @@ impl ThreadRetirement {
                     Ok(SessionLoopOutcome::Panicked) => ThreadLoopOutcome::Panicked,
                     Err(_) => ThreadLoopOutcome::TimedOut,
                 },
-                cleanup: match cleanup {
-                    CleanupExecution::Finished { persistence_failed } => {
-                        ThreadCleanupOutcome::Finished { persistence_failed }
-                    }
-                    CleanupExecution::Panicked => ThreadCleanupOutcome::Panicked,
-                    CleanupExecution::TimedOut => ThreadCleanupOutcome::TimedOut,
-                    CleanupExecution::AuthorityUnavailable => {
-                        ThreadCleanupOutcome::AuthorityUnavailable
-                    }
-                    CleanupExecution::McpFailed => ThreadCleanupOutcome::McpFailed,
-                    CleanupExecution::McpPrewarmFailed => ThreadCleanupOutcome::McpPrewarmFailed,
-                    CleanupExecution::TaskJoinFailed => ThreadCleanupOutcome::TaskJoinFailed,
-                    CleanupExecution::ConversationShutdownFailed => {
-                        ThreadCleanupOutcome::ConversationShutdownFailed
-                    }
-                    CleanupExecution::CodeModeShutdownFailed => {
-                        ThreadCleanupOutcome::CodeModeShutdownFailed
-                    }
-                    CleanupExecution::GuardianFailed => ThreadCleanupOutcome::GuardianFailed,
-                },
+                cleanup: cleanup.into(),
             }
         }
         .boxed()

@@ -19,7 +19,6 @@ use std::io;
 use std::os::windows::io::OwnedHandle;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -41,14 +40,12 @@ use codex_exec_server::ExecProcessEventReceiver;
 use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
 use codex_utils_path_uri::LegacyAppPathString;
 use codex_utils_path_uri::PathUri;
-#[cfg(all(unix, not(target_os = "macos")))]
+use codex_utils_pty::Command;
+use codex_utils_pty::ProcessMode;
+#[cfg(unix)]
 use codex_utils_pty::process_group::kill_process_group;
-#[cfg(target_os = "macos")]
-use codex_utils_pty::process_group::kill_process_group_with_member_fallback as kill_process_group;
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(unix)]
 use codex_utils_pty::process_group::terminate_process_group;
-#[cfg(target_os = "macos")]
-use codex_utils_pty::process_group::terminate_process_group_with_member_fallback as terminate_process_group;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use rmcp::service::RoleClient;
@@ -57,14 +54,13 @@ use rmcp::service::TxJsonRpcMessage;
 use rmcp::transport::Transport;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
-use tokio::process::Command;
 use tokio::sync::broadcast;
+use tokio::sync::watch;
 use tokio::time::Instant;
 use tracing::info;
 use tracing::warn;
 
 use crate::executor_process_transport::ExecutorProcessTransport;
-use crate::local_stdio_transport::LegacyLocalStdioTransport;
 use crate::local_stdio_transport::LocalProcessExitObserver;
 use crate::local_stdio_transport::LocalStdioTransport;
 use crate::program_resolver;
@@ -111,8 +107,7 @@ pub struct StdioServerTransport {
 }
 
 enum StdioServerTransportInner {
-    LocalLegacy(LegacyLocalStdioTransport),
-    LocalModern(LocalStdioTransport),
+    Local(LocalStdioTransport),
     Executor(ExecutorProcessTransport),
 }
 
@@ -127,8 +122,7 @@ impl Transport<RoleClient> for StdioServerTransport {
         // wrapper keeps process placement private while leaving rmcp's send
         // semantics unchanged.
         match &mut self.inner {
-            StdioServerTransportInner::LocalLegacy(transport) => transport.send(item).boxed(),
-            StdioServerTransportInner::LocalModern(transport) => transport.send(item).boxed(),
+            StdioServerTransportInner::Local(transport) => transport.send(item).boxed(),
             StdioServerTransportInner::Executor(transport) => transport.send(item).boxed(),
         }
     }
@@ -138,8 +132,7 @@ impl Transport<RoleClient> for StdioServerTransport {
         // executor variant turns pushed process-output events back into the
         // line-delimited JSON stream expected by rmcp.
         match &mut self.inner {
-            StdioServerTransportInner::LocalLegacy(transport) => transport.receive().boxed(),
-            StdioServerTransportInner::LocalModern(transport) => transport.receive().boxed(),
+            StdioServerTransportInner::Local(transport) => transport.receive().boxed(),
             StdioServerTransportInner::Executor(transport) => transport.receive().boxed(),
         }
     }
@@ -150,8 +143,7 @@ impl Transport<RoleClient> for StdioServerTransport {
         // Waiting for that mutex before terminating would bypass the deadline.
         self.process.terminate().await?;
         match &mut self.inner {
-            StdioServerTransportInner::LocalLegacy(transport) => transport.close().await,
-            StdioServerTransportInner::LocalModern(transport) => {
+            StdioServerTransportInner::Local(transport) => {
                 transport.close_after_terminal_observation().await
             }
             StdioServerTransportInner::Executor(transport) => {
@@ -234,6 +226,9 @@ impl StdioServerLauncher for LocalStdioServerLauncher {
 #[cfg(unix)]
 const PROCESS_GROUP_TERM_GRACE_PERIOD: Duration = Duration::from_secs(2);
 
+// Keep queued stderr diagnostics before closing the reader, even when an
+// escaped descendant prevents the pipe from reaching EOF.
+const STDERR_READER_DRAIN_GRACE_PERIOD: Duration = Duration::from_millis(250);
 pub(super) const PROCESS_RETIREMENT_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[cfg(unix)]
@@ -260,6 +255,8 @@ struct StdioServerProcessHandleInner {
     kind: StdioServerProcessKind,
     terminal_observed: AtomicBool,
     termination_lock: tokio::sync::Mutex<()>,
+    // An escaped descendant can keep stderr open after the MCP server exits.
+    stderr_reader: Option<watch::Sender<()>>,
 }
 
 enum StdioServerProcessKind {
@@ -297,16 +294,8 @@ impl LocalStdioServerLauncher {
 
         let build_command = || {
             let mut command = Command::new(&resolved_program);
-            command
-                .kill_on_drop(true)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .current_dir(&cwd)
-                .env_clear()
-                .envs(&envs)
-                .args(&args);
-            #[cfg(unix)]
-            command.process_group(0);
+            command.current_dir(&cwd).envs(&envs).args(&args);
+            command.process_mode(ProcessMode::NewGroup);
             command
         };
         #[cfg(windows)]
@@ -316,7 +305,7 @@ impl LocalStdioServerLauncher {
         #[cfg(windows)]
         let job = match codex_utils_pty::JobObject::create_without_breakaway() {
             Ok(job) => {
-                job.prepare_suspended_spawn(&mut command);
+                command.prepare_suspended_spawn(&job);
                 Some(job)
             }
             Err(error) => {
@@ -331,31 +320,16 @@ impl LocalStdioServerLauncher {
             Option<u32>,
             LocalProcessExitObserver,
         )> {
-            match protocol_mode {
-                McpProtocolMode::Legacy => {
-                    let (transport, stderr) = LegacyLocalStdioTransport::spawn(command)?;
-                    let process_id = transport.id();
-                    let exit_observer = transport.exit_observer();
-                    Ok((
-                        StdioServerTransportInner::LocalLegacy(transport),
-                        stderr,
-                        process_id,
-                        exit_observer,
-                    ))
-                }
-                McpProtocolMode::V20260728 => {
-                    let (transport, stderr) =
-                        LocalStdioTransport::spawn(command, program_name.clone())?;
-                    let process_id = transport.id();
-                    let exit_observer = transport.exit_observer();
-                    Ok((
-                        StdioServerTransportInner::LocalModern(transport),
-                        stderr,
-                        process_id,
-                        exit_observer,
-                    ))
-                }
-            }
+            let (transport, stderr) =
+                LocalStdioTransport::spawn(command, program_name.clone(), protocol_mode)?;
+            let process_id = transport.id();
+            let exit_observer = transport.exit_observer();
+            Ok((
+                StdioServerTransportInner::Local(transport),
+                stderr,
+                process_id,
+                exit_observer,
+            ))
         };
         let (transport, stderr, process_id, exit_observer) = spawn_transport(command)?;
         #[cfg(windows)]
@@ -395,26 +369,45 @@ impl LocalStdioServerLauncher {
         };
         #[cfg(not(windows))]
         let terminator = process_id.map(LocalProcessTerminator::new);
-        let process =
-            StdioServerProcessHandle::local(program_name.clone(), terminator, exit_observer);
-
-        if let Some(stderr) = stderr {
-            tokio::spawn(async move {
+        let stderr_reader = stderr.map(|stderr| {
+            let program_name = program_name.clone();
+            let (stop_tx, mut stop_rx) = watch::channel(());
+            std::mem::drop(tokio::spawn(async move {
                 let mut reader = BufReader::new(stderr).lines();
+                // Give queued diagnostics time to reach the logs without waiting
+                // indefinitely for a descendant that still has stderr open.
+                let drain_deadline = tokio::time::sleep(STDERR_READER_DRAIN_GRACE_PERIOD);
+                tokio::pin!(drain_deadline);
+                let mut draining = false;
                 loop {
-                    match reader.next_line().await {
-                        Ok(Some(line)) => {
-                            info!("MCP server stderr ({program_name}): {line}");
+                    tokio::select! {
+                        biased;
+                        _ = &mut drain_deadline, if draining => break,
+                        _ = stop_rx.changed(), if !draining => {
+                            draining = true;
+                            drain_deadline.as_mut().reset(
+                                Instant::now() + STDERR_READER_DRAIN_GRACE_PERIOD
+                            );
                         }
-                        Ok(None) => break,
-                        Err(error) => {
-                            warn!("Failed to read MCP server stderr ({program_name}): {error}");
-                            break;
-                        }
+                        line = reader.next_line() => {
+                            match line {
+                                Ok(Some(line)) => {
+                                    info!("MCP server stderr ({program_name}): {line}");
+                                }
+                                Ok(None) => break,
+                                Err(error) => {
+                                    warn!("Failed to read MCP server stderr ({program_name}): {error}");
+                                    break;
+                                }
+                            }
+                        },
                     }
                 }
-            });
-        }
+            }));
+            stop_tx
+        });
+        let process =
+            StdioServerProcessHandle::local(program_name, terminator, exit_observer, stderr_reader);
 
         Ok(StdioServerTransport {
             inner: transport,
@@ -524,6 +517,7 @@ impl StdioServerProcessHandle {
         program_name: String,
         terminator: Option<LocalProcessTerminator>,
         exit_observer: LocalProcessExitObserver,
+        stderr_reader: Option<watch::Sender<()>>,
     ) -> Self {
         Self {
             inner: Arc::new(StdioServerProcessHandleInner {
@@ -534,6 +528,7 @@ impl StdioServerProcessHandle {
                 },
                 terminal_observed: AtomicBool::new(false),
                 termination_lock: tokio::sync::Mutex::new(()),
+                stderr_reader,
             }),
         }
     }
@@ -545,14 +540,11 @@ impl StdioServerProcessHandle {
                 kind: StdioServerProcessKind::Executor(process),
                 terminal_observed: AtomicBool::new(false),
                 termination_lock: tokio::sync::Mutex::new(()),
+                stderr_reader: None,
             }),
         }
     }
 
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "the async attempt lock serializes bounded termination observations, not shared runtime state"
-    )]
     pub(crate) async fn terminate(&self) -> io::Result<()> {
         self.terminate_until(tokio::time::Instant::now() + PROCESS_RETIREMENT_TIMEOUT)
             .await
@@ -577,48 +569,55 @@ impl StdioServerProcessHandle {
         if self.inner.terminal_observed.load(Ordering::Acquire) {
             return Ok(());
         }
-        match &self.inner.kind {
-            StdioServerProcessKind::Local {
-                terminator,
-                exit_observer,
-            } => {
-                let Some(terminator) = terminator else {
-                    exit_observer.abort();
-                    return Err(io::Error::other(
-                        "local MCP process has no process-group terminal evidence",
-                    ));
-                };
-                let mut exit_observer = exit_observer.clone();
-                tokio::time::timeout_at(deadline, async {
-                    tokio::try_join!(exit_observer.wait(), terminator.terminate_and_observe())?;
-                    Ok::<(), io::Error>(())
-                })
-                .await
-                .map_err(|_| {
-                    io::Error::new(io::ErrorKind::TimedOut, "local MCP exit timed out")
-                })??;
-                self.inner.terminal_observed.store(true, Ordering::Release);
-                Ok(())
-            }
-            StdioServerProcessKind::Executor(process) => {
-                // Subscribe before the request so a quickly-closing process is
-                // observed through replay rather than mistaken request acceptance.
-                let mut events = process.subscribe_events();
-                // A previous cancelled/failed attempt is not terminal proof.
-                // Resend the idempotent request; successful observation is
-                // retained by this handle independently of bounded replay.
-                tokio::time::timeout_at(deadline, async {
-                    process.terminate().await.map_err(io::Error::other)?;
-                    await_executor_process_close(&mut events).await
-                })
-                .await
-                .map_err(|_| {
-                    io::Error::new(io::ErrorKind::TimedOut, "executor MCP close timed out")
-                })??;
-                self.inner.terminal_observed.store(true, Ordering::Release);
-                Ok(())
+        let result = async {
+            match &self.inner.kind {
+                StdioServerProcessKind::Local {
+                    terminator,
+                    exit_observer,
+                } => {
+                    let Some(terminator) = terminator else {
+                        exit_observer.abort();
+                        return Err(io::Error::other(
+                            "local MCP process has no process-group terminal evidence",
+                        ));
+                    };
+                    let mut exit_observer = exit_observer.clone();
+                    tokio::time::timeout_at(deadline, async {
+                        tokio::try_join!(exit_observer.wait(), terminator.terminate_and_observe())?;
+                        Ok::<(), io::Error>(())
+                    })
+                    .await
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::TimedOut, "local MCP exit timed out")
+                    })??;
+                    self.inner.terminal_observed.store(true, Ordering::Release);
+                    Ok(())
+                }
+                StdioServerProcessKind::Executor(process) => {
+                    // Subscribe before the request so a quickly-closing process is
+                    // observed through replay rather than mistaken request acceptance.
+                    let mut events = process.subscribe_events();
+                    // A previous cancelled/failed attempt is not terminal proof.
+                    // Resend the idempotent request; successful observation is
+                    // retained by this handle independently of bounded replay.
+                    tokio::time::timeout_at(deadline, async {
+                        process.terminate().await.map_err(io::Error::other)?;
+                        await_executor_process_close(&mut events).await
+                    })
+                    .await
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::TimedOut, "executor MCP close timed out")
+                    })??;
+                    self.inner.terminal_observed.store(true, Ordering::Release);
+                    Ok(())
+                }
             }
         }
+        .await;
+        if let Some(stderr_reader) = &self.inner.stderr_reader {
+            stderr_reader.send_replace(());
+        }
+        result
     }
 }
 
@@ -690,6 +689,9 @@ impl Drop for StdioServerProcessHandleInner {
                     }
                 }));
             }
+        }
+        if let Some(stderr_reader) = &self.stderr_reader {
+            stderr_reader.send_replace(());
         }
     }
 }
@@ -768,9 +770,11 @@ impl ExecutorStdioServerLauncher {
         // rmcp write JSON-RPC requests after the process starts.
         let started = exec_backend
             .start(ExecParams {
+                metadata: Default::default(),
                 process_id,
                 argv,
                 cwd,
+                shell_snapshot: None,
                 env_policy: Some(Self::remote_env_policy(&remote_env_vars)),
                 env,
                 tty: false,
@@ -1005,11 +1009,17 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn missing_local_group_terminator_never_claims_retirement() {
-        let mut command = tokio::process::Command::new("sleep");
-        command.arg("30").kill_on_drop(true);
-        let (transport, _) = LocalStdioTransport::spawn(command, "test".to_owned()).unwrap();
-        let handle =
-            StdioServerProcessHandle::local("test".to_owned(), None, transport.exit_observer());
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        let (transport, _) =
+            LocalStdioTransport::spawn(command, "test".to_owned(), McpProtocolMode::Legacy)
+                .unwrap();
+        let handle = StdioServerProcessHandle::local(
+            "test".to_owned(),
+            /*terminator*/ None,
+            transport.exit_observer(),
+            /*stderr_reader*/ None,
+        );
         for _ in 0..2 {
             assert!(handle.terminate().await.is_err());
             assert!(!handle.inner.terminal_observed.load(Ordering::Acquire));

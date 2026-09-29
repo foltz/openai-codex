@@ -87,6 +87,29 @@ pub(crate) struct AccountWorkPermitGuard {
     permits: AccountWorkPermits,
 }
 
+impl AccountWorkPermitGuard {
+    /// Count a child operation started by this already-admitted work.
+    ///
+    /// Unlike fresh admission, derivation remains valid after barrier closure:
+    /// the borrowed parent keeps the count nonzero until the child is counted.
+    /// The child has its own lifetime and must be retained until its terminal
+    /// evidence, even if the parent request or turn finishes first. Deriving
+    /// through the guard also prevents borrowing authority from another
+    /// coordinator's registry. Exhaustion refuses without changing the barrier.
+    pub(crate) fn try_derive(&self) -> Option<Self> {
+        self.permits
+            .inner
+            .state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                ((state & ACCOUNT_WORK_COUNT_MASK) < ACCOUNT_WORK_COUNT_MASK).then(|| state + 1)
+            })
+            .ok()?;
+        Some(Self {
+            permits: self.permits.clone(),
+        })
+    }
+}
+
 impl Drop for AccountWorkPermitGuard {
     fn drop(&mut self) {
         self.permits.inner.state.fetch_sub(1, Ordering::AcqRel);
@@ -95,7 +118,7 @@ impl Drop for AccountWorkPermitGuard {
 }
 
 impl AccountWorkPermits {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: Arc::new(AccountWorkPermitsInner {
                 state: AtomicU64::new(0),
@@ -137,6 +160,7 @@ impl AccountWorkPermits {
         self.inner
             .state
             .fetch_and(ACCOUNT_WORK_COUNT_MASK, Ordering::AcqRel);
+        self.inner.signal.notify_waiters();
         // Observe the actual admission-opening point, not terminal return.
         #[cfg(test)]
         if let Some(observe) = self.inner.after_reopen.lock().unwrap().take() {
@@ -146,6 +170,21 @@ impl AccountWorkPermits {
 
     pub(crate) fn admitted_count(&self) -> u64 {
         self.inner.state.load(Ordering::Acquire) & ACCOUNT_WORK_COUNT_MASK
+    }
+
+    /// A retry hint, not admission. Register before checking so reopening
+    /// between refusal and this future's first poll cannot lose the wake.
+    pub(crate) async fn wait_until_available(&self) {
+        loop {
+            let notified = self.inner.signal.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let state = self.inner.state.load(Ordering::Acquire);
+            if state & ACCOUNT_WORK_CLOSED == 0 && state < ACCOUNT_WORK_COUNT_MASK {
+                return;
+            }
+            notified.await;
+        }
     }
 
     fn wake_waiters(&self) {
@@ -165,6 +204,10 @@ impl AccountWorkPermits {
 #[path = "account_work_permits_tests.rs"]
 mod account_work_permits_tests;
 
+#[cfg(test)]
+#[path = "effective_plugin_change_custody_tests.rs"]
+mod effective_plugin_change_custody_tests;
+
 #[derive(Clone)]
 pub(crate) struct ManagedTransitionCoordinator {
     state: Arc<Mutex<CoordinatorState>>,
@@ -172,6 +215,7 @@ pub(crate) struct ManagedTransitionCoordinator {
     /// only ever queries it, never mutates it.
     target_evidence_source: Arc<dyn TargetEvidenceSource>,
     account_work_permits: AccountWorkPermits,
+    account_turn_work: crate::account_turn_work::AccountTurnWork,
     /// `None` for every Slice 1-3 construction path (`new`,
     /// `from_authoritative_auth_state[_and_target_evidence_source]`): those
     /// coordinators keep exactly their pre-Slice-4 behavior, closing the
@@ -204,6 +248,7 @@ pub(crate) enum ResetInventoryError {
     ConfigLoadTimedOut,
     ResidencyUnavailable,
     RemoteControlUnavailable,
+    ConstructorsIncomplete,
     ThreadsIncomplete {
         submit_failed: usize,
         timed_out: usize,
@@ -244,6 +289,12 @@ impl From<ResetInventoryError> for TransitionFailure {
 /// without touching any real subsystem.
 pub(crate) trait ResetInventory: Send + Sync {
     fn reset_all(&self) -> ResetInventoryFuture<'_>;
+
+    /// Progress already-admitted construction before adoption. This is not a
+    /// reset and must not close admission, retire sessions or admit fresh work.
+    fn drive_admitted_constructions(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(std::future::pending())
+    }
 }
 
 /// What `advance_inner` should do to the coordinator's own CAS baseline
@@ -559,6 +610,7 @@ impl ManagedTransitionCoordinator {
             })),
             target_evidence_source,
             account_work_permits: AccountWorkPermits::new(),
+            account_turn_work: crate::account_turn_work::AccountTurnWork::default(),
             adoption: None,
         }
     }
@@ -646,6 +698,23 @@ impl ManagedTransitionCoordinator {
     /// the coordinator's auth manager or reset inventory.
     pub(crate) fn account_work_permits(&self) -> AccountWorkPermits {
         self.account_work_permits.clone()
+    }
+
+    /// Listener-independent turn evidence shared with host admission hooks.
+    pub(crate) fn account_turn_work(&self) -> crate::account_turn_work::AccountTurnWork {
+        self.account_turn_work.clone()
+    }
+
+    /// Bind the owners created before ThreadManager and its host callbacks.
+    /// Used only during process construction, before this coordinator admits work.
+    pub(crate) fn with_account_work(
+        mut self,
+        permits: AccountWorkPermits,
+        work: crate::account_turn_work::AccountTurnWork,
+    ) -> Self {
+        self.account_work_permits = permits;
+        self.account_turn_work = work;
+        self
     }
 
     /// Re-derives current target evidence from this coordinator's own source
@@ -998,6 +1067,14 @@ impl ManagedTransitionCoordinator {
             .await?;
 
         let deadline = tokio::time::Instant::now() + DRAIN_DEADLINE;
+        let construction_progress = async {
+            if let Some(deps) = &self.adoption {
+                deps.reset_inventory.drive_admitted_constructions().await;
+            }
+            // A stopped inventory observer is not a drain-completion signal.
+            std::future::pending::<()>().await;
+        };
+        tokio::pin!(construction_progress);
         loop {
             // Race-free: `Notify::notified()` captures its
             // `notify_waiters_calls` baseline at *creation* (before this
@@ -1034,7 +1111,17 @@ impl ManagedTransitionCoordinator {
                 break;
             }
 
-            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+            let work_finished = async {
+                tokio::select! {
+                    _ = notified => {}
+                    _ = self.account_turn_work.observe_terminated() => {}
+                    _ = &mut construction_progress => {}
+                }
+            };
+            if tokio::time::timeout_at(deadline, work_finished)
+                .await
+                .is_err()
+            {
                 // Deadline elapsed. `advance` sets `retryable: true` for
                 // `Quarantined` already; no auth was ever touched and
                 // admitted work was never cancelled or killed (R013).
@@ -3581,6 +3668,7 @@ mod tests {
             agent_identity: None,
             personal_access_token: None,
             bedrock_api_key: None,
+            bedrock_access_keys: None,
         };
         codex_login::save_auth(
             codex_home,
@@ -3823,6 +3911,7 @@ mod tests {
     struct RecordingResetInventory {
         called: AtomicBool,
         should_fail: bool,
+        parked_work: std::sync::Mutex<Option<AccountWorkPermitGuard>>,
     }
 
     impl RecordingResetInventory {
@@ -3830,6 +3919,7 @@ mod tests {
             Self {
                 called: AtomicBool::new(false),
                 should_fail,
+                parked_work: std::sync::Mutex::new(None),
             }
         }
 
@@ -3839,6 +3929,13 @@ mod tests {
     }
 
     impl ResetInventory for RecordingResetInventory {
+        fn drive_admitted_constructions(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(async move {
+                drop(self.parked_work.lock().unwrap().take());
+                std::future::pending::<()>().await;
+            })
+        }
+
         fn reset_all(&self) -> ResetInventoryFuture<'_> {
             Box::pin(async move {
                 self.called.store(true, Ordering::Release);
@@ -4269,13 +4366,14 @@ mod tests {
             assert_eq!(success.phase, ManagedTransitionPhase::Succeeded);
             assert_eq!(success.auth_revision, original.auth_revision);
             assert_eq!(resets.calls.load(Ordering::SeqCst), 3);
-            let state = coordinator.state.lock().await;
-            assert!(state.pending_reset.is_none());
-            assert!(
-                state.auth_authority_available,
-                "successful pending-reset recovery must restore the authority latch"
-            );
-            drop(state);
+            {
+                let state = coordinator.state.lock().await;
+                assert!(state.pending_reset.is_none());
+                assert!(
+                    state.auth_authority_available,
+                    "successful pending-reset recovery must restore the authority latch"
+                );
+            }
             assert!(coordinator.try_acquire_account_work_permit().is_some());
             assert_eq!(
                 coordinator
@@ -4429,6 +4527,14 @@ mod tests {
             Arc::clone(&reset_inventory) as Arc<dyn ResetInventory>,
         );
         let process_id = coordinator.process_instance_id().await;
+
+        // An abandoned constructor cannot rely on the later reset to poll it:
+        // the coordinator must drive already-admitted work before adoption.
+        *reset_inventory.parked_work.lock().unwrap() = Some(
+            coordinator
+                .try_acquire_account_work_permit()
+                .expect("admit constructor"),
+        );
 
         // A different account lands on disk before the transition reaches
         // Adopting -- simulating the operator's external managed-auth write

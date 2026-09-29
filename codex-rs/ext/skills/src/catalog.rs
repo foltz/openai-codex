@@ -178,6 +178,9 @@ pub struct SkillCatalogEntry {
     pub short_description: Option<String>,
     pub main_prompt: SkillResourceId,
     pub display_path: Option<String>,
+    pub(crate) canonical_skill_id: Option<String>,
+    pub(crate) plugin_id: Option<String>,
+    pub(crate) analytics_scope: Option<SkillScope>,
     alias_root: Option<String>,
     alias_root_order: Option<usize>,
     prompt_scope: Option<SkillScope>,
@@ -202,6 +205,9 @@ impl SkillCatalogEntry {
             short_description: None,
             main_prompt,
             display_path: None,
+            canonical_skill_id: None,
+            plugin_id: None,
+            analytics_scope: None,
             alias_root: None,
             alias_root_order: None,
             prompt_scope: None,
@@ -327,12 +333,21 @@ pub struct SkillSearchMatch {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SkillProviderError {
     pub message: String,
+    pub(crate) admission_refused: bool,
 }
 
 impl SkillProviderError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            admission_refused: false,
+        }
+    }
+
+    pub(crate) fn admission_refused() -> Self {
+        Self {
+            message: codex_mcp::McpAttemptRefused.to_string(),
+            admission_refused: true,
         }
     }
 }

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::HookEventName;
@@ -175,9 +176,25 @@ fn request() -> SessionEndRequest {
     }
 }
 
+struct UnexpectedMcpExecutor;
+
+impl crate::mcp::HookMcpExecutor for UnexpectedMcpExecutor {
+    fn execute(
+        &self,
+        _call: crate::mcp::HookMcpCall,
+    ) -> futures::future::BoxFuture<'_, anyhow::Result<String>> {
+        panic!("command hook fixture must not invoke MCP");
+    }
+}
+
 fn engine(handler: ConfiguredHandler, shell: CommandShell) -> ClaudeHooksEngine {
     let (result_sender, _result_receiver) = async_channel::unbounded();
-    let runtime = CommandHookRuntime::new(shell, ThreadId::new(), result_sender);
+    let runtime = CommandHookRuntime::new(
+        shell,
+        Arc::new(std::env::vars_os().collect()),
+        ThreadId::new(),
+        result_sender,
+    );
     let mut engine = ClaudeHooksEngine::new(
         /*enabled*/ true,
         /*bypass_hook_trust*/ false,
@@ -185,6 +202,7 @@ fn engine(handler: ConfiguredHandler, shell: CommandShell) -> ClaudeHooksEngine 
         Vec::new(),
         Vec::new(),
         runtime,
+        Arc::new(UnexpectedMcpExecutor),
     );
     engine.handlers = vec![handler];
     engine
@@ -201,7 +219,10 @@ fn set_command(handler: &mut ConfiguredHandler, command: &str) {
     let crate::engine::ConfiguredHandlerKind::Command {
         command: configured,
         ..
-    } = &mut handler.kind;
+    } = &mut handler.kind
+    else {
+        panic!("expected command hook fixture");
+    };
     *configured = command.to_string();
 }
 
@@ -221,12 +242,13 @@ fn assert_failed_with(events: &[codex_protocol::protocol::HookCompletedEvent], t
 
 fn handler(matcher: Option<&str>) -> ConfiguredHandler {
     ConfiguredHandler {
+        builtin: false,
         event_name: HookEventName::SessionEnd,
         matcher: matcher.map(str::to_string),
         timeout_sec: 2,
         status_message: None,
         additional_context_limit: Default::default(),
-        source_path: test_path_buf("/tmp/hooks.json").abs(),
+        source_path: test_path_buf("/tmp/hooks.json").abs().into(),
         source: HookSource::User,
         display_order: 0,
         kind: crate::engine::ConfiguredHandlerKind::Command {

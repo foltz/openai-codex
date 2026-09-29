@@ -2,6 +2,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use codex_exec_server::ExecutorFileSystem;
+use codex_exec_server::FileSystemEnvironmentAccessor;
+use codex_exec_server::GetMetadataOptions;
+use codex_exec_server::ReadFileOptions;
 use codex_protocol::protocol::SkillScope;
 use codex_skills::ParsedSkillFrontmatter;
 use codex_skills::SkillError;
@@ -149,6 +152,9 @@ async fn load_skills_under_root(
     Vec<SkillError>,
 ) {
     let file_system = skill_root.file_system.as_ref();
+    // TODO(anp): Bind discovery to turn permissions when host skill roots accept an accessor;
+    // until then, keep using the same unrestricted filesystem that supplied the root.
+    let discovery_access = FileSystemEnvironmentAccessor::unrestricted(&skill_root.file_system);
     let plugin_identity = skill_root.plugin_identity();
     let plugin_root = match skill_root.plugin_root() {
         Some(plugin_root) => Some(canonicalize_for_skill_identity(file_system, plugin_root).await),
@@ -165,7 +171,7 @@ async fn load_skills_under_root(
         mut namespace_roots,
         warnings,
     } = discover_skills(
-        file_system,
+        &discovery_access,
         &PathUri::from_abs_path(root),
         SkillDiscoveryOptions {
             directory_symlinks,
@@ -219,7 +225,14 @@ async fn load_skills_under_root(
                     );
                     return None;
                 }
-                match file_system.get_metadata(&path_uri, /*sandbox*/ None).await {
+                match file_system
+                    .get_metadata(
+                        &path_uri,
+                        GetMetadataOptions::default(),
+                        /*sandbox*/ None,
+                    )
+                    .await
+                {
                     Ok(metadata) if metadata.is_file => {}
                     Ok(_) => {
                         error!(
@@ -261,7 +274,7 @@ async fn load_skills_under_root(
             Some(namespace) => SkillNamespaceResolver::with_provided_namespace(namespace),
             None => {
                 SkillNamespaceResolver::discover(
-                    file_system,
+                    &discovery_access,
                     &root_uri,
                     &skill_paths,
                     plugin_roots,
@@ -348,7 +361,7 @@ async fn parse_skill_file(
     }
     .unwrap_or(SkillMetadataDiscovery::Absent);
     let (contents, loaded_metadata) = tokio::join!(
-        file_system.read_file_text(path_uri, /*sandbox*/ None),
+        file_system.read_file_text(path_uri, ReadFileOptions::default(), /*sandbox*/ None,),
         load_host_skill_metadata(file_system, path, &metadata, plugin_root),
     );
     let contents = contents.map_err(|error| format!("failed to read file: {error}"))?;

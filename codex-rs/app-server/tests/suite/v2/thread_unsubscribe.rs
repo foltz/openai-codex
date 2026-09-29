@@ -9,7 +9,9 @@ use codex_app_server_protocol::DynamicToolCallResponse;
 use codex_app_server_protocol::DynamicToolFunctionSpec;
 use codex_app_server_protocol::DynamicToolSpec;
 use codex_app_server_protocol::ItemStartedNotification;
+use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::ServerRequest;
+use codex_app_server_protocol::ThreadClosedNotification;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadLoadedListParams;
 use codex_app_server_protocol::ThreadLoadedListResponse;
@@ -20,6 +22,7 @@ use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStatus;
+use codex_app_server_protocol::ThreadStatusChangedNotification;
 use codex_app_server_protocol::ThreadUnsubscribeParams;
 use codex_app_server_protocol::ThreadUnsubscribeResponse;
 use codex_app_server_protocol::ThreadUnsubscribeStatus;
@@ -32,15 +35,17 @@ use core_test_support::streaming_sse::start_streaming_sse_server;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use tempfile::TempDir;
+use test_case::test_case;
 use tokio::time::timeout;
 
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 #[tokio::test]
-async fn thread_unsubscribe_keeps_thread_loaded_until_idle_timeout() -> Result<()> {
+async fn thread_resubscribe_does_not_retain_idle_thread() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     MockResponsesConfig::new(&server.uri())
         .with_sandbox_mode("danger-full-access")
+        .with_root_config("thread_unload_delay_secs = 2")
         .write(codex_home.path())?;
 
     let mut mcp = TestAppServer::builder()
@@ -55,6 +60,20 @@ async fn thread_unsubscribe_keeps_thread_loaded_until_idle_timeout() -> Result<(
         })
         .await?;
     let thread_id = thread.id;
+
+    // Persist a rollout so both warm and cold resumes can find the thread.
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.start_turn_and_wait_for_completion(TurnStartParams {
+            thread_id: thread_id.clone(),
+            input: vec![V2UserInput::Text {
+                text: "hello".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        }),
+    )
+    .await??;
 
     let unsubscribe: ThreadUnsubscribeResponse = mcp
         .request(|request_id| ClientRequest::ThreadUnsubscribe {
@@ -81,14 +100,97 @@ async fn thread_unsubscribe_keeps_thread_loaded_until_idle_timeout() -> Result<(
             params: ThreadLoadedListParams::default(),
         })
         .await?;
-    assert_eq!(data, vec![thread_id]);
+    assert_eq!(data, vec![thread_id.clone()]);
     assert_eq!(next_cursor, None);
+
+    let resume: ThreadResumeResponse = mcp
+        .request(|request_id| ClientRequest::ThreadResume {
+            request_id,
+            params: ThreadResumeParams {
+                thread_id: thread_id.clone(),
+                ..Default::default()
+            },
+        })
+        .await?;
+    assert_eq!(resume.thread.id, thread_id);
+
+    // Subscriptions observe but do not retain. Collect both unload notifications
+    // without requiring an ordering between them.
+    let (closed, status) = timeout(DEFAULT_READ_TIMEOUT, async {
+        let mut closed = None;
+        let mut status = None;
+        loop {
+            if let JSONRPCMessage::Notification(notification) = mcp.read_next_message().await? {
+                match notification.method.as_str() {
+                    "thread/closed" => {
+                        let value: ThreadClosedNotification =
+                            serde_json::from_value(notification.params.unwrap_or_default())?;
+                        if value.thread_id == thread_id {
+                            closed = Some(value);
+                        }
+                    }
+                    "thread/status/changed" => {
+                        let value: ThreadStatusChangedNotification =
+                            serde_json::from_value(notification.params.unwrap_or_default())?;
+                        if value.thread_id == thread_id && value.status == ThreadStatus::NotLoaded {
+                            status = Some(value);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if closed.is_some() && status.is_some() {
+                return anyhow::Ok((closed.unwrap(), status.unwrap()));
+            }
+        }
+    })
+    .await??;
+    assert_eq!(
+        closed,
+        ThreadClosedNotification {
+            thread_id: thread_id.clone()
+        }
+    );
+    assert_eq!(
+        status,
+        ThreadStatusChangedNotification {
+            thread_id: thread_id.clone(),
+            status: ThreadStatus::NotLoaded,
+        }
+    );
+    let loaded: ThreadLoadedListResponse = mcp
+        .request(|request_id| ClientRequest::ThreadLoadedList {
+            request_id,
+            params: ThreadLoadedListParams::default(),
+        })
+        .await?;
+    assert_eq!(
+        loaded,
+        ThreadLoadedListResponse {
+            data: Vec::new(),
+            next_cursor: None
+        }
+    );
+
+    let resume: ThreadResumeResponse = mcp
+        .request(|request_id| ClientRequest::ThreadResume {
+            request_id,
+            params: ThreadResumeParams {
+                thread_id: thread_id.clone(),
+                ..Default::default()
+            },
+        })
+        .await?;
+    assert_eq!(resume.thread.id, thread_id);
+    assert_eq!(resume.thread.status, ThreadStatus::Idle);
 
     Ok(())
 }
 
+// Zero-delay idle threads may unload before turn/start: subscriptions do not retain.
+#[test_case(1; "one_second_delay")]
 #[tokio::test]
-async fn thread_unsubscribe_during_turn_keeps_turn_running() -> Result<()> {
+async fn thread_unsubscribe_during_turn_keeps_turn_running(delay_secs: u64) -> Result<()> {
     let call_id = "deterministic-wait-call";
     let tool_name = "deterministic_wait";
     let tool_args = json!({});
@@ -121,6 +223,7 @@ async fn thread_unsubscribe_during_turn_keeps_turn_running() -> Result<()> {
     let final_response_completed = completions.remove(0);
     MockResponsesConfig::new(server.uri())
         .with_sandbox_mode("danger-full-access")
+        .with_root_config(&format!("thread_unload_delay_secs = {delay_secs}"))
         .write(&codex_home)?;
 
     let mut mcp = TestAppServer::builder()
@@ -145,6 +248,16 @@ async fn thread_unsubscribe_during_turn_keeps_turn_running() -> Result<()> {
         })
         .await?;
     let thread_id = thread.id;
+
+    // The thread remains loaded during the configured idle grace period.
+    assert!(
+        timeout(
+            std::time::Duration::from_millis(250),
+            mcp.read_stream_until_notification_message("thread/closed"),
+        )
+        .await
+        .is_err()
+    );
 
     let _: TurnStartResponse = mcp
         .request(|request_id| ClientRequest::TurnStart {
@@ -207,7 +320,7 @@ async fn thread_unsubscribe_during_turn_keeps_turn_running() -> Result<()> {
     assert_eq!(unsubscribe.status, ThreadUnsubscribeStatus::Unsubscribed);
 
     let closed_while_tool_call_blocked = timeout(
-        std::time::Duration::from_millis(250),
+        std::time::Duration::from_millis(1200),
         mcp.read_stream_until_notification_message("thread/closed"),
     );
     let closed_while_tool_call_blocked = closed_while_tool_call_blocked.await;
@@ -228,6 +341,20 @@ async fn thread_unsubscribe_during_turn_keeps_turn_running() -> Result<()> {
     )
     .await?;
     timeout(DEFAULT_READ_TIMEOUT, final_response_completed).await??;
+    if delay_secs > 0 {
+        // Once the turn finishes, inactivity starts a fresh countdown.
+        assert!(
+            timeout(
+                std::time::Duration::from_millis(250),
+                mcp.read_stream_until_notification_message("thread/closed"),
+            )
+            .await
+            .is_err()
+        );
+    }
+    let closed: ThreadClosedNotification =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_notification("thread/closed")).await??;
+    assert_eq!(closed, ThreadClosedNotification { thread_id });
     server.shutdown().await;
 
     Ok(())

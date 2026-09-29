@@ -13,17 +13,15 @@ use crate::Cli;
 use crate::app_server_session::AppServerSession;
 use crate::legacy_core::config::ConfigBuilder;
 use crate::legacy_core::config::ConfigOverrides;
-use crate::legacy_core::config::bootstrap_auth_config;
 use crate::legacy_core::config::load_config_toml_with_layer_stack;
 use crate::legacy_core::config::resolve_oss_provider;
 use crate::legacy_core::config::resolve_profile_v2_config_path;
-use crate::named_session_lookup::NamedSessionCandidates;
 use crate::named_session_lookup::SessionCollection;
-use crate::named_session_lookup::SessionNameLookupMode;
+use crate::named_session_lookup::display_label;
+use crate::named_session_lookup::lookup;
 use codex_app_server_client::InProcessHost;
 use codex_app_server_protocol::Thread as AppServerThread;
 use codex_arg0::Arg0DispatchPaths;
-use codex_cloud_config::cloud_config_bundle_loader_for_storage;
 use codex_config::CloudConfigBundleLoader;
 use codex_config::ConfigLoadOptions;
 use codex_config::LoaderOverrides;
@@ -86,7 +84,7 @@ pub async fn run_session_archive_command(
 ) -> Result<String> {
     let codex_home = find_codex_home().wrap_err("failed to find Codex home")?;
     let mut app_server =
-        start_app_server_for_archive_command(options, codex_home.to_path_buf()).await?;
+        start_app_server_for_session_command(options, codex_home.to_path_buf()).await?;
     run_session_archive_action_with_app_server(
         &mut app_server,
         codex_home.as_path(),
@@ -157,63 +155,31 @@ async fn resolve_session_target(
         });
     }
 
-    let (search_scope, archived_values): (&str, &[bool]) = match action {
-        SessionArchiveAction::Archive => ("active", &[false]),
-        SessionArchiveAction::Delete(_) => ("active or archived", &[false, true]),
-        SessionArchiveAction::Unarchive => ("archived", &[true]),
+    let (search_scope, collections): (&str, &[SessionCollection]) = match action {
+        SessionArchiveAction::Archive => ("active", &[SessionCollection::Active]),
+        SessionArchiveAction::Delete(_) => (
+            "active or archived",
+            &[SessionCollection::Active, SessionCollection::Archived],
+        ),
+        SessionArchiveAction::Unarchive => ("archived", &[SessionCollection::Archived]),
     };
-    for &archived in archived_values {
-        if let Some(thread) =
-            lookup_session_by_exact_name(app_server, codex_home, target, archived).await?
-        {
-            return session_target_from_app_server_thread(thread);
-        }
+    if let Some(thread) = lookup(
+        app_server,
+        codex_home,
+        target,
+        collections,
+        &[super::resume_source_kinds(
+            /*include_non_interactive*/ false,
+        )],
+        /*model_provider*/ None,
+    )
+    .await?
+    {
+        return session_target_from_app_server_thread(thread);
     }
     Err(eyre!(
         "No {search_scope} session found matching '{target}'."
     ))
-}
-
-async fn lookup_session_by_exact_name(
-    app_server: &mut AppServerSession,
-    codex_home: &Path,
-    name: &str,
-    archived: bool,
-) -> Result<Option<AppServerThread>> {
-    // Remote workspaces stay on their existing server-side path. Local workspaces trust SQLite
-    // names, then scan and repair only after a miss or an unusable rollout path.
-    let lookup_modes = if app_server.uses_remote_workspace() {
-        &[SessionNameLookupMode::ScanAndRepair][..]
-    } else {
-        &[
-            SessionNameLookupMode::StateDbOnly,
-            SessionNameLookupMode::ScanAndRepair,
-        ][..]
-    };
-    for &lookup_mode in lookup_modes {
-        // Search is the fast path, but legacy stores attach renamed titles after filtering.
-        for search_term in [Some(name), None] {
-            let mut candidates = NamedSessionCandidates::new(
-                name,
-                codex_home,
-                if archived {
-                    SessionCollection::Archived
-                } else {
-                    SessionCollection::Active
-                },
-                lookup_mode,
-                search_term,
-            );
-            if let Some(candidate) = candidates
-                .next(app_server)
-                .await
-                .wrap_err("failed to list sessions while resolving session name")?
-            {
-                return Ok(Some(candidate.thread));
-            }
-        }
-    }
-    Ok(None)
 }
 
 fn session_target_from_app_server_thread(thread: AppServerThread) -> Result<ResolvedSessionTarget> {
@@ -221,7 +187,7 @@ fn session_target_from_app_server_thread(thread: AppServerThread) -> Result<Reso
         .wrap_err_with(|| format!("app server returned invalid session id `{}`", thread.id))?;
     Ok(ResolvedSessionTarget {
         session_id,
-        session_name: thread.name,
+        session_name: Some(display_label(&thread).to_string()),
     })
 }
 
@@ -254,7 +220,7 @@ fn confirm_session_delete(target: &ResolvedSessionTarget) -> Result<bool> {
     Ok(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
 }
 
-async fn start_app_server_for_archive_command(
+pub(super) async fn start_app_server_for_session_command(
     options: SessionArchiveCommandOptions,
     codex_home: PathBuf,
 ) -> Result<AppServerSession> {
@@ -263,6 +229,9 @@ async fn start_app_server_for_archive_command(
         arg0_paths,
         explicit_remote_endpoint,
     } = options;
+    if cli.no_daemon && explicit_remote_endpoint.is_some() {
+        return Err(eyre!("--no-daemon cannot be used with --remote."));
+    }
     let loader_overrides = LoaderOverrides::default();
     let strict_config = cli.strict_config;
     let raw_overrides = cli.config_overrides.raw_overrides.clone();
@@ -279,22 +248,28 @@ async fn start_app_server_for_archive_command(
         launch_loader_overrides.user_config_profile = Some(profile_v2.clone());
     }
 
-    let reuse_implicit_local_daemon = super::can_reuse_implicit_local_daemon(
-        &cli_kv_overrides,
-        &launch_loader_overrides,
-        strict_config,
-        cli.bypass_hook_trust || cli.psp,
-    );
+    let workload_identity_selected = codex_login::is_workload_identity_selected();
+    let reuse_implicit_local_daemon = !cli.no_daemon
+        && !workload_identity_selected
+        && super::daemon_startup::config_exclusion(
+            &cli_kv_overrides,
+            &launch_loader_overrides,
+            strict_config,
+            cli.bypass_hook_trust,
+        )
+        .is_none();
     let default_daemon = if explicit_remote_endpoint.is_none() && reuse_implicit_local_daemon {
         super::maybe_probe_default_daemon_socket(codex_home.as_path()).await
     } else {
         None
     };
-    let app_server_target = super::app_server_target_for_launch(
+    let mut app_server_target = super::app_server_target_for_launch(
         explicit_remote_endpoint,
         default_daemon,
         reuse_implicit_local_daemon,
-    );
+        workload_identity_selected,
+        std::env::var_os(codex_exec_server::CODEX_EXEC_SERVER_URL_ENV_VAR).as_deref(),
+    )?;
     let remote_cwd_override = cli
         .cwd
         .clone()
@@ -338,14 +313,12 @@ async fn start_app_server_for_archive_command(
     .await
     .wrap_err("failed to load config.toml")?;
     let config_toml = &bootstrap_config.config_toml;
-    let cloud_config_bundle = cloud_config_bundle_loader_for_storage(
-        app_server_target.auth_config_for_cloud_loader(bootstrap_auth_config(
-            codex_home.as_path(),
-            &bootstrap_config,
-        )?),
-        /*enable_codex_api_key_env*/ false,
+    let cloud_config_bundle = super::cloud_config_bundle_for_app_server_target(
+        &app_server_target,
+        &bootstrap_config,
+        codex_home.as_path(),
     )
-    .await;
+    .await?;
 
     let model_provider = if cli.oss {
         resolve_oss_provider(cli.oss_provider.as_deref(), config_toml)
@@ -374,7 +347,6 @@ async fn start_app_server_for_archive_command(
             main_execve_wrapper_exe: arg0_paths.main_execve_wrapper_exe.clone(),
             show_raw_agent_reasoning: cli.oss.then_some(true),
             bypass_hook_trust: cli.bypass_hook_trust.then_some(true),
-            psp: Some(cli.psp),
             ..Default::default()
         })
         .loader_overrides(loader_overrides.clone())
@@ -388,13 +360,12 @@ async fn start_app_server_for_archive_command(
             .build(Some(local_runtime_paths), config.http_client_factory())
             .wrap_err("failed to initialize environment manager")?,
     );
-    let state_db = super::init_state_db_for_app_server_target(&config, &app_server_target)
+    let mut state_db = super::init_state_db_for_app_server_target(&config, &app_server_target)
         .await
         .wrap_err("failed to initialize state database")?;
-    let embedded_host = matches!(&app_server_target, super::AppServerTarget::Embedded)
-        .then(|| Arc::new(InProcessHost::default()));
+    let embedded_host = Some(Arc::new(InProcessHost::default()));
     let app_server_result = super::start_app_server(
-        &app_server_target,
+        &mut app_server_target,
         arg0_paths,
         config,
         cli_kv_overrides,
@@ -403,7 +374,7 @@ async fn start_app_server_for_archive_command(
         cloud_config_bundle,
         codex_feedback::CodexFeedback::new(),
         /*log_db*/ None,
-        state_db,
+        &mut state_db,
         environment_manager,
         embedded_host.clone(),
     )

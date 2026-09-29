@@ -9,6 +9,10 @@ use pretty_assertions::assert_eq;
 use std::sync::Arc;
 
 #[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "holding the lifecycle table proves independent runtime cleanup and retained observation after cancellation"
+)]
 async fn processor_shutdown_lifecycle_lock_cannot_starve_runtime_cleanup() {
     let (_home, manager, config) = crate::request_processors::thread_shutdown_fixture().await;
     let started = manager
@@ -114,7 +118,8 @@ async fn zero_grant_observation_does_not_block_or_change_retirement_authority() 
         .try_add_connection_to_thread(thread_id, ConnectionId(1))
         .await
         .expect("observe");
-    let before = serde_json::to_value(manager.thread_attachment_list().await).expect("snapshot");
+    let before = serde_json::to_value(manager.thread_interactive_subscription_list().await)
+        .expect("snapshot");
     let watch = manager
         .subscribe_to_retention(thread_id)
         .await
@@ -131,7 +136,8 @@ async fn zero_grant_observation_does_not_block_or_change_retirement_authority() 
         vec![ConnectionId(1)]
     );
     assert_eq!(
-        serde_json::to_value(manager.thread_attachment_list().await).expect("snapshot"),
+        serde_json::to_value(manager.thread_interactive_subscription_list().await)
+            .expect("snapshot"),
         before
     );
 }
@@ -206,6 +212,10 @@ async fn acquisition_and_retirement_claim_have_one_atomic_winner() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "polling both contenders while their authority lock is held establishes deterministic FIFO race order"
+)]
 async fn production_claim_and_acquire_have_one_winner_in_both_lock_orders() {
     for acquire_first in [true, false] {
         let (_home, core, config) = crate::request_processors::thread_shutdown_fixture().await;
@@ -231,13 +241,12 @@ async fn production_claim_and_acquire_have_one_winner_in_both_lock_orders() {
         let settings = crate::request_processors::thread_settings_from_config_snapshot(
             &started.thread.config_snapshot().await,
         );
-        let (_commands, generation, previous) = entry.lock().await.set_listener(
+        let (_commands, generation) = entry.lock().await.set_listener(
             cancel_tx,
             &started.thread,
             codex_file_watcher::WatchRegistration::default(),
             settings,
         );
-        assert!(previous.is_none());
         let watch = state
             .subscribe_to_retention(thread_id)
             .await

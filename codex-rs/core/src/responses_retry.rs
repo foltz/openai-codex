@@ -5,7 +5,8 @@ use std::time::Duration;
 use crate::client::ModelClientSession;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
-use crate::util::backoff;
+use codex_client::RetryOperation;
+use codex_features::Feature;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::protocol::EventMsg;
@@ -23,6 +24,7 @@ pub(crate) enum ResponsesStreamRequest {
 
 pub(crate) struct ResponsesStreamRetryState {
     retries: u64,
+    connection_retries: u64,
     connection_retry_delay: Duration,
 }
 
@@ -30,14 +32,22 @@ impl Default for ResponsesStreamRetryState {
     fn default() -> Self {
         Self {
             retries: 0,
+            connection_retries: 0,
             connection_retry_delay: INITIAL_CONNECTION_RETRY_DELAY,
         }
     }
 }
 
-/// Handles a retryable stream error and returns `Ok(())` when the caller should
-/// retry the request loop.
-pub(crate) async fn handle_retryable_response_stream_error(
+/// Server retry advice retained after stream retries are exhausted. The turn ID
+/// prevents a reused Guardian session from applying advice from an earlier review.
+pub(crate) struct ExhaustedResponseRetry {
+    pub(crate) turn_id: String,
+    pub(crate) retry_at: Option<tokio::time::Instant>,
+}
+
+/// Returns `Ok(())` when the caller should retry the request loop, or the original error when
+/// it is terminal or the retry budget is exhausted.
+pub(crate) async fn handle_response_stream_error(
     retry_state: &mut ResponsesStreamRetryState,
     max_retries: u64,
     err: CodexErr,
@@ -46,7 +56,20 @@ pub(crate) async fn handle_retryable_response_stream_error(
     turn_context: &TurnContext,
     request: ResponsesStreamRequest,
 ) -> Result<(), CodexErr> {
-    if matches!(request, ResponsesStreamRequest::Sampling)
+    let operation = match request {
+        ResponsesStreamRequest::Sampling => RetryOperation::Sampling,
+        ResponsesStreamRequest::RemoteCompactionV2 => RetryOperation::RemoteCompactionV2,
+    };
+    let retry_count = retry_state.retries.saturating_add(1);
+    let Some(delay) = err.retry_delay(retry_count) else {
+        return Err(err);
+    };
+
+    if turn_context
+        .config
+        .features
+        .enabled(Feature::UnboundedConnectionRetries)
+        && matches!(request, ResponsesStreamRequest::Sampling)
         && matches!(err.details(), CodexErrorDetails::ConnectionFailed(_))
         && !turn_context.session_source.is_internal()
         && !turn_context.provider.info().is_amazon_bedrock()
@@ -60,6 +83,8 @@ pub(crate) async fn handle_retryable_response_stream_error(
         );
         sess.notify_stream_error(turn_context, "Reconnecting... waiting for network", err)
             .await;
+        retry_state.connection_retries = retry_state.connection_retries.saturating_add(1);
+        codex_client::record_retry!(retry_state.connection_retries, retry_delay, operation);
         tokio::time::sleep(retry_delay).await;
         retry_state.connection_retry_delay = retry_delay
             .saturating_mul(2)
@@ -67,10 +92,11 @@ pub(crate) async fn handle_retryable_response_stream_error(
         return Ok(());
     }
 
+    // TODO(anp): Respect server retry advice before issuing the fallback HTTP request.
     if retry_state.retries >= max_retries
         && client_session.try_switch_fallback_transport(
             &turn_context.session_telemetry,
-            &turn_context.model_info,
+            turn_context.model_info(),
         )
     {
         sess.send_event(
@@ -85,9 +111,7 @@ pub(crate) async fn handle_retryable_response_stream_error(
     }
 
     if retry_state.retries < max_retries {
-        retry_state.retries += 1;
-        let retry_count = retry_state.retries;
-        let delay = err.retry_delay().unwrap_or_else(|| backoff(retry_count));
+        retry_state.retries = retry_count;
         log_retry(request, turn_context, &err, retry_count, max_retries, delay);
 
         // In release builds, hide the first websocket retry notification to reduce noisy
@@ -105,10 +129,19 @@ pub(crate) async fn handle_retryable_response_stream_error(
             )
             .await;
         }
+        codex_client::record_retry!(retry_count, delay, operation);
         tokio::time::sleep(delay).await;
         return Ok(());
     }
 
+    sess.services
+        .thread_extension_data
+        .insert(ExhaustedResponseRetry {
+            turn_id: turn_context.sub_id.clone(),
+            retry_at: err
+                .server_retry_delay()
+                .and_then(|delay| tokio::time::Instant::now().checked_add(delay)),
+        });
     Err(err)
 }
 

@@ -10,25 +10,19 @@ use tracing::debug_span;
 use tracing::info_span;
 
 use crate::session::SessionLoopOutcome;
-use crate::session::SteerInputError;
-use crate::session::TurnInput;
 use crate::session::session::Session;
-use crate::session::session::SessionSettingsUpdate;
+use crate::session::thread_settings;
+use crate::session::turn_input;
 
 use crate::config::Config;
+use crate::context::ContextualUserFragment;
+use crate::context::GuardianApprovedAction;
 use crate::review_prompts::resolve_review_request;
 use crate::session::spawn_review_thread;
 use crate::tasks::CompactTask;
 use crate::tasks::UserShellCommandMode;
 use crate::tasks::UserShellCommandTask;
 use crate::tasks::execute_user_shell_command;
-use crate::user_message_admission::UserMessageAdmission;
-use codex_history::RolloutItem;
-use codex_protocol::error::CodexErr;
-use codex_protocol::error::Result as CodexResult;
-use codex_protocol::models::ContentItem;
-use codex_protocol::models::ResponseInputItem;
-use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::Event;
@@ -42,13 +36,11 @@ use codex_protocol::protocol::RealtimeVoicesList;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::ThreadMemoryMode;
-use codex_protocol::protocol::ThreadRolledBackEvent;
-use codex_protocol::protocol::ThreadSettingsAppliedEvent;
-use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::request_user_input::RequestUserInputResponse;
+use codex_thread_store::PersistContext;
 
 use crate::context_manager::is_user_turn_boundary;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
@@ -81,219 +73,27 @@ pub async fn realtime_conversation_list_voices(sess: &Session, sub_id: String) {
     .await;
 }
 
-pub async fn user_input_or_turn(
-    sess: &Arc<Session>,
-    sub_id: String,
-    op: Op,
-    client_user_message_id: Option<String>,
-    parent_turn_id: Option<String>,
-) {
-    let admission = user_input_or_turn_inner(
-        sess,
-        sub_id.clone(),
-        op,
-        client_user_message_id,
-        parent_turn_id,
-    )
-    .await;
-    sess.pending_user_message_admissions
-        .complete(&sub_id, admission);
-}
-
-pub async fn update_thread_settings(
-    sess: &Arc<Session>,
-    sub_id: String,
-    thread_settings: ThreadSettingsOverrides,
-) {
-    let updates = thread_settings_update(sess, thread_settings).await;
-    match sess.update_settings(updates).await {
-        Ok(()) => {
-            sess.send_event_raw_without_materializing_rollout(Event {
-                id: sub_id,
-                msg: thread_settings_applied_event(sess).await,
-            })
-            .await;
-        }
-        Err(err) => {
-            sess.send_event_raw(Event {
-                id: sub_id,
-                msg: EventMsg::Error(ErrorEvent {
-                    message: format!("invalid thread settings override: {err}"),
-                    codex_error_info: Some(CodexErrorInfo::BadRequest),
-                }),
-            })
-            .await;
-        }
-    }
-}
-
-async fn thread_settings_update(
-    sess: &Session,
-    thread_settings: ThreadSettingsOverrides,
-) -> SessionSettingsUpdate {
-    let ThreadSettingsOverrides {
-        environments,
-        profile_workspace_roots,
-        approval_policy,
-        approvals_reviewer,
-        sandbox_policy,
-        permission_profile,
-        active_permission_profile,
-        windows_sandbox_level,
-        model,
-        effort,
-        summary,
-        service_tier,
-        collaboration_mode,
-        personality,
-    } = thread_settings;
-    let collaboration_mode = match collaboration_mode {
-        Some(collaboration_mode) => collaboration_mode,
-        None => {
-            let state = sess.state.lock().await;
-            // Model and reasoning effort live in CollaborationMode settings today, so
-            // partial thread-settings updates refresh those fields on the active mode.
-            state
-                .session_configuration
-                .collaboration_mode
-                .with_updates(model, effort, /*developer_instructions*/ None)
-        }
-    };
-    SessionSettingsUpdate {
-        environments,
-        profile_workspace_roots,
-        approval_policy,
-        approvals_reviewer,
-        sandbox_policy,
-        permission_profile,
-        active_permission_profile,
-        windows_sandbox_level,
-        collaboration_mode: Some(collaboration_mode),
-        reasoning_summary: summary,
-        service_tier,
-        personality,
-        ..Default::default()
-    }
-}
-
-pub(super) async fn thread_settings_applied_event(sess: &Session) -> EventMsg {
-    let snapshot = {
-        let state = sess.state.lock().await;
-        state.session_configuration.thread_config_snapshot()
-    };
-    EventMsg::ThreadSettingsApplied(ThreadSettingsAppliedEvent {
-        thread_settings: snapshot.into_thread_settings_snapshot(),
-    })
-}
-
-pub(super) async fn user_input_or_turn_inner(
-    sess: &Arc<Session>,
-    sub_id: String,
-    op: Op,
-    client_user_message_id: Option<String>,
-    parent_turn_id: Option<String>,
-) -> CodexResult<UserMessageAdmission> {
-    let Op::UserInput {
-        items,
-        final_output_json_schema,
-        responsesapi_client_metadata,
-        additional_context,
-        thread_settings,
-    } = op
-    else {
-        unreachable!();
-    };
-    let emit_thread_settings_applied = thread_settings != ThreadSettingsOverrides::default();
-    let mut updates = if emit_thread_settings_applied {
-        thread_settings_update(sess, thread_settings).await
-    } else {
-        SessionSettingsUpdate::default()
-    };
-    updates.final_output_json_schema = Some(final_output_json_schema);
-
-    // new_turn_with_sub_id already emits an error event when settings are invalid.
-    let current_context = sess.new_turn_with_sub_id(sub_id.clone(), updates).await?;
-    if emit_thread_settings_applied {
-        sess.send_event_raw_without_materializing_rollout(Event {
-            id: sub_id.clone(),
-            msg: thread_settings_applied_event(sess).await,
-        })
-        .await;
-    }
-    sess.maybe_emit_model_warnings_for_turn(current_context.as_ref())
-        .await;
-    match sess
-        .steer_input(
-            items.clone(),
-            additional_context.clone(),
-            /*expected_turn_id*/ None,
-            client_user_message_id.clone(),
-            responsesapi_client_metadata.clone(),
-        )
-        .await
-    {
-        Ok(turn_id) => {
-            current_context.session_telemetry.user_prompt(&items);
-            Ok(UserMessageAdmission::Steered { turn_id })
-        }
-        Err(SteerInputError::NoActiveTurn(items)) => {
-            if let Some(id) = parent_turn_id {
-                current_context.turn_metadata_state.set_parent_turn_id(id);
-            }
-            if let Some(responsesapi_client_metadata) = responsesapi_client_metadata {
-                current_context
-                    .turn_metadata_state
-                    .set_responsesapi_client_metadata(responsesapi_client_metadata);
-            }
-            current_context.session_telemetry.user_prompt(&items);
-            let additional_context_input = {
-                let mut state = sess.state.lock().await;
-                state.additional_context.merge(additional_context)
-            };
-            let mut task_input = additional_context_input
-                .into_iter()
-                .map(ResponseItem::from)
-                .map(TurnInput::ResponseItem)
-                .collect::<Vec<_>>();
-            if !items.is_empty() {
-                task_input.push(TurnInput::UserInput {
-                    content: items,
-                    client_id: client_user_message_id,
-                });
-            }
-            sess.spawn_task(
-                Arc::clone(&current_context),
-                task_input,
-                crate::tasks::RegularTask::new(),
-            )
-            .await;
-            Ok(UserMessageAdmission::Started { turn_id: sub_id })
-        }
-        Err(err) => {
-            sess.send_event_raw(Event {
-                id: sub_id.clone(),
-                msg: EventMsg::Error(err.to_error_event()),
-            })
-            .await;
-            Err(CodexErr::InvalidRequest(format!(
-                "failed to admit user message: {err:?}"
-            )))
-        }
-    }
-}
-
 /// Queues an inter-agent message, then lets the shared pending-work scheduler
 /// decide whether an idle session should start a regular turn.
 pub async fn inter_agent_communication(
     sess: &Arc<Session>,
     sub_id: String,
     communication: InterAgentCommunication,
-    parent_turn_id: Option<String>,
+    start_options: codex_protocol::turn_input::TurnStartOptions,
+    work: Option<Box<dyn codex_protocol::host_turn_work::HostTurnWork>>,
 ) {
     let trigger_turn = communication.trigger_turn;
+    let work = if trigger_turn {
+        work
+    } else {
+        if work.is_some() {
+            tracing::debug!("discarding host turn work attached to queue-only mail");
+        }
+        drop(work);
+        None
+    };
     sess.input_queue
-        .enqueue_mailbox_communication(communication, parent_turn_id.filter(|_| trigger_turn))
-        .await;
+        .enqueue_mailbox_with_work(communication, start_options, work);
     crate::agent_communication::emit_agent_communication_receive(&sub_id);
     if trigger_turn || sess.has_outstanding_durable_sleep() {
         sess.maybe_start_turn_for_pending_work_with_sub_id(sub_id)
@@ -301,7 +101,12 @@ pub async fn inter_agent_communication(
     }
 }
 
-pub async fn run_user_shell_command(sess: &Arc<Session>, sub_id: String, command: String) {
+pub async fn run_user_shell_command(
+    sess: &Arc<Session>,
+    sub_id: String,
+    command: String,
+    timeout_ms: Option<u64>,
+) {
     if let Some((turn_context, cancellation_token)) =
         sess.active_turn_context_and_cancellation_token().await
     {
@@ -311,6 +116,7 @@ pub async fn run_user_shell_command(sess: &Arc<Session>, sub_id: String, command
                 session,
                 turn_context,
                 command,
+                timeout_ms,
                 cancellation_token,
                 UserShellCommandMode::ActiveTurnAuxiliary,
             )
@@ -319,11 +125,13 @@ pub async fn run_user_shell_command(sess: &Arc<Session>, sub_id: String, command
         return;
     }
 
-    let turn_context = sess.new_default_turn_with_sub_id(sub_id).await;
+    let turn_context = sess
+        .new_turn_with_default_settings(sub_id, Default::default())
+        .await;
     sess.spawn_task(
-        Arc::clone(&turn_context),
+        turn_context,
         Vec::new(),
-        UserShellCommandTask::new(command),
+        UserShellCommandTask::new(command, timeout_ms),
     )
     .await;
 }
@@ -441,115 +249,16 @@ pub async fn reload_user_config(sess: &Arc<Session>) {
     sess.reload_user_config_layer().await;
 }
 
-pub async fn compact(sess: &Arc<Session>, sub_id: String) {
-    let turn_context = sess.new_default_turn_with_sub_id(sub_id).await;
-
-    sess.spawn_task(Arc::clone(&turn_context), Vec::new(), CompactTask)
+pub async fn compact(sess: &Arc<Session>, sub_id: String) -> bool {
+    // Stop the old turn before the compact task picks up the next turn's environments.
+    sess.abort_all_tasks(TurnAbortReason::Replaced).await;
+    let turn_context = sess
+        .new_turn_with_default_settings(sub_id, Default::default())
         .await;
-}
 
-pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32) {
-    if num_turns == 0 {
-        sess.send_event_raw(Event {
-            id: sub_id,
-            msg: EventMsg::Error(ErrorEvent {
-                message: "num_turns must be >= 1".to_string(),
-                codex_error_info: Some(CodexErrorInfo::ThreadRollbackFailed),
-            }),
-        })
-        .await;
-        return;
-    }
-
-    let has_active_turn = { sess.active_turn.lock().await.is_some() };
-    if has_active_turn {
-        sess.send_event_raw(Event {
-            id: sub_id,
-            msg: EventMsg::Error(ErrorEvent {
-                message: "Cannot rollback while a turn is in progress.".to_string(),
-                codex_error_info: Some(CodexErrorInfo::ThreadRollbackFailed),
-            }),
-        })
-        .await;
-        return;
-    }
-
-    let turn_context = sess.new_default_turn_with_sub_id(sub_id).await;
-    let live_thread = match sess.live_thread_for_persistence("rollback thread") {
-        Ok(live_thread) => live_thread,
-        Err(_) => {
-            sess.send_event_raw(Event {
-                id: turn_context.sub_id.clone(),
-                msg: EventMsg::Error(ErrorEvent {
-                    message: "thread rollback requires persisted thread history".to_string(),
-                    codex_error_info: Some(CodexErrorInfo::ThreadRollbackFailed),
-                }),
-            })
-            .await;
-            return;
-        }
-    };
-    if let Err(err) = live_thread.flush().await {
-        sess.send_event_raw(Event {
-            id: turn_context.sub_id.clone(),
-            msg: EventMsg::Error(ErrorEvent {
-                message: format!("failed to flush thread persistence for rollback replay: {err}"),
-                codex_error_info: Some(CodexErrorInfo::ThreadRollbackFailed),
-            }),
-        })
-        .await;
-        return;
-    }
-
-    let stored_history = match live_thread.load_history(/*include_archived*/ false).await {
-        Ok(history) => history,
-        Err(err) => {
-            sess.send_event_raw(Event {
-                id: turn_context.sub_id.clone(),
-                msg: EventMsg::Error(ErrorEvent {
-                    message: format!("failed to load thread history for rollback replay: {err}"),
-                    codex_error_info: Some(CodexErrorInfo::ThreadRollbackFailed),
-                }),
-            })
-            .await;
-            return;
-        }
-    };
-
-    let rollback_event = ThreadRolledBackEvent { num_turns };
-    let rollback_msg = EventMsg::ThreadRolledBack(rollback_event.clone());
-    let replay_items = stored_history
-        .items
-        .into_iter()
-        .chain(std::iter::once(RolloutItem::EventMsg(rollback_msg.clone())))
-        .collect::<Vec<_>>();
-    sess.apply_rollout_reconstruction(turn_context.as_ref(), replay_items.as_slice())
-        .await;
-    sess.services
-        .agent_control
-        .rollout_budget()
-        .rearm_reminder(sess.thread_id());
-    sess.recompute_token_usage(turn_context.as_ref()).await;
-
-    sess.persist_rollout_items(&[RolloutItem::EventMsg(rollback_msg.clone())])
-        .await;
-    if let Err(err) = sess.flush_rollout().await {
-        sess.send_event(
-            turn_context.as_ref(),
-            EventMsg::Warning(WarningEvent {
-                message: format!(
-                    "Rolled the thread back, but failed to save the rollback marker. Codex will continue retrying. Error: {err}"
-                ),
-            }),
-        )
-        .await;
-    }
-
-    sess.deliver_event_raw(Event {
-        id: turn_context.sub_id.clone(),
-        msg: rollback_msg,
-    })
-    .await;
+    sess.try_spawn_task(turn_context, Vec::new(), CompactTask)
+        .await
+        .is_ok()
 }
 
 pub(super) async fn persist_thread_memory_mode_update(
@@ -557,7 +266,7 @@ pub(super) async fn persist_thread_memory_mode_update(
     mode: ThreadMemoryMode,
 ) -> anyhow::Result<()> {
     let live_thread = sess.live_thread_for_persistence("update thread memory mode")?;
-    live_thread.persist().await?;
+    live_thread.persist(PersistContext::Standard).await?;
     live_thread.flush().await?;
     live_thread
         .update_memory_mode(mode, /*include_archived*/ false)
@@ -576,6 +285,7 @@ pub async fn set_thread_memory_mode(sess: &Arc<Session>, sub_id: String, mode: T
         let event = Event {
             id: sub_id,
             msg: EventMsg::Error(ErrorEvent {
+                misalignment: None,
                 message: err.to_string(),
                 codex_error_info: Some(CodexErrorInfo::Other),
             }),
@@ -584,7 +294,7 @@ pub async fn set_thread_memory_mode(sess: &Arc<Session>, sub_id: String, mode: T
     }
 }
 
-async fn shutdown_session_runtime(
+pub(super) async fn shutdown_session_runtime(
     sess: &Arc<Session>,
     mode: super::retirement::CleanupMode,
 ) -> Option<super::retirement::CleanupExecution> {
@@ -598,6 +308,11 @@ async fn shutdown_session_runtime(
         failure = Some(super::retirement::CleanupExecution::ConversationShutdownFailed);
     }
     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+    let shell_snapshot_prewarm = sess.state.lock().await.shell_snapshot_prewarm.take();
+    if let Some(shell_snapshot_prewarm) = shell_snapshot_prewarm {
+        shell_snapshot_prewarm.abort();
+        let _ = shell_snapshot_prewarm.await;
+    }
     if let super::retirement::CleanupMode::Legacy = mode {
         let task_result = sess
             .task_joins
@@ -643,17 +358,9 @@ async fn shutdown_session_runtime(
             failure.get_or_insert(super::retirement::CleanupExecution::McpFailed);
         }
     }
-    let guardian = match mode {
-        super::retirement::CleanupMode::Legacy => sess.guardian_review_session.shutdown().await,
-        super::retirement::CleanupMode::DeadlineBound(deadline) => {
-            sess.guardian_review_session.shutdown_until(deadline).await
-        }
-    };
-    if !guardian.is_clean() {
-        failure.get_or_insert(super::retirement::CleanupExecution::GuardianFailed);
-    }
 
     crate::hook_runtime::run_session_end_hooks(sess).await;
+    emit_thread_stop_lifecycle(sess).await;
     failure
 }
 
@@ -677,7 +384,6 @@ pub(super) async fn cleanup_session(
     let history = sess.clone_history().await;
     let turn_count = history
         .raw_items()
-        .iter()
         .filter(|item| is_user_turn_boundary(item))
         .count();
     sess.services.session_telemetry.counter(
@@ -685,7 +391,6 @@ pub(super) async fn cleanup_session(
         i64::try_from(turn_count).unwrap_or(0),
         &[],
     );
-    emit_thread_stop_lifecycle(sess.as_ref()).await;
     let persistence_failed = if let Some(live_thread) = sess.live_thread() {
         let failed_initialization = sess
             .failed_initialization_persistence
@@ -738,7 +443,6 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
         | super::retirement::CleanupExecution::TaskJoinFailed
         | super::retirement::CleanupExecution::ConversationShutdownFailed
         | super::retirement::CleanupExecution::CodeModeShutdownFailed
-        | super::retirement::CleanupExecution::GuardianFailed
         | super::retirement::CleanupExecution::AuthorityUnavailable => {
             warn!(
                 ?cleanup,
@@ -753,6 +457,7 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
         let event = Event {
             id: sub_id.clone(),
             msg: EventMsg::Error(ErrorEvent {
+                misalignment: None,
                 message: "Failed to shutdown thread persistence".to_string(),
                 codex_error_info: Some(CodexErrorInfo::Other),
             }),
@@ -779,8 +484,10 @@ pub async fn review(
     config: &Arc<Config>,
     sub_id: String,
     review_request: ReviewRequest,
-) {
-    let turn_context = sess.new_default_turn_with_sub_id(sub_id.clone()).await;
+) -> bool {
+    let turn_context = sess
+        .new_turn_with_default_settings(sub_id.clone(), Default::default())
+        .await;
     sess.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
         .await;
     #[allow(deprecated)]
@@ -793,21 +500,27 @@ pub async fn review(
                 sub_id,
                 resolved,
             )
-            .await;
+            .await
         }
         Err(err) => {
             let event = Event {
                 id: sub_id,
                 msg: EventMsg::Error(ErrorEvent {
+                    misalignment: None,
                     message: err.to_string(),
                     codex_error_info: Some(CodexErrorInfo::Other),
                 }),
             };
             sess.send_event(&turn_context, event.msg).await;
+            false
         }
     }
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "the loop exclusively owns mailbox_start and select guards polling on Some"
+)]
 pub(super) async fn submission_loop(
     sess: Arc<Session>,
     config: Arc<Config>,
@@ -817,14 +530,61 @@ pub(super) async fn submission_loop(
     // To break out of this loop, send Op::Shutdown.
     let _cleanup_owner = sess.cleanup_owner();
     let mut shutdown_received = false;
-    while let Ok(sub) = rx_sub.recv().await {
+    // As with the former finishing-task caller, birth can interleave with
+    // handlers; install-time task admission remains the shutdown fence.
+    let mut mailbox_start: Option<futures::future::BoxFuture<'_, ()>> = None;
+    // Retain the retry observer across select iterations. Dropping a losing
+    // select arm must not discard the host's pending reopen signal.
+    let mut mailbox_retry = Box::pin(sess.input_queue.work_retry.wait());
+    loop {
+        if rx_sub.is_closed() && rx_sub.is_empty() {
+            break;
+        }
+        let sub = tokio::select! {
+            _ = &mut mailbox_retry => {
+                mailbox_retry = Box::pin(sess.input_queue.work_retry.wait());
+                sess.input_queue.completion_wake.notify_one();
+                continue;
+            }
+            sub = rx_sub.recv() => match sub {
+                Ok(sub) => sub,
+                Err(_) => break,
+            },
+            _ = sess.input_queue.completion_wake.notified(), if mailbox_start.is_none() => {
+                mailbox_start = Some(Box::pin(sess.maybe_start_turn_for_pending_work()));
+                continue;
+            }
+            _ = async { mailbox_start.as_mut().expect("guarded mailbox start").await }, if mailbox_start.is_some() => {
+                mailbox_start = None;
+                continue;
+            }
+        };
         let _dispatch = submissions
             .as_ref()
             .map(super::submission::SubmissionDispatch::begin);
-        debug!(?sub, "Submission");
+        if matches!(sub.op, Op::ResolveElicitation { .. }) {
+            debug!(submission_id = %sub.id, operation = sub.op.kind(), "Submission");
+        } else {
+            debug!(?sub, "Submission");
+        }
         let dispatch_span = submission_dispatch_span(&sub);
-        let should_exit = async {
-            match sub.op.clone() {
+        let dispatch = async {
+            match sub.op {
+                Op::HostTurn { action, mut work } => {
+                    work.bind_submission(&sub.id);
+                    let started = match action {
+                        codex_protocol::host_turn_work::HostTurnAction::Compact => {
+                            compact(&sess, sub.id.clone()).await
+                        }
+                        codex_protocol::host_turn_work::HostTurnAction::Review(request) => {
+                            review(&sess, &config, sub.id.clone(), request).await
+                        }
+                    };
+                    if started {
+                        work.retain_until_terminal();
+                    }
+                    false
+                }
                 Op::Interrupt => {
                     interrupt(&sess).await;
                     false
@@ -840,6 +600,7 @@ pub(super) async fn submission_loop(
                         sess.send_event_raw(Event {
                             id: sub.id.clone(),
                             msg: EventMsg::Error(ErrorEvent {
+                                misalignment: None,
                                 message: err.to_string(),
                                 codex_error_info: Some(CodexErrorInfo::Other),
                             }),
@@ -868,27 +629,89 @@ pub(super) async fn submission_loop(
                     realtime_conversation_list_voices(&sess, sub.id.clone()).await;
                     false
                 }
-                Op::UserInput { .. } => {
-                    user_input_or_turn(
+                Op::TurnInput {
+                    request,
+                    mode,
+                    mut host_work,
+                    reply,
+                } => {
+                    if let Some(work) = &mut host_work {
+                        work.bind_submission(&sub.id);
+                    }
+                    let result = turn_input::handle(&sess, *request, mode, sub.id.clone()).await;
+                    if matches!(
+                        &result,
+                        Ok(codex_protocol::turn_input::TurnInputSubmission::Started { .. })
+                    ) && let Some(work) = host_work.take()
+                    {
+                        work.retain_until_terminal();
+                    }
+                    let _ = reply.send(result);
+                    false
+                }
+                Op::RecoverTurn {
+                    thread_settings,
+                    start_options,
+                    mut host_work,
+                    reply,
+                } => {
+                    if let Some(work) = &mut host_work {
+                        work.bind_submission(&sub.id);
+                    }
+                    let result = turn_input::handle_recovery(
                         &sess,
+                        thread_settings,
+                        start_options,
                         sub.id.clone(),
-                        sub.op,
-                        sub.client_user_message_id,
-                        sub.parent_turn_id,
                     )
                     .await;
+                    if matches!(
+                        &result,
+                        Ok(codex_protocol::turn_input::TurnInputSubmission::Started { .. })
+                    ) && let Some(work) = host_work.take()
+                    {
+                        work.retain_until_terminal();
+                    }
+                    let _ = reply.send(result);
                     false
+                }
+                Op::SuspendTurnAndShutdown { reply } => {
+                    let result =
+                        super::turn_suspension::suspend_turn_and_shutdown(&sess, sub.id.clone())
+                            .await;
+                    // Exit only after history is durable and its writer has closed; an error
+                    // must leave responsibility for the thread with the current worker.
+                    let should_exit = matches!(
+                        &result,
+                        Ok(codex_protocol::turn_input::SuspendTurnOutcome::Suspended { .. })
+                    );
+                    let _ = reply.send(result);
+                    should_exit
                 }
                 Op::ThreadSettings { thread_settings } => {
-                    update_thread_settings(&sess, sub.id.clone(), thread_settings).await;
+                    thread_settings::update(&sess, sub.id.clone(), thread_settings).await;
                     false
                 }
-                Op::InterAgentCommunication { communication } => {
+                Op::TurnSettings {
+                    turn_id,
+                    update,
+                    reply,
+                } => {
+                    let outcome = sess.apply_turn_settings(&turn_id, update).await;
+                    let _ = reply.send(outcome);
+                    false
+                }
+                Op::InterAgentCommunication {
+                    communication,
+                    start_options,
+                    work,
+                } => {
                     inter_agent_communication(
                         &sess,
                         sub.id.clone(),
                         communication,
-                        sub.parent_turn_id,
+                        start_options,
+                        work,
                     )
                     .await;
                     false
@@ -929,16 +752,15 @@ pub(super) async fn submission_loop(
                     compact(&sess, sub.id.clone()).await;
                     false
                 }
-                Op::ThreadRollback { num_turns } => {
-                    thread_rollback(&sess, sub.id.clone(), num_turns).await;
-                    false
-                }
                 Op::SetThreadMemoryMode { mode } => {
                     set_thread_memory_mode(&sess, sub.id.clone(), mode).await;
                     false
                 }
-                Op::RunUserShellCommand { command } => {
-                    run_user_shell_command(&sess, sub.id.clone(), command).await;
+                Op::RunUserShellCommand {
+                    command,
+                    timeout_ms,
+                } => {
+                    run_user_shell_command(&sess, sub.id.clone(), command, timeout_ms).await;
                     false
                 }
                 Op::ResolveElicitation {
@@ -964,13 +786,30 @@ pub(super) async fn submission_loop(
                 _ => false, // Ignore unknown ops; enum is non_exhaustive to allow extensions.
             }
         }
-        .instrument(dispatch_span)
-        .await;
+        .instrument(dispatch_span);
+        tokio::pin!(dispatch);
+        // Keep discovery/start progressing even when a control handler waits
+        // on a lock it holds. Conversely, discovery never blocks dispatch.
+        let should_exit = loop {
+            tokio::select! {
+                result = &mut dispatch => break result,
+                _ = &mut mailbox_retry => {
+                    mailbox_retry = Box::pin(sess.input_queue.work_retry.wait());
+                    sess.input_queue.completion_wake.notify_one();
+                }
+                _ = async { mailbox_start.as_mut().expect("guarded mailbox start").await }, if mailbox_start.is_some() => {
+                    mailbox_start = None;
+                }
+            }
+        };
         if should_exit {
             shutdown_received = true;
             break;
         }
     }
+    // Release any suspended preparation before cleanup acquires its locks.
+    drop(mailbox_start);
+    drop(mailbox_retry);
     // If the submission loop exits because the channel closed without an
     // explicit shutdown op, still run session teardown.
     if !shutdown_received {
@@ -1012,21 +851,9 @@ async fn approve_guardian_denied_action(sess: &Arc<Session>, event: GuardianAsse
             return;
         }
     };
-    let approval_prefix = crate::guardian::AUTO_REVIEW_DENIED_ACTION_APPROVAL_DEVELOPER_PREFIX;
-    let text = format!(
-        r#"{approval_prefix}
-
-Treat this as approval to perform that exact action in the same context in which it was originally requested.
-Do not assume this also authorizes similar operations with different payloads.
-
-Approved action:
-{approved_action_json}"#,
-    );
-    let items = vec![ResponseItem::from(ResponseInputItem::Message {
-        role: "developer".to_string(),
-        content: vec![ContentItem::InputText { text }],
-        phase: None,
-    })];
+    let items = vec![ContextualUserFragment::into(GuardianApprovedAction::new(
+        approved_action_json,
+    ))];
 
     sess.inject_no_new_turn(items, /*current_turn_context*/ None)
         .await;

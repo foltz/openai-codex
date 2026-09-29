@@ -5,9 +5,7 @@ use crate::ServerNotification;
 use crate::ServerNotificationEnvelope;
 use crate::ServerRequest;
 use crate::TS;
-use crate::experimental_api::ExperimentalUnitVariant;
 use crate::experimental_api::experimental_fields;
-use crate::experimental_api::experimental_unit_variants;
 use crate::export_client_notification_schemas;
 use crate::export_client_param_schemas;
 use crate::export_client_response_schemas;
@@ -29,7 +27,6 @@ use anyhow::Result;
 use anyhow::anyhow;
 use codex_history::RolloutLine;
 use schemars::schema_for;
-use serde::Serialize;
 use serde_json::Map;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -44,10 +41,16 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
 
+#[path = "export_user_verification.rs"]
+mod user_verification;
+
 pub(crate) const GENERATED_TS_HEADER: &str = "// GENERATED CODE! DO NOT MODIFY BY HAND!\n\n";
 const IGNORED_DEFINITIONS: &[&str] = &["Option<()>"];
 const JSON_V1_ALLOWLIST: &[&str] = &["InitializeParams", "InitializeResponse"];
 const EXPERIMENTAL_CLIENT_METHOD_DEPENDENCY_TYPES: &[&str] = &[
+    "AwsCredentialType",
+    "BedrockAwsProfile",
+    "BedrockEnvironmentCredential",
     "EnvironmentShellInfo",
     "EnvironmentStatusKind",
     "ManagedTransitionIntent",
@@ -61,6 +64,14 @@ const EXPERIMENTAL_CLIENT_METHOD_DEPENDENCY_TYPES: &[&str] = &[
     "ThreadRetentionRefusalReason",
     "ThreadSearchOccurrence",
     "ThreadSearchTextRange",
+    "TurnSettingsUpdateStatus",
+    "UserVerificationProof",
+    "UserVerificationCancellationReason",
+    "UserVerificationErrorDetails",
+    "UserVerificationFailureReason",
+    "UserVerificationInvalidRequestReason",
+    "UserVerificationRpcError",
+    "UserVerificationUnavailableReason",
 ];
 const SPECIAL_DEFINITIONS: &[&str] = &[
     "ClientNotification",
@@ -129,6 +140,7 @@ pub fn generate_ts_with_options(
     ClientRequest::export_all_to(out_dir)?;
     export_client_responses(out_dir)?;
     ClientNotification::export_all_to(out_dir)?;
+    crate::UserVerificationRpcError::export_all_to(out_dir)?;
 
     ServerRequest::export_all_to(out_dir)?;
     export_server_responses(out_dir)?;
@@ -226,6 +238,10 @@ pub fn generate_json_with_experimental(out_dir: &Path, experimental_api: bool) -
         schemas.push(emit(out_dir)?);
     }
 
+    schemas.push(write_json_schema::<crate::UserVerificationRpcError>(
+        out_dir,
+        "v2::UserVerificationRpcError",
+    )?);
     schemas.extend(export_client_param_schemas(out_dir)?);
     schemas.extend(export_client_response_schemas(out_dir)?);
     schemas.extend(export_server_param_schemas(out_dir)?);
@@ -275,22 +291,12 @@ fn filter_experimental_ts(out_dir: &Path) -> Result<()> {
         EXPERIMENTAL_SERVER_NOTIFICATION_METHODS,
     )?;
     filter_experimental_type_fields_ts(out_dir, &registered_fields)?;
-    let variants = experimental_unit_variants();
-    for path in ts_files_in_recursive(out_dir)? {
-        let Some(name) = path.file_stem().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        let selected: Vec<_> = variants
-            .iter()
-            .copied()
-            .filter(|variant| variant.type_name == name)
-            .collect();
-        if !selected.is_empty() {
-            let content = std::fs::read_to_string(&path)?;
-            std::fs::write(&path, filter_unit_variant_ts(content, &selected)?)?;
-        }
-    }
     remove_generated_type_files(out_dir, &experimental_method_types, "ts")?;
+    let elicitation_path = out_dir.join("v2/McpServerElicitationRequestParams.ts");
+    if elicitation_path.exists() {
+        let content = fs::read_to_string(&elicitation_path)?;
+        fs::write(elicitation_path, user_verification::filter_ts(&content))?;
+    }
     Ok(())
 }
 
@@ -323,6 +329,11 @@ pub(crate) fn filter_experimental_ts_tree(tree: &mut BTreeMap<PathBuf, String>) 
     }
 
     for (path, content) in tree.iter_mut() {
+        if path.file_stem().and_then(|stem| stem.to_str())
+            == Some("McpServerElicitationRequestParams")
+        {
+            *content = user_verification::filter_ts(content);
+        }
         let Some(type_name) = path.file_stem().and_then(|stem| stem.to_str()) else {
             continue;
         };
@@ -336,20 +347,6 @@ pub(crate) fn filter_experimental_ts_tree(tree: &mut BTreeMap<PathBuf, String>) 
         *content = filtered;
     }
 
-    let variants = experimental_unit_variants();
-    for (path, content) in tree.iter_mut() {
-        let Some(name) = path.file_stem().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        let selected: Vec<_> = variants
-            .iter()
-            .copied()
-            .filter(|variant| variant.type_name == name)
-            .collect();
-        if !selected.is_empty() {
-            *content = filter_unit_variant_ts(content.clone(), &selected)?;
-        }
-    }
     remove_generated_type_entries(tree, &experimental_method_types, "ts");
     Ok(())
 }
@@ -392,7 +389,7 @@ fn filter_experimental_method_arms(body: &str, experimental_methods: &HashSet<&s
     let filter_arms = |arms: Vec<String>| {
         arms.into_iter()
             .filter(|arm| {
-                extract_method_from_arm(arm)
+                extract_discriminator_from_arm(arm, "method")
                     .is_none_or(|method| !experimental_methods.contains(method.as_str()))
             })
             .collect::<Vec<_>>()
@@ -496,142 +493,11 @@ fn filter_experimental_schema(bundle: &mut Value) -> Result<()> {
     let registered_fields = experimental_fields();
     filter_experimental_fields_in_root(bundle, &registered_fields);
     filter_experimental_fields_in_definitions(bundle, &registered_fields);
-    filter_unit_variant_schema(bundle, &experimental_unit_variants())?;
     prune_experimental_methods(bundle, EXPERIMENTAL_CLIENT_METHODS);
     prune_experimental_methods(bundle, EXPERIMENTAL_SERVER_METHODS);
     prune_experimental_methods(bundle, EXPERIMENTAL_SERVER_NOTIFICATION_METHODS);
     remove_experimental_method_type_definitions(bundle);
-    Ok(())
-}
-
-fn filter_unit_variant_ts(
-    content: String,
-    variants: &[&ExperimentalUnitVariant],
-) -> Result<String> {
-    let (prefix, body, suffix) = split_type_alias(&content)
-        .ok_or_else(|| anyhow::anyhow!("experimental unit variant requires a TypeScript alias"))?;
-    let arms = split_top_level(&body, '|');
-    let values: Vec<String> = arms
-        .iter()
-        .map(|arm| {
-            serde_json::from_str::<String>(arm)
-                .context("experimental unit variant requires a string-literal union")
-        })
-        .collect::<Result<_>>()?;
-    for variant in variants {
-        anyhow::ensure!(
-            values.iter().any(|value| value == variant.serialized_name),
-            "missing experimental unit variant {}::{} in TypeScript",
-            variant.type_name,
-            variant.serialized_name
-        );
-    }
-    let kept: Vec<_> = arms
-        .into_iter()
-        .zip(values)
-        .filter_map(|(arm, value)| {
-            (!variants
-                .iter()
-                .any(|variant| variant.serialized_name == value))
-            .then_some(arm)
-        })
-        .collect();
-    anyhow::ensure!(
-        !kept.is_empty(),
-        "experimental unit filtering would empty a TypeScript enum"
-    );
-    Ok(format!("{prefix} {}{suffix}", kept.join(" | ")))
-}
-
-fn filter_unit_variant_schema(
-    schema: &mut Value,
-    variants: &[&ExperimentalUnitVariant],
-) -> Result<()> {
-    if let Some(title) = schema
-        .get("title")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-    {
-        let selected: Vec<_> = variants
-            .iter()
-            .copied()
-            .filter(|variant| variant.type_name == title)
-            .collect();
-        if !selected.is_empty() {
-            filter_unit_variant_enum(schema, &selected)?;
-        }
-    }
-    for key in ["definitions", "$defs"] {
-        if let Some(definitions) = schema.get_mut(key).and_then(Value::as_object_mut) {
-            filter_unit_variant_definitions(definitions, variants)?;
-        }
-    }
-    Ok(())
-}
-
-fn filter_unit_variant_definitions(
-    definitions: &mut Map<String, Value>,
-    variants: &[&ExperimentalUnitVariant],
-) -> Result<()> {
-    for (name, schema) in definitions {
-        if is_namespace_map(schema) {
-            if let Some(nested) = schema.as_object_mut() {
-                filter_unit_variant_definitions(nested, variants)?;
-            }
-            continue;
-        }
-        let selected: Vec<_> = variants
-            .iter()
-            .copied()
-            .filter(|variant| definition_matches_type(name, variant.type_name))
-            .collect();
-        if !selected.is_empty() {
-            filter_unit_variant_enum(schema, &selected)?;
-        }
-        for key in ["definitions", "$defs"] {
-            if let Some(nested) = schema.get_mut(key).and_then(Value::as_object_mut) {
-                filter_unit_variant_definitions(nested, variants)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn filter_unit_variant_enum(
-    schema: &mut Value,
-    variants: &[&ExperimentalUnitVariant],
-) -> Result<()> {
-    anyhow::ensure!(
-        schema.get("type").and_then(Value::as_str) == Some("string"),
-        "experimental unit variant requires a string enum schema"
-    );
-    let values = schema
-        .get_mut("enum")
-        .and_then(Value::as_array_mut)
-        .ok_or_else(|| anyhow::anyhow!("experimental unit variant requires enum values"))?;
-    anyhow::ensure!(
-        values.iter().all(Value::is_string),
-        "experimental unit enum contains non-string values"
-    );
-    for variant in variants {
-        anyhow::ensure!(
-            values
-                .iter()
-                .any(|value| value.as_str() == Some(variant.serialized_name)),
-            "missing experimental unit variant {}::{} in schema",
-            variant.type_name,
-            variant.serialized_name
-        );
-    }
-    values.retain(|value| {
-        !variants
-            .iter()
-            .any(|variant| value.as_str() == Some(variant.serialized_name))
-    });
-    anyhow::ensure!(
-        !values.is_empty(),
-        "experimental unit filtering would empty a schema enum"
-    );
+    user_verification::filter_json(bundle);
     Ok(())
 }
 
@@ -773,15 +639,6 @@ fn is_experimental_method_variant(value: &Value, experimental_methods: &HashSet<
 
 fn filter_experimental_json_files(out_dir: &Path) -> Result<()> {
     for path in json_files_in_recursive(out_dir)? {
-        // These two aggregates are produced from the already-filtered bundle
-        // above. Only raw per-type schemas need this pass. Filtering the
-        // aggregates twice would hide schema drift if missing literals were
-        // accepted, or correctly fail their strict unit-variant validation.
-        if path == out_dir.join("codex_app_server_protocol.schemas.json")
-            || path == out_dir.join("codex_app_server_protocol.v2.schemas.json")
-        {
-            continue;
-        }
         let mut value = read_json_value(&path)?;
         filter_experimental_schema(&mut value)?;
         write_pretty_json(path, &value)?;
@@ -1021,14 +878,14 @@ fn split_top_level_multi(input: &str, delimiters: &[char]) -> Vec<String> {
     parts
 }
 
-fn extract_method_from_arm(arm: &str) -> Option<String> {
+fn extract_discriminator_from_arm(arm: &str, discriminator: &str) -> Option<String> {
     let (open, close) = find_top_level_brace_span(arm)?;
     let inner = &arm[open + 1..close];
     for field in split_top_level(inner, ',') {
         let Some((name, value)) = parse_property(field.as_str()) else {
             continue;
         };
-        if name != "method" {
+        if name != discriminator {
             continue;
         }
         let value = value.trim_start();
@@ -1787,8 +1644,11 @@ where
     write_json_schema_with_return::<T>(out_dir, name)
 }
 
-fn write_pretty_json(path: PathBuf, value: &impl Serialize) -> Result<()> {
-    let json = serde_json::to_vec_pretty(value)
+fn write_pretty_json(path: PathBuf, value: &Value) -> Result<()> {
+    let mut value = value.clone();
+    // Keep Cargo and Bazel output identical without changing meaningful array order.
+    value.sort_all_objects();
+    let json = serde_json::to_vec_pretty(&value)
         .with_context(|| format!("Failed to serialize JSON schema to {}", path.display()))?;
     fs::write(&path, json).with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(())
@@ -2363,102 +2223,6 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
-    fn experimental_unit_variant_projection_is_exact_and_fails_on_drift() -> Result<()> {
-        let variant = ExperimentalUnitVariant {
-            type_name: "Mixed",
-            serialized_name: "future|case",
-            reason: "test/future",
-        };
-        let variants = [&variant];
-        let ts = "// header\nexport type Mixed = \"stable\" | \"future|case\";\n";
-        assert_eq!(
-            filter_unit_variant_ts(ts.to_owned(), &variants)?,
-            "// header\nexport type Mixed = \"stable\";\n"
-        );
-        assert!(
-            filter_unit_variant_ts("export type Mixed = \"stable\";".into(), &variants).is_err()
-        );
-        assert!(
-            filter_unit_variant_ts("export type Mixed = \"future|case\";".into(), &variants)
-                .is_err()
-        );
-        assert!(
-            filter_unit_variant_ts(
-                "export type Mixed = { status: \"future|case\" };".into(),
-                &variants
-            )
-            .is_err()
-        );
-        let mut schema = serde_json::json!({"definitions":{"v2":{"Mixed":{"type":"string","enum":["stable","future|case"]},"Other":{"type":"string","enum":["future|case"]}}}});
-        filter_unit_variant_schema(&mut schema, &variants)?;
-        assert_eq!(
-            schema["definitions"]["v2"]["Mixed"]["enum"],
-            serde_json::json!(["stable"])
-        );
-        assert_eq!(
-            schema["definitions"]["v2"]["Other"]["enum"],
-            serde_json::json!(["future|case"])
-        );
-        let mut root =
-            serde_json::json!({"title":"Mixed","type":"string","enum":["stable","future|case"]});
-        filter_unit_variant_schema(&mut root, &variants)?;
-        assert_eq!(root["enum"], serde_json::json!(["stable"]));
-        assert!(filter_unit_variant_schema(&mut root, &variants).is_err());
-        let mut empty = serde_json::json!({"title":"Mixed","type":"string","enum":["future|case"]});
-        assert!(filter_unit_variant_schema(&mut empty, &variants).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn experimental_unit_variant_disk_and_tree_filters_agree() -> Result<()> {
-        // Metadata is registered by the real derive in experimental_api tests.
-        let directory = tempfile::tempdir()?;
-        let relative = PathBuf::from("v2/RenamedUnitProjection.ts");
-        let original = "export type RenamedUnitProjection = \"stable\" | \"futureVariant\" | \"explicit-variant\";\n";
-        std::fs::create_dir(directory.path().join("v2"))?;
-        std::fs::write(directory.path().join(&relative), original)?;
-        let mut tree = BTreeMap::from([(relative.clone(), original.to_owned())]);
-        filter_experimental_ts(directory.path())?;
-        filter_experimental_ts_tree(&mut tree)?;
-        let disk = std::fs::read_to_string(directory.path().join(&relative))?;
-        assert_eq!(disk, "export type RenamedUnitProjection = \"stable\";\n");
-        assert_eq!(tree[&relative], disk);
-        // Experimental projection never invokes either stable filter.
-        assert!(original.contains("futureVariant") && original.contains("explicit-variant"));
-        Ok(())
-    }
-
-    #[test]
-    fn unit_variant_json_file_pass_does_not_refilter_proven_aggregates() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let raw = serde_json::json!({"title":"RenamedUnitProjection","type":"string","enum":["stable","futureVariant","explicit-variant"]});
-        let filtered =
-            serde_json::json!({"title":"RenamedUnitProjection","type":"string","enum":["stable"]});
-        write_pretty_json(directory.path().join("RenamedUnitProjection.json"), &raw)?;
-        for name in [
-            "codex_app_server_protocol.schemas.json",
-            "codex_app_server_protocol.v2.schemas.json",
-        ] {
-            write_pretty_json(directory.path().join(name), &filtered)?;
-        }
-        filter_experimental_json_files(directory.path())?;
-        assert_eq!(
-            read_json_value(&directory.path().join("RenamedUnitProjection.json"))?,
-            filtered
-        );
-        for name in [
-            "codex_app_server_protocol.schemas.json",
-            "codex_app_server_protocol.v2.schemas.json",
-        ] {
-            assert_eq!(read_json_value(&directory.path().join(name))?, filtered);
-        }
-        // The raw-type guard is not made idempotent: a second traversal of an
-        // already-filtered per-type input still detects the absent literals.
-        assert!(filter_experimental_json_files(directory.path()).is_err());
-        Ok(())
-    }
-
-    #[test]
     fn generated_ts_optional_nullable_fields_only_in_params() -> Result<()> {
         // Assert that "?: T | null" only appears in generated *Params types.
         let fixture_tree = read_schema_fixture_subtree(&schema_root()?, "typescript")?;
@@ -2473,6 +2237,22 @@ mod tests {
             client_request_ts.contains("MockExperimentalMethodParams"),
             false
         );
+        const LEGACY_ACCOUNT_USAGE_REQUEST: &str = concat!(
+            "{ \"method\": \"account/usage/read\", id: RequestId, ",
+            "params?: GetAccountTokenUsageParams | undefined, }"
+        );
+        assert!(client_request_ts.contains(LEGACY_ACCOUNT_USAGE_REQUEST));
+        const LEGACY_ACCOUNT_RATE_LIMITS_REQUEST: &str = concat!(
+            "{ \"method\": \"account/rateLimits/read\", id: RequestId, ",
+            "params?: GetAccountRateLimitsParams | undefined, }"
+        );
+        assert!(client_request_ts.contains(LEGACY_ACCOUNT_RATE_LIMITS_REQUEST));
+        let account_usage_response_ts = std::str::from_utf8(
+            fixture_tree
+                .get(Path::new("v2/GetAccountTokenUsageResponse.ts"))
+                .ok_or_else(|| anyhow::anyhow!("missing account usage response fixture"))?,
+        )?;
+        assert!(account_usage_response_ts.contains("threadUsage?: ThreadUsage | null"));
         let server_request_ts = std::str::from_utf8(
             fixture_tree
                 .get(Path::new("ServerRequest.ts"))
@@ -2545,7 +2325,16 @@ mod tests {
                 });
 
             let contents = std::str::from_utf8(contents)?;
-            if contents.contains("| undefined") {
+            // Both stable usage RPCs originally required `params: undefined`. Preserve that
+            // source compatibility only for these exact envelopes, not arbitrary new fields.
+            let checked_contents = if path == Path::new("ClientRequest.ts") {
+                contents
+                    .replace(LEGACY_ACCOUNT_USAGE_REQUEST, "")
+                    .replace(LEGACY_ACCOUNT_RATE_LIMITS_REQUEST, "")
+            } else {
+                contents.to_owned()
+            };
+            if checked_contents.contains("| undefined") {
                 undefined_offenders.push(path.clone());
             }
 
@@ -2657,9 +2446,14 @@ mod tests {
 
                 // If the last non-whitespace before ':' is '?', then this is an
                 // optional field with a nullable type (i.e., "?: T | null").
-                // These are only allowed in *Params types.
+                // These are only allowed in *Params types, except the additive stable usage
+                // response field, which older servers omit and newer servers return as null.
+                let legacy_account_usage_response = path
+                    == Path::new("v2/GetAccountTokenUsageResponse.ts")
+                    && field_prefix.trim() == "threadUsage?";
                 if field_prefix.chars().rev().find(|c| !c.is_whitespace()) == Some('?')
                     && !allow_optional_nullable
+                    && !legacy_account_usage_response
                 {
                     let line_number =
                         contents[..abs_idx].chars().filter(|c| *c == '\n').count() + 1;

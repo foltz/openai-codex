@@ -568,6 +568,7 @@ fn declared_placement_preserves_local_plugin_normalization() {
             bearer_token_env_var: None,
             http_headers: None,
             env_http_headers: None,
+            http_headers_helper: None,
         },
         environment_id: DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
         enabled: true,
@@ -585,10 +586,25 @@ fn declared_placement_preserves_local_plugin_normalization() {
         scopes: None,
         oauth: Some(McpServerOAuthConfig {
             client_id: Some("client-id".to_string()),
+            callback_url: Some("http://127.0.0.1/callback/registered".to_string()),
+            callback_port: Some(9876),
+            ..Default::default()
         }),
         oauth_resource: None,
         tools: HashMap::new(),
     };
+    let mut expected_helper = McpServerConfig {
+        oauth: None,
+        ..expected_http.clone()
+    };
+    let McpServerTransportConfig::StreamableHttp {
+        http_headers_helper,
+        ..
+    } = &mut expected_helper.transport
+    else {
+        unreachable!("expected HTTP transport");
+    };
+    *http_headers_helper = Some("./auth.sh".to_string());
 
     let outcome = parse_plugin_mcp_config(
         &plugin_root,
@@ -601,8 +617,9 @@ fn declared_placement_preserves_local_plugin_normalization() {
             "hosted": {
                 "type": "http",
                 "url": "https://example.com/mcp",
-                "oauth": {"clientId": "client-id", "callbackPort": 9876}
-            }
+                "oauth": {"clientId": "client-id", "callbackUrl": "http://127.0.0.1/callback/registered", "callbackPort": 9876}
+            },
+            "helper": {"type":"http","url":"https://example.com/mcp","http_headers_helper":"./auth.sh"}
         }"#,
     )
     .expect("parse plugin MCP config");
@@ -612,11 +629,39 @@ fn declared_placement_preserves_local_plugin_normalization() {
         PluginMcpConfigParseOutcome {
             servers: BTreeMap::from([
                 ("demo".to_string(), expected_stdio),
+                ("helper".to_string(), expected_helper),
                 ("hosted".to_string(), expected_http),
             ]),
             errors: Vec::new(),
         }
     );
+}
+
+#[test]
+fn native_plugin_mcp_cannot_self_declare_ema_auth() {
+    let server = serde_json::json!({
+        "type": "http",
+        "url": "https://resource.example/mcp",
+        "auth": "ema_auth"
+    });
+    for contents in [
+        serde_json::json!({"enterprise": server}),
+        serde_json::json!({"mcpServers": {"enterprise": server}}),
+    ] {
+        let outcome = parse_plugin_mcp_config(&plugin_root(), &contents.to_string())
+            .expect("parse plugin MCP config");
+
+        assert_eq!(
+            outcome,
+            PluginMcpConfigParseOutcome {
+                servers: BTreeMap::new(),
+                errors: vec![PluginMcpServerParseError {
+                    name: "enterprise".to_string(),
+                    message: "plugin MCP declarations cannot select ema_auth; configure enterprise authentication in host policy".to_string(),
+                }],
+            }
+        );
+    }
 }
 
 #[test]
@@ -774,7 +819,7 @@ fn environment_placement_rejects_orchestrator_env_vars() {
 }
 
 #[test]
-fn remote_environment_placement_rejects_http_env_references() {
+fn remote_environment_placement_preserves_bearer_and_rejects_header_env_references() {
     let plugin_root = plugin_root();
     let outcome = parse_executor_plugin_mcp_config(
         &plugin_root_uri(&plugin_root),
@@ -795,19 +840,20 @@ fn remote_environment_placement_rejects_http_env_references() {
     assert_eq!(
         outcome,
         PluginMcpConfigParseOutcome {
-            servers: BTreeMap::new(),
-            errors: vec![
-                PluginMcpServerParseError {
-                    name: "bearer".to_string(),
-                    message: "`bearer_token_env_var` requires executor-side environment resolution for an executor-owned HTTP MCP"
-                        .to_string(),
-                },
-                PluginMcpServerParseError {
-                    name: "headers".to_string(),
-                    message: "`env_http_headers` requires executor-side environment resolution for an executor-owned HTTP MCP"
-                        .to_string(),
-                },
-            ],
+            servers: BTreeMap::from([(
+                "bearer".to_string(),
+                serde_json::from_value(serde_json::json!({
+                    "url": "https://example.com/bearer",
+                    "bearer_token_env_var": "TOKEN",
+                    "environment_id": "executor-1",
+                }))
+                .expect("executor-owned bearer configuration"),
+            )]),
+            errors: vec![PluginMcpServerParseError {
+                name: "headers".to_string(),
+                message: "`env_http_headers` requires executor-side environment resolution for an executor-owned HTTP MCP"
+                    .to_string(),
+            }],
         }
     );
 }
@@ -843,6 +889,7 @@ fn local_environment_placement_preserves_http_env_references() {
                             "X-Account".to_string(),
                             "ACCOUNT_ID".to_string(),
                         )])),
+                        http_headers_helper: None,
                     },
                     environment_id: DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
                     enabled: true,

@@ -3,15 +3,17 @@ use crate::outgoing_message::ConnectionRequestId;
 use crate::outgoing_message::OutgoingMessageSender;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
-use codex_app_server_protocol::ThreadAttachmentChangedNotification;
-use codex_app_server_protocol::ThreadAttachmentEntry;
-use codex_app_server_protocol::ThreadAttachmentListResponse;
 use codex_app_server_protocol::ThreadGoal;
 use codex_app_server_protocol::ThreadHistoryBuilder;
+use codex_app_server_protocol::ThreadHistoryTurnMetadata;
+use codex_app_server_protocol::ThreadInteractiveSubscriptionChangedNotification;
+use codex_app_server_protocol::ThreadInteractiveSubscriptionEntry;
+use codex_app_server_protocol::ThreadInteractiveSubscriptionListResponse;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadSettings;
 use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnError;
+use codex_app_server_protocol::TurnItemsView;
 use codex_core::CodexThread;
 use codex_core::ThreadConfigSnapshot;
 use codex_file_watcher::WatchRegistration;
@@ -174,6 +176,8 @@ pub(crate) enum RetentionAuthorityError {
 pub(crate) struct PendingThreadResumeRequest {
     pub(crate) request_id: ConnectionRequestId,
     pub(crate) history_items: Vec<RolloutItem>,
+    /// Usage attribution already resolved while cold-loading a paginated child.
+    pub(crate) cold_resume_token_usage_turn_id: Option<String>,
     pub(crate) config_snapshot: ThreadConfigSnapshot,
     pub(crate) instruction_sources: Vec<LegacyAppPathString>,
     pub(crate) thread_summary: codex_app_server_protocol::Thread,
@@ -193,12 +197,17 @@ pub(crate) struct PendingThreadResumeRequest {
 // ThreadListenerCommand is used to perform operations in the context of the thread listener, for serialization purposes.
 pub(crate) enum ThreadListenerCommand {
     // SendThreadResumeResponse is used to resume an already running thread by sending the thread's history to the client and atomically subscribing for new updates.
-    SendThreadResumeResponse(Box<PendingThreadResumeRequest>),
+    SendThreadResumeResponse {
+        request: Box<PendingThreadResumeRequest>,
+        completion_tx: oneshot::Sender<()>,
+    },
     // EmitThreadGoalUpdated is used to order goal updates with running-thread resume responses and goal clears.
     EmitThreadGoalUpdated {
         turn_id: Option<String>,
         goal: ThreadGoal,
     },
+    // EmitThreadQueueChanged orders durable queue updates with thread notifications.
+    EmitThreadQueueChanged,
     // EmitWarning is used to order extension warnings with other thread notifications.
     EmitWarning {
         message: String,
@@ -229,9 +238,11 @@ pub(crate) struct TurnSummary {
 #[derive(Default)]
 pub(crate) struct ThreadState {
     pub(crate) pending_interrupts: PendingInterruptQueue,
-    pub(crate) pending_rollbacks: Option<ConnectionRequestId>,
     pub(crate) turn_summary: TurnSummary,
     pub(crate) last_terminal_turn_id: Option<String>,
+    /// Lets an internal runtime replacement wait until the old listener has processed Core's
+    /// `ShutdownComplete` event before that listener is superseded.
+    shutdown_drain_waiter: Option<oneshot::Sender<()>>,
     pub(crate) cancel_tx: Option<oneshot::Sender<()>>,
     pub(crate) experimental_raw_events: bool,
     pub(crate) listener_generation: u64,
@@ -256,25 +267,24 @@ impl ThreadState {
         conversation: &Arc<CodexThread>,
         watch_registration: WatchRegistration,
         thread_settings_baseline: ThreadSettings,
-    ) -> (
-        mpsc::UnboundedReceiver<ThreadListenerCommand>,
-        u64,
-        Option<oneshot::Sender<()>>,
-    ) {
-        let previous = self.cancel_tx.replace(cancel_tx);
+    ) -> (mpsc::UnboundedReceiver<ThreadListenerCommand>, u64) {
+        if let Some(previous) = self.cancel_tx.replace(cancel_tx) {
+            let _ = previous.send(());
+        }
         self.listener_generation = self.listener_generation.wrapping_add(1);
         self.last_thread_settings = Some(thread_settings_baseline);
         let (listener_command_tx, listener_command_rx) = mpsc::unbounded_channel();
         self.listener_command_tx = Some(listener_command_tx);
         self.listener_thread = Some(Arc::downgrade(conversation));
         self.watch_registration = watch_registration;
-        (listener_command_rx, self.listener_generation, previous)
+        (listener_command_rx, self.listener_generation)
     }
 
     pub(crate) fn clear_listener(&mut self) {
         if let Some(cancel_tx) = self.cancel_tx.take() {
             let _ = cancel_tx.send(());
         }
+        self.shutdown_drain_waiter = None;
         self.listener_command_tx = None;
         self.current_turn_history.reset();
         self.listener_thread = None;
@@ -293,6 +303,33 @@ impl ThreadState {
 
     pub(crate) fn active_turn_snapshot(&self) -> Option<Turn> {
         self.current_turn_history.active_turn_snapshot()
+    }
+
+    /// Returns the same turn ID as `active_turn_snapshot` without cloning its items.
+    pub(crate) fn active_turn_id(&self) -> Option<&str> {
+        self.current_turn_history.active_turn_id()
+    }
+
+    pub(crate) fn active_turn_snapshot_with_items_view(
+        &self,
+        items_view: TurnItemsView,
+    ) -> Option<Turn> {
+        self.current_turn_history
+            .active_turn_snapshot_with_items_view(items_view)
+    }
+
+    pub(crate) fn active_turn_metadata_snapshot(&self) -> Option<ThreadHistoryTurnMetadata> {
+        self.current_turn_history.active_turn_metadata_snapshot()
+    }
+
+    pub(crate) fn register_shutdown_drain_waiter(&mut self) -> oneshot::Receiver<()> {
+        let (completion_tx, completion_rx) = oneshot::channel();
+        self.shutdown_drain_waiter = Some(completion_tx);
+        completion_rx
+    }
+
+    pub(crate) fn take_shutdown_drain_waiter(&mut self) -> Option<oneshot::Sender<()>> {
+        self.shutdown_drain_waiter.take()
     }
 
     pub(crate) fn track_current_turn_event(&mut self, event_turn_id: &str, event: &EventMsg) {
@@ -479,13 +516,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attachment_snapshot_tracks_only_trusted_interactive_subscriptions() {
+    async fn subscription_snapshot_tracks_only_trusted_interactive_subscriptions() {
         let manager = ThreadStateManager::new();
         let thread_id = ThreadId::new();
         let trusted_connection = ConnectionId(1);
         let untrusted_connection = ConnectionId(2);
 
-        let startup_snapshot = manager.thread_attachment_list().await;
+        let startup_snapshot = manager.thread_interactive_subscription_list().await;
         assert_eq!(startup_snapshot.revision, 0);
         assert!(startup_snapshot.entries.is_empty());
 
@@ -511,7 +548,7 @@ mod tests {
             )
             .await
             .expect("untrusted connection should be live");
-        let untrusted_snapshot = manager.thread_attachment_list().await;
+        let untrusted_snapshot = manager.thread_interactive_subscription_list().await;
         assert_eq!(untrusted_snapshot.revision, 0);
         assert!(untrusted_snapshot.entries.is_empty());
 
@@ -531,25 +568,76 @@ mod tests {
             )
             .await
             .expect("trusted connection should remain live");
-        let attached_snapshot = manager.thread_attachment_list().await;
+        let attached_snapshot = manager.thread_interactive_subscription_list().await;
         assert_eq!(attached_snapshot.generation, startup_snapshot.generation);
         assert_eq!(attached_snapshot.revision, 1);
         assert_eq!(
             attached_snapshot.entries,
-            vec![ThreadAttachmentEntry {
+            vec![ThreadInteractiveSubscriptionEntry {
                 thread_id: thread_id.to_string(),
-                interactive_attachment_count: 1,
+                interactive_subscription_count: 1,
             }]
         );
 
         manager.remove_connection(trusted_connection).await;
-        let closed_snapshot = manager.thread_attachment_list().await;
+        let closed_snapshot = manager.thread_interactive_subscription_list().await;
         assert_eq!(closed_snapshot.revision, 2);
         assert!(closed_snapshot.entries.is_empty());
     }
 
     #[tokio::test]
-    async fn reconnect_does_not_retain_interactive_attachment_without_fresh_entitlement() {
+    async fn one_interactive_connection_can_subscribe_to_distinct_threads() {
+        let manager = ThreadStateManager::new();
+        let first = ThreadId::new();
+        let second = ThreadId::new();
+        let connection = ConnectionId(1);
+        manager
+            .connection_initialized(
+                connection,
+                ConnectionCapabilities {
+                    trusted_interactive: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+        for thread_id in [first, second, first] {
+            manager
+                .try_ensure_connection_subscribed(
+                    thread_id, connection, /*experimental_raw_events*/ false,
+                )
+                .await
+                .expect("live interactive connection subscribes");
+        }
+        let before = manager.thread_interactive_subscription_list().await;
+        let mut entries = [first, second]
+            .into_iter()
+            .map(|thread_id| ThreadInteractiveSubscriptionEntry {
+                thread_id: thread_id.to_string(),
+                interactive_subscription_count: 1,
+            })
+            .collect::<Vec<_>>();
+        entries.sort_unstable_by(|left, right| left.thread_id.cmp(&right.thread_id));
+        assert_eq!(
+            before,
+            ThreadInteractiveSubscriptionListResponse {
+                generation: before.generation.clone(),
+                revision: 2,
+                entries,
+            }
+        );
+        manager.remove_connection(connection).await;
+        assert_eq!(
+            manager.thread_interactive_subscription_list().await,
+            ThreadInteractiveSubscriptionListResponse {
+                generation: before.generation,
+                revision: 3,
+                entries: Vec::new(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_does_not_retain_interactive_subscription_without_fresh_entitlement() {
         let manager = ThreadStateManager::new();
         let thread_id = ThreadId::new();
         let connection_id = ConnectionId(1);
@@ -572,7 +660,14 @@ mod tests {
             )
             .await
             .expect("entitled connection should be live");
-        assert_eq!(manager.thread_attachment_list().await.entries.len(), 1);
+        assert_eq!(
+            manager
+                .thread_interactive_subscription_list()
+                .await
+                .entries
+                .len(),
+            1
+        );
 
         manager.remove_connection(connection_id).await;
         manager
@@ -587,21 +682,21 @@ mod tests {
             .await
             .expect("reconnected connection should be live");
 
-        let snapshot = manager.thread_attachment_list().await;
+        let snapshot = manager.thread_interactive_subscription_list().await;
         assert!(snapshot.entries.is_empty());
         assert_eq!(snapshot.revision, 2);
     }
 
     #[tokio::test]
-    async fn attachment_notifications_are_revisioned_and_ignore_duplicate_subscriptions() {
+    async fn interactive_subscription_notifications_are_revisioned_and_ignore_duplicate_subscriptions()
+     {
         let manager = ThreadStateManager::new();
         let thread_id = ThreadId::new();
         let connection_id = ConnectionId(1);
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel(8);
-        manager.set_attachment_notification_outgoing(Arc::new(OutgoingMessageSender::new(
-            outgoing_tx,
-            AnalyticsEventsClient::disabled(),
-        )));
+        manager.set_interactive_subscription_notification_outgoing(Arc::new(
+            OutgoingMessageSender::new(outgoing_tx, AnalyticsEventsClient::disabled()),
+        ));
 
         manager
             .connection_initialized(
@@ -613,7 +708,10 @@ mod tests {
                 },
             )
             .await;
-        let generation = manager.thread_attachment_list().await.generation;
+        let generation = manager
+            .thread_interactive_subscription_list()
+            .await
+            .generation;
 
         manager
             .try_ensure_connection_subscribed(
@@ -623,14 +721,14 @@ mod tests {
             )
             .await
             .expect("trusted connection should be live");
-        let attached = recv_attachment_changed_notification(&mut outgoing_rx).await;
+        let attached = recv_interactive_subscription_changed_notification(&mut outgoing_rx).await;
         assert_eq!(attached.generation, generation);
         assert_eq!(attached.revision, 1);
         assert_eq!(
             attached.changes,
-            vec![ThreadAttachmentEntry {
+            vec![ThreadInteractiveSubscriptionEntry {
                 thread_id: thread_id.to_string(),
-                interactive_attachment_count: 1,
+                interactive_subscription_count: 1,
             }]
         );
 
@@ -653,14 +751,14 @@ mod tests {
                 .unsubscribe_connection_from_thread(thread_id, connection_id)
                 .await
         );
-        let detached = recv_attachment_changed_notification(&mut outgoing_rx).await;
+        let detached = recv_interactive_subscription_changed_notification(&mut outgoing_rx).await;
         assert_eq!(detached.generation, generation);
         assert_eq!(detached.revision, 2);
         assert_eq!(
             detached.changes,
-            vec![ThreadAttachmentEntry {
+            vec![ThreadInteractiveSubscriptionEntry {
                 thread_id: thread_id.to_string(),
-                interactive_attachment_count: 0,
+                interactive_subscription_count: 0,
             }]
         );
 
@@ -672,24 +770,24 @@ mod tests {
             )
             .await
             .expect("re-attached connection should be live");
-        let reattached = recv_attachment_changed_notification(&mut outgoing_rx).await;
+        let reattached = recv_interactive_subscription_changed_notification(&mut outgoing_rx).await;
         assert_eq!(reattached.revision, 3);
 
         manager.remove_connection(connection_id).await;
-        let closed = recv_attachment_changed_notification(&mut outgoing_rx).await;
+        let closed = recv_interactive_subscription_changed_notification(&mut outgoing_rx).await;
         assert_eq!(closed.generation, generation);
         assert_eq!(closed.revision, 4);
         assert_eq!(
             closed.changes,
-            vec![ThreadAttachmentEntry {
+            vec![ThreadInteractiveSubscriptionEntry {
                 thread_id: thread_id.to_string(),
-                interactive_attachment_count: 0,
+                interactive_subscription_count: 0,
             }]
         );
     }
 
     #[tokio::test]
-    async fn attachment_revision_overflow_rotates_generation_before_publishing() {
+    async fn interactive_subscription_revision_overflow_rotates_generation_before_publishing() {
         let manager = ThreadStateManager::new();
         let thread_id = ThreadId::new();
         let connection_id = ConnectionId(1);
@@ -706,8 +804,8 @@ mod tests {
 
         let old_generation = {
             let mut state = manager.state.lock().await;
-            state.attachment_revision = u64::MAX;
-            state.attachment_generation.clone()
+            state.interactive_subscription_revision = u64::MAX;
+            state.interactive_subscription_generation.clone()
         };
         manager
             .try_ensure_connection_subscribed(
@@ -718,14 +816,14 @@ mod tests {
             .await
             .expect("trusted connection should be live");
 
-        let snapshot = manager.thread_attachment_list().await;
+        let snapshot = manager.thread_interactive_subscription_list().await;
         assert_ne!(snapshot.generation, old_generation);
         assert_eq!(snapshot.revision, 0);
         assert_eq!(snapshot.entries.len(), 1);
     }
 
     #[tokio::test]
-    async fn clear_moves_only_requester_with_one_attachment_change() {
+    async fn clear_moves_only_requester_with_one_interactive_subscription_change() {
         let manager = ThreadStateManager::new();
         let predecessor_thread_id = ThreadId::new();
         let successor_thread_id = ThreadId::new();
@@ -751,12 +849,11 @@ mod tests {
                 .await
                 .expect("trusted connection should be live");
         }
-        let before = manager.thread_attachment_list().await;
+        let before = manager.thread_interactive_subscription_list().await;
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel(8);
-        manager.set_attachment_notification_outgoing(Arc::new(OutgoingMessageSender::new(
-            outgoing_tx,
-            AnalyticsEventsClient::disabled(),
-        )));
+        manager.set_interactive_subscription_notification_outgoing(Arc::new(
+            OutgoingMessageSender::new(outgoing_tx, AnalyticsEventsClient::disabled()),
+        ));
 
         assert!(
             manager
@@ -764,22 +861,22 @@ mod tests {
                 .await
         );
 
-        let changed = recv_attachment_changed_notification(&mut outgoing_rx).await;
+        let changed = recv_interactive_subscription_changed_notification(&mut outgoing_rx).await;
         assert_eq!(changed.generation, before.generation);
         assert_eq!(changed.revision, before.revision + 1);
         let mut expected_entries = vec![
-            ThreadAttachmentEntry {
+            ThreadInteractiveSubscriptionEntry {
                 thread_id: predecessor_thread_id.to_string(),
-                interactive_attachment_count: 1,
+                interactive_subscription_count: 1,
             },
-            ThreadAttachmentEntry {
+            ThreadInteractiveSubscriptionEntry {
                 thread_id: successor_thread_id.to_string(),
-                interactive_attachment_count: 1,
+                interactive_subscription_count: 1,
             },
         ];
         expected_entries.sort_unstable_by(|left, right| left.thread_id.cmp(&right.thread_id));
         assert_eq!(changed.changes, expected_entries);
-        let snapshot = manager.thread_attachment_list().await;
+        let snapshot = manager.thread_interactive_subscription_list().await;
         assert_eq!(snapshot.revision, changed.revision);
         assert_eq!(snapshot.entries, expected_entries);
         assert!(
@@ -790,7 +887,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clear_moves_no_attachment_for_disconnected_requester() {
+    async fn clear_moves_no_subscription_for_disconnected_requester() {
         for keep_bystander in [false, true] {
             let manager = ThreadStateManager::new();
             let predecessor = ThreadId::new();
@@ -823,19 +920,19 @@ mod tests {
                     .expect("trusted connection must initially be attached");
             }
             assert_eq!(
-                manager.thread_attachment_list().await.entries,
-                vec![ThreadAttachmentEntry {
+                manager.thread_interactive_subscription_list().await.entries,
+                vec![ThreadInteractiveSubscriptionEntry {
                     thread_id: predecessor.to_string(),
-                    interactive_attachment_count: connections.len() as u32,
+                    interactive_subscription_count: connections.len() as u32,
                 }]
             );
 
             manager.remove_connection(requester).await;
-            let disconnected = manager.thread_attachment_list().await;
+            let disconnected = manager.thread_interactive_subscription_list().await;
             let expected_entries = if keep_bystander {
-                vec![ThreadAttachmentEntry {
+                vec![ThreadInteractiveSubscriptionEntry {
                     thread_id: predecessor.to_string(),
-                    interactive_attachment_count: 1,
+                    interactive_subscription_count: 1,
                 }]
             } else {
                 vec![]
@@ -846,7 +943,10 @@ mod tests {
                     .move_connection_for_clear(predecessor, successor, requester)
                     .await
             );
-            assert_eq!(manager.thread_attachment_list().await, disconnected);
+            assert_eq!(
+                manager.thread_interactive_subscription_list().await,
+                disconnected
+            );
             assert!(!manager.has_subscribers(successor).await);
         }
     }
@@ -879,14 +979,13 @@ mod tests {
         );
         assert!(
             manager
-                .reserve_clear_successor_attachment(predecessor_thread_id, successor_thread_id)
+                .reserve_clear_successor_subscription(predecessor_thread_id, successor_thread_id)
                 .await
         );
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel(4);
-        manager.set_attachment_notification_outgoing(Arc::new(OutgoingMessageSender::new(
-            outgoing_tx,
-            AnalyticsEventsClient::disabled(),
-        )));
+        manager.set_interactive_subscription_notification_outgoing(Arc::new(
+            OutgoingMessageSender::new(outgoing_tx, AnalyticsEventsClient::disabled()),
+        ));
 
         assert!(matches!(
             manager
@@ -909,7 +1008,7 @@ mod tests {
                 .move_connection_for_clear(predecessor_thread_id, successor_thread_id, requester)
                 .await
         );
-        let changed = recv_attachment_changed_notification(&mut outgoing_rx).await;
+        let changed = recv_interactive_subscription_changed_notification(&mut outgoing_rx).await;
         assert_eq!(changed.changes.len(), 2);
         assert!(manager.has_subscribers(successor_thread_id).await);
         assert!(!manager.has_subscribers(predecessor_thread_id).await);
@@ -941,7 +1040,7 @@ mod tests {
         );
         assert!(
             manager
-                .reserve_clear_successor_attachment(predecessor_thread_id, successor_thread_id)
+                .reserve_clear_successor_subscription(predecessor_thread_id, successor_thread_id)
                 .await
         );
 
@@ -958,7 +1057,10 @@ mod tests {
         ));
         assert!(
             manager
-                .terminalize_clear_successor_attachment(predecessor_thread_id, successor_thread_id)
+                .terminalize_clear_successor_subscription_reservation(
+                    predecessor_thread_id,
+                    successor_thread_id
+                )
                 .await
         );
         assert!(
@@ -1305,14 +1407,15 @@ mod tests {
 
         manager.remove_connection(connection).await;
 
-        let state = manager.state.lock().await;
-        assert!(!state.retention_grants_by_thread.contains_key(&thread_id));
-        assert!(
-            !state
-                .retention_threads_by_principal
-                .contains_key(&principal)
-        );
-        drop(state);
+        {
+            let state = manager.state.lock().await;
+            assert!(!state.retention_grants_by_thread.contains_key(&thread_id));
+            assert!(
+                !state
+                    .retention_threads_by_principal
+                    .contains_key(&principal)
+            );
+        }
         assert_eq!(
             manager
                 .release_retention(thread_id, principal, &grant_id)
@@ -1369,28 +1472,30 @@ mod tests {
         ));
     }
 
-    async fn recv_attachment_changed_notification(
+    async fn recv_interactive_subscription_changed_notification(
         outgoing_rx: &mut mpsc::Receiver<OutgoingEnvelope>,
-    ) -> ThreadAttachmentChangedNotification {
+    ) -> ThreadInteractiveSubscriptionChangedNotification {
         let envelope = timeout(Duration::from_secs(1), outgoing_rx.recv())
             .await
-            .expect("timed out waiting for attachment notification")
+            .expect("timed out waiting for subscription notification")
             .expect("outgoing channel closed unexpectedly");
         let OutgoingEnvelope::Broadcast { message } = envelope else {
-            panic!("expected broadcast attachment notification");
+            panic!("expected broadcast subscription notification");
         };
         let OutgoingMessage::AppServerNotification(envelope) = message else {
-            panic!("expected app-server attachment notification");
+            panic!("expected app-server subscription notification");
         };
-        let ServerNotification::ThreadAttachmentChanged(notification) = envelope.notification
+        let ServerNotification::ThreadInteractiveSubscriptionChanged(notification) =
+            envelope.notification
         else {
-            panic!("expected thread/attachment/changed notification");
+            panic!("expected kcf/thread/interactiveSubscription/changed notification");
         };
         notification
     }
 
     fn thread_settings(model: &str) -> ThreadSettings {
         ThreadSettings {
+            disabled_plugin_ids: Vec::new(),
             cwd: AbsolutePathBuf::from_absolute_path("/tmp").expect("absolute path"),
             approval_policy: AskForApproval::OnRequest,
             approvals_reviewer: ApprovalsReviewer::User,
@@ -1456,13 +1561,13 @@ struct ThreadStateManagerInner {
     retention_grants_by_thread: HashMap<ThreadId, HashMap<RetentionPrincipalId, RetentionGrantId>>,
     retention_threads_by_principal: HashMap<RetentionPrincipalId, HashSet<ThreadId>>,
     clear_transition_reservations: HashSet<ThreadId>,
-    // B is disclosed to the requester before the durable A -> B attachment
+    // B is disclosed to the requester before the durable A -> B subscription
     // move completes. Keep it unavailable to ordinary subscribe/resume until
-    // that single atomic move consumes the predecessor attachment.
+    // that single atomic move consumes the predecessor subscription.
     clear_successor_reservations: HashMap<ThreadId, ThreadId>,
-    attachment_generation: String,
-    attachment_revision: u64,
-    attachment_counts: HashMap<ThreadId, u32>,
+    interactive_subscription_generation: String,
+    interactive_subscription_revision: u64,
+    interactive_subscription_counts: HashMap<ThreadId, u32>,
 }
 
 #[derive(Debug)]
@@ -1562,55 +1667,63 @@ impl ThreadStateManagerInner {
         self.publish_retention(thread_id);
     }
 
-    fn add_interactive_attachment(&mut self, thread_id: ThreadId) -> ThreadAttachmentEntry {
-        let interactive_attachment_count = self.attachment_counts.entry(thread_id).or_default();
-        *interactive_attachment_count = interactive_attachment_count.saturating_add(1);
-        ThreadAttachmentEntry {
+    fn add_interactive_subscription(
+        &mut self,
+        thread_id: ThreadId,
+    ) -> ThreadInteractiveSubscriptionEntry {
+        let interactive_subscription_count = self
+            .interactive_subscription_counts
+            .entry(thread_id)
+            .or_default();
+        *interactive_subscription_count = interactive_subscription_count.saturating_add(1);
+        ThreadInteractiveSubscriptionEntry {
             thread_id: thread_id.to_string(),
-            interactive_attachment_count: *interactive_attachment_count,
+            interactive_subscription_count: *interactive_subscription_count,
         }
     }
 
-    fn remove_interactive_attachment(
+    fn remove_interactive_subscription(
         &mut self,
         thread_id: ThreadId,
-    ) -> Option<ThreadAttachmentEntry> {
-        let interactive_attachment_count = {
-            let interactive_attachment_count = self.attachment_counts.get_mut(&thread_id)?;
-            *interactive_attachment_count = interactive_attachment_count.saturating_sub(1);
-            *interactive_attachment_count
+    ) -> Option<ThreadInteractiveSubscriptionEntry> {
+        let interactive_subscription_count = {
+            let interactive_subscription_count =
+                self.interactive_subscription_counts.get_mut(&thread_id)?;
+            *interactive_subscription_count = interactive_subscription_count.saturating_sub(1);
+            *interactive_subscription_count
         };
-        let entry = ThreadAttachmentEntry {
+        let entry = ThreadInteractiveSubscriptionEntry {
             thread_id: thread_id.to_string(),
-            interactive_attachment_count,
+            interactive_subscription_count,
         };
-        if interactive_attachment_count == 0 {
-            self.attachment_counts.remove(&thread_id);
+        if interactive_subscription_count == 0 {
+            self.interactive_subscription_counts.remove(&thread_id);
         }
         Some(entry)
     }
 
-    fn attachment_change(
+    fn interactive_subscription_change(
         &mut self,
-        mut changes: Vec<ThreadAttachmentEntry>,
-    ) -> Option<ThreadAttachmentChangedNotification> {
+        mut changes: Vec<ThreadInteractiveSubscriptionEntry>,
+    ) -> Option<ThreadInteractiveSubscriptionChangedNotification> {
         if changes.is_empty() {
             return None;
         }
         changes.sort_unstable_by(|left, right| left.thread_id.cmp(&right.thread_id));
-        self.attachment_revision = match self.attachment_revision.checked_add(1) {
-            Some(revision) => revision,
-            None => {
-                // Never publish two distinct changes with one revision. A new
-                // generation makes every consumer resnapshot rather than
-                // accepting an ambiguous incremental history.
-                self.attachment_generation = Uuid::now_v7().to_string();
-                0
-            }
-        };
-        Some(ThreadAttachmentChangedNotification {
-            generation: self.attachment_generation.clone(),
-            revision: self.attachment_revision,
+        self.interactive_subscription_revision =
+            match self.interactive_subscription_revision.checked_add(1) {
+                Some(revision) => revision,
+                None => {
+                    // Never publish two distinct changes with one revision. A new
+                    // generation makes every consumer resnapshot rather than
+                    // accepting an ambiguous incremental history.
+                    self.interactive_subscription_generation = Uuid::now_v7().to_string();
+                    0
+                }
+            };
+        Some(ThreadInteractiveSubscriptionChangedNotification {
+            generation: self.interactive_subscription_generation.clone(),
+            revision: self.interactive_subscription_revision,
             changes,
         })
     }
@@ -1639,7 +1752,8 @@ pub(crate) struct ThreadStateManager {
     // enqueue work on the active per-thread listener.
     listener_commands:
         Arc<StdMutex<HashMap<ThreadId, mpsc::UnboundedSender<ThreadListenerCommand>>>>,
-    attachment_notification_outgoing: Arc<StdMutex<Option<Arc<OutgoingMessageSender>>>>,
+    interactive_subscription_notification_outgoing:
+        Arc<StdMutex<Option<Arc<OutgoingMessageSender>>>>,
 }
 
 impl Default for ThreadStateManager {
@@ -1652,40 +1766,42 @@ impl ThreadStateManager {
     pub(crate) fn new() -> Self {
         Self {
             state: Arc::new(Mutex::new(ThreadStateManagerInner {
-                attachment_generation: Uuid::now_v7().to_string(),
+                interactive_subscription_generation: Uuid::now_v7().to_string(),
                 ..ThreadStateManagerInner::default()
             })),
             listener_commands: Arc::new(StdMutex::new(HashMap::new())),
-            attachment_notification_outgoing: Arc::new(StdMutex::new(None)),
+            interactive_subscription_notification_outgoing: Arc::new(StdMutex::new(None)),
         }
     }
 
-    pub(crate) fn set_attachment_notification_outgoing(
+    pub(crate) fn set_interactive_subscription_notification_outgoing(
         &self,
         outgoing: Arc<OutgoingMessageSender>,
     ) {
         *self
-            .attachment_notification_outgoing
+            .interactive_subscription_notification_outgoing
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outgoing);
     }
 
-    pub(crate) async fn thread_attachment_list(&self) -> ThreadAttachmentListResponse {
+    pub(crate) async fn thread_interactive_subscription_list(
+        &self,
+    ) -> ThreadInteractiveSubscriptionListResponse {
         let state = self.state.lock().await;
         let mut entries = state
-            .attachment_counts
+            .interactive_subscription_counts
             .iter()
             .map(
-                |(thread_id, interactive_attachment_count)| ThreadAttachmentEntry {
+                |(thread_id, interactive_subscription_count)| ThreadInteractiveSubscriptionEntry {
                     thread_id: thread_id.to_string(),
-                    interactive_attachment_count: *interactive_attachment_count,
+                    interactive_subscription_count: *interactive_subscription_count,
                 },
             )
             .collect::<Vec<_>>();
         entries.sort_unstable_by(|left, right| left.thread_id.cmp(&right.thread_id));
-        ThreadAttachmentListResponse {
-            generation: state.attachment_generation.clone(),
-            revision: state.attachment_revision,
+        ThreadInteractiveSubscriptionListResponse {
+            generation: state.interactive_subscription_generation.clone(),
+            revision: state.interactive_subscription_revision,
             entries,
         }
     }
@@ -1798,18 +1914,23 @@ impl ThreadStateManager {
         Ok(RetentionReleaseOutcome::Released)
     }
 
-    async fn publish_attachment_change(&self, change: Option<ThreadAttachmentChangedNotification>) {
+    async fn publish_interactive_subscription_change(
+        &self,
+        change: Option<ThreadInteractiveSubscriptionChangedNotification>,
+    ) {
         let Some(change) = change else {
             return;
         };
         let outgoing = self
-            .attachment_notification_outgoing
+            .interactive_subscription_notification_outgoing
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         if let Some(outgoing) = outgoing {
             outgoing
-                .send_server_notification(ServerNotification::ThreadAttachmentChanged(change))
+                .send_server_notification(ServerNotification::ThreadInteractiveSubscriptionChanged(
+                    change,
+                ))
                 .await;
         }
     }
@@ -1837,15 +1958,15 @@ impl ThreadStateManager {
                 .into_iter()
                 .filter_map(|thread_id| {
                     if capabilities.trusted_interactive {
-                        Some(state.add_interactive_attachment(thread_id))
+                        Some(state.add_interactive_subscription(thread_id))
                     } else {
-                        state.remove_interactive_attachment(thread_id)
+                        state.remove_interactive_subscription(thread_id)
                     }
                 })
                 .collect();
-            state.attachment_change(changes)
+            state.interactive_subscription_change(changes)
         };
-        self.publish_attachment_change(change).await;
+        self.publish_interactive_subscription_change(change).await;
     }
 
     /// Validates client authority and reserves the predecessor for one clear transition.
@@ -1888,7 +2009,7 @@ impl ThreadStateManager {
     /// disposition. This is deliberately separate from the request-scoped A
     /// authority release: an error after B is disclosed must remain
     /// fail-closed until reconciliation can account for the durable record.
-    pub(crate) async fn terminalize_clear_successor_attachment(
+    pub(crate) async fn terminalize_clear_successor_subscription_reservation(
         &self,
         predecessor_thread_id: ThreadId,
         successor_thread_id: ThreadId,
@@ -1905,7 +2026,7 @@ impl ThreadStateManager {
 
     /// Prevents an ordinary resume from attaching the disclosed clear
     /// successor before the authoritative A -> B move consumes A.
-    pub(crate) async fn reserve_clear_successor_attachment(
+    pub(crate) async fn reserve_clear_successor_subscription(
         &self,
         predecessor_thread_id: ThreadId,
         successor_thread_id: ThreadId,
@@ -2005,7 +2126,7 @@ impl ThreadStateManager {
     }
 
     pub(crate) async fn remove_thread_state(&self, thread_id: ThreadId) {
-        let (thread_state, attachment_change) = {
+        let (thread_state, interactive_subscription_change) = {
             let mut state = self.state.lock().await;
             let thread_state = state
                 .threads
@@ -2024,17 +2145,18 @@ impl ThreadStateManager {
                 !thread_ids.is_empty()
             });
             let changes = state
-                .attachment_counts
+                .interactive_subscription_counts
                 .remove(&thread_id)
-                .map(|_| ThreadAttachmentEntry {
+                .map(|_| ThreadInteractiveSubscriptionEntry {
                     thread_id: thread_id.to_string(),
-                    interactive_attachment_count: 0,
+                    interactive_subscription_count: 0,
                 })
                 .into_iter()
                 .collect();
-            (thread_state, state.attachment_change(changes))
+            (thread_state, state.interactive_subscription_change(changes))
         };
-        self.publish_attachment_change(attachment_change).await;
+        self.publish_interactive_subscription_change(interactive_subscription_change)
+            .await;
         self.unregister_listener_command_tx(thread_id);
 
         if let Some(thread_state) = thread_state {
@@ -2043,7 +2165,7 @@ impl ThreadStateManager {
                 thread_id = %thread_id,
                 listener_generation = thread_state.listener_generation,
                 had_listener = thread_state.cancel_tx.is_some(),
-                had_active_turn = thread_state.active_turn_snapshot().is_some(),
+                had_active_turn = thread_state.active_turn_id().is_some(),
                 "clearing thread listener during thread-state teardown"
             );
             thread_state.clear_listener();
@@ -2067,7 +2189,7 @@ impl ThreadStateManager {
                 thread_id = %thread_id,
                 listener_generation = thread_state.listener_generation,
                 had_listener = thread_state.cancel_tx.is_some(),
-                had_active_turn = thread_state.active_turn_snapshot().is_some(),
+                had_active_turn = thread_state.active_turn_id().is_some(),
                 "clearing thread listener during app-server shutdown"
             );
             thread_state.clear_listener();
@@ -2116,18 +2238,18 @@ impl ThreadStateManager {
                 state.revoke_retention_grant(thread_id, principal, RetentionAction::Unsubscribed);
             }
             let changes = trusted_interactive
-                .then(|| state.remove_interactive_attachment(thread_id))
+                .then(|| state.remove_interactive_subscription(thread_id))
                 .flatten()
                 .into_iter()
                 .collect();
-            state.attachment_change(changes)
+            state.interactive_subscription_change(changes)
         };
-        self.publish_attachment_change(change).await;
+        self.publish_interactive_subscription_change(change).await;
         true
     }
 
     /// Moves one live connection from an authoritative clear predecessor to
-    /// its successor with one attachment revision. The caller has already
+    /// its successor with one subscription revision. The caller has already
     /// established the durable A/B/T transition and listener readiness.
     pub(crate) async fn move_connection_for_clear(
         &self,
@@ -2159,7 +2281,10 @@ impl ThreadStateManager {
                 .live_connections
                 .get(&connection_id)
                 .and_then(|capabilities| capabilities.retention_principal);
-            if trusted_interactive && !state.attachment_counts.contains_key(&predecessor_thread_id)
+            if trusted_interactive
+                && !state
+                    .interactive_subscription_counts
+                    .contains_key(&predecessor_thread_id)
             {
                 return false;
             }
@@ -2194,18 +2319,18 @@ impl ThreadStateManager {
 
             let changes = if trusted_interactive {
                 let Some(predecessor_change) =
-                    state.remove_interactive_attachment(predecessor_thread_id)
+                    state.remove_interactive_subscription(predecessor_thread_id)
                 else {
                     return false;
                 };
-                let successor_change = state.add_interactive_attachment(successor_thread_id);
+                let successor_change = state.add_interactive_subscription(successor_thread_id);
                 vec![successor_change, predecessor_change]
             } else {
                 Vec::new()
             };
-            state.attachment_change(changes)
+            state.interactive_subscription_change(changes)
         };
-        self.publish_attachment_change(change).await;
+        self.publish_interactive_subscription_change(change).await;
         true
     }
 
@@ -2255,7 +2380,7 @@ impl ThreadStateManager {
         connection_id: ConnectionId,
         experimental_raw_events: bool,
     ) -> Result<Arc<Mutex<ThreadState>>, ConnectionSubscriptionError> {
-        let (thread_state, attachment_change) = {
+        let (thread_state, interactive_subscription_change) = {
             let mut state = self.state.lock().await;
             if !state.live_connections.contains_key(&connection_id) {
                 return Err(ConnectionSubscriptionError::ConnectionClosed);
@@ -2278,13 +2403,14 @@ impl ThreadStateManager {
                 .live_connections
                 .get(&connection_id)
                 .is_some_and(|capabilities| capabilities.trusted_interactive)
-                .then(|| was_added.then(|| state.add_interactive_attachment(thread_id)))
+                .then(|| was_added.then(|| state.add_interactive_subscription(thread_id)))
                 .flatten()
                 .into_iter()
                 .collect();
-            (thread_state, state.attachment_change(changes))
+            (thread_state, state.interactive_subscription_change(changes))
         };
-        self.publish_attachment_change(attachment_change).await;
+        self.publish_interactive_subscription_change(interactive_subscription_change)
+            .await;
         {
             let mut thread_state_guard = thread_state.lock().await;
             if experimental_raw_events {
@@ -2321,18 +2447,18 @@ impl ThreadStateManager {
                 .live_connections
                 .get(&connection_id)
                 .is_some_and(|capabilities| capabilities.trusted_interactive)
-                .then(|| was_added.then(|| state.add_interactive_attachment(thread_id)))
+                .then(|| was_added.then(|| state.add_interactive_subscription(thread_id)))
                 .flatten()
                 .into_iter()
                 .collect();
-            state.attachment_change(changes)
+            state.interactive_subscription_change(changes)
         };
-        self.publish_attachment_change(change).await;
+        self.publish_interactive_subscription_change(change).await;
         Ok(())
     }
 
     pub(crate) async fn remove_connection(&self, connection_id: ConnectionId) -> Vec<ThreadId> {
-        let (thread_ids, attachment_change) = {
+        let (thread_ids, interactive_subscription_change) = {
             let mut state = self.state.lock().await;
             let removed_capabilities = state.live_connections.remove(&connection_id);
             let trusted_interactive = removed_capabilities
@@ -2357,13 +2483,13 @@ impl ThreadStateManager {
                 {
                     thread_ids
                         .iter()
-                        .filter_map(|thread_id| state.remove_interactive_attachment(*thread_id))
+                        .filter_map(|thread_id| state.remove_interactive_subscription(*thread_id))
                         .collect()
                 }
             } else {
                 Default::default()
             };
-            let attachment_change = state.attachment_change(changes);
+            let interactive_subscription_change = state.interactive_subscription_change(changes);
             let threads_to_unload = thread_ids
                 .into_iter()
                 .filter(|thread_id| {
@@ -2373,9 +2499,10 @@ impl ThreadStateManager {
                         .is_some_and(|thread_entry| thread_entry.connection_ids.is_empty())
                 })
                 .collect::<Vec<_>>();
-            (threads_to_unload, attachment_change)
+            (threads_to_unload, interactive_subscription_change)
         };
-        self.publish_attachment_change(attachment_change).await;
+        self.publish_interactive_subscription_change(interactive_subscription_change)
+            .await;
         thread_ids
     }
 

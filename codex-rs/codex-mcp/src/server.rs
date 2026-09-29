@@ -15,8 +15,10 @@ use codex_connectors::ConnectorRuntimeContextKey;
 use codex_exec_server::Environment;
 use codex_login::CodexAuth;
 use codex_protocol::mcp::ClientMcpExtensions;
+use codex_rmcp_client::McpOAuthRefreshMode;
 use codex_rmcp_client::StoredOAuthCredentialSnapshot;
 use codex_rmcp_client::StoredOAuthTokens;
+use codex_utils_path_uri::PathUri;
 use rmcp::model::ElicitationCapability;
 use tracing::warn;
 
@@ -25,6 +27,7 @@ use tracing::warn;
 pub struct EffectiveMcpServer {
     config: McpServerConfig,
     agent_plugin: bool,
+    requires_read_only_mcp_tools: bool,
 }
 
 impl EffectiveMcpServer {
@@ -32,12 +35,22 @@ impl EffectiveMcpServer {
         Self {
             config,
             agent_plugin: false,
+            requires_read_only_mcp_tools: false,
         }
     }
 
     pub fn with_agent_plugin(mut self, agent_plugin: bool) -> Self {
         self.agent_plugin = agent_plugin;
         self
+    }
+
+    pub(crate) fn with_read_only_mcp_tools(mut self, requires_read_only_mcp_tools: bool) -> Self {
+        self.requires_read_only_mcp_tools = requires_read_only_mcp_tools;
+        self
+    }
+
+    pub(crate) fn requires_read_only_mcp_tools(&self) -> bool {
+        self.requires_read_only_mcp_tools
     }
 
     pub fn config(&self) -> &McpServerConfig {
@@ -93,9 +106,12 @@ pub(crate) fn has_explicit_http_authorization(config: &McpServerConfig) -> bool 
 /// those belong to a publication and can change without reconnecting.
 #[derive(Clone)]
 pub(crate) struct McpServerConnectionIdentity {
+    auth: McpServerAuth,
     transport: McpServerTransportConfig,
     environment_id: String,
+    host_plugin_root: Option<PathUri>,
     oauth_store: Option<(OAuthCredentialsStoreMode, AuthKeyringBackendKind)>,
+    oauth_refresh_mode: Option<McpOAuthRefreshMode>,
     oauth_credentials: Result<Option<StoredOAuthCredentialSnapshot>, String>,
     pub(crate) oauth_store_was_contended: bool,
     resolved_environment: Result<Option<Arc<Environment>>, String>,
@@ -107,6 +123,7 @@ pub(crate) struct McpServerConnectionIdentity {
     client_elicitation_capability: ElicitationCapability,
     client_mcp_extensions: ClientMcpExtensions,
     agent_plugin: bool,
+    requires_read_only_mcp_tools: bool,
     /// Whether this server opted into thread-identity binding (default
     /// `false`). Mirrors `McpServerConfig::thread_identity_eligible`.
     pub(crate) thread_identity_eligible: bool,
@@ -127,8 +144,10 @@ impl McpServerConnectionIdentity {
     pub(crate) fn new(
         server_name: &str,
         server: &EffectiveMcpServer,
+        host_plugin_root: Option<&PathUri>,
         store_mode: OAuthCredentialsStoreMode,
         keyring_backend_kind: AuthKeyringBackendKind,
+        oauth_refresh_mode: McpOAuthRefreshMode,
         resolved_environment: &Result<Option<Arc<Environment>>, String>,
         runtime_context: &McpRuntimeContext,
         runtime_auth_provider: Option<&SharedAuthProvider>,
@@ -147,6 +166,7 @@ impl McpServerConnectionIdentity {
                 .all(|byte| byte == b'\t' || (byte >= b' ' && byte != 0x7f))
         };
         let stored_oauth_url = if runtime_auth_provider.is_none()
+            && !matches!(config.auth, McpServerAuth::EmaAuth)
             && (!matches!(config.auth, McpServerAuth::ChatGpt) || config.is_local_environment())
         {
             match &config.transport {
@@ -155,6 +175,7 @@ impl McpServerConnectionIdentity {
                     bearer_token_env_var: None,
                     http_headers,
                     env_http_headers,
+                    http_headers_helper: _,
                 } if !http_headers.as_ref().is_some_and(|headers| {
                     headers.iter().any(|(name, value)| {
                         name.eq_ignore_ascii_case("authorization") && valid_http_header_value(value)
@@ -204,8 +225,12 @@ impl McpServerConnectionIdentity {
             && matches!(
                 config.transport,
                 McpServerTransportConfig::Stdio { cwd: None, .. }
+                    | McpServerTransportConfig::StreamableHttp {
+                        http_headers_helper: Some(_),
+                        ..
+                    }
             ))
-        .then(|| runtime_context.local_stdio_fallback_cwd());
+        .then(|| runtime_context.local_process_cwd());
         let referenced_environment_variables = referenced_environment_variables(config);
         let runtime_auth = runtime_auth_provider.and(auth).cloned();
         let runtime_auth_token = runtime_auth.as_ref().and_then(|auth| auth.get_token().ok());
@@ -216,11 +241,14 @@ impl McpServerConnectionIdentity {
             .is_some_and(StoredOAuthCredentialSnapshot::store_was_contended);
 
         Self {
+            auth: config.auth.clone(),
             transport: config.transport.clone(),
             environment_id: config.environment_id.clone(),
+            host_plugin_root: host_plugin_root.cloned(),
             oauth_store: stored_oauth_url
                 .is_some()
                 .then_some((store_mode, keyring_backend_kind)),
+            oauth_refresh_mode: stored_oauth_url.is_some().then_some(oauth_refresh_mode),
             oauth_credentials,
             oauth_store_was_contended,
             resolved_environment: resolved_environment.clone(),
@@ -232,6 +260,7 @@ impl McpServerConnectionIdentity {
             client_elicitation_capability,
             client_mcp_extensions,
             agent_plugin: server.is_agent_plugin(),
+            requires_read_only_mcp_tools: server.requires_read_only_mcp_tools(),
             thread_identity_eligible: config.thread_identity_eligible,
             canonical_thread_id,
             control_endpoint: config
@@ -256,9 +285,12 @@ impl McpServerConnectionIdentity {
             (None, None) => true,
             (Some(_), None) | (None, Some(_)) => false,
         };
-        self.transport == other.transport
+        self.auth == other.auth
+            && self.transport == other.transport
             && self.environment_id == other.environment_id
+            && self.host_plugin_root == other.host_plugin_root
             && self.oauth_store == other.oauth_store
+            && self.oauth_refresh_mode == other.oauth_refresh_mode
             && same_resolved_environment(&self.resolved_environment, &other.resolved_environment)
             && self.local_stdio_fallback_cwd == other.local_stdio_fallback_cwd
             && self.referenced_environment_variables == other.referenced_environment_variables
@@ -268,6 +300,7 @@ impl McpServerConnectionIdentity {
             && self.client_elicitation_capability == other.client_elicitation_capability
             && self.client_mcp_extensions == other.client_mcp_extensions
             && self.agent_plugin == other.agent_plugin
+            && self.requires_read_only_mcp_tools == other.requires_read_only_mcp_tools
             && self.thread_identity_eligible == other.thread_identity_eligible
             && self.control_endpoint_eligible == other.control_endpoint_eligible
             // Ineligible servers never bind an identity, so a thread change
@@ -361,6 +394,7 @@ fn referenced_environment_variables(config: &McpServerConfig) -> Vec<(String, Op
             ..
         } => bearer_token_env_var
             .iter()
+            .filter(|name| config.is_local_environment() || std::env::var_os(name).is_some())
             .chain(env_http_headers.iter().flat_map(|headers| headers.values()))
             .cloned()
             .collect(),
@@ -444,3 +478,7 @@ impl From<&EffectiveMcpServer> for McpServerMetadata {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "server_tests.rs"]
+mod tests;

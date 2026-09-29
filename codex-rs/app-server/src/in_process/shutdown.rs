@@ -431,9 +431,7 @@ impl ProcessorCleanupOwner {
         let login = processor.begin_login_shutdown(deadline).ok();
         let threads = processor.begin_thread_shutdown(deadline).ok();
         let connection = async {
-            let Some((_, session)) = self.custody.as_ref() else {
-                return None;
-            };
+            let (_, session) = self.custody.as_ref()?;
             Some(
                 AssertUnwindSafe(session.rpc_gate.shutdown_with_evidence())
                     .catch_unwind()

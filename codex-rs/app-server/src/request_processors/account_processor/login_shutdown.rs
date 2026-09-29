@@ -47,6 +47,7 @@ impl AccountRequestProcessor {
     pub(crate) fn begin_login_shutdown(
         &self,
         deadline: Instant,
+        tasks: &ProcessorTasks,
     ) -> io::Result<AccountLoginShutdown> {
         let mut original = self
             .login_deadline
@@ -55,11 +56,11 @@ impl AccountRequestProcessor {
         let deadline = *original.get_or_insert(deadline);
         self.login_shutdown.cancel();
         // Neither failed gate may prevent the other population being closed.
-        let tasks_closed = self.login_tasks.close_registration();
+        let tasks_closed = tasks.close_registration();
         let browsers_closed = self.browser_logins.close(deadline);
         Ok(AccountLoginShutdown {
             deadline,
-            tasks: self.login_tasks.clone(),
+            tasks: tasks.clone(),
             browsers: self.browser_logins.clone(),
             admission_unavailable: tasks_closed.is_err() || browsers_closed.is_err(),
         })

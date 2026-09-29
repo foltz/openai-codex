@@ -34,7 +34,11 @@ impl HostSkillProvider {
 }
 
 impl SkillProvider for HostSkillProvider {
-    fn list(&self, query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog> {
+    fn list<'a>(
+        &'a self,
+        query: SkillListQuery,
+        _mcp_access: Result<codex_mcp::McpAttemptAccess<'a>, codex_mcp::McpAttemptRefused>,
+    ) -> SkillProviderFuture<'a, SkillCatalog> {
         Box::pin(async move {
             let Some(host_snapshot) = query.host_snapshot else {
                 return Err(SkillProviderError::new(
@@ -46,7 +50,10 @@ impl SkillProvider for HostSkillProvider {
         })
     }
 
-    fn read(&self, request: SkillReadRequest) -> SkillProviderFuture<'_, SkillReadResult> {
+    fn read<'a>(
+        &'a self,
+        request: SkillReadRequest<'a>,
+    ) -> SkillProviderFuture<'a, SkillReadResult> {
         Box::pin(async move {
             let Some(host_snapshot) = request.host_snapshot else {
                 return Err(SkillProviderError::new(

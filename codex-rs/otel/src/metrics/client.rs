@@ -36,6 +36,7 @@ use opentelemetry_semantic_conventions as semconv;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::Weak;
 use std::time::Duration;
@@ -110,7 +111,7 @@ pub(super) struct MetricsClientInner {
     histograms: Mutex<HashMap<String, Histogram<f64>>>,
     duration_histograms: Mutex<HashMap<InstrumentKey, Histogram<f64>>>,
     runtime_reader: Option<Arc<ManualReader>>,
-    runtime_only_metrics: &'static [&'static str],
+    statsig_disabled_metrics: &'static [&'static str],
     default_tags: BTreeMap<String, String>,
 }
 
@@ -131,7 +132,7 @@ impl MetricsClientInner {
         }
         let attributes = self.attributes(tags)?;
 
-        if self.runtime_only_metrics.contains(&name) {
+        if self.statsig_disabled_metrics.contains(&name) {
             return Ok(());
         }
 
@@ -155,17 +156,31 @@ impl MetricsClientInner {
         Ok(())
     }
 
-    fn histogram(&self, name: &str, value: i64, tags: &[(&str, &str)]) -> Result<()> {
+    fn histogram(
+        &self,
+        name: &str,
+        value: i64,
+        boundaries: Option<&[f64]>,
+        tags: &[(&str, &str)],
+    ) -> Result<()> {
         validate_metric_name(name)?;
         let attributes = self.attributes(tags)?;
+
+        if self.statsig_disabled_metrics.contains(&name) {
+            return Ok(());
+        }
 
         let mut histograms = self
             .histograms
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let histogram = histograms
-            .entry(name.to_string())
-            .or_insert_with(|| self.meter.f64_histogram(name.to_string()).build());
+        let histogram = histograms.entry(name.to_string()).or_insert_with(|| {
+            let builder = self.meter.f64_histogram(name.to_string());
+            match boundaries {
+                Some(boundaries) => builder.with_boundaries(boundaries.to_vec()).build(),
+                None => builder.build(),
+            }
+        });
         histogram.record(value as f64, &attributes);
         Ok(())
     }
@@ -179,6 +194,10 @@ impl MetricsClientInner {
     ) -> Result<()> {
         validate_metric_name(name)?;
         let attributes = self.attributes(tags)?;
+
+        if self.statsig_disabled_metrics.contains(&name) {
+            return Ok(());
+        }
 
         let mut gauges = self
             .gauges
@@ -209,6 +228,11 @@ impl MetricsClientInner {
     ) -> Result<()> {
         validate_metric_name(name)?;
         let attributes = self.attributes(tags)?;
+
+        if self.statsig_disabled_metrics.contains(&name) {
+            return Ok(());
+        }
+
         let _gauge = self
             .meter
             .i64_observable_gauge(name.to_string())
@@ -230,7 +254,7 @@ impl MetricsClientInner {
         validate_metric_name(name)?;
         let attributes = self.attributes(tags)?;
 
-        if self.runtime_only_metrics.contains(&name) {
+        if self.statsig_disabled_metrics.contains(&name) {
             return Ok(());
         }
 
@@ -318,7 +342,7 @@ impl MetricsClient {
             exporter,
             export_interval,
             runtime_reader,
-            runtime_only_metrics,
+            statsig_disabled_metrics,
             default_tags,
         } = config;
 
@@ -364,7 +388,7 @@ impl MetricsClient {
                 histograms: Mutex::new(HashMap::new()),
                 duration_histograms: Mutex::new(HashMap::new()),
                 runtime_reader,
-                runtime_only_metrics,
+                statsig_disabled_metrics,
                 default_tags,
             })),
             active: None,
@@ -411,7 +435,18 @@ impl MetricsClient {
 
     /// Send a single histogram sample.
     pub fn histogram(&self, name: &str, value: i64, tags: &[(&str, &str)]) -> Result<()> {
-        self.with_active_inner(|inner| inner.histogram(name, value, tags))
+        self.with_active_inner(|inner| inner.histogram(name, value, /*boundaries*/ None, tags))
+    }
+
+    /// Send a single histogram sample using explicit bucket boundaries.
+    pub fn histogram_with_boundaries(
+        &self,
+        name: &str,
+        value: i64,
+        boundaries: &[f64],
+        tags: &[(&str, &str)],
+    ) -> Result<()> {
+        self.with_active_inner(|inner| inner.histogram(name, value, Some(boundaries), tags))
     }
 
     /// Send a single gauge measurement.
@@ -552,7 +587,9 @@ impl MetricsClient {
 }
 
 fn os_resource_attributes() -> Vec<KeyValue> {
-    let os_info = os_info::get();
+    // Provider creation must not repeat OS discovery subprocesses.
+    static OS_INFO: LazyLock<os_info::Info> = LazyLock::new(os_info::get);
+    let os_info = &*OS_INFO;
     let os_type_raw = os_info.os_type().to_string();
     let os_type = sanitize_metric_tag_value(os_type_raw.as_str());
     let os_version_raw = os_info.version().to_string();

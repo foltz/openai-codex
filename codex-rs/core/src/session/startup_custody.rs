@@ -12,7 +12,9 @@ use crate::codex_thread::ThreadRetirement;
 use crate::codex_thread::ThreadRetirementError;
 use crate::codex_thread::ThreadRetirementReport;
 use codex_protocol::ThreadId;
+#[cfg(test)]
 use codex_thread_store::LiveThread;
+use codex_thread_store::LiveThreadInitGuard;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use futures::future::Shared;
@@ -25,7 +27,7 @@ type PersistenceDisposalReceipt = Shared<BoxFuture<'static, bool>>;
 
 struct PreSessionPersistence {
     thread_id: ThreadId,
-    live_thread: LiveThread,
+    guard: Arc<tokio::sync::Mutex<LiveThreadInitGuard>>,
     disposal: Option<PersistenceDisposal>,
 }
 
@@ -91,14 +93,29 @@ impl StartupCleanup {
 mod tests;
 
 impl SessionStartupCustody {
+    #[cfg(test)]
     pub(super) fn retain_persistence(&self, thread_id: ThreadId, live_thread: LiveThread) {
+        self.retain_persistence_guard(
+            thread_id,
+            Arc::new(tokio::sync::Mutex::new(LiveThreadInitGuard::new(Some(
+                live_thread,
+            )))),
+        );
+    }
+
+    /// Retain acquisition before its first poll, not just its eventual writer.
+    pub(super) fn retain_persistence_guard(
+        &self,
+        thread_id: ThreadId,
+        guard: Arc<tokio::sync::Mutex<LiveThreadInitGuard>>,
+    ) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.persistence = Some(PreSessionPersistence {
             thread_id,
-            live_thread,
+            guard,
             disposal: None,
         });
     }
@@ -173,6 +190,14 @@ impl SessionStartupCustody {
         {
             return false;
         }
+        if let Some(persistence) = state.persistence.as_ref() {
+            // Construction has released the acquisition lock before Session birth.
+            // Do not transfer custody if that invariant is violated.
+            let Ok(mut guard) = persistence.guard.try_lock() else {
+                return false;
+            };
+            guard.commit();
+        }
         state.persistence.take();
         state.session = Some(UnpublishedSession {
             session: Arc::clone(session),
@@ -210,6 +235,10 @@ impl SessionStartupCustody {
             .is_ok_and(|state| state.session.is_none() && state.persistence.is_none())
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the retained disposal receipt exclusively owns acquisition and discard through this guard"
+    )]
     fn persistence_disposal(
         persistence: &mut PreSessionPersistence,
         phase: PersistenceDisposalPhase,
@@ -217,10 +246,10 @@ impl SessionStartupCustody {
         persistence
             .disposal
             .get_or_insert_with(|| {
-                let live_thread = persistence.live_thread.clone();
+                let guard = Arc::clone(&persistence.guard);
                 let thread_id = persistence.thread_id;
                 let receipt = async move {
-                    let complete = live_thread.discard().await.is_ok();
+                    let complete = guard.lock().await.discard_with_result().await.is_ok();
                     if !complete {
                         warn!(
                             persistence_operation = "discard_failed_initialization",
@@ -315,6 +344,10 @@ impl SessionStartupCustody {
         }
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "the unbounded branch constructs a disposal receipt; the bounded branch returns before use"
+    )]
     async fn shutdown_persistence_legacy(&self) -> Option<bool> {
         let (thread_id, disposal, bounded_deadline) = {
             let Ok(mut state) = self.state.lock() else {

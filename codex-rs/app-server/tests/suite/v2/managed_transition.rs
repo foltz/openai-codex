@@ -26,7 +26,7 @@ fn start_params(process_instance_id: String) -> StartManagedTransitionParams {
         expected_auth_revision: 0,
         expected_transition_revision: 0,
         expected_auth_fingerprint: None,
-        intended_result_auth_fingerprint: Some("intended-account".to_owned()),
+        intended_result_auth_fingerprint: Some("test-intended-fingerprint".to_owned()),
     }
 }
 

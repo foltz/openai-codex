@@ -15,6 +15,10 @@ pub(crate) const OVERLOADED_ERROR_CODE: i64 = -32001;
 pub(crate) const ACCOUNT_TRANSITION_IN_PROGRESS_ERROR_CODE: i64 = -32002;
 pub const INPUT_TOO_LARGE_ERROR_CODE: &str = "input_too_large";
 
+pub(crate) fn server_draining_error() -> JSONRPCErrorError {
+    invalid_request("Server is draining; retry after reconnecting")
+}
+
 pub(crate) fn invalid_request(message: impl Into<String>) -> JSONRPCErrorError {
     error(INVALID_REQUEST_ERROR_CODE, message)
 }

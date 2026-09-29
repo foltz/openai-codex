@@ -103,7 +103,7 @@ async fn command_exec_without_process_id_keeps_buffered_compatibility() -> Resul
         .send_command_exec_request(CommandExecParams {
             command: vec![
                 "sh".to_string(),
-                "-lc".to_string(),
+                "-c".to_string(),
                 "printf 'legacy-out'; printf 'legacy-err' >&2".to_string(),
             ],
             process_id: None,
@@ -152,7 +152,7 @@ async fn command_exec_env_overrides_merge_with_server_environment_and_support_un
         .send_command_exec_request(CommandExecParams {
             command: vec![
                 "/bin/sh".to_string(),
-                "-lc".to_string(),
+                "-c".to_string(),
                 "printf '%s|%s|%s|%s|%s|%s' \"$COMMAND_EXEC_BASELINE\" \"$COMMAND_EXEC_EXTRA\" \"${RUST_LOG-unset}\" \"$CODEX_HOME\" \"$OPENAI_FEDERATION_RULE_ID\" \"$openai_identity_token_file\"".to_string(),
             ],
             process_id: None,
@@ -298,7 +298,7 @@ async fn command_exec_accepts_permission_profile() -> Result<()> {
         .send_command_exec_request(CommandExecParams {
             command: vec![
                 "sh".to_string(),
-                "-lc".to_string(),
+                "-c".to_string(),
                 "printf 'profile'".to_string(),
             ],
             process_id: None,
@@ -330,6 +330,119 @@ async fn command_exec_accepts_permission_profile() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn command_exec_enforces_managed_deny_read_requirements() -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri(), "never")?;
+    let denied_root = codex_home.path().join("private");
+    let nested_root = denied_root.join("nested");
+    std::fs::create_dir_all(&nested_root)?;
+    let denied_path = nested_root.join("secret.txt");
+    std::fs::write(&denied_path, "managed secret")?;
+    let user_denied_root = codex_home.path().join("user-private");
+    std::fs::create_dir_all(&user_denied_root)?;
+    let user_denied_path = user_denied_root.join("secret.txt");
+    std::fs::write(&user_denied_path, "user secret")?;
+    std::fs::write(
+        codex_home.path().join("requirements.toml"),
+        format!("[permissions.filesystem]\ndeny_read = [{denied_root:?}]\n"),
+    )?;
+    insert_command_exec_config(
+        codex_home.path(),
+        &format!(
+            "default_permissions = \"thread-policy\"\n\n[permissions.thread-policy.filesystem]\n\":root\" = \"read\"\n{user_denied_root:?} = \"deny\"\n\n[permissions.nested.filesystem]\n\":root\" = \"read\"\n{nested_root:?} = \"write\"\n"
+        ),
+    )?;
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
+
+    let request = CommandExecParams {
+        command: vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "cat \"$1\"".to_string(),
+            "sh".to_string(),
+            denied_path.to_string_lossy().into_owned(),
+        ],
+        process_id: None,
+        tty: false,
+        stream_stdin: false,
+        stream_stdout_stderr: false,
+        output_bytes_cap: None,
+        disable_output_cap: false,
+        disable_timeout: false,
+        timeout_ms: None,
+        cwd: Some(codex_home.path().to_path_buf()),
+        env: None,
+        size: None,
+        sandbox_policy: Some(SandboxPolicy::ReadOnly {
+            network_access: false,
+        }),
+        permission_profile: None,
+    };
+    let request_id = app_server
+        .send_command_exec_request(request.clone())
+        .await?;
+    let response: CommandExecResponse = app_server.read_response(request_id).await?;
+    assert_ne!(response.exit_code, 0);
+    assert!(!response.stdout.contains("managed secret"));
+
+    let mut user_request = request.clone();
+    *user_request
+        .command
+        .last_mut()
+        .expect("cat command includes a file path") = user_denied_path.to_string_lossy().into();
+    let request_id = app_server.send_command_exec_request(user_request).await?;
+    let response: CommandExecResponse = app_server.read_response(request_id).await?;
+    assert_eq!(
+        response,
+        CommandExecResponse {
+            exit_code: 0,
+            stdout: "user secret".to_string(),
+            stderr: String::new(),
+        }
+    );
+
+    for sandbox_policy in [
+        SandboxPolicy::DangerFullAccess,
+        SandboxPolicy::WorkspaceWrite {
+            writable_roots: vec![nested_root.try_into()?],
+            network_access: false,
+            exclude_tmpdir_env_var: false,
+            exclude_slash_tmp: false,
+        },
+    ] {
+        let request_id = app_server
+            .send_command_exec_request(CommandExecParams {
+                sandbox_policy: Some(sandbox_policy),
+                ..request.clone()
+            })
+            .await?;
+        let error = app_server
+            .read_stream_until_error_message(RequestId::Integer(request_id))
+            .await?;
+        assert!(error.error.message.contains("invalid sandbox policy"));
+    }
+
+    let request_id = app_server
+        .send_command_exec_request(CommandExecParams {
+            sandbox_policy: None,
+            permission_profile: Some("nested".to_string()),
+            ..request
+        })
+        .await?;
+    let error = app_server
+        .read_stream_until_error_message(RequestId::Integer(request_id))
+        .await?;
+    assert!(error.error.message.contains("invalid permission profile"));
+    Ok(())
+}
+
 #[tokio::test]
 async fn command_exec_permission_profile_starts_selected_network_proxy() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
@@ -349,7 +462,7 @@ async fn command_exec_permission_profile_starts_selected_network_proxy() -> Resu
         .send_command_exec_request(CommandExecParams {
             command: vec![
                 "sh".to_string(),
-                "-lc".to_string(),
+                "-c".to_string(),
                 "printf '%s' \"${CODEX_NETWORK_PROXY_ACTIVE-unset}\"".to_string(),
             ],
             process_id: None,
@@ -397,7 +510,7 @@ async fn command_exec_permission_profile_does_not_reuse_default_network_proxy() 
         .send_command_exec_request(CommandExecParams {
             command: vec![
                 "sh".to_string(),
-                "-lc".to_string(),
+                "-c".to_string(),
                 "printf '%s' \"${CODEX_NETWORK_PROXY_ACTIVE-unset}\"".to_string(),
             ],
             process_id: None,
@@ -750,7 +863,7 @@ async fn command_exec_non_streaming_respects_output_cap() -> Result<()> {
         .send_command_exec_request(CommandExecParams {
             command: vec![
                 "sh".to_string(),
-                "-lc".to_string(),
+                "-c".to_string(),
                 "printf 'abcdef'; printf 'uvwxyz' >&2".to_string(),
             ],
             process_id: Some("cap-1".to_string()),

@@ -269,10 +269,7 @@ async fn fresh_startup_uses_server_defaults_with_explicit_and_managed_precedence
             server.thread_tool_transport(),
         )
         .await?;
-        let crate::app_server_session::PendingStartupThread {
-            started: started,
-            retention,
-        } = started;
+        let crate::app_server_session::PendingStartupThread { started, retention } = started;
         retention.commit();
         assert_eq!(selected_model, expected_model, "{choice}");
         let starts = recorded_params(&requests, "thread/start");
@@ -365,10 +362,7 @@ async fn fresh_startup_reads_destination_and_cleared_model_uses_catalog() -> Res
             server.thread_tool_transport(),
         )
         .await?;
-        let crate::app_server_session::PendingStartupThread {
-            started: started,
-            retention,
-        } = started;
+        let crate::app_server_session::PendingStartupThread { started, retention } = started;
         retention.commit();
         assert_eq!(started.session.model, selected_model);
         let starts = recorded_params(&requests, "thread/start");

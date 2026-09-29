@@ -1121,6 +1121,9 @@ impl App {
                 return;
             }
         };
+        let retention = app_server
+            .retain_clear_successor(&response.successor_thread.id)
+            .await;
         let session = self
             .session_state_for_thread_read(successor_thread_id, &response.successor_thread)
             .await;
@@ -1150,10 +1153,14 @@ impl App {
 
         // The server has now atomically moved this connection from A to B. Local listener cleanup
         // may safely follow the authoritative response, but must never precede the request above.
-        self.shutdown_current_thread(app_server).await;
+        self.shutdown_current_thread_except(app_server, Some(successor_thread_id))
+            .await;
         let tracked_thread_ids: Vec<ThreadId> =
             self.thread_event_channels.keys().copied().collect();
         for thread_id in tracked_thread_ids {
+            if thread_id == successor_thread_id {
+                continue;
+            }
             if let Err(err) = app_server.thread_unsubscribe(thread_id).await {
                 tracing::warn!("failed to unsubscribe tracked thread {thread_id}: {err}");
             }
@@ -1177,6 +1184,9 @@ impl App {
                 "Failed to attach to clear successor app-server thread: {err}"
             ));
         } else {
+            if let Some(retention) = retention {
+                retention.commit();
+            }
             if let Some(err) = name_error {
                 self.chat_widget.add_error_message(err);
             }
@@ -1456,12 +1466,8 @@ impl App {
             && self.chat_widget.thread_id() == Some(resumed_thread_id))
         .then(|| self.chat_widget.capture_thread_input_state())
         .flatten();
-        if self.chat_widget.thread_id() == Some(resumed_thread_id) {
-            // The successful resume has already subscribed this connection to the same thread.
-            self.shutdown_side_threads(app_server).await;
-        } else {
-            self.shutdown_current_thread(app_server).await;
-        }
+        self.shutdown_current_thread_except(app_server, Some(resumed_thread_id))
+            .await;
         self.local_settings = local_settings;
         self.refresh_server_version_overview_notice(CODEX_CLI_VERSION);
         self.config = resume_config;

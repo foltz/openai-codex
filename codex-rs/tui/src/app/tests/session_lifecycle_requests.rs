@@ -4277,6 +4277,20 @@ fn clear_session_uses_exact_displayed_thread_before_unsubscribe_and_attaches_suc
                     .current_displayed_thread_id()
                     .expect("clear successor should be displayed");
                 assert_ne!(successor, predecessor);
+                let retained: codex_app_server_protocol::ThreadRetentionAcquireResponse =
+                    app_server
+                        .request_handle()
+                        .request_typed(ClientRequest::ThreadRetentionAcquire {
+                            request_id: app_server.next_request_id(),
+                            params: codex_app_server_protocol::ThreadRetentionAcquireParams {
+                                thread_id: successor.to_string(),
+                            },
+                        })
+                        .await?;
+                assert!(matches!(
+                    retained,
+                    codex_app_server_protocol::ThreadRetentionAcquireResponse::AlreadyHeld { .. }
+                ));
                 assert_eq!(
                     app_server
                         .thread_read(successor, /*include_turns*/ false)

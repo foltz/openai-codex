@@ -38,10 +38,37 @@ impl App {
     }
 
     pub(super) async fn shutdown_current_thread(&mut self, app_server: &mut AppServerSession) {
+        self.shutdown_current_thread_except(app_server, /*retained_target*/ None)
+            .await;
+    }
+
+    /// Preserve an already adopted target across primary, displayed and side cleanup.
+    pub(super) async fn shutdown_current_thread_except(
+        &mut self,
+        app_server: &mut AppServerSession,
+        retained_target: Option<ThreadId>,
+    ) {
         self.stop_realtime_conversation(app_server).await;
-        self.shutdown_side_threads(app_server).await;
-        if let Some(thread_id) = self.chat_widget.thread_id() {
-            if let Err(err) = app_server.thread_unsubscribe(thread_id).await {
+        let side_thread_ids: Vec<ThreadId> = self.side_threads.keys().copied().collect();
+        for side_thread_id in side_thread_ids {
+            if Some(side_thread_id) != retained_target {
+                self.discard_side_thread(app_server, side_thread_id).await;
+            }
+        }
+        let displayed = self.chat_widget.thread_id();
+        let mut leaving = Vec::new();
+        if let Some(primary) = self.primary_thread_id
+            && Some(primary) != displayed
+        {
+            leaving.push(primary);
+        }
+        if let Some(displayed) = displayed {
+            leaving.push(displayed);
+        }
+        for thread_id in leaving {
+            if Some(thread_id) != retained_target
+                && let Err(err) = app_server.thread_unsubscribe(thread_id).await
+            {
                 tracing::warn!("failed to unsubscribe thread {thread_id}: {err}");
             }
             self.abort_thread_event_listener(thread_id);

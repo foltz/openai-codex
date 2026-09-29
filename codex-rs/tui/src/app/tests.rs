@@ -4,6 +4,8 @@
 mod daybreak_tests;
 #[path = "tests/math_interruption_tests.rs"]
 mod math_interruption_tests;
+#[path = "tests/retention_adoption_tests.rs"]
+mod retention_adoption_tests;
 
 #[path = "tests/advanced_reasoning_tests.rs"]
 mod advanced_reasoning_tests;

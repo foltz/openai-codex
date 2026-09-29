@@ -6,10 +6,12 @@
 )]
 
 use crate::DbTelemetry;
+use crate::kcf_migrations::KCF_STATE_MIGRATOR;
 use crate::migrations::repair_legacy_recency_migration_version;
 use crate::runtime::RuntimeDbInitError;
 use crate::telemetry;
 use crate::telemetry::DbKind;
+use anyhow::Context;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use log::LevelFilter;
 use sqlx::ConnectOptions;
@@ -275,7 +277,16 @@ impl SqliteConfig {
             if matches!(spec.kind, DbKind::State) {
                 repair_legacy_recency_migration_version(&pool, migrator).await?;
             }
-            migrator.run(&pool).await.map_err(anyhow::Error::from)
+            migrator.run(&pool).await?;
+            if matches!(spec.kind, DbKind::State) {
+                // Each script is transactional, not the two-ledger sequence.
+                // Do not publish the pool if KCF fails after upstream commits.
+                KCF_STATE_MIGRATOR
+                    .run(&pool)
+                    .await
+                    .context("failed to migrate KCF state schema")?;
+            }
+            Ok::<(), anyhow::Error>(())
         }
         .await;
         telemetry::record_init_result(

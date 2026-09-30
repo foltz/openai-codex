@@ -925,6 +925,7 @@ mod tests {
 
     struct TestClient {
         _codex_home: TempDir,
+        _host: Arc<InProcessHost>,
         client: InProcessAppServerClient,
     }
 
@@ -951,34 +952,39 @@ mod tests {
         let state_db = init_state_db(config.as_ref())
             .await
             .expect("state db should initialize for in-process test");
-        let client = InProcessAppServerClient::start(InProcessClientStartArgs {
-            arg0_paths: Arg0DispatchPaths::default(),
-            config,
-            cli_overrides: Vec::new(),
-            loader_overrides: LoaderOverrides::default(),
-            strict_config: false,
-            cloud_config_bundle: CloudConfigBundleLoader::default(),
-            embedded_network_policy: Default::default(),
-            feedback: CodexFeedback::new(),
-            log_db: None,
-            state_db: Some(state_db),
-            environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
-            config_warnings: Vec::new(),
-            session_source,
-            enable_codex_api_key_env: false,
-            client_name: "codex-app-server-client-test".to_string(),
-            client_version: "0.0.0-test".to_string(),
-            experimental_api: true,
-            mcp_server_openai_form_elicitation: false,
-            interactive_client: false,
-            opt_out_notification_methods: Vec::new(),
-            channel_capacity,
-        })
+        let host = Arc::new(InProcessHost::default());
+        let client = InProcessAppServerClient::start_in_host(
+            Arc::clone(&host),
+            InProcessClientStartArgs {
+                arg0_paths: Arg0DispatchPaths::default(),
+                config,
+                cli_overrides: Vec::new(),
+                loader_overrides: LoaderOverrides::default(),
+                strict_config: false,
+                cloud_config_bundle: CloudConfigBundleLoader::default(),
+                embedded_network_policy: Default::default(),
+                feedback: CodexFeedback::new(),
+                log_db: None,
+                state_db: Some(state_db),
+                environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
+                config_warnings: Vec::new(),
+                session_source,
+                enable_codex_api_key_env: false,
+                client_name: "codex-app-server-client-test".to_string(),
+                client_version: "0.0.0-test".to_string(),
+                experimental_api: true,
+                mcp_server_openai_form_elicitation: false,
+                interactive_client: false,
+                opt_out_notification_methods: Vec::new(),
+                channel_capacity,
+            },
+        )
         .await
         .expect("in-process app-server client should start");
 
         TestClient {
             _codex_home: codex_home,
+            _host: host,
             client,
         }
     }

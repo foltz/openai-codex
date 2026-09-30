@@ -149,11 +149,6 @@ impl McpServerConnection {
         self.client.client_with_authority(access).await
     }
 
-    #[cfg(test)]
-    async fn shutdown(&self) {
-        self.client.shutdown().await;
-    }
-
     fn cancel_startup(&self) {
         if !self.startup_is_dormant() && !self.client.startup_complete.load(Ordering::Acquire) {
             self.client.cancel_token.cancel();

@@ -704,18 +704,6 @@ impl AsyncManagedClient {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) async fn shutdown(&self) {
-        self.cancel_token.cancel();
-        match self.client().await {
-            Ok(client) => client.client.shutdown().await,
-            Err(StartupOutcomeError::Cancelled) => {}
-            Err(error) => {
-                warn!("failed to initialize MCP client during shutdown: {error:#}");
-            }
-        }
-    }
-
     pub(crate) fn has_cached_tools(&self) -> bool {
         self.codex_apps_tools_cache_context
             .as_ref()

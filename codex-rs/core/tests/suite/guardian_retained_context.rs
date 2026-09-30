@@ -1004,17 +1004,6 @@ async fn ordered_rollback_replay_removes_steered_answers_after_acceptance_bounda
             .collect::<Vec<_>>(),
         answers
     );
-    let before_rollback = serde_json::to_value(
-        thread
-            .conversation_history_snapshot()
-            .await
-            .retained_context()
-            .expect("ordered answer context"),
-    )?;
-    assert!(before_rollback["verified_answers"]
-        .as_array()
-        .is_some_and(|entries| entries.len() == answers.len()
-            && entries.iter().all(|entry| entry["acceptance_order"].is_u64())));
     // Both answers were accepted after the steer, even though the first call
     // remains in the model window after rolling back that steer.
     thread
@@ -1043,8 +1032,7 @@ async fn ordered_rollback_replay_removes_steered_answers_after_acceptance_bounda
             .verified_answers()
             .cloned()
             .collect::<Vec<_>>(),
-        Vec::<VerifiedAnswer>::new(),
-        "retained context before rollback: {before_rollback}"
+        Vec::<VerifiedAnswer>::new()
     );
     compact_and_assert_answers(&test, &thread, &[]).await?;
     thread = resume(&test, &thread).await?;

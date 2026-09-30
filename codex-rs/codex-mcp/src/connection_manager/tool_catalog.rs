@@ -272,7 +272,6 @@ impl McpConnectionSet {
         (tools, errors)
     }
 
-    #[instrument(level = "trace", skip_all)]
     #[cfg(test)]
     pub(crate) async fn capture_binding_with_metadata(
         self: &Arc<Self>,
@@ -291,6 +290,7 @@ impl McpConnectionSet {
         .await
     }
 
+    #[instrument(level = "trace", skip_all, name = "capture_binding_with_metadata")]
     pub(crate) async fn capture_binding_with_authority(
         self: &Arc<Self>,
         config: Arc<crate::McpConfig>,

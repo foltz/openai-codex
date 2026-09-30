@@ -4219,6 +4219,12 @@ fn clear_session_uses_exact_displayed_thread_before_unsubscribe_and_attaches_suc
                 .build()?;
             runtime.block_on(async {
                 let mut app = make_test_app().await;
+                // Clear qualification must not wait for external plugin catalog sync.
+                app.config.features.disable(Feature::Plugins);
+                app.cli_kv_overrides.push((
+                    "features.plugins".to_string(),
+                    toml::Value::Boolean(false),
+                ));
                 let codex_home = tempdir()?;
                 app.config.codex_home = codex_home.path().to_path_buf().abs();
                 app.config.sqlite = SqliteConfig::new_for_testing(codex_home.path().abs());
@@ -4324,6 +4330,12 @@ fn clear_then_submit_ui_path_uses_one_combined_request() -> Result<()> {
                 .build()?;
             runtime.block_on(async {
                 let mut app = make_test_app().await;
+                // Preserve this fixture isolation when fresh-session config reloads.
+                app.config.features.disable(Feature::Plugins);
+                app.cli_kv_overrides.push((
+                    "features.plugins".to_string(),
+                    toml::Value::Boolean(false),
+                ));
                 let codex_home = tempdir()?;
                 app.config.codex_home = codex_home.path().to_path_buf().abs();
                 app.config.sqlite = SqliteConfig::new_for_testing(codex_home.path().abs());

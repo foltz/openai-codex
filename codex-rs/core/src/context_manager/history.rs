@@ -818,8 +818,8 @@ impl ContextManager {
             .filter_map(|item| item.turn_id())
             .collect::<Vec<_>>();
         // Old answer events lack accepted-input order even when a resumed thread
-        // now captures user messages. Their answers still follow source calls.
-        if source == RetainedInputSource::Inherited || source.acceptance_order().is_some() {
+        // now captures ordered user messages. Their answers still follow source calls.
+        if source == RetainedInputSource::Inherited {
             Arc::make_mut(&mut retained_context).rollback(
                 &removed_turns,
                 first_removed_message_id,
@@ -831,7 +831,10 @@ impl ContextManager {
                 first_removed_message_id,
                 source,
             );
-            Arc::make_mut(&mut retained_context).retain_answers(|answer| {
+            Arc::make_mut(&mut retained_context).retain_answers_at_rollback(|answer, order| {
+                if let (Some(order), Some(boundary)) = (order, source.acceptance_order()) {
+                    return order < boundary;
+                }
                 // Legacy answers follow their original call, not later steers in the same turn.
                 if let Some(source_index) = snapshot.iter().rposition(|item| {
                     item.turn_id() == Some(answer.turn_id.as_str())

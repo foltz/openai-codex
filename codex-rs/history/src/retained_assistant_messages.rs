@@ -78,6 +78,7 @@ impl RetainedContext {
             revision,
             inherited,
             order,
+            acceptance_order: None,
             value: message,
         };
         let source = entry.source(RetainedSourceRole::Assistant);

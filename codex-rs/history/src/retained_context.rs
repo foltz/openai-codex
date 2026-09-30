@@ -102,6 +102,8 @@ struct Ordered<T> {
     inherited: bool,
     #[serde(default)]
     order: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    acceptance_order: Option<u64>,
     #[serde(flatten)]
     value: T,
 }
@@ -262,6 +264,7 @@ impl RetainedContext {
             revision: None,
             inherited: false,
             order,
+            acceptance_order: None,
             value: messages,
         });
         bound_family(&mut self.sender_deliveries, /*incomplete*/ &mut false);
@@ -411,6 +414,7 @@ impl RetainedContext {
             revision,
             inherited,
             order,
+            acceptance_order: None,
             value: message,
         };
         let source = entry.source(RetainedSourceRole::User);
@@ -461,6 +465,7 @@ impl RetainedContext {
                     revision: None,
                     inherited: false,
                     order,
+                    acceptance_order,
                     value: answer,
                 });
                 bound_family(
@@ -555,6 +560,15 @@ impl RetainedContext {
     /// Keeps legacy answers whose source calls survive when no retained instruction boundary exists.
     pub fn retain_answers(&mut self, mut keep: impl FnMut(&VerifiedAnswer) -> bool) {
         self.verified_answers.retain(|answer| keep(&answer.value));
+    }
+
+    /// Preserve modern acceptance boundaries and legacy source-call boundaries separately.
+    pub fn retain_answers_at_rollback(
+        &mut self,
+        mut keep: impl FnMut(&VerifiedAnswer, Option<u64>) -> bool,
+    ) {
+        self.verified_answers
+            .retain(|answer| keep(&answer.value, answer.acceptance_order));
     }
 
     /// Rolls back at the original user-message boundary, including later-accepted facts.

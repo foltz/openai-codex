@@ -878,14 +878,14 @@ async fn legacy_incomplete_capture_stays_incomplete_after_compaction_and_resume(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn legacy_rollback_replay_retains_only_surviving_steered_answers() -> Result<()> {
+async fn ordered_rollback_replay_removes_steered_answers_after_acceptance_boundary() -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
     let test = test_codex()
         .with_history_mode(ThreadHistoryMode::Legacy)
         .with_config(|config| {
             config.experimental_thread_store = ThreadStoreConfig::Local;
-            // Legacy saved answers use their source calls, not acceptance-order metadata.
+            // Ordered live answers follow acceptance boundaries across steers.
             for feature in [Feature::TokenBudget, Feature::DefaultModeRequestUserInput] {
                 config
                     .features
@@ -992,27 +992,13 @@ async fn legacy_rollback_replay_retains_only_surviving_steered_answers() -> Resu
             );
         }
     }
-    test.codex
-        .append_rollout_items(
-            &answers
-                .iter()
-                .cloned()
-                .map(|answer| {
-                    RolloutItem::RetainedContext(RetainedContextEvent::VerifiedAnswer {
-                        answer,
-                        acceptance_order: None,
-                    })
-                })
-                .collect::<Vec<_>>(),
-        )
-        .await?;
     let mut thread = resume(&test, &test.codex).await?;
     assert_eq!(
         thread
             .conversation_history_snapshot()
             .await
             .retained_context()
-            .expect("legacy answers")
+            .expect("ordered answers")
             .verified_answers()
             .cloned()
             .collect::<Vec<_>>(),
@@ -1023,9 +1009,14 @@ async fn legacy_rollback_replay_retains_only_surviving_steered_answers() -> Resu
             .conversation_history_snapshot()
             .await
             .retained_context()
-            .expect("legacy answer context"),
+            .expect("ordered answer context"),
     )?;
-    // Legacy answer survival follows the actual source-call boundary.
+    assert!(before_rollback["verified_answers"]
+        .as_array()
+        .is_some_and(|entries| entries.len() == answers.len()
+            && entries.iter().all(|entry| entry["acceptance_order"].is_u64())));
+    // Both answers were accepted after the steer, even though the first call
+    // remains in the model window after rolling back that steer.
     thread
         .append_rollout_items(&[RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
             ThreadRolledBackEvent { num_turns: 1 },
@@ -1052,12 +1043,12 @@ async fn legacy_rollback_replay_retains_only_surviving_steered_answers() -> Resu
             .verified_answers()
             .cloned()
             .collect::<Vec<_>>(),
-        answers[..1],
+        Vec::<VerifiedAnswer>::new(),
         "retained context before rollback: {before_rollback}"
     );
-    compact_and_assert_answers(&test, &thread, &answers[..1]).await?;
+    compact_and_assert_answers(&test, &thread, &[]).await?;
     thread = resume(&test, &thread).await?;
-    compact_and_assert_answers(&test, &thread, &answers[..1]).await?;
+    compact_and_assert_answers(&test, &thread, &[]).await?;
     thread.shutdown_and_wait().await?;
     Ok(())
 }

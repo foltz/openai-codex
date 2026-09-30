@@ -3,8 +3,8 @@
 //! This module owns the typed JSON-RPC calls needed by the TUI and keeps
 //! request/response plumbing out of `App` and `ChatWidget`.
 
-mod external_agent_config;
 mod clear_recovery;
+mod external_agent_config;
 pub(crate) mod fs;
 mod history;
 mod models;

@@ -500,7 +500,10 @@ fn session_summary(
     if usage_line.is_none() && resume_hint.is_none() {
         return None;
     }
-    Some(SessionSummary { usage_line, resume_hint })
+    Some(SessionSummary {
+        usage_line,
+        resume_hint,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

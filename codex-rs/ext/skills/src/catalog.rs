@@ -343,7 +343,6 @@ impl SkillProviderError {
             admission_refused: false,
         }
     }
-
 }
 
 impl std::fmt::Display for SkillProviderError {

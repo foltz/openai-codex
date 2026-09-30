@@ -118,11 +118,7 @@ fn legacy_answer_rollback_can_trim_messages_without_losing_surviving_source_call
         acceptance_order: None,
     }));
 
-    context.rollback_messages(
-        &["turn-1"],
-        Some("steer"),
-        RetainedInputSource::Local(None),
-    );
+    context.rollback_messages(&["turn-1"], Some("steer"), RetainedInputSource::Local(None));
     assert_eq!(context.user_messages.len(), 0);
     assert_eq!(context.verified_answers().count(), 2);
     context.retain_answers(|answer| answer.call_id == "ask-1");

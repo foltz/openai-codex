@@ -1233,37 +1233,40 @@ mod tests {
             .unwrap();
         let mut auth_config = config.auth_config();
         let host = Arc::new(codex_app_server_client::InProcessHost::default());
-        let client = InProcessAppServerClient::start_in_host(Arc::clone(&host), InProcessClientStartArgs {
-            arg0_paths: Arg0DispatchPaths::default(),
-            config: Arc::new(config),
-            cli_overrides: Vec::new(),
-            loader_overrides: Default::default(),
-            strict_config: false,
-            cloud_config_bundle: cloud_config_bundle_loader_for_storage(
-                auth_config.clone(),
-                /*enable_codex_api_key_env*/ false,
-            )
-            .await
-            .expect("test cloud config loader"),
-            embedded_network_policy: Default::default(),
-            feedback: codex_feedback::CodexFeedback::new(),
-            log_db: None,
-            state_db: None,
-            environment_manager: Arc::new(
-                codex_app_server_client::EnvironmentManager::default_for_tests(),
-            ),
-            config_warnings: Vec::new(),
-            session_source: serde_json::from_value(serde_json::json!("cli"))
-                .expect("cli session source should deserialize"),
-            enable_codex_api_key_env: false,
-            client_name: "test".to_string(),
-            client_version: "test".to_string(),
-            experimental_api: true,
-            mcp_server_openai_form_elicitation: false,
-            interactive_client: false,
-            opt_out_notification_methods: Vec::new(),
-            channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
-        })
+        let client = InProcessAppServerClient::start_in_host(
+            Arc::clone(&host),
+            InProcessClientStartArgs {
+                arg0_paths: Arg0DispatchPaths::default(),
+                config: Arc::new(config),
+                cli_overrides: Vec::new(),
+                loader_overrides: Default::default(),
+                strict_config: false,
+                cloud_config_bundle: cloud_config_bundle_loader_for_storage(
+                    auth_config.clone(),
+                    /*enable_codex_api_key_env*/ false,
+                )
+                .await
+                .expect("test cloud config loader"),
+                embedded_network_policy: Default::default(),
+                feedback: codex_feedback::CodexFeedback::new(),
+                log_db: None,
+                state_db: None,
+                environment_manager: Arc::new(
+                    codex_app_server_client::EnvironmentManager::default_for_tests(),
+                ),
+                config_warnings: Vec::new(),
+                session_source: serde_json::from_value(serde_json::json!("cli"))
+                    .expect("cli session source should deserialize"),
+                enable_codex_api_key_env: false,
+                client_name: "test".to_string(),
+                client_version: "test".to_string(),
+                experimental_api: true,
+                mcp_server_openai_form_elicitation: false,
+                interactive_client: false,
+                opt_out_notification_methods: Vec::new(),
+                channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
+            },
+        )
         .await
         .unwrap();
         auth_config.forced_login_method = Some(ForcedLoginMethod::Chatgpt);

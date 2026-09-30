@@ -21,15 +21,13 @@ mod sqlite;
 mod telemetry;
 
 pub use log_db::LogWriteFailureReporter;
-pub use model::CreatedProject;
-pub use model::ClearTransitionId;
 pub use model::ClearTransitionEvidenceKind;
 pub use model::ClearTransitionEvidenceState;
+pub use model::ClearTransitionId;
 pub use model::ClearTransitionPhase;
 pub use model::ClearTransitionRecord;
 pub use model::ClearTransitionReserveOutcome;
-pub use runtime::ClearRecoveryPhase;
-pub use runtime::ClearRecoveryRecord;
+pub use model::CreatedProject;
 pub use model::LogEntry;
 pub use model::LogQuery;
 pub use model::LogRow;
@@ -42,6 +40,8 @@ pub use model::QueuedUserSubmissionRecord;
 pub use model::RolloutMigrationCursor;
 pub use model::RolloutMigrationSkippedRollout;
 pub use model::RolloutMigrationState;
+pub use runtime::ClearRecoveryPhase;
+pub use runtime::ClearRecoveryRecord;
 /// Preferred entrypoint: owns configuration and metrics.
 pub use runtime::StateRuntime;
 pub use sqlite::SqliteConfig;

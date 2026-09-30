@@ -345,12 +345,14 @@ impl McpRequestProcessor {
         let processor = self.clone();
         let request_work = derive_request_work()
             .map_err(|_| internal_error("MCP status account work is unavailable"))?;
-        let receipt = self.tasks.spawn(async move {
-            let result = processor
-                .list_mcp_server_status_response(params, thread, request_work)
-                .await;
-            outgoing.send_result(request, result).await;
-        })
+        let receipt = self
+            .tasks
+            .spawn(async move {
+                let result = processor
+                    .list_mcp_server_status_response(params, thread, request_work)
+                    .await;
+                outgoing.send_result(request, result).await;
+            })
             .map_err(|err| internal_error(format!("MCP status task admission failed: {err:?}")))?;
         drop(receipt);
         Ok(())
@@ -412,7 +414,9 @@ impl McpRequestProcessor {
                 params.server_name.as_deref(),
                 self.control_endpoint.clone(),
                 codex_mcp::McpAttemptAccess::from_work(
-                    request_work.as_ref().map(|work| work as &dyn codex_mcp::McpAttemptWork),
+                    request_work
+                        .as_ref()
+                        .map(|work| work as &dyn codex_mcp::McpAttemptWork),
                 ),
             )
             .await

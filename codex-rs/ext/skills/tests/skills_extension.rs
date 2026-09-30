@@ -171,7 +171,7 @@ async fn start_registered_turn(
     for contributor in registry.turn_lifecycle_contributors() {
         contributor
             .on_turn_start(TurnStartInput {
-                    mcp_access: Ok(codex_mcp::McpAttemptAccess::Unscoped),
+                mcp_access: Ok(codex_mcp::McpAttemptAccess::Unscoped),
                 turn_id,
                 collaboration_mode: &mode,
                 token_usage_at_turn_start: None,

@@ -2619,7 +2619,10 @@ impl ThreadManagerState {
             if let std::collections::hash_map::Entry::Vacant(e) = threads.entry(thread_id) {
                 return publication.publish(|| {
                     if let Some(update) = initial_host_config {
-                        session.services.agent_control.propagate_config_update(update);
+                        session
+                            .services
+                            .agent_control
+                            .propagate_config_update(update);
                     }
                     let thread = Arc::new(CodexThread::new(
                         session,

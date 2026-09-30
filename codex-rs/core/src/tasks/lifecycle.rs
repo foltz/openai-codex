@@ -31,8 +31,7 @@ impl Session {
                 && contributor.requires_mcp_runtime(&self.services.thread_extension_data)
             {
                 // Only this post-install phase has a bound turn entry.
-                self
-                    .turn_mcp_work(turn_context)
+                self.turn_mcp_work(turn_context)
                     .map_err(|err| CodexErr::Fatal(err.to_string()))?
             } else {
                 None

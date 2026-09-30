@@ -290,7 +290,7 @@ async fn start_embedded_app_server(
     log_db: Option<log_db::LogDbLayer>,
     state_db: Option<StateDbHandle>,
     environment_manager: Arc<EnvironmentManager>,
-embedded_network_policy: codex_app_server_client::EmbeddedNetworkPolicy,
+    embedded_network_policy: codex_app_server_client::EmbeddedNetworkPolicy,
     host: Arc<InProcessHost>,
 ) -> color_eyre::Result<InProcessAppServerClient> {
     start_embedded_app_server_with(
@@ -304,7 +304,7 @@ embedded_network_policy: codex_app_server_client::EmbeddedNetworkPolicy,
         log_db,
         state_db,
         environment_manager,
-embedded_network_policy,
+        embedded_network_policy,
         move |args| InProcessAppServerClient::start_in_host(Arc::clone(&host), args),
     )
     .await
@@ -559,7 +559,7 @@ async fn start_app_server(
     log_db: Option<log_db::LogDbLayer>,
     state_db: &mut Option<StateDbHandle>,
     environment_manager: Arc<EnvironmentManager>,
-embedded_network_policy: codex_app_server_client::EmbeddedNetworkPolicy,
+    embedded_network_policy: codex_app_server_client::EmbeddedNetworkPolicy,
     embedded_host: Option<Arc<InProcessHost>>,
 ) -> color_eyre::Result<AppServerClient> {
     let connection = if matches!(target, AppServerTarget::Embedded) {
@@ -603,7 +603,7 @@ embedded_network_policy: codex_app_server_client::EmbeddedNetworkPolicy,
         log_db,
         state_db.clone(),
         environment_manager,
-embedded_network_policy,
+        embedded_network_policy,
         embedded_host
             .ok_or_else(|| color_eyre::eyre::eyre!("embedded app-server host was not retained"))?,
     )
@@ -621,7 +621,7 @@ pub(crate) async fn start_app_server_for_picker(
 ) -> color_eyre::Result<AppServerSession> {
     let mut target = target.clone();
     let mut state_db = state_db;
-let embedded_network_policy =
+    let embedded_network_policy =
         codex_app_server_client::EmbeddedNetworkPolicy::load(&loader_overrides).await;
     let embedded_host = Some(Arc::new(InProcessHost::default()));
     let app_server = start_app_server(
@@ -636,7 +636,7 @@ let embedded_network_policy =
         /*log_db*/ None,
         &mut state_db,
         environment_manager,
-embedded_network_policy,
+        embedded_network_policy,
         embedded_host.clone(),
     )
     .await;
@@ -666,7 +666,7 @@ pub(crate) async fn start_embedded_app_server_for_picker(
         /*log_db*/ None,
         &mut state_db,
         Arc::new(EnvironmentManager::default_for_tests()),
-Default::default(),
+        Default::default(),
         Some(Arc::new(InProcessHost::default())),
     )
     .await?;
@@ -1205,7 +1205,7 @@ async fn run_ratatui_app(
                 log_db.clone(),
                 &mut state_db,
                 environment_manager.clone(),
-embedded_network_policy.clone(),
+                embedded_network_policy.clone(),
                 embedded_host.clone(),
             ),
         )
@@ -1777,7 +1777,7 @@ embedded_network_policy.clone(),
                     log_db.clone(),
                     &mut state_db,
                     environment_manager.clone(),
-embedded_network_policy.clone(),
+                    embedded_network_policy.clone(),
                     Some(Arc::new(InProcessHost::default())),
                 ),
             )
@@ -1865,7 +1865,7 @@ embedded_network_policy.clone(),
                     log_db.clone(),
                     &mut state_db,
                     environment_manager.clone(),
-embedded_network_policy.clone(),
+                    embedded_network_policy.clone(),
                     Some(Arc::new(InProcessHost::default())),
                 )
                 .await?;
@@ -2673,7 +2673,7 @@ requires_openai_auth = {requires_openai_auth}
             /*log_db*/ None,
             state_db,
             Arc::new(EnvironmentManager::default_for_tests()),
-Default::default(),
+            Default::default(),
             Arc::new(InProcessHost::default()),
         )
         .await

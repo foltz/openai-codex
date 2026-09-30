@@ -262,11 +262,13 @@ impl Session {
             && self.services.code_mode_service.is_available()
         {
             let session = Arc::clone(self);
-            self.task_joins.register(tokio::spawn(async move {
-                if session.services.code_mode_service.session().await.is_err() {
-                    warn!("code-mode host startup prewarm failed");
-                }
-            })).detach();
+            self.task_joins
+                .register(tokio::spawn(async move {
+                    if session.services.code_mode_service.session().await.is_err() {
+                        warn!("code-mode host startup prewarm failed");
+                    }
+                }))
+                .detach();
         }
 
         let account_work = match self.services.host_admission.as_ref() {
@@ -284,12 +286,14 @@ impl Session {
             // Without websocket prewarm, resolve auth once so Agent Identity bootstrap can
             // register or engage this session's bearer fallback before the first user request.
             let model_client = self.services.model_client.clone();
-            self.task_joins.register(tokio::spawn(async move {
-                let _account_work = account_work;
-                if let Err(err) = model_client.prewarm_auth().await {
-                    warn!("startup auth prewarm failed: {err:#}");
-                }
-            })).detach();
+            self.task_joins
+                .register(tokio::spawn(async move {
+                    let _account_work = account_work;
+                    if let Err(err) = model_client.prewarm_auth().await {
+                        warn!("startup auth prewarm failed: {err:#}");
+                    }
+                }))
+                .detach();
             return;
         }
 

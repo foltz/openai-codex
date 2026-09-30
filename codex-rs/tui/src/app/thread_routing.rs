@@ -78,7 +78,10 @@ impl App {
         for thread_id in leaving {
             if Some(thread_id) == retained_target
                 || (retained_target.is_some() && self.voice_owner_thread_id() == Some(thread_id))
-                || self.agents_overview.dispatched_requests.contains_key(&thread_id)
+                || self
+                    .agents_overview
+                    .dispatched_requests
+                    .contains_key(&thread_id)
                 || self.agents_overview.blank_sessions.contains_key(&thread_id)
             {
                 continue;

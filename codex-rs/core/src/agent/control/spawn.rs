@@ -780,12 +780,9 @@ impl LocalAgentControl {
             }
             (None, _, _) => {
                 let child_create_started_at = Instant::now();
-                let new_thread = Box::pin(state.spawn_new_thread(
-                    config.clone(),
-                    self.clone(),
-                    account_work,
-                ))
-                .await?;
+                let new_thread =
+                    Box::pin(state.spawn_new_thread(config.clone(), self.clone(), account_work))
+                        .await?;
                 SpawnedThreadResult {
                     new_thread,
                     fork_context: None,
@@ -1292,15 +1289,14 @@ impl LocalAgentControl {
             })?
             .flatten();
         let root_depth = thread_spawn_depth(&session_source).unwrap_or(0);
-        let (resumed_thread_id, resumed_multi_agent_version) = Box::pin(
-            self.resume_single_agent_from_rollout(
+        let (resumed_thread_id, resumed_multi_agent_version) =
+            Box::pin(self.resume_single_agent_from_rollout(
                 config.clone(),
                 thread_id,
                 session_source,
                 account_work.as_deref(),
-            ),
-        )
-        .await?;
+            ))
+            .await?;
         let state = self.runtime.upgrade()?;
         if config.multi_agent_version_from_features() == MultiAgentVersion::V2
             || resumed_multi_agent_version == MultiAgentVersion::V2

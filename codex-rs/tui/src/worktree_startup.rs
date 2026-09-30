@@ -126,7 +126,7 @@ pub(super) async fn prepare(
     target: &AppServerTarget,
     arg0_paths: &Arg0DispatchPaths,
     source_bundle: CloudConfigBundleLoader,
-embedded_network_policy: &codex_app_server_client::EmbeddedNetworkPolicy,
+    embedded_network_policy: &codex_app_server_client::EmbeddedNetworkPolicy,
     host: Arc<InProcessHost>,
 ) -> color_eyre::Result<(Config, CloudConfigBundleLoader, ManagedTuiWorktree)> {
     if let Some(id_or_name) = cli.fork_session_id.as_deref() {
@@ -161,7 +161,7 @@ embedded_network_policy: &codex_app_server_client::EmbeddedNetworkPolicy,
             /*log_db*/ None,
             state,
             Arc::new(environment),
-embedded_network_policy.clone(),
+            embedded_network_policy.clone(),
             host,
         )
         .await?;

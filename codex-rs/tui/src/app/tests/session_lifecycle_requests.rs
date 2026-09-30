@@ -283,7 +283,7 @@ pub(super) async fn start_recording_app_server_with_realtime_speech(
         /*log_db*/ None,
         state_db,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
-Default::default(),
+        Default::default(),
         Arc::new(codex_app_server_client::InProcessHost::default()),
     )
     .await?;
@@ -4221,10 +4221,8 @@ fn clear_session_uses_exact_displayed_thread_before_unsubscribe_and_attaches_suc
                 let mut app = make_test_app().await;
                 // Clear qualification must not wait for external plugin catalog sync.
                 app.config.features.disable(Feature::Plugins)?;
-                app.cli_kv_overrides.push((
-                    "features.plugins".to_string(),
-                    toml::Value::Boolean(false),
-                ));
+                app.cli_kv_overrides
+                    .push(("features.plugins".to_string(), toml::Value::Boolean(false)));
                 let codex_home = tempdir()?;
                 app.config.codex_home = codex_home.path().to_path_buf().abs();
                 app.config.sqlite = SqliteConfig::new_for_testing(codex_home.path().abs());
@@ -4332,10 +4330,8 @@ fn clear_then_submit_ui_path_uses_one_combined_request() -> Result<()> {
                 let mut app = make_test_app().await;
                 // Preserve this fixture isolation when fresh-session config reloads.
                 app.config.features.disable(Feature::Plugins)?;
-                app.cli_kv_overrides.push((
-                    "features.plugins".to_string(),
-                    toml::Value::Boolean(false),
-                ));
+                app.cli_kv_overrides
+                    .push(("features.plugins".to_string(), toml::Value::Boolean(false)));
                 let codex_home = tempdir()?;
                 app.config.codex_home = codex_home.path().to_path_buf().abs();
                 app.config.sqlite = SqliteConfig::new_for_testing(codex_home.path().abs());

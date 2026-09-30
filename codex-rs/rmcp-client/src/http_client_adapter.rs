@@ -54,8 +54,8 @@ use rmcp::transport::streamable_http_client::StreamableHttpPostResponse;
 use sse_stream::Sse;
 use sse_stream::SseStream;
 use tokio::sync::oneshot;
-use tracing::Instrument;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 use crate::bounded_stdio_transport::MAX_MCP_STDIO_LINE_BYTES;
 use crate::event_notification_transport::MAX_EVENT_NOTIFICATION_BYTES;

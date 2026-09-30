@@ -713,7 +713,10 @@ async fn thread_id_generator_applies_to_roots_children_and_forks() {
         .await
         .expect("spawn actual child agent");
     let fork = manager
-        .spawn_legacy_subagent(root.thread_id, StartThreadOptions::new(config, /*control_endpoint*/ None))
+        .spawn_legacy_subagent(
+            root.thread_id,
+            StartThreadOptions::new(config, /*control_endpoint*/ None),
+        )
         .await
         .expect("fork root thread");
 
@@ -1094,8 +1097,11 @@ fn fork_thread_accepts_legacy_usize_snapshot_argument() {
         config: Config,
         path: std::path::PathBuf,
     ) {
-        let _future =
-            manager.fork_legacy_thread(usize::MAX, crate::StartThreadOptions::new(config, /*control_endpoint*/ None), path);
+        let _future = manager.fork_legacy_thread(
+            usize::MAX,
+            crate::StartThreadOptions::new(config, /*control_endpoint*/ None),
+            path,
+        );
     }
 
     let _: fn(&ThreadManager, Config, std::path::PathBuf) = assert_legacy_snapshot_callsite;

@@ -479,7 +479,7 @@ pub(super) async fn run_main_inner(
                 &app_server_target,
                 &arg0_paths,
                 cloud_config_bundle.clone(),
-&embedded_network_policy,
+                &embedded_network_policy,
                 Arc::clone(&lookup_host),
             ))
             .await?

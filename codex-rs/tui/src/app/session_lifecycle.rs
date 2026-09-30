@@ -1095,10 +1095,10 @@ impl App {
                             lines.push(usage_line.into());
                         }
                         if let Some(command) = summary.resume_hint {
-                            lines.push(vec![
-                                "To continue this session, run ".into(),
-                                command.cyan(),
-                            ].into());
+                            lines.push(
+                                vec!["To continue this session, run ".into(), command.cyan()]
+                                    .into(),
+                            );
                         }
                         self.chat_widget.add_plain_history_lines(lines);
                     }

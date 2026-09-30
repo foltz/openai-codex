@@ -1017,7 +1017,9 @@ async fn ordered_rollback_replay_removes_steered_answers_after_acceptance_bounda
         .items()
         .filter_map(|item| match item {
             ResponseItem::FunctionCall { call_id, .. }
-                if answers.iter().any(|answer| answer.call_id == call_id.as_str()) =>
+                if answers
+                    .iter()
+                    .any(|answer| answer.call_id == call_id.as_str()) =>
             {
                 Some(call_id.as_str())
             }

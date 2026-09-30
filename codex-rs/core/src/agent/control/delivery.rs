@@ -78,7 +78,8 @@ impl LocalAgentControl {
             AgentInput::Message { message, mode } => {
                 let receiver = self.runtime.ensure_agent_known(target)?;
                 let author = self
-                    .runtime.ensure_agent_known(caller)?
+                    .runtime
+                    .ensure_agent_known(caller)?
                     .agent_path
                     .unwrap_or_else(AgentPath::root);
                 if mode == MessageDeliveryMode::TriggerTurn

@@ -15,8 +15,8 @@ use codex_login::login_with_bedrock_access_keys;
 use codex_model_provider::is_supported_amazon_bedrock_region;
 
 mod bedrock_setup;
-mod gateway_oauth;
 mod browser_logins;
+mod gateway_oauth;
 mod login_shutdown;
 pub(crate) use login_shutdown::AccountLoginReport;
 pub(crate) use login_shutdown::AccountLoginShutdown;
@@ -136,12 +136,12 @@ impl AccountRequestProcessor {
             config_manager,
             applied_mcp_config_identity,
             active_login: Arc::new(Mutex::new(None)),
-    gateway_login: Arc::new(std::sync::Mutex::new(/*t*/ None)),
-    gateway_client: Arc::new(std::sync::Mutex::new(/*t*/ None)),
-    browser_logins: browser_logins::BrowserLogins::default(),
-    login_tasks,
-    login_shutdown: CancellationToken::new(),
-    login_deadline: Arc::new(std::sync::Mutex::new(None)),
+            gateway_login: Arc::new(std::sync::Mutex::new(/*t*/ None)),
+            gateway_client: Arc::new(std::sync::Mutex::new(/*t*/ None)),
+            browser_logins: browser_logins::BrowserLogins::default(),
+            login_tasks,
+            login_shutdown: CancellationToken::new(),
+            login_deadline: Arc::new(std::sync::Mutex::new(None)),
             workspace_routing: Arc::new(Mutex::new(None)),
             workspace_routing_fetches: Arc::new(Mutex::new(HashMap::new())),
             workspace_routing_shutdown: CancellationToken::new(),

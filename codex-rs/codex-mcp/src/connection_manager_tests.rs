@@ -5217,7 +5217,10 @@ fn retirement_runtime_input(
         config: Arc::new(runtime_config),
         plugins_available: false,
         ready_selected_capability_roots: Vec::new(),
-        mcp_servers: HashMap::from([("docs".to_string(), EffectiveMcpServer::from_host_config(config))]),
+        mcp_servers: HashMap::from([(
+            "docs".to_string(),
+            EffectiveMcpServer::from_host_config(config),
+        )]),
         submit_id: "retirement-proof".to_string(),
         tx_event: None,
         startup_cancellation_token: CancellationToken::new(),

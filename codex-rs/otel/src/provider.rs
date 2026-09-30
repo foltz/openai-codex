@@ -338,7 +338,13 @@ impl OtelProvider {
             let log_resource = make_resource(settings, ResourceKind::Logs);
             let trace_resource = make_resource(settings, ResourceKind::Traces);
             let (logger, log_receipt) = log_enabled
-                .then(|| build_logger(&log_resource, &settings.exporter, &settings.http_client_factory))
+                .then(|| {
+                    build_logger(
+                        &log_resource,
+                        &settings.exporter,
+                        &settings.http_client_factory,
+                    )
+                })
                 .transpose()?
                 .map(|(provider, receipt)| (Some(provider), receipt))
                 .unwrap_or_default();
@@ -573,11 +579,12 @@ fn build_logger(
                 .with_tls_config(tls_config)
                 .build()?;
 
-            let (exporter, evidence) =
-                crate::trace_exporter_retirement::AcknowledgedExporter::new(crate::network_policy::PolicyExporter {
-                exporter,
-                policy: factory.network_policy().clone(),
-            });
+            let (exporter, evidence) = crate::trace_exporter_retirement::AcknowledgedExporter::new(
+                crate::network_policy::PolicyExporter {
+                    exporter,
+                    policy: factory.network_policy().clone(),
+                },
+            );
             receipt = evidence;
             builder = builder.with_batch_exporter(exporter);
         }
@@ -614,11 +621,12 @@ fn build_logger(
 
             let exporter = exporter_builder.build()?;
 
-            let (exporter, evidence) =
-                crate::trace_exporter_retirement::AcknowledgedExporter::new(crate::network_policy::PolicyExporter {
-                exporter,
-                policy: factory.network_policy().clone(),
-            });
+            let (exporter, evidence) = crate::trace_exporter_retirement::AcknowledgedExporter::new(
+                crate::network_policy::PolicyExporter {
+                    exporter,
+                    policy: factory.network_policy().clone(),
+                },
+            );
             receipt = evidence;
             builder = builder.with_batch_exporter(exporter);
         }
@@ -701,11 +709,11 @@ fn build_tracer_provider(
 
                 let (exporter, receipt) =
                     crate::trace_exporter_retirement::AcknowledgedExporter::new(
-                    crate::network_policy::PolicyExporter {
-                        exporter: exporter_builder.build()?,
-                        policy: factory.network_policy().clone(),
-                    },
-                );
+                        crate::network_policy::PolicyExporter {
+                            exporter: exporter_builder.build()?,
+                            policy: factory.network_policy().clone(),
+                        },
+                    );
                 let processor = TokioBatchSpanProcessor::builder(exporter, runtime::Tokio).build();
 
                 return Ok((
@@ -744,11 +752,12 @@ fn build_tracer_provider(
         }
     };
 
-    let (span_exporter, receipt) =
-        crate::trace_exporter_retirement::AcknowledgedExporter::new(crate::network_policy::PolicyExporter {
+    let (span_exporter, receipt) = crate::trace_exporter_retirement::AcknowledgedExporter::new(
+        crate::network_policy::PolicyExporter {
             exporter: span_exporter,
             policy: factory.network_policy().clone(),
-        });
+        },
+    );
     let processor = BatchSpanProcessor::builder(span_exporter).build();
 
     Ok((
@@ -858,8 +867,8 @@ mod tests {
         let cached = crate::metrics::global().expect("initial global metrics client");
 
         let exporter = InMemoryMetricExporter::default();
-        let replacement = crate::metrics::install_global(MetricsClient::new(
-            MetricsConfig::in_memory(
+        let replacement =
+            crate::metrics::install_global(MetricsClient::new(MetricsConfig::in_memory(
                 "test",
                 "codex-test",
                 env!("CARGO_PKG_VERSION"),

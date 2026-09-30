@@ -405,12 +405,10 @@ async fn build_test_processor_for_retirement(
     mpsc::Receiver<crate::outgoing_message::OutgoingEnvelope>,
     Option<TestManagedTelemetry>,
 ) {
-    let auth_manager = AuthManager::shared_from_config(
-        config.as_ref(),
-        /*enable_codex_api_key_env*/ false,
-    )
-    .await
-    .expect("create test auth manager");
+    let auth_manager =
+        AuthManager::shared_from_config(config.as_ref(), /*enable_codex_api_key_env*/ false)
+            .await
+            .expect("create test auth manager");
     build_test_processor_with_telemetry(config, auth_manager, telemetry).await
 }
 

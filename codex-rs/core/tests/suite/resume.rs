@@ -68,6 +68,7 @@ async fn local_thread_history_mode_survives_restart(
             initial.thread_manager.auth_manager(),
             /*parent_trace*/ None,
             ClientMcpExtensions::default(),
+            /*control_endpoint*/ None,
         )
         .await?;
     assert_eq!(
@@ -189,6 +190,7 @@ async fn resume_includes_initial_messages_from_rollout_events() -> Result<()> {
             resumed.thread_manager.auth_manager(),
             /*parent_trace*/ None,
             ClientMcpExtensions::default(),
+            /*control_endpoint*/ None,
         )
         .await?;
     assert!(Arc::ptr_eq(&rejoined.thread, &resumed.codex));

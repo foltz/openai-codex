@@ -463,17 +463,20 @@ async fn host_alias_roots_follow_core_discovery_order() -> Result<(), Box<dyn st
     )
     .await;
     let catalog = HostSkillProvider::new()
-        .list(SkillListQuery {
-            turn_id: "turn-1".to_string(),
-            executor_roots: Vec::new(),
-            resolved_executor_roots: Vec::new(),
-            host_snapshot: Some(Arc::new(HostSkillsSnapshot::new(Arc::new(outcome)))),
-            include_host_skills: true,
-            include_bundled_skills: false,
-            include_cloud_skills: false,
-            mcp_resources: None,
-            executor_capability_discovery: None,
-        })
+        .list(
+            SkillListQuery {
+                turn_id: "turn-1".to_string(),
+                executor_roots: Vec::new(),
+                resolved_executor_roots: Vec::new(),
+                host_snapshot: Some(Arc::new(HostSkillsSnapshot::new(Arc::new(outcome)))),
+                include_host_skills: true,
+                include_bundled_skills: false,
+                include_cloud_skills: false,
+                mcp_resources: None,
+                executor_capability_discovery: None,
+            },
+            Ok(codex_mcp::McpAttemptAccess::Unscoped),
+        )
         .await?;
     let mut entries = catalog.entries.iter().collect::<Vec<_>>();
     SkillCatalogRenderPolicy::CoreCompatible.order_entries(&mut entries);
@@ -831,17 +834,20 @@ async fn singleton_plugin_versions_share_the_marketplace_alias_root()
     )
     .await;
     let catalog = HostSkillProvider::new()
-        .list(SkillListQuery {
-            turn_id: "turn-1".to_string(),
-            executor_roots: Vec::new(),
-            resolved_executor_roots: Vec::new(),
-            host_snapshot: Some(Arc::new(HostSkillsSnapshot::new(Arc::new(outcome)))),
-            include_host_skills: true,
-            include_bundled_skills: false,
-            include_cloud_skills: false,
-            mcp_resources: None,
-            executor_capability_discovery: None,
-        })
+        .list(
+            SkillListQuery {
+                turn_id: "turn-1".to_string(),
+                executor_roots: Vec::new(),
+                resolved_executor_roots: Vec::new(),
+                host_snapshot: Some(Arc::new(HostSkillsSnapshot::new(Arc::new(outcome)))),
+                include_host_skills: true,
+                include_bundled_skills: false,
+                include_cloud_skills: false,
+                mcp_resources: None,
+                executor_capability_discovery: None,
+            },
+            Ok(codex_mcp::McpAttemptAccess::Unscoped),
+        )
         .await?;
     let entries = catalog.entries.iter().collect::<Vec<_>>();
     let plan = build_alias_plan(&entries).expect("alias plan should build");

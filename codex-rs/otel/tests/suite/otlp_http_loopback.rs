@@ -27,6 +27,110 @@ use tracing_subscriber::layer::SubscriberExt;
 
 static TRACE_CONTEXT_CONFIG_LOCK: Mutex<()> = Mutex::new(());
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn managed_route_swap_keeps_old_spans_on_exact_exporter_and_retires_before_disable()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let first_listener = TcpListener::bind("127.0.0.1:0")?;
+    let second_listener = TcpListener::bind("127.0.0.1:0")?;
+    let prepare = |listener: &TcpListener| {
+        OtelProvider::prepare(&OtelSettings {
+            http_client_factory: HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+            environment: "test".to_owned(),
+            service_name: "managed-route-test".to_owned(),
+            service_version: "1".to_owned(),
+            codex_home: PathBuf::from("."),
+            exporter: OtelExporter::None,
+            trace_exporter: OtelExporter::OtlpHttp {
+                endpoint: format!("http://{}/v1/traces", listener.local_addr().unwrap()),
+                headers: Default::default(),
+                protocol: OtelHttpProtocol::Json,
+                tls: None,
+            },
+            metrics_exporter: OtelExporter::None,
+            runtime_metrics: false,
+            span_attributes: Default::default(),
+            tracestate: Default::default(),
+        })
+    };
+    let mut first_candidate = Some(prepare(&first_listener)?);
+    let mut second_candidate = Some(prepare(&second_listener)?);
+    // Start collector deadlines after both providers finish client/TLS setup.
+    let collect = |listener: TcpListener| {
+        thread::spawn(move || -> std::io::Result<String> {
+            listener.set_nonblocking(true)?;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let (path, _, body) = read_http_request(&mut stream)?;
+                        assert_eq!(path, "/v1/traces");
+                        write_http_response(&mut stream, "200 OK")?;
+                        return Ok(String::from_utf8_lossy(&body).into_owned());
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "collector",
+                            ));
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        })
+    };
+    let first_server = collect(first_listener);
+    let second_server = collect(second_listener);
+    let (layers, routes) = codex_otel::ManagedTelemetryRoutes::layers();
+    let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(layers));
+    let mut first = routes.publish(&mut first_candidate)?;
+    let (old, late) = tracing::dispatcher::with_default(&dispatch, || {
+        (
+            tracing::info_span!("only_a"),
+            tracing::info_span!("retired_a_late"),
+        )
+    });
+    let second = routes.publish(&mut second_candidate)?;
+    drop(old);
+    tracing::dispatcher::with_default(&dispatch, || drop(tracing::info_span!("only_b")));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let (second_provider, retired_a) = second.retire_previous(first.provider.take());
+    assert_eq!(
+        retired_a.wait_until(tokio::time::Instant::now()).await,
+        Err(codex_otel::OtelRetirementError::TimedOut)
+    );
+    retired_a.wait_until(deadline).await?;
+    retired_a.wait_until(tokio::time::Instant::now()).await?;
+    drop(late);
+    let mut disabled = Some(OtelProvider::prepare(&OtelSettings {
+        http_client_factory: HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+        environment: "disabled".to_owned(),
+        service_name: "test".to_owned(),
+        service_version: "1".to_owned(),
+        codex_home: PathBuf::from("."),
+        exporter: OtelExporter::None,
+        trace_exporter: OtelExporter::None,
+        metrics_exporter: OtelExporter::None,
+        runtime_metrics: false,
+        span_attributes: Default::default(),
+        tracestate: Default::default(),
+    })?);
+    let disabled = routes.publish(&mut disabled)?;
+    let (current, retired_b) = disabled.retire_previous(second_provider);
+    assert!(current.is_none());
+    retired_b.wait_until(deadline).await?;
+    let a = first_server.join().expect("collector join")?;
+    let b = second_server.join().expect("collector join")?;
+    assert!(a.contains("only_a"));
+    assert!(!a.contains("only_b"));
+    assert!(b.contains("only_b"));
+    assert!(!b.contains("only_a"));
+    assert!(!b.contains("retired_a_late"));
+    Ok(())
+}
+
 struct CapturedRequest {
     path: String,
     content_type: Option<String>,
@@ -149,8 +253,14 @@ fn otlp_http_exporter_sends_metrics_to_collector() -> Result<()> {
     listener.set_nonblocking(true).expect("set_nonblocking");
 
     let (tx, rx) = mpsc::channel::<Vec<CapturedRequest>>();
+    let (start_tx, start_rx) = mpsc::channel::<()>();
     let server = thread::spawn(move || {
         let mut captured = Vec::new();
+        // Provider construction can load certificates and start SDK workers.
+        // That setup is not part of the collector's export observation window.
+        if start_rx.recv_timeout(Duration::from_secs(30)).is_err() {
+            return;
+        }
         let deadline = Instant::now() + Duration::from_secs(3);
 
         while Instant::now() < deadline {
@@ -188,6 +298,7 @@ fn otlp_http_exporter_sends_metrics_to_collector() -> Result<()> {
         },
     ))?;
 
+    start_tx.send(()).expect("start collector");
     metrics.counter("codex.turns", /*inc*/ 1, &[("source", "test")])?;
     metrics.counter("codex.api_request", /*inc*/ 1, &[("status", "200")])?;
     metrics.counter_with_description(
@@ -329,8 +440,14 @@ fn otlp_http_exporter_sends_logs_to_collector()
     listener.set_nonblocking(true).expect("set_nonblocking");
 
     let (tx, rx) = mpsc::channel::<Vec<CapturedRequest>>();
+    let (start_tx, start_rx) = mpsc::channel::<()>();
     let server = thread::spawn(move || {
         let mut captured = Vec::new();
+        // Provider construction can load certificates and start SDK workers.
+        // That setup is not part of the collector's export observation window.
+        if start_rx.recv_timeout(Duration::from_secs(30)).is_err() {
+            return;
+        }
         let deadline = Instant::now() + Duration::from_secs(3);
 
         while Instant::now() < deadline {
@@ -377,6 +494,7 @@ fn otlp_http_exporter_sends_logs_to_collector()
     .expect("otel provider");
     let logger_layer = otel.logger_layer().expect("logger layer");
     let subscriber = tracing_subscriber::registry().with(logger_layer);
+    start_tx.send(()).expect("start collector");
 
     tracing::subscriber::with_default(subscriber, || {
         tracing::callsite::rebuild_interest_cache();
@@ -455,8 +573,14 @@ fn otlp_http_exporter_sends_traces_to_collector()
     listener.set_nonblocking(true).expect("set_nonblocking");
 
     let (tx, rx) = mpsc::channel::<Vec<CapturedRequest>>();
+    let (start_tx, start_rx) = mpsc::channel::<()>();
     let server = thread::spawn(move || {
         let mut captured = Vec::new();
+        // Provider construction can load certificates and start SDK workers.
+        // That setup is not part of the collector's export observation window.
+        if start_rx.recv_timeout(Duration::from_secs(30)).is_err() {
+            return;
+        }
         let deadline = Instant::now() + Duration::from_secs(3);
 
         while Instant::now() < deadline {
@@ -514,6 +638,7 @@ fn otlp_http_exporter_sends_traces_to_collector()
     let subscriber = tracing_subscriber::registry().with(tracing_layer);
 
     let propagated_trace = tracing::subscriber::with_default(subscriber, || {
+        start_tx.send(()).expect("start collector");
         let span = tracing::info_span!(
             "trace-loopback",
             otel.name = "trace-loopback",
@@ -601,8 +726,14 @@ async fn otlp_http_exporter_sends_traces_to_collector_with_bounded_shutdown_in_t
     listener.set_nonblocking(true).expect("set_nonblocking");
 
     let (tx, rx) = mpsc::channel::<Vec<CapturedRequest>>();
+    let (start_tx, start_rx) = mpsc::channel::<()>();
     let server = thread::spawn(move || {
         let mut captured = Vec::new();
+        // Provider construction can load certificates and start SDK workers.
+        // That setup is not part of the collector's export observation window.
+        if start_rx.recv_timeout(Duration::from_secs(30)).is_err() {
+            return;
+        }
         let deadline = Instant::now() + Duration::from_secs(3);
 
         while Instant::now() < deadline {
@@ -651,6 +782,7 @@ async fn otlp_http_exporter_sends_traces_to_collector_with_bounded_shutdown_in_t
     let subscriber = tracing_subscriber::registry().with(tracing_layer);
 
     tracing::subscriber::with_default(subscriber, || {
+        start_tx.send(()).expect("start collector");
         let span = tracing::info_span!(
             "trace-loopback-tokio",
             otel.name = "trace-loopback-tokio",
@@ -787,8 +919,14 @@ fn otlp_http_exporter_sends_traces_to_collector_in_current_thread_tokio_runtime(
     listener.set_nonblocking(true).expect("set_nonblocking");
 
     let (tx, rx) = mpsc::channel::<Vec<CapturedRequest>>();
+    let (start_tx, start_rx) = mpsc::channel::<()>();
     let server = thread::spawn(move || {
         let mut captured = Vec::new();
+        // Provider construction can load certificates and start SDK workers.
+        // That setup is not part of the collector's export observation window.
+        if start_rx.recv_timeout(Duration::from_secs(30)).is_err() {
+            return;
+        }
         let deadline = Instant::now() + Duration::from_secs(3);
 
         while Instant::now() < deadline {
@@ -815,6 +953,7 @@ fn otlp_http_exporter_sends_traces_to_collector_in_current_thread_tokio_runtime(
     });
 
     let (runtime_result_tx, runtime_result_rx) = mpsc::channel::<std::result::Result<(), String>>();
+    let (runtime_ready_tx, runtime_ready_rx) = mpsc::channel();
     let runtime_thread = thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -844,6 +983,8 @@ fn otlp_http_exporter_sends_traces_to_collector_in_current_thread_tokio_runtime(
             .expect("otel provider");
             let tracing_layer = otel.tracing_layer().expect("tracing layer");
             let subscriber = tracing_subscriber::registry().with(tracing_layer);
+            start_tx.send(()).expect("start collector");
+            runtime_ready_tx.send(()).expect("runtime observer");
 
             tracing::subscriber::with_default(subscriber, || {
                 let span = tracing::info_span!(
@@ -862,6 +1003,12 @@ fn otlp_http_exporter_sends_traces_to_collector_in_current_thread_tokio_runtime(
         let _ = runtime_result_tx.send(result);
     });
 
+    // Provider/TLS setup can initialize platform trust stores. Keep that out of
+    // the existing five-second bound proving current-thread export/shutdown does
+    // not deadlock; the collector uses the same post-setup start boundary.
+    runtime_ready_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("current-thread provider setup should complete");
     runtime_result_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("current-thread runtime should complete")

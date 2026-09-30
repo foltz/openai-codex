@@ -389,6 +389,7 @@ async fn steer_user_input(codex: &CodexThread, text: &str) {
 async fn enqueue_queue_only_agent_mail(codex: &CodexThread, text: &str) {
     codex
         .submit(Op::InterAgentCommunication {
+            work: None,
             communication: InterAgentCommunication::new(
                 AgentPath::try_from("/root/worker").expect("worker path should parse"),
                 AgentPath::root(),
@@ -1317,7 +1318,7 @@ async fn steers_during_tool_drain_preserve_tool_output_and_each_input() {
                 input_schema: json!({"type": "object", "properties": {}}),
                 defer_loading: false,
             })],
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await
         .expect("start thread with dynamic tool")
@@ -1441,7 +1442,7 @@ async fn steers_yield_exec_and_wait_without_stopping_the_cell(instant_interrupt:
                 input_schema: json!({"type": "object", "properties": {}}),
                 defer_loading: false,
             })],
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await
         .expect("start thread with dynamic tool")
@@ -1745,7 +1746,7 @@ async fn input_preempts_response_and_yields_running_code_mode_call() {
                 input_schema: json!({"type": "object", "properties": {}}),
                 defer_loading: false,
             })],
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await
         .expect("start thread with dynamic tool")
@@ -2130,6 +2131,7 @@ async fn terminal_compaction_error_does_not_retry_pending_input(
         PendingInputAfterFailure::TriggeringMail => {
             codex
                 .submit(Op::InterAgentCommunication {
+                    work: None,
                     communication: InterAgentCommunication::new(
                         AgentPath::root().join("worker").expect("valid worker path"),
                         AgentPath::root(),

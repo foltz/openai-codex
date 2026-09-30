@@ -80,10 +80,11 @@ pub(crate) fn request_span(message: &Value) -> Span {
         .get("method")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
-    let span = tracing::info_span!("mcp.http.request", mcp.method = method);
-    // Set the parent before the span is entered; never reparent the shared worker.
-    codex_otel::set_parent_from_context(&span, context);
-    span
+    // The managed tracing layer builds on span creation, so provide the
+    // request parent at that point rather than reparenting the shared worker.
+    codex_otel::span_with_parent_context(Some(context), || {
+        tracing::info_span!("mcp.http.request", mcp.method = method)
+    })
 }
 
 #[cfg(test)]

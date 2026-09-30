@@ -1526,6 +1526,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inherited_context_failure_returns_the_opened_live_thread_to_custody() {
+        let home = TempDir::new().expect("temp dir");
+        std::fs::write(home.path().join("sessions"), "not a directory")
+            .expect("block rollout directory");
+        let store = Arc::new(LocalThreadStore::new(
+            test_config(home.path()),
+            /*state_db*/ None,
+        ));
+        let thread_id = ThreadId::default();
+        let mut guard = crate::LiveThreadInitGuard::default();
+        assert!(
+            LiveThread::create_with_inherited_model_context(
+                store,
+                create_thread_params(thread_id),
+                &[user_message_item("inherited")],
+                &mut guard,
+            )
+            .await
+            .is_err(),
+            "inherited append should fail"
+        );
+        assert!(
+            guard.as_ref().is_some(),
+            "opened live thread remains in custody"
+        );
+
+        guard
+            .discard_with_result()
+            .await
+            .expect("returned live thread remains disposable");
+        assert!(
+            !home
+                .path()
+                .join("thread-writer-locks")
+                .join(format!("{thread_id}.lock"))
+                .exists()
+        );
+    }
+
+    #[tokio::test]
     async fn resume_thread_reopens_live_writer_and_appends() {
         let home = TempDir::new().expect("temp dir");
         let config = test_config(home.path());
@@ -2086,6 +2126,7 @@ mod tests {
             extra_config: None,
             forked_from_id: None,
             parent_thread_id: None,
+            clear_lineage: None,
             source: SessionSource::Exec,
             thread_source: None,
             originator: "test_originator".to_string(),

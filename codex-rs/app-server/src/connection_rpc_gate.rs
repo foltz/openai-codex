@@ -2,9 +2,13 @@
 //! Auth ownership changes reject queued work while started handlers finish cleanup.
 
 use std::future::Future;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use codex_app_server_transport::ConnectionAuth;
 
+use futures::FutureExt;
+use std::panic::AssertUnwindSafe;
 use tokio::sync::Mutex;
 use tokio_util::task::TaskTracker;
 
@@ -17,6 +21,7 @@ pub(crate) struct ConnectionRpcGate {
     pub(crate) auth: Option<ConnectionAuth>,
     accepting: Mutex<bool>,
     tasks: TaskTracker,
+    panicked: AtomicBool,
 }
 
 impl ConnectionRpcGate {
@@ -26,6 +31,7 @@ impl ConnectionRpcGate {
             auth: None,
             accepting: Mutex::new(accepting),
             tasks: TaskTracker::new(),
+            panicked: AtomicBool::new(false),
         }
     }
 
@@ -41,7 +47,9 @@ impl ConnectionRpcGate {
             self.tasks.token()
         };
 
-        future.await;
+        if AssertUnwindSafe(future).catch_unwind().await.is_err() {
+            self.panicked.store(true, Ordering::Release);
+        }
         drop(token);
     }
 
@@ -60,6 +68,14 @@ impl ConnectionRpcGate {
         self.tasks.wait().await;
     }
 
+    pub(crate) async fn shutdown_with_evidence(&self) -> ConnectionRpcShutdown {
+        self.close().await;
+        self.tasks.wait().await;
+        ConnectionRpcShutdown {
+            panicked: self.panicked.load(Ordering::Acquire),
+        }
+    }
+
     #[cfg(test)]
     async fn is_accepting(&self) -> bool {
         *self.accepting.lock().await
@@ -68,6 +84,17 @@ impl ConnectionRpcGate {
     #[cfg(test)]
     fn inflight_count(&self) -> usize {
         self.tasks.len()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ConnectionRpcShutdown {
+    pub panicked: bool,
+}
+
+impl ConnectionRpcShutdown {
+    pub(crate) fn is_clean(self) -> bool {
+        !self.panicked
     }
 }
 
@@ -245,5 +272,15 @@ mod tests {
             .expect("handler body should still be waiting");
         run_task.await.expect("run task should complete");
         assert_eq!(gate.inflight_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_evidence_distinguishes_handler_panic() {
+        let gate = ConnectionRpcGate::new();
+        gate.run(async { panic!("controlled RPC handler panic") })
+            .await;
+        let report = gate.shutdown_with_evidence().await;
+        assert!(report.panicked);
+        assert!(!report.is_clean());
     }
 }

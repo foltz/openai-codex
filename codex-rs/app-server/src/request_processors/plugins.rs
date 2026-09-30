@@ -3,6 +3,8 @@ use super::config_processor::reload_user_config;
 use super::*;
 use crate::error_code::internal_error;
 use crate::error_code::invalid_request;
+use crate::mcp_config_identity::AppliedMcpConfigIdentity;
+use crate::processor_task_retirement::ProcessorTasks;
 use codex_analytics::PluginInstallSource;
 use codex_app_server_protocol::PluginAvailability;
 use codex_app_server_protocol::PluginSharePrincipalRole;
@@ -61,8 +63,10 @@ pub(crate) struct PluginRequestProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     analytics_events_client: AnalyticsEventsClient,
     config_manager: ConfigManager,
+    applied_mcp_config_identity: AppliedMcpConfigIdentity,
     on_effective_plugins_changed:
         Arc<dyn Fn(codex_core_plugins::EffectivePluginsChange) + Send + Sync>,
+    tasks: ProcessorTasks,
 }
 
 fn plugin_skills_to_info<'a>(
@@ -397,15 +401,18 @@ fn plugin_share_principal_from_remote(
 }
 
 impl PluginRequestProcessor {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         auth_manager: Arc<AuthManager>,
         thread_manager: Arc<ThreadManager>,
         outgoing: Arc<OutgoingMessageSender>,
         analytics_events_client: AnalyticsEventsClient,
         config_manager: ConfigManager,
+        applied_mcp_config_identity: AppliedMcpConfigIdentity,
         on_effective_plugins_changed: Arc<
             dyn Fn(codex_core_plugins::EffectivePluginsChange) + Send + Sync,
         >,
+        tasks: ProcessorTasks,
     ) -> Self {
         Self {
             auth_manager,
@@ -413,7 +420,9 @@ impl PluginRequestProcessor {
             outgoing,
             analytics_events_client,
             config_manager,
+            applied_mcp_config_identity,
             on_effective_plugins_changed,
+            tasks,
         }
     }
 
@@ -1533,7 +1542,12 @@ impl PluginRequestProcessor {
         };
 
         self.clear_plugin_related_caches();
-        reload_user_config(&self.config_manager, &self.thread_manager).await;
+        reload_user_config(
+            &self.config_manager,
+            &self.thread_manager,
+            &self.applied_mcp_config_identity,
+        )
+        .await;
         self.thread_manager.invalidate_mcp_runtimes().await;
         self.thread_manager.refresh_hook_runtimes().await;
 
@@ -1772,13 +1786,30 @@ impl PluginRequestProcessor {
             })
             .collect();
         let environment_manager = self.thread_manager.environment_manager();
+        let request_work = match crate::account_turn_admission::derive_request_work() {
+            Ok(work) => work,
+            Err(_) => {
+                warn!(
+                    plugin = plugin_id,
+                    "plugin app discovery account work unavailable"
+                );
+                return Vec::new();
+            }
+        };
+        let access = request_work
+            .as_ref()
+            .map_or(codex_mcp::McpAttemptAccess::Unscoped, |work| {
+                codex_mcp::McpAttemptAccess::Admitted(work)
+            });
         let (app_summaries, accessible_connectors_result) = tokio::join!(
             load_plugin_app_summaries(config, auth, &plugin_apps, &app_category_by_id),
-            connectors::list_accessible_connectors_from_mcp_tools_with_mcp_manager(
+            codex_core::connectors::list_accessible_connectors_with_authority(
                 config,
                 /*force_refetch*/ true,
                 Arc::clone(&environment_manager),
                 self.thread_manager.mcp_manager(),
+                /*retirement*/ None,
+                access,
             ),
         );
 
@@ -1897,7 +1928,17 @@ impl PluginRequestProcessor {
             let http_client = Arc::clone(&http_client);
             let global_callback_url = config.mcp_oauth_callback_url.clone();
 
-            tokio::spawn(async move {
+            let account_work = match crate::account_turn_admission::derive_request_work() {
+                Ok(work) => work,
+                Err(_) => {
+                    warn!(server = %name, "plugin OAuth account work unavailable");
+                    continue;
+                }
+            };
+            if let Err(err) = self.tasks.spawn(async move {
+                // Silent login awaits the flow inline. The actual task owns
+                // custody through both attempts, credential storage and its tail.
+                let _account_work = account_work;
                 let oauth_client_config = server.oauth.as_ref();
                 let first_attempt = perform_oauth_login_silent(
                     &oauth_credential_name,
@@ -1959,7 +2000,9 @@ impl PluginRequestProcessor {
                     },
                 );
                 outgoing.send_server_notification(notification).await;
-            });
+            }) {
+                warn!(?err, "plugin OAuth task admission closed during shutdown");
+            }
         }
     }
 
@@ -2313,6 +2356,7 @@ fn remote_plugin_detail_to_info(
 fn remote_plugin_catalog_error_type(err: &RemotePluginCatalogError) -> &'static str {
     match err {
         RemotePluginCatalogError::AuthRequired => "remote_catalog_auth_required",
+        RemotePluginCatalogError::AuthChanged => "remote_catalog_auth_changed",
         RemotePluginCatalogError::UnsupportedAuthMode => "remote_catalog_unsupported_auth_mode",
         RemotePluginCatalogError::AuthToken(_) => "remote_catalog_auth_token",
         RemotePluginCatalogError::Request { .. } => "remote_catalog_request",
@@ -2385,9 +2429,9 @@ fn remote_plugin_catalog_error_to_jsonrpc(
 ) -> JSONRPCErrorError {
     let message = format!("{context}: {err}");
     match &err {
-        RemotePluginCatalogError::AuthRequired | RemotePluginCatalogError::UnsupportedAuthMode => {
-            invalid_request(message)
-        }
+        RemotePluginCatalogError::AuthRequired
+        | RemotePluginCatalogError::UnsupportedAuthMode
+        | RemotePluginCatalogError::AuthChanged => invalid_request(message),
         RemotePluginCatalogError::UnexpectedStatus { status, .. } if status.as_u16() == 404 => {
             invalid_request(message)
         }

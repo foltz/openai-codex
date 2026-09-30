@@ -1690,6 +1690,7 @@ async fn run_guardian_subagent_review(
                     test.thread_manager.auth_manager(),
                     /*parent_trace*/ None,
                     ClientMcpExtensions::default(),
+                    /*control_endpoint*/ None,
                 )
                 .await?
                 .thread;

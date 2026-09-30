@@ -217,9 +217,17 @@ async fn read_updated_at(path: &Path, created_at: Option<&str>) -> Option<String
     updated_at.or_else(|| created_at.map(str::to_string))
 }
 
-pub(super) fn thread_started_notification(mut thread: Thread) -> ThreadStartedNotification {
+pub(super) fn thread_started_notification(
+    mut thread: Thread,
+    session_start_source: Option<codex_app_server_protocol::ThreadStartSource>,
+    clear_predecessor_thread_id: Option<String>,
+) -> ThreadStartedNotification {
     thread.turns.clear();
-    ThreadStartedNotification { thread }
+    ThreadStartedNotification {
+        thread,
+        session_start_source,
+        clear_predecessor_thread_id,
+    }
 }
 
 #[cfg(test)]

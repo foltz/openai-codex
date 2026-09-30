@@ -14,7 +14,16 @@ impl McpConnectionSet {
     ///
     /// The manager must already be reachable through [`crate::McpRuntime`] so
     /// startup-time elicitation can resolve while validation waits.
+    #[cfg(test)]
     pub(crate) async fn validate_required_servers(&self) -> Result<()> {
+        self.validate_required_servers_with_authority(crate::McpAttemptAccess::Unscoped)
+            .await
+    }
+
+    pub(crate) async fn validate_required_servers_with_authority(
+        &self,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Result<()> {
         let failures = async {
             self.record_startup_readiness("required_startup", &[], &HashSet::new());
             let mut failures = Vec::new();
@@ -32,7 +41,7 @@ impl McpConnectionSet {
                     continue;
                 }
 
-                match view.connection.client().await {
+                match view.connection.client_with_authority(access).await {
                     Ok(_) => {}
                     Err(error) => failures.push(McpStartupFailure {
                         server: server_name.clone(),
@@ -66,6 +75,7 @@ impl McpConnectionSet {
 fn startup_outcome_error_message(error: StartupOutcomeError) -> String {
     match error {
         StartupOutcomeError::Cancelled => "MCP startup cancelled".to_string(),
+        StartupOutcomeError::Refused(error) => error.to_string(),
         StartupOutcomeError::Failed { error, .. } => error,
     }
 }

@@ -18,7 +18,6 @@ use crate::tui::FrameRequester;
 use crate::tui::Tui;
 #[cfg(not(debug_assertions))]
 use crate::tui::TuiEvent;
-use crate::update_action::UpdateAction;
 #[cfg(not(debug_assertions))]
 use crate::updates;
 #[cfg(not(debug_assertions))]
@@ -42,25 +41,12 @@ use tokio_stream::StreamExt;
 const RELEASE_NOTES_URL: &str = "https://github.com/openai/codex/releases/latest";
 
 #[cfg(not(debug_assertions))]
-pub(crate) enum UpdatePromptOutcome {
-    Continue,
-    RunUpdate(UpdateAction),
-}
-
-#[cfg(not(debug_assertions))]
-pub(crate) async fn run_update_prompt_if_needed(
-    tui: &mut Tui,
-    config: &Config,
-) -> Result<UpdatePromptOutcome> {
+pub(crate) async fn run_update_prompt_if_needed(tui: &mut Tui, config: &Config) -> Result<()> {
     let Some(latest_version) = updates::get_upgrade_version_for_popup(config) else {
-        return Ok(UpdatePromptOutcome::Continue);
-    };
-    let Some(update_action) = crate::update_action::get_update_action() else {
-        return Ok(UpdatePromptOutcome::Continue);
+        return Ok(());
     };
 
-    let mut screen =
-        UpdatePromptScreen::new(tui.frame_requester(), latest_version.clone(), update_action);
+    let mut screen = UpdatePromptScreen::new(tui.frame_requester(), latest_version.clone());
     tui.draw(u16::MAX, |frame| {
         frame.render_widget_ref(&screen, frame.area());
     })?;
@@ -87,23 +73,18 @@ pub(crate) async fn run_update_prompt_if_needed(
     }
 
     match screen.selection() {
-        Some(UpdateSelection::UpdateNow) => {
-            tui.terminal.clear()?;
-            Ok(UpdatePromptOutcome::RunUpdate(update_action))
-        }
-        Some(UpdateSelection::NotNow) | None => Ok(UpdatePromptOutcome::Continue),
+        Some(UpdateSelection::NotNow) | None => Ok(()),
         Some(UpdateSelection::DontRemind) => {
             if let Err(err) = updates::dismiss_version(config, screen.latest_version()).await {
                 tracing::error!("Failed to persist update dismissal: {err}");
             }
-            Ok(UpdatePromptOutcome::Continue)
+            Ok(())
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UpdateSelection {
-    UpdateNow,
     NotNow,
     DontRemind,
 }
@@ -112,23 +93,17 @@ struct UpdatePromptScreen {
     request_frame: FrameRequester,
     latest_version: String,
     current_version: String,
-    update_action: UpdateAction,
     highlighted: UpdateSelection,
     selection: Option<UpdateSelection>,
 }
 
 impl UpdatePromptScreen {
-    fn new(
-        request_frame: FrameRequester,
-        latest_version: String,
-        update_action: UpdateAction,
-    ) -> Self {
+    fn new(request_frame: FrameRequester, latest_version: String) -> Self {
         Self {
             request_frame,
             latest_version,
             current_version: env!("CARGO_PKG_VERSION").to_string(),
-            update_action,
-            highlighted: UpdateSelection::UpdateNow,
+            highlighted: UpdateSelection::NotNow,
             selection: None,
         }
     }
@@ -146,9 +121,8 @@ impl UpdatePromptScreen {
         match key_event.code {
             KeyCode::Up | KeyCode::Char('k') => self.set_highlight(self.highlighted.prev()),
             KeyCode::Down | KeyCode::Char('j') => self.set_highlight(self.highlighted.next()),
-            KeyCode::Char('1') => self.select(UpdateSelection::UpdateNow),
-            KeyCode::Char('2') => self.select(UpdateSelection::NotNow),
-            KeyCode::Char('3') => self.select(UpdateSelection::DontRemind),
+            KeyCode::Char('1') => self.select(UpdateSelection::NotNow),
+            KeyCode::Char('2') => self.select(UpdateSelection::DontRemind),
             KeyCode::Enter => self.select(self.highlighted),
             KeyCode::Esc => self.select(UpdateSelection::NotNow),
             _ => {}
@@ -185,16 +159,14 @@ impl UpdatePromptScreen {
 impl UpdateSelection {
     fn next(self) -> Self {
         match self {
-            UpdateSelection::UpdateNow => UpdateSelection::NotNow,
             UpdateSelection::NotNow => UpdateSelection::DontRemind,
-            UpdateSelection::DontRemind => UpdateSelection::UpdateNow,
+            UpdateSelection::DontRemind => UpdateSelection::NotNow,
         }
     }
 
     fn prev(self) -> Self {
         match self {
-            UpdateSelection::UpdateNow => UpdateSelection::DontRemind,
-            UpdateSelection::NotNow => UpdateSelection::UpdateNow,
+            UpdateSelection::NotNow => UpdateSelection::DontRemind,
             UpdateSelection::DontRemind => UpdateSelection::NotNow,
         }
     }
@@ -204,8 +176,6 @@ impl WidgetRef for &UpdatePromptScreen {
     fn render_ref(&self, area: Rect, buf: &mut Buffer) {
         Clear.render(area, buf);
         let mut column = FlexRenderable::new();
-
-        let update_command = self.update_action.command_str();
 
         column.push(/*flex*/ 1, RenderableItem::Borrowed(&""));
         column.push(
@@ -233,17 +203,15 @@ impl WidgetRef for &UpdatePromptScreen {
             .inset(Insets::vh(/*v*/ 0, /*h*/ 2)),
         );
         let selected_index = match self.highlighted {
-            UpdateSelection::UpdateNow => 0,
-            UpdateSelection::NotNow => 1,
-            UpdateSelection::DontRemind => 2,
+            UpdateSelection::NotNow => 0,
+            UpdateSelection::DontRemind => 1,
         };
         column.push(
             /*flex*/ 1,
             picker_option_list(
                 vec![
-                    format!("Update now (runs `{update_command}`)"),
-                    "Skip".to_string(),
-                    "Skip until next version".to_string(),
+                    "Continue without updating".to_string(),
+                    "Hide this notice for this version".to_string(),
                 ],
                 selected_index,
             ),
@@ -283,11 +251,7 @@ mod tests {
     use ratatui::widgets::FrameExt;
 
     fn new_prompt() -> UpdatePromptScreen {
-        UpdatePromptScreen::new(
-            FrameRequester::test_dummy(),
-            "9.9.9".into(),
-            UpdateAction::NpmGlobalLatest,
-        )
+        UpdatePromptScreen::new(FrameRequester::test_dummy(), "9.9.9".into())
     }
 
     #[test]
@@ -298,30 +262,27 @@ mod tests {
         terminal
             .draw(|frame| frame.render_widget_ref(&screen, frame.area()))
             .expect("render update prompt");
-        insta::assert_snapshot!("update_prompt_modal", terminal.backend());
+        let rendered = terminal
+            .backend()
+            .to_string()
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n");
+        insta::assert_snapshot!("update_prompt_modal", rendered);
     }
 
     #[test]
-    fn update_prompt_confirm_selects_update() {
+    fn managed_update_prompt_confirm_continues_without_update() {
         let mut screen = new_prompt();
-        screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(screen.is_done());
-        assert_eq!(screen.selection(), Some(UpdateSelection::UpdateNow));
-    }
-
-    #[test]
-    fn update_prompt_dismiss_option_leaves_prompt_in_normal_state() {
-        let mut screen = new_prompt();
-        screen.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(screen.is_done());
         assert_eq!(screen.selection(), Some(UpdateSelection::NotNow));
     }
 
     #[test]
-    fn update_prompt_dont_remind_selects_dismissal() {
+    fn update_prompt_dismiss_option_hides_notice_for_current_version() {
         let mut screen = new_prompt();
-        screen.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         screen.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(screen.is_done());
@@ -342,13 +303,12 @@ mod tests {
         screen.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(screen.highlighted, UpdateSelection::DontRemind);
         screen.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        assert_eq!(screen.highlighted, UpdateSelection::UpdateNow);
+        assert_eq!(screen.highlighted, UpdateSelection::NotNow);
     }
 
     #[test]
-    fn long_update_command_keeps_selected_skip_visible_in_a_short_viewport() {
+    fn managed_update_notice_keeps_selected_dismiss_visible_in_a_short_viewport() {
         let mut screen = new_prompt();
-        screen.update_action = UpdateAction::StandaloneWindows;
         screen.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         let (width, height) = (28, 12);
         let mut terminal = Terminal::new(VT100Backend::new(width, height)).expect("terminal");
@@ -356,7 +316,7 @@ mod tests {
             .draw(|frame| frame.render_widget_ref(&screen, frame.area()))
             .expect("render resized update picker");
         let rendered = terminal.backend().to_string();
-        assert!(rendered.contains("› 3. Skip until next version"));
+        assert!(rendered.contains("› 2. Hide this notice"));
         let words = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(words.contains("enter continue · esc skip"));
         assert_eq!(screen.selection(), None);

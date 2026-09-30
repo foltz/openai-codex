@@ -56,6 +56,9 @@ pub(crate) fn without_notification_media(notification: ServerNotification) -> Se
         }
         ServerNotification::Error(_)
         | ServerNotification::ThreadStarted(_)
+        | ServerNotification::ThreadClearStarted(_)
+        | ServerNotification::ThreadClearEnded(_)
+        | ServerNotification::ThreadInteractiveSubscriptionChanged(_)
         | ServerNotification::ThreadStatusChanged(_)
         | ServerNotification::ThreadArchived(_)
         | ServerNotification::ThreadDeleted(_)
@@ -99,6 +102,7 @@ pub(crate) fn without_notification_media(notification: ServerNotification) -> Se
         | ServerNotification::McpServerStatusUpdated(_)
         | ServerNotification::McpServerEventStream(_)
         | ServerNotification::AccountUpdated(_)
+        | ServerNotification::ManagedTransitionStatusUpdated(_)
         | ServerNotification::AccountRateLimitsUpdated(_)
         | ServerNotification::AppListUpdated(_)
         | ServerNotification::RemoteControlStatusChanged(_)

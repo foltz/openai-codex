@@ -242,18 +242,17 @@ impl ExecServerTelemetry {
         let parent = codex_otel::current_span_w3c_trace_context();
         // `parent:` accepts a local tracing span/ID, not a W3C context. A local
         // parent would keep the request span alive until process exit and delay
-        // its export. Use `parent: None`, then set the W3C parent below to link
-        // the spans without retaining the request span.
-        let span = tracing::info_span!(
-            parent: None,
-            "codex.exec_server.process",
-            otel.kind = "internal",
-            process.id = process_id,
-            result = tracing::field::Empty,
-        );
-        if let Some(parent) = parent {
-            codex_otel::set_parent_from_w3c_trace_context(&span, &parent);
-        }
+        // its export. Select the W3C parent at creation while keeping this a
+        // tracing root, including under the managed eager telemetry layer.
+        let span = codex_otel::root_span_with_w3c_parent(parent.as_ref(), || {
+            tracing::info_span!(
+                parent: None,
+                "codex.exec_server.process",
+                otel.kind = "internal",
+                process.id = process_id,
+                result = tracing::field::Empty,
+            )
+        });
         ProcessMetricGuard {
             telemetry: self.clone(),
             span,

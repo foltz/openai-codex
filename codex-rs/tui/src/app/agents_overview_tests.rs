@@ -694,7 +694,11 @@ async fn check_hidden_thread_does_not_refresh_shared_overview(source: &str) {
     app.handle_app_server_event(
         &app_server,
         AppServerEvent::ServerNotification(Box::new(ServerNotification::ThreadStarted(
-            ThreadStartedNotification { thread },
+            ThreadStartedNotification {
+                thread,
+                session_start_source: None,
+                clear_predecessor_thread_id: None,
+            },
         ))),
     )
     .await;
@@ -725,7 +729,11 @@ async fn check_hidden_thread_does_not_refresh_shared_overview(source: &str) {
     app.handle_app_server_event(
         &app_server,
         AppServerEvent::ServerNotification(Box::new(ServerNotification::ThreadStarted(
-            ThreadStartedNotification { thread },
+            ThreadStartedNotification {
+                thread,
+                session_start_source: None,
+                clear_predecessor_thread_id: None,
+            },
         ))),
     )
     .await;

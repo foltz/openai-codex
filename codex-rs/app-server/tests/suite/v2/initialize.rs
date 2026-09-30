@@ -243,6 +243,7 @@ async fn initialize_opt_out_notification_methods_filters_notifications() -> Resu
                 explicit_gateway_oauth: false,
                 experimental_api: true,
                 request_attestation: false,
+                interactive_client: false,
                 opt_out_notification_methods: Some(vec!["thread/started".to_string()]),
                 mcp_server_openai_form_elicitation: false,
                 extensions: None,

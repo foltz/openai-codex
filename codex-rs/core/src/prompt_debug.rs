@@ -70,7 +70,7 @@ pub async fn build_prompt_input(
         /*external_time_provider*/ None,
     );
     let thread = thread_manager
-        .start_thread(StartThreadOptions::new(config))
+        .start_thread(StartThreadOptions::new(config, None))
         .await?;
 
     let output = build_prompt_input_from_session(&thread.thread.session, input).await;
@@ -86,7 +86,8 @@ pub(crate) async fn build_prompt_input_from_session(
     input: Vec<UserInput>,
 ) -> CodexResult<Vec<ResponseItem>> {
     let turn_context = sess.new_default_turn().await;
-    // Prompt debugging builds a standalone request without entering run_turn.
+    // Prompt debugging builds a hostless CLI request without entering run_turn.
+    // A hosted caller would need explicit authority for this synthetic context.
     let step_context = sess
         .capture_step_context(Arc::clone(&turn_context), &CancellationToken::new())
         .await?;

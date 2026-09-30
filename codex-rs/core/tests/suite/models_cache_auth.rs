@@ -194,6 +194,7 @@ async fn auth_rotation_refreshes_before_turn_with_best_effort(
         Input::Mail => {
             test.codex
                 .submit(Op::InterAgentCommunication {
+                    work: None,
                     communication: InterAgentCommunication::new(
                         AgentPath::root().join("worker").expect("valid path"),
                         AgentPath::root(),

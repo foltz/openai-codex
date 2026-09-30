@@ -314,6 +314,7 @@ impl LocalAgentControl {
         mut config: Config,
         thread_id: ThreadId,
         parent: Option<Arc<CodexThread>>,
+        parent_authority: Option<&crate::ParentTurnAuthority>,
     ) -> CodexResult<()> {
         let state = self.runtime.upgrade()?;
         let owner_thread_id = parent.as_ref().map(|parent| parent.session.thread_id);
@@ -393,6 +394,15 @@ impl LocalAgentControl {
                 return Ok(());
             }
         }
+        // Warm queue-only delivery needs no new work. A cold load is construction,
+        // independent of whether the eventual message triggers a child turn.
+        let account_work = parent_authority
+            .map(crate::ParentTurnAuthority::derive_operation)
+            .transpose()
+            .map_err(|_| {
+                CodexErr::Fatal("parent account work cannot admit agent construction".to_owned())
+            })?
+            .flatten();
         let parent = if let Some(parent) = parent {
             let turn = parent
                 .session
@@ -590,6 +600,7 @@ impl LocalAgentControl {
 
         match state
             .resume_thread_with_history_with_source(ResumeThreadWithHistoryOptions {
+                account_work,
                 config,
                 initial_history,
                 agent_control: self.clone(),
@@ -636,6 +647,15 @@ impl LocalAgentControl {
     ) -> CodexResult<(LiveAgent, ThreadConfigSnapshot)> {
         let spawn_started_at = Instant::now();
         let state = self.runtime.upgrade()?;
+        let account_work = options
+            .parent_authority
+            .as_ref()
+            .map(crate::ParentTurnAuthority::derive_operation)
+            .transpose()
+            .map_err(|_| {
+                CodexErr::Fatal("parent account work cannot admit agent construction".to_owned())
+            })?
+            .flatten();
         let multi_agent_version = state
             .effective_multi_agent_version_for_spawn(
                 &InitialHistory::New,
@@ -720,6 +740,7 @@ impl LocalAgentControl {
                     &options,
                     inheritance,
                     multi_agent_version,
+                    account_work,
                 ))
                 .await?
             }
@@ -748,6 +769,7 @@ impl LocalAgentControl {
                     inheritance.environments,
                     inheritance.exec_policy,
                     options.environments.clone(),
+                    account_work,
                 ))
                 .await?;
                 SpawnedThreadResult {
@@ -758,8 +780,12 @@ impl LocalAgentControl {
             }
             (None, _, _) => {
                 let child_create_started_at = Instant::now();
-                let new_thread =
-                    Box::pin(state.spawn_new_thread(config.clone(), self.clone())).await?;
+                let new_thread = Box::pin(state.spawn_new_thread(
+                    config.clone(),
+                    self.clone(),
+                    account_work,
+                ))
+                .await?;
                 SpawnedThreadResult {
                     new_thread,
                     fork_context: None,
@@ -840,8 +866,13 @@ impl LocalAgentControl {
         let input_admission_started_at = Instant::now();
         match initial_input {
             SpawnInitialInput::UserInput(input) => {
-                self.send_input(new_thread.thread_id, input, start_options)
-                    .await?;
+                self.send_input(
+                    new_thread.thread_id,
+                    input,
+                    start_options,
+                    options.parent_authority.as_ref(),
+                )
+                .await?;
             }
             SpawnInitialInput::InterAgentCommunication(communication, context) => {
                 self.send_inter_agent_communication_after_capacity_check(
@@ -850,6 +881,7 @@ impl LocalAgentControl {
                     communication,
                     context,
                     start_options,
+                    options.parent_authority.as_ref(),
                 )
                 .await?;
             }
@@ -906,6 +938,7 @@ impl LocalAgentControl {
         Ok((agent, config))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_forked_thread(
         &self,
         state: &Arc<ThreadManagerState>,
@@ -914,6 +947,7 @@ impl LocalAgentControl {
         options: &SpawnAgentOptions,
         inheritance: SpawnAgentThreadInheritance,
         multi_agent_version: MultiAgentVersion,
+        account_work: Option<Box<dyn codex_extension_api::HostOperationWork>>,
     ) -> CodexResult<SpawnedThreadResult> {
         let SpawnAgentThreadInheritance {
             environments: inherited_environments,
@@ -1231,6 +1265,7 @@ impl LocalAgentControl {
                 inherited_exec_policy,
                 options.environments.clone(),
                 thread_extension_init,
+                account_work,
             )
             .await?;
         let child_create = child_create_started_at.elapsed();
@@ -1247,10 +1282,23 @@ impl LocalAgentControl {
         config: Config,
         thread_id: ThreadId,
         session_source: SessionSource,
+        parent_authority: Option<&crate::ParentTurnAuthority>,
     ) -> CodexResult<ThreadId> {
+        let account_work = parent_authority
+            .map(crate::ParentTurnAuthority::derive_operation)
+            .transpose()
+            .map_err(|_| {
+                CodexErr::Fatal("parent account work cannot admit agent construction".to_owned())
+            })?
+            .flatten();
         let root_depth = thread_spawn_depth(&session_source).unwrap_or(0);
         let (resumed_thread_id, resumed_multi_agent_version) = Box::pin(
-            self.resume_single_agent_from_rollout(config.clone(), thread_id, session_source),
+            self.resume_single_agent_from_rollout(
+                config.clone(),
+                thread_id,
+                session_source,
+                account_work.as_deref(),
+            ),
         )
         .await?;
         let state = self.runtime.upgrade()?;
@@ -1298,6 +1346,7 @@ impl LocalAgentControl {
                         config.clone(),
                         child_thread_id,
                         child_session_source,
+                        account_work.as_deref(),
                     ))
                     .await
                     {
@@ -1322,8 +1371,15 @@ impl LocalAgentControl {
         config: Config,
         thread_id: ThreadId,
         session_source: SessionSource,
+        account_work: Option<&dyn codex_extension_api::HostOperationWork>,
     ) -> CodexResult<(ThreadId, MultiAgentVersion)> {
         let state = self.runtime.upgrade()?;
+        let account_work = account_work
+            .map(codex_extension_api::HostOperationWork::derive_operation)
+            .transpose()
+            .map_err(|_| {
+                CodexErr::Fatal("account work cannot admit resumed agent construction".to_owned())
+            })?;
         let stored_thread = state
             .read_stored_thread(ReadThreadParams {
                 thread_id,
@@ -1390,6 +1446,7 @@ impl LocalAgentControl {
 
         let resumed_thread = state
             .resume_thread_with_history_with_source(ResumeThreadWithHistoryOptions {
+                account_work,
                 config: config.clone(),
                 initial_history,
                 agent_control: self.clone(),

@@ -159,7 +159,7 @@ pub(super) async fn mcp_server_elicitation_scenario(
         .start_thread(StartThreadOptions {
             session_source: Some(session_source),
             environments: Some(vec![test.executor_environment().selection().clone()]),
-            ..StartThreadOptions::new(config)
+            ..StartThreadOptions::new(config, /*control_endpoint*/ None)
         })
         .await?
         .thread;

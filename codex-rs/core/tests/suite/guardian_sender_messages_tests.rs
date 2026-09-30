@@ -48,7 +48,7 @@ async fn guardian_receives_sender_user_messages_by_default(
         .thread_manager
         .start_thread(StartThreadOptions {
             environments: Some(test.codex.environment_selections().await),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?
         .thread;

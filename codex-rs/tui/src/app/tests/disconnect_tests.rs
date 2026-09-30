@@ -318,6 +318,10 @@ where
         let request_id = request.id.clone();
         let response = match request.method.as_str() {
             "initialize" => Some(json!({"result": {"userAgent": "reconnect-test/2.0.0"}})),
+            "thread/retention/acquire" => Some(
+                json!({"result": {"status": "acquired", "grantId": format!("reconnect-{}", request.params.as_ref().unwrap()["threadId"])}}),
+            ),
+            "thread/retention/release" => Some(json!({"result": {"status": "released"}})),
             "account/read" => {
                 Some(json!({"result": {"account": null, "requiresOpenaiAuth": false}}))
             }
@@ -363,6 +367,7 @@ async fn lost_initial_thread_reply_keeps_startup_draft_offline() -> Result<()> {
         );
         let result = crate::app_server_session::start_thread_with_request_handle(
             session.request_handle(),
+            session.retention_client(),
             &app.local_settings,
             app.config.clone(),
             ThreadParamsMode::Remote,

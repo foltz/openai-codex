@@ -1953,7 +1953,9 @@ async fn replayed_interrupted_turn_restores_queued_input_to_composer() {
 async fn token_usage_update_refreshes_status_line_with_runtime_context_window() {
     let mut app = make_test_app().await;
     app.chat_widget.setup_status_line(
-        vec![crate::bottom_pane::StatusLineItem::ContextWindowSize],
+        vec![crate::bottom_pane::StatusLineConfigEntry::BuiltIn(
+            crate::bottom_pane::StatusLineItem::ContextWindowSize,
+        )],
         /*use_theme_colors*/ true,
     );
 
@@ -4526,6 +4528,8 @@ async fn inactive_thread_started_notification_initializes_replay_session() -> Re
                 name: Some("agent thread".to_string()),
                 turns: Vec::new(),
             },
+            session_start_source: None,
+            clear_predecessor_thread_id: None,
         }),
     )
     .await?;
@@ -4631,6 +4635,8 @@ async fn inactive_thread_started_notification_preserves_primary_model_when_path_
                 name: Some("agent thread".to_string()),
                 turns: Vec::new(),
             },
+            session_start_source: None,
+            clear_predecessor_thread_id: None,
         }),
     )
     .await?;

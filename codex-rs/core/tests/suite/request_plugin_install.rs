@@ -864,7 +864,7 @@ async fn subagent_install_request_returns_root_only_error(
                 agent_nickname: None,
                 agent_role: None,
             })),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?;
     subagent

@@ -114,7 +114,8 @@ async fn activate_turn_with_new_review_authority(session: &Arc<Session>) -> Arc<
                 listen_to_cancellation_token: true,
             },
         )
-        .await;
+        .await
+        .expect("install test turn with new review authority");
 
     let (active_turn, _, _, _) = session
         .active_turn_context_and_strict_auto_review()
@@ -724,7 +725,8 @@ async fn strict_auto_review_turn_grant_forces_guardian_for_exec_command_policy_s
                 listen_to_cancellation_token: true,
             },
         )
-        .await;
+        .await
+        .expect("install test turn before invoking the tool");
 
     let handler = crate::tools::handlers::ExecCommandHandler::default();
     #[allow(deprecated)]
@@ -788,7 +790,8 @@ async fn network_approval_uses_published_task_authority_within_same_turn(
                 listen_to_cancellation_token: true,
             },
         )
-        .await;
+        .await
+        .expect("install test turn before changing later-step authority");
     // Inject later-step authority directly while live policy changes remain gated.
     {
         let active = session.active_turn.lock().await;
@@ -1314,6 +1317,8 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
         mcp_manager,
         code_mode_session_provider: Arc::new(codex_code_mode::DisabledCodeModeSessionProvider),
         extensions: codex_extension_api::empty_extension_registry(),
+        host_admission: None,
+        initial_mcp_work: None,
         conversation_history: InitialHistory::New,
         disabled_plugin_ids: None,
         requested_history_mode: None,
@@ -1337,6 +1342,7 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
         thread_extension_init,
         client_mcp_extensions: ClientMcpExtensions::default(),
         reserved_thread_id: None,
+        control_endpoint: None,
         analytics_events_client: None,
         image_store: crate::thread_manager::passthrough_image_store(),
         thread_store,
@@ -1346,6 +1352,9 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
         git_enrichment_policy: GitEnrichmentPolicy::Skip,
         windows_sandbox_proxy_settings_mode:
             codex_sandboxing::WindowsSandboxProxySettingsMode::Preserve,
+        deferred_clear_session_start: None,
+        runtime_config_change_listener: None,
+        runtime_config_change_gate: None,
     })
     .await
     .expect("spawn guardian subagent");

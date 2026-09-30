@@ -30,6 +30,11 @@ use tracing::Instrument;
 use tracing::Span;
 use tracing::warn;
 
+#[path = "account_projection.rs"]
+mod account_projection;
+pub(crate) use account_projection::AccountProjectionReservation;
+pub(crate) use account_projection::AccountProjectionReservationError;
+
 use crate::error_code::internal_error;
 use crate::server_request_error::TURN_TRANSITION_PENDING_REQUEST_ERROR_REASON;
 pub(crate) use codex_app_server_transport::ConnectionId;
@@ -813,6 +818,7 @@ impl OutgoingMessageSender {
             .await
         {
             warn!("failed to send server notification to client: {err:?}");
+            return false;
         }
         write_complete_rx.await.is_ok()
     }

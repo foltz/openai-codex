@@ -77,6 +77,11 @@ pub enum McpStartupPolicy {
 
 /// Configuration and owning-thread state needed to materialize an MCP runtime.
 pub struct McpRuntimeInput {
+    /// Uncounted policy retained by connections, independently of this call.
+    pub attempt_requirement: crate::McpAttemptRequirement,
+    /// Finite construction authority. Drivers derive their own work before
+    /// detaching; dormant connections must not retain this input.
+    pub startup_work: Option<Box<dyn crate::McpAttemptWork>>,
     pub startup_policy: McpStartupPolicy,
     pub config: Arc<McpConfig>,
     pub plugins_available: bool,
@@ -94,6 +99,21 @@ pub struct McpRuntimeInput {
     pub auth_manager: Option<Arc<AuthManager>>,
     pub elicitation_reviewer: Option<ElicitationReviewerHandle>,
     pub elicitation_lifecycle: Option<ElicitationLifecycle>,
+    /// Canonical Codex `ThreadId` for the owning session, used only to
+    /// determine per-connection thread-identity bind eligibility and reuse
+    /// compatibility. `None` for every threadless caller (connector
+    /// discovery, apps-install probing, and similar session-independent
+    /// paths) — absence is modeled explicitly so a threadless path can
+    /// never be mistaken for a real, bindable ID; the bind gate treats
+    /// `None` as ineligible regardless of `thread_identity_eligible`. Never
+    /// sent to a server outside the capability-gated `codex/thread-identity`
+    /// bind handshake gated by `McpServerConfig::thread_identity_eligible`;
+    /// see `kcf-runtime/04-mcp-thread-identity-contract.md`.
+    pub canonical_thread_id: Option<String>,
+    /// URI for the Unix control listener that owns this session, if the host
+    /// has one. Disclosed only to explicitly eligible providers through the
+    /// capability-gated `codex/control-endpoint` handshake.
+    pub control_endpoint: Option<String>,
 }
 
 /// Owns all mutable MCP state for one Codex thread.
@@ -101,6 +121,7 @@ pub struct McpRuntimeInput {
 /// Publication replaces the latest state atomically. Existing bindings retain
 /// their exact connections and configuration for as long as they are needed.
 pub struct McpRuntime {
+    retirement: crate::runtime_retirement::RuntimeRetirementRegistry,
     current: ArcSwap<PublishedMcpRuntime>,
     event_stream_cancellation: Mutex<EventStreamCancellation>,
     reconnect_pending: AtomicBool,
@@ -189,7 +210,7 @@ pub(crate) struct McpPublicationGate {
 }
 
 impl McpPublicationGate {
-    fn pending() -> (watch::Sender<bool>, Self) {
+    pub(crate) fn pending() -> (watch::Sender<bool>, Self) {
         let (publish, published) = watch::channel(false);
         (
             publish,
@@ -225,6 +246,7 @@ impl McpRuntime {
     /// runtime handle before its full MCP inputs are available.
     pub fn empty(prefix_mcp_tool_names: bool) -> Self {
         Self {
+            retirement: crate::runtime_retirement::RuntimeRetirementRegistry::default(),
             current: ArcSwap::from_pointee(PublishedMcpRuntime {
                 connections: Arc::new(McpConnectionSet::empty(prefix_mcp_tool_names)),
                 config: None,
@@ -289,21 +311,49 @@ impl McpRuntime {
         call_id: &str,
         uri: &str,
     ) -> anyhow::Result<ReadResourceResult> {
+        self.read_resource_for_call_with_authority(
+            thread_id,
+            call_id,
+            uri,
+            crate::McpAttemptAccess::Unscoped,
+        )
+        .await
+    }
+
+    pub async fn read_resource_for_call_with_authority(
+        &self,
+        thread_id: ThreadId,
+        call_id: &str,
+        uri: &str,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> anyhow::Result<ReadResourceResult> {
         let origin = self
             .resource_origins
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .find(call_id)?;
         let binding = self
-            .current_binding_for_call(crate::CODEX_APPS_MCP_SERVER_NAME)
+            .current_binding_for_call_with_authority(crate::CODEX_APPS_MCP_SERVER_NAME, access)
             .await
             .ok_or_else(|| anyhow::anyhow!("codex_apps MCP server is unavailable"))?;
 
-        origin.read(&binding, thread_id, uri).await
+        origin.read(&binding, thread_id, uri, access).await
     }
 
     pub async fn new(input: McpRuntimeInput) -> Self {
         let runtime = Self::empty(input.config.prefix_mcp_tool_names);
+        runtime.replace(input).await;
+        runtime
+    }
+
+    /// Attach external custody before the first startup await. The caller must
+    /// retain the supplied owner until its exact retirement report is complete.
+    pub async fn new_in_retirement(
+        input: McpRuntimeInput,
+        retirement: crate::McpRuntimeRetirement,
+    ) -> Self {
+        let mut runtime = Self::empty(input.config.prefix_mcp_tool_names);
+        runtime.retirement = retirement.registry;
         runtime.replace(input).await;
         runtime
     }
@@ -325,8 +375,18 @@ impl McpRuntime {
 
     /// Starts fresh connections and returns their complete, refreshed Apps catalog.
     pub async fn replace_fresh(&self, input: McpRuntimeInput) -> anyhow::Result<Vec<ToolInfo>> {
+        self.replace_fresh_with_authority(input, crate::McpAttemptAccess::Unscoped)
+            .await
+    }
+
+    pub async fn replace_fresh_with_authority(
+        &self,
+        input: McpRuntimeInput,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> anyhow::Result<Vec<ToolInfo>> {
         self.publish(input, /*previous*/ None).await;
-        self.latest_hard_refresh_codex_apps_tools_cache().await
+        self.latest_hard_refresh_codex_apps_tools_cache_with_authority(access)
+            .await
     }
 
     async fn publish(&self, input: McpRuntimeInput, previous: Option<&McpConnectionSet>) {
@@ -345,11 +405,12 @@ impl McpRuntime {
         let environment_selections = Arc::clone(&input.runtime_context.environment_selections);
         let ready_environments = input.runtime_context.ready_environments.clone();
         let connections = Arc::new(
-            McpConnectionSet::new(
+            McpConnectionSet::new_with_retirement(
                 previous,
                 publication_gate,
                 input,
                 self.elicitation_router.clone(),
+                self.retirement.clone(),
             )
             .await,
         );
@@ -413,6 +474,15 @@ impl McpRuntime {
             .await
     }
 
+    /// Captures a binding using this invocation's finite startup authority.
+    pub async fn current_binding_with_authority(
+        &self,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Option<Arc<McpBinding>> {
+        self.current_binding_with_requirements_and_authority(&[], &HashSet::new(), access)
+            .await
+    }
+
     /// Captures one runtime, waiting for explicitly required servers and selected plugins.
     /// Plugin IDs are resolved by the captured connection set, even if a refresh publishes later.
     pub async fn current_binding_with_requirements(
@@ -420,19 +490,36 @@ impl McpRuntime {
         required_servers: &[String],
         required_plugins: &HashSet<String>,
     ) -> Option<Arc<McpBinding>> {
+        self.current_binding_with_requirements_and_authority(
+            required_servers,
+            required_plugins,
+            crate::McpAttemptAccess::Unscoped,
+        )
+        .await
+    }
+
+    /// Authority is borrowed only while capturing; cached bindings retain none.
+    pub async fn current_binding_with_requirements_and_authority(
+        &self,
+        required_servers: &[String],
+        required_plugins: &HashSet<String>,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Option<Arc<McpBinding>> {
         let current = self.current.load_full();
         current.connections.record_startup_readiness(
             "model_binding",
             required_servers,
             required_plugins,
         );
-        Self::binding_from_published_runtime(current, required_servers, required_plugins).await
+        Self::binding_from_published_runtime(current, required_servers, required_plugins, access)
+            .await
     }
 
     async fn binding_from_published_runtime(
         current: Arc<PublishedMcpRuntime>,
         required_servers: &[String],
         required_plugins: &HashSet<String>,
+        access: crate::McpAttemptAccess<'_>,
     ) -> Option<Arc<McpBinding>> {
         let config = Arc::clone(current.config.as_ref()?);
         let stable_catalog_revisions = current
@@ -455,11 +542,12 @@ impl McpRuntime {
         let binding = Arc::new(
             current
                 .connections
-                .capture_binding_with_metadata(
+                .capture_binding_with_authority(
                     config,
                     current.plugins_available,
                     required_servers,
                     required_plugins,
+                    access,
                 )
                 .await,
         );
@@ -531,10 +619,19 @@ impl McpRuntime {
 
     /// Waits for the selected server without capturing an execution binding.
     pub async fn wait_for_server_startup(&self, server: &str) {
+        self.wait_for_server_startup_with_authority(server, crate::McpAttemptAccess::Unscoped)
+            .await;
+    }
+
+    pub async fn wait_for_server_startup_with_authority(
+        &self,
+        server: &str,
+        access: crate::McpAttemptAccess<'_>,
+    ) {
         self.current
             .load_full()
             .connections
-            .wait_for_server_startup(server)
+            .wait_for_server_startup_with_authority(server, access)
             .await;
     }
 
@@ -550,15 +647,29 @@ impl McpRuntime {
 
     /// Captures the current runtime after its selected server has finished startup.
     pub async fn current_binding_for_call(&self, server: &str) -> Option<Arc<McpBinding>> {
+        self.current_binding_for_call_with_authority(server, crate::McpAttemptAccess::Unscoped)
+            .await
+    }
+
+    pub async fn current_binding_for_call_with_authority(
+        &self,
+        server: &str,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Option<Arc<McpBinding>> {
         let current = self.current.load_full();
         current.config.as_ref()?;
-        if !current.connections.wait_for_server_startup(server).await {
+        if !current
+            .connections
+            .wait_for_server_startup_with_authority(server, access)
+            .await
+        {
             return None;
         }
         Self::binding_from_published_runtime(
             current,
             /*required_servers*/ &[],
             /*required_plugins*/ &HashSet::new(),
+            access,
         )
         .await
     }
@@ -616,13 +727,31 @@ impl McpRuntime {
     pub async fn latest_hard_refresh_codex_apps_tools_cache(
         &self,
     ) -> anyhow::Result<Vec<ToolInfo>> {
+        self.latest_hard_refresh_codex_apps_tools_cache_with_authority(
+            crate::McpAttemptAccess::Unscoped,
+        )
+        .await
+    }
+
+    pub async fn latest_hard_refresh_codex_apps_tools_cache_with_authority(
+        &self,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> anyhow::Result<Vec<ToolInfo>> {
         self.latest_connections()
-            .refresh_codex_apps_tools_for_discovery()
+            .refresh_codex_apps_tools_for_discovery_with_authority(access)
             .await
     }
 
     /// Refreshes the published Apps client and returns its exact inventory and MCP eligibility.
     pub async fn refresh_codex_apps_tools(&self) -> anyhow::Result<CodexAppsToolSnapshot> {
+        self.refresh_codex_apps_tools_with_authority(crate::McpAttemptAccess::Unscoped)
+            .await
+    }
+
+    pub async fn refresh_codex_apps_tools_with_authority(
+        &self,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> anyhow::Result<CodexAppsToolSnapshot> {
         let current = self.current.load_full();
         let config = current
             .config
@@ -630,7 +759,7 @@ impl McpRuntime {
             .ok_or_else(|| anyhow::anyhow!("MCP runtime is not configured"))?;
         current
             .connections
-            .refresh_codex_apps_client_catalog(config)
+            .refresh_codex_apps_client_catalog_with_authority(config, access)
             .await
     }
 
@@ -640,6 +769,16 @@ impl McpRuntime {
     /// client reconnects because callers only inspect tool metadata.
     pub async fn latest_list_all_tools(&self) -> Vec<ToolInfo> {
         self.latest_connections().list_all_tools().await
+    }
+
+    pub async fn latest_list_all_tools_with_authority(
+        &self,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Vec<ToolInfo> {
+        self.latest_connections()
+            .list_tools_with_errors_with_authority(|_| true, access)
+            .await
+            .0
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -653,8 +792,33 @@ impl McpRuntime {
         requested_timeout: Option<Duration>,
         wait_for_server: bool,
     ) -> anyhow::Result<CallToolResult> {
+        self.latest_call_tool_with_authority(
+            server,
+            tool,
+            environment_id,
+            arguments,
+            meta,
+            requested_timeout,
+            wait_for_server,
+            crate::McpAttemptAccess::Unscoped,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn latest_call_tool_with_authority(
+        &self,
+        server: &str,
+        tool: &str,
+        environment_id: Option<&str>,
+        arguments: Option<serde_json::Value>,
+        meta: Option<serde_json::Value>,
+        requested_timeout: Option<Duration>,
+        wait_for_server: bool,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> anyhow::Result<CallToolResult> {
         self.latest_connections()
-            .call_tool(
+            .call_tool_with_authority(
                 server,
                 tool,
                 environment_id,
@@ -662,6 +826,7 @@ impl McpRuntime {
                 meta,
                 requested_timeout,
                 wait_for_server,
+                access,
             )
             .await
     }
@@ -671,19 +836,53 @@ impl McpRuntime {
         server: &str,
         params: ReadResourceRequestParams,
     ) -> anyhow::Result<ReadResourceResult> {
+        self.latest_read_resource_with_authority(server, params, crate::McpAttemptAccess::Unscoped)
+            .await
+    }
+
+    pub async fn latest_read_resource_with_authority(
+        &self,
+        server: &str,
+        params: ReadResourceRequestParams,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> anyhow::Result<ReadResourceResult> {
         self.latest_connections()
-            .read_resource(server, params)
+            .read_resource_with_authority(server, params, access)
             .await
     }
 
     pub async fn latest_wait_for_server_ready(&self, server: &str, timeout: Duration) -> bool {
+        self.latest_wait_for_server_ready_with_authority(
+            server,
+            timeout,
+            crate::McpAttemptAccess::Unscoped,
+        )
+        .await
+    }
+
+    pub async fn latest_wait_for_server_ready_with_authority(
+        &self,
+        server: &str,
+        timeout: Duration,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> bool {
         self.latest_connections()
-            .wait_for_server_ready(server, timeout)
+            .wait_for_server_ready_with_authority(server, timeout, access)
             .await
     }
 
     pub async fn validate_required_servers(&self) -> anyhow::Result<()> {
-        self.latest_connections().validate_required_servers().await
+        self.validate_required_servers_with_authority(crate::McpAttemptAccess::Unscoped)
+            .await
+    }
+
+    pub async fn validate_required_servers_with_authority(
+        &self,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> anyhow::Result<()> {
+        self.latest_connections()
+            .validate_required_servers_with_authority(access)
+            .await
     }
 
     pub fn cancel_startup(&self) {
@@ -778,7 +977,21 @@ impl McpRuntime {
     }
 
     pub async fn shutdown(&self) {
-        self.latest_connections().shutdown().await;
+        let report = self
+            .shutdown_until(tokio::time::Instant::now() + std::time::Duration::from_secs(30))
+            .await;
+        if !report.is_complete() {
+            tracing::warn!(?report, "MCP runtime retirement was not acknowledged");
+        }
+    }
+
+    /// Freeze all generations and observe every admitted owner under one budget.
+    /// A timeout retains unfinished ownership for a subsequent observation.
+    pub async fn shutdown_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> crate::RuntimeTerminationReport {
+        self.retirement.shutdown_until(deadline).await
     }
 }
 
@@ -965,6 +1178,8 @@ mod tests {
             startup_readiness: Default::default(),
             supports_parallel_tool_calls: false,
             tool_input_schema_max_bytes: None,
+            thread_identity_eligible: false,
+            control_endpoint_eligible: false,
             omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,
@@ -1034,6 +1249,7 @@ mod tests {
             Arc::clone(&published),
             /*required_servers*/ &[],
             /*required_plugins*/ &HashSet::new(),
+            crate::McpAttemptAccess::Unscoped,
         )
         .await
         .expect("initial binding");
@@ -1041,6 +1257,7 @@ mod tests {
             Arc::clone(&published),
             /*required_servers*/ &[],
             /*required_plugins*/ &HashSet::new(),
+            crate::McpAttemptAccess::Unscoped,
         )
         .await
         .expect("cached initial binding");
@@ -1052,6 +1269,7 @@ mod tests {
             Arc::clone(&published),
             /*required_servers*/ &[],
             /*required_plugins*/ &HashSet::new(),
+            crate::McpAttemptAccess::Unscoped,
         )
         .await
         .expect("refreshed binding");
@@ -1074,6 +1292,7 @@ mod tests {
             Arc::clone(&published),
             /*required_servers*/ &[],
             /*required_plugins*/ &HashSet::new(),
+            crate::McpAttemptAccess::Unscoped,
         )
         .await
         .expect("cached refreshed binding");
@@ -1108,6 +1327,7 @@ mod tests {
             Arc::clone(&published),
             /*required_servers*/ &[],
             /*required_plugins*/ &HashSet::new(),
+            crate::McpAttemptAccess::Unscoped,
         )
         .await
         .expect("first binding");
@@ -1115,6 +1335,7 @@ mod tests {
             Arc::clone(&published),
             /*required_servers*/ &[],
             /*required_plugins*/ &HashSet::new(),
+            crate::McpAttemptAccess::Unscoped,
         )
         .await
         .expect("repeated binding");
@@ -1129,6 +1350,7 @@ mod tests {
             republished,
             /*required_servers*/ &[],
             /*required_plugins*/ &HashSet::new(),
+            crate::McpAttemptAccess::Unscoped,
         )
         .await
         .expect("republished binding");

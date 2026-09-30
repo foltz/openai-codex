@@ -1968,6 +1968,7 @@ async fn overridden_voice_save_keeps_effective_voice() -> Result<()> {
             /*state_db*/ None,
             Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
             Default::default(),
+            Arc::new(codex_app_server_client::InProcessHost::default()),
         )
         .await?;
         let server = AppServerSession::new(

@@ -4,22 +4,29 @@ use std::string::String;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::oauth_callback_server::Request as CallbackRequest;
+use crate::oauth_callback_server::Response as CallbackResponse;
+use crate::oauth_callback_server::Server as CallbackServer;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
 use codex_config::McpServerOAuthConfig;
+use bytes::Bytes;
 use codex_exec_server::HttpClient;
+use http_body_util::Full;
 use rmcp::transport::AuthorizationManager;
 use rmcp::transport::AuthorizationSession;
 use rmcp::transport::auth::AuthorizationMetadata;
 use rmcp::transport::auth::OAuthClientConfig;
 use rmcp::transport::auth::OAuthHttpClient;
 use rmcp::transport::auth::OAuthState;
-use tiny_http::Response;
-use tiny_http::Server;
+use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
+use tokio_util::task::AbortOnDropHandle;
 use url::Url;
 use urlencoding::decode;
 
@@ -65,12 +72,18 @@ pub(crate) struct OAuthHttpContext {
 }
 
 struct CallbackServerGuard {
-    server: Arc<Server>,
+    server: Arc<CallbackServer>,
+}
+
+impl CallbackServerGuard {
+    fn close(&self) {
+        self.server.close();
+    }
 }
 
 impl Drop for CallbackServerGuard {
     fn drop(&mut self) {
-        self.server.unblock();
+        self.server.close();
     }
 }
 
@@ -246,6 +259,7 @@ pub async fn perform_oauth_login_return_url(
     global_callback_url: Option<&str>,
     http_client: Arc<dyn HttpClient>,
     redirect_mode: StreamableHttpRedirectMode,
+    operation_work: Option<Box<dyn Send>>,
 ) -> Result<OauthLoginHandle> {
     let http_context = OAuthHttpContext {
         http_headers,
@@ -273,29 +287,29 @@ pub async fn perform_oauth_login_return_url(
     .await?;
 
     let authorization_url = flow.authorization_url();
-    let completion = flow.spawn();
+    let (completion, task) = flow.spawn(operation_work);
 
-    Ok(OauthLoginHandle::new(authorization_url, completion))
+    Ok(OauthLoginHandle::new(authorization_url, completion, task))
 }
 
-fn spawn_callback_server(
-    server: Arc<Server>,
+fn spawn_callback_dispatcher(
+    mut requests: mpsc::Receiver<CallbackRequest>,
     tx: oneshot::Sender<CallbackResult>,
     expected_callback_path: String,
-) {
-    tokio::task::spawn_blocking(move || {
-        while let Ok(request) = server.recv() {
-            let path = request.url().to_string();
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(request) = requests.recv().await {
+            let path = request.url.clone();
             match parse_oauth_callback(&path, &expected_callback_path) {
                 CallbackOutcome::Success(OauthCallbackResult {
                     code,
                     state,
                     issuer,
                 }) => {
-                    let response = Response::from_string(
+                    let response: CallbackResponse = http::Response::new(Full::new(Bytes::from(
                         "Authentication complete. You may close this window.",
-                    );
-                    if let Err(err) = request.respond(response) {
+                    )));
+                    if let Err(err) = request.respond(response).await {
                         eprintln!("Failed to respond to OAuth callback: {err}");
                     }
                     if let Err(message) = send_oauth_callback(
@@ -311,8 +325,10 @@ fn spawn_callback_server(
                     break;
                 }
                 CallbackOutcome::Error(error) => {
-                    let response = Response::from_string(error.to_string()).with_status_code(400);
-                    if let Err(err) = request.respond(response) {
+                    let mut response: CallbackResponse =
+                        http::Response::new(Full::new(Bytes::from(error.to_string())));
+                    *response.status_mut() = http::StatusCode::BAD_REQUEST;
+                    if let Err(err) = request.respond(response).await {
                         eprintln!("Failed to respond to OAuth callback: {err}");
                     }
                     if let Err(message) = send_oauth_callback(tx, CallbackResult::Error(error)) {
@@ -321,15 +337,16 @@ fn spawn_callback_server(
                     break;
                 }
                 CallbackOutcome::Invalid => {
-                    let response =
-                        Response::from_string("Invalid OAuth callback").with_status_code(400);
-                    if let Err(err) = request.respond(response) {
+                    let mut response: CallbackResponse =
+                        http::Response::new(Full::new(Bytes::from("Invalid OAuth callback")));
+                    *response.status_mut() = http::StatusCode::BAD_REQUEST;
+                    if let Err(err) = request.respond(response).await {
                         eprintln!("Failed to respond to OAuth callback: {err}");
                     }
                 }
             }
         }
-    });
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -409,14 +426,20 @@ fn parse_oauth_callback(path: &str, expected_callback_path: &str) -> CallbackOut
 
 pub struct OauthLoginHandle {
     authorization_url: String,
-    completion: oneshot::Receiver<Result<()>>,
+    completion: Option<oneshot::Receiver<Result<()>>>,
+    task: Option<JoinHandle<()>>,
 }
 
 impl OauthLoginHandle {
-    fn new(authorization_url: String, completion: oneshot::Receiver<Result<()>>) -> Self {
+    fn new(
+        authorization_url: String,
+        completion: oneshot::Receiver<Result<()>>,
+        task: JoinHandle<()>,
+    ) -> Self {
         Self {
             authorization_url,
-            completion,
+            completion: Some(completion),
+            task: Some(task),
         }
     }
 
@@ -424,14 +447,48 @@ impl OauthLoginHandle {
         &self.authorization_url
     }
 
-    pub fn into_parts(self) -> (String, oneshot::Receiver<Result<()>>) {
-        (self.authorization_url, self.completion)
+    #[expect(
+        clippy::expect_used,
+        reason = "completion is initialized by new and taken only by methods that consume self"
+    )]
+    pub fn into_parts(mut self) -> (String, oneshot::Receiver<Result<()>>) {
+        // Preserve the historical receiver-only escape hatch. Callers using
+        // it explicitly take responsibility for the detached compatibility
+        // path; the structured `wait` path retains and joins the task.
+        let _ = self.task.take();
+        (
+            std::mem::take(&mut self.authorization_url),
+            self.completion
+                .take()
+                .expect("OAuth completion already taken"),
+        )
     }
 
-    pub async fn wait(self) -> Result<()> {
-        self.completion
-            .await
-            .map_err(|err| anyhow!("OAuth login task was cancelled: {err}"))?
+    #[expect(
+        clippy::expect_used,
+        reason = "completion is initialized by new and taken only by methods that consume self"
+    )]
+    pub async fn wait(mut self) -> Result<()> {
+        let mut completion = self
+            .completion
+            .take()
+            .expect("OAuth completion already taken");
+        let result = match (&mut completion).await {
+            Ok(result) => result,
+            Err(err) => Err(anyhow!("OAuth login task was cancelled: {err}")),
+        };
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+        result
+    }
+}
+
+impl Drop for OauthLoginHandle {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.as_ref() {
+            task.abort();
+        }
     }
 }
 
@@ -442,6 +499,7 @@ pub(crate) struct OauthLoginFlow {
     authorization_server_issuer: Option<String>,
     rx: oneshot::Receiver<CallbackResult>,
     guard: CallbackServerGuard,
+    callback_dispatcher: AbortOnDropHandle<()>,
     server_name: String,
     server_url: String,
     store_mode: OAuthCredentialsStoreMode,
@@ -463,26 +521,16 @@ fn resolve_callback_port(callback_port: Option<u16>) -> Result<Option<u16>> {
     Ok(None)
 }
 
-fn local_redirect_uri(server: &Server) -> Result<String> {
-    match server.server_addr() {
-        tiny_http::ListenAddr::IP(std::net::SocketAddr::V4(addr)) => {
-            let ip = addr.ip();
-            let port = addr.port();
-            Ok(format!("http://{ip}:{port}/callback"))
-        }
-        tiny_http::ListenAddr::IP(std::net::SocketAddr::V6(addr)) => {
-            let ip = addr.ip();
-            let port = addr.port();
-            Ok(format!("http://[{ip}]:{port}/callback"))
-        }
-        #[cfg(not(target_os = "windows"))]
-        _ => Err(anyhow!("unable to determine callback address")),
-    }
+fn local_redirect_uri(addr: std::net::SocketAddr) -> Result<String> {
+    Ok(match addr {
+        std::net::SocketAddr::V4(addr) => format!("http://{addr}/callback"),
+        std::net::SocketAddr::V6(addr) => format!("http://{addr}/callback"),
+    })
 }
 
-fn resolve_redirect_uri(server: &Server, callback_url: Option<&str>) -> Result<String> {
+fn resolve_redirect_uri(addr: std::net::SocketAddr, callback_url: Option<&str>) -> Result<String> {
     let Some(callback_url) = callback_url else {
-        return local_redirect_uri(server);
+        return local_redirect_uri(addr);
     };
     let mut parsed = Url::parse(callback_url)
         .with_context(|| format!("invalid MCP OAuth callback URL `{callback_url}`"))?;
@@ -496,11 +544,7 @@ fn resolve_redirect_uri(server: &Server, callback_url: Option<&str>) -> Result<S
         && parsed.host_str() == Some("127.0.0.1")
         && parsed.port().is_none()
     {
-        let listener_port = server
-            .server_addr()
-            .to_ip()
-            .ok_or_else(|| anyhow!("unable to determine OAuth callback listener port"))?
-            .port();
+        let listener_port = addr.port();
         parsed
             .set_port(Some(listener_port))
             .map_err(|()| anyhow!("unable to set OAuth callback listener port"))?;
@@ -639,17 +683,20 @@ impl OauthLoginFlow {
         // Port zero asks the OS for a free ephemeral port; the resolved
         // redirect receives that port after the listener has been bound.
         let bind_addr = SocketAddr::new(bind_ip, callback_port.unwrap_or(0));
-        let server = Arc::new(Server::http(bind_addr).map_err(|err| anyhow!(err))?);
+        let listener = TcpListener::bind(bind_addr)
+            .await
+            .with_context(|| format!("failed to bind OAuth callback listener at {bind_addr}"))?;
+        let callback_addr = listener
+            .local_addr()
+            .context("unable to determine callback address")?;
+        let (server, callback_requests) = CallbackServer::start(listener)?;
+        let server = Arc::new(server);
         let guard = CallbackServerGuard {
             server: Arc::clone(&server),
         };
-        let redirect_uri = resolve_redirect_uri(&server, callback_url)?;
+        let redirect_uri = resolve_redirect_uri(callback_addr, callback_url)?;
         let redirect_uri = if is_enterprise_idp {
-            let listener_port = server
-                .server_addr()
-                .to_ip()
-                .ok_or_else(|| anyhow!("unable to determine enterprise callback listener port"))?
-                .port();
+            let listener_port = callback_addr.port();
             let mut redirect = Url::parse(&redirect_uri)?;
             redirect
                 .set_port(Some(listener_port))
@@ -702,7 +749,11 @@ impl OauthLoginFlow {
         };
         let callback_path = callback_path_from_redirect_uri(&redirect_uri)?;
         let (tx, rx) = oneshot::channel();
-        spawn_callback_server(server, tx, callback_path);
+        let callback_dispatcher = AbortOnDropHandle::new(spawn_callback_dispatcher(
+            callback_requests,
+            tx,
+            callback_path,
+        ));
         let auth_url = append_query_param(
             &oauth_state.get_authorization_url().await?,
             "resource",
@@ -718,6 +769,7 @@ impl OauthLoginFlow {
             authorization_server_issuer,
             rx,
             guard,
+            callback_dispatcher,
             server_name: server_name.to_string(),
             server_url: server_url.to_string(),
             store_mode,
@@ -806,15 +858,37 @@ impl OauthLoginFlow {
         }
         .await;
 
-        drop(self.guard);
+        self.guard.close();
+        let report = self.guard.server.wait().await;
+        let dispatcher = (&mut self.callback_dispatcher).await;
+        let retirement_clean = dispatcher.is_ok()
+            && !report.unavailable
+            && report.acceptor == crate::oauth_callback_server::WorkerOutcome::Joined
+            && report.connections.interrupted == 0
+            && report.connections.failed == 0
+            && report.connections.cancelled == 0
+            && report.connections.panicked == 0;
+        if !retirement_clean && result.is_ok() {
+            // Callback-server retirement is independent evidence. Do not
+            // relabel a login whose credentials were already obtained as a
+            // failed OAuth operation merely because the browser connection
+            // closed or its cleanup report was incomplete.
+            eprintln!("OAuth callback server did not retire cleanly");
+        }
         result
     }
 
-    fn spawn(self) -> oneshot::Receiver<Result<()>> {
+    fn spawn(
+        self,
+        operation_work: Option<Box<dyn Send>>,
+    ) -> (oneshot::Receiver<Result<()>>, JoinHandle<()>) {
         let server_name = self.server_name.clone();
         let (tx, rx) = oneshot::channel();
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
+            // The observer's Drop only requests abort. Keep finite host work
+            // inside the actual flow until completion or task destruction.
+            let _operation_work = operation_work;
             let result = self.finish(/*emit_browser_url*/ false).await;
             if let Err(err) = &result {
                 eprintln!("Failed to complete OAuth login for '{server_name}': {err:#}");
@@ -823,7 +897,7 @@ impl OauthLoginFlow {
             let _ = tx.send(result);
         });
 
-        rx
+        (rx, task)
     }
 }
 
@@ -944,6 +1018,7 @@ mod tests {
     use super::append_query_param;
     use super::callback_id_from_server_url;
     use super::callback_path_from_redirect_uri;
+    use super::local_redirect_uri;
     use super::parse_oauth_callback;
     use super::perform_oauth_login;
     use super::perform_oauth_login_silent;
@@ -951,6 +1026,14 @@ mod tests {
     use super::start_authorization;
     use crate::oauth::stored_oauth_credentials;
     use crate::oauth::test_support::TempCodexHome;
+
+    #[test]
+    fn local_redirect_uri_formats_ipv6_socket_address_once() {
+        let uri = local_redirect_uri("[::1]:49152".parse().unwrap()).unwrap();
+
+        assert_eq!(uri, "http://[::1]:49152/callback");
+        assert_eq!(Url::parse(&uri).unwrap().port(), Some(49152));
+    }
 
     #[derive(Default)]
     struct RecordingHttpClient {
@@ -1486,18 +1569,26 @@ mod tests {
     }
 
     #[test]
+    fn local_redirect_uri_preserves_ipv6_socket_address() {
+        let address = "[::1]:43123".parse().expect("valid loopback address");
+        assert_eq!(
+            super::local_redirect_uri(address).expect("resolve callback URI"),
+            "http://[::1]:43123/callback"
+        );
+    }
+
+    #[test]
     fn portless_loopback_callbacks_use_the_active_listener_port() {
-        let server = tiny_http::Server::http("127.0.0.1:0").expect("start callback listener");
-        let listener_port = server
-            .server_addr()
-            .to_ip()
-            .expect("resolve callback listener address")
-            .port();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("start callback listener");
+        let callback_addr = listener
+            .local_addr()
+            .expect("resolve callback listener address");
+        let listener_port = callback_addr.port();
 
         for path in ["/callback", "/callback/callback-id", "/custom/callback"] {
             let callback = format!("http://127.0.0.1{path}");
             assert_eq!(
-                super::resolve_redirect_uri(&server, Some(&callback))
+                super::resolve_redirect_uri(callback_addr, Some(&callback))
                     .expect("insert active listener port"),
                 format!("http://127.0.0.1:{listener_port}{path}")
             );
@@ -1510,7 +1601,7 @@ mod tests {
             "https://devbox.example.com/callback",
         ] {
             assert_eq!(
-                super::resolve_redirect_uri(&server, Some(callback))
+                super::resolve_redirect_uri(callback_addr, Some(callback))
                     .expect("preserve configured callback origin"),
                 callback
             );

@@ -335,7 +335,7 @@ async fn tool_result_history_keeps_originating_model_across_switch_and_replay() 
                 input_schema: json!({"type": "object", "properties": {}}),
                 defer_loading: false,
             })],
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?;
     test.codex = started.thread;
@@ -582,6 +582,7 @@ async fn tool_result_history_keeps_originating_model_across_switch_and_replay() 
                 codex_core::test_support::auth_manager_from_auth(CodexAuth::from_api_key("dummy")),
                 /*parent_trace*/ None,
                 ClientMcpExtensions::default(),
+                /*control_endpoint*/ None,
             )
             .await?
             .thread;
@@ -589,7 +590,7 @@ async fn tool_result_history_keeps_originating_model_across_switch_and_replay() 
             .thread_manager
             .fork_legacy_thread(
                 ForkSnapshot::Interrupted,
-                StartThreadOptions::new(replay_config),
+                StartThreadOptions::new(replay_config, /*control_endpoint*/ None),
                 rollout_path.clone(),
             )
             .await?
@@ -716,6 +717,7 @@ async fn custom_tool_output_replay_preserves_originating_budget() -> Result<()> 
             codex_core::test_support::auth_manager_from_auth(CodexAuth::from_api_key("dummy")),
             /*parent_trace*/ None,
             ClientMcpExtensions::default(),
+            /*control_endpoint*/ None,
         )
         .await?
         .thread;
@@ -723,7 +725,7 @@ async fn custom_tool_output_replay_preserves_originating_budget() -> Result<()> 
         .thread_manager
         .fork_legacy_thread(
             ForkSnapshot::Interrupted,
-            StartThreadOptions::new(replay_config),
+            StartThreadOptions::new(replay_config, /*control_endpoint*/ None),
             rollout_path,
         )
         .await?

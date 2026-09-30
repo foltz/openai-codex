@@ -84,7 +84,10 @@ impl<'call> ToolExecutor<ToolCall<'call>> for ReadTool {
                 super::SkillToolAuthoritySelector::Cloud,
                 super::SkillToolAuthoritySelector::Executor,
             ] {
-                let catalog = self.context.catalog(&call.turn_id, selector).await;
+                let catalog = self
+                    .context
+                    .catalog(&call.turn_id, selector, call.mcp_access)
+                    .await;
                 let alias_plan = build_alias_plan(
                     &catalog
                         .entries
@@ -187,6 +190,7 @@ impl<'call> ToolExecutor<ToolCall<'call>> for ReadTool {
                         .read_skill(
                             &self.context.providers,
                             SkillReadRequest {
+                                mcp_access: call.mcp_access,
                                 _lifetime: PhantomData,
                                 authority: authority.clone(),
                                 package: package.clone(),

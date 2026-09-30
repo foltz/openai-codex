@@ -615,14 +615,16 @@ async fn regular_turn_emits_turn_started_with_trace_id_without_waiting_for_start
         Some("00000000000000000000000000000011")
     );
     let (_tx, startup_prewarm_rx) = tokio::sync::oneshot::channel::<()>();
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     let handle = tokio::spawn(async move {
         let _ = startup_prewarm_rx.await;
-        Ok(test_model_client_session())
+        let _ = result_tx.send(Ok(test_model_client_session()));
     });
 
     sess.set_session_startup_prewarm(
         crate::session::startup_prewarm::SessionStartupPrewarmHandle::new(
-            handle,
+            sess.task_joins.register(handle),
+            result_rx,
             std::time::Instant::now(),
             crate::client::WEBSOCKET_CONNECT_TIMEOUT,
         ),
@@ -771,14 +773,16 @@ async fn request_mcp_server_elicitation_waits_for_user_response(source: SessionS
 async fn interrupting_regular_turn_waiting_on_startup_prewarm_emits_turn_aborted() {
     let (sess, tc, rx) = make_session_and_context_with_rx().await;
     let (_tx, startup_prewarm_rx) = tokio::sync::oneshot::channel::<()>();
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     let handle = tokio::spawn(async move {
         let _ = startup_prewarm_rx.await;
-        Ok(test_model_client_session())
+        let _ = result_tx.send(Ok(test_model_client_session()));
     });
 
     sess.set_session_startup_prewarm(
         crate::session::startup_prewarm::SessionStartupPrewarmHandle::new(
-            handle,
+            sess.task_joins.register(handle),
+            result_rx,
             std::time::Instant::now(),
             crate::client::WEBSOCKET_CONNECT_TIMEOUT,
         ),
@@ -828,6 +832,106 @@ async fn interrupting_regular_turn_waiting_on_startup_prewarm_emits_turn_aborted
     assert!(started_at.is_some());
     assert!(completed_at.is_some());
     assert!(duration_ms.is_some());
+}
+
+#[tokio::test]
+async fn startup_prewarm_ready_result_is_consumed_once_with_join_retained() {
+    let (session, _) = make_session_and_context().await;
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _ = result_tx.send(Ok(test_model_client_session()));
+        // A ready value is deliberately not the end of this task. The
+        // current-thread executor cannot process its abort until we yield.
+        std::future::pending::<()>().await;
+    });
+    let task_exit = task.abort_handle();
+    session
+        .set_session_startup_prewarm(
+            crate::session::startup_prewarm::SessionStartupPrewarmHandle::new(
+                session.task_joins.register(task),
+                result_rx,
+                std::time::Instant::now(),
+                Duration::from_secs(3),
+            ),
+        )
+        .await;
+    let cancel = CancellationToken::new();
+    assert!(matches!(
+        session
+            .consume_startup_prewarm_for_regular_turn(&cancel)
+            .await,
+        crate::session::startup_prewarm::SessionStartupPrewarmResolution::Ready(_)
+    ));
+    assert!(
+        !task_exit.is_finished(),
+        "result consumption is not task exit"
+    );
+    assert_eq!(
+        session
+            .task_joins
+            .shutdown_until(tokio::time::Instant::now())
+            .await,
+        crate::tasks::TaskJoinOutcome::TimedOut,
+        "an unobserved join cannot become success from a consumed result"
+    );
+    assert!(matches!(
+        session
+            .consume_startup_prewarm_for_regular_turn(&cancel)
+            .await,
+        crate::session::startup_prewarm::SessionStartupPrewarmResolution::Unavailable {
+            status: "not_scheduled",
+            ..
+        }
+    ));
+    session.close_task_admission().await;
+    assert_eq!(
+        session
+            .task_joins
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(3))
+            .await,
+        crate::tasks::TaskJoinOutcome::Complete { panicked: false }
+    );
+    assert!(task_exit.is_finished());
+}
+
+#[tokio::test]
+async fn startup_prewarm_uses_host_admission_with_an_empty_extension_registry() {
+    #[derive(Debug)]
+    struct Refused(std::sync::atomic::AtomicUsize);
+    impl codex_extension_api::TurnStartAdmission for Refused {
+        fn admit_turn_start(&self) -> Option<Box<dyn Send>> {
+            panic!("prewarm must not use turn admission");
+        }
+
+        fn admit_operation_work(
+            &self,
+        ) -> Result<
+            Option<Box<dyn codex_extension_api::HostOperationWork>>,
+            codex_extension_api::TurnWorkRefused,
+        > {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err(codex_extension_api::TurnWorkRefused::Unavailable)
+        }
+    }
+
+    let (mut session, _) = make_session_and_context().await;
+    let host = Arc::new(Refused(std::sync::atomic::AtomicUsize::new(0)));
+    session.services.extensions = codex_extension_api::empty_extension_registry();
+    session.services.host_admission = Some(host.clone());
+    let session = Arc::new(session);
+    session
+        .schedule_startup_prewarm(crate::session::startup_prewarm::PrewarmInput::Base)
+        .await;
+    assert_eq!(host.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+    // No prewarm task was spawned: the current-thread runtime has not yielded
+    // to a worker, and joining an empty registry requires no time budget.
+    assert_eq!(
+        session
+            .task_joins
+            .shutdown_until(tokio::time::Instant::now())
+            .await,
+        crate::tasks::TaskJoinOutcome::Complete { panicked: false }
+    );
 }
 
 fn test_model_client_session() -> crate::client::ModelClientSession {
@@ -996,6 +1100,7 @@ async fn preview_session_start_hooks(
             target: codex_hooks::StartHookTarget::SessionStart {
                 source: codex_hooks::SessionStartSource::Startup,
             },
+            clear_context: None,
         }),
     )
 }
@@ -1782,6 +1887,41 @@ async fn reload_user_config_layer_updates_effective_apps_config() {
 }
 
 #[tokio::test]
+async fn reload_user_config_layer_notifies_runtime_config_change_listener() {
+    #[derive(Default)]
+    struct Listener {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::RuntimeConfigChangeListener for Listener {
+        fn before_runtime_config_change(&self) {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    let listener = Arc::new(Listener::default());
+    let (session, _turn_context) =
+        make_session_with_config_and_listener_and_rx(|_| {}, Some(listener.clone()))
+            .await
+            .expect("session should initialize");
+    let codex_home = session.codex_home().await;
+    std::fs::create_dir_all(&codex_home).expect("create codex home");
+    std::fs::write(
+        codex_home.join(CONFIG_TOML_FILE),
+        "[mcp_servers.changed]\ncommand = \"changed\"\n",
+    )
+    .expect("write user config");
+
+    session.reload_user_config_layer().await;
+
+    assert_eq!(
+        listener.calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the legacy core reload path must invalidate host-owned provenance before it changes runtime config"
+    );
+}
+
+#[tokio::test]
 async fn reload_user_config_layer_keeps_previous_config_for_malformed_shell_policy() {
     let (session, _turn_context) = make_session_and_context().await;
     let codex_home = session.codex_home().await;
@@ -1916,6 +2056,7 @@ async fn reload_user_config_layer_refreshes_hooks() -> anyhow::Result<()> {
         target: codex_hooks::StartHookTarget::SessionStart {
             source: codex_hooks::SessionStartSource::Startup,
         },
+        clear_context: None,
     };
     assert!(session.hooks().preview_session_start(&request).is_empty());
 
@@ -2025,6 +2166,7 @@ async fn refresh_runtime_config_refreshes_hooks() -> anyhow::Result<()> {
         target: codex_hooks::StartHookTarget::SessionStart {
             source: codex_hooks::SessionStartSource::Startup,
         },
+        clear_context: None,
     };
     assert!(session.hooks().preview_session_start(&request).is_empty());
 
@@ -4048,7 +4190,10 @@ async fn fork_startup_context_then_first_turn_diff_snapshot() -> anyhow::Result<
         .thread_manager
         .fork_legacy_thread(
             usize::MAX,
-            core_test_support::test_codex::StartThreadOptions::new(fork_config.clone()),
+            core_test_support::test_codex::StartThreadOptions::new(
+                fork_config.clone(),
+                /*control_endpoint*/ None,
+            ),
             rollout_path,
         )
         .await?;
@@ -4248,6 +4393,7 @@ async fn set_rate_limits_retains_previous_credits() {
         originator: "test_originator".to_string(),
         dynamic_tools: Vec::new(),
         user_shell_override: None,
+        control_endpoint: None,
     };
 
     let mut state = SessionState::new(session_configuration);
@@ -4370,6 +4516,7 @@ async fn set_rate_limits_updates_plan_type_when_present() {
         originator: "test_originator".to_string(),
         dynamic_tools: Vec::new(),
         user_shell_override: None,
+        control_endpoint: None,
     };
 
     let mut state = SessionState::new(session_configuration);
@@ -4649,7 +4796,7 @@ fn success_flag_true_with_no_error_and_content_used() {
     assert_eq!(expected, got);
 }
 
-async fn open_thread_persistence(session: &mut Session) -> PathBuf {
+pub(super) async fn open_thread_persistence(session: &mut Session) -> PathBuf {
     let config = session.get_config().await;
     let live_thread = LiveThread::create(
         Arc::clone(&session.services.thread_store),
@@ -4661,6 +4808,7 @@ async fn open_thread_persistence(session: &mut Session) -> PathBuf {
             extra_config: None,
             forked_from_id: None,
             parent_thread_id: None,
+            clear_lineage: None,
             source: SessionSource::Exec,
             thread_source: None,
             originator: "test_originator".to_string(),
@@ -4991,6 +5139,7 @@ pub(crate) async fn make_session_configuration_for_tests() -> SessionConfigurati
         originator: "test_originator".to_string(),
         dynamic_tools: Vec::new(),
         user_shell_override: None,
+        control_endpoint: None,
     }
 }
 
@@ -5895,6 +6044,7 @@ async fn standalone_settings_invalidate_continuation_before_delivering_acceptanc
         Arc::clone(&session),
         turn_context.config,
         rx_sub,
+        None,
     )));
     assert!(futures::poll!(submissions.as_mut()).is_pending());
     assert_eq!(session.state.lock().await.last_started_turn_id, None);
@@ -6334,6 +6484,7 @@ async fn session_new_fails_when_zsh_fork_enabled_without_packaged_zsh() {
         originator: "test_originator".to_string(),
         dynamic_tools: Vec::new(),
         user_shell_override: None,
+        control_endpoint: None,
     };
 
     let (tx_event, _rx_event) = async_channel::unbounded();
@@ -6370,6 +6521,8 @@ async fn session_new_fails_when_zsh_fork_enabled_without_packaged_zsh() {
         mcp_manager,
         Arc::new(codex_code_mode::DisabledCodeModeSessionProvider),
         Arc::new(codex_extension_api::ExtensionRegistryBuilder::new().build()),
+        /*host_admission*/ None,
+        /*initial_mcp_work*/ None,
         codex_extension_api::ExtensionDataInit::default(),
         ClientMcpExtensions::default(),
         LocalAgentControl::default().into(),
@@ -6388,6 +6541,10 @@ async fn session_new_fails_when_zsh_fork_enabled_without_packaged_zsh() {
         Some(config.multi_agent_version_from_features()),
         GitEnrichmentPolicy::Fresh,
         codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
+        /*deferred_clear_session_start*/ None,
+        /*runtime_config_change_listener*/ None,
+        /*runtime_config_change_gate*/ None,
+        /*startup_custody*/ None,
     )
     .await;
 
@@ -6560,6 +6717,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         originator: "test_originator".to_string(),
         dynamic_tools: Vec::new(),
         user_shell_override: None,
+        control_endpoint: None,
     };
     let session_telemetry = session_telemetry(
         thread_id,
@@ -6652,6 +6810,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         plugins_manager,
         mcp_manager,
         extensions: Arc::new(codex_extension_api::ExtensionRegistryBuilder::new().build()),
+        host_admission: None,
         session_extension_data: codex_extension_api::ExtensionData::new(
             agent_control.session_id().to_string(),
         ),
@@ -6705,6 +6864,8 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         ),
         tool_search_handler_cache: Default::default(),
         turn_environments: Arc::clone(&turn_environments),
+        runtime_config_change_listener: None,
+        runtime_config_change_gate: None,
     };
 
     let session = Session {
@@ -6733,6 +6894,10 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         conversation: Arc::new(RealtimeConversationManager::new()),
         realtime_history: None,
         active_turn: Mutex::new(None),
+        task_admission_closed: std::sync::atomic::AtomicBool::new(false),
+        task_joins: Default::default(),
+        cleanup_owner: Default::default(),
+        failed_initialization_persistence: std::sync::atomic::AtomicBool::new(false),
         async_hook_results,
         input_queue: super::input_queue::InputQueue::new(),
         services,
@@ -6817,6 +6982,16 @@ async fn load_latest_config_for_session(session: &Session) -> Config {
 async fn make_session_with_config_and_rx(
     mutator: impl FnOnce(&mut Config),
 ) -> anyhow::Result<(Arc<Session>, async_channel::Receiver<Event>)> {
+    make_session_with_config_and_listener_and_rx(mutator, None).await
+}
+
+async fn make_session_with_config_and_listener_and_rx(
+    mutator: impl FnOnce(&mut Config),
+    runtime_config_change_listener: Option<Arc<dyn crate::RuntimeConfigChangeListener>>,
+) -> anyhow::Result<(Arc<Session>, async_channel::Receiver<Event>)> {
+    let runtime_config_change_gate = runtime_config_change_listener
+        .as_ref()
+        .map(|_| crate::RuntimeConfigChangeGate::default());
     let codex_home = tempfile::tempdir().expect("create temp dir");
     let mut config = build_test_config(codex_home.path()).await;
     mutator(&mut config);
@@ -6883,6 +7058,7 @@ async fn make_session_with_config_and_rx(
         originator: "test_originator".to_string(),
         dynamic_tools: Vec::new(),
         user_shell_override: None,
+        control_endpoint: None,
     };
 
     let (tx_event, rx_event) = async_channel::unbounded();
@@ -6920,6 +7096,8 @@ async fn make_session_with_config_and_rx(
         mcp_manager,
         Arc::new(codex_code_mode::DisabledCodeModeSessionProvider),
         Arc::new(codex_extension_api::ExtensionRegistryBuilder::new().build()),
+        /*host_admission*/ None,
+        /*initial_mcp_work*/ None,
         codex_extension_api::ExtensionDataInit::default(),
         ClientMcpExtensions::default(),
         LocalAgentControl::default().into(),
@@ -6938,6 +7116,10 @@ async fn make_session_with_config_and_rx(
         Some(config.multi_agent_version_from_features()),
         GitEnrichmentPolicy::Fresh,
         codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
+        /*deferred_clear_session_start*/ None,
+        runtime_config_change_listener,
+        runtime_config_change_gate,
+        /*startup_custody*/ None,
     )
     .await?;
 
@@ -6948,10 +7130,12 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
     initial_history: InitialHistory,
     session_source: SessionSource,
     agent_control: LocalAgentControl,
+    in_memory_store_id: Option<String>,
+    startup_custody: Option<&super::startup_custody::SessionStartupCustody>,
 ) -> anyhow::Result<(Arc<Session>, async_channel::Receiver<Event>)> {
     let codex_home = tempfile::tempdir().expect("create temp dir");
     let mut config = build_test_config(codex_home.path()).await;
-    config.ephemeral = true;
+    config.ephemeral = in_memory_store_id.is_none();
     let config = Arc::new(config);
     let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
     let models_manager = models_manager_with_provider(
@@ -7015,6 +7199,7 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         originator: "test_originator".to_string(),
         dynamic_tools: Vec::new(),
         user_shell_override: None,
+        control_endpoint: None,
     };
 
     let (tx_event, rx_event) = async_channel::unbounded();
@@ -7029,6 +7214,20 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         /*bundled_skills_enabled*/ true,
     ));
     let environment_manager = Arc::new(EnvironmentManager::default_for_tests());
+    let thread_store: Arc<dyn codex_thread_store::ThreadStore> = match in_memory_store_id {
+        Some(id) => codex_thread_store::InMemoryThreadStore::for_id(id),
+        None => Arc::new(codex_thread_store::LocalThreadStore::new(
+            codex_thread_store::LocalThreadStoreConfig::from_config(config.as_ref()),
+            Some(
+                codex_state::StateRuntime::init(
+                    config.sqlite.clone(),
+                    config.model_provider_id.clone(),
+                )
+                .await
+                .expect("state db should initialize"),
+            ),
+        )),
+    };
 
     let session = Session::new(
         /*startup*/ None,
@@ -7052,6 +7251,8 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         mcp_manager,
         Arc::new(codex_code_mode::DisabledCodeModeSessionProvider),
         Arc::new(codex_extension_api::ExtensionRegistryBuilder::new().build()),
+        /*host_admission*/ None,
+        /*initial_mcp_work*/ None,
         codex_extension_api::ExtensionDataInit::default(),
         ClientMcpExtensions::default(),
         agent_control.into(),
@@ -7060,23 +7261,17 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         /*inherited_environments*/ None,
         /*analytics_events_client*/ None,
         crate::passthrough_image_store(),
-        Arc::new(codex_thread_store::LocalThreadStore::new(
-            codex_thread_store::LocalThreadStoreConfig::from_config(config.as_ref()),
-            Some(
-                codex_state::StateRuntime::init(
-                    config.sqlite.clone(),
-                    config.model_provider_id.clone(),
-                )
-                .await
-                .expect("state db should initialize"),
-            ),
-        )),
+        thread_store,
         codex_rollout_trace::ThreadTraceContext::disabled(),
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,
         Some(config.multi_agent_version_from_features()),
         GitEnrichmentPolicy::Fresh,
         codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
+        /*deferred_clear_session_start*/ None,
+        /*runtime_config_change_listener*/ None,
+        /*runtime_config_change_gate*/ None,
+        startup_custody,
     )
     .await?;
 
@@ -7094,6 +7289,8 @@ async fn resumed_root_session_uses_thread_id_as_session_id() {
         }),
         SessionSource::Exec,
         LocalAgentControl::default(),
+        /*in_memory_store_id*/ None,
+        /*startup_custody*/ None,
     )
     .await
     .expect("resume should succeed");
@@ -7137,6 +7334,8 @@ async fn resumed_subagent_session_restores_persisted_session_id() {
         }),
         session_source,
         LocalAgentControl::default(),
+        /*in_memory_store_id*/ None,
+        /*startup_custody*/ None,
     )
     .await
     .expect("resume should succeed");
@@ -7150,6 +7349,33 @@ async fn resumed_subagent_session_restores_persisted_session_id() {
     };
     assert_eq!(event.session_id, parent_session_id);
     assert_eq!(event.thread_id, thread_id);
+}
+
+#[tokio::test]
+async fn custody_bearing_resumed_session_supplies_history_without_loading_store_history() {
+    let thread_id = ThreadId::new();
+    let store_id = format!("session-resume-history-{}", Uuid::new_v4());
+    let store = codex_thread_store::InMemoryThreadStore::for_id(store_id.clone());
+    let custody = super::startup_custody::SessionStartupCustody::default();
+    let (session, _rx_event) = make_session_with_history_source_and_agent_control_and_rx(
+        InitialHistory::Resumed(ResumedHistory {
+            conversation_id: thread_id,
+            history: Arc::new(Vec::new()),
+            rollout_path: None,
+        }),
+        SessionSource::Exec,
+        LocalAgentControl::default(),
+        /*in_memory_store_id*/ Some(store_id.clone()),
+        /*startup_custody*/ Some(&custody),
+    )
+    .await
+    .expect("resume should succeed");
+    assert_eq!(session.thread_id(), thread_id);
+    let calls = store.calls().await;
+    assert_eq!((calls.resume_thread, calls.load_history), (1, 0));
+    drop(session);
+    drop(custody);
+    codex_thread_store::InMemoryThreadStore::remove_id(&store_id);
 }
 
 #[tokio::test]
@@ -7190,6 +7416,8 @@ async fn resumed_copied_fork_ignores_source_history_base() {
         }),
         SessionSource::Exec,
         LocalAgentControl::default(),
+        /*in_memory_store_id*/ None,
+        /*startup_custody*/ None,
     )
     .await
     .expect("resume should succeed");
@@ -7842,7 +8070,7 @@ async fn submit_with_trace_captures_current_span_trace_context() {
     let (tx_sub, rx_sub) = async_channel::bounded(1);
     let (_tx_event, rx_event) = async_channel::unbounded();
     let io = SessionIo {
-        tx_sub,
+        tx_sub: tx_sub.into(),
         rx_event,
         agent_status: watch::channel(AgentStatus::PendingInit).1,
         session_loop_termination: completed_session_loop_termination(),
@@ -8398,6 +8626,7 @@ async fn shutdown_complete_does_not_append_to_thread_store_after_shutdown() {
             extra_config: None,
             forked_from_id: None,
             parent_thread_id: None,
+            clear_lineage: None,
             source: SessionSource::Exec,
             thread_source: None,
             originator: "test_originator".to_string(),
@@ -8518,6 +8747,7 @@ async fn submission_loop_channel_close_runs_full_thread_teardown() {
             extra_config: None,
             forked_from_id: None,
             parent_thread_id: None,
+            clear_lineage: None,
             source: SessionSource::Exec,
             thread_source: None,
             originator: "test_originator".to_string(),
@@ -8564,7 +8794,7 @@ async fn submission_loop_channel_close_runs_full_thread_teardown() {
     let (tx_sub, rx_sub) = async_channel::bounded(1);
     drop(tx_sub);
     let session = Arc::new(session);
-    submission_loop(session, Arc::clone(&turn_context.config), rx_sub).await;
+    submission_loop(session, Arc::clone(&turn_context.config), rx_sub, None).await;
 
     assert_eq!(1, calls.load(std::sync::atomic::Ordering::SeqCst));
     assert_eq!(
@@ -8649,7 +8879,13 @@ async fn submission_loop_channel_close_aborts_active_turn_before_thread_stop_lif
 
     let (tx_sub, rx_sub) = async_channel::bounded(1);
     drop(tx_sub);
-    submission_loop(Arc::clone(&session), session.get_config().await, rx_sub).await;
+    submission_loop(
+        Arc::clone(&session),
+        session.get_config().await,
+        rx_sub,
+        None,
+    )
+    .await;
 
     assert_eq!(
         vec!["turn_abort", "thread_stop"],
@@ -8657,6 +8893,195 @@ async fn submission_loop_channel_close_aborts_active_turn_before_thread_stop_lif
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     );
+}
+
+#[tokio::test]
+async fn closing_task_admission_during_preparation_prevents_final_install() {
+    struct PausedTurnStart {
+        entered: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
+    }
+    impl codex_extension_api::TurnLifecycleContributor for PausedTurnStart {
+        fn on_turn_start<'a>(
+            &'a self,
+            _input: codex_extension_api::TurnStartInput<'a>,
+        ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+            Box::pin(async move {
+                self.entered.add_permits(1);
+                self.release
+                    .acquire()
+                    .await
+                    .expect("release preparation")
+                    .forget();
+            })
+        }
+    }
+    let (mut session, context) = make_session_and_context().await;
+    session.state.lock().await.last_started_turn_id = Some("previous".into());
+    let pause = Arc::new(PausedTurnStart {
+        entered: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::<crate::config::Config>::new();
+    builder.turn_lifecycle_contributor(pause.clone());
+    session.services.extensions = Arc::new(builder.build());
+    let session = Arc::new(session);
+    let starting = Arc::clone(&session);
+    let start = tokio::spawn(async move {
+        starting
+            .spawn_task(
+                Arc::new(context),
+                Vec::new(),
+                NeverEndingTask {
+                    kind: TaskKind::Regular,
+                    listen_to_cancellation_token: false,
+                },
+            )
+            .await;
+    });
+    pause
+        .entered
+        .acquire()
+        .await
+        .expect("preparation entered")
+        .forget();
+    {
+        let active = session.active_turn.lock().await;
+        assert!(
+            active.as_ref().is_some_and(|turn| turn.task.is_none()),
+            "must pass early gate and reserve before closing admission"
+        );
+    }
+    session.close_task_admission().await;
+    assert!(session.active_turn.lock().await.is_none());
+    pause.release.add_permits(1);
+    start.await.expect("start returned");
+    assert_eq!(
+        session.state.lock().await.last_started_turn_id.as_deref(),
+        Some("previous")
+    );
+    assert!(
+        session.active_turn.lock().await.is_none(),
+        "late final install must refuse without residue"
+    );
+}
+
+#[tokio::test]
+async fn closed_task_admission_prevents_direct_and_mailbox_task_creation() {
+    let (session, context, _events) = make_session_and_context_with_rx().await;
+    *session.active_turn.lock().await = Some(ActiveTurn::default());
+    session.close_task_admission().await;
+    assert!(session.active_turn.lock().await.is_none());
+    session
+        .spawn_task(Arc::clone(&context), Vec::new(), CompletingTask)
+        .await;
+    assert!(session.active_turn.lock().await.is_none());
+    session
+        .input_queue
+        .enqueue_mailbox_communication(
+            InterAgentCommunication::new(
+                AgentPath::root(),
+                AgentPath::root(),
+                Vec::new(),
+                "pending shutdown mail".to_string(),
+                /*trigger_turn*/ true,
+            ),
+            codex_protocol::turn_input::TurnStartOptions::default(),
+        )
+        .await;
+    session.maybe_start_turn_for_pending_work().await;
+    assert!(session.active_turn.lock().await.is_none());
+    assert!(session.input_queue.has_pending_mailbox_items().await);
+}
+
+#[tokio::test]
+async fn mcp_prewarm_shutdown_retains_join_after_observer_cancellation() {
+    let (session, _context) = make_session_and_context().await;
+    let (release, released) = tokio::sync::oneshot::channel();
+    let worker = tokio::spawn(async move {
+        released.await.expect("release worker");
+    });
+    *session.mcp_prewarm_task.lock().expect("worker owner") =
+        Some(session_loop_termination_from_handle(worker));
+    {
+        let observer = session.stop_mcp_prewarm_worker();
+        tokio::pin!(observer);
+        assert!(futures::poll!(observer.as_mut()).is_pending());
+        assert!(session.mcp_prewarm_shutdown.is_cancelled());
+    }
+    let observer = session.stop_mcp_prewarm_worker();
+    tokio::pin!(observer);
+    assert!(futures::poll!(observer.as_mut()).is_pending());
+    release.send(()).expect("worker still owned");
+    assert_eq!(observer.await, SessionLoopOutcome::Normal);
+    assert_eq!(
+        session.stop_mcp_prewarm_worker().await,
+        SessionLoopOutcome::Normal
+    );
+}
+
+#[tokio::test]
+async fn session_loop_abort_and_multiple_observers_refer_to_the_same_task() {
+    let completion =
+        session_loop_termination_from_handle(tokio::spawn(std::future::pending::<()>()));
+    {
+        let observer = completion.clone();
+        tokio::pin!(observer);
+        assert!(futures::poll!(observer.as_mut()).is_pending());
+    }
+    completion.request_abort();
+    let (first, second) = tokio::join!(completion.clone(), completion.clone());
+    assert_eq!(
+        (first, second),
+        (SessionLoopOutcome::Cancelled, SessionLoopOutcome::Cancelled)
+    );
+    completion.request_abort();
+    assert_eq!(completion.await, SessionLoopOutcome::Cancelled);
+}
+
+#[tokio::test]
+async fn session_loop_outcome_retains_normal_cancelled_and_panicked_results() {
+    let normal = session_loop_termination_from_handle(tokio::spawn(async {}));
+    assert_eq!(normal.clone().await, SessionLoopOutcome::Normal);
+    assert_eq!(normal.await, SessionLoopOutcome::Normal);
+
+    let cancelled = tokio::spawn(std::future::pending::<()>());
+    cancelled.abort();
+    let cancelled = session_loop_termination_from_handle(cancelled);
+    assert_eq!(cancelled.clone().await, SessionLoopOutcome::Cancelled);
+    assert_eq!(cancelled.await, SessionLoopOutcome::Cancelled);
+
+    let panicked = session_loop_termination_from_handle(tokio::spawn(async {
+        panic!("session loop failure fixture");
+    }));
+    assert_eq!(panicked.clone().await, SessionLoopOutcome::Panicked);
+    assert_eq!(panicked.await, SessionLoopOutcome::Panicked);
+}
+
+#[tokio::test]
+async fn shutdown_and_wait_refuses_cancelled_or_panicked_loop() {
+    let cancelled = tokio::spawn(std::future::pending::<()>());
+    cancelled.abort();
+    let panicked = tokio::spawn(async { panic!("session loop failure fixture") });
+    for handle in [cancelled, panicked] {
+        let (tx_sub, rx_sub) = async_channel::bounded(1);
+        drop(rx_sub);
+        let (_tx_event, rx_event) = async_channel::unbounded();
+        let io = SessionIo {
+            tx_sub: tx_sub.into(),
+            rx_event,
+            agent_status: watch::channel(AgentStatus::PendingInit).1,
+            session_loop_termination: session_loop_termination_from_handle(handle),
+        };
+        let error = io
+            .shutdown_and_wait()
+            .await
+            .expect_err("failed loop must refuse");
+        assert!(matches!(
+            error.details(),
+            CodexErrorDetails::InternalAgentDied
+        ));
+    }
 }
 
 #[tokio::test]
@@ -8670,7 +9095,7 @@ async fn shutdown_and_wait_allows_multiple_waiters() {
         tokio::time::sleep(StdDuration::from_millis(50)).await;
     });
     let io = Arc::new(SessionIo {
-        tx_sub,
+        tx_sub: tx_sub.into(),
         rx_event,
         agent_status: watch::channel(AgentStatus::PendingInit).1,
         session_loop_termination: session_loop_termination_from_handle(session_loop_handle),
@@ -8706,7 +9131,7 @@ async fn shutdown_and_wait_waits_when_shutdown_is_already_in_progress() {
         let _ = shutdown_complete_rx.await;
     });
     let io = Arc::new(SessionIo {
-        tx_sub,
+        tx_sub: tx_sub.into(),
         rx_event,
         agent_status: watch::channel(AgentStatus::PendingInit).1,
         session_loop_termination: session_loop_termination_from_handle(session_loop_handle),
@@ -8837,6 +9262,7 @@ where
         originator: "test_originator".to_string(),
         dynamic_tools,
         user_shell_override: None,
+        control_endpoint: None,
     };
     let session_telemetry = session_telemetry(
         thread_id,
@@ -8928,6 +9354,7 @@ where
         plugins_manager,
         mcp_manager,
         extensions: Arc::new(codex_extension_api::ExtensionRegistryBuilder::new().build()),
+        host_admission: None,
         session_extension_data: codex_extension_api::ExtensionData::new(
             agent_control.session_id().to_string(),
         ),
@@ -8981,6 +9408,8 @@ where
         ),
         tool_search_handler_cache: Default::default(),
         turn_environments: Arc::clone(&turn_environments),
+        runtime_config_change_listener: None,
+        runtime_config_change_gate: None,
     };
 
     let session = Arc::new(Session {
@@ -9009,6 +9438,10 @@ where
         conversation: Arc::new(RealtimeConversationManager::new()),
         realtime_history: None,
         active_turn: Mutex::new(None),
+        task_admission_closed: std::sync::atomic::AtomicBool::new(false),
+        task_joins: Default::default(),
+        cleanup_owner: Default::default(),
+        failed_initialization_persistence: std::sync::atomic::AtomicBool::new(false),
         async_hook_results,
         input_queue: super::input_queue::InputQueue::new(),
         services,
@@ -9243,8 +9676,10 @@ async fn refresh_mcp_servers_uses_latest_state_for_existing_turns() {
             /*selected_capability_roots*/ &[],
             /*required_servers*/ &[],
             /*required_plugins*/ &HashSet::new(),
+            codex_mcp::McpAttemptAccess::Unscoped,
         )
-        .await;
+        .await
+        .expect("resolve the latest MCP state");
 
     let configured_servers = codex_mcp::configured_mcp_servers(new_step.mcp.config());
     assert_eq!(
@@ -9635,8 +10070,15 @@ async fn mcp_policy_changes_schedule_runtime_refresh() {
 
 #[tokio::test]
 async fn mcp_refresh_detects_shared_auth_manager_changes() {
-    let (session, _turn_context) = make_session_and_context().await;
-    let session = Arc::new(session);
+    let codex_home = tempfile::tempdir().expect("create temp dir");
+    let (session, _turn_context, _rx_event) =
+        make_session_and_context_with_auth_config_home_and_rx(
+            CodexAuth::from_api_key("Test API Key"),
+            Vec::new(),
+            codex_home.path(),
+            |_| {},
+        )
+        .await;
 
     assert_eq!(
         session.services.plugins_manager.auth_mode(),
@@ -9851,6 +10293,8 @@ async fn step_context_keeps_its_mcp_runtime_for_tools() -> anyhow::Result<()> {
             startup_readiness: Default::default(),
             supports_parallel_tool_calls: false,
             tool_input_schema_max_bytes: None,
+            thread_identity_eligible: false,
+            control_endpoint_eligible: false,
             omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,
@@ -11316,6 +11760,7 @@ async fn attach_in_memory_thread_store(
             extra_config: None,
             forked_from_id: None,
             parent_thread_id: None,
+            clear_lineage: None,
             source: SessionSource::Exec,
             thread_source: None,
             originator: "test_originator".to_string(),
@@ -11417,6 +11862,48 @@ async fn recv_terminal_event(
     })
     .await
     .expect("terminal event should be delivered")
+}
+
+#[tokio::test]
+async fn deadline_bound_cleanup_joins_an_installed_session_task() {
+    let (session, turn_context) = make_session_and_context().await;
+    let session = Arc::new(session);
+    session
+        .spawn_task(
+            Arc::new(turn_context),
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: false,
+            },
+        )
+        .await;
+    assert!(
+        session
+            .active_turn
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|turn| turn.task.is_some())
+    );
+    let owner = session.cleanup_owner();
+    owner
+        .bind_deadline(tokio::time::Instant::now() + Duration::from_secs(3))
+        .expect("bind");
+    assert_eq!(
+        owner.observe(Arc::clone(&session)).await,
+        super::retirement::CleanupExecution::Finished {
+            persistence_failed: false
+        }
+    );
+    assert!(session.active_turn.lock().await.is_none());
+    assert_eq!(
+        session
+            .task_joins
+            .shutdown_until(tokio::time::Instant::now())
+            .await,
+        crate::tasks::TaskJoinOutcome::Complete { panicked: false }
+    );
 }
 
 #[derive(Clone, Copy)]
@@ -12391,7 +12878,7 @@ async fn queue_only_mailbox_mail_waits_for_next_turn_after_answer_boundary() {
     );
     assert_eq!(
         sess.input_queue
-            .get_pending_input(&sess.active_turn)
+            .get_pending_input(&sess.active_turn, "test-turn")
             .await
             .0,
         Vec::new()
@@ -12400,7 +12887,11 @@ async fn queue_only_mailbox_mail_waits_for_next_turn_after_answer_boundary() {
     sess.abort_all_tasks(TurnAbortReason::Replaced).await;
 
     assert_eq!(
-        (sess.input_queue.get_pending_input(&sess.active_turn).await).0,
+        (sess
+            .input_queue
+            .get_pending_input(&sess.active_turn, "test-turn")
+            .await)
+            .0,
         vec![TurnInput::InterAgentCommunication(communication)],
     );
 }
@@ -12499,7 +12990,11 @@ async fn active_turn_keeps_first_root_when_mail_coalesces(inherited_root: Option
     }
 
     assert_eq!(
-        (sess.input_queue.get_pending_input(&sess.active_turn).await).0,
+        (sess
+            .input_queue
+            .get_pending_input(&sess.active_turn, "test-turn")
+            .await)
+            .0,
         vec![
             TurnInput::InterAgentCommunication(first),
             TurnInput::InterAgentCommunication(second),
@@ -12552,7 +13047,11 @@ async fn steered_input_reopens_mailbox_delivery_for_current_turn() {
     assert!(matches!(submission, TurnInputSubmission::Steered { .. }));
 
     assert_eq!(
-        (sess.input_queue.get_pending_input(&sess.active_turn).await).0,
+        (sess
+            .input_queue
+            .get_pending_input(&sess.active_turn, "test-turn")
+            .await)
+            .0,
         vec![
             TurnInput::UserInput {
                 metadata: crate::session::UserInputMetadata {
@@ -12612,7 +13111,11 @@ async fn stale_defer_mailbox_delivery_does_not_override_steered_input() {
         .await;
 
     assert_eq!(
-        (sess.input_queue.get_pending_input(&sess.active_turn).await).0,
+        (sess
+            .input_queue
+            .get_pending_input(&sess.active_turn, "test-turn")
+            .await)
+            .0,
         vec![
             TurnInput::UserInput {
                 metadata: crate::session::UserInputMetadata {
@@ -12681,7 +13184,11 @@ async fn tool_calls_reopen_mailbox_delivery_for_current_turn() {
     assert!(output.needs_follow_up);
     assert!(output.tool_future.is_some());
     assert_eq!(
-        (sess.input_queue.get_pending_input(&sess.active_turn).await).0,
+        (sess
+            .input_queue
+            .get_pending_input(&sess.active_turn, "test-turn")
+            .await)
+            .0,
         vec![TurnInput::InterAgentCommunication(communication)],
     );
 }
@@ -13072,4 +13579,41 @@ async fn session_start_hooks_require_project_trust_without_config_toml() -> std:
     }
 
     Ok(())
+}
+/// Exercises the identity selection used by session construction, preserving
+/// upstream's reservation rejection for resumed histories.
+#[test]
+fn select_thread_id_matches_the_contract_for_every_lifecycle_transition() {
+    let agent_control = crate::agent::control::AgentControlInit::from(LocalAgentControl::default());
+    let mut minted = std::collections::HashSet::new();
+    for history in [
+        InitialHistory::New,
+        InitialHistory::New,
+        InitialHistory::Cleared,
+        InitialHistory::Forked(Vec::new()),
+    ] {
+        let id =
+            Session::select_thread_id(&history, /*reserved_thread_id*/ None, &agent_control)
+                .expect("new lifecycle must select an identity");
+        assert!(
+            minted.insert(id),
+            "fresh, child, clear and fork must select distinct IDs"
+        );
+        let reserved = ThreadId::new();
+        assert_eq!(
+            Session::select_thread_id(&history, Some(reserved), &agent_control).unwrap(),
+            reserved,
+        );
+    }
+    let stored = ThreadId::new();
+    let history = InitialHistory::Resumed(ResumedHistory {
+        conversation_id: stored,
+        history: std::sync::Arc::new(Vec::new()),
+        rollout_path: None,
+    });
+    assert_eq!(
+        Session::select_thread_id(&history, /*reserved_thread_id*/ None, &agent_control).unwrap(),
+        stored,
+    );
+    assert!(Session::select_thread_id(&history, Some(ThreadId::new()), &agent_control).is_err());
 }

@@ -131,7 +131,7 @@ async fn host_drain_allows_spawned_agent_input_but_not_automatic_work() -> anyho
                 agent_role: None,
             })),
             environments: Some(test.codex.environment_selections().await),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?
         .thread;
@@ -337,6 +337,7 @@ async fn host_drain_allows_mailbox_work_to_start_a_turn() -> anyhow::Result<()> 
     // Mailbox input is memory-only and must be processed before the host exits.
     test.codex
         .submit(Op::InterAgentCommunication {
+            work: None,
             communication: InterAgentCommunication::new(
                 AgentPath::try_from("/root/worker").expect("valid agent path"),
                 AgentPath::root(),

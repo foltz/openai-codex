@@ -11,6 +11,7 @@ use pretty_assertions::assert_eq;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use serial_test::serial;
+use std::collections::HashMap;
 
 #[tokio::test]
 async fn finalized_voice_transcript_renders_beside_the_streamed_cell() {
@@ -2938,6 +2939,64 @@ async fn status_line_hostname_renders_current_machine_hostname() {
         drain_insert_history(&mut rx).is_empty(),
         "hostname should be accepted as a status line item"
     );
+}
+
+#[tokio::test]
+async fn status_line_prefix_preserves_primary_enablement_and_order() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.local_settings.tui.status_line_prefix = vec!["template:(k:{lane})".to_string()];
+    chat.local_settings
+        .tui
+        .status_line_variables
+        .insert("lane".to_string(), "dev".to_string());
+
+    chat.local_settings.tui.status_line = None;
+    chat.refresh_status_line();
+    let default_line = status_line_text(&chat).expect("default status line");
+    assert!(default_line.starts_with("(k:dev) · "), "{default_line}");
+
+    chat.local_settings.tui.status_line = Some(vec![
+        "model-name".to_string(),
+        "template:{lane}".to_string(),
+        "current-dir".to_string(),
+    ]);
+    chat.refresh_status_line();
+    let configured_line = status_line_text(&chat).expect("configured status line");
+    assert!(
+        configured_line.starts_with("(k:dev) · "),
+        "{configured_line}"
+    );
+    assert!(configured_line.contains(" · dev · "), "{configured_line}");
+
+    chat.local_settings.tui.status_line = Some(Vec::new());
+    chat.refresh_status_line();
+    assert_eq!(status_line_text(&chat), None);
+
+    chat.local_settings.tui.status_line = Some(vec!["not-a-status-item".to_string()]);
+    chat.refresh_status_line();
+    assert_eq!(status_line_text(&chat), None);
+}
+
+#[tokio::test]
+async fn status_line_template_omission_keeps_sibling_segments() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.local_settings.tui.status_line = Some(vec![
+        "model-name".to_string(),
+        "template:(secret:{present}:{missing})".to_string(),
+        "current-dir".to_string(),
+    ]);
+    chat.local_settings.tui.status_line_variables =
+        HashMap::from([("present".to_string(), "secret-shaped-value".to_string())]);
+
+    chat.refresh_status_line();
+    let line = status_line_text(&chat).expect("built-in siblings remain");
+    assert!(!line.contains("secret"));
+    let warning = drain_insert_history_transcript(&mut rx);
+    assert_eq!(warning.len(), 1);
+    let warning = lines_to_single_string(&warning[0]);
+    assert!(warning.contains("missing"));
+    assert!(!warning.contains("secret-shaped-value"));
 }
 
 #[tokio::test]

@@ -104,6 +104,8 @@ animations = false
 show_tooltips = false
 show_server_version_notice = false
 auto_recap = false
+status_line_prefix = ["template:(k:{lane})"]
+status_line_variables = { lane = "dev" }
 fullscreen_transcript = true
 copy_on_select = "never"
 right_click_paste = "off"
@@ -162,6 +164,9 @@ fast_default_opt_out = true
             expected.show_tooltips = false;
             expected.show_server_version_notice = false;
             expected.auto_recap = false;
+            expected.status_line_prefix = vec!["template:(k:{lane})".to_string()];
+            expected.status_line_variables =
+                std::collections::HashMap::from([("lane".to_string(), "dev".to_string())]);
             expected.fullscreen_transcript = true;
             expected.copy_on_select = CopyOnSelect::Never;
             expected.vim_mode_default = true;

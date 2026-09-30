@@ -15,7 +15,6 @@ use codex_mcp::McpServerRegistration;
 use codex_mcp::McpServerSource;
 use codex_mcp::McpStartupPolicy;
 use codex_mcp::PreparedMcpCall;
-use codex_mcp::ToolInfo;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use std::collections::HashSet;
 
@@ -28,6 +27,7 @@ pub(super) struct McpDesiredState {
     pub(super) environments: TurnEnvironmentSnapshot,
     pub(super) local_process_cwd: PathBuf,
     pub(super) disabled_plugin_ids: Vec<String>,
+    pub(super) control_endpoint: Option<String>,
 }
 
 impl Session {
@@ -45,24 +45,43 @@ impl Session {
     }
 
     /// Waits on this session's refreshed server before tool execution is admitted.
-    pub(crate) async fn wait_for_mcp_server(self: &Arc<Self>, server: &str) {
-        self.refresh_mcp_if_dirty().await;
+    pub(crate) async fn wait_for_mcp_server(
+        self: &Arc<Self>,
+        turn: &TurnContext,
+        server: &str,
+    ) -> anyhow::Result<()> {
+        let work = self.turn_mcp_work(turn)?;
+        let access = work.as_deref().map_or(
+            codex_mcp::McpAttemptAccess::Unscoped,
+            codex_mcp::McpAttemptAccess::Admitted,
+        );
+        self.refresh_mcp_if_dirty_with_authority(access).await?;
         self.services
             .mcp_runtime
-            .wait_for_server_startup(server)
+            .wait_for_server_startup_with_authority(server, access)
             .await;
+        Ok(())
     }
 
     /// Captures this session's current MCP client and catalog for one tool call.
     pub(crate) async fn prepare_mcp_call(
         self: &Arc<Self>,
-        advertised_tool: &ToolInfo,
-    ) -> Option<PreparedMcpCall> {
-        self.refresh_mcp_if_dirty().await;
-        self.services
+        turn: &TurnContext,
+        server: &str,
+        tool: &str,
+    ) -> anyhow::Result<Option<PreparedMcpCall>> {
+        let work = self.turn_mcp_work(turn)?;
+        let access = work.as_deref().map_or(
+            codex_mcp::McpAttemptAccess::Unscoped,
+            codex_mcp::McpAttemptAccess::Admitted,
+        );
+        self.refresh_mcp_if_dirty_with_authority(access).await?;
+        Ok(self
+            .services
             .mcp_runtime
-            .prepare_call(advertised_tool)
+            .current_binding_for_call_with_authority(server, access)
             .await
+            .and_then(|binding| binding.prepare_call(server, tool)))
     }
 
     pub(super) async fn latest_mcp_desired_state(
@@ -100,6 +119,7 @@ impl Session {
             environments,
             local_process_cwd,
             disabled_plugin_ids,
+            control_endpoint: session_configuration.control_endpoint,
         }
     }
 
@@ -110,6 +130,7 @@ impl Session {
         mcp_projection: McpRuntimeProjection,
         resolved_environments: &TurnEnvironmentSnapshot,
         mcp_runtime_cwd: PathBuf,
+        access: codex_mcp::McpAttemptAccess<'_>,
     ) -> anyhow::Result<()> {
         let cwd = AbsolutePathBuf::from_absolute_path(mcp_runtime_cwd)
             .unwrap_or_else(|_| session_configuration.cwd().clone());
@@ -131,20 +152,25 @@ impl Session {
             environments: resolved_environments.clone(),
             local_process_cwd,
             disabled_plugin_ids: session_configuration.disabled_plugin_ids.clone(),
+            control_endpoint: session_configuration.control_endpoint.clone(),
         };
-        self.publish_mcp_runtime(
+        self.publish_mcp_runtime_with_authority(
             &desired,
             mcp_projection,
             /*ready_selected_capability_roots*/ &[],
             Some(self.mcp_elicitation_reviewer()),
+            access,
         )
         .instrument(info_span!(
             "session_init.mcp_manager_init",
             otel.name = "session_init.mcp_manager_init",
         ))
-        .await;
+        .await?;
 
-        self.services.mcp_runtime.validate_required_servers().await
+        self.services
+            .mcp_runtime
+            .validate_required_servers_with_authority(access)
+            .await
     }
 
     /// Adds effective executor-owned configuration from this exact thread snapshot.
@@ -279,13 +305,18 @@ impl Session {
     }
 
     #[tracing::instrument(name = "mcp.runtime.refresh", skip_all)]
-    pub(super) async fn publish_mcp_runtime(
+    pub(super) async fn publish_mcp_runtime_with_authority(
         &self,
         desired: &McpDesiredState,
         mcp_projection: McpRuntimeProjection,
         ready_selected_capability_roots: &[SelectedCapabilityRoot],
         elicitation_reviewer: Option<ElicitationReviewerHandle>,
-    ) {
+        access: codex_mcp::McpAttemptAccess<'_>,
+    ) -> anyhow::Result<()> {
+        let startup_work = match access {
+            codex_mcp::McpAttemptAccess::Unscoped => None,
+            codex_mcp::McpAttemptAccess::Admitted(work) => Some(work.derive_attempt()?),
+        };
         let mcp_projection = self
             .project_selected_environment_mcp_servers(
                 &desired.config,
@@ -294,14 +325,18 @@ impl Session {
             )
             .await;
         let selected_plugins = mcp_projection.selected_plugins.clone();
-        let input = self.build_mcp_runtime_input(
+        let mut input = self.build_mcp_runtime_input(
             desired,
             mcp_projection,
             ready_selected_capability_roots,
             elicitation_reviewer,
         );
+        // Keep the existing requirement until every constructor/turn producer
+        // is converted; explicit callers already transfer finite startup work.
+        input.startup_work = startup_work;
         self.services.mcp_runtime.replace(input).await;
         self.services.thread_extension_data.insert(selected_plugins);
+        Ok(())
     }
 
     pub(super) fn build_mcp_runtime_input(
@@ -354,6 +389,17 @@ impl Session {
             desired.environments.ready_environment_handles(),
         );
         McpRuntimeInput {
+            attempt_requirement: if self
+                .services
+                .host_admission
+                .as_ref()
+                .is_some_and(|host| host.requires_account_work())
+            {
+                codex_mcp::McpAttemptRequirement::Required
+            } else {
+                codex_mcp::McpAttemptRequirement::Ungated
+            },
+            startup_work: None,
             startup_policy: if matches!(desired.session_source, SessionSource::SubAgent(_)) {
                 McpStartupPolicy::LazyWhenCached
             } else {
@@ -375,6 +421,8 @@ impl Session {
             auth_manager: Some(Arc::clone(&self.services.auth_manager)),
             elicitation_reviewer,
             elicitation_lifecycle: Some(self.mcp_elicitation_lifecycle()),
+            canonical_thread_id: Some(self.services.thread_extension_data.level_id().to_string()),
+            control_endpoint: desired.control_endpoint.clone(),
         }
     }
 }

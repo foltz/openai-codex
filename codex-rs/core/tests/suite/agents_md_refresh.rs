@@ -136,7 +136,7 @@ async fn concurrent_preparation_preserves_warnings_errors_and_plugin_publication
             environments: Some(vec![test.executor_environment().selection().clone()]),
             dynamic_tools,
             thread_instructions_provider: Some(observer.clone()),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?
         .thread;

@@ -87,6 +87,7 @@ pub struct RemoteAppServerConnectArgs {
     pub client_version: String,
     pub experimental_api: bool,
     pub mcp_server_openai_form_elicitation: bool,
+    pub interactive_client: bool,
     pub opt_out_notification_methods: Vec<String>,
     pub channel_capacity: usize,
 }
@@ -96,6 +97,7 @@ impl RemoteAppServerConnectArgs {
             explicit_gateway_oauth: false,
             experimental_api: self.experimental_api,
             request_attestation: false,
+            interactive_client: self.interactive_client,
             extensions: None,
             opt_out_notification_methods: if self.opt_out_notification_methods.is_empty() {
                 None

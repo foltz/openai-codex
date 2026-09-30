@@ -5,6 +5,7 @@ pub(crate) mod control;
 mod registry;
 pub(crate) mod role;
 pub(crate) mod status;
+pub(crate) mod turn_authority;
 pub(crate) mod types;
 
 pub(crate) use codex_protocol::protocol::AgentStatus;

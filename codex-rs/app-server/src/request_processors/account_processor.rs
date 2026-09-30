@@ -5,6 +5,7 @@ use super::bedrock_auth::ensure_user_model_provider_can_be_bedrock;
 use super::*;
 use crate::auth_mode::auth_mode_to_api;
 use crate::external_auth::ExternalAuthBridge;
+use crate::mcp_config_identity::AppliedMcpConfigIdentity;
 use crate::outgoing_message::AccountNotification;
 use chrono::DateTime;
 use codex_app_server_protocol::DesktopOnboardingEntrypoint;
@@ -15,6 +16,10 @@ use codex_model_provider::is_supported_amazon_bedrock_region;
 
 mod bedrock_setup;
 mod gateway_oauth;
+mod browser_logins;
+mod login_shutdown;
+pub(crate) use login_shutdown::AccountLoginReport;
+pub(crate) use login_shutdown::AccountLoginShutdown;
 mod rate_limit_resets;
 mod workspace_routing;
 
@@ -93,6 +98,7 @@ pub(crate) struct AccountRequestProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     config: Arc<Config>,
     config_manager: ConfigManager,
+    applied_mcp_config_identity: AppliedMcpConfigIdentity,
     active_login: Arc<Mutex<Option<ActiveLogin>>>,
     workspace_routing: Arc<Mutex<Option<workspace_routing::CachedWorkspaceRouting>>>,
     workspace_routing_fetches: Arc<Mutex<workspace_routing::WorkspaceRoutingFetches>>,
@@ -100,6 +106,10 @@ pub(crate) struct AccountRequestProcessor {
     gateway_login: Arc<std::sync::Mutex<Option<gateway_oauth::ActiveGatewayLogin>>>,
     gateway_client: Arc<std::sync::Mutex<Option<Arc<codex_login::GatewayAuthManager>>>>,
     _gateway_notifications: Arc<tokio_util::task::AbortOnDropHandle<()>>,
+    browser_logins: browser_logins::BrowserLogins,
+    login_tasks: crate::processor_task_retirement::ProcessorTaskTicket,
+    login_shutdown: CancellationToken,
+    login_deadline: Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
 }
 
 impl AccountRequestProcessor {
@@ -109,6 +119,8 @@ impl AccountRequestProcessor {
         outgoing: Arc<OutgoingMessageSender>,
         config: Arc<Config>,
         config_manager: ConfigManager,
+        applied_mcp_config_identity: AppliedMcpConfigIdentity,
+        login_tasks: crate::processor_task_retirement::ProcessorTaskTicket,
     ) -> Arc<Self> {
         let gateway_notifications = crate::gateway_oauth_notifications::spawn(
             Arc::clone(&auth_manager),
@@ -122,9 +134,14 @@ impl AccountRequestProcessor {
             outgoing,
             config,
             config_manager,
+            applied_mcp_config_identity,
             active_login: Arc::new(Mutex::new(None)),
-            gateway_login: Arc::new(std::sync::Mutex::new(/*t*/ None)),
-            gateway_client: Arc::new(std::sync::Mutex::new(/*t*/ None)),
+    gateway_login: Arc::new(std::sync::Mutex::new(/*t*/ None)),
+    gateway_client: Arc::new(std::sync::Mutex::new(/*t*/ None)),
+    browser_logins: browser_logins::BrowserLogins::default(),
+    login_tasks,
+    login_shutdown: CancellationToken::new(),
+    login_deadline: Arc::new(std::sync::Mutex::new(None)),
             workspace_routing: Arc::new(Mutex::new(None)),
             workspace_routing_fetches: Arc::new(Mutex::new(HashMap::new())),
             workspace_routing_shutdown: CancellationToken::new(),
@@ -134,7 +151,7 @@ impl AccountRequestProcessor {
             .auth_manager
             .set_workspace_routing_resolver(Arc::downgrade(&resolver));
         let startup = processor.clone();
-        tokio::spawn(async move {
+        let _ = processor.login_tasks.spawn(async move {
             let _ = startup.read_account(/*request*/ None).await;
         });
         processor
@@ -250,6 +267,8 @@ impl AccountRequestProcessor {
         config_manager: &ConfigManager,
         thread_manager: &Arc<ThreadManager>,
         auth: Option<CodexAuth>,
+        applied_mcp_config_identity: AppliedMcpConfigIdentity,
+        task_ticket: crate::processor_task_retirement::ProcessorTaskTicket,
     ) {
         thread_manager
             .plugins_manager()
@@ -263,6 +282,8 @@ impl AccountRequestProcessor {
                 Self::spawn_effective_plugins_changed_task(
                     Arc::clone(thread_manager),
                     config_manager.clone(),
+                    applied_mcp_config_identity.clone(),
+                    &task_ticket,
                 );
                 let plugins_config = config.plugins_config_input();
                 let refresh_thread_manager = Arc::clone(thread_manager);
@@ -273,6 +294,8 @@ impl AccountRequestProcessor {
                     Self::spawn_effective_plugins_changed_task(
                         Arc::clone(&refresh_thread_manager),
                         refresh_config_manager.clone(),
+                        applied_mcp_config_identity.clone(),
+                        &task_ticket,
                     );
                 });
                 thread_manager
@@ -300,12 +323,20 @@ impl AccountRequestProcessor {
     fn spawn_effective_plugins_changed_task(
         thread_manager: Arc<ThreadManager>,
         config_manager: ConfigManager,
+        applied_mcp_config_identity: AppliedMcpConfigIdentity,
+        task_ticket: &crate::processor_task_retirement::ProcessorTaskTicket,
     ) {
-        tokio::spawn(async move {
+        // A late callback may still be invoked by lower plugin workers. Closed
+        // admission drops this unpolled future before any account-local effect.
+        let _ = task_ticket.spawn(async move {
             thread_manager.plugins_manager().clear_cache();
             thread_manager.skills_service().clear_cache();
-            crate::mcp_refresh::reload_mcp_config_best_effort(&thread_manager, &config_manager)
-                .await;
+            crate::mcp_refresh::reload_mcp_config_best_effort(
+                &thread_manager,
+                &config_manager,
+                &applied_mcp_config_identity,
+            )
+            .await;
             thread_manager.invalidate_mcp_runtimes().await;
         });
     }
@@ -643,7 +674,9 @@ impl AccountRequestProcessor {
         let opts = self
             .login_chatgpt_common(codex_streamlined_login, login_success_page)
             .await?;
-        let server = run_login_server(opts)
+        let server = self
+            .browser_logins
+            .start(opts)
             .map_err(|err| internal_error(format!("failed to start login server: {err}")))?;
         let login_id = Uuid::new_v4();
         let shutdown_handle = server.cancel_handle();
@@ -651,6 +684,10 @@ impl AccountRequestProcessor {
         // Replace active login if present.
         {
             let mut guard = self.active_login.lock().await;
+            if self.login_shutdown.is_cancelled() {
+                shutdown_handle.shutdown();
+                return Err(internal_error("login admission closed".to_string()));
+            }
             if let Some(existing) = guard.take() {
                 drop(existing);
             }
@@ -663,7 +700,8 @@ impl AccountRequestProcessor {
         let processor = self.clone();
         let active_login = self.active_login.clone();
         let auth_url = server.auth_url.clone();
-        tokio::spawn(async move {
+        let admission_cancel = shutdown_handle.clone();
+        let admitted = self.login_tasks.spawn(async move {
             let (success, error_msg, onboarding_entrypoint) = match tokio::time::timeout(
                 LOGIN_CHATGPT_TIMEOUT,
                 server.block_until_done_with_callback_result(),
@@ -702,6 +740,14 @@ impl AccountRequestProcessor {
             }
         });
 
+        if admitted.is_err() {
+            admission_cancel.shutdown();
+            let _ = self.cancel_login_chatgpt_common(login_id).await;
+            return Err(internal_error(
+                "login task admission unavailable".to_string(),
+            ));
+        }
+
         Ok(LoginAccountResponse::Chatgpt {
             login_id: login_id.to_string(),
             auth_url,
@@ -722,14 +768,23 @@ impl AccountRequestProcessor {
                 LoginSuccessPage::default(),
             )
             .await?;
-        let device_code = request_device_code(&opts)
-            .await
-            .map_err(Self::login_chatgpt_device_code_start_error)?;
+        let device_code = tokio::select! {
+            biased;
+            _ = self.login_shutdown.cancelled() => {
+                return Err(internal_error("login admission closed".to_string()));
+            }
+            result = request_device_code(&opts) => {
+                result.map_err(Self::login_chatgpt_device_code_start_error)?
+            }
+        };
         let login_id = Uuid::new_v4();
-        let cancel = CancellationToken::new();
+        let cancel = self.login_shutdown.child_token();
 
         {
             let mut guard = self.active_login.lock().await;
+            if self.login_shutdown.is_cancelled() {
+                return Err(internal_error("login admission closed".to_string()));
+            }
             if let Some(existing) = guard.take() {
                 drop(existing);
             }
@@ -744,7 +799,8 @@ impl AccountRequestProcessor {
 
         let processor = self.clone();
         let active_login = self.active_login.clone();
-        tokio::spawn(async move {
+        let admission_cancel = cancel.clone();
+        let admitted = self.login_tasks.spawn(async move {
             let (success, error_msg) = tokio::select! {
                 _ = cancel.cancelled() => {
                     (false, Some("Login was not completed".to_string()))
@@ -771,6 +827,14 @@ impl AccountRequestProcessor {
                 *guard = None;
             }
         });
+
+        if admitted.is_err() {
+            admission_cancel.cancel();
+            let _ = self.cancel_login_chatgpt_common(login_id).await;
+            return Err(internal_error(
+                "login task admission unavailable".to_string(),
+            ));
+        }
 
         Ok(LoginAccountResponse::ChatgptDeviceCode {
             login_id: login_id.to_string(),
@@ -910,6 +974,8 @@ impl AccountRequestProcessor {
                 &self.config_manager,
                 &self.thread_manager,
                 self.auth_manager.auth_cached(),
+                self.applied_mcp_config_identity.clone(),
+                self.login_tasks.clone(),
             )
             .await;
         }
@@ -988,6 +1054,8 @@ impl AccountRequestProcessor {
             &self.config_manager,
             &self.thread_manager,
             self.auth_manager.auth_cached(),
+            self.applied_mcp_config_identity.clone(),
+            self.login_tasks.clone(),
         )
         .await;
 

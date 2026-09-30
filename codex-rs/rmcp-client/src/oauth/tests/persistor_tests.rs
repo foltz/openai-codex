@@ -193,6 +193,7 @@ async fn coordinated_401_refresh_rereads_and_persists_before_retry() -> Result<(
             /*has_configured_headers*/ false,
             StreamableHttpRedirectMode::Legacy,
             Arc::default(),
+            tokio_util::sync::CancellationToken::new(),
         ),
         manager,
     );

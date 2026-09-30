@@ -194,7 +194,7 @@ async fn model_switch_program_pair(
                 .thread_manager
                 .fork_legacy_thread(
                     ForkSnapshot::TruncateBeforeNthUserMessage(1),
-                    StartThreadOptions::new(config),
+                    StartThreadOptions::new(config, /*control_endpoint*/ None),
                     initial.codex.rollout_path().expect("rollout"),
                 )
                 .await?

@@ -4,6 +4,8 @@
 //! behavior easier to review without paging through the rest of `chatwidget.rs`.
 
 use super::*;
+use crate::bottom_pane::StatusLineConfigEntry;
+use crate::bottom_pane::parse_status_line_entries;
 use crate::bottom_pane::status_line_from_segments;
 use crate::branch_summary;
 use crate::chatwidget::limit_label_for_window;
@@ -50,7 +52,8 @@ const TERMINAL_TITLE_ACTION_REQUIRED_PREFIX_HIDDEN: &str = "[ . ] Action Require
 /// refresh pass compute those shared concerns once, then render both surfaces
 /// from the same selection set.
 struct StatusSurfaceSelections {
-    status_line_items: Vec<StatusLineItem>,
+    status_line_enabled: bool,
+    status_line_items: Vec<StatusLineConfigEntry>,
     invalid_status_line_items: Vec<String>,
     terminal_title_items: Vec<TerminalTitleItem>,
     invalid_terminal_title_items: Vec<String>,
@@ -58,30 +61,34 @@ struct StatusSurfaceSelections {
 
 impl StatusSurfaceSelections {
     fn uses_git_branch(&self) -> bool {
-        self.status_line_items.contains(&StatusLineItem::GitBranch)
+        self.status_line_items
+            .iter()
+            .any(|entry| entry.built_in() == Some(StatusLineItem::GitBranch))
             || self
                 .terminal_title_items
                 .contains(&TerminalTitleItem::GitBranch)
     }
 
     fn uses_git_summary(&self) -> bool {
-        self.status_line_items
-            .contains(&StatusLineItem::PullRequestNumber)
-            || self
-                .status_line_items
-                .contains(&StatusLineItem::BranchChanges)
+        self.status_line_items.iter().any(|entry| {
+            matches!(
+                entry.built_in(),
+                Some(StatusLineItem::PullRequestNumber | StatusLineItem::BranchChanges)
+            )
+        })
     }
 
     fn uses_workspace_headline(&self) -> bool {
         self.status_line_items
-            .contains(&StatusLineItem::WorkspaceHeadline)
+            .iter()
+            .any(|entry| entry.built_in() == Some(StatusLineItem::WorkspaceHeadline))
     }
 
     fn uses_thread_usage(&self) -> bool {
-        self.status_line_items.iter().any(|item| {
+        self.status_line_items.iter().any(|entry| {
             matches!(
-                item,
-                StatusLineItem::ThreadCredits | StatusLineItem::EstimatedThreadCost
+                entry.built_in(),
+                Some(StatusLineItem::ThreadCredits | StatusLineItem::EstimatedThreadCost)
             )
         }) || self.terminal_title_items.iter().any(|item| {
             matches!(
@@ -105,10 +112,12 @@ pub(super) struct CachedProjectRootName {
 
 impl ChatWidget {
     fn status_surface_selections(&self) -> StatusSurfaceSelections {
-        let (status_line_items, invalid_status_line_items) = self.status_line_items_with_invalids();
+        let (status_line_items, invalid_status_line_items, status_line_enabled) =
+            self.status_line_items_with_invalids();
         let (terminal_title_items, invalid_terminal_title_items) =
             self.terminal_title_items_with_invalids();
         StatusSurfaceSelections {
+            status_line_enabled,
             status_line_items,
             invalid_status_line_items,
             terminal_title_items,
@@ -200,20 +209,29 @@ impl ChatWidget {
     }
 
     fn refresh_status_line_from_selections(&mut self, selections: &StatusSurfaceSelections) {
-        let enabled = !selections.status_line_items.is_empty();
+        let mut status_line_warnings = selections.invalid_status_line_items.clone();
+        let enabled = selections.status_line_enabled;
         self.bottom_pane.set_status_line_enabled(enabled);
         if !enabled {
+            self.warn_invalid_status_line_items_once(&status_line_warnings);
             self.set_status_line(/*status_line*/ None);
             self.set_status_line_hyperlink(/*url*/ None);
             return;
         }
 
         let mut segments = Vec::new();
-        for item in &selections.status_line_items {
-            if let Some(value) = self.status_line_value_for_item(*item) {
-                segments.push((*item, value));
+        let status_line_variables = self.local_settings.tui.status_line_variables.clone();
+        for entry in &selections.status_line_items {
+            match entry.render(&status_line_variables, |item| {
+                self.status_line_value_for_item(item)
+            }) {
+                Ok(Some(segment)) => segments.push(segment),
+                Ok(None) => {}
+                Err(err) => status_line_warnings.push(err.warning_label()),
             }
         }
+
+        self.warn_invalid_status_line_items_once(&status_line_warnings);
 
         self.set_status_line(status_line_from_segments(
             segments,
@@ -222,7 +240,8 @@ impl ChatWidget {
         ));
         let hyperlink_url = selections
             .status_line_items
-            .contains(&StatusLineItem::PullRequestNumber)
+            .iter()
+            .any(|entry| entry.built_in() == Some(StatusLineItem::PullRequestNumber))
             .then(|| self.status_line_pull_request_url())
             .flatten();
         self.set_status_line_hyperlink(hyperlink_url);
@@ -302,7 +321,6 @@ impl ChatWidget {
         self.bottom_pane
             .set_luna_reserve_active(self.current_model() == LUNA_RESERVE_MODEL);
         let selections = self.status_surface_selections();
-        self.warn_invalid_status_line_items_once(&selections.invalid_status_line_items);
         self.warn_invalid_terminal_title_items_once(&selections.invalid_terminal_title_items);
         self.sync_status_surface_shared_state(&selections);
         self.refresh_status_line_from_selections(&selections);
@@ -401,12 +419,14 @@ impl ChatWidget {
         if self.local_settings.tui.animations
             && self.local_settings.tui.effects.progress
             && self.status_state.thread_title_generation_pending
-            && (selections.status_line_items.iter().any(|item| {
+            && (selections.status_line_items.iter().any(|entry| {
                 matches!(
-                    item,
-                    StatusLineItem::ThreadName
-                        | StatusLineItem::ThreadTitle
-                        | StatusLineItem::SessionId
+                    entry.built_in(),
+                    Some(
+                        StatusLineItem::ThreadName
+                            | StatusLineItem::ThreadTitle
+                            | StatusLineItem::SessionId
+                    )
                 )
             }) || selections.terminal_title_items.iter().any(|item| {
                 matches!(
@@ -453,8 +473,17 @@ impl ChatWidget {
     /// Parses configured status-line ids into known items and collects unknown ids.
     ///
     /// Unknown ids are deduplicated in insertion order for warning messages.
-    fn status_line_items_with_invalids(&self) -> (Vec<StatusLineItem>, Vec<String>) {
-        parse_items_with_invalids(self.configured_status_line_items())
+    fn status_line_items_with_invalids(&self) -> (Vec<StatusLineConfigEntry>, Vec<String>, bool) {
+        let (primary, mut invalid) = parse_status_line_entries(self.configured_status_line_items());
+        let enabled = !primary.is_empty();
+        if !enabled {
+            return (Vec::new(), invalid, false);
+        }
+        let (mut prefix, prefix_invalid) =
+            parse_status_line_entries(self.local_settings.tui.status_line_prefix.clone());
+        prefix.extend(primary);
+        invalid.extend(prefix_invalid);
+        (prefix, invalid, true)
     }
 
     pub(super) fn configured_status_line_items(&self) -> Vec<String> {
@@ -662,7 +691,8 @@ impl ChatWidget {
             && self
                 .status_line_items_with_invalids()
                 .0
-                .contains(&StatusLineItem::WorkspaceHeadline)
+                .iter()
+                .any(|entry| entry.built_in() == Some(StatusLineItem::WorkspaceHeadline))
         {
             self.refresh_status_line();
         }
@@ -695,7 +725,8 @@ impl ChatWidget {
             && self
                 .status_line_items_with_invalids()
                 .0
-                .contains(&StatusLineItem::WorkspaceHeadline)
+                .iter()
+                .any(|entry| entry.built_in() == Some(StatusLineItem::WorkspaceHeadline))
         {
             self.frame_requester
                 .schedule_frame_in(crate::workspace_messages::WORKSPACE_HEADLINE_REFRESH_INTERVAL);

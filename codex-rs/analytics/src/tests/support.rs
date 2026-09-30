@@ -145,6 +145,7 @@ pub(super) fn sample_thread_start_response(
     model: &str,
 ) -> ClientResponsePayload {
     ClientResponsePayload::ThreadStart(ThreadStartResponse {
+        clear_recovery: None,
         disabled_plugin_ids: Vec::new(),
         thread: sample_thread_with_metadata(
             thread_id,
@@ -588,6 +589,7 @@ pub(super) fn sample_initialize_fact(connection_id: u64) -> AnalyticsFact {
                 explicit_gateway_oauth: false,
                 experimental_api: false,
                 request_attestation: false,
+                interactive_client: false,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,
                 extensions: None,

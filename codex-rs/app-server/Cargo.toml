@@ -109,10 +109,12 @@ toml_edit = { workspace = true }
 tokio = { workspace = true, features = [
     "io-std",
     "macros",
+    "net",
     "process",
     "rt-multi-thread",
     "signal",
 ] }
+tokio-tungstenite = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true, features = ["log"] }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "json"] }

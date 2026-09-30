@@ -2,6 +2,7 @@
 //! Context selection and assembly stay on the existing path pending its replacement.
 
 use super::*;
+use codex_extension_api::HostOperationWork;
 use codex_guardian_reviewer::ReviewerPool;
 use codex_guardian_reviewer::ReviewerRequest;
 
@@ -12,6 +13,8 @@ pub struct PreparedGuardianContext {
     context_policy: ReviewContextPolicy,
     key: GuardianReviewSessionReuseKey,
     parent_compaction: Option<ResponseItem>,
+    // Owned by this review/prewarm invocation, never by the idle pooled session.
+    account_work: Option<Box<dyn HostOperationWork>>,
     pub history_reset: CancellationToken,
 }
 
@@ -22,6 +25,7 @@ impl PreparedGuardianContext {
         config: Config,
         history: &ContextManager,
         node_repl_policy: &GuardianNodeReplPolicy,
+        account_work: Option<Box<dyn HostOperationWork>>,
     ) -> anyhow::Result<Self> {
         let (reset_version, history_reset) = parent.history_reset().await;
         // Preparation may have raced with a history reset before capturing the reviewer context.
@@ -51,6 +55,7 @@ impl PreparedGuardianContext {
             context_policy,
             key,
             parent_compaction,
+            account_work,
             history_reset,
         })
     }
@@ -78,7 +83,15 @@ impl PreparedGuardianContext {
     pub async fn thread_options(
         &self,
         snapshot: Option<GuardianReviewForkSnapshot>,
-    ) -> (crate::StartThreadOptions, GuardianReviewState) {
+    ) -> anyhow::Result<(crate::StartThreadOptions, GuardianReviewState)> {
+        // The managed constructor runs in another task and cannot inherit a
+        // request scope or look up the synthetic prewarm turn as a parent.
+        let account_work = self
+            .account_work
+            .as_ref()
+            .map(|work| work.derive_operation())
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("account admission refused Guardian construction"))?;
         let (conversation, history) = snapshot.map(ConversationState::fork).unzip();
         let state = GuardianReviewState {
             conversation: conversation.unwrap_or_default(),
@@ -100,6 +113,7 @@ impl PreparedGuardianContext {
             .responses_websocket_enabled();
         let options = crate::StartThreadOptions {
             history_mode: Some(codex_protocol::protocol::ThreadHistoryMode::Paginated),
+            account_work,
             internal_parent: Some(crate::thread_manager::InternalSessionParent {
                 thread_id: self.parent.thread_id(),
                 auth_manager: Arc::clone(&self.parent.services.auth_manager),
@@ -120,9 +134,9 @@ impl PreparedGuardianContext {
             environments: Some(self.context.environments().to_selections()),
             inherited_environments: Some(self.context.environments().clone()),
             client_mcp_extensions: self.parent.services.client_mcp_extensions.clone(),
-            ..crate::StartThreadOptions::new(config)
+            ..crate::StartThreadOptions::new(config, /*control_endpoint*/ None)
         };
-        (options, state)
+        Ok((options, state))
     }
 
     /// Binds context bookkeeping to an agent that Guardian has already started.
@@ -156,6 +170,7 @@ impl PreparedGuardianContext {
             SubAgentSource::Other(GUARDIAN_REVIEWER_NAME.to_owned()),
         );
         GuardianReviewSession {
+            parent_session: Arc::downgrade(&self.parent),
             session,
             io,
             cancel_token: cancellation,
@@ -219,12 +234,22 @@ pub(crate) async fn run_guardian_review_session(
 pub(super) async fn prepare_review(
     params: GuardianReviewSessionParams,
 ) -> anyhow::Result<PreparedReview> {
+    let account_work = match params.parent_session.services.host_admission.as_ref() {
+        Some(host) => host
+            .derive_operation_work(
+                &params.parent_session.services.thread_extension_data,
+                &params.parent_context.turn().sub_id,
+            )
+            .map_err(|_| anyhow::anyhow!("account admission refused Guardian review setup"))?,
+        None => None,
+    };
     let context = PreparedGuardianContext::prepare(
         Arc::clone(&params.parent_session),
         params.parent_context.clone(),
         params.spawn_config.clone(),
         &params.parent_history,
         &params.node_repl_policy,
+        account_work,
     )
     .await?;
     Ok(PreparedReview {
@@ -238,16 +263,25 @@ pub(super) async fn prepare_review(
 pub async fn prepare_review_prewarm(
     parent: &crate::CodexThread,
 ) -> anyhow::Result<PreparedGuardianContext> {
+    // This optional producer has no parent turn. Refusal skips prewarm rather
+    // than waiting for admission while retaining construction resources.
+    let account_work = match parent.session.services.host_admission.as_ref() {
+        Some(host) => host
+            .admit_operation_work()
+            .map_err(|_| anyhow::anyhow!("account admission refused Guardian prewarm"))?,
+        None => None,
+    };
     let turn = parent
         .session
         .new_startup_prewarm_turn_with_sub_id(crate::session::INITIAL_SUBMIT_ID.to_owned())
         .await;
-    prepare_prewarm(Arc::clone(&parent.session), turn).await
+    prepare_prewarm(Arc::clone(&parent.session), turn, account_work).await
 }
 
 pub(super) fn prepare_prewarm(
     parent: Arc<Session>,
     turn: Arc<TurnContext>,
+    account_work: Option<Box<dyn HostOperationWork>>,
 ) -> BoxFuture<'static, anyhow::Result<PreparedGuardianContext>> {
     Box::pin(async move {
         let context = GuardianReviewContext::from(turn);
@@ -259,6 +293,7 @@ pub(super) fn prepare_prewarm(
             config.spawn_config,
             &history,
             &config.node_repl_policy,
+            account_work,
         )
         .await
     })

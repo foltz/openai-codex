@@ -61,7 +61,7 @@ async fn descriptions_share_space_without_hiding_late_namespaces() -> Result<()>
         .start_thread(StartThreadOptions {
             dynamic_tools,
             environments: Some(vec![test.executor_environment().selection().clone()]),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?;
     test.codex = thread.thread;

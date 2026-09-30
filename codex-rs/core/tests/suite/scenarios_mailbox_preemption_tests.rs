@@ -114,6 +114,7 @@ async fn mailbox_preemption_preserves_response_when_deferred(
     for message in ["Worker found the result.", "Worker checked the result."] {
         test.codex
             .submit(Op::InterAgentCommunication {
+                work: None,
                 communication: InterAgentCommunication::new(
                     AgentPath::root().join("worker").expect("worker path"),
                     AgentPath::root(),

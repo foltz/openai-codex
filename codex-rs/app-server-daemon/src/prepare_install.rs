@@ -8,7 +8,6 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use codex_install_context::CodexPackageManifest;
-use codex_install_context::InstallContext;
 
 use crate::Daemon;
 use crate::install_lock::acquire_install_lock;
@@ -25,55 +24,17 @@ pub struct InstallRequest {
 }
 
 /// Prepare a missing package while the caller holds the daemon operation lock.
-pub(super) async fn prepare(daemon: &Daemon, settings: &DaemonSettings) -> Result<()> {
-    let source = InstallContext::current().package_layout.as_ref();
-    // Keep package replacement state out of the CLI dispatcher's async stack frame.
-    Box::pin(prepare_from_package(
-        daemon,
-        settings,
-        InstallMode::Missing,
-        source.map(|layout| layout.package_dir.as_path()),
-        &std::env::current_exe()?,
-        |_| Ok(true),
-    ))
-    .await
-    .map(|_| ())
+pub(super) async fn prepare(daemon: &Daemon, _settings: &DaemonSettings) -> Result<()> {
+    // Package installation is owned by the managed release workflow.
+    daemon.ensure_managed_codex_bin()
 }
 
 /// Select this CLI's complete package and pin it, restarting only a running daemon.
 /// Returns None when the user cancels without changing the installation.
 pub async fn update_from_cli(
-    confirm: impl FnOnce(&InstallRequest) -> Result<bool>,
+    _confirm: impl FnOnce(&InstallRequest) -> Result<bool>,
 ) -> Result<Option<crate::UpdateOutput>> {
-    crate::ensure_supported_platform()?;
-    #[cfg(windows)]
-    crate::backend::windows::ensure_not_elevated()?;
-    let daemon = Daemon::from_environment()?;
-    let settings = daemon.load_settings().await?;
-    let source = InstallContext::current().package_layout.as_ref();
-    if !Box::pin(prepare_from_package(
-        &daemon,
-        &settings,
-        InstallMode::Replace,
-        source.map(|layout| layout.package_dir.as_path()),
-        &std::env::current_exe()?,
-        confirm,
-    ))
-    .await?
-    {
-        return Ok(None);
-    }
-    let managed_codex_path = daemon.current_managed_codex_bin()?;
-    Ok(Some(crate::UpdateOutput {
-        status: crate::UpdateStatus::Updated,
-        installed_version: Some(managed_install::managed_codex_version(&managed_codex_path).await?),
-        running_version: crate::client::probe(&daemon.socket_path)
-            .await
-            .ok()
-            .map(|info| info.app_server_version),
-        managed_codex_path,
-        message: "The CLI package is selected and pinned. Run `codex app-server daemon update` to return to production updates.".to_string(),
-    }))
+    anyhow::bail!(crate::MANAGED_UPDATE_DISABLED_MESSAGE)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

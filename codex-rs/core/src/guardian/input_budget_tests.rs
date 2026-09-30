@@ -44,6 +44,11 @@ async fn cancelled_startup_does_not_record_unselected_review_evidence() {
     let (session, turn, events) = crate::session::tests::make_session_and_context_with_rx().await;
     let context = required_context("unselected review evidence ".repeat(/*n*/ 10_000));
     let content = context.clone().into_user_inputs().unwrap();
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let prewarm = session.task_joins.register(tokio::spawn(async move {
+        let _result_tx = result_tx;
+        std::future::pending::<()>().await;
+    }));
     session
         .services
         .thread_extension_data
@@ -51,7 +56,8 @@ async fn cancelled_startup_does_not_record_unselected_review_evidence() {
     session
         .set_session_startup_prewarm(
             crate::session::startup_prewarm::SessionStartupPrewarmHandle::new(
-                tokio::spawn(std::future::pending()),
+                prewarm,
+                result_rx,
                 std::time::Instant::now(),
                 crate::client::WEBSOCKET_CONNECT_TIMEOUT,
             ),

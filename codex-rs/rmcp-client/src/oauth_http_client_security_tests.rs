@@ -429,17 +429,20 @@ async fn same_origin_redirects_preserve_timeout_and_response_body_limits() -> Re
             )?,
             &resource_url,
         );
-        // Measure redirect handling after lazy native HTTP client initialization.
-        adapter
+        // Client construction is charged to request deadlines. Warm the native
+        // client first so this fixture isolates the shared redirect budget.
+        let warmup = adapter
             .execute_request(
                 oauth2::http::Request::builder()
+                    .method("GET")
                     .uri(format!("{}/warmup", server.uri()))
                     .body(Vec::new())?,
                 OAuthHttpRedirectPolicy::Stop,
                 /*timeout*/ None,
             )
             .await
-            .expect("HTTP client warmup should succeed");
+            .expect("client warm-up must reach the mock server");
+        assert_eq!(warmup.status(), oauth2::http::StatusCode::NO_CONTENT);
         let error = adapter
             .execute_request(
                 oauth2::http::Request::builder()

@@ -105,6 +105,8 @@ pub enum RolloutRecorderParams {
         forked_from_id: Option<ThreadId>,
         forked_from_ordinal_exclusive: Option<u64>,
         parent_thread_id: Option<ThreadId>,
+        clear_predecessor_thread_id: Option<ThreadId>,
+        clear_transition_id: Option<String>,
         source: Box<SessionSource>,
         thread_source: Option<ThreadSource>,
         originator: String,
@@ -211,6 +213,8 @@ impl RolloutRecorderParams {
             forked_from_id,
             forked_from_ordinal_exclusive: None,
             parent_thread_id,
+            clear_predecessor_thread_id: None,
+            clear_transition_id: None,
             source: Box::new(source),
             thread_source,
             originator,
@@ -239,6 +243,24 @@ impl RolloutRecorderParams {
             *creator_user_id = user_id;
             *creator_account_id = account_id;
         }
+        self
+    }
+
+    pub fn with_clear_lineage(
+        mut self,
+        predecessor_thread_id: ThreadId,
+        transition_id: String,
+    ) -> Self {
+        let Self::Create {
+            clear_predecessor_thread_id,
+            clear_transition_id,
+            ..
+        } = &mut self
+        else {
+            return self;
+        };
+        *clear_predecessor_thread_id = Some(predecessor_thread_id);
+        *clear_transition_id = Some(transition_id);
         self
     }
 
@@ -904,6 +926,8 @@ impl RolloutRecorder {
                 forked_from_id,
                 forked_from_ordinal_exclusive,
                 parent_thread_id,
+                clear_predecessor_thread_id,
+                clear_transition_id,
                 source,
                 thread_source,
                 originator,
@@ -939,6 +963,8 @@ impl RolloutRecorder {
                     forked_from_ordinal_exclusive: forked_from_ordinal_exclusive
                         .filter(|_| forked_from_id.is_some()),
                     parent_thread_id,
+                    clear_predecessor_thread_id,
+                    clear_transition_id,
                     timestamp,
                     cwd: cwd.clone(),
                     runtime_workspace_roots,

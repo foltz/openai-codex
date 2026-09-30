@@ -34,6 +34,21 @@ use tokio_util::sync::CancellationToken;
 
 struct PendingTask;
 
+#[tokio::test]
+async fn refused_replacement_does_not_report_a_started_task() {
+    let (session, turn_context, _receiver) = make_session_and_context_with_rx().await;
+    session.close_task_admission().await;
+
+    let result = session
+        .try_spawn_task(turn_context, Vec::new(), PendingTask)
+        .await;
+    let error = result.expect_err("closed admission must refuse replacement");
+    assert!(
+        matches!(error.details(), codex_protocol::error::CodexErrorDetails::Fatal(message) if message == "thread task admission is closed")
+    );
+    assert!(session.active_turn.lock().await.is_none());
+}
+
 impl SessionTask for PendingTask {
     fn kind(&self) -> TaskKind {
         TaskKind::Regular

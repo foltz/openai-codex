@@ -18,6 +18,7 @@ use codex_app_server_protocol::ThreadRealtimeStartParams;
 use codex_app_server_protocol::ThreadRealtimeStartTransport;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::ThreadStartSource;
 use codex_protocol::protocol::RealtimeOutputModality;
 use pretty_assertions::assert_eq;
 use std::time::Duration;
@@ -43,6 +44,7 @@ async fn mock_experimental_method_requires_experimental_api_capability() -> Resu
                 explicit_gateway_oauth: false,
                 experimental_api: false,
                 request_attestation: false,
+                interactive_client: false,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,
                 extensions: None,
@@ -81,6 +83,7 @@ async fn realtime_conversation_start_requires_experimental_api_capability() -> R
                 explicit_gateway_oauth: false,
                 experimental_api: false,
                 request_attestation: false,
+                interactive_client: false,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,
                 extensions: None,
@@ -140,6 +143,7 @@ async fn thread_memory_mode_set_requires_experimental_api_capability() -> Result
                 explicit_gateway_oauth: false,
                 experimental_api: false,
                 request_attestation: false,
+                interactive_client: false,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,
                 extensions: None,
@@ -183,6 +187,7 @@ async fn settings_update_requires_experimental_api_capability(method: &str) -> R
                 explicit_gateway_oauth: false,
                 experimental_api: false,
                 request_attestation: false,
+                interactive_client: false,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,
                 extensions: None,
@@ -223,6 +228,7 @@ async fn realtime_webrtc_start_requires_experimental_api_capability() -> Result<
                 explicit_gateway_oauth: false,
                 experimental_api: false,
                 request_attestation: false,
+                interactive_client: false,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,
                 extensions: None,
@@ -285,6 +291,7 @@ async fn thread_start_mock_field_requires_experimental_api_capability() -> Resul
                 explicit_gateway_oauth: false,
                 experimental_api: false,
                 request_attestation: false,
+                interactive_client: false,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,
                 extensions: None,
@@ -312,6 +319,51 @@ async fn thread_start_mock_field_requires_experimental_api_capability() -> Resul
 }
 
 #[tokio::test]
+async fn thread_start_clear_predecessor_requires_experimental_api_capability() -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    let init = mcp
+        .initialize_with_capabilities(
+            default_client_info(),
+            Some(InitializeCapabilities {
+                experimental_api: false,
+                request_attestation: false,
+                interactive_client: false,
+                opt_out_notification_methods: None,
+                mcp_server_openai_form_elicitation: false,
+                explicit_gateway_oauth: false,
+                extensions: None,
+            }),
+        )
+        .await?;
+    let JSONRPCMessage::Response(_) = init else {
+        anyhow::bail!("expected initialize response, got {init:?}");
+    };
+
+    let request_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            session_start_source: Some(ThreadStartSource::Clear),
+            clear_predecessor_thread_id: Some("019fe0ce-0000-4000-8000-000000000000".to_string()),
+            ..Default::default()
+        })
+        .await?;
+
+    let error = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    assert_experimental_capability_error(error, "thread/start.clearPredecessor");
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_start_without_dynamic_tools_allows_without_experimental_api_capability()
 -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
@@ -329,6 +381,7 @@ async fn thread_start_without_dynamic_tools_allows_without_experimental_api_capa
                 explicit_gateway_oauth: false,
                 experimental_api: false,
                 request_attestation: false,
+                interactive_client: false,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,
                 extensions: None,
@@ -372,6 +425,7 @@ async fn thread_start_granular_approval_policy_requires_experimental_api_capabil
                 explicit_gateway_oauth: false,
                 experimental_api: false,
                 request_attestation: false,
+                interactive_client: false,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,
                 extensions: None,

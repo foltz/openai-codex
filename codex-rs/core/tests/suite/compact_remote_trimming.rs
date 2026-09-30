@@ -53,7 +53,10 @@ async fn remote_compact_v2_token_estimate_ignores_message_bookkeeping_and_json_e
                 environments: Some(vec![
                     harness.test().executor_environment().selection().clone(),
                 ]),
-                ..StartThreadOptions::new(harness.test().config.clone())
+                ..StartThreadOptions::new(
+                    harness.test().config.clone(),
+                    /*control_endpoint*/ None,
+                )
             })
             .await?
             .thread;

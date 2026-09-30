@@ -154,6 +154,7 @@ impl Harness {
             AnalyticsEventsClient::disabled(),
         ));
         let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
+            telemetry_reset: crate::otel_reset_control::TelemetryResetControl::default(),
             outgoing: Arc::clone(&outgoing),
             analytics_events_client: AnalyticsEventsClient::disabled(),
             arg0_paths: Arg0DispatchPaths::default(),
@@ -178,6 +179,9 @@ impl Harness {
             },
             remote_control_handle: None,
             plugin_startup_tasks: None,
+            managed_transition_control_socket_endpoint: None,
+            managed_transition_process_instance_id: None,
+            control_endpoint: None,
         }));
         Ok(Self {
             processor,

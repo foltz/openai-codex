@@ -80,6 +80,8 @@ fn connection_identity(
         /*codex_apps_cache_identity*/ None,
         ElicitationCapability::default(),
         ClientMcpExtensions::default(),
+        /*canonical_thread_id*/ None,
+        /*control_endpoint*/ None,
         /*previous_identity*/ None,
     )
 }

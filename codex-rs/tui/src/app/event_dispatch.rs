@@ -149,9 +149,10 @@ impl App {
             AppEvent::PluginMentionsLoaded { ref cwd, .. }
                 if cwds_differ(cwd, self.config.cwd.as_path()) => {}
             AppEvent::NewSession { name } => {
-                self.start_fresh_session(
-                    tui, app_server, /*session_start_source*/ None,
-                    /*initial_user_message*/ None, name,
+
+                self.start_fresh_session_with_summary_hint(
+                    tui, app_server, /*initial_user_message*/ None, name,
+                    /*session_start_source*/ None,
                 )
                 .await;
                 if self.chat_widget.has_misalignment_policy_violation() {
@@ -386,15 +387,9 @@ impl App {
                 if self.reject_pending_permission_root_switch() {
                     return Ok(AppRunControl::Continue);
                 }
-                self.clear_terminal_ui(tui, /*redraw_header*/ false)?;
-                self.reset_app_ui_state_after_clear();
 
-                self.start_fresh_session(
-                    tui,
-                    app_server,
-                    Some(ThreadStartSource::Clear),
-                    /*initial_user_message*/ None,
-                    name,
+                self.clear_displayed_session(
+                    tui, app_server, /*initial_user_message*/ None, name,
                 )
                 .await;
             }
@@ -406,13 +401,10 @@ impl App {
                     self.chat_widget.restore_user_message_to_composer(text.into());
                     return Ok(AppRunControl::Continue);
                 }
-                self.clear_terminal_ui(tui, /*redraw_header*/ false)?;
-                self.reset_app_ui_state_after_clear();
 
-                self.start_fresh_session(
+                self.clear_displayed_session(
                     tui,
                     app_server,
-                    Some(ThreadStartSource::Clear),
                     crate::chatwidget::create_initial_user_message(
                         Some(text),
                         Vec::new(),
@@ -2987,7 +2979,10 @@ impl App {
                 items,
                 use_theme_colors,
             } => {
-                let ids = items.iter().map(ToString::to_string).collect::<Vec<_>>();
+                let ids = items
+                    .iter()
+                    .map(crate::bottom_pane::StatusLineConfigEntry::raw_config)
+                    .collect::<Vec<_>>();
                 let items_edit = crate::legacy_core::config::edit::status_line_items_edit(&ids);
                 let colors_edit =
                     crate::legacy_core::config::edit::status_line_use_colors_edit(use_theme_colors);

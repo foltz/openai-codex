@@ -4,10 +4,13 @@
 //! request/response plumbing out of `App` and `ChatWidget`.
 
 mod external_agent_config;
+mod clear_recovery;
 pub(crate) mod fs;
 mod history;
 mod models;
 mod realtime;
+mod retention;
+pub(crate) use retention::RetentionClient;
 mod rollout_history;
 mod thread_list;
 
@@ -72,6 +75,8 @@ use codex_app_server_protocol::ThreadArchiveParams;
 use codex_app_server_protocol::ThreadArchiveResponse;
 use codex_app_server_protocol::ThreadBackgroundTerminalsCleanParams;
 use codex_app_server_protocol::ThreadBackgroundTerminalsCleanResponse;
+use codex_app_server_protocol::ThreadClearParams;
+use codex_app_server_protocol::ThreadClearResponse;
 use codex_app_server_protocol::ThreadCompactStartParams;
 use codex_app_server_protocol::ThreadCompactStartResponse;
 use codex_app_server_protocol::ThreadDeleteParams;
@@ -311,6 +316,9 @@ pub(crate) struct AppServerBootstrap {
 
 pub(crate) struct AppServerSession {
     client: AppServerClient,
+    retention: RetentionClient,
+    retention_warnings:
+        tokio::sync::mpsc::UnboundedReceiver<codex_app_server_protocol::WarningNotification>,
     next_request_id: i64,
     history_pagination: HashMap<ThreadId, history::ThreadHistoryPagination>,
     task_tool_threads: HashSet<ThreadId>,
@@ -419,8 +427,11 @@ impl AppServerSession {
     }
 
     pub(crate) fn new(client: AppServerClient, thread_params_mode: ThreadParamsMode) -> Self {
+        let (retention, retention_warnings) = RetentionClient::new();
         Self {
             client,
+            retention,
+            retention_warnings,
             next_request_id: 1,
             history_pagination: HashMap::new(),
             task_tool_threads: HashSet::new(),
@@ -479,6 +490,7 @@ impl AppServerSession {
             self.thread_params_mode(),
             self.remote_cwd_override(),
             /*session_start_source*/ None,
+            /*clear_predecessor_thread_id*/ None,
         );
         self.dynamic_tool_mcp = Some(Arc::new(
             DynamicToolMcpServer::start(
@@ -736,7 +748,32 @@ impl AppServerSession {
     }
 
     pub(crate) async fn next_event(&mut self) -> Option<AppServerEvent> {
-        self.client.next_event().await
+        tokio::select! {
+            biased;
+            Some(warning) = self.retention_warnings.recv() => Some(AppServerEvent::ServerNotification(Box::new(codex_app_server_protocol::ServerNotification::Warning(warning)))),
+            event = self.client.next_event() => event,
+        }
+    }
+
+    pub(crate) fn retention_client(&self) -> RetentionClient {
+        self.retention.clone()
+    }
+
+    pub(crate) async fn retain_clear_successor(
+        &self,
+        thread_id: &str,
+    ) -> Option<retention::PendingRetention> {
+        match self
+            .retention
+            .retain_thread(self.request_handle(), thread_id.to_string())
+            .await
+        {
+            Ok(retention) => Some(retention),
+            Err(error) => {
+                self.retention.warn_clear(thread_id, &error);
+                None
+            }
+        }
     }
 
     #[cfg(test)]
@@ -745,6 +782,7 @@ impl AppServerSession {
             &LocalSettings::from(config),
             config,
             /*session_start_source*/ None,
+            /*clear_predecessor_thread_id*/ None,
             /*remote_cwd_override*/ None,
             /*selected_profile*/ None,
         )
@@ -756,6 +794,7 @@ impl AppServerSession {
         local_settings: &LocalSettings,
         config: &Config,
         session_start_source: Option<ThreadStartSource>,
+        clear_predecessor_thread_id: Option<ThreadId>,
         remote_cwd_override: Option<&std::path::Path>,
         selected_profile: Option<&PermissionProfileSelection>,
     ) -> Result<AppServerStartedThread> {
@@ -766,6 +805,7 @@ impl AppServerSession {
             self.thread_params_mode(),
             remote_cwd_override.or(self.remote_cwd_override.as_deref()),
             session_start_source,
+            clear_predecessor_thread_id,
         );
         if let Some(selected_profile) = selected_profile {
             params.runtime_workspace_roots = None;
@@ -789,6 +829,10 @@ impl AppServerSession {
         if history_support == ThreadHistorySupport::LegacyOnly {
             self.history_support = ThreadHistorySupport::LegacyOnly;
         }
+        let retention = self
+            .retention
+            .retain_thread(self.request_handle(), response.thread.id.clone())
+            .await?;
         let mut started = started_thread_from_start_response(
             response,
             local_settings,
@@ -800,6 +844,7 @@ impl AppServerSession {
         if task_tools_available {
             self.remember_task_tool_thread(started.session.thread_id);
         }
+        retention.commit();
         Ok(started)
     }
 
@@ -991,6 +1036,10 @@ impl AppServerSession {
                 ));
             }
         };
+        let retention = self
+            .retention
+            .retain_thread(self.request_handle(), response.thread.id.clone())
+            .await?;
         let mut response = response;
         if presentation == ForkPresentation::Regular
             && !response.thread.ephemeral
@@ -1023,6 +1072,7 @@ impl AppServerSession {
             started.task_tools_available = true;
             self.remember_task_tool_thread(started.session.thread_id);
         }
+        retention.commit();
         Ok(started)
     }
 
@@ -1486,6 +1536,22 @@ impl AppServerSession {
             .wrap_err("thread/goal/clear failed in TUI")
     }
 
+    pub(crate) async fn thread_clear(
+        &mut self,
+        thread_id: ThreadId,
+    ) -> Result<ThreadClearResponse> {
+        let request_id = self.next_request_id();
+        self.client
+            .request_typed(ClientRequest::ThreadClear {
+                request_id,
+                params: ThreadClearParams {
+                    thread_id: thread_id.to_string(),
+                },
+            })
+            .await
+            .wrap_err("thread/clear failed in TUI")
+    }
+
     pub(crate) async fn logout_account(&mut self) -> Result<()> {
         let request_id = self.next_request_id();
         let _: LogoutAccountResponse = self
@@ -1670,18 +1736,20 @@ impl AppServerSession {
 
 pub(crate) async fn start_thread_with_request_handle(
     request_handle: AppServerRequestHandle,
+    retention_client: RetentionClient,
     local_settings: &LocalSettings,
     config: Config,
     thread_params_mode: ThreadParamsMode,
     remote_cwd_override: Option<PathBuf>,
     thread_tool_transport: ThreadToolTransport,
-) -> Result<AppServerStartedThread> {
+) -> Result<PendingStartupThread> {
     let request_id = RequestId::String(format!("startup-thread-start-{}", Uuid::new_v4()));
     let mut params = thread_start_params_from_config(
         &config,
         thread_params_mode,
         remote_cwd_override.as_deref(),
         /*session_start_source*/ None,
+        /*clear_predecessor_thread_id*/ None,
     );
     thread_tool_transport.configure(&mut params);
     let (response, _history_support, task_tools_available) =
@@ -1690,11 +1758,22 @@ pub(crate) async fn start_thread_with_request_handle(
             .map_err(|err| {
                 bootstrap_request_error("thread/start failed during TUI bootstrap", err)
             })?;
+    let retention = retention_client
+        .retain_thread(request_handle, response.thread.id.clone())
+        .await?;
     let mut started =
         started_thread_from_start_response(response, local_settings, &config, thread_params_mode)
             .await?;
     started.task_tools_available = task_tools_available;
-    Ok(started)
+    Ok(PendingStartupThread { started, retention })
+}
+
+/// Unique startup custody travels through event delivery, separately from the
+/// cloneable presentation data. Abandoned delivery releases only a new grant.
+#[derive(Debug)]
+pub(crate) struct PendingStartupThread {
+    pub(crate) started: AppServerStartedThread,
+    pub(crate) retention: retention::PendingRetention,
 }
 
 pub(crate) fn status_account_display_from_auth_mode(
@@ -2019,6 +2098,7 @@ pub(crate) fn thread_start_params_from_config(
     thread_params_mode: ThreadParamsMode,
     remote_cwd_override: Option<&std::path::Path>,
     session_start_source: Option<ThreadStartSource>,
+    clear_predecessor_thread_id: Option<ThreadId>,
 ) -> ThreadStartParams {
     let permissions = permissions_selection_from_config(config, thread_params_mode);
     let sandbox = permissions
@@ -2047,6 +2127,7 @@ pub(crate) fn thread_start_params_from_config(
         ephemeral: Some(config.ephemeral),
         history_mode: (!config.ephemeral).then_some(ThreadHistoryMode::Paginated),
         session_start_source,
+        clear_predecessor_thread_id: clear_predecessor_thread_id.map(|id| id.to_string()),
         thread_source: Some(ThreadSource::User),
         developer_instructions: with_terminal_visualization_instructions(
             config, /*control_instructions*/ None,
@@ -2785,6 +2866,7 @@ mod tests {
             ThreadParamsMode::Embedded,
             /*remote_cwd_override*/ None,
             /*session_start_source*/ None,
+            /*clear_predecessor_thread_id*/ None,
         );
 
         assert_eq!(params.ephemeral, Some(true));
@@ -2835,6 +2917,7 @@ mod tests {
             ThreadParamsMode::Remote,
             /*remote_cwd_override*/ None,
             /*session_start_source*/ None,
+            /*clear_predecessor_thread_id*/ None,
         );
 
         let overrides = params.config.expect("config overrides");
@@ -2897,6 +2980,7 @@ mod tests {
             ThreadParamsMode::Embedded,
             /*remote_cwd_override*/ None,
             /*session_start_source*/ None,
+            /*clear_predecessor_thread_id*/ None,
         );
 
         assert_eq!(params.cwd, Some(config.cwd.to_string_lossy().to_string()));
@@ -2921,15 +3005,21 @@ mod tests {
     async fn thread_start_params_can_mark_clear_source() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let config = build_config(&temp_dir).await;
+        let predecessor = ThreadId::new();
 
         let params = thread_start_params_from_config(
             &config,
             ThreadParamsMode::Embedded,
             /*remote_cwd_override*/ None,
             Some(ThreadStartSource::Clear),
+            Some(predecessor),
         );
 
         assert_eq!(params.session_start_source, Some(ThreadStartSource::Clear));
+        assert_eq!(
+            params.clear_predecessor_thread_id,
+            Some(predecessor.to_string())
+        );
     }
 
     #[test]
@@ -3144,6 +3234,7 @@ mod tests {
             ThreadParamsMode::Remote,
             /*remote_cwd_override*/ None,
             /*session_start_source*/ None,
+            /*clear_predecessor_thread_id*/ None,
         );
         let resume = thread_resume_params_from_config(
             config.clone(),
@@ -3285,6 +3376,7 @@ mod tests {
             ThreadParamsMode::Remote,
             Some(remote_cwd.as_path()),
             /*session_start_source*/ None,
+            /*clear_predecessor_thread_id*/ None,
         );
         let resume = thread_resume_params_from_config(
             config.clone(),
@@ -3340,6 +3432,7 @@ mod tests {
             ThreadParamsMode::Embedded,
             /*remote_cwd_override*/ None,
             /*session_start_source*/ None,
+            /*clear_predecessor_thread_id*/ None,
         );
         let resume = thread_resume_params_from_config(
             config.clone(),
@@ -3734,7 +3827,7 @@ mod tests {
         for mode in [ThreadParamsMode::Embedded, ThreadParamsMode::Remote] {
             let start = thread_start_params_from_config(
                 &config, mode, /*remote_cwd_override*/ None,
-                /*session_start_source*/ None,
+                /*session_start_source*/ None, /*clear_predecessor_thread_id*/ None,
             );
             let resume = thread_resume_params_from_config(
                 config.clone(),
@@ -3846,6 +3939,7 @@ mod tests {
             ThreadParamsMode::Embedded,
             /*remote_cwd_override*/ None,
             /*session_start_source*/ None,
+            /*clear_predecessor_thread_id*/ None,
         );
         let control_resume = thread_resume_params_from_config(
             config.clone(),
@@ -3876,6 +3970,7 @@ mod tests {
             ThreadParamsMode::Embedded,
             /*remote_cwd_override*/ None,
             /*session_start_source*/ None,
+            /*clear_predecessor_thread_id*/ None,
         );
         let treatment_resume = thread_resume_params_from_config(
             config.clone(),

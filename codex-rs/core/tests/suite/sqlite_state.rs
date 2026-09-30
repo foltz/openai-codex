@@ -156,7 +156,7 @@ async fn thread_creator_survives_resume_and_forks_use_current_auth() -> Result<(
             .thread_manager
             .fork_legacy_thread(
                 codex_core::ForkSnapshot::Interrupted,
-                StartThreadOptions::new(resumed.config.clone()),
+                StartThreadOptions::new(resumed.config.clone(), /*control_endpoint*/ None),
                 rollout_path,
             )
             .await?;
@@ -280,7 +280,7 @@ async fn staged_metadata_is_persisted_on_first_turn() -> Result<()> {
             },
         )
         .await?;
-    let mut options = StartThreadOptions::new(test.config.clone());
+    let mut options = StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None);
     options.reserved_thread_id = Some(thread_id);
     let started = test.thread_manager.start_thread(options).await?;
 
@@ -359,7 +359,7 @@ async fn resume_restores_dynamic_tools_from_rollout_with_sqlite_enabled() -> Res
         .start_thread(StartThreadOptions {
             dynamic_tools: vec![dynamic_tool],
             history_mode: Some(codex_protocol::protocol::ThreadHistoryMode::Legacy),
-            ..StartThreadOptions::new(base_test.config.clone())
+            ..StartThreadOptions::new(base_test.config.clone(), None)
         })
         .await?;
     let rollout_path = started
@@ -454,7 +454,7 @@ async fn resume_restores_legacy_dynamic_tools_from_rollout_with_sqlite_enabled()
         .thread_manager
         .start_thread(StartThreadOptions {
             history_mode: Some(codex_protocol::protocol::ThreadHistoryMode::Legacy),
-            ..StartThreadOptions::new(base_test.config.clone())
+            ..StartThreadOptions::new(base_test.config.clone(), None)
         })
         .await?;
     let rollout_path = started
@@ -564,6 +564,8 @@ async fn backfill_scans_existing_rollouts() -> Result<()> {
                     forked_from_id: None,
                     forked_from_ordinal_exclusive: None,
                     parent_thread_id: None,
+                    clear_predecessor_thread_id: None,
+                    clear_transition_id: None,
                     timestamp: "2026-01-27T12:00:00Z".to_string(),
                     cwd: codex_home.to_path_buf(),
                     runtime_workspace_roots: None,
@@ -885,6 +887,8 @@ async fn mcp_call_marks_thread_memory_mode_polluted_when_configured() -> Result<
                 startup_readiness: Default::default(),
                 supports_parallel_tool_calls: false,
                 tool_input_schema_max_bytes: None,
+                thread_identity_eligible: false,
+                control_endpoint_eligible: false,
                 omit_tools_from: None,
                 disabled_reason: None,
                 startup_timeout_sec: Some(Duration::from_secs(10)),

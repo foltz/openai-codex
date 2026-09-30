@@ -127,6 +127,8 @@ impl LocalAgentControl {
         .map(|(agent, _)| agent)
     }
 }
+#[path = "parent_authority_tests.rs"]
+mod parent_authority_tests;
 
 async fn test_config_with_cli_overrides(
     mut cli_overrides: Vec<(String, TomlValue)>,
@@ -268,7 +270,7 @@ impl AgentControlHarness {
     async fn start_thread(&self) -> (ThreadId, Arc<CodexThread>) {
         let new_thread = self
             .manager
-            .start_thread(StartThreadOptions::new(self.config.clone()))
+            .start_thread(StartThreadOptions::new(self.config.clone(), None))
             .await
             .expect("start thread");
         (new_thread.thread_id, new_thread.thread)
@@ -280,7 +282,7 @@ impl AgentControlHarness {
             .start_thread(StartThreadOptions {
                 history_mode: Some(ThreadHistoryMode::Paginated),
                 environments: Some(Vec::new()),
-                ..StartThreadOptions::new(self.config.clone())
+                ..StartThreadOptions::new(self.config.clone(), None)
             })
             .await
             .expect("start paginated thread");
@@ -543,6 +545,7 @@ async fn send_input_errors_when_manager_dropped() {
                 text_elements: Vec::new(),
             }],
             Default::default(),
+            /*parent*/ None,
         )
         .await
         .expect_err("send_input should fail without a manager");
@@ -650,7 +653,7 @@ async fn resume_agent_errors_when_manager_dropped() {
     let control = LocalAgentControl::default();
     let (_home, config) = test_config().await;
     let err = control
-        .resume_agent_from_rollout(config, ThreadId::new(), SessionSource::Exec)
+        .resume_agent_from_rollout(config, ThreadId::new(), SessionSource::Exec, None)
         .await
         .expect_err("resume_agent should fail without a manager");
     assert_eq!(
@@ -672,6 +675,7 @@ async fn send_input_errors_when_thread_missing() {
                 text_elements: Vec::new(),
             }],
             Default::default(),
+            /*parent*/ None,
         )
         .await
         .expect_err("send_input should fail for missing thread");
@@ -756,6 +760,7 @@ async fn send_input_submits_user_message() {
                 text_elements: Vec::new(),
             }],
             Default::default(),
+            /*parent*/ None,
         )
         .await
         .expect("send_input should succeed");
@@ -782,6 +787,7 @@ async fn send_inter_agent_communication_without_turn_queues_message_without_trig
             communication.clone(),
             AgentCommunicationContext::new(AgentCommunicationKind::Message, ThreadId::new()),
             Default::default(),
+            /*parent*/ None,
         )
         .await
         .expect("send_inter_agent_communication should succeed");
@@ -792,6 +798,7 @@ async fn send_inter_agent_communication_without_turn_queues_message_without_trig
         Op::InterAgentCommunication {
             communication: communication.clone(),
             start_options: Default::default(),
+            work: None,
         },
     );
     let captured = harness
@@ -898,7 +905,7 @@ async fn check_v2_agent_reload(route: V2ReloadRoute) {
                 text: "thread instructions survive parent eviction".into(),
                 shared: false,
             })),
-            ..StartThreadOptions::new(harness.config.clone())
+            ..StartThreadOptions::new(harness.config.clone(), /*control_endpoint*/ None)
         })
         .await
         .expect("start root thread");
@@ -995,10 +1002,38 @@ async fn check_v2_agent_reload(route: V2ReloadRoute) {
 
     let mut parent_turn = parent_thread.session.new_default_turn().await;
     match route {
-        V2ReloadRoute::Sender => control
-            .ensure_v2_agent_loaded(sender_config, spawned_agent.thread_id, /*parent*/ None)
-            .await
-            .expect("known v2 agent should reload"),
+        V2ReloadRoute::Sender => {
+            let (caller, gate) = parent_authority_tests::parent().await;
+            let expired = crate::ParentTurnAuthority::capture(&caller, "ended-parent");
+            assert!(
+                control
+                    .ensure_v2_agent_loaded(
+                        sender_config.clone(),
+                        spawned_agent.thread_id,
+                        None,
+                        Some(&expired)
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_thread_not_loaded(&harness.manager, spawned_agent.thread_id).await;
+            let authority = crate::ParentTurnAuthority::capture(&caller, "live-parent");
+            control
+                .ensure_v2_agent_loaded(
+                    sender_config,
+                    spawned_agent.thread_id,
+                    None,
+                    Some(&authority),
+                )
+                .await
+                .expect("known v2 agent should reload");
+            assert!(
+                gate.constructor_derivations
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    > 0,
+                "the resumed constructor must receive caller-derived work"
+            );
+        }
         V2ReloadRoute::NestedParent => {
             let environment = parent_turn
                 .initial_environments
@@ -1102,6 +1137,7 @@ async fn check_v2_agent_reload(route: V2ReloadRoute) {
             communication.clone(),
             AgentCommunicationContext::new(AgentCommunicationKind::Message, ThreadId::new()),
             Default::default(),
+            /*parent*/ None,
         )
         .await
         .expect("send_inter_agent_communication should succeed after reload");
@@ -1110,6 +1146,7 @@ async fn check_v2_agent_reload(route: V2ReloadRoute) {
         Op::InterAgentCommunication {
             communication,
             start_options: Default::default(),
+            work: None,
         },
     );
     let captured = harness
@@ -1211,6 +1248,7 @@ async fn resume_agent_from_rollout_does_not_reopen_v2_descendants() {
             harness.config.clone(),
             parent_thread_id,
             SessionSource::Exec,
+            None,
         )
         .await
         .expect("v2 root resume should succeed");
@@ -1297,7 +1335,7 @@ async fn cold_resume_with_thread_instructions_preserves_lazy_v2_child_inheritanc
                 text: "initial thread instructions".into(),
                 shared,
             })),
-            ..StartThreadOptions::new(harness.config.clone())
+            ..StartThreadOptions::new(harness.config.clone(), /*control_endpoint*/ None)
         })
         .await
         .expect("start parent with thread instructions");
@@ -1373,7 +1411,7 @@ async fn cold_resume_with_thread_instructions_preserves_lazy_v2_child_inheritanc
             initial_history,
             session_source: Some(SessionSource::Exec),
             thread_instructions_provider: Some(provider.clone()),
-            ..StartThreadOptions::new(harness.config.clone())
+            ..StartThreadOptions::new(harness.config.clone(), /*control_endpoint*/ None)
         })
         .await
         .expect("cold resume parent with updated thread instructions");
@@ -1400,6 +1438,7 @@ async fn cold_resume_with_thread_instructions_preserves_lazy_v2_child_inheritanc
             .services
             .agent_control
             .send(crate::SendRequest {
+                parent_authority: None,
                 caller: parent_thread_id,
                 target: crate::AgentTarget::Id(target_thread_id),
                 resume_config: crate::agent::child_config::build_agent_resume_config(&turn)
@@ -1472,7 +1511,7 @@ async fn v2_sibling_reload_preserves_shared_instructions_after_root_unloads(shar
         .manager
         .start_thread(StartThreadOptions {
             thread_instructions_provider: Some(provider.clone()),
-            ..StartThreadOptions::new(harness.config.clone())
+            ..StartThreadOptions::new(harness.config.clone(), /*control_endpoint*/ None)
         })
         .await
         .expect("start root");
@@ -1530,6 +1569,7 @@ async fn v2_sibling_reload_preserves_shared_instructions_after_root_unloads(shar
         .services
         .agent_control
         .send(crate::SendRequest {
+            parent_authority: None,
             caller: sender_id,
             target: crate::AgentTarget::Id(target_id),
             resume_config: crate::agent::child_config::build_agent_resume_config(&sender_turn)
@@ -1632,21 +1672,39 @@ async fn resumed_root_reuses_or_freezes_surviving_shared_instructions() {
 #[tokio::test]
 async fn spawn_agent_creates_thread_and_sends_prompt() {
     let harness = AgentControlHarness::new().await;
-    let thread_id = harness
+    let (parent, gate) = parent_authority_tests::parent().await;
+    let spawned = harness
         .control
-        .spawn_agent(
+        .spawn_agent_with_metadata(
             harness.config.clone(),
             text_input("spawned"),
-            /*session_source*/ None,
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: parent.thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: None,
+            }),
+            SpawnAgentOptions {
+                parent_thread_id: Some(parent.thread_id),
+                parent_authority: Some(crate::ParentTurnAuthority::capture(&parent, "live-parent")),
+                ..Default::default()
+            },
         )
         .await
         .expect("spawn_agent should succeed");
     let thread = harness
         .manager
-        .get_thread(thread_id)
+        .get_thread(spawned.thread_id)
         .await
         .expect("thread should be registered");
     wait_for_recorded_user_message(thread.as_ref(), "spawned").await;
+    assert!(
+        gate.constructor_derivations
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0,
+        "the initial constructor must receive caller-derived work"
+    );
 }
 
 #[tokio::test]
@@ -2178,7 +2236,7 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
         .manager
         .start_thread(StartThreadOptions {
             history_mode: Some(ThreadHistoryMode::Legacy),
-            ..StartThreadOptions::new(parent_config.clone())
+            ..StartThreadOptions::new(parent_config.clone(), None)
         })
         .await
         .expect("start parent thread");
@@ -2538,7 +2596,7 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history() {
         Some("Child subagent guidance.".to_string());
     let new_thread = harness
         .manager
-        .start_thread(StartThreadOptions::new(parent_config))
+        .start_thread(StartThreadOptions::new(parent_config, None))
         .await
         .expect("start parent thread");
     let parent_thread_id = new_thread.thread_id;
@@ -2786,7 +2844,7 @@ async fn spawn_agent_full_fork_restores_instructions_after_compaction_discards_p
 
     let new_thread = harness
         .manager
-        .start_thread(StartThreadOptions::new(parent_config))
+        .start_thread(StartThreadOptions::new(parent_config, None))
         .await
         .expect("start parent thread");
     let parent_thread_id = new_thread.thread_id;
@@ -2964,7 +3022,7 @@ async fn spawn_agent_full_fork_legacy_compaction_rebuilds_child_instructions_onc
 
         let new_thread = harness
             .manager
-            .start_thread(StartThreadOptions::new(parent_config))
+            .start_thread(StartThreadOptions::new(parent_config, None))
             .await
             .expect("start parent thread");
         let parent_thread_id = new_thread.thread_id;
@@ -3162,7 +3220,7 @@ async fn resume_and_cold_fork_restore_mcp_attribution_in_constructed_requests(
         .manager
         .start_thread(StartThreadOptions {
             history_mode: Some(ThreadHistoryMode::Legacy),
-            ..StartThreadOptions::new(harness.config.clone())
+            ..StartThreadOptions::new(harness.config.clone(), /*control_endpoint*/ None)
         })
         .await
         .expect("start legacy source");
@@ -3230,7 +3288,7 @@ async fn resume_and_cold_fork_restore_mcp_attribution_in_constructed_requests(
         .manager
         .fork_legacy_thread(
             ForkSnapshot::Interrupted,
-            StartThreadOptions::new(harness.config.clone()),
+            StartThreadOptions::new(harness.config.clone(), /*control_endpoint*/ None),
             rollout_path.clone(),
         )
         .await
@@ -3243,6 +3301,7 @@ async fn resume_and_cold_fork_restore_mcp_attribution_in_constructed_requests(
             AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy")),
             /*parent_trace*/ None,
             ClientMcpExtensions::default(),
+            /*control_endpoint*/ None,
         )
         .await
         .expect("resume source thread");
@@ -3528,7 +3587,7 @@ async fn spawn_agent_fork_last_n_turns_drops_parent_startup_prefix_when_under_li
         .start_thread(StartThreadOptions {
             environments: Some(Vec::new()),
             thread_extension_init,
-            ..StartThreadOptions::new(harness.config.clone())
+            ..StartThreadOptions::new(harness.config.clone(), None)
         })
         .await
         .expect("start parent thread");
@@ -3654,7 +3713,7 @@ async fn spawn_agent_fork_last_n_turns_strips_parent_usage_hints() {
         Some("Child subagent guidance.".to_string());
     let new_thread = harness
         .manager
-        .start_thread(StartThreadOptions::new(parent_config))
+        .start_thread(StartThreadOptions::new(parent_config, None))
         .await
         .expect("start parent thread");
     let parent_thread_id = new_thread.thread_id;
@@ -3792,7 +3851,7 @@ async fn spawn_agent_respects_legacy_max_threads_alias() {
     let control = manager.agent_control();
 
     let _ = manager
-        .start_thread(StartThreadOptions::new(config.clone()))
+        .start_thread(StartThreadOptions::new(config.clone(), None))
         .await
         .expect("start thread");
 
@@ -3954,7 +4013,7 @@ async fn resume_agent_respects_max_threads_limit() {
         .expect("spawn_agent should succeed for active slot");
 
     let err = control
-        .resume_agent_from_rollout(config, resumable_id, SessionSource::Exec)
+        .resume_agent_from_rollout(config, resumable_id, SessionSource::Exec, None)
         .await
         .expect_err("resume should respect max threads");
     let CodexErrorDetails::AgentLimitReached {
@@ -3988,7 +4047,7 @@ async fn resume_agent_releases_slot_after_resume_failure() {
     let control = manager.agent_control();
 
     let _ = control
-        .resume_agent_from_rollout(config.clone(), ThreadId::new(), SessionSource::Exec)
+        .resume_agent_from_rollout(config.clone(), ThreadId::new(), SessionSource::Exec, None)
         .await
         .expect_err("resume should fail for missing rollout path");
 
@@ -4043,7 +4102,7 @@ async fn multi_agent_v2_completion_ignores_dead_direct_parent() {
     let _ = config.features.enable(Feature::MultiAgentV2);
     let root = harness
         .manager
-        .start_thread(StartThreadOptions::new(config.clone()))
+        .start_thread(StartThreadOptions::new(config.clone(), None))
         .await
         .expect("root thread should start");
     let root_thread_id = root.thread_id;
@@ -4150,7 +4209,7 @@ async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
     let _ = tester_config.features.enable(Feature::MultiAgentV2);
     let tester_thread_id = harness
         .manager
-        .start_thread(StartThreadOptions::new(tester_config.clone()))
+        .start_thread(StartThreadOptions::new(tester_config.clone(), None))
         .await
         .expect("tester thread should start")
         .thread_id;
@@ -4207,6 +4266,7 @@ async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
                 /*trigger_turn*/ false,
             ),
             start_options: Default::default(),
+            work: None,
         },
     );
 
@@ -4326,7 +4386,7 @@ async fn spawn_thread_subagents_persist_parent_originator_across_new_and_truncat
         .start_thread(StartThreadOptions {
             metrics_service_name: Some("codex_work_desktop".to_string()),
             environments: Some(Vec::new()),
-            ..StartThreadOptions::new(harness.config.clone())
+            ..StartThreadOptions::new(harness.config.clone(), None)
         })
         .await
         .expect("parent thread should start");
@@ -4555,6 +4615,7 @@ async fn resume_thread_subagent_restores_stored_metadata() {
                 agent_nickname: None,
                 agent_role: None,
             }),
+            None,
         )
         .await
         .expect("resume should succeed");
@@ -4628,7 +4689,12 @@ async fn resume_agent_from_rollout_reads_archived_rollout_path() {
 
     let resumed_thread_id = harness
         .control
-        .resume_agent_from_rollout(harness.config.clone(), child_thread_id, SessionSource::Exec)
+        .resume_agent_from_rollout(
+            harness.config.clone(),
+            child_thread_id,
+            SessionSource::Exec,
+            None,
+        )
         .await
         .expect("resume should find archived rollout");
     assert_eq!(resumed_thread_id, child_thread_id);
@@ -4671,7 +4737,12 @@ async fn resume_agent_from_paginated_rollout_loads_model_context() {
 
     let resumed_thread_id = harness
         .control
-        .resume_agent_from_rollout(harness.config.clone(), child_thread_id, SessionSource::Exec)
+        .resume_agent_from_rollout(
+            harness.config.clone(),
+            child_thread_id,
+            SessionSource::Exec,
+            None,
+        )
         .await
         .expect("resume should load paginated model context");
     assert_eq!(resumed_thread_id, child_thread_id);
@@ -4837,7 +4908,7 @@ async fn list_agent_subtree_thread_ids_finds_live_descendants_of_unloaded_root()
     );
     let control = manager.agent_control();
     let parent_thread_id = manager
-        .start_thread(StartThreadOptions::new(config.clone()))
+        .start_thread(StartThreadOptions::new(config.clone(), None))
         .await
         .expect("parent should start")
         .thread_id;
@@ -5132,6 +5203,7 @@ async fn resume_agent_from_rollout_does_not_reopen_closed_descendants() {
             harness.config.clone(),
             parent_thread_id,
             SessionSource::Exec,
+            None,
         )
         .await
         .expect("single-thread resume should succeed");
@@ -5228,6 +5300,7 @@ async fn resume_closed_child_reopens_open_descendants() {
                 agent_nickname: None,
                 agent_role: None,
             }),
+            None,
         )
         .await
         .expect("child resume should succeed");
@@ -5320,6 +5393,7 @@ async fn resume_agent_from_rollout_reopens_open_descendants_after_manager_shutdo
             harness.config.clone(),
             parent_thread_id,
             SessionSource::Exec,
+            None,
         )
         .await
         .expect("tree resume should succeed");
@@ -5433,6 +5507,7 @@ async fn resume_agent_from_rollout_uses_edge_data_when_descendant_metadata_sourc
             harness.config.clone(),
             parent_thread_id,
             SessionSource::Exec,
+            None,
         )
         .await
         .expect("tree resume should succeed");
@@ -5548,6 +5623,7 @@ async fn resume_agent_from_rollout_skips_descendants_when_parent_resume_fails() 
             harness.config.clone(),
             parent_thread_id,
             SessionSource::Exec,
+            None,
         )
         .await
         .expect("root resume should succeed");

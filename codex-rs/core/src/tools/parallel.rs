@@ -197,7 +197,8 @@ impl ToolCallRuntime {
             async move {
                 let _message_admission = message_admission?;
                 if let Some(tool_runtime) = tool_runtime
-                    && let Some(readiness) = tool_runtime.wait_until_ready(&session)
+                    && let Some(readiness) =
+                        tool_runtime.wait_until_ready(&session, &step_context.turn)
                 {
                     readiness.await;
                 }

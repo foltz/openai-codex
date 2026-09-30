@@ -172,6 +172,7 @@ mod tests {
                     extra_config: None,
                     forked_from_id: None,
                     parent_thread_id,
+                    clear_lineage: None,
                     source: SessionSource::Exec,
                     thread_source: None,
                     originator: "test_originator".to_string(),
@@ -446,6 +447,7 @@ mod tests {
             extra_config: None,
             forked_from_id: None,
             parent_thread_id: None,
+            clear_lineage: None,
             source: SessionSource::Exec,
             thread_source: None,
             originator: "test_originator".to_string(),
@@ -573,11 +575,21 @@ impl InMemoryThreadStore {
     async fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreResult<()> {
         let mut state = self.state.lock().await;
         state.calls.create_thread += 1;
+        let clear_predecessor_thread_id = params
+            .clear_lineage
+            .as_ref()
+            .map(|lineage| lineage.predecessor_thread_id);
+        let clear_transition_id = params
+            .clear_lineage
+            .as_ref()
+            .map(|lineage| lineage.transition_id.clone());
         let session_meta = SessionMeta {
             session_id: params.session_id,
             id: params.thread_id,
             forked_from_id: params.forked_from_id,
             parent_thread_id: params.parent_thread_id,
+            clear_predecessor_thread_id,
+            clear_transition_id,
             cwd: params.metadata.cwd.clone().unwrap_or_default(),
             runtime_workspace_roots: params
                 .runtime_workspace_roots

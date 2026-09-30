@@ -1,9 +1,15 @@
 pub mod auth_storage;
 pub(crate) mod config;
 mod events;
+mod local_trace_route;
+mod managed_routes;
 pub(crate) mod metrics;
+mod prepared_provider;
 pub(crate) mod provider;
+mod provider_retirement;
+mod root_span_context;
 pub(crate) mod trace_context;
+mod trace_exporter_retirement;
 
 mod agent_response;
 mod guardian_assessment;
@@ -28,11 +34,20 @@ pub use crate::config::validate_span_attributes;
 pub use crate::events::session_telemetry::AuthEnvTelemetryMetadata;
 pub use crate::events::session_telemetry::SessionTelemetry;
 pub use crate::events::session_telemetry::SessionTelemetryMetadata;
+pub use crate::managed_routes::ManagedTelemetryRoutes;
+pub use crate::managed_routes::RetiredTelemetry;
+pub use crate::managed_routes::TelemetryPublication;
 pub use crate::metrics::runtime_metrics::RuntimeMetricTotals;
 pub use crate::metrics::runtime_metrics::RuntimeMetricsSummary;
 pub use crate::metrics::timer::Timer;
 pub use crate::metrics::*;
+pub use crate::prepared_provider::OtelPreparationError;
+pub use crate::prepared_provider::PreparedOtelProvider;
 pub use crate::provider::OtelProvider;
+pub use crate::provider::OtelShutdownError;
+pub use crate::provider_retirement::OtelRetirement;
+pub use crate::provider_retirement::OtelRetirementError;
+pub use crate::root_span_context::root_span_with_w3c_parent;
 pub use crate::trace_context::context_from_w3c_trace_context;
 pub use crate::trace_context::current_span_trace_id;
 pub use crate::trace_context::current_span_w3c_trace_context;
@@ -40,6 +55,7 @@ pub use crate::trace_context::inject_span_w3c_trace_headers;
 pub use crate::trace_context::set_parent_from_context;
 pub use crate::trace_context::set_parent_from_w3c_trace_context;
 pub use crate::trace_context::span_w3c_trace_context;
+pub use crate::trace_context::span_with_parent_context;
 pub use crate::trace_context::traceparent_context_from_env;
 pub use crate::trace_context::validate_tracestate_entries;
 pub use crate::trace_context::validate_tracestate_member;
@@ -80,7 +96,9 @@ impl From<AuthMode> for TelemetryAuthMode {
 /// Call this once during single-threaded startup, before any instruments are
 /// registered. Keep the returned handle to flush and shut down the exporter
 /// owned by this installation.
-pub fn install_global_metrics(metrics: MetricsClient) -> MetricsClient {
+/// Returns a routing error if publication cannot be acquired or this handle
+/// has already been installed; neither case silently acknowledges installation.
+pub fn install_global_metrics(metrics: MetricsClient) -> MetricsResult<MetricsClient> {
     crate::metrics::install_global(metrics)
 }
 

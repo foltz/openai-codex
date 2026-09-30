@@ -167,7 +167,7 @@ async fn run_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
     let NewThread {
         thread_id, thread, ..
     } = thread_manager
-        .start_thread(StartThreadOptions::new(config))
+        .start_thread(StartThreadOptions::new(config, None))
         .await
         .context("start Codex thread")?;
 
@@ -291,6 +291,8 @@ async fn new_config(
         tui_right_click_paste: Default::default(),
         tui_alternate_screen: AltScreenMode::Auto,
         tui_status_line: None,
+        tui_status_line_prefix: Vec::new(),
+        tui_status_line_variables: HashMap::new(),
         tui_status_line_use_colors: true,
         tui_terminal_title: None,
         tui_theme: None,

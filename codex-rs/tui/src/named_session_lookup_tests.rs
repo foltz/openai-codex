@@ -492,6 +492,7 @@ async fn uses_listed_thread_when_older_server_cannot_read_it() -> color_eyre::Re
             client_name: "legacy-test".to_string(),
             client_version: "0.0.0".to_string(),
             experimental_api: true,
+            interactive_client: false,
             mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: 8,

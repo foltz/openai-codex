@@ -4,7 +4,6 @@ use opentelemetry_sdk::metrics::data::AggregatedMetrics;
 use opentelemetry_sdk::metrics::data::MetricData;
 use pretty_assertions::assert_eq;
 use std::sync::Barrier;
-use std::sync::RwLock;
 
 fn client() -> MetricsClient {
     MetricsClient::new(
@@ -158,13 +157,15 @@ fn redirecting_a_global_handle_does_not_change_the_buffers_installation() {
     let buffer = BufferedMetrics::new();
     let first = client();
     let second = client();
-    let active = Arc::new(RwLock::new(Arc::clone(&first.inner)));
+    let active = Arc::new(crate::metrics::route::MetricsRoute::new(
+        first.original_inner().unwrap(),
+    ));
     let redirected = MetricsClient {
-        inner: Arc::clone(&first.inner),
+        inner: first.inner.clone(),
         active: Some(Arc::clone(&active)),
     };
     buffer.enable(&redirected);
-    *active.write().unwrap() = Arc::clone(&second.inner);
+    let _retirement = active.replace(second.original_inner().unwrap()).unwrap();
     observe(&buffer);
     assert_eq!(totals(&first), (1, 1, 7.0));
     assert_eq!(totals(&second), (0, 0, 0.0));

@@ -124,6 +124,7 @@ pub(crate) type GuardianReviewSessionManager =
 
 /// Opaque host session handle. Its state belongs to the existing context builder.
 pub struct GuardianReviewSession {
+    parent_session: std::sync::Weak<Session>,
     session: Arc<Session>,
     io: SessionIo,
     cancel_token: CancellationToken,
@@ -397,12 +398,36 @@ async fn run_review_on_session(
         .await
         .token_limit_reached
     {
-        let compact_submission = run_before_review_deadline(
-            deadline,
-            params.external_cancel.as_ref(),
-            review_session.io.submit(Op::Compact),
-        )
-        .await;
+        let compact_submission =
+            run_before_review_deadline(deadline, params.external_cancel.as_ref(), async {
+                let termination = review_session.io.session_loop_termination.clone();
+                let work = params
+                    .parent_session
+                    .services
+                    .extensions
+                    .derive_turn_work(
+                        &params.parent_session.services.thread_extension_data,
+                        &params.parent_context.turn().sub_id,
+                        &review_session.session.services.thread_extension_data,
+                        Box::pin(async move {
+                            termination.await;
+                        }),
+                    )
+                    .map_err(|_| {
+                        codex_protocol::error::CodexErr::Fatal(
+                            "review parent has no admitted account work".to_string(),
+                        )
+                    })?;
+                let operation = match work {
+                    Some(work) => Op::HostTurn {
+                        action: codex_protocol::host_turn_work::HostTurnAction::Compact,
+                        work,
+                    },
+                    None => Op::Compact,
+                };
+                review_session.io.submit(operation).await
+            })
+            .await;
         let compact_turn_id = match compact_submission {
             Ok(Ok(turn_id)) => turn_id,
             Ok(Err(error)) => {
@@ -835,13 +860,24 @@ async fn ensure_guardian_node_repl_policy(
         .is_none()
     {
         let initialize_context: BoxFuture<'_, anyhow::Result<()>> = Box::pin(async {
+            let work = params
+                .parent_session
+                .turn_mcp_work(params.parent_context.turn())?;
+            let access = work.as_deref().map_or(
+                codex_mcp::McpAttemptAccess::Unscoped,
+                codex_mcp::McpAttemptAccess::Admitted,
+            );
             let step_context = review_session
                 .session
-                .capture_step_context(Arc::clone(&turn_context), &review_session.cancel_token)
+                .capture_step_context_with_authority(
+                    Arc::clone(&turn_context),
+                    &review_session.cancel_token,
+                    access,
+                )
                 .await?;
             review_session
                 .session
-                .record_context_updates_and_set_reference_context_item(step_context.as_ref())
+                .record_context_updates_with_authority(step_context.as_ref(), Ok(access))
                 .await?;
             Ok(())
         });
@@ -859,14 +895,42 @@ async fn ensure_guardian_node_repl_policy(
 
 impl codex_guardian_reviewer::ReviewerRuntime for GuardianReviewSession {
     async fn submit_turn(&self, request: TurnInputRequest) -> anyhow::Result<TurnInputSubmission> {
+        let parent = self
+            .parent_session
+            .upgrade()
+            .ok_or_else(|| anyhow::anyhow!("review parent session has ended"))?;
+        let termination = self.io.session_loop_termination.clone();
+        let host_work = parent
+            .services
+            .extensions
+            .derive_turn_work(
+                &parent.services.thread_extension_data,
+                request.start.parent_turn_id.as_deref().unwrap_or_default(),
+                &self.session.services.thread_extension_data,
+                Box::pin(async move {
+                    termination.await;
+                }),
+            )
+            .map_err(|_| anyhow::anyhow!("review parent has no admitted account work"))?;
         Ok(self
             .io
-            .submit_turn_input(request, TurnInputMode::StartIfIdle)
+            .submit_turn_input(request, TurnInputMode::StartIfIdle, host_work)
             .await?)
     }
 
     async fn next_event(&self) -> anyhow::Result<Event> {
-        Ok(self.io.next_event().await?)
+        let event = self.io.next_event().await?;
+        if matches!(
+            &event.msg,
+            EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_)
+        ) && let Some(parent) = self.parent_session.upgrade()
+        {
+            parent
+                .services
+                .extensions
+                .turn_work_terminal(&self.session.services.thread_extension_data, &event.id);
+        }
+        Ok(event)
     }
 
     async fn admit_context(&self, event: &Event) {

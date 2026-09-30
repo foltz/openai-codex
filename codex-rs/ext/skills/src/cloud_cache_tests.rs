@@ -23,7 +23,11 @@ struct Provider {
 }
 
 impl SkillProvider for Provider {
-    fn list(&self, _query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog> {
+    fn list<'a>(
+        &'a self,
+        _query: SkillListQuery,
+        _mcp_access: Result<codex_mcp::McpAttemptAccess<'a>, codex_mcp::McpAttemptRefused>,
+    ) -> SkillProviderFuture<'a, SkillCatalog> {
         Box::pin(async move {
             if self.pause_list.swap(false, Ordering::SeqCst) {
                 self.entered.notify_one();
@@ -93,6 +97,7 @@ fn query(client: Option<Arc<McpResourceClient>>) -> SkillListQuery {
 
 fn request(client: Option<Arc<McpResourceClient>>) -> SkillReadRequest<'static> {
     SkillReadRequest {
+        mcp_access: Ok(codex_mcp::McpAttemptAccess::Unscoped),
         _lifetime: Default::default(),
         authority: SkillAuthority::new(SkillSourceKind::Cloud, "codex_apps"),
         package: SkillPackageId("skill://demo".into()),
@@ -117,7 +122,11 @@ async fn late_read_cannot_return_or_populate_a_replaced_cache() {
         let (late, ()) = tokio::join!(state.read_skill(&providers, request(original)), async {
             provider.entered.notified().await;
             state
-                .refresh_cloud_catalog(&providers, query(replacement.clone()))
+                .refresh_cloud_catalog(
+                    &providers,
+                    query(replacement.clone()),
+                    Ok(codex_mcp::McpAttemptAccess::Unscoped),
+                )
                 .await
                 .unwrap();
             provider.resume.notify_one();
@@ -141,7 +150,11 @@ async fn late_discovery_cannot_publish_into_a_new_generation() {
     let providers = SkillProviders::new().with_cloud_provider(provider.clone());
     provider.pause_list.store(true, Ordering::SeqCst);
     let (late, ()) = tokio::join!(
-        state.refresh_cloud_catalog(&providers, query(Some(client()))),
+        state.refresh_cloud_catalog(
+            &providers,
+            query(Some(client())),
+            Ok(codex_mcp::McpAttemptAccess::Unscoped),
+        ),
         async {
             provider.entered.notified().await;
             state.cloud_cache(Some(&client()));

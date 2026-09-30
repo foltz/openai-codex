@@ -78,6 +78,9 @@ impl StageOneRequestContext {
 }
 
 pub(crate) struct MemoryStartupContext {
+    // Finite pipeline plus its detached consolidation monitor, not an idle
+    // service or a turn entry. The triggering turn may already have ended.
+    account_work: Option<Arc<dyn codex_core::HostOperationWork>>,
     version: MemoryVersion,
     thread_id: ThreadId,
     thread: Arc<CodexThread>,
@@ -142,6 +145,7 @@ impl MemoryStartupContext {
         thread: Arc<CodexThread>,
         config: &Config,
         source: SessionSource,
+        account_work: Option<Arc<dyn codex_core::HostOperationWork>>,
     ) -> Self {
         let provider = create_model_provider(
             config.model_provider.clone(),
@@ -155,6 +159,7 @@ impl MemoryStartupContext {
             config,
             source,
             provider,
+            account_work,
         )
     }
 
@@ -176,9 +181,11 @@ impl MemoryStartupContext {
             config,
             source,
             provider,
+            /*account_work*/ None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_with_provider(
         thread_manager: Arc<ThreadManager>,
         auth_manager: Arc<AuthManager>,
@@ -187,6 +194,7 @@ impl MemoryStartupContext {
         config: &Config,
         source: SessionSource,
         provider: SharedModelProvider,
+        account_work: Option<Arc<dyn codex_core::HostOperationWork>>,
     ) -> Self {
         let model = config.model.as_deref().unwrap_or("unknown");
         let session_telemetry = build_session_telemetry(
@@ -199,6 +207,7 @@ impl MemoryStartupContext {
         );
 
         Self {
+            account_work,
             version: config.memories.version,
             thread_id,
             thread,
@@ -405,25 +414,37 @@ impl MemoryStartupContext {
         } = self
             .thread_manager
             .start_thread(StartThreadOptions {
+                account_work: self
+                    .account_work
+                    .as_ref()
+                    .map(|work| work.derive_operation())
+                    .transpose()
+                    .map_err(|_| {
+                        anyhow::anyhow!("memory child construction account work unavailable")
+                    })?,
                 session_source: Some(SessionSource::Internal(
                     InternalSessionSource::MemoryConsolidation,
                 )),
                 thread_source: Some(ThreadSource::MemoryConsolidation),
-                ..StartThreadOptions::new(config)
+                ..StartThreadOptions::new(config, None)
             })
             .await?;
 
         let agent = SpawnedConsolidationAgent { thread_id, thread };
-        let submit_result = match agent
-            .thread
-            .start_turn_if_idle(
-                TurnInputRequest::user_input(prompt).on_start(TurnStartOptions {
-                    turn_trigger: Some("memory_consolidation".to_owned()),
-                    ..Default::default()
-                }),
-            )
-            .await
-        {
+        let request = TurnInputRequest::user_input(prompt).on_start(TurnStartOptions {
+            turn_trigger: Some("memory_consolidation".to_owned()),
+            ..Default::default()
+        });
+        let submission = match self.account_work.as_deref() {
+            Some(work) => {
+                agent
+                    .thread
+                    .start_turn_if_idle_from_operation(request, work)
+                    .await
+            }
+            None => agent.thread.start_turn_if_idle(request).await,
+        };
+        let submit_result = match submission {
             Ok(StartIfIdleSubmission::Started { .. }) => Ok(()),
             Ok(submission) => Err(anyhow::anyhow!(
                 "memory consolidation input was not started: {submission:?}"
@@ -447,14 +468,40 @@ impl MemoryStartupContext {
         agent: SpawnedConsolidationAgent,
     ) -> anyhow::Result<()> {
         let SpawnedConsolidationAgent { thread_id, thread } = agent;
-        tokio::time::timeout(Duration::from_secs(10), thread.shutdown_and_wait())
+        let cleanup = thread.shutdown_and_wait_with_cleanup();
+        tokio::pin!(cleanup);
+        let (report, timed_out) = match tokio::time::timeout(Duration::from_secs(10), &mut cleanup)
             .await
-            .map_err(|_| {
-                anyhow::anyhow!("memory consolidation agent {thread_id} shutdown timed out")
-            })??;
-
-        self.thread_manager.remove_thread(&thread_id).await;
-
+        {
+            Ok(report) => (report, false),
+            Err(_) => {
+                tracing::warn!(
+                    "memory consolidation agent {thread_id} shutdown timed out; retaining account custody until cleanup observation completes"
+                );
+                // Keep the finite job's authority while driving the SAME
+                // retained cleanup. The timeout still means job failure.
+                (cleanup.await, true)
+            }
+        };
+        if report.cleanup
+            == (codex_core::ThreadCleanupOutcome::Finished {
+                persistence_failed: false,
+            })
+        {
+            // The owner may remove a dead child after positive cleanup even
+            // when its loop panicked. Incomplete cleanup stays in the inventory.
+            self.thread_manager
+                .remove_thread_if_same(&thread_id, &thread)
+                .await;
+        }
+        anyhow::ensure!(
+            !timed_out,
+            "memory consolidation agent {thread_id} shutdown timed out"
+        );
+        anyhow::ensure!(
+            report.is_complete(),
+            "memory consolidation agent {thread_id} shutdown incomplete: {report:?}"
+        );
         Ok(())
     }
 }

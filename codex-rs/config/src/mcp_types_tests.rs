@@ -643,6 +643,8 @@ fn deserialize_ignores_unknown_server_fields() {
             startup_readiness: Default::default(),
             supports_parallel_tool_calls: false,
             tool_input_schema_max_bytes: None,
+            thread_identity_eligible: false,
+            control_endpoint_eligible: false,
             omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,

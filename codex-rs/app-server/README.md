@@ -221,8 +221,39 @@ the Bedrock destination. Static access keys with an explicit region need no cred
 AWS profile `credential_process` commands are run by the AWS SDK; their network traffic is outside
 the application's HTTP policy. Configured credential exporters and AWS reauthentication commands
 require unrestricted application policy; policy revocation cancels their active work.
+## Clear lifecycle
+
+KCF's `thread/clear` replaces the requester's displayed predecessor with an
+authoritative successor. Its `transitionId` correlates the requester-scoped
+`thread/clear/ended` and `thread/clear/started` notifications; broad
+`thread/started` notifications are not succession authority. Protocol-only
+builds reject clear until the corresponding orchestration is enabled.
 
 ## Stored thread attachments
+
+### KCF interactive-subscription terminology
+
+`kcf/thread/interactiveSubscription/list` returns the experimental snapshot
+`{ generation, revision, entries: [{ threadId, interactiveSubscriptionCount }] }`.
+`kcf/thread/interactiveSubscription/changed` publishes revisioned changes.
+Both require experimental API opt-in. The counted unit is one live thread-event
+subscription held by a connection verified as a trusted interactive client,
+not evidence of human presence, display focus or retention.
+
+Historical KCF records called these relationships interactive attachments.
+The old KCF method names are not aliases: upstream now owns
+`thread/attachment/list` for stored resources. Consumers must migrate to the
+new names and count field, not silently treat the stored-resource response as
+a subscription snapshot.
+
+The KCF interactive relationship is separate from the stored resources below.
+Its experimental snapshot counts only connections requesting
+`initialize.capabilities.interactiveClient` that the server verifies as embedded
+or as a Unix peer with the running executable's file identity. Client name,
+cwd and loaded state establish no entitlement. Generation changes and revision
+gaps require a fresh snapshot. Revisioned changes contain complete counts for
+the changed threads. This is reachability evidence, not authority to transfer
+clear continuity, queued work, replies or names.
 
 - `thread/attachment/add` — add a durable resource reference to a stored thread without loading it. Repeated writes with the same attachment type and identity key return the existing attachment.
 - `thread/attachment/list` — list attachments for one stored thread in a cursor-paginated request, including a thread that is not loaded.
@@ -313,6 +344,20 @@ switching models. Setting `friendly` or `pragmatic` can replace a previous
 `none` setting for that purpose. Changing the setting does not rewrite the
 thread's existing instructions or change explicitly supplied base instructions.
 The old `features.personality` flag is ignored.
+
+# Applied MCP configuration identity
+
+`config/mcpServer/identity` returns `{ applied, current }`. Each identity has
+ordered base-to-profile `layers`, whose entries carry the normalized absolute
+`filePath` spelling from the accepted snapshot (without resolving symlinks)
+and the configuration layer's existing `sha256:...` `version`.
+`applied` is the complete selected-user snapshot accepted at startup or by the
+most recent successful runtime MCP refresh; `current` is freshly loaded from
+disk. Legacy core reloads that cannot construct this identity make `applied`
+unavailable rather than reporting stale provenance. Currentness requires both
+complete ordered layer lists to match exactly.
+This read-only method does not reload servers, restart the app-server or write
+configuration.
 
 # MCP server capabilities
 
@@ -486,3 +531,119 @@ and out-of-scope item IDs return invalid params (`-32602`) with
 Omitted or null cursors preserve normal first-page behavior. Continue anchored
 pages with the returned opaque string `nextCursor`; response fields and
 `backwardsCursor` semantics are unchanged.
+### Persisted thread classification
+
+`thread/read` preserves the persisted `threadSource` classification across clear,
+persistence, and unloaded reads. It is independent of the client origin in
+`source` and of interactive subscription state. Missing classification remains
+`null`; it is not inferred to be `user` from either origin or subscription.
+
+## Managed authentication transitions
+
+`account/managedAuthTransition/start`, `/read`, `/cancel`, and
+`account/managedAuthTransition/updated` form the experimental, version-`1`
+managed-auth transition protocol. Until a server-derived caller authorization
+is installed, all three requests refuse with `authorizationNotAdmitted` and
+make no auth or transition-state change. The protocol carries only correlation
+and revision/fingerprint metadata; it never accepts credentials or account
+secrets.
+
+## Clear transition observation
+
+Experimental clients can query this hosting server's durable clear record without
+subscribing to a thread or receiving the original clear notifications:
+
+```json
+{"id": 42, "method": "thread/clear/read", "params": {"successorThreadId": "B"}}
+```
+
+The result is a discriminated union:
+
+```json
+{"disposition": "none", "transition": null}
+{"disposition": "pending", "transition": {"transitionId": "T", "predecessorThreadId": "A", "successorThreadId": "B"}}
+{"disposition": "complete", "transition": {"transitionId": "T", "predecessorThreadId": "A", "successorThreadId": "B"}}
+```
+
+IDs above are placeholders; requests require a valid thread UUID. The lookup uses
+the existing local `clear_transitions` store, not rollout inference. `none` means
+no non-abandoned row for that successor in the available store; it does not prove
+that the thread exists, is fresh, or is eligible for any downstream service.
+Invalid IDs, unavailable/nonlocal storage, and database/decoding failures return
+errors rather than `none`. Normal initialization and experimental opt-in apply;
+this adds no authorization beyond the existing control interface.
+
+Reserved, successor-created, committed, and evidence-claimed records return
+`pending`; completed records return `complete`. Pending need not make progress
+and may become `none` when a reservation is abandoned. Consumers must own bounded
+retries, fail closed on unresolved/error outcomes, and must not treat pending or
+pending-to-none as permission to manufacture a fresh identity.
+
+This read has no thread serialization scope and takes no lifecycle lock: a second
+connection can read a pending record while a clear hook is running. It does not
+advance phases, deliver evidence, release reservations, or change subscriptions.
+Existing pre-move hook ordering is unchanged. A hook which blocks completion
+cannot wait for its own successor's subscription to move.
+
+`complete` is historical succession evidence, **not** proof of hook delivery or
+current interactive subscription. Completion precedes the connection move; a
+disconnect or startup reconciliation can leave a completed record with no
+successor subscription. Verify current subscription and any consumer policy
+separately. Reconnect by querying the same hosting server/store and exact
+successor; completed tuples survive unload, cold resume, and restart without
+replaying hooks. For a chain X → A → B, querying A returns X/A and querying B
+returns A/B; it never selects an arbitrary latest transition.
+
+Lifecycle consumers can use the already negotiated generic control endpoint.
+This API does not add hook endpoint discovery, change `codex/thread-identity`,
+or implement downstream admission, naming, trust, or routing decisions.
+
+## Clear recovery observation (experimental)
+
+Recovery creates an independent thread when the client's displayed predecessor
+is unavailable, or when no predecessor is displayed. It does not shut down the
+predecessor, authorize succession, or create a `clear_transitions` edge. The TUI
+uses its existing unavailable predicate; the server does not arbitrate whether
+an authoritative clear could have succeeded from fresher client state.
+
+Before creation, probe `thread/clear/recovery/read` with `{}` on the same
+connection. A supported producer returns `contractVersion: 1`,
+`durability: "durable" | "unavailable"`, and `observation: {"type":"support"}`.
+Revision 1 promises both this read and the revision-1 `thread/start.clearRecovery`
+write contract. Repeat the probe after reconnect. Method existence alone, an
+experimental opt-in, or a post-creation echo is not support proof.
+
+Send `thread/start` with `sessionStartSource: "clear"` and
+`clearRecovery: {"contractVersion":1,"predecessorThreadId":"A"}`. Use null only
+when there genuinely is no displayed predecessor. Never put recovery A in
+`clearPredecessorThreadId`. Unsupported producers must not be sent a recovery
+creation request. There is no automatic creation retry or idempotency key.
+The recovery TUI omits `historyMode`: the server selects paginated history when
+its store supports it and otherwise uses its normal legacy default. This avoids
+a pagination-discovery retry on a fresh or reconnected client.
+
+`ThreadStartResponse.clearRecovery` echoes `successorThreadId`, the accepted
+`context`, and `durability`. An absent/mismatched echo or lost response is an
+unknown outcome; a new attempt may create another thread. Hooks and notifications
+are unchanged: a clear-source hook without an authoritative tuple is not a
+recovery receipt. Consumers discover provenance through the successor-keyed read.
+
+Read with `{"successorThreadId":"B"}`. The result has the same version and
+durability fields, plus an observation whose type is `none`, `pending`,
+`complete`, or `failed`. The latter three contain `recovery` in the response
+echo's shape. Pending is written before construction (including the composed
+KCF eager hooks); complete means core thread creation succeeded, not that the
+client received its response or that A stopped. Failed means creation returned
+an error. Cancellation, a crash or a failed phase write can leave pending;
+consumers must bound waiting and fail closed. No background expiry or repair
+turns pending into permission.
+
+Evidence lives in the process state database, independently of rollouts. Even an
+ephemeral successor has durable evidence when that database is available. Without
+it, creation is allowed with explicitly unavailable durability and the accepted
+context in the response, but every successor-specific read errors, including
+during construction. An in-memory response is not restart evidence. `none` from
+this read and `thread/clear/read` together still does not prove freshness. Errors,
+lost storage or a previously observed recovery disappearing must never fall
+through to fresh identity admission. Records have no implicit TTL or predecessor
+uniqueness constraint; repeated independent recoveries can name the same A.

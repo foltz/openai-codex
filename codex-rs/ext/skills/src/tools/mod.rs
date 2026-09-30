@@ -208,7 +208,12 @@ struct SkillToolContext {
 }
 
 impl SkillToolContext {
-    async fn catalog(&self, turn_id: &str, authority: SkillToolAuthoritySelector) -> SkillCatalog {
+    async fn catalog(
+        &self,
+        turn_id: &str,
+        authority: SkillToolAuthoritySelector,
+        _mcp_access: Result<codex_mcp::McpAttemptAccess<'_>, codex_mcp::McpAttemptRefused>,
+    ) -> SkillCatalog {
         match authority {
             SkillToolAuthoritySelector::Cloud => {
                 if !self.cloud_available {

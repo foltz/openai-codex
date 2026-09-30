@@ -14,7 +14,14 @@ struct FakeCloudSkillProvider {
 }
 
 impl SkillProvider for FakeCloudSkillProvider {
-    fn list(&self, _query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog> {
+    fn list<'a>(
+        &'a self,
+        _query: SkillListQuery,
+        _mcp_access: std::result::Result<
+            codex_mcp::McpAttemptAccess<'a>,
+            codex_mcp::McpAttemptRefused,
+        >,
+    ) -> SkillProviderFuture<'a, SkillCatalog> {
         Box::pin(async { Ok(self.catalog.clone()) })
     }
 

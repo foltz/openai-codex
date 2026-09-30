@@ -20,6 +20,96 @@ use wiremock::matchers::method;
 use wiremock::matchers::path;
 
 #[tokio::test]
+async fn managed_reset_observes_admitted_backend_mutation_and_retry_after_cancellation() {
+    let home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    let mut config = load_plugins_config(home.path(), home.path()).await;
+    config.chatgpt_base_url = format!("{}/backend-api", server.uri());
+    let auth_manager = test_auth_manager(Some(AuthMode::Chatgpt));
+    let auth = auth_manager.auth().await;
+    let manager = Arc::new(test_plugins_manager_with_auth_manager(
+        home.path().to_path_buf(),
+        /*restriction_product*/ None,
+        auth_manager,
+    ));
+    let remote_id = "b1234567-89ab-4cde-8f01-234567890abc";
+    let plugin_id = PluginId::new(
+        "sample".to_string(),
+        REMOTE_GLOBAL_MARKETPLACE_NAME.to_string(),
+    )
+    .unwrap();
+    let cache = manager.store.plugin_base_root(&plugin_id);
+    write_file(
+        cache.join("1.0.0/.codex-plugin/plugin.json").as_path(),
+        r#"{"name":"sample","version":"1.0.0"}"#,
+    );
+    Mock::given(method("GET"))
+        .and(path(format!("/backend-api/ps/plugins/{remote_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": remote_id, "name": "sample", "scope": "GLOBAL",
+            "installation_policy": "AVAILABLE", "authentication_policy": "ON_USE",
+            "release": {"display_name": "Sample", "description": "Sample plugin", "interface": {}}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let entered = Arc::new(Notify::new());
+    let post_entered = Arc::clone(&entered);
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/backend-api/ps/plugins/{remote_id}/uninstall"
+        )))
+        .respond_with(move |_: &wiremock::Request| {
+            post_entered.notify_one();
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"id": remote_id, "enabled": false}))
+                .set_delay(std::time::Duration::from_secs(60))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    let old_manager = Arc::clone(&manager);
+    let mutation = tokio::spawn(async move {
+        old_manager
+            .uninstall_remote_plugin(
+                &config,
+                auth.as_ref(),
+                remote_id,
+                /*on_effective_plugins_changed*/ None,
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(30), entered.notified())
+        .await
+        .expect("backend mutation entered");
+    // Do not charge cold HTTP setup to this discriminator's reset budget.
+    tokio::time::pause();
+    let reset = manager.reset_remote_installed_plugins();
+    tokio::pin!(reset);
+    assert!(futures::poll!(reset.as_mut()).is_pending());
+    tokio::time::advance(std::time::Duration::from_secs(10)).await;
+    assert_eq!(
+        reset.await.unwrap_err().kind(),
+        std::io::ErrorKind::TimedOut
+    );
+    assert!(cache.as_path().exists());
+    mutation.abort();
+    assert!(
+        mutation
+            .await
+            .err()
+            .expect("mutation task cancelled")
+            .is_cancelled()
+    );
+    manager
+        .reset_remote_installed_plugins()
+        .await
+        .expect("retry observes cancelled request");
+    assert!(cache.as_path().exists());
+    server.verify().await;
+}
+
+#[tokio::test]
 async fn uninstall_serializes_backend_mutations_and_preserves_cache_on_failure() {
     for uninstall_fails in [false, true] {
         let home = TempDir::new().unwrap();

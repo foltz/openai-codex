@@ -48,6 +48,12 @@ pub(super) fn server_notification_thread_target(
     let thread_id = match notification {
         ServerNotification::Error(notification) => Some(notification.thread_id.as_str()),
         ServerNotification::ThreadStarted(notification) => Some(notification.thread.id.as_str()),
+        ServerNotification::ThreadClearEnded(notification) => {
+            Some(notification.predecessor_thread_id.as_str())
+        }
+        ServerNotification::ThreadClearStarted(notification) => {
+            Some(notification.successor_thread.id.as_str())
+        }
         ServerNotification::ThreadStatusChanged(notification) => {
             Some(notification.thread_id.as_str())
         }
@@ -191,10 +197,12 @@ pub(super) fn server_notification_thread_target(
             }
         }
         ServerNotification::ProjectChanged(_)
+        | ServerNotification::ThreadInteractiveSubscriptionChanged(_)
         | ServerNotification::SkillsChanged(_)
         | ServerNotification::McpServerOauthLoginCompleted(_)
         | ServerNotification::AccountUpdated(_)
-        | ServerNotification::GatewayOAuthChanged(_)
+| ServerNotification::GatewayOAuthChanged(_)
+        | ServerNotification::ManagedTransitionStatusUpdated(_)
         | ServerNotification::AccountRateLimitsUpdated(_)
         | ServerNotification::AppListUpdated(_)
         | ServerNotification::EnvironmentConnected(_)

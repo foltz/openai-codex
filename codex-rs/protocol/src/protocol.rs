@@ -588,6 +588,11 @@ pub struct AdditionalContextEntry {
 #[allow(clippy::large_enum_variant)]
 #[non_exhaustive]
 pub enum Op {
+    /// Host-admitted legacy task start; owned by the queue after submission.
+    HostTurn {
+        action: crate::host_turn_work::HostTurnAction,
+        work: Box<dyn crate::host_turn_work::HostTurnWork>,
+    },
     /// Abort current task without terminating background terminal processes.
     /// This server sends [`EventMsg::TurnAborted`] in response.
     Interrupt,
@@ -625,6 +630,7 @@ pub enum Op {
     TurnInput {
         request: Box<TurnInputRequest>,
         mode: TurnInputMode,
+        host_work: Option<Box<dyn crate::host_turn_work::HostTurnWork>>,
         reply: oneshot::Sender<CodexResult<TurnInputSubmission>>,
     },
 
@@ -632,6 +638,7 @@ pub enum Op {
     RecoverTurn {
         thread_settings: ThreadSettingsOverrides,
         start_options: TurnStartOptions,
+        host_work: Option<Box<dyn crate::host_turn_work::HostTurnWork>>,
         reply: oneshot::Sender<CodexResult<TurnInputSubmission>>,
     },
 
@@ -665,6 +672,8 @@ pub enum Op {
     InterAgentCommunication {
         communication: InterAgentCommunication,
         start_options: TurnStartOptions,
+        /// In-process custody follows trigger mail until its consuming turn.
+        work: Option<Box<dyn crate::host_turn_work::HostTurnWork>>,
     },
 
     /// Approve a command execution
@@ -932,6 +941,10 @@ impl InterAgentCommunication {
 impl Op {
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::HostTurn { action, .. } => match action {
+                crate::host_turn_work::HostTurnAction::Compact => "compact",
+                crate::host_turn_work::HostTurnAction::Review(_) => "review",
+            },
             Self::Interrupt => "interrupt",
             Self::InterruptIfNoPendingInput { .. } => "interrupt_if_no_pending_input",
             Self::CleanBackgroundTerminals => "clean_background_terminals",
@@ -3138,6 +3151,12 @@ pub struct SessionMeta {
     pub forked_from_ordinal_exclusive: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<ThreadId>,
+    /// Exact predecessor for a server-authorized clear replacement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clear_predecessor_thread_id: Option<ThreadId>,
+    /// Stable clear-transition identity shared with the predecessor end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clear_transition_id: Option<String>,
     pub timestamp: String,
     pub cwd: PathBuf,
     /// Top-level runtime workspace roots at creation for default environments,
@@ -3208,6 +3227,8 @@ impl Default for SessionMeta {
             forked_from_id: None,
             forked_from_ordinal_exclusive: None,
             parent_thread_id: None,
+            clear_predecessor_thread_id: None,
+            clear_transition_id: None,
             timestamp: String::new(),
             cwd: PathBuf::new(),
             runtime_workspace_roots: None,

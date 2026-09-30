@@ -215,6 +215,7 @@ where
                         executor_capability_discovery: None,
                     },
                     &thread_state,
+                    Ok(codex_mcp::McpAttemptAccess::Unscoped),
                 )
                 .await;
             for warning in bounded_warnings(&catalog.warnings) {
@@ -412,7 +413,10 @@ where
                 .get::<ExecutorSkillsStepState>()
                 .map(|executor_skills| executor_skills.0.clone())
                 .unwrap_or_default();
-            catalog.extend(self.list_skills(query, &thread_state).await);
+            catalog.extend(
+                self.list_skills(query, &thread_state, input.mcp_access)
+                    .await,
+            );
             for warning in bounded_warnings(&catalog.warnings) {
                 self.emit_warning(thread_store.level_id(), Some(&input.turn_id), warning);
             }
@@ -481,6 +485,7 @@ where
                         host_snapshot.clone(),
                         mcp_resources.clone(),
                         &thread_state,
+                        input.mcp_access,
                     )
                     .await
                 {
@@ -600,6 +605,7 @@ impl<C> SkillsExtension<C> {
         &self,
         mut query: SkillListQuery,
         thread_state: &SkillsThreadState,
+        _mcp_access: Result<codex_mcp::McpAttemptAccess<'_>, codex_mcp::McpAttemptRefused>,
     ) -> SkillCatalog {
         let include_cloud_skills = query.include_cloud_skills;
         query.include_cloud_skills = false;
@@ -619,11 +625,13 @@ impl<C> SkillsExtension<C> {
         host_snapshot: Option<Arc<HostSkillsSnapshot>>,
         mcp_resources: Option<Arc<McpResourceClient>>,
         thread_state: &SkillsThreadState,
+        mcp_access: Result<codex_mcp::McpAttemptAccess<'_>, codex_mcp::McpAttemptRefused>,
     ) -> Result<SkillReadResult, String> {
         thread_state
             .read_skill(
                 &self.providers,
                 SkillReadRequest {
+                    mcp_access,
                     _lifetime: PhantomData,
                     authority: entry.authority.clone(),
                     package: entry.id.clone(),

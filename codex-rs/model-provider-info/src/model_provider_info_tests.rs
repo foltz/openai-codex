@@ -22,6 +22,40 @@ fn runtime_internal_metadata_opt_in_is_not_serialized_or_configurable() {
 }
 
 #[test]
+fn residency_publication_replaces_and_clears_exact_state() {
+    let state = RwLock::new(None);
+    assert_eq!(
+        replace_residency_requirement(&state, Some(ResidencyRequirement::Us)),
+        Ok(())
+    );
+    assert_eq!(*state.read().unwrap(), Some(ResidencyRequirement::Us));
+    assert_eq!(replace_residency_requirement(&state, None), Ok(()));
+    assert_eq!(*state.read().unwrap(), None);
+}
+
+#[test]
+fn residency_publication_refuses_poison_without_erasing_prior_state() {
+    let state = std::sync::Arc::new(RwLock::new(Some(ResidencyRequirement::Us)));
+    let poisoned = std::sync::Arc::clone(&state);
+    assert!(
+        std::thread::spawn(move || {
+            let _guard = poisoned.write().unwrap();
+            panic!("poison isolated residency state");
+        })
+        .join()
+        .is_err()
+    );
+    assert_eq!(
+        replace_residency_requirement(&state, None),
+        Err(ResidencyRequirementUnavailable)
+    );
+    assert_eq!(
+        *state.read().unwrap_err().into_inner(),
+        Some(ResidencyRequirement::Us)
+    );
+}
+
+#[test]
 fn test_api_provider_applies_current_managed_residency() {
     let info = ModelProviderInfo {
         http_headers: Some(maplit::hashmap! {

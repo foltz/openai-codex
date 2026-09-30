@@ -678,6 +678,7 @@ async fn command_center_new_preserves_only_selected_server_profiles() -> Result<
         state_db,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
         Default::default(),
+        Arc::new(codex_app_server_client::InProcessHost::default()),
     )
     .await?;
     let mut server = AppServerSession::new(
@@ -695,6 +696,7 @@ async fn command_center_new_preserves_only_selected_server_profiles() -> Result<
             &app.local_settings,
             &app.config,
             /*session_start_source*/ None,
+            /*clear_predecessor_thread_id*/ None,
             /*remote_cwd_override*/ None,
             Some(&selection),
         )
@@ -812,7 +814,7 @@ async fn command_center_new_restores_blank_drafts_and_builtin_permissions() -> R
     let started = server.start_thread(&app.config).await?;
     let startup = started.session.thread_id;
     app.pending_startup_thread_start = true;
-    app.handle_startup_thread_started(&mut server, Ok(started))
+    app.handle_startup_thread_started(&mut server, Ok(started.into()))
         .await?;
     app.new_agents_overview_session(&mut tui, &mut server, /*cwd*/ None)
         .await?;

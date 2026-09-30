@@ -381,7 +381,7 @@ impl App {
         }
 
         let (session, turns, live_attached) = match app_server
-            .resume_thread(
+            .observe_thread(
                 &self.local_settings,
                 self.config.clone(),
                 thread_id,
@@ -826,11 +826,11 @@ impl App {
     pub(super) async fn handle_startup_thread_started(
         &mut self,
         app_server: &mut AppServerSession,
-        result: Result<AppServerStartedThread>,
+        result: Result<crate::app_server_session::PendingStartupThread>,
     ) -> Result<()> {
         if !self.pending_startup_thread_start {
             if let Ok(started) = result {
-                let thread_id = started.session.thread_id;
+                let thread_id = started.started.session.thread_id;
                 if let Err(err) = app_server.thread_unsubscribe(thread_id).await {
                     tracing::warn!(
                         thread_id = %thread_id,
@@ -846,7 +846,7 @@ impl App {
         self.chat_widget
             .set_queue_submissions_until_session_configured(/*queue*/ false);
         match result {
-            Ok(started) => {
+            Ok(crate::app_server_session::PendingStartupThread { started, retention }) => {
                 self.chat_widget.mark_fresh_task_for_sparkle(&started);
                 let thread_id = started.session.thread_id;
                 if started.task_tools_available {
@@ -916,6 +916,7 @@ impl App {
                 let recovery_was_pending = self.chat_widget.hold_rate_limit_recovery();
                 self.enqueue_primary_thread_session(started.session, started.turns)
                     .await?;
+                retention.commit();
                 self.apply_backend_banner_fallback(app_server).await;
                 if let Some(notice) = self.pending_server_version_notice.take() {
                     self.chat_widget.add_server_version_warning(notice);
@@ -945,13 +946,32 @@ impl App {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) async fn start_fresh_session(
         &mut self,
         tui: &mut tui::Tui,
         app_server: &mut AppServerSession,
-        session_start_source: Option<ThreadStartSource>,
         initial_user_message: Option<crate::chatwidget::UserMessage>,
         new_thread_name: Option<String>,
+        session_start_source: Option<codex_app_server_protocol::ThreadStartSource>,
+    ) {
+        self.start_fresh_session_with_summary_hint(
+            tui,
+            app_server,
+            initial_user_message,
+            new_thread_name,
+            session_start_source,
+        )
+        .await;
+    }
+
+    pub(super) async fn start_fresh_session_with_summary_hint(
+        &mut self,
+        tui: &mut tui::Tui,
+        app_server: &mut AppServerSession,
+        initial_user_message: Option<crate::chatwidget::UserMessage>,
+        new_thread_name: Option<String>,
+        session_start_source: Option<codex_app_server_protocol::ThreadStartSource>,
     ) {
         if self.reject_pending_permission_root_switch() {
             if let Some(message) = initial_user_message {
@@ -980,16 +1000,34 @@ impl App {
             &self.cli_kv_overrides,
             &self.harness_overrides,
         );
-        match app_server
-            .start_thread_with_session_start_source(
-                &self.local_settings,
-                &config,
-                session_start_source,
-                /*remote_cwd_override*/ None,
-                /*selected_profile*/ None,
-            )
-            .await
-        {
+        let summary = session_summary(
+            self.chat_widget.token_usage(),
+            self.chat_widget.thread_id(),
+            self.chat_widget.thread_name(),
+            self.chat_widget.rollout_path().as_deref(),
+        );
+        let started =
+            if session_start_source == Some(codex_app_server_protocol::ThreadStartSource::Clear) {
+                app_server
+                    .start_clear_recovery(
+                        &self.local_settings,
+                        &config,
+                        self.current_displayed_thread_id(),
+                    )
+                    .await
+            } else {
+                app_server
+                    .start_thread_with_session_start_source(
+                        &self.local_settings,
+                        &config,
+                        session_start_source,
+                        /*clear_predecessor_thread_id*/ None,
+                        /*remote_cwd_override*/ None,
+                        /*selected_profile*/ None,
+                    )
+                    .await
+            };
+        match started {
             Ok(mut started) => {
                 if let Some(thread_id) = self.current_displayed_thread_id()
                     && let Some(blank) = self.agents_overview.blank_sessions.get_mut(&thread_id)
@@ -1047,8 +1085,23 @@ impl App {
                     self.chat_widget.add_error_message(format!(
                         "Failed to attach to fresh app-server thread: {err}"
                     ));
-                } else if let Some(err) = name_error {
-                    self.chat_widget.add_error_message(err);
+                } else {
+                    if let Some(err) = name_error {
+                        self.chat_widget.add_error_message(err);
+                    }
+                    if let Some(summary) = summary {
+                        let mut lines: Vec<Line<'static>> = Vec::new();
+                        if let Some(usage_line) = summary.usage_line {
+                            lines.push(usage_line.into());
+                        }
+                        if let Some(command) = summary.resume_hint {
+                            lines.push(vec![
+                                "To continue this session, run ".into(),
+                                command.cyan(),
+                            ].into());
+                        }
+                        self.chat_widget.add_plain_history_lines(lines);
+                    }
                 }
             }
             Err(err) => {
@@ -1058,6 +1111,152 @@ impl App {
                 if let Some(message) = initial_user_message {
                     self.chat_widget.restore_user_message_to_composer(message);
                 }
+            }
+        }
+        tui.frame_requester().schedule_frame();
+    }
+
+    /// Replaces the displayed thread through the server-owned clear transition.
+    ///
+    /// The request must be issued before any local unsubscribe or listener teardown because the
+    /// app server authorizes the operation from the requesting connection's current subscription
+    /// to the exact displayed predecessor.
+    pub(super) async fn clear_displayed_session(
+        &mut self,
+        tui: &mut tui::Tui,
+        app_server: &mut AppServerSession,
+        initial_user_message: Option<crate::chatwidget::UserMessage>,
+        new_thread_name: Option<String>,
+    ) {
+        let displayed = self.current_displayed_thread_id();
+        if displayed.is_none() || displayed.is_some_and(|id| self.thread_unavailable(id)) {
+            self.start_fresh_session_with_summary_hint(
+                tui,
+                app_server,
+                initial_user_message,
+                new_thread_name,
+                Some(codex_app_server_protocol::ThreadStartSource::Clear),
+            )
+            .await;
+            return;
+        }
+        let Some(predecessor_thread_id) = displayed else {
+            return;
+        };
+        let summary = session_summary(
+            self.chat_widget.token_usage(),
+            self.chat_widget.thread_id(),
+            self.chat_widget.thread_name(),
+            self.chat_widget.rollout_path().as_deref(),
+        );
+
+        let response = match app_server.thread_clear(predecessor_thread_id).await {
+            Ok(response) => response,
+            Err(err) => {
+                self.chat_widget
+                    .add_error_message(format!("Failed to clear the displayed session: {err}"));
+                tui.frame_requester().schedule_frame();
+                return;
+            }
+        };
+        if response.predecessor_thread_id != predecessor_thread_id.to_string() {
+            self.chat_widget.add_error_message(format!(
+                "Failed to clear: app server returned predecessor {} for displayed thread {}",
+                response.predecessor_thread_id, predecessor_thread_id
+            ));
+            tui.frame_requester().schedule_frame();
+            return;
+        }
+        let successor_thread_id = match ThreadId::from_string(&response.successor_thread.id) {
+            Ok(thread_id) => thread_id,
+            Err(err) => {
+                self.chat_widget.add_error_message(format!(
+                    "Failed to attach clear successor {}: {err}",
+                    response.successor_thread.id
+                ));
+                tui.frame_requester().schedule_frame();
+                return;
+            }
+        };
+        let retention = app_server
+            .retain_clear_successor(&response.successor_thread.id)
+            .await;
+        let session = self
+            .session_state_for_thread_read(successor_thread_id, &response.successor_thread)
+            .await;
+        let blocks_direct_input =
+            crate::app_server_session::thread_blocks_direct_input(&response.successor_thread);
+        let mut started = AppServerStartedThread {
+            session,
+            turns: response.successor_thread.turns,
+            blocks_direct_input,
+            task_tools_available: false,
+        };
+
+        let name_error = if let Some(name) = new_thread_name {
+            match app_server
+                .thread_set_name(successor_thread_id, name.clone())
+                .await
+            {
+                Ok(()) => {
+                    started.session.thread_name = Some(name);
+                    None
+                }
+                Err(err) => Some(format!("Failed to name the new session: {err}")),
+            }
+        } else {
+            None
+        };
+
+        // The server has now atomically moved this connection from A to B. Local listener cleanup
+        // may safely follow the authoritative response, but must never precede the request above.
+        self.shutdown_current_thread_except(app_server, Some(successor_thread_id))
+            .await;
+        let tracked_thread_ids: Vec<ThreadId> =
+            self.thread_event_channels.keys().copied().collect();
+        for thread_id in tracked_thread_ids {
+            if thread_id == successor_thread_id {
+                continue;
+            }
+            if let Err(err) = app_server.thread_unsubscribe(thread_id).await {
+                tracing::warn!("failed to unsubscribe tracked thread {thread_id}: {err}");
+            }
+        }
+        if let Err(err) = self.clear_terminal_ui(tui, /*redraw_header*/ false) {
+            self.chat_widget
+                .add_error_message(format!("Failed to clear terminal UI: {err}"));
+        }
+        self.reset_app_ui_state_after_clear();
+
+        if let Err(err) = self
+            .replace_chat_widget_with_app_server_thread(
+                tui,
+                started,
+                ThreadAttachPresentation::SessionLineage,
+                initial_user_message,
+            )
+            .await
+        {
+            self.chat_widget.add_error_message(format!(
+                "Failed to attach to clear successor app-server thread: {err}"
+            ));
+        } else {
+            if let Some(retention) = retention {
+                retention.commit();
+            }
+            if let Some(err) = name_error {
+                self.chat_widget.add_error_message(err);
+            }
+            if let Some(summary) = summary {
+                let mut lines: Vec<Line<'static>> = Vec::new();
+                if let Some(usage_line) = summary.usage_line {
+                    lines.push(usage_line.into());
+                }
+                if let Some(command) = summary.resume_hint {
+                    let spans = vec!["To continue this session, run ".into(), command.cyan()];
+                    lines.push(spans.into());
+                }
+                self.chat_widget.add_plain_history_lines(lines);
             }
         }
         tui.frame_requester().schedule_frame();
@@ -1343,7 +1542,7 @@ impl App {
             && self.chat_widget.thread_id() == Some(resumed_thread_id))
         .then(|| self.chat_widget.capture_thread_input_state())
         .flatten();
-        self.detach_current_thread_for_navigation(app_server, Some(resumed_thread_id))
+        self.shutdown_current_thread_except(app_server, Some(resumed_thread_id))
             .await;
         self.local_settings = local_settings;
         self.refresh_server_version_overview_notice(CODEX_CLI_VERSION);

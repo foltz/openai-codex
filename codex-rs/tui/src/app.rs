@@ -133,7 +133,6 @@ use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadLoadedListParams;
 use codex_app_server_protocol::ThreadMemoryMode;
 use codex_app_server_protocol::ThreadSettingsUpdateParams;
-use codex_app_server_protocol::ThreadStartSource;
 use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnError as AppServerTurnError;
 use codex_app_server_protocol::TurnStatus;
@@ -486,6 +485,28 @@ pub enum ExitReason {
     /// The current thread was deleted, rather than disconnected.
     ThreadRemoved,
     Fatal(String),
+}
+
+fn session_summary(
+    token_usage: TokenUsage,
+    thread_id: Option<ThreadId>,
+    thread_name: Option<String>,
+    rollout_path: Option<&Path>,
+) -> Option<SessionSummary> {
+    let usage_line = (!token_usage.is_zero()).then(|| token_usage.to_string());
+    let resume_hint = resumable_thread(thread_id, thread_name, rollout_path).and_then(|thread| {
+        codex_utils_cli::resume_hint(thread.thread_name.as_deref(), Some(thread.thread_id))
+    });
+    if usage_line.is_none() && resume_hint.is_none() {
+        return None;
+    }
+    Some(SessionSummary { usage_line, resume_hint })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionSummary {
+    usage_line: Option<String>,
+    resume_hint: Option<String>,
 }
 
 fn resumable_thread(

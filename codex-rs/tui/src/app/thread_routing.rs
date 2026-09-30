@@ -44,9 +44,51 @@ impl App {
     }
 
     pub(super) async fn shutdown_current_thread(&mut self, app_server: &mut AppServerSession) {
-        self.stop_realtime_conversation(app_server).await;
-        self.detach_current_thread_for_navigation(app_server, /*destination*/ None)
+        self.shutdown_current_thread_except(app_server, /*retained_target*/ None)
             .await;
+    }
+
+    /// Preserve an already adopted target across primary, displayed and side cleanup.
+    pub(super) async fn shutdown_current_thread_except(
+        &mut self,
+        app_server: &mut AppServerSession,
+        retained_target: Option<ThreadId>,
+    ) {
+        // A navigation target parks the existing voice owner under its own
+        // listener. An explicit shutdown has no destination and stops it.
+        if retained_target.is_none() {
+            self.stop_realtime_conversation(app_server).await;
+        }
+        let side_thread_ids: Vec<ThreadId> = self.side_threads.keys().copied().collect();
+        for side_thread_id in side_thread_ids {
+            if Some(side_thread_id) != retained_target {
+                self.discard_side_thread(app_server, side_thread_id).await;
+            }
+        }
+        let displayed = self.chat_widget.thread_id();
+        let mut leaving = Vec::new();
+        if let Some(primary) = self.primary_thread_id
+            && Some(primary) != displayed
+        {
+            leaving.push(primary);
+        }
+        if let Some(displayed) = displayed {
+            leaving.push(displayed);
+        }
+        for thread_id in leaving {
+            if Some(thread_id) == retained_target
+                || (retained_target.is_some() && self.voice_owner_thread_id() == Some(thread_id))
+                || self.agents_overview.dispatched_requests.contains_key(&thread_id)
+                || self.agents_overview.blank_sessions.contains_key(&thread_id)
+            {
+                continue;
+            }
+            if let Err(err) = app_server.thread_unsubscribe(thread_id).await {
+                tracing::warn!("failed to unsubscribe thread {thread_id}: {err}");
+            }
+            self.abort_thread_event_listener(thread_id);
+            self.pending_server_profiles.remove(&thread_id);
+        }
     }
 
     pub(super) async fn shutdown_side_threads(&mut self, app_server: &mut AppServerSession) {
@@ -1674,7 +1716,7 @@ impl App {
         }
 
         match app_server
-            .resume_thread(
+            .observe_thread(
                 &self.local_settings,
                 self.config.clone(),
                 thread_id,

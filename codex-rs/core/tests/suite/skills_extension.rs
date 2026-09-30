@@ -115,7 +115,11 @@ use toml::toml;
 use tracing::Level;
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_test::internal::MockWriter;
+use wiremock::Mock;
 use wiremock::MockServer;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path_regex;
 
 #[path = "skills_extension/cloud_skill_tests.rs"]
 mod cloud_skill_tests;
@@ -140,7 +144,11 @@ struct PausedCatalogSkillProvider {
 }
 
 impl SkillProvider for PausedCatalogSkillProvider {
-    fn list(&self, query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog> {
+    fn list<'a>(
+        &'a self,
+        query: SkillListQuery,
+        mcp_access: Result<codex_mcp::McpAttemptAccess<'a>, codex_mcp::McpAttemptRefused>,
+    ) -> SkillProviderFuture<'a, SkillCatalog> {
         Box::pin(async move {
             if query.host_snapshot.is_none() {
                 return Ok(SkillCatalog::default());
@@ -155,7 +163,7 @@ impl SkillProvider for PausedCatalogSkillProvider {
                     .expect("resume discovery")
                     .forget();
             }
-            self.inner.list(query).await
+            self.inner.list(query, mcp_access).await
         })
     }
 
@@ -199,7 +207,11 @@ impl ExtensionEventSink for ChannelEventSink {
 }
 
 impl SkillProvider for StaticSkillProvider {
-    fn list(&self, query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog> {
+    fn list<'a>(
+        &'a self,
+        query: SkillListQuery,
+        _mcp_access: Result<codex_mcp::McpAttemptAccess<'a>, codex_mcp::McpAttemptRefused>,
+    ) -> SkillProviderFuture<'a, SkillCatalog> {
         // Keep thread context empty so the catalog is exercised through the
         // production turn-input path, where the host snapshot is available.
         let catalog = if query.host_snapshot.is_some() {
@@ -233,7 +245,11 @@ impl SkillProvider for StaticSkillProvider {
 }
 
 impl SkillProvider for CatalogSkillProvider {
-    fn list(&self, _query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog> {
+    fn list<'a>(
+        &'a self,
+        _query: SkillListQuery,
+        _mcp_access: Result<codex_mcp::McpAttemptAccess<'a>, codex_mcp::McpAttemptRefused>,
+    ) -> SkillProviderFuture<'a, SkillCatalog> {
         Box::pin(async { Ok(self.catalog.clone()) })
     }
 
@@ -1114,7 +1130,7 @@ async fn opted_in_executor_provider_skips_host_discovery_but_injects_discovered_
             history_mode: Some(codex_protocol::protocol::ThreadHistoryMode::Legacy),
             environments: Some(vec![environment.clone()]),
             thread_extension_init,
-            ..StartThreadOptions::new(executor_config)
+            ..StartThreadOptions::new(executor_config, /*control_endpoint*/ None)
         })
         .await?;
     let executor_skill_path = environment
@@ -1508,7 +1524,7 @@ async fn executor_skill_tool_reads_references_under_current_permissions(
         .start_thread(StartThreadOptions {
             environments: Some(vec![selection]),
             thread_extension_init,
-            ..StartThreadOptions::new(config)
+            ..StartThreadOptions::new(config, /*control_endpoint*/ None)
         })
         .await?;
     let response = responses::mount_sse_sequence(
@@ -2011,6 +2027,12 @@ async fn assert_catalog_model_switch(max_context_tokens: Option<usize>) -> Resul
     const MODEL_A: &str = "skills-model-a";
     const MODEL_B: &str = "skills-model-b";
     let server = responses::start_mock_server().await;
+    // Exporter shutdown flushes to the configured sink after the snapshot assertions.
+    Mock::given(method("POST"))
+        .and(path_regex("^/metrics$"))
+        .respond_with(ResponseTemplate::new(/*status*/ 200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
     let response = responses::mount_sse_sequence(
         &server,
         vec![
@@ -2970,7 +2992,7 @@ async fn production_turn_keeps_rebalanced_catalogs_stable_after_compaction_and_r
         .start_thread(StartThreadOptions {
             environments: Some(vec![pending_selection.clone()]),
             thread_extension_init: thread_extension_init.clone(),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), None)
         })
         .await?;
     let response = responses::mount_sse_sequence(
@@ -3095,7 +3117,7 @@ async fn production_turn_keeps_rebalanced_catalogs_stable_after_compaction_and_r
             }),
             environments: Some(vec![pending_selection.clone()]),
             thread_extension_init,
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?;
     resumed

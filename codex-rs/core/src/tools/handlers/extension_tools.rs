@@ -3,6 +3,8 @@ use std::sync::Arc;
 use std::sync::Weak;
 
 use codex_history::ResponseItemEnvelope;
+use codex_mcp::McpAttemptAccess;
+use codex_mcp::McpAttemptRefused;
 use codex_protocol::items::TurnItem;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
@@ -66,7 +68,18 @@ impl ToolExecutor<ToolInvocation> for ExtensionToolAdapter {
     where
         ToolInvocation: 'a,
     {
-        Box::pin(async move { self.0.handle(to_extension_call(&invocation).await).await })
+        Box::pin(async move {
+            // Own the work across the invocation, including spawned tool tasks.
+            // Preserve refusal for MCP consumers without disabling local tools.
+            let mcp_work = invocation.session.turn_mcp_work(&invocation.turn);
+            let mcp_access = match &mcp_work {
+                Ok(work) => Ok(McpAttemptAccess::from_work(work.as_deref())),
+                Err(_) => Err(McpAttemptRefused),
+            };
+            self.0
+                .handle(to_extension_call(&invocation, mcp_access).await)
+                .await
+        })
     }
 }
 
@@ -164,7 +177,10 @@ impl TurnItemEmitter for CoreTurnItemEmitter {
     }
 }
 
-async fn to_extension_call(invocation: &ToolInvocation) -> ExtensionToolCall<'_> {
+async fn to_extension_call<'a>(
+    invocation: &'a ToolInvocation,
+    mcp_access: Result<McpAttemptAccess<'a>, McpAttemptRefused>,
+) -> ExtensionToolCall<'a> {
     let history = invocation
         .session
         .clone_history()
@@ -218,6 +234,7 @@ async fn to_extension_call(invocation: &ToolInvocation) -> ExtensionToolCall<'_>
             turn: Arc::downgrade(&invocation.turn),
         }),
         environments,
+        mcp_access,
         payload: invocation.payload.clone(),
     }
 }
@@ -360,6 +377,8 @@ mod tests {
                 .collect();
             let call = codex_tools::ToolCall {
                 environments: Vec::new(),
+                // Keep the metadata, not the callback's borrowed authority.
+                mcp_access: Err(codex_mcp::McpAttemptRefused),
                 ..call
             };
             *self.captured_call.lock().await = Some(call);

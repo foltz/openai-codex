@@ -342,6 +342,28 @@ mod tests {
         )))
     }
 
+    async fn warm_discovery_client(http_client: &dyn HttpClient, origin: &str) {
+        // These fixtures assert status/metadata behavior, not cold construction
+        // latency. Production correctly charges construction to LOCAL's budget;
+        // prime both redirect-policy pools before starting that unchanged budget.
+        for redirect_policy in [HttpRedirectPolicy::Follow, HttpRedirectPolicy::Stop] {
+            let response = http_client
+                .http_request(HttpRequestParams {
+                    method: "GET".to_owned(),
+                    url: format!("{origin}/client-warmup"),
+                    headers: Vec::new(),
+                    body: None,
+                    timeout_ms: None,
+                    redirect_policy,
+                    request_id: "discovery-fixture-warmup".to_owned(),
+                    stream_response: false,
+                })
+                .await
+                .expect("warm discovery client through the local fixture");
+            assert_eq!(response.status, StatusCode::NOT_FOUND.as_u16());
+        }
+    }
+
     impl Drop for TestServer {
         fn drop(&mut self) {
             self.handle.abort();
@@ -645,6 +667,9 @@ mod tests {
                 .mount(&server)
                 .await;
 
+            let http_client = test_http_client();
+            warm_discovery_client(http_client.as_ref(), &server.uri()).await;
+
             let error = determine_streamable_http_auth_status(
                 "transient-http-error",
                 &format!("{}/mcp", server.uri()),
@@ -653,7 +678,7 @@ mod tests {
                 /*env_http_headers*/ None,
                 OAuthCredentialsStoreMode::File,
                 AuthKeyringBackendKind::default(),
-                test_http_client(),
+                http_client,
                 OAuthDiscoveryTimeout::LOCAL,
                 StreamableHttpRedirectMode::Legacy,
             )
@@ -868,11 +893,14 @@ mod tests {
             handle,
         };
 
+        let http_client = test_http_client();
+        warm_discovery_client(http_client.as_ref(), &format!("http://{address}")).await;
+
         let discovery = discover_streamable_http_oauth(
             &resource_server.url,
             /*http_headers*/ None,
             /*env_http_headers*/ None,
-            test_http_client(),
+            http_client,
             OAuthDiscoveryTimeout::LOCAL,
             StreamableHttpRedirectMode::Legacy,
         )

@@ -23,6 +23,7 @@ fn install() -> MetricsClient {
         )
         .expect("build in-memory metrics"),
     )
+    .expect("install in-memory metrics")
 }
 
 fn observe() {

@@ -47,6 +47,34 @@ fn read_auth_json(codex_home: &Path) -> Result<Value> {
 }
 
 #[test]
+fn managed_auth_rejects_root_remote_flags_before_connecting() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    for (flag, value) in [
+        ("--remote", "unix:///unused-remote.sock"),
+        ("--remote-auth-token-env", "UNUSED_MANAGED_AUTH_TOKEN"),
+    ] {
+        codex_command(codex_home.path())?
+            .args([
+                flag,
+                value,
+                "__managed-auth-transition",
+                "--socket",
+                "not-an-absolute-socket",
+                "--action",
+                "read",
+                "--transition-id",
+                "test-transition",
+                "--process-instance-id",
+                "test-process",
+            ])
+            .assert()
+            .failure()
+            .stderr(contains("only supported for interactive TUI commands"));
+    }
+    Ok(())
+}
+
+#[test]
 fn login_with_api_key_reads_stdin_and_writes_auth_json() -> Result<()> {
     let codex_home = TempDir::new()?;
     write_file_auth_config(codex_home.path())?;

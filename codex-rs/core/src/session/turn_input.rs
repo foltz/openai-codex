@@ -362,8 +362,8 @@ async fn start_or_steer(
                     .push(pending_turn_input(session, input, &turn_context.sub_id, origin).await);
             }
             session
-                .spawn_task(turn_context, task_input, RegularTask::new())
-                .await;
+                .try_spawn_task(turn_context, task_input, RegularTask::new())
+                .await?;
             Ok(TurnInputSubmission::Started {
                 turn_id: submission_id,
             })
@@ -428,9 +428,17 @@ async fn start_if_idle(
         });
     }
 
-    let turn_state = {
+    let (turn_state, registration) = {
         let mut active_turn = session.active_turn.lock().await;
-        if active_turn.is_some() {
+        if session
+            .task_admission_closed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(CodexErr::Fatal(
+                "thread task admission is closed".to_string(),
+            ));
+        }
+        if active_turn.is_some() || session.input_queue.preparation.is_busy() {
             return Ok(TurnInputSubmission::NotSubmitted {
                 reason: NotSubmittedReason::NotIdle,
             });
@@ -443,11 +451,15 @@ async fn start_if_idle(
             });
         }
         let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
-        Arc::clone(&active_turn.turn_state)
+        (
+            Arc::clone(&active_turn.turn_state),
+            session.input_queue.preparation.register(),
+        )
     };
 
     if session.input_queue.has_trigger_turn_mailbox_items().await {
         session.clear_reserved_idle_turn(&turn_state).await;
+        drop(registration);
         session.maybe_start_turn_for_pending_work().await;
         return Ok(TurnInputSubmission::NotSubmitted {
             reason: NotSubmittedReason::PendingTriggerTurn,
@@ -458,6 +470,7 @@ async fn start_if_idle(
         Ok(settings) => settings,
         Err(error) => {
             session.clear_reserved_idle_turn(&turn_state).await;
+            drop(registration);
             return Err(error);
         }
     };
@@ -468,12 +481,14 @@ async fn start_if_idle(
         Ok(Some(turn_context)) => turn_context,
         Ok(None) => {
             session.clear_reserved_idle_turn(&turn_state).await;
+            drop(registration);
             return Ok(TurnInputSubmission::NotSubmitted {
                 reason: NotSubmittedReason::PlanMode,
             });
         }
         Err(error) => {
             session.clear_reserved_idle_turn(&turn_state).await;
+            drop(registration);
             return Err(error);
         }
     };
@@ -511,8 +526,8 @@ async fn start_if_idle(
         }
     }
     session
-        .start_task(turn_context, task_input, RegularTask::new())
-        .await;
+        .start_reserved_task(turn_context, task_input, RegularTask::new(), turn_state)
+        .await?;
     Ok(TurnInputSubmission::Started {
         turn_id: submission_id,
     })
@@ -559,9 +574,26 @@ async fn steer(
 }
 
 impl Session {
-    /// Called under the active-turn lock before running any task or lifecycle callback.
-    pub(crate) async fn record_started_turn(&self, turn_id: &str) {
-        self.state.lock().await.last_started_turn_id = Some(turn_id.to_string());
+    /// Called under final active-turn admission, immediately before task installation.
+    /// Lock order is active_turn -> state -> turn_state. Cancellation before the
+    /// destination lock restores mail without recording an uninstalled turn;
+    /// the caller must not await again between this commit and installation.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "ordered state and destination locks precede the cancellation-free turn commit"
+    )]
+    pub(crate) async fn commit_started_turn(
+        &self,
+        turn_id: &str,
+        turn_state: &tokio::sync::Mutex<TurnState>,
+        mailbox: super::MailboxReservation,
+    ) {
+        let turn_id = turn_id.to_owned();
+        let mut state = self.state.lock().await;
+        self.input_queue
+            .commit_mailbox_for_turn_state(turn_state, mailbox, &turn_id)
+            .await;
+        state.last_started_turn_id = Some(turn_id);
     }
 
     pub(crate) async fn route_realtime_text_input(
@@ -569,6 +601,12 @@ impl Session {
         text: String,
     ) -> Result<(), &'static str> {
         let submission_id = Uuid::now_v7().to_string();
+        let mut work = self
+            .admit_turn_work(self.turn_work_termination())
+            .map_err(|_| "Server is draining; retry the turn after reconnecting")?;
+        if let Some(work) = &mut work {
+            work.bind_submission(&submission_id);
+        }
         let submission = handle(
             self,
             TurnInputRequest::user_input(vec![UserInput::Text {
@@ -583,6 +621,15 @@ impl Session {
             submission_id.clone(),
         )
         .await;
+        // Installation and Started return have no intervening await. Transfer
+        // custody here before anything else can suspend this fanout task.
+        if matches!(&submission, Ok(TurnInputSubmission::Started { .. })) {
+            if let Some(work) = work {
+                work.retain_until_terminal();
+            }
+        } else {
+            drop(work);
+        }
         match submission {
             Ok(TurnInputSubmission::Started { .. } | TurnInputSubmission::Steered { .. }) => {}
             Ok(TurnInputSubmission::NotSubmitted {

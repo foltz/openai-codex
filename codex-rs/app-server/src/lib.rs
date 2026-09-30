@@ -43,7 +43,7 @@ use crate::transport::TransportEvent;
 use crate::transport::acquire_app_server_startup_lock;
 use crate::transport::app_server_startup_lock_path;
 use crate::transport::route_outgoing_envelope;
-use crate::transport::start_control_socket_acceptor;
+use crate::transport::start_control_socket_acceptor_with_bound_hook;
 use crate::transport::start_remote_control;
 use crate::transport::start_stdio_connection;
 use crate::transport::start_websocket_acceptor;
@@ -92,6 +92,10 @@ fn is_unsupported_untrusted_approval_policy_error(err: &std::io::Error) -> bool 
     )
 }
 
+mod account_dependency;
+mod account_operation_work;
+mod account_turn_admission;
+mod account_turn_work;
 mod analytics_utils;
 mod app_info;
 mod app_server_tracing;
@@ -121,6 +125,10 @@ mod gateway_oauth_notifications;
 mod image_url;
 pub mod in_process;
 mod log_write_warning;
+mod managed_reset;
+mod managed_target_record;
+mod managed_transition;
+mod mcp_config_identity;
 mod mcp_refresh;
 mod message_processor;
 mod model_catalog;
@@ -128,8 +136,10 @@ mod models;
 mod models_refresh_worker;
 mod notification_media;
 mod otel_reloader;
+mod otel_reset_control;
 mod outgoing_message;
 mod plugin_config_reload;
+mod processor_task_retirement;
 mod request_processors;
 mod request_serialization;
 mod server_request_error;
@@ -206,6 +216,21 @@ enum ShutdownSignal {
     Forceable,
     #[cfg(unix)]
     GracefulOnly,
+}
+
+async fn abort_startup_transports(
+    shutdown: &CancellationToken,
+    handles: &mut Vec<JoinHandle<()>>,
+    record: &mut managed_target_record::ManagedTargetRecordSetup,
+) {
+    shutdown.cancel();
+    for handle in handles.drain(..) {
+        handle.abort();
+        let _ = handle.await;
+    }
+    if let Err(error) = record.remove_after_startup_failure() {
+        error!(kind = ?error.kind(), "failed to remove managed target record after startup failure");
+    }
 }
 
 async fn shutdown_signal() -> IoResult<ShutdownSignal> {
@@ -499,6 +524,7 @@ pub async fn run_main_with_transport_options(
 ) -> IoResult<AppServerExit> {
     #[cfg(target_os = "windows")]
     let _registered_core = codex_windows_sandbox::registered_core_requested();
+    let control_endpoint = mcp_control_endpoint_uri(&transport);
     let loader_overrides = loader_overrides_with_test_user_config_file(
         loader_overrides,
         test_user_config_file_from_env(),
@@ -571,15 +597,6 @@ pub async fn run_main_with_transport_options(
         }
     };
     config.auth_config().validate()?;
-    let auth_manager =
-        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false)
-            .await
-            .map_err(std::io::Error::other)?;
-    config_manager.replace_cloud_config_bundle_loader(
-        auth_manager.clone(),
-        config.chatgpt_base_url.clone(),
-        config.http_client_factory(),
-    );
     config_manager
         .sync_default_client_residency_requirement()
         .await;
@@ -625,20 +642,23 @@ pub async fn run_main_with_transport_options(
     .map(Arc::new)
     .map_err(std::io::Error::other)?;
 
-    let otel = codex_core::otel_init::build_provider(
-        &config,
-        env!("CARGO_PKG_VERSION"),
-        Some(OTEL_SERVICE_NAME),
-        default_analytics_enabled,
-    )
-    .map_err(|e| {
-        std::io::Error::new(
-            ErrorKind::InvalidData,
-            format!("error loading otel config: {e}"),
+    let mut prepared_otel = Some(
+        codex_core::otel_init::prepare_provider(
+            &config,
+            env!("CARGO_PKG_VERSION"),
+            Some(OTEL_SERVICE_NAME),
+            default_analytics_enabled,
         )
-    })?;
-    codex_core::otel_init::record_process_start(otel.as_ref(), OTEL_SERVICE_NAME);
-    codex_core::otel_init::install_sqlite_telemetry(otel.as_ref(), OTEL_SERVICE_NAME);
+        .map_err(|e| {
+            std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!("error loading otel config: {e}"),
+            )
+        })?,
+    );
+    let mut managed_target_record =
+        managed_target_record::ManagedTargetRecordSetup::from_env(&transport)
+            .map_err(|_| std::io::Error::other("managed target record preparation failed"))?;
     let unix_socket_startup_lock = match &transport {
         AppServerTransport::UnixSocket { .. } => {
             let startup_lock_path = app_server_startup_lock_path(&codex_home)?;
@@ -647,25 +667,6 @@ pub async fn run_main_with_transport_options(
         }
         _ => None,
     };
-    let state_db_init = match init_sqlite_state_db_with_fresh_start_on_corruption(&config).await {
-        Ok(state_db_init) => state_db_init,
-        Err(err) => {
-            return Err(std::io::Error::other(format!(
-                "failed to initialize sqlite state runtime under {}: {err}",
-                config.sqlite_config().home().display()
-            )));
-        }
-    };
-    let state_db = state_db_init.state_db;
-    if let Some(recovery_notice) = state_db_init.recovery_notice {
-        config_warnings.push(ConfigWarningNotification {
-            summary: SQLITE_RECOVERY_CONFIG_WARNING_SUMMARY.to_string(),
-            details: Some(recovery_notice.details),
-            path: None,
-            range: None,
-        });
-    }
-
     if let Ok(Some(err)) = check_execpolicy_for_warnings(&config.config_layer_stack).await {
         config_warnings.push(exec_policy_config_warning(&err));
     }
@@ -692,12 +693,6 @@ pub async fn run_main_with_transport_options(
         });
     }
 
-    let analytics_events_client =
-        analytics_events_client_from_config(Arc::clone(&auth_manager), &config);
-    let outgoing_message_sender = Arc::new(OutgoingMessageSender::new(
-        outgoing_tx,
-        analytics_events_client.clone(),
-    ));
     let feedback = CodexFeedback::new();
 
     // Install a simple subscriber so `tracing` output is visible. Users can
@@ -717,32 +712,42 @@ pub async fn run_main_with_transport_options(
             .boxed(),
     };
 
-    let log_write_warning = log_write_warning::LogWriteWarningReporter::new(
-        feedback.clone(),
-        &outgoing_message_sender,
-        &config,
-    );
     let feedback_layer = feedback.logger_layer();
     let feedback_metadata_layer = feedback.metadata_layer();
-    let log_db = state_db
-        .clone()
-        .map(|state_db| log_db::start(state_db, log_write_warning.clone()));
-    let log_db_layer = log_db
-        .clone()
-        .map(|layer| layer.with_filter(log_db::default_filter()));
-    let (otel_layers, otel_logger_reload_handle) = otel_reloader::layers(otel.as_ref());
-    let _ = tracing_subscriber::registry()
+    let (log_db_layer, log_db_reload) =
+        tracing_subscriber::reload::Layer::new(None::<log_db::LogDbLayer>);
+    let log_db_layer = log_db_layer.with_filter(log_db::default_filter());
+    let (otel_layers, otel_routes) = codex_otel::ManagedTelemetryRoutes::layers();
+    tracing_subscriber::registry()
         .with(stderr_fmt)
         .with(feedback_layer)
         .with(feedback_metadata_layer)
         .with(log_db_layer)
         .with(otel_layers)
-        .try_init();
-    for warning in &config_warnings {
-        match &warning.details {
-            Some(details) => error!("{} {}", warning.summary, details),
-            None => error!("{}", warning.summary),
+        .try_init()
+        .map_err(|_| std::io::Error::other("app-server tracing subscriber unavailable"))?;
+    let otel = otel_routes
+        .publish(&mut prepared_otel)
+        .map_err(|_| std::io::Error::other("initial telemetry publication unavailable"))?;
+    codex_core::otel_init::record_process_start(otel.provider.as_ref(), OTEL_SERVICE_NAME);
+    codex_core::otel_init::install_sqlite_telemetry(otel.provider.as_ref(), OTEL_SERVICE_NAME);
+    let state_db_init = match init_sqlite_state_db_with_fresh_start_on_corruption(&config).await {
+        Ok(state_db_init) => state_db_init,
+        Err(err) => {
+            return Err(std::io::Error::other(format!(
+                "failed to initialize sqlite state runtime under {}: {err}",
+                config.sqlite_config().home().display()
+            )));
         }
+    };
+    let state_db = state_db_init.state_db;
+    if let Some(recovery_notice) = state_db_init.recovery_notice {
+        config_warnings.push(ConfigWarningNotification {
+            summary: SQLITE_RECOVERY_CONFIG_WARNING_SUMMARY.to_string(),
+            details: Some(recovery_notice.details),
+            path: None,
+            range: None,
+        });
     }
     let remote_control_policy = if config
         .config_layer_stack
@@ -792,7 +797,7 @@ pub async fn run_main_with_transport_options(
             transport_accept_handles.push(handle);
         }
         AppServerTransport::UnixSocket { socket_path } => {
-            let accept_handle = start_control_socket_acceptor(
+            let accept_handle = start_control_socket_acceptor_with_bound_hook(
                 socket_path.clone(),
                 transport_event_tx.clone(),
                 transport_shutdown_token.clone(),
@@ -803,6 +808,13 @@ pub async fn run_main_with_transport_options(
                     DaemonShutdownAccess::Managed
                 } else {
                     DaemonShutdownAccess::Disabled
+                },
+                || {
+                    managed_target_record
+                        .publish_after_socket_bound()
+                        .map_err(|_| {
+                            std::io::Error::other("managed target record publication failed")
+                        })
                 },
             )
             .await?;
@@ -822,6 +834,56 @@ pub async fn run_main_with_transport_options(
     }
     drop(unix_socket_startup_lock);
 
+    for warning in &config_warnings {
+        match &warning.details {
+            Some(details) => error!("{} {}", warning.summary, details),
+            None => error!("{}", warning.summary),
+        }
+    }
+    let auth_manager =
+        match AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await {
+            Ok(manager) => manager,
+            Err(error) => {
+                abort_startup_transports(
+                    &transport_shutdown_token,
+                    &mut transport_accept_handles,
+                    &mut managed_target_record,
+                )
+                .await;
+                return Err(std::io::Error::other(error));
+            }
+        };
+    config_manager.replace_cloud_config_bundle_loader(
+        auth_manager.clone(),
+        config.chatgpt_base_url.clone(),
+        config.http_client_factory(),
+    );
+    let analytics_events_client =
+        analytics_events_client_from_config(Arc::clone(&auth_manager), &config);
+    let outgoing_message_sender = Arc::new(OutgoingMessageSender::new(
+        outgoing_tx,
+        analytics_events_client.clone(),
+    ));
+    let log_write_warning = log_write_warning::LogWriteWarningReporter::new(
+        feedback.clone(),
+        &outgoing_message_sender,
+        &config,
+    );
+    // Start the database writer only after the target and dependent auth are ready.
+    let log_db = state_db
+        .clone()
+        .map(|state_db| log_db::start(state_db, log_write_warning.clone()));
+    if log_db_reload.reload(log_db.clone()).is_err() {
+        abort_startup_transports(
+            &transport_shutdown_token,
+            &mut transport_accept_handles,
+            &mut managed_target_record,
+        )
+        .await;
+        return Err(std::io::Error::other(
+            "app-server log database subscriber unavailable",
+        ));
+    }
     let remote_control_enabled = remote_control_policy == RemoteControlPolicy::Allowed
         && remote_control_explicitly_requested
         && state_db.is_some();
@@ -845,7 +907,7 @@ pub async fn run_main_with_transport_options(
         ));
     }
 
-    let (remote_control_accept_handle, remote_control_handle) = start_remote_control(
+    let (remote_control_accept_handle, remote_control_handle) = match start_remote_control(
         RemoteControlStartConfig {
             remote_control_url: config.chatgpt_base_url.clone(),
             installation_id: installation_id.clone(),
@@ -858,7 +920,19 @@ pub async fn run_main_with_transport_options(
         app_server_client_name_rx,
         remote_control_startup_mode,
     )
-    .await?;
+    .await
+    {
+        Ok(handles) => handles,
+        Err(error) => {
+            abort_startup_transports(
+                &transport_shutdown_token,
+                &mut transport_accept_handles,
+                &mut managed_target_record,
+            )
+            .await;
+            return Err(error);
+        }
+    };
     if no_local_transport
         && remote_control_startup_mode == RemoteControlStartupMode::ResolvePersisted
     {
@@ -888,13 +962,17 @@ pub async fn run_main_with_transport_options(
     transport_accept_handles.push(remote_control_accept_handle);
 
     // Only the standalone server measures its local home, not embedded/cloud runtimes.
-    if let Some(metrics) = otel.as_ref().and_then(codex_otel::OtelProvider::metrics) {
+    if let Some(metrics) = otel
+        .provider
+        .as_ref()
+        .and_then(codex_otel::OtelProvider::metrics)
+    {
         codex_home_metrics::spawn(&config, metrics.clone(), transport_shutdown_token.clone());
     }
 
-    let otel_reloader_handle = otel_reloader::spawn(
+    let (telemetry_reset, otel_reloader_handle) = otel_reloader::spawn_managed(
         otel,
-        otel_logger_reload_handle,
+        otel_routes,
         config_manager.clone(),
         Arc::clone(&auth_manager),
         default_analytics_enabled,
@@ -962,6 +1040,7 @@ pub async fn run_main_with_transport_options(
         let initialize_notification_sender = outgoing_message_sender.clone();
         let outbound_control_tx = outbound_control_tx;
         let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
+            telemetry_reset,
             outgoing: outgoing_message_sender,
             analytics_events_client,
             arg0_paths,
@@ -986,6 +1065,13 @@ pub async fn run_main_with_transport_options(
                 PluginStartupTasks::Start
             )
             .then_some(plugin_startup_config),
+            managed_transition_control_socket_endpoint: managed_target_record
+                .control_endpoint
+                .clone(),
+            managed_transition_process_instance_id: managed_target_record
+                .process_instance_id
+                .clone(),
+            control_endpoint,
         }));
         let mut thread_created_rx = processor.thread_created_receiver();
         let mut running_turn_count_rx = processor.subscribe_running_assistant_turn_count();
@@ -997,6 +1083,7 @@ pub async fn run_main_with_transport_options(
         let mut remote_control_status = remote_control_status_rx.borrow().clone();
         let transport_shutdown_token = transport_shutdown_token.clone();
         async move {
+            processor.reconcile_incomplete_clear_transitions().await;
             let recovery_task = if managed_daemon {
                 match daemon_thread_recovery::start_recovery(
                     recovery_file.clone(),
@@ -1106,6 +1193,7 @@ pub async fn run_main_with_transport_options(
                                 connection_id,
                                 origin,
                                 auth,
+                                provenance,
                                 writer,
                                 disconnect_sender,
                             } => {
@@ -1137,6 +1225,7 @@ pub async fn run_main_with_transport_options(
                                     ConnectionState::new(
                                         origin,
                                         auth,
+                                        provenance,
                                         outbound_initialized,
                                         outbound_experimental_api_enabled,
                                         outbound_opted_out_notification_methods,
@@ -1231,6 +1320,12 @@ pub async fn run_main_with_transport_options(
                                                     connection_state
                                                         .session
                                                         .request_attestation(),
+                                                    connection_state
+                                                        .session
+                                                        .trusted_interactive(),
+                                                    connection_state
+                                                        .session
+                                                        .retention_principal(),
                                                 )
                                                 .await;
                                             connection_state
@@ -1346,7 +1441,23 @@ pub async fn run_main_with_transport_options(
     let _ = outbound_handle.await;
 
     transport_shutdown_token.cancel();
-    let _ = otel_reloader_handle.await;
+    // A joined actor is not proof that its exporters retired. Retain the
+    // returned owner through the remaining standalone shutdown work.
+    let otel_shutdown_owner = otel_reloader_handle.await;
+    match &otel_shutdown_owner {
+        Ok(owner) => {
+            if let Some(Err(outcome)) = &owner.shutdown_result {
+                warn!(?outcome, "standalone telemetry retirement incomplete");
+            }
+        }
+        Err(error) => {
+            warn!(
+                cancelled = error.is_cancelled(),
+                panicked = error.is_panic(),
+                "standalone telemetry reloader task failed"
+            );
+        }
+    }
     for handle in transport_accept_handles {
         let _ = handle.await;
     }
@@ -1524,18 +1635,38 @@ fn analytics_rpc_transport(transport: &AppServerTransport) -> AppServerRpcTransp
     }
 }
 
+/// Returns the URI eligible MCP providers receive for this app-server's
+/// explicitly bound Unix listener. Stdio and websocket transports do not have
+/// a filesystem control endpoint to disclose. A relative or non-Unicode Unix
+/// path remains usable by the app server itself but is deliberately not
+/// disclosed: the generic MCP contract requires an absolute `unix:///` URI.
+fn mcp_control_endpoint_uri(transport: &AppServerTransport) -> Option<String> {
+    let AppServerTransport::UnixSocket { socket_path } = transport else {
+        return None;
+    };
+    if !socket_path.is_absolute() {
+        warn!(path = %socket_path.display(), "not disclosing relative app-server control endpoint to MCP providers");
+        return None;
+    }
+    let path = socket_path.to_str()?;
+    let mut endpoint = url::Url::parse("unix:///").ok()?;
+    endpoint.set_path(path);
+    Some(endpoint.to_string())
+}
+
 #[cfg(test)]
 mod tests {
+    use super::AppServerTransport;
     use super::LogFormat;
     use super::ShutdownAction;
     use super::ShutdownSignal;
     use super::ShutdownState;
     #[cfg(debug_assertions)]
     use super::loader_overrides_with_test_user_config_file;
+    use super::mcp_control_endpoint_uri;
     use super::turn_admission::TurnAdmission;
     #[cfg(debug_assertions)]
     use codex_config::LoaderOverrides;
-    #[cfg(debug_assertions)]
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
 
@@ -1587,6 +1718,18 @@ mod tests {
         assert_eq!(LogFormat::from_env_value(Some("")), LogFormat::Default);
         assert_eq!(LogFormat::from_env_value(Some("text")), LogFormat::Default);
         assert_eq!(LogFormat::from_env_value(Some("jsonl")), LogFormat::Default);
+    }
+
+    #[test]
+    fn mcp_control_endpoint_uri_encodes_only_absolute_unix_listener_paths() {
+        assert_eq!(
+            mcp_control_endpoint_uri(&AppServerTransport::UnixSocket {
+                socket_path: AbsolutePathBuf::from_absolute_path("/tmp/kcf control.sock")
+                    .expect("absolute fixture path"),
+            }),
+            Some("unix:///tmp/kcf%20control.sock".to_string())
+        );
+        assert_eq!(mcp_control_endpoint_uri(&AppServerTransport::Stdio), None);
     }
 
     #[cfg(debug_assertions)]

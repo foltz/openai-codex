@@ -1928,6 +1928,30 @@
             },
             "method": {
               "enum": [
+                "thread/clear"
+              ],
+              "title": "Thread/clearRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/ThreadClearParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Thread/clearRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/RequestId"
+            },
+            "method": {
+              "enum": [
                 "thread/name/set"
               ],
               "title": "Thread/name/setRequestMethod",
@@ -3572,6 +3596,29 @@
             "method"
           ],
           "title": "Config/mcpServer/reloadRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/RequestId"
+            },
+            "method": {
+              "enum": [
+                "config/mcpServer/identity"
+              ],
+              "title": "Config/mcpServer/identityRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "id",
+            "method"
+          ],
+          "title": "Config/mcpServer/identityRequest",
           "type": "object"
         },
         {
@@ -9674,6 +9721,10 @@
             "null"
           ]
         },
+        "interactiveClient": {
+          "description": "Requests classification as an interactive app-server client. This is a request only; the server must independently establish entitlement.",
+          "type": "boolean"
+        },
         "mcpServerOpenaiFormElicitation": {
           "description": "Legacy opt-in for the `openai/form` MCP extension.\n\nNew clients should declare `openai/form` in [`Self::extensions`].",
           "type": "boolean"
@@ -10757,6 +10808,57 @@
         "connectorId",
         "linkId"
       ],
+      "type": "object"
+    },
+    "McpServerConfigIdentity": {
+      "description": "Identity of every selected user configuration layer that supplied effective MCP configuration, ordered from base to highest-precedence profile.",
+      "properties": {
+        "layers": {
+          "items": {
+            "$ref": "#/definitions/McpServerConfigIdentityLayer"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "layers"
+      ],
+      "type": "object"
+    },
+    "McpServerConfigIdentityLayer": {
+      "description": "One selected user configuration layer that contributes to effective MCP configuration.",
+      "properties": {
+        "filePath": {
+          "description": "Normalized absolute path spelling from the accepted selected user configuration snapshot. This deliberately does not resolve symlinks.",
+          "type": "string"
+        },
+        "version": {
+          "description": "Existing canonical layer version, in `sha256:...` form.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "filePath",
+        "version"
+      ],
+      "type": "object"
+    },
+    "McpServerConfigIdentityResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Paired MCP configuration identities for diagnostic comparison.\n\n`applied` is every selected user configuration layer accepted by the running server's most recent successful startup or strict MCP reload. `current` is freshly read from every selected user configuration layer when this method runs.",
+      "properties": {
+        "applied": {
+          "$ref": "#/definitions/McpServerConfigIdentity"
+        },
+        "current": {
+          "$ref": "#/definitions/McpServerConfigIdentity"
+        }
+      },
+      "required": [
+        "applied",
+        "current"
+      ],
+      "title": "McpServerConfigIdentityResponse",
       "type": "object"
     },
     "McpServerConnectionStatus": {
@@ -16070,6 +16172,66 @@
           "properties": {
             "method": {
               "enum": [
+                "thread/clear/ended"
+              ],
+              "title": "Thread/clear/endedNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/ThreadClearEndedNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Thread/clear/endedNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
+                "thread/clear/started"
+              ],
+              "title": "Thread/clear/startedNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/ThreadClearStartedNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Thread/clear/startedNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
+                "kcf/thread/interactiveSubscription/changed"
+              ],
+              "title": "Kcf/thread/interactiveSubscription/changedNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/ThreadInteractiveSubscriptionChangedNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Kcf/thread/interactiveSubscription/changedNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
                 "thread/status/changed"
               ],
               "title": "Thread/status/changedNotificationMethod",
@@ -18908,6 +19070,267 @@
       "title": "ThreadAttachmentUpdatedNotification",
       "type": "object"
     },
+    "ThreadClearEndReason": {
+      "enum": [
+        "clear"
+      ],
+      "type": "string"
+    },
+    "ThreadClearEndedNotification": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Requester-scoped authoritative predecessor evidence for `thread/clear`.",
+      "properties": {
+        "predecessorThreadId": {
+          "type": "string"
+        },
+        "reason": {
+          "$ref": "#/definitions/ThreadClearEndReason"
+        },
+        "successorThreadId": {
+          "type": "string"
+        },
+        "transitionId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "predecessorThreadId",
+        "reason",
+        "successorThreadId",
+        "transitionId"
+      ],
+      "title": "ThreadClearEndedNotification",
+      "type": "object"
+    },
+    "ThreadClearParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Parameters for the server-owned clear-and-replace operation.",
+      "properties": {
+        "threadId": {
+          "description": "The predecessor currently displayed by the requesting connection.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "threadId"
+      ],
+      "title": "ThreadClearParams",
+      "type": "object"
+    },
+    "ThreadClearRecovery": {
+      "properties": {
+        "context": {
+          "$ref": "#/definitions/ThreadClearRecoveryContext"
+        },
+        "durability": {
+          "$ref": "#/definitions/ThreadClearRecoveryDurability"
+        },
+        "successorThreadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "context",
+        "durability",
+        "successorThreadId"
+      ],
+      "type": "object"
+    },
+    "ThreadClearRecoveryContext": {
+      "additionalProperties": false,
+      "description": "Caller provenance, never an authoritative clear edge or a shutdown receipt.",
+      "properties": {
+        "contractVersion": {
+          "description": "Must match the recovery-read contract on this connection before creation.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "predecessorThreadId": {
+          "description": "Null means genuinely no displayed predecessor, not an unavailable known ID.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "contractVersion"
+      ],
+      "type": "object"
+    },
+    "ThreadClearRecoveryDurability": {
+      "enum": [
+        "durable",
+        "unavailable"
+      ],
+      "type": "string"
+    },
+    "ThreadClearRecoveryObservation": {
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "support"
+              ],
+              "title": "SupportThreadClearRecoveryObservationType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "SupportThreadClearRecoveryObservation",
+          "type": "object"
+        },
+        {
+          "description": "Absence is not proof of freshness or permission to register an identity.",
+          "properties": {
+            "type": {
+              "enum": [
+                "none"
+              ],
+              "title": "NoneThreadClearRecoveryObservationType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "NoneThreadClearRecoveryObservation",
+          "type": "object"
+        },
+        {
+          "description": "May remain pending after a crash; consumers must bound their wait.",
+          "properties": {
+            "recovery": {
+              "$ref": "#/definitions/ThreadClearRecovery"
+            },
+            "type": {
+              "enum": [
+                "pending"
+              ],
+              "title": "PendingThreadClearRecoveryObservationType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "recovery",
+            "type"
+          ],
+          "title": "PendingThreadClearRecoveryObservation",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "recovery": {
+              "$ref": "#/definitions/ThreadClearRecovery"
+            },
+            "type": {
+              "enum": [
+                "complete"
+              ],
+              "title": "CompleteThreadClearRecoveryObservationType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "recovery",
+            "type"
+          ],
+          "title": "CompleteThreadClearRecoveryObservation",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "recovery": {
+              "$ref": "#/definitions/ThreadClearRecovery"
+            },
+            "type": {
+              "enum": [
+                "failed"
+              ],
+              "title": "FailedThreadClearRecoveryObservationType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "recovery",
+            "type"
+          ],
+          "title": "FailedThreadClearRecoveryObservation",
+          "type": "object"
+        }
+      ]
+    },
+    "ThreadClearResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "predecessorThreadId": {
+          "type": "string"
+        },
+        "successorThread": {
+          "$ref": "#/definitions/Thread"
+        },
+        "transitionId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "predecessorThreadId",
+        "successorThread",
+        "transitionId"
+      ],
+      "title": "ThreadClearResponse",
+      "type": "object"
+    },
+    "ThreadClearStartedNotification": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Requester-scoped authoritative successor evidence for `thread/clear`.",
+      "properties": {
+        "predecessorThreadId": {
+          "type": "string"
+        },
+        "startSource": {
+          "$ref": "#/definitions/ThreadStartSource"
+        },
+        "successorThread": {
+          "$ref": "#/definitions/Thread"
+        },
+        "transitionId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "predecessorThreadId",
+        "startSource",
+        "successorThread",
+        "transitionId"
+      ],
+      "title": "ThreadClearStartedNotification",
+      "type": "object"
+    },
+    "ThreadClearTransition": {
+      "description": "Server-recorded succession, not proof of current interactive attachment.",
+      "properties": {
+        "predecessorThreadId": {
+          "type": "string"
+        },
+        "successorThreadId": {
+          "type": "string"
+        },
+        "transitionId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "predecessorThreadId",
+        "successorThreadId",
+        "transitionId"
+      ],
+      "type": "object"
+    },
     "ThreadClosedNotification": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
@@ -19420,6 +19843,52 @@
     "ThreadInjectItemsResponse": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "title": "ThreadInjectItemsResponse",
+      "type": "object"
+    },
+    "ThreadInteractiveSubscriptionChangedNotification": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "An atomic subscription-state transition. A zero count explicitly records a removal; it is not encoded by omitting an entry.",
+      "properties": {
+        "changes": {
+          "items": {
+            "$ref": "#/definitions/ThreadInteractiveSubscriptionEntry"
+          },
+          "type": "array"
+        },
+        "generation": {
+          "type": "string"
+        },
+        "revision": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "changes",
+        "generation",
+        "revision"
+      ],
+      "title": "ThreadInteractiveSubscriptionChangedNotification",
+      "type": "object"
+    },
+    "ThreadInteractiveSubscriptionEntry": {
+      "description": "A server-owned count of trusted interactive clients attached to one exact thread.\n\nThis is subscription evidence only. It does not establish thread succession, loaded state, or authority to transfer a clear transition.",
+      "properties": {
+        "interactiveSubscriptionCount": {
+          "description": "Distinct live thread-event subscriptions held by server-verified interactive clients. Not evidence of human presence, focus or retention.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "interactiveSubscriptionCount",
+        "threadId"
+      ],
       "type": "object"
     },
     "ThreadItem": {
@@ -22266,6 +22735,24 @@
     "ThreadStartedNotification": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
+        "clearPredecessorThreadId": {
+          "description": "The explicit predecessor of a `Clear` start. This is omitted for normal new sessions and forks; resumes do not emit `thread/started`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sessionStartSource": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ThreadStartSource"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The client-declared source for this start, when the source was supplied on the corresponding `thread/start` request."
+        },
         "thread": {
           "$ref": "#/definitions/Thread"
         }

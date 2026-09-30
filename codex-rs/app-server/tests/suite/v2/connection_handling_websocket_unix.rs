@@ -86,6 +86,7 @@ async fn websocket_transport_ctrl_c_waits_for_running_turn_before_exit() -> Resu
         ),
         ("thread/queue/start", json!({"threadId": thread_id})),
         ("thread/start", json!({})),
+        ("thread/clear", json!({"threadId": thread_id})),
         ("thread/fork", json!({"threadId": thread_id})),
         ("thread/resume", json!({"threadId": thread_id})),
         ("thread/delete", json!({"threadId": thread_id})),

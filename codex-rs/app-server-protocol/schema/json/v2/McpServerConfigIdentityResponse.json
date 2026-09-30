@@ -1,0 +1,53 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "McpServerConfigIdentity": {
+      "description": "Identity of every selected user configuration layer that supplied effective MCP configuration, ordered from base to highest-precedence profile.",
+      "properties": {
+        "layers": {
+          "items": {
+            "$ref": "#/definitions/McpServerConfigIdentityLayer"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "layers"
+      ],
+      "type": "object"
+    },
+    "McpServerConfigIdentityLayer": {
+      "description": "One selected user configuration layer that contributes to effective MCP configuration.",
+      "properties": {
+        "filePath": {
+          "description": "Normalized absolute path spelling from the accepted selected user configuration snapshot. This deliberately does not resolve symlinks.",
+          "type": "string"
+        },
+        "version": {
+          "description": "Existing canonical layer version, in `sha256:...` form.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "filePath",
+        "version"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "Paired MCP configuration identities for diagnostic comparison.\n\n`applied` is every selected user configuration layer accepted by the running server's most recent successful startup or strict MCP reload. `current` is freshly read from every selected user configuration layer when this method runs.",
+  "properties": {
+    "applied": {
+      "$ref": "#/definitions/McpServerConfigIdentity"
+    },
+    "current": {
+      "$ref": "#/definitions/McpServerConfigIdentity"
+    }
+  },
+  "required": [
+    "applied",
+    "current"
+  ],
+  "title": "McpServerConfigIdentityResponse",
+  "type": "object"
+}

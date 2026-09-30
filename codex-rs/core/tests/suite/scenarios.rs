@@ -39,7 +39,6 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::models::ImageReference;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::CodeModeToolMessages;
-use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::openai_models::ToolMessage;
 use codex_protocol::openai_models::ToolMode;
 use codex_protocol::protocol::EnvironmentConfigState;
@@ -731,7 +730,7 @@ async fn astra_omits_disabled_executor_skills_from_model_context() -> Result<()>
         .thread_manager
         .start_thread(StartThreadOptions {
             thread_extension_init,
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?
         .thread;
@@ -1167,7 +1166,7 @@ async fn astra_continues_after_input_yields_a_code_mode_cell() -> Result<()> {
                 input_schema: json!({"type": "object", "properties": {}}),
                 defer_loading: false,
             })],
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?
         .thread;

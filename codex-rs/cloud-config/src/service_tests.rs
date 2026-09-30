@@ -25,6 +25,7 @@ use codex_login::auth::ExternalAuthRefreshContext;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::collections::VecDeque;
+use std::future::Future;
 use std::future::pending;
 use std::path::Path;
 use std::sync::RwLock;
@@ -35,6 +36,194 @@ use tempfile::tempdir;
 fn write_auth_json(codex_home: &Path, value: serde_json::Value) -> std::io::Result<()> {
     std::fs::write(codex_home.join("auth.json"), serde_json::to_string(&value)?)?;
     Ok(())
+}
+
+#[tokio::test]
+async fn retired_memoized_loader_refuses_and_fresh_identity_replaces_it() {
+    let home = tempdir().expect("home");
+    let first_client = Arc::new(StaticBundleClient::new(bundle_with_model("old-model")));
+    let first = CloudConfigBundleService::new(
+        auth_manager_with_plan_and_identity("enterprise", Some("user-a"), Some("account-a")).await,
+        Arc::clone(&first_client),
+        home.path().to_path_buf(),
+        CLOUD_CONFIG_BUNDLE_TIMEOUT,
+    );
+    let (old, _) =
+        crate::bundle_loader::cloud_config_bundle_loader_for_service(first).expect("old loader");
+    assert_eq!(
+        old.get().await.expect("old bundle"),
+        Some(bundle_with_model("old-model"))
+    );
+    let lifecycle = crate::home_lifecycle::home_lifecycle(home.path()).expect("lifecycle");
+    lifecycle.retire_owners().await.expect("retire");
+    assert!(old.get().await.is_err());
+    assert_eq!(first_client.request_count.load(Ordering::SeqCst), 1);
+
+    let mut fresh = CloudConfigBundleService::new(
+        auth_manager_with_plan_and_identity("enterprise", Some("user-b"), Some("account-b")).await,
+        Arc::new(StaticBundleClient::new(bundle_with_model("new-model"))),
+        home.path().to_path_buf(),
+        CLOUD_CONFIG_BUNDLE_TIMEOUT,
+    );
+    fresh.strict_cache_publication = true;
+    lifecycle.owners.lock().expect("owners").retiring = false;
+    let (new, _) =
+        crate::bundle_loader::cloud_config_bundle_loader_for_service(fresh).expect("new loader");
+    assert_eq!(
+        new.get().await.expect("fresh bundle"),
+        Some(bundle_with_model("new-model"))
+    );
+    assert!(old.get().await.is_err());
+    assert_eq!(
+        new.get().await.expect("fresh memo"),
+        Some(bundle_with_model("new-model"))
+    );
+}
+
+#[tokio::test]
+async fn uncached_loader_is_fenced_without_refresher_or_cache_file() {
+    let home = tempdir().expect("home");
+    let client = Arc::new(StaticBundleClient::new(test_bundle()));
+    let service = CloudConfigBundleService::new(
+        auth_manager_with_plan("business").await,
+        Arc::clone(&client),
+        home.path().to_path_buf(),
+        CLOUD_CONFIG_BUNDLE_TIMEOUT,
+    );
+    let loader = crate::bundle_loader::uncached_loader(service).expect("uncached");
+    let lifecycle = crate::home_lifecycle::home_lifecycle(home.path()).expect("lifecycle");
+    assert_eq!(
+        loader.get().await.expect("network bundle"),
+        Some(test_bundle())
+    );
+    assert!(lifecycle.owners.lock().expect("owners").tasks.is_empty());
+    assert!(
+        !home
+            .path()
+            .join(CLOUD_CONFIG_BUNDLE_CACHE_FILENAME)
+            .exists()
+    );
+    lifecycle.retire_owners().await.expect("retire");
+    assert!(loader.get().await.is_err());
+    assert_eq!(client.request_count.load(Ordering::SeqCst), 1);
+    assert!(
+        !home
+            .path()
+            .join(CLOUD_CONFIG_BUNDLE_CACHE_FILENAME)
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn in_flight_loader_is_retired_before_return_or_cache_publication() {
+    let home = tempdir().expect("home");
+    let started = Arc::new(tokio::sync::Notify::new());
+    let service = CloudConfigBundleService::new(
+        auth_manager_with_plan("business").await,
+        Arc::new(NotifyingPendingBundleClient {
+            request_started: Arc::clone(&started),
+            request_cancelled: Arc::new(tokio::sync::Notify::new()),
+        }),
+        home.path().to_path_buf(),
+        CLOUD_CONFIG_BUNDLE_TIMEOUT,
+    );
+    let (loader, _) =
+        crate::bundle_loader::cloud_config_bundle_loader_for_service(service).expect("loader");
+    let worker_loader = loader.clone();
+    let worker = tokio::spawn(async move { worker_loader.get().await });
+    started.notified().await;
+    let lifecycle = crate::home_lifecycle::home_lifecycle(home.path()).expect("lifecycle");
+    lifecycle
+        .retire_owners()
+        .await
+        .expect("retire in-flight fetch");
+    assert!(worker.await.expect("getter join").is_err());
+    assert!(loader.get().await.is_err());
+    assert!(
+        !home
+            .path()
+            .join(CLOUD_CONFIG_BUNDLE_CACHE_FILENAME)
+            .exists()
+    );
+}
+
+#[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "test holds publication until an old-generation write is queued and invalidated"
+)]
+async fn retired_generation_cannot_publish_a_queued_cache_write() {
+    let home = tempdir().expect("home");
+    let auth =
+        auth_manager_with_plan_and_identity("enterprise", Some("user-a"), Some("account-a")).await;
+    let service = Arc::new(CloudConfigBundleService::new(
+        auth.clone(),
+        Arc::new(StaticBundleClient::new(test_bundle())),
+        home.path().to_path_buf(),
+        Duration::from_secs(5),
+    ));
+    let lease = service.publication.lock().await;
+    let captured_auth = auth.auth().await.expect("auth");
+    let worker_service = service.clone();
+    let mut publish = Box::pin(async move {
+        worker_service
+            .validate_and_cache_remote_bundle(&captured_auth, "startup", 1, test_bundle())
+            .await
+    });
+    std::future::poll_fn(|cx| {
+        assert!(publish.as_mut().poll(cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    service.generation.fetch_add(1, Ordering::AcqRel);
+    drop(lease);
+    assert!(publish.await.is_err());
+    assert!(
+        !home
+            .path()
+            .join(CLOUD_CONFIG_BUNDLE_CACHE_FILENAME)
+            .exists()
+    );
+}
+
+#[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "test holds publication while cancelling the caller to prove retained write ownership"
+)]
+async fn cancelled_publication_caller_does_not_release_write_ownership() {
+    let home = tempdir().expect("home");
+    let auth =
+        auth_manager_with_plan_and_identity("enterprise", Some("user-a"), Some("account-a")).await;
+    let service = Arc::new(CloudConfigBundleService::new(
+        auth.clone(),
+        Arc::new(StaticBundleClient::new(test_bundle())),
+        home.path().to_path_buf(),
+        Duration::from_secs(5),
+    ));
+    let lease = service.publication.lock().await;
+    let captured_auth = auth.auth().await.expect("auth");
+    let worker_service = service.clone();
+    let mut publish = Box::pin(async move {
+        worker_service
+            .validate_and_cache_remote_bundle(&captured_auth, "startup", 1, test_bundle())
+            .await
+    });
+    std::future::poll_fn(|cx| {
+        assert!(publish.as_mut().poll(cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    // Run the spawned writer far enough to queue its lease before cancellation.
+    tokio::task::yield_now().await;
+    drop(publish);
+    drop(lease);
+    let _retirement_barrier = service.publication.lock().await;
+    assert!(
+        home.path()
+            .join(CLOUD_CONFIG_BUNDLE_CACHE_FILENAME)
+            .exists()
+    );
 }
 
 fn create_test_cache(codex_home: &Path) -> CloudConfigBundleCache {
@@ -193,6 +382,12 @@ fn test_config_fragment() -> CloudConfigFragment {
         name: "Base config".to_string(),
         contents: "model = \"gpt-5\"".to_string(),
     }
+}
+
+fn bundle_with_model(model: &str) -> CloudConfigBundle {
+    let mut bundle = test_bundle();
+    bundle.config_toml.enterprise_managed[0].contents = format!("model = {model:?}");
+    bundle
 }
 
 fn test_requirements_fragment() -> CloudRequirementsFragment {
@@ -1205,7 +1400,8 @@ async fn production_loader_recovers_startup_timeouts_in_background() {
         codex_home.path().to_path_buf(),
         CLOUD_CONFIG_BUNDLE_TIMEOUT,
     );
-    let (loader, _) = crate::bundle_loader::cloud_config_bundle_loader_for_service(service);
+    let (loader, _) = crate::bundle_loader::cloud_config_bundle_loader_for_service(service)
+        .expect("loader admission");
     let (initial, ()) = tokio::join!(loader.get(), async {
         fetcher.request_started.notified().await;
         tokio::time::advance(CLOUD_CONFIG_BUNDLE_TIMEOUT + Duration::from_millis(1)).await;
@@ -1284,7 +1480,8 @@ async fn production_loader_restores_normal_refresh_interval_after_non_timeout_er
         codex_home.path().to_path_buf(),
         CLOUD_CONFIG_BUNDLE_TIMEOUT,
     );
-    let (loader, _) = crate::bundle_loader::cloud_config_bundle_loader_for_service(service);
+    let (loader, _) = crate::bundle_loader::cloud_config_bundle_loader_for_service(service)
+        .expect("loader admission");
     let (initial, ()) = tokio::join!(loader.get(), async {
         fetcher.request_started.notified().await;
         tokio::time::advance(CLOUD_CONFIG_BUNDLE_TIMEOUT + Duration::from_millis(1)).await;
@@ -1356,7 +1553,8 @@ async fn production_loader_refreshes_later_configs_and_preserves_failed_refreshe
         codex_home.path().to_path_buf(),
         CLOUD_CONFIG_BUNDLE_TIMEOUT,
     );
-    let (loader, _) = crate::bundle_loader::cloud_config_bundle_loader_for_service(service);
+    let (loader, _) = crate::bundle_loader::cloud_config_bundle_loader_for_service(service)
+        .expect("loader admission");
 
     let (first, second) = tokio::join!(loader.get(), loader.get());
     assert_eq!(first, Ok(Some(initial_bundle.clone())));
@@ -1413,7 +1611,8 @@ async fn each_loader_owns_refresh_until_its_last_clone_is_dropped() {
         CLOUD_CONFIG_BUNDLE_TIMEOUT,
     );
     let (loader, original_task) =
-        crate::bundle_loader::cloud_config_bundle_loader_for_service(service);
+        crate::bundle_loader::cloud_config_bundle_loader_for_service(service)
+            .expect("loader admission");
     let cloned_loader = loader.clone();
     assert_eq!(loader.get().await, Ok(Some(test_bundle())));
     fetcher.request_started.notified().await;
@@ -1439,7 +1638,8 @@ async fn each_loader_owns_refresh_until_its_last_clone_is_dropped() {
         CLOUD_CONFIG_BUNDLE_TIMEOUT,
     );
     let (replacement_loader, replacement_task) =
-        crate::bundle_loader::cloud_config_bundle_loader_for_service(replacement_service);
+        crate::bundle_loader::cloud_config_bundle_loader_for_service(replacement_service)
+            .expect("loader admission");
     assert_eq!(replacement_loader.get().await, Ok(Some(test_bundle())));
     replacement_fetcher.request_started.notified().await;
 
@@ -1494,7 +1694,8 @@ async fn dropping_loader_cancels_in_flight_startup_and_refresh() {
             codex_home.path().to_path_buf(),
             CLOUD_CONFIG_BUNDLE_TIMEOUT,
         );
-        let (loader, _) = crate::bundle_loader::cloud_config_bundle_loader_for_service(service);
+        let (loader, _) = crate::bundle_loader::cloud_config_bundle_loader_for_service(service)
+            .expect("loader admission");
         if starts_from_cache {
             assert_eq!(loader.get().await, Ok(Some(test_bundle())));
             tokio::task::yield_now().await;

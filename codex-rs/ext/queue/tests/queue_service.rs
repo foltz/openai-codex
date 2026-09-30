@@ -617,7 +617,10 @@ async fn externally_changed_queues_dispatch_independently_and_retry_failed_wakes
     let queue = install_registered_queue(&test, installed.as_ref())?;
     let independent_thread = test
         .thread_manager
-        .start_thread(StartThreadOptions::new(test.config.clone()))
+        .start_thread(StartThreadOptions::new(
+            test.config.clone(),
+            /*control_endpoint*/ None,
+        ))
         .await?;
     let external_runtime = StateRuntime::init(
         test.codex
@@ -696,6 +699,7 @@ async fn externally_changed_queues_dispatch_independently_and_retry_failed_wakes
             test.thread_manager.auth_manager(),
             /*parent_trace*/ None,
             Default::default(),
+            /*control_endpoint*/ None,
         )
         .await?;
     advance_queue_poll().await;

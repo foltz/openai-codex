@@ -4509,6 +4509,7 @@ async fn paginated_compaction_cold_resume_from_bounded_suffix() -> Result<()> {
             auth_manager,
             /*parent_trace*/ None,
             codex_protocol::mcp::ClientMcpExtensions::default(),
+            /*control_endpoint*/ None,
         )
         .await?;
     assert_eq!(

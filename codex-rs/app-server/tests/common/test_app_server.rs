@@ -91,6 +91,7 @@ use codex_app_server_protocol::ThreadCompactStartParams;
 use codex_app_server_protocol::ThreadDeleteParams;
 use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadInjectItemsParams;
+use codex_app_server_protocol::ThreadInteractiveSubscriptionListParams;
 use codex_app_server_protocol::ThreadItemsListParams;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadLoadedListParams;
@@ -104,6 +105,8 @@ use codex_app_server_protocol::ThreadRealtimeListVoicesParams;
 use codex_app_server_protocol::ThreadRealtimeStartParams;
 use codex_app_server_protocol::ThreadRealtimeStopParams;
 use codex_app_server_protocol::ThreadResumeParams;
+use codex_app_server_protocol::ThreadRetentionAcquireParams;
+use codex_app_server_protocol::ThreadRetentionReleaseParams;
 use codex_app_server_protocol::ThreadSearchOccurrencesParams;
 use codex_app_server_protocol::ThreadSearchParams;
 use codex_app_server_protocol::ThreadSectionMoveParams;
@@ -693,6 +696,34 @@ impl TestAppServer {
     ) -> anyhow::Result<i64> {
         let params = Some(serde_json::to_value(params)?);
         self.send_request("thread/loaded/list", params).await
+    }
+
+    /// Send a `kcf/thread/interactiveSubscription/list` JSON-RPC request.
+    pub async fn send_thread_interactive_subscription_list_request(
+        &mut self,
+        params: ThreadInteractiveSubscriptionListParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("kcf/thread/interactiveSubscription/list", params)
+            .await
+    }
+
+    /// Send an experimental `thread/retention/acquire` JSON-RPC request.
+    pub async fn send_thread_retention_acquire_request(
+        &mut self,
+        params: ThreadRetentionAcquireParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("thread/retention/acquire", params).await
+    }
+
+    /// Send an experimental `thread/retention/release` JSON-RPC request.
+    pub async fn send_thread_retention_release_request(
+        &mut self,
+        params: ThreadRetentionReleaseParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("thread/retention/release", params).await
     }
 
     /// Send a `thread/read` JSON-RPC request.
@@ -1560,13 +1591,23 @@ impl TestAppServer {
         &mut self,
         make_request: impl FnOnce(RequestId) -> ClientRequest,
     ) -> anyhow::Result<T> {
+        self.request_with_trace(make_request, None).await
+    }
+
+    /// Sends an actual JSON-RPC trace carrier through the standalone transport.
+    pub async fn request_with_trace<T: DeserializeOwned>(
+        &mut self,
+        make_request: impl FnOnce(RequestId) -> ClientRequest,
+        trace: Option<codex_protocol::protocol::W3cTraceContext>,
+    ) -> anyhow::Result<T> {
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let request = make_request(RequestId::Integer(request_id));
         ensure!(
             request.id() == &RequestId::Integer(request_id),
             "typed request must use the supplied request ID"
         );
-        let request = serde_json::from_value::<JSONRPCRequest>(serde_json::to_value(request)?)?;
+        let mut request = serde_json::from_value::<JSONRPCRequest>(serde_json::to_value(request)?)?;
+        request.trace = trace;
         self.send_jsonrpc_message(JSONRPCMessage::Request(request))
             .await?;
         tokio::time::timeout(DEFAULT_REQUEST_TIMEOUT, self.read_response(request_id)).await?

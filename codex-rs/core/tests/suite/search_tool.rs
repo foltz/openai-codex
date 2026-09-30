@@ -1148,7 +1148,7 @@ async fn tool_search_returns_deferred_dynamic_tool_and_routes_follow_up_call() -
         .thread_manager
         .start_thread(StartThreadOptions {
             dynamic_tools: vec![dynamic_tool, shadow_tool],
-            ..StartThreadOptions::new(base_test.config.clone())
+            ..StartThreadOptions::new(base_test.config.clone(), None)
         })
         .await?;
     let mut test = base_test;
@@ -1338,6 +1338,8 @@ async fn tool_search_indexes_only_enabled_non_app_mcp_tools() -> Result<()> {
                     oauth_resource: None,
                     supports_parallel_tool_calls: false,
                     tool_input_schema_max_bytes: None,
+                    thread_identity_eligible: false,
+                    control_endpoint_eligible: false,
                     omit_tools_from: None,
                     tools: HashMap::new(),
                 },
@@ -1473,6 +1475,8 @@ async fn tool_search_surfaced_mcp_tool_errors_are_returned_to_model() -> Result<
                     oauth_resource: None,
                     supports_parallel_tool_calls: false,
                     tool_input_schema_max_bytes: None,
+                    thread_identity_eligible: false,
+                    control_endpoint_eligible: false,
                     omit_tools_from: None,
                     tools: HashMap::new(),
                 },
@@ -1624,6 +1628,8 @@ async fn tool_search_uses_non_app_mcp_server_instructions_as_namespace_descripti
                     oauth_resource: None,
                     supports_parallel_tool_calls: false,
                     tool_input_schema_max_bytes: None,
+                    thread_identity_eligible: false,
+                    control_endpoint_eligible: false,
                     omit_tools_from: None,
                     tools: HashMap::new(),
                 },
@@ -1807,7 +1813,7 @@ async fn tool_search_matches_dynamic_tools_by_name_description_namespace_and_sch
         .thread_manager
         .start_thread(StartThreadOptions {
             dynamic_tools: vec![dynamic_tool],
-            ..StartThreadOptions::new(base_test.config.clone())
+            ..StartThreadOptions::new(base_test.config.clone(), None)
         })
         .await?;
     let mut test = base_test;

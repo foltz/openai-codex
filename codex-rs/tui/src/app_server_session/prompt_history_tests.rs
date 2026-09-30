@@ -52,6 +52,7 @@ async fn lifecycle_metadata_uses_local_prompt_history() -> Result<()> {
                 &local_settings,
                 &config,
                 /*session_start_source*/ None,
+                /*clear_predecessor_thread_id*/ None,
                 /*remote_cwd_override*/ None,
                 /*selected_profile*/ None,
             )
@@ -59,6 +60,7 @@ async fn lifecycle_metadata_uses_local_prompt_history() -> Result<()> {
         assert_eq!(started.session.message_history, expected);
         let startup = start_thread_with_request_handle(
             app_server.request_handle(),
+            app_server.retention_client(),
             &local_settings,
             config.clone(),
             mode,
@@ -66,6 +68,11 @@ async fn lifecycle_metadata_uses_local_prompt_history() -> Result<()> {
             app_server.thread_tool_transport(),
         )
         .await?;
+        let crate::app_server_session::PendingStartupThread {
+            started: startup,
+            retention,
+        } = startup;
+        retention.commit();
         assert_eq!(startup.session.message_history, expected);
         let resumed = app_server
             .resume_thread(

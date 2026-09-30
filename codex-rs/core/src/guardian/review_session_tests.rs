@@ -147,9 +147,10 @@ async fn test_review_session() -> (
 
     (
         GuardianReviewSession {
+            parent_session: Arc::downgrade(&session),
             session,
             io: SessionIo {
-                tx_sub,
+                tx_sub: tx_sub.into(),
                 rx_event,
                 agent_status,
                 session_loop_termination: crate::session::completed_session_loop_termination(),
@@ -1059,6 +1060,7 @@ async fn prewarm_test_session(
     let context = setup::prepare_prewarm(
         Arc::clone(&params.parent_session),
         Arc::clone(params.parent_context.turn()),
+        /*account_work*/ None,
     )
     .await
     .unwrap();

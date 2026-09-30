@@ -21,7 +21,23 @@ pub(crate) const SESSION_END_DEFAULT_TIMEOUT_SEC: u64 = 1;
 /// Keep below app-server's in-process `SHUTDOWN_TIMEOUT`: SessionEnd runs during
 /// teardown and must leave headroom within the existing five-second bound.
 pub(crate) const SESSION_END_MAX_TIMEOUT_SEC: u64 = 3;
-const SESSION_END_REASON: &str = "other";
+#[cfg(debug_assertions)]
+const SESSION_END_SERIALIZATION_FAILURE_FOR_TESTS_ENV: &str =
+    "CODEX_HOOKS_SESSION_END_SERIALIZATION_FAILURE_FOR_TESTS";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEndReason {
+    Other,
+    Clear,
+}
+
+impl SessionEndReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Other => "other",
+            Self::Clear => "clear",
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct SessionEndRequest {
@@ -29,6 +45,8 @@ pub struct SessionEndRequest {
     pub turn_id: String,
     pub cwd: AbsolutePathBuf,
     pub transcript_path: Option<PathBuf>,
+    pub reason: SessionEndReason,
+    pub clear_transition_id: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -36,36 +54,63 @@ pub struct SessionEndOutcome {
     pub hook_events: Vec<HookCompletedEvent>,
 }
 
-pub(crate) fn preview(handlers: &[ConfiguredHandler]) -> Vec<HookRunSummary> {
-    dispatcher::select_handlers(
-        handlers,
-        HookEventName::SessionEnd,
-        Some(SESSION_END_REASON),
-    )
-    .into_iter()
-    .map(|handler| dispatcher::running_summary(&handler))
-    .collect()
+fn select_handlers(
+    handlers: &[ConfiguredHandler],
+    reason: SessionEndReason,
+) -> Vec<ConfiguredHandler> {
+    match reason {
+        SessionEndReason::Other => {
+            dispatcher::select_handlers(handlers, HookEventName::SessionEnd, Some(reason.as_str()))
+        }
+        SessionEndReason::Clear => dispatcher::select_clear_session_end_handlers(handlers),
+    }
+}
+
+pub(crate) fn preview(
+    handlers: &[ConfiguredHandler],
+    reason: SessionEndReason,
+) -> Vec<HookRunSummary> {
+    select_handlers(handlers, reason)
+        .into_iter()
+        .map(|handler| dispatcher::running_summary(&handler))
+        .collect()
 }
 
 pub(crate) async fn run(
     engine: &ClaudeHooksEngine,
     request: SessionEndRequest,
 ) -> SessionEndOutcome {
-    let matched = dispatcher::select_handlers(
-        &engine.handlers,
-        HookEventName::SessionEnd,
-        Some(SESSION_END_REASON),
-    );
+    #[cfg(debug_assertions)]
+    if std::env::var_os(SESSION_END_SERIALIZATION_FAILURE_FOR_TESTS_ENV).is_some() {
+        return run_with_serializer(engine, request, |_input| {
+            Err("injected session end serialization failure".to_string())
+        })
+        .await;
+    }
+
+    run_with_serializer(engine, request, |input| {
+        serde_json::to_string(input).map_err(|error| error.to_string())
+    })
+    .await
+}
+
+async fn run_with_serializer(
+    engine: &ClaudeHooksEngine,
+    request: SessionEndRequest,
+    serialize: impl FnOnce(&SessionEndCommandInput) -> Result<String, String>,
+) -> SessionEndOutcome {
+    let matched = select_handlers(&engine.handlers, request.reason);
     if matched.is_empty() {
         return SessionEndOutcome::default();
     }
 
-    let input_json = match serde_json::to_string(&SessionEndCommandInput {
+    let input_json = match serialize(&SessionEndCommandInput {
         session_id: request.session_id.to_string(),
         transcript_path: NullableString::from_path(request.transcript_path.clone()),
         cwd: request.cwd.display().to_string(),
         hook_event_name: "SessionEnd".to_string(),
-        reason: SESSION_END_REASON.to_string(),
+        reason: request.reason.as_str().to_string(),
+        clear_transition_id: request.clear_transition_id,
     }) {
         Ok(input_json) => input_json,
         Err(error) => {

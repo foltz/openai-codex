@@ -2,22 +2,20 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::retirement::ManagedRunningService;
 use anyhow::Result;
 use anyhow::anyhow;
 use codex_exec_server::ExecServerError;
 use http::StatusCode;
-use rmcp::service::RoleClient;
-use rmcp::service::RunningService;
 use rmcp::transport::streamable_http_client::StreamableHttpError;
 use tokio::time;
 use tracing::warn;
 
-use crate::elicitation_client_service::ElicitationClientService;
 use crate::http_client_adapter::StreamableHttpClientAdapterError;
 use crate::oauth::OAuthRuntime;
 
 use super::InitializeContext;
-use super::PendingTransport;
+use super::PendingConnection;
 use super::RmcpClient;
 
 const JSON_RPC_INTERNAL_ERROR_CODE: i64 = -32603;
@@ -26,19 +24,11 @@ pub(super) const STREAMABLE_HTTP_RETRY_DELAYS_MS: [u64; 2] = [250, 1_000];
 impl RmcpClient {
     pub(super) async fn connect_pending_transport_with_initialize_retries(
         &self,
-        initial_transport: PendingTransport,
+        initial_transport: PendingConnection,
         initialize_context: &InitializeContext,
-    ) -> Result<(
-        Arc<RunningService<RoleClient, ElicitationClientService>>,
-        Option<OAuthRuntime>,
-    )> {
+    ) -> Result<(Arc<ManagedRunningService>, Option<OAuthRuntime>)> {
         let timeout = initialize_context.timeout;
-        let should_retry = match &initial_transport {
-            PendingTransport::InProcess { .. } | PendingTransport::Stdio { .. } => false,
-            PendingTransport::StreamableHttp { .. }
-            | PendingTransport::StreamableHttpWithOAuth { .. }
-            | PendingTransport::StreamableHttpWithAccessTokenOnly { .. } => true,
-        };
+        let should_retry = initial_transport.retryable;
         let mut retry_deadline = timeout.map(|duration| Instant::now() + duration);
         let mut pending_transport = Some(initial_transport);
 
@@ -56,15 +46,24 @@ impl RmcpClient {
                     match remaining {
                         Some(remaining) => time::timeout(
                             remaining,
-                            Self::create_pending_transport(&self.transport_recipe),
+                            Self::create_registered_transport(
+                                &self.transport_recipe,
+                                &self.retirement,
+                            ),
                         )
                         .await
                         .map_err(|_| initialize_timeout_error(timeout, remaining))??,
-                        None => Self::create_pending_transport(&self.transport_recipe).await?,
+                        None => {
+                            Self::create_registered_transport(
+                                &self.transport_recipe,
+                                &self.retirement,
+                            )
+                            .await?
+                        }
                     }
                 }
             };
-            if let PendingTransport::StreamableHttpWithOAuth { oauth_runtime, .. } = &transport {
+            if let Some(oauth_runtime) = &transport.oauth {
                 // OAuth refresh has its own lock and provider request bounds. Exclude it from the
                 // MCP handshake budget, and finish persistence before attempting initialize.
                 let refresh_started_at = Instant::now();

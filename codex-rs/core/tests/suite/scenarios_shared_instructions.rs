@@ -36,7 +36,7 @@ async fn running_descendants_refresh_only_shared_thread_instructions(shared: boo
         .start_thread(StartThreadOptions {
             environments: Some(vec![test.executor_environment().selection().clone()]),
             thread_instructions_provider: Some(provider.clone()),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?;
     let mut parent_id = root.thread_id;
@@ -53,7 +53,7 @@ async fn running_descendants_refresh_only_shared_thread_instructions(shared: boo
                     agent_nickname: None,
                     agent_role: None,
                 })),
-                ..StartThreadOptions::new(test.config.clone())
+                ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
             })
             .await?;
         parent_id = child.thread_id;
@@ -66,7 +66,7 @@ async fn running_descendants_refresh_only_shared_thread_instructions(shared: boo
         .start_thread(StartThreadOptions {
             environments: Some(vec![test.executor_environment().selection().clone()]),
             thread_instructions_provider: Some(other_provider),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?;
     let root_response = mount_sse_once(&server, responses::sse_completed("root-step")).await;
@@ -96,7 +96,7 @@ async fn running_descendants_refresh_only_shared_thread_instructions(shared: boo
             initial_history: history,
             environments: Some(vec![test.executor_environment().selection().clone()]),
             thread_instructions_provider: Some(provider.clone()),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?;
     previous_provider.set_instructions(Some(Instructions {
@@ -204,7 +204,7 @@ async fn guardian_tracks_shared_instruction_updates_in_running_descendants() -> 
         .start_thread(StartThreadOptions {
             environments: Some(vec![test.executor_environment().selection().clone()]),
             thread_instructions_provider: Some(provider),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?;
     let mut descendant = root;
@@ -220,7 +220,7 @@ async fn guardian_tracks_shared_instruction_updates_in_running_descendants() -> 
                     agent_nickname: None,
                     agent_role: None,
                 })),
-                ..StartThreadOptions::new(test.config.clone())
+                ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
             })
             .await?;
     }

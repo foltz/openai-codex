@@ -133,6 +133,8 @@ use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::HasLegacyEvent;
 use codex_protocol::protocol::HistoryPosition;
+use codex_protocol::protocol::HookCompletedEvent;
+use codex_protocol::protocol::HookRunSummary;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ItemStartedEvent;
@@ -241,14 +243,24 @@ mod submission;
 pub(crate) use reasoning_effort::RequestEffortUsage;
 pub(crate) use submission::Submission;
 mod input_queue;
+mod mailbox;
 mod mcp;
 mod mcp_prewarm;
+#[cfg(test)]
+mod mcp_prewarm_tests;
 mod mcp_refresh;
 mod mcp_runtime;
+mod mcp_work;
+pub(crate) use mcp_work::McpOperationWork;
 pub(crate) mod multi_agents;
 mod plugin_selection;
 mod realtime_history;
 mod retained_context;
+pub(crate) mod retirement;
+pub(crate) mod startup_custody;
+pub(crate) use submission::IdleAdmissionError;
+pub(crate) use submission::SubmissionDispatch;
+use submission::SubmissionSender;
 mod review;
 mod rollout_budget;
 mod rollout_reconstruction;
@@ -265,6 +277,7 @@ pub(crate) mod turn;
 pub(crate) mod turn_context;
 mod turn_input;
 mod turn_suspension;
+mod turn_work;
 mod world_state;
 use self::code_mode_warning::unsupported_code_mode_warning;
 pub(crate) use self::environment::ThreadEnvironmentDefaults;
@@ -275,6 +288,7 @@ pub(crate) use self::input_queue::InputQueueActivity;
 pub(crate) use self::input_queue::TurnInput;
 pub(crate) use self::input_queue::TurnInputQueue;
 pub(crate) use self::input_queue::UserInputMetadata;
+pub(crate) use self::mailbox::MailboxReservation;
 use self::review::spawn_review_thread;
 use self::session::AppServerClientMetadata;
 use self::session::Session;
@@ -402,7 +416,7 @@ use codex_utils_stream_parser::ProposedPlanSegment;
 /// completion future observes that shutdown.
 #[derive(Clone)]
 pub(crate) struct SessionIo {
-    pub(crate) tx_sub: Sender<Submission>,
+    pub(crate) tx_sub: SubmissionSender,
     pub(crate) rx_event: Receiver<Event>,
     // Last known status of the agent.
     pub(crate) agent_status: watch::Receiver<AgentStatus>,
@@ -411,7 +425,105 @@ pub(crate) struct SessionIo {
     pub(crate) session_loop_termination: SessionLoopTermination,
 }
 
-pub(crate) type SessionLoopTermination = Shared<BoxFuture<'static, ()>>;
+/// Submission/loop control only: retirement must never clone event-consumer
+/// or agent-status capabilities merely to retain its shutdown attempt.
+#[derive(Clone)]
+pub(crate) struct SessionRetirementIo {
+    pub(crate) tx_sub: SubmissionSender,
+    pub(crate) session_loop_termination: SessionLoopTermination,
+}
+
+impl SessionRetirementIo {
+    pub(crate) async fn submit_shutdown(&self) -> CodexResult<()> {
+        self.tx_sub
+            .send_shutdown(Submission {
+                id: new_submission_id(),
+                op: Op::Shutdown,
+                root_turn_id: None,
+                trace: current_span_w3c_trace_context(),
+                parent_turn_id: None,
+                residency_guard: None,
+            })
+            .await
+            .map_err(|_| CodexErr::InternalAgentDied)?;
+        Ok(())
+    }
+
+    pub(crate) async fn shutdown_and_wait(&self) -> CodexResult<()> {
+        match self.submit_shutdown().await {
+            Ok(()) => {}
+            Err(err) if matches!(err.details(), CodexErrorDetails::InternalAgentDied) => {}
+            Err(err) => return Err(err),
+        }
+        match self.session_loop_termination.clone().await {
+            SessionLoopOutcome::Normal => match self.session_loop_termination.cleanup_completed() {
+                // Synthetic fixtures and non-session workers (for example the
+                // MCP prewarm worker) have no session teardown owner and
+                // retain their legacy join-only behavior. The production
+                // submission loop attaches its owner at loop birth, so its
+                // missing or non-clean receipt cannot be normalized to
+                // success.
+                None => Ok(()),
+                Some(retirement::CleanupExecution::Finished {
+                    persistence_failed: false,
+                }) => Ok(()),
+                Some(_) => Err(CodexErr::InternalAgentDied),
+            },
+            SessionLoopOutcome::Cancelled | SessionLoopOutcome::Panicked => {
+                Err(CodexErr::InternalAgentDied)
+            }
+        }
+    }
+}
+
+/// Observed loop outcome, not a receipt for session resource cleanup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SessionLoopOutcome {
+    Normal,
+    Cancelled,
+    Panicked,
+}
+
+/// Couples a loop's abort capability to observation of that exact task.
+/// Aborting requests termination; only polling completion observes its outcome.
+#[derive(Clone)]
+pub(crate) struct SessionLoopTermination {
+    completion: Shared<BoxFuture<'static, SessionLoopOutcome>>,
+    abort: Option<tokio::task::AbortHandle>,
+    cleanup_owner: Option<Arc<retirement::SessionCleanupOwner>>,
+}
+
+impl SessionLoopTermination {
+    /// Normalize only the retained join. This never polls session cleanup and
+    /// is not, by itself, evidence that cleanup completed successfully.
+    pub(crate) fn observed(&self) -> Option<SessionLoopOutcome> {
+        self.completion.clone().now_or_never()
+    }
+
+    pub(crate) fn request_abort(&self) {
+        if let Some(abort) = &self.abort {
+            abort.abort();
+        }
+    }
+
+    /// A normal loop join is not enough to certify teardown. The loop owns
+    /// the cleanup observer, so expose its retained receipt separately for
+    /// callers that classify the legacy shutdown result.
+    pub(crate) fn cleanup_completed(&self) -> Option<retirement::CleanupExecution> {
+        self.cleanup_owner.as_ref()?.completed()
+    }
+}
+
+impl std::future::Future for SessionLoopTermination {
+    type Output = SessionLoopOutcome;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.completion).poll(cx)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GitEnrichmentPolicy {
@@ -445,6 +557,9 @@ pub(crate) struct SessionSpawnArgs {
     pub(crate) mcp_manager: Arc<McpManager>,
     pub(crate) code_mode_session_provider: Arc<dyn codex_code_mode::CodeModeSessionProvider>,
     pub(crate) extensions: Arc<codex_extension_api::ExtensionRegistry<crate::config::Config>>,
+    pub(crate) host_admission: Option<Arc<dyn codex_extension_api::TurnStartAdmission>>,
+    /// Invocation-owned authority for initial publication, never retained on services.
+    pub(crate) initial_mcp_work: Option<Box<dyn codex_mcp::McpAttemptWork>>,
     pub(crate) conversation_history: InitialHistory,
     pub(crate) disabled_plugin_ids: Option<Vec<String>>,
     pub(crate) requested_history_mode: Option<ThreadHistoryMode>,
@@ -470,6 +585,7 @@ pub(crate) struct SessionSpawnArgs {
     pub(crate) thread_extension_init: ExtensionDataInit,
     pub(crate) client_mcp_extensions: ClientMcpExtensions,
     pub(crate) reserved_thread_id: Option<ThreadId>,
+    pub(crate) control_endpoint: Option<String>,
     pub(crate) analytics_events_client: Option<AnalyticsEventsClient>,
     pub(crate) image_store: Arc<dyn AttachmentStore>,
     pub(crate) thread_store: Arc<dyn ThreadStore>,
@@ -479,6 +595,16 @@ pub(crate) struct SessionSpawnArgs {
     pub(crate) git_enrichment_policy: GitEnrichmentPolicy,
     pub(crate) windows_sandbox_proxy_settings_mode:
         codex_sandboxing::WindowsSandboxProxySettingsMode,
+    pub(crate) deferred_clear_session_start: Option<DeferredClearSessionStart>,
+    pub(crate) runtime_config_change_listener: Option<Arc<dyn crate::RuntimeConfigChangeListener>>,
+    pub(crate) runtime_config_change_gate: Option<crate::RuntimeConfigChangeGate>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DeferredClearSessionStart {
+    pub(crate) predecessor_thread_id: ThreadId,
+    pub(crate) successor_thread_id: ThreadId,
+    pub(crate) transition_id: codex_state::ClearTransitionId,
 }
 
 pub(crate) fn resolve_multi_agent_version(
@@ -511,6 +637,13 @@ impl Session {
     pub(crate) fn spawn(
         args: SessionSpawnArgs,
     ) -> BoxFuture<'static, CodexResult<(Arc<Self>, SessionIo)>> {
+        Self::spawn_with_custody(args, /*custody*/ None)
+    }
+
+    pub(crate) fn spawn_with_custody(
+        args: SessionSpawnArgs,
+        custody: Option<Arc<startup_custody::SessionStartupCustody>>,
+    ) -> futures::future::BoxFuture<'static, CodexResult<(Arc<Self>, SessionIo)>> {
         Box::pin(async move {
             let parent_trace = match args.parent_trace {
                 Some(trace) => {
@@ -527,16 +660,22 @@ impl Session {
             if let Some(trace) = parent_trace.as_ref() {
                 let _ = set_parent_from_w3c_trace_context(&thread_spawn_span, trace);
             }
-            Self::spawn_internal(SessionSpawnArgs {
-                parent_trace,
-                ..args
-            })
+            Self::spawn_internal(
+                SessionSpawnArgs {
+                    parent_trace,
+                    ..args
+                },
+                custody,
+            )
             .instrument(thread_spawn_span)
             .await
         })
     }
 
-    async fn spawn_internal(args: SessionSpawnArgs) -> CodexResult<(Arc<Self>, SessionIo)> {
+    async fn spawn_internal(
+        args: SessionSpawnArgs,
+        custody: Option<Arc<startup_custody::SessionStartupCustody>>,
+    ) -> CodexResult<(Arc<Self>, SessionIo)> {
         let SessionSpawnArgs {
             startup,
             config,
@@ -552,6 +691,8 @@ impl Session {
             mcp_manager,
             code_mode_session_provider,
             extensions,
+            host_admission,
+            initial_mcp_work,
             conversation_history,
             disabled_plugin_ids,
             requested_history_mode,
@@ -573,6 +714,7 @@ impl Session {
             thread_extension_init,
             client_mcp_extensions,
             reserved_thread_id,
+            control_endpoint,
             analytics_events_client,
             image_store,
             thread_store,
@@ -581,6 +723,9 @@ impl Session {
             inherited_multi_agent_version,
             git_enrichment_policy,
             windows_sandbox_proxy_settings_mode,
+            deferred_clear_session_start,
+            runtime_config_change_listener,
+            runtime_config_change_gate,
         } = args;
         let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
         let (tx_event, rx_event) = async_channel::unbounded();
@@ -858,6 +1003,7 @@ impl Session {
             originator,
             dynamic_tools,
             user_shell_override,
+            control_endpoint,
         };
         session_configuration
             .validate(&environment_selections)
@@ -889,6 +1035,8 @@ impl Session {
             mcp_manager.clone(),
             code_mode_session_provider,
             extensions,
+            host_admission,
+            initial_mcp_work,
             thread_extension_init,
             client_mcp_extensions,
             agent_control,
@@ -904,6 +1052,10 @@ impl Session {
             multi_agent_version,
             git_enrichment_policy,
             windows_sandbox_proxy_settings_mode,
+            deferred_clear_session_start,
+            runtime_config_change_listener,
+            runtime_config_change_gate,
+            custody.as_deref(),
         ))
         .await
         .map_err(|e| {
@@ -925,26 +1077,61 @@ impl Session {
 
         // This task will run until Op::Shutdown is received.
         let session_for_loop = Arc::clone(&session);
+        let cleanup_owner = session.cleanup_owner();
+        let loop_cleanup_owner = Arc::clone(&cleanup_owner);
+        let tx_sub = SubmissionSender::from(tx_sub);
+        let submissions = tx_sub.dispatch_control();
+        let (loop_ready, ready) = tokio::sync::oneshot::channel();
         let session_loop_handle = tokio::spawn(async move {
-            submission_loop(session_for_loop, configured_config, rx_sub)
-                .instrument(info_span!("session_loop", thread_id = %thread_id))
-                .await;
+            let _cleanup_owner = loop_cleanup_owner;
+            if ready.await.is_err() {
+                return;
+            }
+            submission_loop(
+                session_for_loop,
+                configured_config,
+                rx_sub,
+                Some(submissions),
+            )
+            .instrument(info_span!("session_loop", thread_id = %thread_id))
+            .await;
         });
+        let mut termination = session_loop_termination_from_handle(session_loop_handle);
+        // Publish the join-only fallback before this loop can admit mailbox
+        // work. It retains no submission sender or session-cleanup owner.
+        session
+            .services
+            .thread_extension_data
+            .insert(turn_work::SessionLoopWorkReceipt(
+                termination.completion.clone(),
+            ));
+        termination.cleanup_owner = Some(cleanup_owner);
         let io = SessionIo {
             tx_sub,
             rx_event,
             agent_status: agent_status_rx,
-            session_loop_termination: session_loop_termination_from_handle(session_loop_handle),
+            session_loop_termination: termination,
         };
+        let _ = loop_ready.send(());
 
         if let Some(startup) = startup {
             let _ = startup.io.set(io.clone());
+        }
+        if let Some(custody) = custody {
+            custody.attach_io(io.retirement_io());
         }
         Ok((session, io))
     }
 }
 
 impl SessionIo {
+    pub(crate) fn retirement_io(&self) -> SessionRetirementIo {
+        SessionRetirementIo {
+            tx_sub: self.tx_sub.clone(),
+            session_loop_termination: self.session_loop_termination.clone(),
+        }
+    }
+
     /// Submit the `op` wrapped in a `Submission` with a unique ID.
     pub(crate) async fn submit(&self, op: Op) -> CodexResult<String> {
         self.submit_with_trace(
@@ -995,6 +1182,7 @@ impl SessionIo {
         &self,
         mut request: TurnInputRequest,
         mode: TurnInputMode,
+        host_work: Option<Box<dyn codex_protocol::host_turn_work::HostTurnWork>>,
     ) -> CodexResult<TurnInputSubmission> {
         let id = new_submission_id();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -1004,6 +1192,7 @@ impl SessionIo {
             op: Op::TurnInput {
                 request: Box::new(request),
                 mode,
+                host_work,
                 reply: reply_tx,
             },
             trace,
@@ -1021,6 +1210,7 @@ impl SessionIo {
         start_options: TurnStartOptions,
         trace: Option<W3cTraceContext>,
         turn_id: String,
+        host_work: Option<Box<dyn codex_protocol::host_turn_work::HostTurnWork>>,
     ) -> CodexResult<TurnInputSubmission> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.submit_with_id(Submission {
@@ -1028,6 +1218,7 @@ impl SessionIo {
             op: Op::RecoverTurn {
                 thread_settings,
                 start_options,
+                host_work,
                 reply: reply_tx,
             },
             trace,
@@ -1040,14 +1231,7 @@ impl SessionIo {
     }
 
     pub(crate) async fn shutdown_and_wait(&self) -> CodexResult<()> {
-        let session_loop_termination = self.session_loop_termination.clone();
-        match self.submit(Op::Shutdown).await {
-            Ok(_) => {}
-            Err(err) if matches!(err.details(), CodexErrorDetails::InternalAgentDied) => {}
-            Err(err) => return Err(err),
-        }
-        session_loop_termination.await;
-        Ok(())
+        self.retirement_io().shutdown_and_wait().await
     }
 
     pub(crate) async fn next_event(&self) -> CodexResult<Event> {
@@ -1115,17 +1299,33 @@ fn session_permission_profile_state_from_config(
 
 #[cfg(test)]
 pub(crate) fn completed_session_loop_termination() -> SessionLoopTermination {
-    futures::future::ready(()).boxed().shared()
+    SessionLoopTermination {
+        completion: futures::future::ready(SessionLoopOutcome::Normal)
+            .boxed()
+            .shared(),
+        abort: None,
+        cleanup_owner: None,
+    }
 }
 
 pub(crate) fn session_loop_termination_from_handle(
     handle: JoinHandle<()>,
 ) -> SessionLoopTermination {
-    async move {
-        let _ = handle.await;
+    let abort = handle.abort_handle();
+    let completion = async move {
+        match handle.await {
+            Ok(()) => SessionLoopOutcome::Normal,
+            Err(error) if error.is_cancelled() => SessionLoopOutcome::Cancelled,
+            Err(_) => SessionLoopOutcome::Panicked,
+        }
     }
     .boxed()
-    .shared()
+    .shared();
+    SessionLoopTermination {
+        completion,
+        abort: Some(abort),
+        cleanup_owner: None,
+    }
 }
 
 async fn thread_title_from_thread_store(
@@ -2003,6 +2203,13 @@ impl Session {
         startup_prewarm: SessionStartupPrewarmHandle,
     ) {
         let mut state = self.state.lock().await;
+        if self
+            .task_admission_closed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            drop(state);
+            return;
+        }
         state.set_session_startup_prewarm(startup_prewarm);
     }
 
@@ -2042,6 +2249,20 @@ impl Session {
     }
 
     pub(crate) async fn refresh_runtime_config(&self, next_config: Config) {
+        let _change_guard = match self.services.runtime_config_change_gate.as_ref() {
+            Some(gate) => Some(gate.lock().await),
+            None => None,
+        };
+        if let Some(listener) = self.services.runtime_config_change_listener.as_ref() {
+            listener.before_runtime_config_change();
+        }
+        self.refresh_runtime_config_from_host(next_config).await;
+    }
+
+    /// Applies a materialized runtime configuration under a transition the
+    /// host already owns. Callers must hold the matching
+    /// `RuntimeConfigChangeGate` for the entire runtime transition.
+    pub(crate) async fn refresh_runtime_config_from_host(&self, next_config: Config) {
         self.refresh_runtime_config_inner(next_config, /*refresh_recording*/ true)
             .await;
     }
@@ -2198,6 +2419,10 @@ impl Session {
     }
 
     pub(crate) async fn reload_user_config_layer(&self) {
+        let _change_guard = match self.services.runtime_config_change_gate.as_ref() {
+            Some(gate) => Some(gate.lock().await),
+            None => None,
+        };
         // Refresh layer-backed runtime state for an existing session, including enabled plugin,
         // skill, and hook state. Derived config fields such as feature gates and legacy notify
         // settings remain session-static.
@@ -2268,6 +2493,9 @@ impl Session {
                 resolve_tool_suggest_config_from_layer_stack(&config.config_layer_stack);
             config
         };
+        if let Some(listener) = self.services.runtime_config_change_listener.as_ref() {
+            listener.before_runtime_config_change();
+        }
         self.services.skills_service.clear_cache();
         self.services.plugins_manager.clear_cache();
         // This legacy snapshot still has the original execution features, not
@@ -3760,12 +3988,41 @@ impl Session {
         required_servers: &[String],
         required_plugins: &HashSet<String>,
     ) -> CodexResult<Arc<StepContext>> {
+        let work = self
+            .turn_mcp_work(&turn_context)
+            .map_err(|err| CodexErr::Fatal(err.to_string()))?;
+        let access = work.as_deref().map_or(
+            codex_mcp::McpAttemptAccess::Unscoped,
+            codex_mcp::McpAttemptAccess::Admitted,
+        );
         let step_context = self
             .capture_step_context_inner(
                 turn_context,
                 cancellation_token,
                 required_servers,
                 required_plugins,
+                access,
+            )
+            .await?;
+        self.set_last_known_step_context(&step_context).await;
+        Ok(step_context)
+    }
+
+    /// Standalone captures have no installed turn entry. Their caller supplies
+    /// request, parent-turn, or prewarm authority for this invocation only.
+    pub(crate) async fn capture_step_context_with_authority(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        cancellation_token: &CancellationToken,
+        access: codex_mcp::McpAttemptAccess<'_>,
+    ) -> CodexResult<Arc<StepContext>> {
+        let step_context = self
+            .capture_step_context_inner(
+                turn_context,
+                cancellation_token,
+                /*required_servers*/ &[],
+                /*required_plugins*/ &HashSet::new(),
+                access,
             )
             .await?;
         self.set_last_known_step_context(&step_context).await;
@@ -3779,11 +4036,19 @@ impl Session {
         turn_context: Arc<TurnContext>,
         cancellation_token: &CancellationToken,
     ) -> CodexResult<Arc<StepContext>> {
+        let work = self
+            .turn_mcp_work(&turn_context)
+            .map_err(|err| CodexErr::Fatal(err.to_string()))?;
+        let access = work.as_deref().map_or(
+            codex_mcp::McpAttemptAccess::Unscoped,
+            codex_mcp::McpAttemptAccess::Admitted,
+        );
         self.capture_step_context_inner(
             turn_context,
             cancellation_token,
             /*required_servers*/ &[],
             /*required_plugins*/ &HashSet::new(),
+            access,
         )
         .await
     }
@@ -3795,6 +4060,7 @@ impl Session {
         cancellation_token: &CancellationToken,
         required_servers: &[String],
         required_plugins: &HashSet<String>,
+        access: codex_mcp::McpAttemptAccess<'_>,
     ) -> CodexResult<Arc<StepContext>> {
         // Read the step's model and record its environments together so an update cannot split them.
         // Wait for executor startup below, after releasing the lock.
@@ -3898,9 +4164,11 @@ impl Session {
                     &selected_capability_roots,
                     required_servers,
                     required_plugins,
+                    access,
                 )),
                 turn::prepare_tool_recommendations(self.as_ref(), turn_context.as_ref()),
             );
+            let mcp = mcp?;
             let mut selected_plugins = self
                 .services
                 .thread_extension_data
@@ -4298,6 +4566,21 @@ impl Session {
         step_context: &StepContext,
         world_state: &WorldState,
     ) -> Vec<ResponseItem> {
+        let work = self.turn_mcp_work(&step_context.turn);
+        let access = match &work {
+            Ok(work) => Ok(codex_mcp::McpAttemptAccess::from_work(work.as_deref())),
+            Err(_) => Err(codex_mcp::McpAttemptRefused),
+        };
+        self.build_initial_context_with_world_state_and_authority(step_context, world_state, access)
+            .await
+    }
+
+    async fn build_initial_context_with_world_state_and_authority(
+        &self,
+        step_context: &StepContext,
+        world_state: &WorldState,
+        access: Result<codex_mcp::McpAttemptAccess<'_>, codex_mcp::McpAttemptRefused>,
+    ) -> Vec<ResponseItem> {
         let turn_context = step_context.turn.as_ref();
         let mut developer_sections = Vec::<RenderedFragment>::with_capacity(8);
         let mut contextual_user_sections = Vec::<RenderedFragment>::with_capacity(2);
@@ -4396,10 +4679,11 @@ impl Session {
                 .token_budget
                 .as_ref()
                 .is_some_and(|config| config.use_history_notes_extension)
+                && let Ok(access) = access
                 && let Some(mcp_result) = self
                     .services
                     .mcp_runtime
-                    .latest_call_tool(
+                    .latest_call_tool_with_authority(
                         "notes",
                         "thread_hint",
                         /*environment_id*/ None,
@@ -4409,6 +4693,7 @@ impl Session {
                         })),
                         /*requested_timeout*/ None,
                         /*wait_for_server*/ true,
+                        access,
                     )
                     .await
                     .ok()
@@ -4673,6 +4958,20 @@ impl Session {
         &self,
         step_context: &StepContext,
     ) -> CodexResult<Arc<WorldState>> {
+        let work = self.turn_mcp_work(&step_context.turn);
+        let access = match &work {
+            Ok(work) => Ok(codex_mcp::McpAttemptAccess::from_work(work.as_deref())),
+            Err(_) => Err(codex_mcp::McpAttemptRefused),
+        };
+        self.record_context_updates_with_authority(step_context, access)
+            .await
+    }
+
+    pub(crate) async fn record_context_updates_with_authority(
+        &self,
+        step_context: &StepContext,
+        access: Result<codex_mcp::McpAttemptAccess<'_>, codex_mcp::McpAttemptRefused>,
+    ) -> CodexResult<Arc<WorldState>> {
         let turn_context = step_context.turn.as_ref();
         let reference_context_item = {
             let state = self.state.lock().await;
@@ -4681,11 +4980,18 @@ impl Session {
         let turn_context_item = step_context.to_turn_context_item();
         let turn_context_changed = reference_context_item.as_ref() != Some(&turn_context_item);
         let should_inject_full_context = reference_context_item.is_none();
-        let world_state = Arc::new(self.build_world_state_for_step(step_context).await?);
+        let world_state = Arc::new(
+            self.build_world_state_for_step_with_authority(step_context, access)
+                .await?,
+        );
         // Full initial context resets the baseline; later turns persist only its changes.
         let (mut context_items, world_state_item) = if should_inject_full_context {
             let context_items = self
-                .build_initial_context_with_world_state(step_context, world_state.as_ref())
+                .build_initial_context_with_world_state_and_authority(
+                    step_context,
+                    world_state.as_ref(),
+                    access,
+                )
                 .await;
             let snapshot = world_state.snapshot();
             self.state
@@ -5084,11 +5390,41 @@ impl Session {
         Some(rollout_path)
     }
 
-    pub(crate) async fn take_pending_session_start_source(
+    pub(crate) async fn take_pending_session_start(
         &self,
-    ) -> Option<codex_hooks::SessionStartSource> {
+    ) -> Option<crate::state::PendingSessionStart> {
         let mut state = self.state.lock().await;
-        state.take_pending_session_start_source()
+        state.take_pending_session_start()
+    }
+
+    pub(crate) async fn take_deferred_clear_session_start(
+        &self,
+    ) -> Option<codex_hooks::ClearSessionStartContext> {
+        let mut state = self.state.lock().await;
+        state.take_deferred_clear_session_start()
+    }
+
+    pub(crate) async fn queue_eager_session_start_hook_outcome(
+        &self,
+        preview_runs: Vec<HookRunSummary>,
+        hook_events: Vec<HookCompletedEvent>,
+        should_stop: bool,
+        additional_contexts: Vec<String>,
+    ) {
+        let mut state = self.state.lock().await;
+        state.queue_eager_session_start_outcome(
+            preview_runs,
+            hook_events,
+            should_stop,
+            additional_contexts,
+        );
+    }
+
+    pub(crate) async fn take_eager_session_start_hook_outcome(
+        &self,
+    ) -> Option<crate::state::EagerSessionStartOutcome> {
+        let mut state = self.state.lock().await;
+        state.take_eager_session_start_outcome()
     }
 
     fn show_raw_agent_reasoning(&self) -> bool {
@@ -5209,3 +5545,11 @@ mod elicitation_holders_tests;
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+#[path = "mailbox_wake_tests.rs"]
+mod mailbox_wake_tests;
+
+#[cfg(test)]
+#[path = "turn_install_tests.rs"]
+mod turn_install_tests;

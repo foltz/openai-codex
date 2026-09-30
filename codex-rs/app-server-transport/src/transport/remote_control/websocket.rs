@@ -455,7 +455,7 @@ impl RemoteControlWebsocket {
     pub(super) async fn run(
         mut self,
         app_server_client_name_rx: Option<oneshot::Receiver<String>>,
-    ) {
+    ) -> bool {
         let auth_owner = self.auth_manager.owner.clone();
         info!(
             remote_control_url = %self.remote_control_url,
@@ -477,12 +477,12 @@ impl RemoteControlWebsocket {
                     shutdown_requested = self.shutdown_token.is_cancelled(),
                     "app-server remote control websocket loop stopped before client name was ready"
                 );
-                self.client_tracker.lock().await.shutdown().await;
-                return;
+                return self.client_tracker.lock().await.shutdown().await;
             }
         };
         self.pairing_persistence_key
             .send_replace(app_server_client_name.clone());
+        let mut workers_clean = true;
         loop {
             let status = self.status_publisher.status();
             info!(
@@ -521,9 +521,10 @@ impl RemoteControlWebsocket {
                 ConnectOutcome::Shutdown => break,
             };
 
-            let connection_end_reason = self
+            let (connection_end_reason, clean) = self
                 .run_connection(websocket_connection, shutdown_token)
                 .await;
+            workers_clean &= clean;
             let status = self.status_publisher.status();
             info!(
                 remote_control_url = %self.remote_control_url,
@@ -537,7 +538,7 @@ impl RemoteControlWebsocket {
             );
         }
 
-        self.client_tracker.lock().await.shutdown().await;
+        let clients_clean = self.client_tracker.lock().await.shutdown().await;
         info!(
             remote_control_url = %self.remote_control_url,
             installation_id = %self.installation_id,
@@ -545,6 +546,7 @@ impl RemoteControlWebsocket {
             shutdown_requested = self.shutdown_token.is_cancelled(),
             "app-server remote control websocket loop exited"
         );
+        clients_clean && workers_clean
     }
 
     async fn wait_for_app_server_client_name(
@@ -849,9 +851,9 @@ impl RemoteControlWebsocket {
         &self,
         websocket_connection: codex_websocket_client::WebSocketConnection,
         shutdown_token: CancellationToken,
-    ) -> ConnectionEndReason {
+    ) -> (ConnectionEndReason, bool) {
         if !self.auth_manager.owner.is_current() {
-            return ConnectionEndReason::AuthOwnerChanged;
+            return (ConnectionEndReason::AuthOwnerChanged, true);
         }
         self.client_tracker.lock().await.auth = Some(self.auth_manager.owner.clone());
         let (websocket_writer, websocket_reader) = websocket_connection.split();
@@ -874,6 +876,7 @@ impl RemoteControlWebsocket {
         ));
 
         let mut desired_state_rx = self.desired_state_rx.clone();
+        let mut workers_clean = true;
         let connection_end_reason = tokio::select! {
             biased;
             _ = shutdown_token.cancelled() => ConnectionEndReason::Shutdown,
@@ -887,24 +890,37 @@ impl RemoteControlWebsocket {
                     ConnectionEndReason::EnabledWatchClosed
                 }
             }
-            _ = join_set.join_next() => ConnectionEndReason::ConnectionWorkerStopped,
+            result = join_set.join_next() => {
+                workers_clean = match result {
+                    Some(Ok(())) => true,
+                    Some(Err(error)) => error.is_cancelled(),
+                    None => false,
+                };
+                ConnectionEndReason::ConnectionWorkerStopped
+            },
         };
         shutdown_token.cancel();
 
-        Self::join_connection_workers(&mut join_set, REMOTE_CONTROL_CONNECTION_SHUTDOWN_TIMEOUT)
-            .await;
-        connection_end_reason
+        workers_clean &= Self::join_connection_workers(
+            &mut join_set,
+            REMOTE_CONTROL_CONNECTION_SHUTDOWN_TIMEOUT,
+        )
+        .await;
+        (connection_end_reason, workers_clean)
     }
 
     async fn join_connection_workers(
         join_set: &mut tokio::task::JoinSet<()>,
         shutdown_timeout: std::time::Duration,
-    ) {
-        if tokio::time::timeout(shutdown_timeout, Self::drain_join_set(join_set))
+    ) -> bool {
+        // Keep evidence outside the timed future: a panic already joined before
+        // the timeout must not disappear when that observer is dropped.
+        let mut clean = true;
+        if tokio::time::timeout(shutdown_timeout, Self::drain_join_set(join_set, &mut clean))
             .await
             .is_ok()
         {
-            return;
+            return clean;
         }
 
         warn!(
@@ -913,11 +929,16 @@ impl RemoteControlWebsocket {
             "timed out waiting for remote control connection workers to stop; aborting"
         );
         join_set.abort_all();
-        Self::drain_join_set(join_set).await;
+        Self::drain_join_set(join_set, &mut clean).await;
+        clean
     }
 
-    async fn drain_join_set(join_set: &mut tokio::task::JoinSet<()>) {
-        while join_set.join_next().await.is_some() {}
+    async fn drain_join_set(join_set: &mut tokio::task::JoinSet<()>, clean: &mut bool) {
+        while let Some(result) = join_set.join_next().await {
+            // A completed abort is positive termination evidence, not an
+            // unobserved worker. Panics remain failures.
+            *clean &= result.is_ok() || result.is_err_and(|error| error.is_cancelled());
+        }
     }
 
     async fn run_server_writer(
@@ -2750,9 +2771,30 @@ mod tests {
         let mut join_set = tokio::task::JoinSet::new();
         join_set.spawn(futures::future::pending::<()>());
 
-        RemoteControlWebsocket::join_connection_workers(&mut join_set, Duration::from_millis(10))
-            .await;
+        assert!(
+            RemoteControlWebsocket::join_connection_workers(
+                &mut join_set,
+                Duration::from_millis(10)
+            )
+            .await
+        );
 
+        assert!(join_set.is_empty());
+    }
+
+    #[tokio::test]
+    async fn join_connection_workers_preserves_panic_before_timeout() {
+        let mut join_set = tokio::task::JoinSet::new();
+        join_set.spawn(async { panic!("worker panic") });
+        join_set.spawn(futures::future::pending::<()>());
+
+        assert!(
+            !RemoteControlWebsocket::join_connection_workers(
+                &mut join_set,
+                Duration::from_millis(10),
+            )
+            .await
+        );
         assert!(join_set.is_empty());
     }
 

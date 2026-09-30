@@ -129,12 +129,27 @@ impl McpServerConnection {
     }
 
     pub(crate) async fn client(&self) -> Result<ManagedClient, StartupOutcomeError> {
+        self.client_with_authority(crate::McpAttemptAccess::Unscoped)
+            .await
+    }
+
+    pub(crate) async fn client_with_authority(
+        &self,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Result<ManagedClient, StartupOutcomeError> {
+        // Stage before waking the retained driver. No await may separate these
+        // operations: a dropped activator must leave a live terminal poller.
+        if self.client.cancel_token.is_cancelled() {
+            self.client.client.cancel_unstarted();
+        }
+        self.client.client.admit(access)?;
         if let Some(startup_trigger) = &self.startup_trigger {
             startup_trigger.send_replace(true);
         }
-        self.client.client().await
+        self.client.client_with_authority(access).await
     }
 
+    #[cfg(test)]
     async fn shutdown(&self) {
         self.client.shutdown().await;
     }
@@ -195,8 +210,25 @@ impl McpServerView {
     async fn listed_tools(
         &self,
         tool_plugin_context: &ToolPluginContext,
+        access: crate::McpAttemptAccess<'_>,
     ) -> Result<Vec<ToolInfo>, StartupOutcomeError> {
-        let tools = self.connection.client.listed_tools().await?;
+        let connection = &self.connection;
+        // Cached discovery must stay dormant. A cache miss, however, starts
+        // real work: wake its retained driver before polling the shared startup
+        // so progress does not depend on the lifetime of this listing request.
+        let tools = if !connection.client.startup_complete.load(Ordering::Acquire)
+            && let Some(startup_tools) = connection.client.cached_tools()
+        {
+            startup_tools
+        } else {
+            match connection.client_with_authority(access).await {
+                Ok(client) => client.listed_tools().await,
+                Err(error) if connection.client.is_codex_apps_mcp_server => {
+                    connection.client.cached_tools().ok_or(error)?
+                }
+                Err(error) => return Err(error),
+            }
+        };
         let tools = filter_tools(tools, &self.tool_filter);
         Ok(if self.connection.client.is_codex_apps_mcp_server {
             prepare_codex_apps_tools_for_model(tools, tool_plugin_context)
@@ -208,6 +240,7 @@ impl McpServerView {
 
 /// A published view over a set of running MCP server connections.
 pub(crate) struct McpConnectionSet {
+    retirement: crate::runtime_retirement::RuntimeRetirementRegistry,
     servers: HashMap<String, McpServerView>,
     pub(crate) event_stream_connection: Option<Arc<EventStreamConnectionSettings>>,
     disabled_servers: Vec<String>,
@@ -229,8 +262,30 @@ impl McpConnectionSet {
         input: McpRuntimeInput,
         elicitation_router: ElicitationRequestRouter,
     ) -> Self {
+        let retirement = previous
+            .map(|previous| previous.retirement.clone())
+            .unwrap_or_default();
+        Self::new_with_retirement(
+            previous,
+            publication_gate,
+            input,
+            elicitation_router,
+            retirement,
+        )
+        .await
+    }
+
+    pub(crate) async fn new_with_retirement(
+        previous: Option<&Self>,
+        publication_gate: McpPublicationGate,
+        input: McpRuntimeInput,
+        elicitation_router: ElicitationRequestRouter,
+        retirement: crate::runtime_retirement::RuntimeRetirementRegistry,
+    ) -> Self {
         let trusted_access = TrustedAccessContext::from_runtime(&input);
         let McpRuntimeInput {
+            attempt_requirement,
+            startup_work,
             startup_policy,
             config,
             plugins_available: _,
@@ -248,7 +303,10 @@ impl McpConnectionSet {
             auth_manager,
             elicitation_reviewer,
             elicitation_lifecycle,
+            canonical_thread_id,
+            control_endpoint,
         } = input;
+        let startup_access = crate::McpAttemptAccess::from_work(startup_work.as_deref());
         let store_mode = config.mcp_oauth_credentials_store_mode;
         let keyring_backend_kind = config.auth_keyring_backend_kind;
         let oauth_refresh_mode = config.oauth_refresh_mode;
@@ -450,6 +508,8 @@ impl McpConnectionSet {
                     .then(|| (codex_home.clone(), codex_apps_tools_cache_key.clone())),
                 client_elicitation_capability.clone(),
                 client_mcp_extensions.clone(),
+                canonical_thread_id.clone(),
+                control_endpoint.clone(),
                 previous
                     .and_then(|previous| previous.servers.get(&server_name))
                     .and_then(|view| view.connection.identity.as_ref()),
@@ -501,17 +561,24 @@ impl McpConnectionSet {
                 } else {
                     None
                 };
-                if reusable_pending_startup
-                    || unchanged_auth_failure.is_some()
-                    || connection
-                        .reusable_client(&connection_identity)
-                        .await
-                        .is_some_and(|client| {
-                            previous_view.catalog_item_limit == catalog_item_limit
-                                && expected_protocol_mode.is_some_and(|expected| {
-                                    client.client.protocol_mode() == expected
-                                })
-                        })
+                let reuse_work = if reusable_pending_startup {
+                    attempt_requirement.derive(startup_access)
+                } else {
+                    Ok(None)
+                };
+                if connection.client.client.requirement == attempt_requirement
+                    && reuse_work.is_ok()
+                    && (reusable_pending_startup
+                        || unchanged_auth_failure.is_some()
+                        || connection
+                            .reusable_client(&connection_identity)
+                            .await
+                            .is_some_and(|client| {
+                                previous_view.catalog_item_limit == catalog_item_limit
+                                    && expected_protocol_mode.is_some_and(|expected| {
+                                        client.client.protocol_mode() == expected
+                                    })
+                            }))
                 {
                     let pending_client =
                         reusable_pending_startup.then(|| connection.client.clone());
@@ -565,12 +632,14 @@ impl McpConnectionSet {
                             (server_name, Err(error))
                         });
                     } else if let Some(client) = pending_client {
+                        let reuse_work = reuse_work.ok().flatten();
                         let publication_gate = publication_gate.clone();
                         join_set.spawn(async move {
                             if !publication_gate.wait().await {
                                 return (server_name, Err(StartupOutcomeError::Cancelled));
                             }
-                            (server_name, client.client().await)
+                            let access = crate::McpAttemptAccess::from_work(reuse_work.as_deref());
+                            (server_name, client.client_with_authority(access).await)
                         });
                     } else {
                         reused_ready.push(server_name);
@@ -579,6 +648,12 @@ impl McpConnectionSet {
                 }
             }
             let cancel_token = startup_cancellation_token.child_token();
+            // Reserve before constructing even a dormant startup. The runtime
+            // retains this owner after the published set is superseded.
+            let Ok(retirement_owner) = retirement.register_connection(cancel_token.clone()) else {
+                cancel_token.cancel();
+                continue;
+            };
             let tool_catalog_cache_context = if server_name == CODEX_APPS_MCP_SERVER_NAME
                 || server.requires_read_only_mcp_tools()
             {
@@ -628,6 +703,11 @@ impl McpConnectionSet {
                     .map(|manager| manager.auth_change_state_receiver()),
                 protocol_mode,
                 catalog_item_limit,
+                connection_identity.canonical_thread_id.clone(),
+                connection_identity.control_endpoint.clone(),
+                retirement_owner.lower(),
+                retirement_owner.task_ticket(),
+                attempt_requirement,
             );
             let defer_startup = allow_deferred_startup
                 && !tool_plugin_context.is_selected_plugin_mcp_server(&server_name)
@@ -646,6 +726,21 @@ impl McpConnectionSet {
                 (Some(trigger), Some(receiver))
             } else {
                 (None, None)
+            };
+            let driver_work = if defer_startup {
+                // Apps is never dormant: only the regular tool-catalog cache
+                // participates in deferral. Dormant drivers cannot reconnect.
+                None
+            } else {
+                match attempt_requirement.derive(startup_access) {
+                    Ok(work) => work,
+                    Err(error) => {
+                        warn!(server = %server_name, %error, "MCP startup not admitted");
+                        cancel_token.cancel();
+                        async_managed_client.client.cancel_unstarted();
+                        continue;
+                    }
+                }
             };
             servers.insert(
                 server_name.clone(),
@@ -668,6 +763,8 @@ impl McpConnectionSet {
             let tx_event = tx_event.clone();
             let submit_id = startup_submit_id.clone();
             let publication_gate = publication_gate.clone();
+            let outcome_server_name = server_name.clone();
+            let client_on_registration_failure = async_managed_client.clone();
             let startup = async move {
                 if let Some(mut startup_receiver) = startup_receiver
                     && tokio::select! {
@@ -675,9 +772,11 @@ impl McpConnectionSet {
                         () = cancel_token.cancelled() => true,
                     }
                 {
+                    async_managed_client.client.cancel_unstarted();
                     return (server_name, Err(StartupOutcomeError::Cancelled));
                 }
                 if !publication_gate.wait().await {
+                    async_managed_client.client.cancel_unstarted();
                     return (server_name, Err(StartupOutcomeError::Cancelled));
                 }
                 if let Some(tx_event) = tx_event.as_ref() {
@@ -691,7 +790,8 @@ impl McpConnectionSet {
                     )
                     .await;
                 }
-                let mut outcome = async_managed_client.client().await;
+                let access = crate::McpAttemptAccess::from_work(driver_work.as_deref());
+                let mut outcome = async_managed_client.client_with_authority(access).await;
                 if cancel_token.is_cancelled() {
                     outcome = Err(StartupOutcomeError::Cancelled);
                 }
@@ -767,19 +867,40 @@ impl McpConnectionSet {
                 }
 
                 if matches!(&outcome, Err(StartupOutcomeError::Failed { .. })) {
-                    async_managed_client.reconnect_failed_startup().await;
+                    async_managed_client
+                        .reconnect_failed_startup_with_authority(access)
+                        .await;
                 }
 
                 (server_name, outcome)
             };
-            if defer_startup {
-                // Dormant servers must not hold the initial startup summary open.
+            let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+            let startup = retirement_owner.task_ticket().register(move || async move {
+                let _ = outcome_tx.send(startup.await);
+                crate::runtime_retirement::RuntimeTaskOutcome::Complete
+            });
+            if let Ok(startup) = startup {
+                // The registry retains the original future even if this driver
+                // or the initial summary is cancelled.
                 tokio::spawn(startup);
             } else {
-                join_set.spawn(startup);
+                client_on_registration_failure.cancel_token.cancel();
+                client_on_registration_failure.client.cancel_unstarted();
+            }
+            if defer_startup {
+                // Dormant servers must not hold the initial startup summary open.
+                drop(outcome_rx);
+            } else {
+                join_set.spawn(async move {
+                    outcome_rx
+                        .await
+                        .unwrap_or((outcome_server_name, Err(StartupOutcomeError::Cancelled)))
+                });
             }
         }
+        let summary_ticket = retirement.task_ticket();
         let manager = Self {
+            retirement,
             servers,
             event_stream_connection,
             disabled_servers,
@@ -792,11 +913,11 @@ impl McpConnectionSet {
             trusted_access,
         };
         let summary_publication_gate = publication_gate;
-        tokio::spawn(async move {
+        let summary = summary_ticket.register(move || async move {
             let outcomes = join_set.join_all().await;
             if let Some(tx_event) = tx_event {
                 if !summary_publication_gate.wait().await {
-                    return;
+                    return crate::runtime_retirement::RuntimeTaskOutcome::Complete;
                 }
                 let mut summary = McpStartupCompleteEvent {
                     ready: reused_ready,
@@ -817,6 +938,12 @@ impl McpConnectionSet {
                     match outcome {
                         Ok(_) => summary.ready.push(server_name),
                         Err(StartupOutcomeError::Cancelled) => summary.cancelled.push(server_name),
+                        Err(StartupOutcomeError::Refused(error)) => {
+                            summary.failed.push(McpStartupFailure {
+                                server: server_name,
+                                error: error.to_string(),
+                            })
+                        }
                         Err(StartupOutcomeError::Failed { error, .. }) => {
                             summary.failed.push(McpStartupFailure {
                                 server: server_name,
@@ -832,12 +959,17 @@ impl McpConnectionSet {
                     })
                     .await;
             }
+            crate::runtime_retirement::RuntimeTaskOutcome::Complete
         });
+        if let Ok(summary) = summary {
+            tokio::spawn(summary);
+        }
         manager
     }
 
     pub fn empty(prefix_mcp_tool_names: bool) -> Self {
         Self {
+            retirement: crate::runtime_retirement::RuntimeRetirementRegistry::default(),
             servers: HashMap::new(),
             event_stream_connection: None,
             disabled_servers: Vec::new(),
@@ -913,28 +1045,33 @@ impl McpConnectionSet {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn wait_for_server_startup(&self, server_name: &str) -> bool {
+        self.wait_for_server_startup_with_authority(server_name, crate::McpAttemptAccess::Unscoped)
+            .await
+    }
+
+    pub(crate) async fn wait_for_server_startup_with_authority(
+        &self,
+        server_name: &str,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> bool {
         let Some(view) = self.servers.get(server_name) else {
             return false;
         };
-        view.connection.client.ready_transport().is_some() || view.connection.client().await.is_ok()
+        view.connection.client.ready_transport().is_some()
+            || view.connection.client_with_authority(access).await.is_ok()
     }
 
     /// Stop all MCP clients owned by this manager and terminate stdio server processes.
+    #[cfg(test)]
     pub async fn shutdown(&self) {
-        let connections = self
-            .servers
-            .values()
-            .map(|view| Arc::clone(&view.connection))
-            .collect::<Vec<_>>();
-        // Keep cleanup alive if an interrupt cancels the refresh that requested it.
-        let shutdown_task = tokio::spawn(async move {
-            for connection in connections {
-                connection.shutdown().await;
-            }
-        });
-        if let Err(error) = shutdown_task.await {
-            warn!("MCP client shutdown task failed: {error}");
+        let report = self
+            .retirement
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(30))
+            .await;
+        if !report.is_complete() {
+            warn!(?report, "MCP connection retirement was not acknowledged");
         }
     }
 
@@ -954,12 +1091,27 @@ impl McpConnectionSet {
             .is_selected_plugin_mcp_server(server_name)
     }
 
+    #[cfg(test)]
     pub async fn wait_for_server_ready(&self, server_name: &str, timeout: Duration) -> bool {
+        self.wait_for_server_ready_with_authority(
+            server_name,
+            timeout,
+            crate::McpAttemptAccess::Unscoped,
+        )
+        .await
+    }
+
+    pub(crate) async fn wait_for_server_ready_with_authority(
+        &self,
+        server_name: &str,
+        timeout: Duration,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> bool {
         let Some(view) = self.servers.get(server_name) else {
             return false;
         };
 
-        match tokio::time::timeout(timeout, view.connection.client()).await {
+        match tokio::time::timeout(timeout, view.connection.client_with_authority(access)).await {
             Ok(Ok(_)) => true,
             Ok(Err(_)) | Err(_) => false,
         }
@@ -967,7 +1119,32 @@ impl McpConnectionSet {
 
     /// Invoke the tool indicated by the (server, tool) pair.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub async fn call_tool(
+        &self,
+        server: &str,
+        tool: &str,
+        environment_id: Option<&str>,
+        arguments: Option<serde_json::Value>,
+        meta: Option<serde_json::Value>,
+        requested_timeout: Option<Duration>,
+        wait_for_server: bool,
+    ) -> Result<CallToolResult> {
+        self.call_tool_with_authority(
+            server,
+            tool,
+            environment_id,
+            arguments,
+            meta,
+            requested_timeout,
+            wait_for_server,
+            crate::McpAttemptAccess::Unscoped,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn call_tool_with_authority(
         &self,
         server: &str,
         tool: &str,
@@ -976,6 +1153,7 @@ impl McpConnectionSet {
         mut meta: Option<serde_json::Value>,
         requested_timeout: Option<Duration>,
         wait_for_server: bool,
+        access: crate::McpAttemptAccess<'_>,
     ) -> Result<CallToolResult> {
         let view = self
             .servers
@@ -996,7 +1174,7 @@ impl McpConnectionSet {
         }
         let client = if wait_for_server {
             view.connection
-                .client()
+                .client_with_authority(access)
                 .await
                 .context("failed to get client")?
         } else {
@@ -1049,9 +1227,22 @@ impl McpConnectionSet {
     /// Returns presentation metadata from the current connection.
     /// Codex Apps metadata may come from its existing cache; regular MCP server information is
     /// connection-specific, so pending regular clients are awaited.
+    #[cfg(test)]
     pub(crate) async fn list_available_server_infos(
         &self,
         include_server: impl Fn(&str) -> bool,
+    ) -> HashMap<String, McpServerInfo> {
+        self.list_available_server_infos_with_authority(
+            include_server,
+            crate::McpAttemptAccess::Unscoped,
+        )
+        .await
+    }
+
+    pub(crate) async fn list_available_server_infos_with_authority(
+        &self,
+        include_server: impl Fn(&str) -> bool,
+        access: crate::McpAttemptAccess<'_>,
     ) -> HashMap<String, McpServerInfo> {
         let mut server_infos = HashMap::new();
         for (server_name, view) in self.servers.iter().filter(|(name, _)| include_server(name)) {
@@ -1062,7 +1253,7 @@ impl McpConnectionSet {
                 server_infos.insert(server_name.clone(), server_info);
                 continue;
             }
-            match view.connection.client().await {
+            match view.connection.client_with_authority(access).await {
                 Ok(managed_client) => {
                     server_infos.insert(server_name.clone(), managed_client.server_info);
                 }

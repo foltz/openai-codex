@@ -359,6 +359,7 @@ async fn preparation_and_first_sampling_do_not_wait_for_durable_metadata(
         FirstInputKind::InterAgentCommunication => {
             test.codex
                 .submit(Op::InterAgentCommunication {
+                    work: None,
                     communication: InterAgentCommunication::new(
                         AgentPath::try_from("/root/worker").expect("valid agent path"),
                         AgentPath::root(),
@@ -516,6 +517,7 @@ async fn local_preparation_is_durable_before_first_input_and_survives_restart(
             initial.thread_manager.auth_manager(),
             /*parent_trace*/ None,
             ClientMcpExtensions::default(),
+            /*control_endpoint*/ None,
         )
         .await?;
     assert!(!Arc::ptr_eq(&initial.codex, &resumed.thread));

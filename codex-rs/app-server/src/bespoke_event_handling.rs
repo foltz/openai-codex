@@ -2635,7 +2635,7 @@ mod tests {
             thread: conversation,
             ..
         } = thread_manager
-            .start_thread(codex_core::StartThreadOptions::new(config.clone()))
+            .start_thread(codex_core::StartThreadOptions::new(config.clone(), None))
             .await?;
         let thread_state = new_thread_state();
         let thread_watch_manager = ThreadWatchManager::new();
@@ -3081,7 +3081,7 @@ mod tests {
             thread: conversation,
             ..
         } = thread_manager
-            .start_thread(codex_core::StartThreadOptions::new(config.clone()))
+            .start_thread(codex_core::StartThreadOptions::new(config.clone(), None))
             .await?;
         let thread_state = new_thread_state();
         {
@@ -3216,7 +3216,7 @@ mod tests {
             thread: conversation,
             ..
         } = thread_manager
-            .start_thread(codex_core::StartThreadOptions::new(config))
+            .start_thread(codex_core::StartThreadOptions::new(config, None))
             .await?;
         let child_thread_id = ThreadId::new();
         let child_thread_id_string = child_thread_id.to_string();
@@ -3307,7 +3307,7 @@ mod tests {
             thread: conversation,
             ..
         } = thread_manager
-            .start_thread(codex_core::StartThreadOptions::new(config))
+            .start_thread(codex_core::StartThreadOptions::new(config, None))
             .await?;
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
         let outgoing = Arc::new(OutgoingMessageSender::new(

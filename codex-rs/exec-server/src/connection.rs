@@ -68,24 +68,25 @@ impl JsonRpcConnectionEvent {
         };
 
         let queued_at = Instant::now();
-        // Record phase offsets from receipt because detached work can keep the span open.
-        let request_span = tracing::info_span!(
-            "codex.exec_server.request",
-            otel.kind = "server",
-            otel.name = "unknown",
-            method = request.method.as_str(),
-            rpc.dispatch_offset_ns = tracing::field::Empty,
-            rpc.response_enqueue_offset_ns = tracing::field::Empty,
-            result = tracing::field::Empty,
-        );
-        if let Some(trace) = &request.trace
-            && !codex_otel::set_parent_from_w3c_trace_context(&request_span, trace)
-        {
+        let parent = request
+            .trace
+            .as_ref()
+            .and_then(codex_otel::context_from_w3c_trace_context);
+        if request.trace.is_some() && parent.is_none() {
             warn!(
                 method = request.method.as_str(),
                 "ignoring invalid inbound exec-server trace carrier"
             );
         }
+        let request_span = codex_otel::span_with_parent_context(parent, || {
+            tracing::info_span!(
+                "codex.exec_server.request",
+                otel.kind = "server",
+                otel.name = "unknown",
+                method = request.method.as_str(),
+                result = tracing::field::Empty,
+            )
+        });
 
         Self::QueuedRequest {
             request,

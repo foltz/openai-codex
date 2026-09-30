@@ -4,6 +4,8 @@ use crate::ToolPayload;
 use codex_extension_items::ExtensionItem;
 use codex_file_system::ExecutorFileSystem;
 use codex_file_system::FileSystemSandboxContext;
+use codex_protocol::mcp_work::McpAttemptAccess;
+use codex_protocol::mcp_work::McpAttemptRefused;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_utils_output_truncation::TruncationPolicy;
@@ -139,6 +141,9 @@ pub struct ToolCall<'call> {
     pub source: ToolCallSource,
     pub conversation_history: ConversationHistory,
     pub turn_item_emitter: Arc<dyn TurnItemEmitter>,
+    /// Borrowed authority for MCP effects only. A failed capture must not be
+    /// treated as ungated access; local-only tools may ignore it.
+    pub mcp_access: Result<McpAttemptAccess<'call>, McpAttemptRefused>,
     pub environments: Vec<ToolEnvironment<'call>>,
     pub payload: ToolPayload,
 }
@@ -158,6 +163,7 @@ impl std::fmt::Debug for ToolCall<'_> {
             .field("source", &self.source)
             .field("conversation_history", &self.conversation_history)
             .field("turn_item_emitter", &"<host turn item emitter>")
+            .field("mcp_access", &self.mcp_access)
             .field("environment_count", &self.environments.len())
             .field("payload", &self.payload)
             .finish()

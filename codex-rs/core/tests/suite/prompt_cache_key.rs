@@ -186,7 +186,7 @@ async fn ephemeral_fork_shares_cache_routing_but_keeps_session_identity() -> Res
             ForkSnapshot::TruncateBeforeNthUserMessage(usize::MAX),
             StartThreadOptions {
                 environments: Some(test.codex.environment_selections().await),
-                ..StartThreadOptions::new(config)
+                ..StartThreadOptions::new(config, /*control_endpoint*/ None)
             },
             test.codex.rollout_path().expect("parent rollout"),
         )

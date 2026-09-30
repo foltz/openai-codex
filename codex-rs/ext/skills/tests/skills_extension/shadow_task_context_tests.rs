@@ -7,8 +7,12 @@ use super::*;
 struct FailedReads(StaticSkillProvider);
 
 impl SkillProvider for FailedReads {
-    fn list(&self, query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog> {
-        self.0.list(query)
+    fn list<'a>(
+        &'a self,
+        query: SkillListQuery,
+        mcp_access: Result<codex_mcp::McpAttemptAccess<'a>, codex_mcp::McpAttemptRefused>,
+    ) -> SkillProviderFuture<'a, SkillCatalog> {
+        self.0.list(query, mcp_access)
     }
 
     fn read<'a>(
@@ -123,6 +127,7 @@ async fn task_context_recovers_prior_requests_and_explicit_intent_without_changi
             let fragments = registry.turn_input_contributors()[0]
                 .contribute(
                     TurnInputContext {
+                        mcp_access: Ok(codex_mcp::McpAttemptAccess::Unscoped),
                         turn_id: turn_id.to_string(),
                         user_input,
                         environments: Vec::new(),

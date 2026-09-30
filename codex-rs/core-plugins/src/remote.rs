@@ -53,6 +53,7 @@ use url::Url;
 mod catalog_cache;
 mod plugin_capabilities;
 mod remote_installed_plugin_sync;
+mod reset_authority;
 mod search;
 mod share;
 
@@ -70,6 +71,8 @@ pub use remote_installed_plugin_sync::mark_remote_plugin_cache_mutation_in_fligh
 pub(crate) use remote_installed_plugin_sync::remote_installed_plugin_bundle_sync_gate;
 pub use remote_installed_plugin_sync::sync_remote_installed_plugin_bundles_once;
 pub(crate) use remote_installed_plugin_sync::sync_remote_installed_plugin_bundles_once_with_snapshot;
+pub(crate) use reset_authority::RemotePluginBundleSyncGeneration;
+pub(crate) use reset_authority::retire_remote_plugin_bundle_sync;
 pub use search::RemotePluginSearchPage;
 pub use search::RemotePluginSearchRequest;
 pub use search::search_remote_plugins;
@@ -395,6 +398,9 @@ pub fn validate_remote_plugin_id(plugin_id: &str) -> Result<(), JSONRPCErrorErro
 
 #[derive(Debug, thiserror::Error)]
 pub enum RemotePluginCatalogError {
+    #[error("authentication changed while fetching remote plugins")]
+    AuthChanged,
+
     #[error("chatgpt authentication required for remote plugin catalog")]
     AuthRequired,
 
@@ -493,7 +499,8 @@ impl RemotePluginCatalogError {
             Self::UnexpectedStatus { status, .. } => {
                 Some(http_status_sub_error_type(*status).to_string())
             }
-            Self::AuthRequired
+            Self::AuthChanged
+            | Self::AuthRequired
             | Self::UnsupportedAuthMode
             | Self::AuthToken(_)
             | Self::Request { .. }
@@ -1708,6 +1715,20 @@ pub async fn uninstall_remote_plugin(
     codex_home: PathBuf,
     target: RemotePluginUninstallTarget,
 ) -> Result<(), RemotePluginCatalogError> {
+    let generation = RemotePluginBundleSyncGeneration::capture(&codex_home);
+    uninstall_remote_plugin_for_generation(config, auth, codex_home, target, generation).await
+}
+
+pub(crate) async fn uninstall_remote_plugin_for_generation(
+    config: &RemotePluginServiceConfig,
+    auth: Option<&CodexAuth>,
+    codex_home: PathBuf,
+    target: RemotePluginUninstallTarget,
+    generation: RemotePluginBundleSyncGeneration,
+) -> Result<(), RemotePluginCatalogError> {
+    let _lease = generation
+        .begin_commit()
+        .ok_or(RemotePluginCatalogError::AuthChanged)?;
     let auth = ensure_chatgpt_auth(auth)?;
     let RemotePluginUninstallTarget {
         plugin_id,
@@ -1741,15 +1762,18 @@ pub async fn uninstall_remote_plugin(
 
     let legacy_plugin_id = response.id;
     tokio::task::spawn_blocking(move || {
+        let _lease = generation
+            .begin_commit()
+            .ok_or(RemotePluginCatalogError::AuthChanged)?;
         remove_remote_plugin_cache(codex_home, marketplace_name, plugin_name, legacy_plugin_id)
+            .map_err(RemotePluginCatalogError::CacheRemove)
     })
     .await
     .map_err(|err| {
         RemotePluginCatalogError::CacheRemove(format!(
             "failed to join remote plugin cache removal task: {err}"
         ))
-    })?
-    .map_err(RemotePluginCatalogError::CacheRemove)?;
+    })??;
 
     Ok(())
 }

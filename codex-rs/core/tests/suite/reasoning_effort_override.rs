@@ -138,7 +138,7 @@ async fn worker_reasoning_overrides_follow_effective_client_policy(
     let mut config = test.config.clone();
     config.ephemeral = history == WorkerHistory::Ephemeral;
     assert!(config.features.enabled(Feature::ReasoningEffortOverride));
-    let mut options = StartThreadOptions::new(config);
+    let mut options = StartThreadOptions::new(config, /*control_endpoint*/ None);
     options.session_source = Some(session_source);
     options.thread_source = Some(thread_source);
     let forked = test
@@ -621,7 +621,10 @@ async fn reasoning_effort_override_websocket_prewarm_preserves_baseline(
                 .thread_manager
                 .fork_legacy_thread(
                     ForkSnapshot::Interrupted,
-                    codex_core::StartThreadOptions::new(config.clone()),
+                    codex_core::StartThreadOptions::new(
+                        config.clone(),
+                        /*control_endpoint*/ None,
+                    ),
                     previous.codex.rollout_path().expect("rollout path"),
                 )
                 .await?;

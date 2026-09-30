@@ -13,16 +13,12 @@ const RECAP_HEADING: &str = "Conversation recap";
 #[derive(Debug)]
 pub(crate) struct UpdateAvailableHistoryCell {
     latest_version: String,
-    update_action: Option<UpdateAction>,
 }
 
 #[cfg_attr(debug_assertions, allow(dead_code))]
 impl UpdateAvailableHistoryCell {
-    pub(crate) fn new(latest_version: String, update_action: Option<UpdateAction>) -> Self {
-        Self {
-            latest_version,
-            update_action,
-        }
+    pub(crate) fn new(latest_version: String) -> Self {
+        Self { latest_version }
     }
 }
 
@@ -30,22 +26,6 @@ impl HistoryCell for UpdateAvailableHistoryCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         use ratatui_macros::line;
         use ratatui_macros::text;
-        let update_instruction = if let Some(update_action) = self.update_action {
-            line![
-                "Run ",
-                update_action.command_str().fg(accent_color()),
-                " to update."
-            ]
-        } else {
-            line![
-                "See ",
-                "https://github.com/openai/codex"
-                    .fg(accent_color())
-                    .underlined(),
-                " for installation options."
-            ]
-        };
-
         let content = text![
             line![
                 "✨\u{200A}".bold().fg(accent_color()),
@@ -53,7 +33,7 @@ impl HistoryCell for UpdateAvailableHistoryCell {
                 " ",
                 format!("{CODEX_CLI_VERSION} -> {}", self.latest_version).bold(),
             ],
-            update_instruction,
+            "Managed Codex updates use the release and promotion workflow.",
             "",
             "See full release notes:",
             "https://github.com/openai/codex/releases/latest"
@@ -70,15 +50,10 @@ impl HistoryCell for UpdateAvailableHistoryCell {
     }
 
     fn raw_lines(&self) -> Vec<Line<'static>> {
-        let update_instruction = if let Some(update_action) = self.update_action {
-            format!("Run {} to update.", update_action.command_str())
-        } else {
-            "See https://github.com/openai/codex for installation options.".to_string()
-        };
         vec![
             Line::from("Update available!"),
             Line::from(format!("{CODEX_CLI_VERSION} -> {}", self.latest_version)),
-            Line::from(update_instruction),
+            Line::from("Managed Codex updates use the release and promotion workflow."),
             Line::from(""),
             Line::from("See full release notes:"),
             Line::from("https://github.com/openai/codex/releases/latest"),

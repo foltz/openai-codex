@@ -14,6 +14,8 @@ use serde_json::json;
 use tracing::warn;
 
 use crate::config_manager::ConfigManager;
+use crate::managed_transition::AccountWorkPermits;
+use crate::processor_task_retirement::ProcessorTasks;
 use crate::request_processors::ConfigRequestProcessor;
 use crate::request_serialization::RequestSerializationAccess;
 use crate::request_serialization::RequestSerializationQueueKey;
@@ -26,16 +28,32 @@ pub(crate) fn effective_plugins_changed_callback(
     config_manager: ConfigManager,
     config_processor: ConfigRequestProcessor,
     request_serialization_queues: RequestSerializationQueues,
+    tasks: ProcessorTasks,
+    account_work_permits: AccountWorkPermits,
 ) -> Arc<dyn Fn(EffectivePluginsChange) + Send + Sync> {
     Arc::new(move |change| {
+        // Cache invalidation is synchronous and account-safe while the barrier
+        // is closed. It must not be dropped with the account-bound async work:
+        // reset does not otherwise re-drive this callback after reopening.
         thread_manager.plugins_manager().clear_cache();
         thread_manager.skills_service().clear_cache();
 
+        let Some(permit) = account_work_permits.try_acquire() else {
+            return;
+        };
+        // One admission covers every callback effect. Each actual async owner
+        // retains a share, including the queued future after enqueue returns.
+        let permit = Arc::new(permit);
+
         let refresh_thread_manager = Arc::clone(&thread_manager);
-        tokio::spawn(async move {
+        let refresh_permit = Arc::clone(&permit);
+        if let Err(err) = tasks.spawn_unverified(async move {
+            let _permit = refresh_permit;
             refresh_thread_manager.invalidate_mcp_runtimes().await;
             refresh_thread_manager.refresh_hook_runtimes().await;
-        });
+        }) {
+            warn!(?err, "effective-plugin refresh task admission closed");
+        }
 
         if change.materialized_remote_plugins.is_empty() {
             return;
@@ -46,12 +64,13 @@ pub(crate) fn effective_plugins_changed_callback(
         let trust_config_manager = config_manager.clone();
         let trust_config_processor = config_processor.clone();
         let trust_request_serialization_queues = request_serialization_queues.clone();
-        tokio::spawn(async move {
+        if let Err(err) = tasks.spawn_unverified(async move {
             trust_request_serialization_queues
                 .enqueue_background(
                     RequestSerializationQueueKey::Global("config"),
                     RequestSerializationAccess::Exclusive,
                     async move {
+                        let _permit = permit;
                         if let Err(err) = trust_materialized_plugin_hooks(
                             change.materialized_remote_plugins,
                             &trust_auth_manager,
@@ -66,7 +85,9 @@ pub(crate) fn effective_plugins_changed_callback(
                     },
                 )
                 .await;
-        });
+        }) {
+            warn!(?err, "effective-plugin trust task admission closed");
+        }
     })
 }
 

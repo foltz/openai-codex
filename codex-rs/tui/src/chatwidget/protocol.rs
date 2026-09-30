@@ -340,10 +340,13 @@ impl ChatWidget {
                 }
             }
             ServerNotification::ServerRequestResolved(_)
+            | ServerNotification::ThreadInteractiveSubscriptionChanged(_)
             | ServerNotification::AccountUpdated(_)
             | ServerNotification::GatewayOAuthChanged(_)
             | ServerNotification::AccountRateLimitsUpdated(_)
             | ServerNotification::ThreadStarted(_)
+            | ServerNotification::ThreadClearEnded(_)
+            | ServerNotification::ThreadClearStarted(_)
             | ServerNotification::ThreadStatusChanged(_)
             | ServerNotification::ThreadReverted(_)
             | ServerNotification::ThreadQueueChanged(_)
@@ -364,6 +367,7 @@ impl ChatWidget {
             | ServerNotification::EnvironmentConnected(_)
             | ServerNotification::EnvironmentDisconnected(_)
             | ServerNotification::RemoteControlStatusChanged(_)
+            | ServerNotification::ManagedTransitionStatusUpdated(_)
             | ServerNotification::ExternalAgentConfigImportProgress(_)
             | ServerNotification::ExternalAgentConfigImportCompleted(_)
             | ServerNotification::FsChanged(_)

@@ -22,6 +22,14 @@ mod telemetry;
 
 pub use log_db::LogWriteFailureReporter;
 pub use model::CreatedProject;
+pub use model::ClearTransitionId;
+pub use model::ClearTransitionEvidenceKind;
+pub use model::ClearTransitionEvidenceState;
+pub use model::ClearTransitionPhase;
+pub use model::ClearTransitionRecord;
+pub use model::ClearTransitionReserveOutcome;
+pub use runtime::ClearRecoveryPhase;
+pub use runtime::ClearRecoveryRecord;
 pub use model::LogEntry;
 pub use model::LogQuery;
 pub use model::LogRow;

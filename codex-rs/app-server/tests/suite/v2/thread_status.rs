@@ -151,6 +151,7 @@ async fn thread_status_changed_can_be_opted_out() -> Result<()> {
                 explicit_gateway_oauth: false,
                 experimental_api: true,
                 request_attestation: false,
+                interactive_client: false,
                 opt_out_notification_methods: Some(vec!["thread/status/changed".to_string()]),
                 mcp_server_openai_form_elicitation: false,
                 extensions: None,

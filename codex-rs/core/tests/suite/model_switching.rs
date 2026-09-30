@@ -268,7 +268,7 @@ async fn first_turn_after_empty_prefix_fork_preserves_inherited_base_instruction
         .thread_manager
         .fork_legacy_thread(
             ForkSnapshot::TruncateBeforeNthUserMessage(0),
-            codex_core::StartThreadOptions::new(fork_config),
+            codex_core::StartThreadOptions::new(fork_config, /*control_endpoint*/ None),
             source_rollout_path,
         )
         .await?;
@@ -993,6 +993,7 @@ async fn model_change_projects_media_without_changing_live_or_replayed_history(
                     test.thread_manager.auth_manager(),
                     /*parent_trace*/ None,
                     ClientMcpExtensions::default(),
+                    /*control_endpoint*/ None,
                 )
                 .await?
                 .thread
@@ -1001,7 +1002,10 @@ async fn model_change_projects_media_without_changing_live_or_replayed_history(
             test.thread_manager
                 .fork_legacy_thread(
                     ForkSnapshot::Interrupted,
-                    codex_core::StartThreadOptions::new(test.config.clone()),
+                    codex_core::StartThreadOptions::new(
+                        test.config.clone(),
+                        /*control_endpoint*/ None,
+                    ),
                     rollout_path,
                 )
                 .await?

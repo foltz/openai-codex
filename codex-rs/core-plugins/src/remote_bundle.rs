@@ -300,6 +300,37 @@ pub(crate) async fn download_remote_plugin_bundle(
     .await
 }
 
+/// Downloads outside the commit lease; retired downloads cannot publish files.
+pub(crate) async fn download_and_install_remote_plugin_bundle_for_generation(
+    config: &RemotePluginServiceConfig,
+    codex_home: PathBuf,
+    bundle: ValidatedRemotePluginBundle,
+    generation: crate::remote::RemotePluginBundleSyncGeneration,
+) -> Result<Option<PluginInstallResult>, RemotePluginBundleInstallError> {
+    let bundle_bytes = download_remote_plugin_bundle(config, &bundle).await?;
+    tokio::task::spawn_blocking(move || {
+        install_remote_plugin_bundle_for_generation(codex_home, bundle, bundle_bytes, &generation)
+    })
+    .await
+    .map_err(|err| {
+        RemotePluginBundleInstallError::InvalidBundle(format!(
+            "failed to join remote plugin bundle install task: {err}"
+        ))
+    })?
+}
+
+fn install_remote_plugin_bundle_for_generation(
+    codex_home: PathBuf,
+    bundle: ValidatedRemotePluginBundle,
+    bundle_bytes: Vec<u8>,
+    generation: &crate::remote::RemotePluginBundleSyncGeneration,
+) -> Result<Option<PluginInstallResult>, RemotePluginBundleInstallError> {
+    let Some(_lease) = generation.begin_commit() else {
+        return Ok(None);
+    };
+    install_remote_plugin_bundle(codex_home, bundle, bundle_bytes).map(Some)
+}
+
 async fn download_remote_plugin_bundle_with_limit(
     config: &RemotePluginServiceConfig,
     bundle_download_url: &str,
@@ -806,6 +837,59 @@ mod tests {
         assert_eq!(
             recorded_http_client_urls(&selected_urls),
             vec![download_url]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn account_reset_fences_paused_bundle_install_before_filesystem_publication() {
+        let codex_home = tempdir().unwrap();
+        let generation =
+            crate::remote::RemotePluginBundleSyncGeneration::capture(codex_home.path());
+        let old_home = codex_home.path().to_path_buf();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let old_install = tokio::spawn(async move {
+            let bytes = tar_gz_bytes(&[(
+                ".codex-plugin/plugin.json",
+                br#"{"name":"linear","version":"1.2.3"}"#,
+                /*mode*/ 0o644,
+            )]);
+            ready_tx.send(()).unwrap();
+            resume_rx.await.unwrap();
+            tokio::task::spawn_blocking(move || {
+                install_remote_plugin_bundle_for_generation(
+                    old_home,
+                    valid_remote_plugin_bundle(),
+                    bytes,
+                    &generation,
+                )
+            })
+            .await
+            .unwrap()
+        });
+        ready_rx.await.unwrap();
+        crate::remote::retire_remote_plugin_bundle_sync(codex_home.path());
+        let b_generation =
+            crate::remote::RemotePluginBundleSyncGeneration::capture(codex_home.path());
+        let mut b_bundle = valid_remote_plugin_bundle();
+        b_bundle.plugin_version = "2.0.0".to_string();
+        let b = install_remote_plugin_bundle_for_generation(
+            codex_home.path().to_path_buf(),
+            b_bundle,
+            tar_gz_bytes(&[(
+                ".codex-plugin/plugin.json",
+                br#"{"name":"linear","version":"2.0.0"}"#,
+                /*mode*/ 0o644,
+            )]),
+            &b_generation,
+        )
+        .unwrap()
+        .unwrap();
+        resume_tx.send(()).unwrap();
+        assert!(old_install.await.unwrap().unwrap().is_none());
+        assert_eq!(
+            PluginStore::new(codex_home.path().to_path_buf()).active_plugin_version(&b.plugin_id),
+            Some("2.0.0".to_string())
         );
     }
 

@@ -66,6 +66,9 @@ pub(crate) async fn run_codex_thread_interactive(
         ));
     }
     config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
+    let initial_mcp_work = parent_session
+        .turn_mcp_work(&parent_ctx)
+        .map_err(|error| CodexErr::Fatal(error.to_string()))?;
     config.model_provider.supports_websockets &= parent_session
         .services
         .model_client
@@ -101,6 +104,8 @@ pub(crate) async fn run_codex_thread_interactive(
         mcp_manager: Arc::clone(&parent_session.services.mcp_manager),
         code_mode_session_provider: parent_session.services.code_mode_service.session_provider(),
         extensions,
+        host_admission: parent_session.services.host_admission.clone(),
+        initial_mcp_work,
         conversation_history,
         disabled_plugin_ids: None,
         requested_history_mode: None,
@@ -129,6 +134,7 @@ pub(crate) async fn run_codex_thread_interactive(
         thread_extension_init,
         client_mcp_extensions: parent_session.services.client_mcp_extensions.clone(),
         reserved_thread_id: None,
+        control_endpoint: None,
         analytics_events_client: Some(parent_session.services.analytics_events_client.clone()),
         image_store: Arc::clone(&parent_session.services.image_store),
         thread_store: Arc::clone(&parent_session.services.thread_store),
@@ -137,6 +143,12 @@ pub(crate) async fn run_codex_thread_interactive(
         inherited_multi_agent_version: Some(MultiAgentVersion::Disabled),
         git_enrichment_policy,
         windows_sandbox_proxy_settings_mode,
+        deferred_clear_session_start: None,
+        runtime_config_change_listener: parent_session
+            .services
+            .runtime_config_change_listener
+            .clone(),
+        runtime_config_change_gate: parent_session.services.runtime_config_change_gate.clone(),
     })
     .or_cancel(&cancel_token)
     .await??;
@@ -164,7 +176,7 @@ pub(crate) fn forward_session_io(io: Arc<SessionIo>, cancel_token: CancellationT
 
     // Forward public events from the sub-agent to the consumer.
     let caller_io = SessionIo {
-        tx_sub: tx_ops,
+        tx_sub: tx_ops.into(),
         rx_event: rx_sub,
         agent_status: io.agent_status.clone(),
         session_loop_termination: io.session_loop_termination.clone(),
@@ -175,8 +187,9 @@ pub(crate) fn forward_session_io(io: Arc<SessionIo>, cancel_token: CancellationT
     });
 
     // Forward ops from the caller to the sub-agent.
+    let submissions = caller_io.tx_sub.dispatch_control();
     tokio::spawn(async move {
-        forward_ops(io, rx_ops, cancel_token_ops).await;
+        forward_ops(io, rx_ops, cancel_token_ops, Some(submissions)).await;
     });
 
     caller_io
@@ -202,6 +215,8 @@ pub(crate) async fn run_codex_thread_one_shot(
     // requiring the caller to cancel the parent token.
     let child_cancel = cancel_token.child_token();
     let parent_turn_id = parent_ctx.sub_id.clone();
+    let parent_for_admission = Arc::clone(&parent_session);
+    let host = parent_session.services.host_admission.clone();
     let parent_environments = parent_ctx.initial_environments.clone();
     let root_turn_id = parent_ctx.turn_metadata_state.root_turn_id();
     let (session, io) = Box::pin(run_codex_thread_interactive(
@@ -221,6 +236,23 @@ pub(crate) async fn run_codex_thread_one_shot(
     .await?;
 
     // Send the initial input to kick off the one-shot turn.
+    let termination = io.session_loop_termination.clone();
+    let host_work = match &host {
+        Some(host) => host
+            .derive_turn_work(
+                &parent_for_admission.services.thread_extension_data,
+                &parent_turn_id,
+                &session.services.thread_extension_data,
+                Box::pin(async move {
+                    termination.await;
+                }),
+            )
+            .map_err(|_| {
+                CodexErr::Fatal("delegate parent has no admitted account work".to_string())
+            })?,
+        None => None,
+    };
+    drop(parent_for_admission);
     let submission = io
         .submit_turn_input(
             TurnInputRequest::user_input(input).on_start(TurnStartOptions {
@@ -231,6 +263,7 @@ pub(crate) async fn run_codex_thread_one_shot(
                 ..Default::default()
             }),
             TurnInputMode::StartIfIdle,
+            host_work,
         )
         .await?;
     match submission {
@@ -248,12 +281,19 @@ pub(crate) async fn run_codex_thread_one_shot(
     let agent_status = io.agent_status.clone();
     let session_loop_termination = io.session_loop_termination.clone();
     let io_for_bridge = io;
+    let child_for_evidence = Arc::clone(&session);
     tokio::spawn(async move {
         while let Ok(event) = io_for_bridge.next_event().await {
             let should_shutdown = matches!(
                 event.msg,
                 EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_)
             );
+            if should_shutdown && let Some(host) = &host {
+                host.turn_work_terminal(
+                    &child_for_evidence.services.thread_extension_data,
+                    &event.id,
+                );
+            }
             let _ = tx_bridge.send(event).await;
             if should_shutdown {
                 let _ = ops_tx
@@ -282,7 +322,7 @@ pub(crate) async fn run_codex_thread_one_shot(
         session,
         SessionIo {
             rx_event: rx_bridge,
-            tx_sub: tx_closed,
+            tx_sub: tx_closed.into(),
             agent_status,
             session_loop_termination,
         },
@@ -367,12 +407,16 @@ async fn forward_ops(
     io: Arc<SessionIo>,
     rx_ops: Receiver<Submission>,
     cancel_token_ops: CancellationToken,
+    submissions: Option<crate::session::SubmissionDispatch>,
 ) {
     loop {
         let submission = match rx_ops.recv().or_cancel(&cancel_token_ops).await {
             Ok(Ok(submission)) => submission,
             Ok(Err(_)) | Err(_) => break,
         };
+        let _dispatch = submissions
+            .as_ref()
+            .map(crate::session::SubmissionDispatch::begin);
         let _ = io.submit_with_id(submission).await;
     }
 }

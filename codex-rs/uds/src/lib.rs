@@ -74,6 +74,13 @@ impl UnixStream {
     }
 }
 
+#[cfg(unix)]
+impl std::os::fd::AsRawFd for UnixStream {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.inner.as_raw_fd()
+    }
+}
+
 impl AsyncRead for UnixStream {
     fn poll_read(
         self: Pin<&mut Self>,

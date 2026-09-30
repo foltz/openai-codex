@@ -103,7 +103,7 @@ async fn command_exec_without_process_id_keeps_buffered_compatibility() -> Resul
         .send_command_exec_request(CommandExecParams {
             command: vec![
                 "sh".to_string(),
-                "-lc".to_string(),
+                "-c".to_string(),
                 "printf 'legacy-out'; printf 'legacy-err' >&2".to_string(),
             ],
             process_id: None,
@@ -152,7 +152,7 @@ async fn command_exec_env_overrides_merge_with_server_environment_and_support_un
         .send_command_exec_request(CommandExecParams {
             command: vec![
                 "/bin/sh".to_string(),
-                "-lc".to_string(),
+                "-c".to_string(),
                 "printf '%s|%s|%s|%s|%s|%s' \"$COMMAND_EXEC_BASELINE\" \"$COMMAND_EXEC_EXTRA\" \"${RUST_LOG-unset}\" \"$CODEX_HOME\" \"$OPENAI_FEDERATION_RULE_ID\" \"$openai_identity_token_file\"".to_string(),
             ],
             process_id: None,
@@ -298,7 +298,7 @@ async fn command_exec_accepts_permission_profile() -> Result<()> {
         .send_command_exec_request(CommandExecParams {
             command: vec![
                 "sh".to_string(),
-                "-lc".to_string(),
+                "-c".to_string(),
                 "printf 'profile'".to_string(),
             ],
             process_id: None,
@@ -462,7 +462,7 @@ async fn command_exec_permission_profile_starts_selected_network_proxy() -> Resu
         .send_command_exec_request(CommandExecParams {
             command: vec![
                 "sh".to_string(),
-                "-lc".to_string(),
+                "-c".to_string(),
                 "printf '%s' \"${CODEX_NETWORK_PROXY_ACTIVE-unset}\"".to_string(),
             ],
             process_id: None,
@@ -510,7 +510,7 @@ async fn command_exec_permission_profile_does_not_reuse_default_network_proxy() 
         .send_command_exec_request(CommandExecParams {
             command: vec![
                 "sh".to_string(),
-                "-lc".to_string(),
+                "-c".to_string(),
                 "printf '%s' \"${CODEX_NETWORK_PROXY_ACTIVE-unset}\"".to_string(),
             ],
             process_id: None,
@@ -863,7 +863,7 @@ async fn command_exec_non_streaming_respects_output_cap() -> Result<()> {
         .send_command_exec_request(CommandExecParams {
             command: vec![
                 "sh".to_string(),
-                "-lc".to_string(),
+                "-c".to_string(),
                 "printf 'abcdef'; printf 'uvwxyz' >&2".to_string(),
             ],
             process_id: Some("cap-1".to_string()),

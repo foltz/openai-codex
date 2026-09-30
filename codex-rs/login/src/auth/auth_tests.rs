@@ -59,6 +59,114 @@ fn header_auth_exposes_a_valid_chatgpt_account_id() {
 }
 
 #[tokio::test]
+async fn managed_account_projection_is_exact_guarded_and_credential_free() {
+    let home = tempdir().unwrap();
+    write_managed_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".to_owned()),
+            chatgpt_account_id: Some("projection-account".to_owned()),
+        },
+        home.path(),
+    )
+    .unwrap();
+    let manager = AuthManager::new(
+        home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+        /*forced_chatgpt_workspace_id*/ None,
+        /*chatgpt_base_url*/ None,
+        AuthKeyringBackendKind::default(),
+        crate::test_support::transport_default_auth_route_config(),
+    )
+    .await;
+    let fingerprint = AuthManager::managed_account_fingerprint("projection-account");
+    let revision = *manager.auth_change_receiver().borrow();
+    let projected = manager
+        .with_managed_account_projection(Some(&fingerprint), |mode, plan| {
+            assert!(
+                manager.inner.try_write().is_err(),
+                "cache guard must span the callback"
+            );
+            assert!(
+                manager.external_auth.try_write().is_err(),
+                "external authority stays fenced"
+            );
+            (mode, plan)
+        })
+        .unwrap();
+    assert_eq!(
+        projected,
+        (Some(AuthMode::Chatgpt), Some(AccountPlanType::Pro))
+    );
+    assert_eq!(*manager.auth_change_receiver().borrow(), revision);
+    let terminal = manager
+        .prepare_managed_terminal_commit(Some(&fingerprint))
+        .await
+        .unwrap();
+    let storage = create_auth_storage(
+        home.path().to_path_buf(),
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
+    );
+    let mut raw = storage.load().unwrap().unwrap();
+    let competing_writer = storage.lock_managed_source().unwrap();
+    assert!(matches!(
+        manager.with_managed_terminal_projection(&terminal, |_, _| panic!(
+            "contended source must not publish"
+        )),
+        Err(ManagedTerminalVerificationError::SourceUnavailable(
+            ManagedAuthStorageError::ReadFailed(ManagedAuthStorageFailure::CoordinationContended)
+        ))
+    ));
+    drop(competing_writer);
+    // Contention did not consume the proof or obscure the cached authority;
+    // the same unchanged precondition can be checked after the writer leaves.
+    assert_eq!(
+        manager
+            .with_managed_terminal_projection(&terminal, |mode, plan| {
+                assert!(manager.inner.try_write().is_err());
+                assert!(manager.external_auth.try_write().is_err());
+                assert!(
+                    storage.save(&raw).is_err(),
+                    "cooperating writer must be excluded through callback"
+                );
+                (mode, plan)
+            })
+            .unwrap(),
+        (Some(AuthMode::Chatgpt), Some(AccountPlanType::Pro))
+    );
+    raw.tokens.as_mut().unwrap().access_token = "replaced-after-final-verification".to_owned();
+    storage.save(&raw).unwrap();
+    assert!(matches!(
+        manager.with_managed_terminal_projection(&terminal, |_, _| panic!(
+            "changed durable source must not publish"
+        )),
+        Err(ManagedTerminalVerificationError::SourceChanged)
+    ));
+    assert!(matches!(
+        manager.with_managed_account_projection(Some("wrong"), |_, _| {
+            panic!("mismatched cache must not publish")
+        }),
+        Err(ManagedAdoptionVerificationError::IntendedResultMismatch)
+    ));
+    manager.inner.write().unwrap().auth = None;
+    assert_eq!(
+        manager
+            .with_managed_account_projection(None, |mode, plan| (mode, plan))
+            .unwrap(),
+        (None, None)
+    );
+    manager.inner.write().unwrap().initial_load_failed = true;
+    assert!(matches!(
+        manager.with_managed_account_projection(None, |_, _| {
+            panic!("unavailable authority must not publish absence")
+        }),
+        Err(ManagedAdoptionVerificationError::CacheUnavailable)
+    ));
+}
+
+#[tokio::test]
 async fn refresh_without_id_token() {
     let codex_home = tempdir().unwrap();
     let fake_jwt = write_auth_file(
@@ -3038,6 +3146,43 @@ async fn plan_type_maps_unknown_to_unknown() {
     pretty_assertions::assert_eq!(auth.account_plan_type(), Some(AccountPlanType::Unknown));
 }
 
+#[test]
+fn authoritative_cached_auth_distinguishes_initial_failure_from_logged_out() {
+    let manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    assert!(manager.authoritative_auth_cached().is_ok());
+    manager
+        .inner
+        .write()
+        .expect("test cache lock")
+        .initial_load_failed = true;
+    assert_eq!(
+        manager.authoritative_auth_cached(),
+        Err(AuthoritativeAuthUnavailable::InitialLoadFailed)
+    );
+}
+
+#[test]
+fn authoritative_cached_auth_reports_cache_lock_unavailable_when_poisoned() {
+    let manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    assert!(manager.authoritative_auth_cached().is_ok());
+
+    let poisoning_manager = Arc::clone(&manager);
+    let poisoned = std::thread::spawn(move || {
+        let _guard = poisoning_manager.inner.write().expect("test cache lock");
+        panic!("deliberately poison the cache lock for this test");
+    })
+    .join();
+    assert!(poisoned.is_err(), "the spawned thread must have panicked");
+
+    assert_eq!(
+        manager.authoritative_auth_cached(),
+        Err(AuthoritativeAuthUnavailable::CacheLockUnavailable),
+        "a poisoned cache lock must fail closed as unavailable, never as logged-out"
+    );
+}
+
 #[tokio::test]
 #[serial(codex_auth_env)]
 async fn missing_plan_type_maps_to_unknown() {
@@ -3069,4 +3214,508 @@ async fn missing_plan_type_maps_to_unknown() {
     .expect("auth available");
 
     pretty_assertions::assert_eq!(auth.account_plan_type(), Some(AccountPlanType::Unknown));
+}
+
+// --- Issue 05 Slice 4 managed-auth-transition adoption (R014, R001, R002,
+// R044, R045, R064) -----------------------------------------------------
+
+fn write_managed_auth_file(params: AuthFileParams, codex_home: &Path) -> std::io::Result<()> {
+    let account_id = params.chatgpt_account_id.clone();
+    write_auth_file(params, codex_home)?;
+    let path = get_auth_file(codex_home);
+    let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+    value["tokens"]["account_id"] = serde_json::json!(account_id);
+    std::fs::write(path, serde_json::to_vec(&value)?)
+}
+
+fn write_api_key_auth_file(codex_home: &Path, api_key: &str) {
+    let auth_dot_json = AuthDotJson {
+        auth_mode: Some(AuthMode::ApiKey),
+        openai_api_key: Some(api_key.to_owned()),
+        tokens: None,
+        last_refresh: None,
+        agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
+        bedrock_access_keys: None,
+    };
+    super::save_auth(
+        codex_home,
+        &auth_dot_json,
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
+    )
+    .expect("write api key auth.json");
+}
+
+/// R044/R045: external auth authority (agent identity, injected tokens) is
+/// excluded from managed-auth-transition adoption regardless of what it
+/// would resolve to -- the production source reader must refuse before any
+/// resolution could be treated as an adoptable managed source.
+#[tokio::test]
+async fn managed_adoption_snapshot_excludes_external_auth_authority() {
+    let codex_home = tempdir().unwrap();
+    let manager = AuthManager::new(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::Ephemeral,
+        /*forced_chatgpt_workspace_id*/ None,
+        /*chatgpt_base_url*/ None,
+        AuthKeyringBackendKind::default(),
+        crate::test_support::transport_default_auth_route_config(),
+    )
+    .await;
+    manager
+        .set_external_auth(Arc::new(StaticExternalAuth(CodexAuth::from_api_key(
+            "sk-external",
+        ))))
+        .await
+        .expect("external auth should install");
+
+    match manager.read_managed_adoption_snapshot().await {
+        Err(error) => assert_eq!(
+            error,
+            ManagedAdoptionVerificationError::IneligibleAuthMode,
+            "external auth authority must never be treated as an adoptable managed source"
+        ),
+        Ok(_) => panic!("external auth authority was treated as an adoptable managed source"),
+    }
+}
+
+/// R002: a persisted, non-ChatGPT mode (API key mode here) must refuse as
+/// `IneligibleAuthMode`, rather than slipping through as an adoptable managed
+/// source. This fixture is rejected by the serialized auth-mode gate before a
+/// `CodexAuth` is constructed, so it deliberately does not model the
+/// stable-identity handling for `AgentIdentity` or `PersonalAccessToken`.
+#[tokio::test]
+async fn managed_adoption_snapshot_excludes_persisted_non_chatgpt_mode() {
+    let codex_home = tempdir().unwrap();
+    write_api_key_auth_file(codex_home.path(), "sk-persisted");
+    let manager = AuthManager::new(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+        /*forced_chatgpt_workspace_id*/ None,
+        /*chatgpt_base_url*/ None,
+        AuthKeyringBackendKind::default(),
+        crate::test_support::transport_default_auth_route_config(),
+    )
+    .await;
+
+    match manager.read_managed_adoption_snapshot().await {
+        Err(error) => assert_eq!(
+            error,
+            ManagedAdoptionVerificationError::IneligibleAuthMode,
+            "a persisted non-ChatGPT mode must refuse as IneligibleAuthMode"
+        ),
+        Ok(_) => panic!("a persisted non-ChatGPT mode was treated as adoptable"),
+    }
+}
+
+/// R001: deliberate managed logout is a legitimate success, not a
+/// failure -- `install_managed_logout` must clear the cache, publish the
+/// auth-change signal, and never touch the durable store (no file is
+/// written by this call).
+#[tokio::test]
+async fn install_managed_logout_clears_the_cache_and_publishes_a_revision() {
+    let codex_home = tempdir().unwrap();
+    write_managed_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".to_owned()),
+            chatgpt_account_id: Some("managed-before-logout".to_owned()),
+        },
+        codex_home.path(),
+    )
+    .expect("write managed prior auth");
+    let manager = AuthManager::new(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+        /*forced_chatgpt_workspace_id*/ None,
+        /*chatgpt_base_url*/ None,
+        AuthKeyringBackendKind::default(),
+        crate::test_support::transport_default_auth_route_config(),
+    )
+    .await;
+    manager.reload().await;
+    let previous = manager.auth_cached();
+    assert!(previous.is_some(), "precondition: an auth was cached");
+    let revisions = manager.auth_change_receiver();
+    let owner_before = *manager.auth_change_state_receiver().borrow();
+    let precondition = manager
+        .capture_managed_adoption_precondition(Some(&AuthManager::managed_account_fingerprint(
+            "managed-before-logout",
+        )))
+        .unwrap();
+
+    let outcome = manager.install_managed_logout(previous, &precondition);
+    assert!(
+        matches!(outcome, ManagedAdoptionInstallOutcome::LoggedOut),
+        "expected LoggedOut, got {outcome:?}"
+    );
+    assert_eq!(manager.auth_cached(), None);
+    assert!(manager.is_managed_auth_change(*manager.auth_change_receiver().borrow()));
+    assert_eq!(
+        *manager.auth_change_state_receiver().borrow(),
+        AuthChangeState {
+            generation: owner_before.generation + 1,
+            owner_generation: owner_before.owner_generation + 1,
+        }
+    );
+    assert!(
+        revisions.has_changed().unwrap_or(false),
+        "logout must publish an auth-change signal like any other adoption"
+    );
+    assert!(
+        get_auth_file(codex_home.path()).exists(),
+        "managed logout must never touch the durable store -- the writer boundary is separately owned"
+    );
+}
+
+/// R014's manager-owned CAS: installing must refuse rather than
+/// overwrite when the cache no longer holds the snapshot observed
+/// immediately before the read that produced the value being installed
+/// -- an ordinary non-managed login/logout landing concurrently during
+/// adoption must not be silently clobbered.
+#[tokio::test]
+async fn install_managed_adoption_refuses_when_the_cache_changed_concurrently() {
+    let codex_home = tempdir().unwrap();
+    write_managed_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".to_owned()),
+            chatgpt_account_id: Some("admission-account".to_owned()),
+        },
+        codex_home.path(),
+    )
+    .unwrap();
+    let manager = AuthManager::new(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+        /*forced_chatgpt_workspace_id*/ None,
+        /*chatgpt_base_url*/ None,
+        AuthKeyringBackendKind::default(),
+        crate::test_support::transport_default_auth_route_config(),
+    )
+    .await;
+    let observed_previous = manager.auth_cached();
+    assert!(matches!(observed_previous, Some(CodexAuth::Chatgpt(_))));
+    let precondition = manager
+        .capture_managed_adoption_precondition(Some(&AuthManager::managed_account_fingerprint(
+            "admission-account",
+        )))
+        .unwrap();
+
+    // Something else installs concurrently while the (simulated) read was
+    // in flight.
+    manager
+        .set_external_auth(Arc::new(StaticExternalAuth(CodexAuth::from_api_key(
+            "sk-concurrent-writer",
+        ))))
+        .await
+        .expect("concurrent external auth should install");
+
+    let new_auth = CodexAuth::from_api_key("sk-intended-adoption");
+    let outcome = manager.install_managed_adoption(
+        new_auth,
+        observed_previous,
+        "intended-account",
+        &precondition,
+    );
+    assert!(
+        matches!(
+            outcome,
+            ManagedAdoptionInstallOutcome::CacheChangedConcurrently
+        ),
+        "expected CacheChangedConcurrently, got {outcome:?}"
+    );
+    assert_eq!(
+        manager.auth_cached().as_ref().and_then(CodexAuth::api_key),
+        Some("sk-concurrent-writer"),
+        "a refused install must never overwrite the concurrent value"
+    );
+}
+
+#[tokio::test]
+async fn managed_admission_and_logout_refuse_absent_or_api_key_current_auth() {
+    let codex_home = tempdir().unwrap();
+    let manager = AuthManager::new(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+        /*forced_chatgpt_workspace_id*/ None,
+        /*chatgpt_base_url*/ None,
+        AuthKeyringBackendKind::default(),
+        crate::test_support::transport_default_auth_route_config(),
+    )
+    .await;
+    for auth in [None, Some(CodexAuth::from_api_key("excluded-current-key"))] {
+        manager.set_cached_auth(auth.clone());
+        let revision = *manager.auth_change_receiver().borrow();
+        assert_eq!(manager.managed_transition_eligible(), Ok(false));
+        assert!(manager.capture_managed_adoption_precondition(None).is_err());
+        assert_eq!(manager.auth_cached(), auth);
+        assert_eq!(*manager.auth_change_receiver().borrow(), revision);
+    }
+}
+
+#[tokio::test]
+async fn managed_adoption_preserves_upstream_credential_and_owner_generations() {
+    for (next_account, owner_delta) in [("owner-a", 0), ("owner-b", 1)] {
+        let home = tempdir().unwrap();
+        let write_account = |account: &str, plan: &str| {
+            write_managed_auth_file(
+                AuthFileParams {
+                    openai_api_key: None,
+                    chatgpt_plan_type: Some(plan.to_owned()),
+                    chatgpt_account_id: Some(account.to_owned()),
+                },
+                home.path(),
+            )
+            .unwrap();
+        };
+        write_account("owner-a", "pro");
+        let manager = AuthManager::new(
+            home.path().to_path_buf(),
+            /*enable_codex_api_key_env*/ false,
+            AuthCredentialsStoreMode::File,
+            /*forced_chatgpt_workspace_id*/ None,
+            /*chatgpt_base_url*/ None,
+            AuthKeyringBackendKind::default(),
+            crate::test_support::transport_default_auth_route_config(),
+        )
+        .await;
+        let before = *manager.auth_change_state_receiver().borrow();
+        let precondition = manager
+            .capture_managed_adoption_precondition(Some(&AuthManager::managed_account_fingerprint(
+                "owner-a",
+            )))
+            .unwrap();
+        // Changing the ID token forces a credential change even for the same owner.
+        write_account(next_account, "plus");
+        let prepared = manager
+            .prepare_managed_adoption(
+                Some(&AuthManager::managed_account_fingerprint(next_account)),
+                &precondition,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            manager.install_prepared_managed_adoption(&prepared, &precondition),
+            ManagedAdoptionInstallOutcome::Installed { .. }
+        ));
+        let after = *manager.auth_change_state_receiver().borrow();
+        let managed_revision = *manager.auth_change_receiver().borrow();
+        assert!(manager.is_managed_auth_change(managed_revision));
+        assert!(!manager.is_managed_auth_change(0));
+        assert_eq!(
+            after,
+            AuthChangeState {
+                generation: before.generation + 1,
+                owner_generation: before.owner_generation + owner_delta,
+            }
+        );
+        // A refused reuse must not publish another owner or credential change.
+        assert!(matches!(
+            manager.install_prepared_managed_adoption(&prepared, &precondition),
+            ManagedAdoptionInstallOutcome::IntendedResultMismatch
+        ));
+        assert_eq!(*manager.auth_change_state_receiver().borrow(), after);
+        manager.set_cached_auth(None);
+        let ordinary_revision = *manager.auth_change_receiver().borrow();
+        assert!(ordinary_revision > managed_revision);
+        assert!(!manager.is_managed_auth_change(ordinary_revision));
+    }
+}
+
+#[tokio::test]
+async fn prepared_managed_candidate_refuses_changed_source_and_installs_only_once() {
+    let home = tempdir().unwrap();
+    let write_account = |account: &str| {
+        write_managed_auth_file(
+            AuthFileParams {
+                openai_api_key: None,
+                chatgpt_plan_type: Some("pro".to_owned()),
+                chatgpt_account_id: Some(account.to_owned()),
+            },
+            home.path(),
+        )
+        .unwrap()
+    };
+    write_account("prepared-a");
+    let manager = AuthManager::new(
+        home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+        None,
+        None,
+        AuthKeyringBackendKind::default(),
+        crate::test_support::transport_default_auth_route_config(),
+    )
+    .await;
+    let precondition = manager
+        .capture_managed_adoption_precondition(Some(&AuthManager::managed_account_fingerprint(
+            "prepared-a",
+        )))
+        .unwrap();
+    write_account("prepared-b");
+    let original_b = std::fs::read(get_auth_file(home.path())).unwrap();
+    let prepared = manager
+        .prepare_managed_adoption(
+            Some(&AuthManager::managed_account_fingerprint("prepared-b")),
+            &precondition,
+        )
+        .await
+        .unwrap();
+    let revision = *manager.auth_change_receiver().borrow();
+    write_account("unexpected-c");
+    assert!(matches!(
+        manager.install_prepared_managed_adoption(&prepared, &precondition),
+        ManagedAdoptionInstallOutcome::SourceChanged
+    ));
+    assert_eq!(
+        manager.auth_cached().unwrap().get_account_id().as_deref(),
+        Some("prepared-a")
+    );
+    assert_eq!(*manager.auth_change_receiver().borrow(), revision);
+    std::fs::write(get_auth_file(home.path()), &original_b).unwrap();
+    assert!(matches!(
+        manager.install_prepared_managed_adoption(&prepared, &precondition),
+        ManagedAdoptionInstallOutcome::IntendedResultMismatch
+    ));
+    let malformed_candidate = manager
+        .prepare_managed_adoption(
+            Some(&AuthManager::managed_account_fingerprint("prepared-b")),
+            &precondition,
+        )
+        .await
+        .unwrap();
+    // A malformed replacement is rejected by raw preimage comparison, not
+    // parsed as a new candidate or collapsed into authoritative absence.
+    std::fs::write(get_auth_file(home.path()), b"not auth JSON").unwrap();
+    assert!(matches!(
+        manager.install_prepared_managed_adoption(&malformed_candidate, &precondition),
+        ManagedAdoptionInstallOutcome::SourceChanged
+    ));
+    std::fs::write(get_auth_file(home.path()), original_b).unwrap();
+    assert!(matches!(
+        manager.install_prepared_managed_adoption(&malformed_candidate, &precondition),
+        ManagedAdoptionInstallOutcome::IntendedResultMismatch
+    ));
+    let prepared = manager
+        .prepare_managed_adoption(
+            Some(&AuthManager::managed_account_fingerprint("prepared-b")),
+            &precondition,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        manager.install_prepared_managed_adoption(&prepared, &precondition),
+        ManagedAdoptionInstallOutcome::Installed { .. }
+    ));
+    assert_eq!(
+        manager.auth_cached().unwrap().get_account_id().as_deref(),
+        Some("prepared-b")
+    );
+    let installed_revision = *manager.auth_change_receiver().borrow();
+    assert!(matches!(
+        manager.install_prepared_managed_adoption(&prepared, &precondition),
+        ManagedAdoptionInstallOutcome::IntendedResultMismatch
+    ));
+    assert_eq!(*manager.auth_change_receiver().borrow(), installed_revision);
+}
+
+#[tokio::test]
+async fn managed_recovery_verifies_durable_and_cached_result_without_installing() {
+    let codex_home = tempdir().unwrap();
+    write_managed_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".to_owned()),
+            chatgpt_account_id: Some("recovery-account".to_owned()),
+        },
+        codex_home.path(),
+    )
+    .unwrap();
+    let manager = AuthManager::new(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+        /*forced_chatgpt_workspace_id*/ None,
+        /*chatgpt_base_url*/ None,
+        AuthKeyringBackendKind::default(),
+        crate::test_support::transport_default_auth_route_config(),
+    )
+    .await;
+    let fingerprint = AuthManager::managed_account_fingerprint("recovery-account");
+    let revision = *manager.auth_change_receiver().borrow();
+    match manager
+        .prepare_managed_terminal_commit(Some(&fingerprint))
+        .await
+    {
+        Ok(_) => {}
+        Err(error) => panic!("matching durable and cached result must verify: {error:?}"),
+    }
+    match manager
+        .prepare_managed_terminal_commit(Some("wrong-result"))
+        .await
+    {
+        Err(error) => assert_eq!(
+            error,
+            ManagedAdoptionVerificationError::IntendedResultMismatch,
+            "a different intended result must be rejected"
+        ),
+        Ok(_) => panic!("a different intended result was accepted"),
+    }
+    assert_eq!(*manager.auth_change_receiver().borrow(), revision);
+
+    // Durable absence alone is insufficient while the cache still holds A.
+    std::fs::remove_file(get_auth_file(codex_home.path())).unwrap();
+    match manager.prepare_managed_terminal_commit(None).await {
+        Err(error) => assert_eq!(
+            error,
+            ManagedAdoptionVerificationError::CacheChangedConcurrently,
+            "durable absence must not override a stale cached account"
+        ),
+        Ok(_) => {
+            panic!("durable absence was treated as a verified logout while cache held an account")
+        }
+    }
+    assert_eq!(*manager.auth_change_receiver().borrow(), revision);
+    let precondition = manager
+        .capture_managed_adoption_precondition(Some(&fingerprint))
+        .unwrap();
+    assert!(matches!(
+        manager.install_managed_logout(manager.auth_cached(), &precondition),
+        ManagedAdoptionInstallOutcome::LoggedOut
+    ));
+    let logout_revision = *manager.auth_change_receiver().borrow();
+    match manager.prepare_managed_terminal_commit(None).await {
+        Ok(_) => {}
+        Err(error) => panic!("installed managed logout must verify: {error:?}"),
+    }
+    assert_eq!(*manager.auth_change_receiver().borrow(), logout_revision);
+}
+
+/// The credential-bearing install outcome must never render key/token
+/// material through `{:?}`, matching the existing `CachedAuth` Debug
+/// precedent in this same file.
+#[tokio::test]
+async fn managed_adoption_outcomes_never_debug_print_credential_material() {
+    let fingerprint = AuthManager::managed_account_fingerprint("opaque-account");
+    let install_outcome = ManagedAdoptionInstallOutcome::Installed {
+        fingerprint: fingerprint.clone(),
+    };
+    let rendered = format!("{install_outcome:?}");
+    assert_eq!(
+        rendered,
+        format!("Installed {{ fingerprint: {fingerprint:?} }}"),
+        "debug output must expose only the opaque account fingerprint"
+    );
+    assert!(
+        !rendered.contains("opaque-account"),
+        "debug output must not expose the source account identifier"
+    );
 }

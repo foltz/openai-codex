@@ -12,10 +12,13 @@ use super::thread_input::can_accept_direct_input;
 use super::thread_input::ensure_direct_input_allowed;
 use super::*;
 use crate::error_code::method_not_found;
+use crate::processor_task_retirement::ProcessorTaskDrain;
+use crate::processor_task_retirement::ProcessorTasks;
 use codex_app_server_protocol::SelectedCapabilityRoot;
 use codex_app_server_protocol::ThreadHistoryMode as ApiThreadHistoryMode;
 use codex_app_server_protocol::ThreadItemsListAnchor;
 use codex_app_server_protocol::ThreadItemsListCursor;
+use codex_app_server_protocol::ThreadInteractiveSubscriptionListParams;
 use codex_app_server_protocol::ThreadRevertParams;
 use codex_app_server_protocol::ThreadRevertResponse;
 use codex_app_server_protocol::ThreadRevertedNotification;
@@ -33,6 +36,14 @@ use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_thread_store::PersistContext;
 use std::ops::ControlFlow;
+
+mod shutdown;
+pub(crate) use shutdown::ProcessorThreadRetirement;
+pub(crate) use shutdown::ProcessorThreadShutdown;
+#[cfg(test)]
+pub(crate) use shutdown::ThreadShutdownOwner;
+#[cfg(test)]
+pub(crate) use shutdown::tests::fixture as thread_shutdown_fixture;
 
 pub(super) const THREAD_LIST_DEFAULT_LIMIT: usize = 25;
 pub(super) const THREAD_LIST_MAX_LIMIT: usize = 100;
@@ -457,10 +468,12 @@ pub(crate) struct ThreadRequestProcessor {
     pub(super) thread_goal_processor: ThreadGoalRequestProcessor,
     pub(super) state_db: Option<StateDbHandle>,
     pub(super) log_db: Option<LogDbLayer>,
-    pub(super) background_tasks: TaskTracker,
+    pub(super) background_tasks: ProcessorTasks,
+    thread_shutdown: shutdown::ThreadShutdownOwner,
     pub(super) skills_watcher: Arc<SkillsWatcher>,
     pub(super) turn_cost_worker: Option<crate::turn_cost_worker::TurnCostWorkerHandle>,
     pub(super) initial_config_warnings: Arc<Vec<ConfigWarningNotification>>,
+    pub(super) control_endpoint: Option<String>,
 }
 
 /// Whether resume attaches a client or restores a cold runtime during daemon startup.
@@ -500,6 +513,7 @@ impl ThreadRequestProcessor {
         skills_watcher: Arc<SkillsWatcher>,
         turn_cost_worker: Option<crate::turn_cost_worker::TurnCostWorkerHandle>,
         initial_config_warnings: Vec<ConfigWarningNotification>,
+        control_endpoint: Option<String>,
     ) -> Self {
         Self {
             auth_manager,
@@ -516,10 +530,12 @@ impl ThreadRequestProcessor {
             thread_goal_processor,
             state_db,
             log_db,
-            background_tasks: TaskTracker::new(),
+            background_tasks: ProcessorTasks::default(),
+            thread_shutdown: shutdown::ThreadShutdownOwner::default(),
             skills_watcher,
             turn_cost_worker,
             initial_config_warnings: Arc::new(initial_config_warnings),
+            control_endpoint,
         }
     }
 
@@ -552,6 +568,18 @@ impl ThreadRequestProcessor {
         self.thread_unsubscribe_response_inner(params, request_id.connection_id)
             .await
             .map(|response| Some(response.into()))
+    }
+
+    pub(crate) async fn thread_interactive_subscription_list(
+        &self,
+        _params: ThreadInteractiveSubscriptionListParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        Ok(Some(
+            self.thread_state_manager
+                .thread_interactive_subscription_list()
+                .await
+                .into(),
+        ))
     }
 
     pub(crate) async fn thread_resume(
@@ -985,7 +1013,7 @@ impl ThreadRequestProcessor {
             })
     }
 
-    async fn set_app_server_client_info(
+    pub(super) async fn set_app_server_client_info(
         thread: &CodexThread,
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
@@ -1094,7 +1122,7 @@ impl ThreadRequestProcessor {
         }
     }
 
-    async fn ensure_conversation_listener(
+    pub(super) async fn ensure_conversation_listener(
         &self,
         conversation_id: ThreadId,
         connection_id: ConnectionId,
@@ -1109,7 +1137,7 @@ impl ThreadRequestProcessor {
         .await
     }
 
-    async fn ensure_listener_task_running(
+    pub(crate) async fn ensure_listener_task_running(
         &self,
         conversation_id: ThreadId,
         conversation: Arc<CodexThread>,
@@ -1157,11 +1185,20 @@ impl ThreadRequestProcessor {
             ephemeral,
             history_mode,
             session_start_source,
+            clear_predecessor_thread_id,
+            clear_recovery,
             thread_source,
             project_id,
             daybreak_enabled,
             environments,
         } = params;
+        if let Some(context) = &clear_recovery {
+            super::thread_clear_recovery::validate_recovery(
+                context,
+                session_start_source,
+                &clear_predecessor_thread_id,
+            )?;
+        }
         if matches!(
             history_mode,
             Some(codex_app_server_protocol::ThreadHistoryMode::Paginated)
@@ -1193,6 +1230,16 @@ impl ThreadRequestProcessor {
             if project.is_none() {
                 return Err(invalid_request(format!("project not found: {project_id}")));
             }
+        }
+        if clear_predecessor_thread_id.is_some()
+            && !matches!(
+                session_start_source,
+                Some(codex_app_server_protocol::ThreadStartSource::Clear)
+            )
+        {
+            return Err(invalid_request(
+                "clearPredecessorThreadId requires sessionStartSource=clear",
+            ));
         }
         let runtime_workspace_roots = runtime_workspace_roots.map(resolve_runtime_workspace_roots);
         let environments =
@@ -1226,13 +1273,22 @@ impl ThreadRequestProcessor {
         let request_trace = request_context.request_trace();
         let config_manager = self.config_manager.clone();
         let thread_store = Arc::clone(&self.thread_store);
+        let control_endpoint = self.control_endpoint.clone();
         let initial_config_warnings = Arc::clone(&self.initial_config_warnings);
         let outgoing = Arc::clone(&listener_task_context.outgoing);
         let error_request_id = request_id.clone();
+        let recovery_state = self.state_db.clone();
+        // Capture inside the executing request, not in its synchronous factory.
+        // ProcessorTasks keeps construction alive if the receipt observer drops;
+        // its account custody must survive that observer too. Descendant spawns
+        // do not inherit this scope and still need their own custody.
+        let construction_work = crate::account_turn_admission::derive_request_work()
+            .map_err(|_| internal_error("account-work custody unavailable for thread startup"))?;
         let thread_start_task = async move {
             if let Err(error) = Self::thread_start_task(
                 listener_task_context,
                 thread_store,
+                control_endpoint,
                 config_manager,
                 request_id,
                 app_server_client_name,
@@ -1244,6 +1300,9 @@ impl ThreadRequestProcessor {
                 selected_capability_roots.unwrap_or_default(),
                 history_mode.map(Into::into),
                 session_start_source,
+                clear_predecessor_thread_id,
+                clear_recovery,
+                recovery_state,
                 thread_source.map(Into::into),
                 project_id,
                 daybreak_enabled,
@@ -1259,21 +1318,46 @@ impl ThreadRequestProcessor {
                 outgoing.send_error(error_request_id, error).await;
             }
         };
-        self.background_tasks
-            .spawn(thread_start_task.instrument(request_context.span()))
-            .await
-            .map_err(|_| internal_error("thread startup task stopped before completing"))?;
+        let receipt = self
+            .background_tasks
+            .spawn(
+                crate::account_turn_admission::within_request(construction_work, thread_start_task)
+                    .instrument(request_context.span()),
+            )
+            .map_err(|_| internal_error("background thread-start admission unavailable"))?;
+        match receipt.await {
+            crate::processor_task_retirement::ProcessorTaskJoin::Joined => {}
+            crate::processor_task_retirement::ProcessorTaskJoin::Cancelled
+            | crate::processor_task_retirement::ProcessorTaskJoin::Panicked => {
+                return Err(internal_error(
+                    "thread startup task stopped before completing",
+                ));
+            }
+        }
         Ok(())
     }
 
     pub(crate) async fn drain_background_tasks(&self) {
-        self.background_tasks.close();
-        if tokio::time::timeout(Duration::from_secs(10), self.background_tasks.wait())
+        if !self
+            .drain_background_tasks_until(tokio::time::Instant::now() + Duration::from_secs(10))
             .await
-            .is_err()
+            .is_clean()
         {
-            warn!("timed out waiting for background tasks to shut down; proceeding");
+            warn!("background thread-start shutdown was not clean; proceeding");
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn background_tasks_for_test(&self) -> &ProcessorTasks {
+        &self.background_tasks
+    }
+
+    /// Closes task birth and observes retained joins under the first deadline.
+    pub(crate) async fn drain_background_tasks_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> ProcessorTaskDrain {
+        self.background_tasks.shutdown_until(deadline).await
     }
 
     pub(crate) async fn clear_all_thread_listeners(&self) {
@@ -1281,16 +1365,37 @@ impl ThreadRequestProcessor {
     }
 
     pub(crate) async fn shutdown_threads(&self) {
-        let report = self
-            .thread_manager
-            .shutdown_all_threads_bounded(Duration::from_secs(10))
-            .await;
+        let (report, retirements) = tokio::join!(
+            self.thread_manager
+                .shutdown_all_threads_bounded(Duration::from_secs(10)),
+            self.thread_state_manager.drain_retirement_tickets(),
+        );
+        for (claim, retirement) in retirements {
+            if matches!(
+                retirement.session_loop,
+                codex_core::ThreadLoopOutcome::TimedOut
+            ) || !matches!(
+                retirement.cleanup,
+                codex_core::ThreadCleanupOutcome::Finished { .. }
+            ) {
+                warn!(thread_id = %claim.thread_id, ?retirement, "committed thread retirement remains incomplete");
+            }
+        }
         for thread_id in report.submit_failed {
             warn!("failed to submit Shutdown to thread {thread_id}");
         }
         for thread_id in report.timed_out {
             warn!("timed out waiting for thread {thread_id} to shut down");
         }
+    }
+
+    /// Permanent host shutdown; not a reusable account-transition reset.
+    pub(crate) fn begin_thread_shutdown(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<ProcessorThreadRetirement, codex_core::ThreadManagerRetirementError> {
+        self.thread_shutdown
+            .begin(&self.thread_manager, &self.thread_state_manager, deadline)
     }
 
     async fn request_trace_context(
@@ -1315,6 +1420,7 @@ impl ThreadRequestProcessor {
     async fn thread_start_task(
         listener_task_context: ListenerTaskContext,
         thread_store: Arc<dyn ThreadStore>,
+        control_endpoint: Option<String>,
         config_manager: ConfigManager,
         request_id: ConnectionRequestId,
         app_server_client_name: Option<String>,
@@ -1326,6 +1432,9 @@ impl ThreadRequestProcessor {
         selected_capability_roots: Vec<SelectedCapabilityRoot>,
         history_mode: Option<ThreadHistoryMode>,
         session_start_source: Option<codex_app_server_protocol::ThreadStartSource>,
+        clear_predecessor_thread_id: Option<String>,
+        clear_recovery: Option<codex_app_server_protocol::ThreadClearRecoveryContext>,
+        recovery_state: Option<StateDbHandle>,
         thread_source: Option<codex_protocol::protocol::ThreadSource>,
         project_id: Option<String>,
         daybreak_enabled: Option<bool>,
@@ -1467,8 +1576,8 @@ impl ThreadRequestProcessor {
         if !selected_capability_roots.is_empty() {
             thread_extension_init.insert(selected_capability_roots);
         }
-        let mut start_options = StartThreadOptions::new(config);
-        let reserved_thread_id = if start_options.config.ephemeral {
+        let mut start_options = StartThreadOptions::new(config, /*control_endpoint*/ None);
+        let mut reserved_thread_id = if start_options.config.ephemeral {
             None
         } else {
             stage_pending_thread_metadata(
@@ -1483,15 +1592,66 @@ impl ThreadRequestProcessor {
             )
             .await?
         };
+        // Recovery also reserves IDs for empty metadata and ephemeral threads.
+        // Its separate evidence does not depend on rollout materialization.
+        if clear_recovery.is_some() && reserved_thread_id.is_none() {
+            reserved_thread_id = Some(listener_task_context.thread_manager.reserve_thread_id());
+        }
+        let recovery = if let (Some(context), Some(successor)) =
+            (clear_recovery, reserved_thread_id)
+        {
+            let durability = if let Some(state) = &recovery_state {
+                let predecessor = context
+                    .predecessor_thread_id
+                    .as_deref()
+                    .map(ThreadId::from_string)
+                    .transpose()
+                    .map_err(|err| {
+                        invalid_request(format!("invalid recovery predecessor: {err}"))
+                    })?;
+                if let Err(err) = state.reserve_clear_recovery(successor, predecessor).await {
+                    remove_pending_thread_metadata(thread_store.as_ref(), reserved_thread_id).await;
+                    return Err(internal_error(format!(
+                        "failed to reserve recovery evidence: {err}"
+                    )));
+                }
+                codex_app_server_protocol::ThreadClearRecoveryDurability::Durable
+            } else {
+                // All exact recovery reads on this producer report unavailable,
+                // including during construction: no consumer can observe false none.
+                codex_app_server_protocol::ThreadClearRecoveryDurability::Unavailable
+            };
+            Some(codex_app_server_protocol::ThreadClearRecovery {
+                successor_thread_id: successor.to_string(),
+                context,
+                durability,
+            })
+        } else {
+            None
+        };
         let thread_id = reserved_thread_id
             .unwrap_or_else(|| listener_task_context.thread_manager.reserve_thread_id());
         start_options.reserved_thread_id = Some(thread_id);
         // Startup can prewarm the Responses socket before start_thread returns.
         // Register the creating client first so that handshake can request attestation.
-        listener_task_context
+        if let Err(error) = listener_task_context
             .thread_state_manager
             .try_add_connection_to_thread(thread_id, request_id.connection_id)
-            .await;
+            .await
+        {
+            remove_pending_thread_metadata(thread_store.as_ref(), reserved_thread_id).await;
+            if recovery.is_some()
+                && let (Some(state), Some(successor)) = (&recovery_state, reserved_thread_id)
+                && let Err(record_error) = state
+                    .finish_clear_recovery(successor, codex_state::ClearRecoveryPhase::Failed)
+                    .await
+            {
+                warn!("recovery remains pending after subscription failure: {record_error}");
+            }
+            return Err(internal_error(format!(
+                "failed to subscribe creating client to thread {thread_id}: {error:?}"
+            )));
+        }
         let create_thread_started_at = std::time::Instant::now();
         let new_thread = listener_task_context
             .thread_manager
@@ -1511,6 +1671,7 @@ impl ThreadRequestProcessor {
                 environments: Some(environments),
                 thread_extension_init,
                 client_mcp_extensions,
+                control_endpoint,
                 ..start_options
             })
             .instrument(tracing::info_span!(
@@ -1532,6 +1693,14 @@ impl ThreadRequestProcessor {
                     .remove_thread_state(thread_id)
                     .await;
                 remove_pending_thread_metadata(thread_store.as_ref(), reserved_thread_id).await;
+                if recovery.is_some()
+                    && let (Some(state), Some(successor)) = (&recovery_state, reserved_thread_id)
+                    && let Err(record_err) = state
+                        .finish_clear_recovery(successor, codex_state::ClearRecoveryPhase::Failed)
+                        .await
+                {
+                    warn!("recovery remains pending after failed creation: {record_err}");
+                }
                 return Err(match err.details() {
                     CodexErrorDetails::InvalidRequest(message) => invalid_request(message.clone()),
                     CodexErrorDetails::UnsupportedOperation(message) => {
@@ -1541,6 +1710,14 @@ impl ThreadRequestProcessor {
                 });
             }
         };
+        if recovery.is_some()
+            && let Some(state) = &recovery_state
+        {
+            state.finish_clear_recovery(thread_id, codex_state::ClearRecoveryPhase::Complete)
+                .await.map_err(|err| internal_error(format!(
+                    "thread {thread_id} created but recovery evidence outcome is unknown: {err}; do not automatically retry"
+                )))?;
+        }
         let session_telemetry = thread.session_telemetry();
         session_telemetry.record_startup_phase(
             "thread_start_create_thread",
@@ -1620,6 +1797,7 @@ impl ThreadRequestProcessor {
         let thread_originator = config_snapshot.originator.clone();
 
         let response = ThreadStartResponse {
+            clear_recovery: recovery,
             thread: thread.clone(),
             disabled_plugin_ids: config_snapshot.disabled_plugin_ids,
             model: config_snapshot.model,
@@ -1635,7 +1813,8 @@ impl ThreadRequestProcessor {
             reasoning_effort: config_snapshot.reasoning_effort,
             multi_agent_mode: MultiAgentMode::ExplicitRequestOnly,
         };
-        let notif = thread_started_notification(thread);
+        let notif =
+            thread_started_notification(thread, session_start_source, clear_predecessor_thread_id);
         listener_task_context
             .outgoing
             .send_response_with_thread_originator(request_id, response, thread_originator)
@@ -2292,6 +2471,7 @@ impl ThreadRequestProcessor {
                 self.auth_manager.clone(),
                 self.request_trace_context(request_id).await,
                 client_mcp_extensions,
+                self.control_endpoint.clone(),
             )
             .await
             .map_err(|err| internal_error(format!("error reloading thread after revert: {err}")))?;
@@ -3982,6 +4162,7 @@ impl ThreadRequestProcessor {
                     ThreadResumeTarget::DaemonRecovery(_) => None,
                 },
                 client_mcp_extensions,
+                self.control_endpoint.clone(),
             )
             .await
         {
@@ -5179,7 +5360,7 @@ impl ThreadRequestProcessor {
             parent_trace,
             client_mcp_extensions,
             reserved_thread_id,
-            ..StartThreadOptions::new(config)
+            ..StartThreadOptions::new(config, self.control_endpoint.clone())
         };
         let new_thread = if let Some(prepared_fork) = prepared_fork {
             self.thread_manager
@@ -5380,7 +5561,7 @@ impl ThreadRequestProcessor {
             multi_agent_mode: MultiAgentMode::ExplicitRequestOnly,
         };
 
-        let notif = thread_started_notification(thread);
+        let notif = thread_started_notification(thread, None, None);
         let connection_id = request_id.connection_id;
         self.outgoing
             .send_response_with_thread_originator(request_id, response, thread_originator)
@@ -6258,7 +6439,7 @@ fn preview_from_rollout_items(items: &[RolloutItem]) -> String {
         .unwrap_or_default()
 }
 
-fn build_thread_from_snapshot(
+pub(super) fn build_thread_from_snapshot(
     thread_id: ThreadId,
     session_id: String,
     multi_agent_version: Option<codex_protocol::protocol::MultiAgentVersion>,

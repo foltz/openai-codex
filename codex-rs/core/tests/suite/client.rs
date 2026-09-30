@@ -621,6 +621,8 @@ async fn synthetic_call_output_id_is_stable_across_resumes() -> anyhow::Result<(
                     session_id: thread_id.into(),
                     id: thread_id,
                     parent_thread_id: None,
+                    clear_predecessor_thread_id: None,
+                    clear_transition_id: None,
                     timestamp: "2024-01-01T00:00:00Z".to_string(),
                     cwd: ".".into(),
                     originator: "test_originator".to_string(),
@@ -1138,6 +1140,8 @@ async fn resume_replays_legacy_js_repl_image_rollout_shapes() {
                     session_id: thread_id.into(),
                     id: thread_id,
                     parent_thread_id: None,
+                    clear_predecessor_thread_id: None,
+                    clear_transition_id: None,
                     timestamp: "2024-01-01T00:00:00Z".to_string(),
                     cwd: ".".into(),
                     originator: "test_originator".to_string(),
@@ -1280,6 +1284,8 @@ async fn resume_replays_image_tool_outputs_with_detail() {
                     session_id: thread_id.into(),
                     id: thread_id,
                     parent_thread_id: None,
+                    clear_predecessor_thread_id: None,
+                    clear_transition_id: None,
                     timestamp: "2024-01-01T00:00:00Z".to_string(),
                     cwd: ".".into(),
                     originator: "test_originator".to_string(),
@@ -1963,7 +1969,7 @@ async fn prefers_apikey_when_config_prefers_apikey_even_with_chatgpt_tokens() {
         /*external_time_provider*/ None,
     );
     let NewThread { thread: codex, .. } = thread_manager
-        .start_thread(StartThreadOptions::new(config.clone()))
+        .start_thread(StartThreadOptions::new(config.clone(), None))
         .await
         .expect("create new conversation");
 

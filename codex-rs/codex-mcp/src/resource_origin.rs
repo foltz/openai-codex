@@ -250,6 +250,7 @@ impl ResourceOrigin {
         binding: &McpBinding,
         thread_id: ThreadId,
         uri: &str,
+        access: crate::McpAttemptAccess<'_>,
     ) -> anyhow::Result<ReadResourceResult> {
         if self.uri != uri {
             anyhow::bail!("originating MCP tool call does not match the requested resource");
@@ -307,9 +308,10 @@ impl ResourceOrigin {
             },
         }))?;
         binding
-            .read_resource(
+            .read_resource_with_authority(
                 CODEX_APPS_MCP_SERVER_NAME,
                 ReadResourceRequestParams::new(uri).with_meta(meta),
+                access,
             )
             .await
     }

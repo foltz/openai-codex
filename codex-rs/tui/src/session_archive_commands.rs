@@ -19,6 +19,7 @@ use crate::legacy_core::config::resolve_profile_v2_config_path;
 use crate::named_session_lookup::SessionCollection;
 use crate::named_session_lookup::display_label;
 use crate::named_session_lookup::lookup;
+use codex_app_server_client::InProcessHost;
 use codex_app_server_protocol::Thread as AppServerThread;
 use codex_arg0::Arg0DispatchPaths;
 use codex_config::CloudConfigBundleLoader;
@@ -369,7 +370,8 @@ pub(super) async fn start_app_server_for_session_command(
     let mut state_db = super::init_state_db_for_app_server_target(&config, &app_server_target)
         .await
         .wrap_err("failed to initialize state database")?;
-    let app_server = super::start_app_server(
+    let embedded_host = Some(Arc::new(InProcessHost::default()));
+    let app_server_result = super::start_app_server(
         &mut app_server_target,
         arg0_paths,
         config,
@@ -382,8 +384,11 @@ pub(super) async fn start_app_server_for_session_command(
         &mut state_db,
         environment_manager,
         embedded_network_policy,
+        embedded_host.clone(),
     )
-    .await?;
+    .await;
+    drop(embedded_host);
+    let app_server = app_server_result?;
     Ok(
         AppServerSession::new(app_server, app_server_target.thread_params_mode())
             .with_remote_cwd_override(remote_cwd_override),

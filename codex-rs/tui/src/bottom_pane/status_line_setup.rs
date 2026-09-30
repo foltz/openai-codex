@@ -22,6 +22,7 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use strum::IntoEnumIterator;
 use strum_macros::Display;
@@ -34,6 +35,8 @@ use crate::bottom_pane::CancellationEvent;
 use crate::bottom_pane::bottom_pane_view::BottomPaneView;
 use crate::bottom_pane::multi_select_picker::MultiSelectItem;
 use crate::bottom_pane::multi_select_picker::MultiSelectPicker;
+use crate::bottom_pane::status_line_template::StatusLineConfigEntry;
+use crate::bottom_pane::status_line_template::parse_status_line_entries;
 use crate::bottom_pane::status_surface_preview::StatusSurfacePreviewData;
 use crate::bottom_pane::status_surface_preview::StatusSurfacePreviewItem;
 use crate::keymap::ListKeymap;
@@ -279,6 +282,7 @@ impl StatusLineSetupView {
     ///
     /// Items from `status_line_items` are shown first (in order) and marked as
     /// enabled. Remaining items are appended and marked as disabled.
+    #[cfg(test)]
     pub(crate) fn new(
         status_line_items: Option<&[String]>,
         use_theme_colors: bool,
@@ -286,7 +290,29 @@ impl StatusLineSetupView {
         app_event_tx: AppEventSender,
         list_keymap: ListKeymap,
     ) -> Self {
+        Self::new_with_templates(
+            status_line_items,
+            &[],
+            &HashMap::new(),
+            use_theme_colors,
+            preview_data,
+            app_event_tx,
+            list_keymap,
+        )
+    }
+
+    pub(crate) fn new_with_templates(
+        status_line_items: Option<&[String]>,
+        status_line_prefix: &[String],
+        status_line_variables: &HashMap<String, String>,
+        use_theme_colors: bool,
+        preview_data: StatusSurfacePreviewData,
+        app_event_tx: AppEventSender,
+        list_keymap: ListKeymap,
+    ) -> Self {
         let mut used_ids = HashSet::new();
+        let mut entries_by_id = HashMap::new();
+        let mut prefix_ids = HashSet::new();
         let mut items = vec![MultiSelectItem {
             id: STATUS_LINE_USE_THEME_COLORS_ITEM_ID.to_string(),
             name: "Use theme colors".to_string(),
@@ -296,15 +322,49 @@ impl StatusLineSetupView {
             section_break_after: true,
         }];
 
+        let (prefix_entries, _) = parse_status_line_entries(status_line_prefix.to_vec());
+        for (index, entry) in prefix_entries.into_iter().enumerate() {
+            let id = format!("status-line-prefix-{index}");
+            prefix_ids.insert(id.clone());
+            let raw = entry.raw_config();
+            entries_by_id.insert(id.clone(), entry);
+            items.push(MultiSelectItem {
+                id,
+                name: raw,
+                description: Some("Managed prefix (effective, read-only)".to_string()),
+                enabled: true,
+                orderable: false,
+                section_break_after: false,
+            });
+        }
+
         if let Some(selected_items) = status_line_items.as_ref() {
-            for id in *selected_items {
-                let Ok(item) = id.parse::<StatusLineItem>() else {
+            let (selected_entries, _) = parse_status_line_entries(selected_items.to_vec());
+            let mut template_index = 0;
+            for entry in selected_entries {
+                if entry.is_template() {
+                    let id = format!("status-line-template-{template_index}");
+                    template_index += 1;
+                    let raw = entry.raw_config();
+                    entries_by_id.insert(id.clone(), entry);
+                    items.push(MultiSelectItem {
+                        id,
+                        name: raw,
+                        description: Some("Template (preserved exactly)".to_string()),
+                        enabled: true,
+                        orderable: true,
+                        section_break_after: false,
+                    });
+                    continue;
+                }
+                let Some(item) = entry.built_in() else {
                     continue;
                 };
                 let item_id = item.to_string();
                 if !used_ids.insert(item_id.clone()) {
                     continue;
                 }
+                entries_by_id.insert(item_id, entry);
                 items.push(Self::status_line_select_item(
                     item,
                     /*enabled*/ true,
@@ -318,6 +378,7 @@ impl StatusLineSetupView {
             if used_ids.contains(&item_id) {
                 continue;
             }
+            entries_by_id.insert(item_id, StatusLineConfigEntry::BuiltIn(item));
             items.push(Self::status_line_select_item(
                 item,
                 /*enabled*/ false,
@@ -325,6 +386,10 @@ impl StatusLineSetupView {
             ));
         }
 
+        let preview_entries = entries_by_id.clone();
+        let confirm_entries = entries_by_id;
+        let confirm_prefix_ids = prefix_ids;
+        let preview_variables = status_line_variables.clone();
         Self {
             picker: MultiSelectPicker::builder(
                 "Configure Status Line".to_string(),
@@ -340,21 +405,23 @@ impl StatusLineSetupView {
                     .find(|item| item.id == STATUS_LINE_USE_THEME_COLORS_ITEM_ID)
                     .map(|item| item.enabled)
                     .unwrap_or(true);
-                preview_data.status_line_for_items(
+                preview_data.status_line_for_config_entries(
                     items
                         .iter()
                         .filter(|item| item.enabled)
-                        .filter_map(|item| item.id.parse::<StatusLineItem>().ok()),
+                        .filter_map(|item| preview_entries.get(&item.id)),
+                    &preview_variables,
                     use_theme_colors,
                 )
             })
-            .on_confirm(|ids, app_event| {
+            .on_confirm(move |ids, app_event| {
                 let use_theme_colors = ids
                     .iter()
                     .any(|id| id == STATUS_LINE_USE_THEME_COLORS_ITEM_ID);
                 let items = ids
                     .iter()
-                    .filter_map(|id| id.parse::<StatusLineItem>().ok())
+                    .filter(|id| !confirm_prefix_ids.contains(*id))
+                    .filter_map(|id| confirm_entries.get(id).cloned())
                     .collect::<Vec<_>>();
                 app_event.send(AppEvent::StatusLineSetup {
                     items,
@@ -428,6 +495,9 @@ impl Renderable for StatusLineSetupView {
 mod tests {
     use super::*;
     use crate::app_event_sender::AppEventSender;
+    use crossterm::event::KeyCode;
+    use crossterm::event::KeyEvent;
+    use crossterm::event::KeyModifiers;
     use insta::assert_snapshot;
     use pretty_assertions::assert_eq;
     use ratatui::buffer::Buffer;
@@ -767,6 +837,114 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         );
+    }
+
+    #[test]
+    fn setup_confirmation_preserves_templates_and_excludes_managed_prefix() {
+        let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let configured = [
+            "model-name".to_string(),
+            "model".to_string(),
+            "template:(k:{lane})".to_string(),
+            "template:(k:{lane})".to_string(),
+            "project".to_string(),
+        ];
+        let prefix = ["template:(csr:{lane})".to_string()];
+        let variables = HashMap::from([("lane".to_string(), "dev".to_string())]);
+        let mut view = StatusLineSetupView::new_with_templates(
+            Some(&configured),
+            &prefix,
+            &variables,
+            /*use_theme_colors*/ true,
+            StatusSurfacePreviewData::default(),
+            tx,
+            crate::keymap::RuntimeKeymap::defaults().list,
+        );
+
+        view.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let event = rx.try_recv().expect("setup event");
+        let AppEvent::StatusLineSetup {
+            items,
+            use_theme_colors,
+        } = event
+        else {
+            panic!("unexpected event: {event:?}");
+        };
+        assert!(use_theme_colors);
+        assert_eq!(
+            items
+                .iter()
+                .map(StatusLineConfigEntry::raw_config)
+                .collect::<Vec<_>>(),
+            vec![
+                "model".to_string(),
+                "template:(k:{lane})".to_string(),
+                "template:(k:{lane})".to_string(),
+                "project-name".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn setup_can_disable_one_duplicate_template_and_reorder_the_other() {
+        let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
+        let configured = [
+            "model".to_string(),
+            "template:(k:{lane})".to_string(),
+            "template:(k:{lane})".to_string(),
+            "project-name".to_string(),
+        ];
+        let mut view = StatusLineSetupView::new_with_templates(
+            Some(&configured),
+            &[],
+            &HashMap::from([("lane".to_string(), "dev".to_string())]),
+            /*use_theme_colors*/ true,
+            StatusSurfacePreviewData::default(),
+            AppEventSender::new(tx_raw),
+            crate::keymap::RuntimeKeymap::defaults().list,
+        );
+
+        // The initial cursor is on the non-orderable theme-colors row. Disable
+        // the first duplicate template, then move the remaining duplicate
+        // after project-name before confirming.
+        for _ in 0..2 {
+            view.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        view.handle_key_event(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        view.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        view.handle_key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        view.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let AppEvent::StatusLineSetup { items, .. } = rx.try_recv().expect("setup event") else {
+            panic!("unexpected setup event");
+        };
+        assert_eq!(
+            items
+                .iter()
+                .map(StatusLineConfigEntry::raw_config)
+                .collect::<Vec<_>>(),
+            vec![
+                "model".to_string(),
+                "project-name".to_string(),
+                "template:(k:{lane})".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn setup_preview_marks_unavailable_templates_without_values() {
+        let (entries, invalid) =
+            parse_status_line_entries(["template:{present}:{missing}".to_string()]);
+        assert!(invalid.is_empty());
+        let preview = StatusSurfacePreviewData::default().status_line_for_config_entries(
+            entries.iter(),
+            &HashMap::from([("present".to_string(), "secret-shaped-value".to_string())]),
+            /*use_theme_colors*/ true,
+        );
+        let rendered = line_text(preview).expect("unavailable marker");
+        assert_eq!(rendered, "(unavailable)");
+        assert!(!rendered.contains("secret-shaped-value"));
     }
 
     fn render_lines(view: &StatusLineSetupView, width: u16) -> String {

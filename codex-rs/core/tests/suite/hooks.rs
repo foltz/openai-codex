@@ -34,6 +34,8 @@ use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::HookEventName;
+use codex_protocol::protocol::HookOutputEntryKind;
+use codex_protocol::protocol::HookRunStatus;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
@@ -922,6 +924,33 @@ with Path(r"{log_path}").open("a", encoding="utf-8") as handle:
     Ok(())
 }
 
+fn write_clear_only_session_start_hook(home: &Path) -> Result<()> {
+    let script_path = home.join("clear_only_session_start_hook.py");
+    let marker_path = home.join("clear_only_session_start_hook_ran");
+    let script = format!(
+        r#"from pathlib import Path
+
+Path(r"{marker_path}").write_text("ran", encoding="utf-8")
+"#,
+        marker_path = marker_path.display(),
+    );
+    let hooks = serde_json::json!({
+        "hooks": {
+            "SessionStart": [{
+                "matcher": "clear",
+                "hooks": [{
+                    "type": "command",
+                    "command": format!("python3 {}", script_path.display()),
+                }]
+            }]
+        }
+    });
+
+    fs::write(&script_path, script).context("write clear-only session start hook script")?;
+    fs::write(home.join("hooks.json"), hooks.to_string()).context("write hooks.json")?;
+    Ok(())
+}
+
 fn write_session_start_hook_with_context(home: &Path, additional_context: &str) -> Result<()> {
     let script_path = home.join("session_start_hook.py");
     let additional_context_json = serde_json::to_string(additional_context)
@@ -1448,6 +1477,18 @@ async fn session_start_hook_sees_materialized_transcript_path() -> Result<()> {
         .with_config(trust_discovered_hooks);
     let test = builder.build(&server).await?;
 
+    let hook_inputs_before_first_turn = read_session_start_hook_inputs(test.codex_home_path())?;
+    assert_eq!(
+        hook_inputs_before_first_turn
+            .iter()
+            .map(|input| input["hook_event_name"]
+                .as_str()
+                .expect("hook input event name"))
+            .collect::<Vec<_>>(),
+        vec!["SessionStart"],
+        "an empty interactive session must dispatch SessionStart before its first prompt"
+    );
+
     test.submit_turn("hello").await?;
 
     let hook_inputs = read_session_start_hook_inputs(test.codex_home_path())?;
@@ -1458,6 +1499,109 @@ async fn session_start_hook_sees_materialized_transcript_path() -> Result<()> {
     assert!(
         Path::new(transcript_path).exists(),
         "local session start hook transcript_path should be materialized",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn non_matching_eager_session_start_hook_does_not_materialize_rollout() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let test = test_codex()
+        .with_pre_build_hook(|home| {
+            write_clear_only_session_start_hook(home)
+                .expect("failed to write non-matching session start hook fixture");
+        })
+        .with_config(trust_discovered_hooks)
+        .build(&server)
+        .await?;
+
+    assert!(
+        !test
+            .codex_home_path()
+            .join("clear_only_session_start_hook_ran")
+            .exists(),
+        "a clear-only hook must not run for a startup session"
+    );
+    let rollout_path = test.codex.rollout_path().expect("rollout path");
+    assert!(
+        !rollout_path.exists(),
+        "previewing a non-matching eager hook must not materialize rollout state"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn eager_session_start_stop_emits_lifecycle_events_and_blocks_first_turn() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let test = test_codex()
+        .with_pre_build_hook(|home| {
+            write_session_start_hook_recording_transcript(home, /*stop*/ true)
+                .expect("failed to write stopping session start hook fixture");
+        })
+        .with_config(trust_discovered_hooks)
+        .build(&server)
+        .await?;
+
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "this prompt must be stopped before sampling".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+
+    let started = wait_for_event(&test.codex, |event| {
+        matches!(
+            event,
+            EventMsg::HookStarted(started)
+                if started.run.event_name == HookEventName::SessionStart
+        )
+    })
+    .await;
+    let EventMsg::HookStarted(started) = started else {
+        unreachable!("event predicate requires HookStarted");
+    };
+    let completed = wait_for_event(&test.codex, |event| {
+        matches!(
+            event,
+            EventMsg::HookCompleted(completed)
+                if completed.run.event_name == HookEventName::SessionStart
+        )
+    })
+    .await;
+    let EventMsg::HookCompleted(completed) = completed else {
+        unreachable!("event predicate requires HookCompleted");
+    };
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    assert_eq!(started.turn_id, completed.turn_id);
+    assert!(
+        started.turn_id.is_some(),
+        "hook events must identify the first turn"
+    );
+    assert_eq!(completed.run.status, HookRunStatus::Stopped);
+    assert!(
+        completed.run.entries.iter().any(|entry| {
+            entry.kind == HookOutputEntryKind::Stop
+                && entry.text == "integration assertion complete"
+        }),
+        "HookCompleted must surface the eager stop reason"
+    );
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "an eager SessionStart stop must prevent the first sampling request"
     );
 
     Ok(())
@@ -1559,7 +1703,7 @@ async fn session_end_skips_subagents() -> Result<()> {
             .start_thread(StartThreadOptions {
                 session_source: Some(SessionSource::SubAgent(source)),
                 environments: Some(Vec::new()),
-                ..StartThreadOptions::new(test.config.clone())
+                ..StartThreadOptions::new(test.config.clone(), None)
             })
             .await?;
 
@@ -1680,7 +1824,7 @@ print(json.dumps({"hookSpecificOutput": {
         .thread_manager
         .fork_legacy_thread(
             ForkSnapshot::TruncateBeforeNthUserMessage(1),
-            StartThreadOptions::new(test.config.clone()),
+            StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None),
             test.codex.rollout_path().expect("parent rollout path"),
         )
         .await?
@@ -1743,6 +1887,7 @@ async fn explicit_history_runs_resume_session_start_hook() -> Result<()> {
             test.thread_manager.auth_manager(),
             /*parent_trace*/ None,
             ClientMcpExtensions::default(),
+            /*control_endpoint*/ None,
         )
         .await?
         .thread;

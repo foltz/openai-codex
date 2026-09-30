@@ -156,6 +156,9 @@ pub(super) enum HistoryCapabilities {
     ItemsAndSummaryTurnsFail,
     ThreadListFails,
     ThreadStartFails,
+    RecoveryUnsupported,
+    RecoveryRevisionMismatch,
+    RecoveryWithoutStateDb,
     ConfigReadUnsupported(i64),
     ConfigReadFails,
     ConfigReadUnknownVoice,
@@ -263,9 +266,12 @@ pub(super) async fn start_recording_app_server_with_realtime_speech(
     realtime_behavior: RealtimeRequestBehavior,
     loader_overrides: LoaderOverrides,
 ) -> Result<RecordingAppServer> {
-    let state_db =
+    let state_db = if history_capabilities == HistoryCapabilities::RecoveryWithoutStateDb {
+        None
+    } else {
         crate::init_state_db_for_app_server_target(config, &crate::AppServerTarget::Embedded)
-            .await?;
+            .await?
+    };
     let mut embedded = crate::start_embedded_app_server(
         codex_arg0::Arg0DispatchPaths::default(),
         config.clone(),
@@ -277,7 +283,8 @@ pub(super) async fn start_recording_app_server_with_realtime_speech(
         /*log_db*/ None,
         state_db,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
-        Default::default(),
+Default::default(),
+        Arc::new(codex_app_server_client::InProcessHost::default()),
     )
     .await?;
     let codex_home = config.codex_home.display().to_string();
@@ -443,6 +450,27 @@ pub(super) async fn start_recording_app_server_with_realtime_speech(
                                 data: None,
                                 message: "method not found".to_string(),
                             },
+                        })
+                    } else if history_capabilities == HistoryCapabilities::RecoveryUnsupported
+                        && request.method == "thread/clear/recovery/read"
+                    {
+                        JSONRPCMessage::Error(JSONRPCError {
+                            id: request_id,
+                            error: JSONRPCErrorError {
+                                code: -32601,
+                                data: None,
+                                message: "method not found".into(),
+                            },
+                        })
+                    } else if history_capabilities == HistoryCapabilities::RecoveryRevisionMismatch
+                        && request.method == "thread/clear/recovery/read"
+                    {
+                        JSONRPCMessage::Response(JSONRPCResponse {
+                            id: request_id,
+                            result: serde_json::json!({
+                                "contractVersion": 2, "durability": "durable",
+                                "observation": {"type": "support"}
+                            }),
                         })
                     } else if history_capabilities == HistoryCapabilities::ThreadStartFails
                         && request.method == "thread/start"
@@ -817,6 +845,7 @@ fn spawn_approved_task_tool_call(
         app_server.thread_params_mode(),
         app_server.remote_cwd_override(),
         /*session_start_source*/ None,
+        /*clear_predecessor_thread_id*/ None,
     );
     app_server
         .thread_tool_transport()
@@ -852,6 +881,7 @@ async fn external_transport_registers_dynamic_tools_and_finds_task_mentions() ->
     assert!(app_server.task_tools_available(started.session.thread_id));
     let startup = crate::app_server_session::start_thread_with_request_handle(
         app_server.request_handle(),
+        app_server.retention_client(),
         &app.local_settings,
         app.config.clone(),
         crate::app_server_session::ThreadParamsMode::Embedded,
@@ -859,6 +889,11 @@ async fn external_transport_registers_dynamic_tools_and_finds_task_mentions() ->
         app_server.thread_tool_transport(),
     )
     .await?;
+    let crate::app_server_session::PendingStartupThread {
+        started: startup,
+        retention,
+    } = startup;
+    retention.commit();
     assert!(startup.task_tools_available);
 
     let starts = recorded_params(&requests, "thread/start");
@@ -1109,6 +1144,7 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths() 
     assert!(app_server.task_tools_available(thread_id));
     let startup = crate::app_server_session::start_thread_with_request_handle(
         app_server.request_handle(),
+        app_server.retention_client(),
         &app.local_settings,
         app.config.clone(),
         crate::app_server_session::ThreadParamsMode::Embedded,
@@ -1116,6 +1152,11 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths() 
         app_server.thread_tool_transport(),
     )
     .await?;
+    let crate::app_server_session::PendingStartupThread {
+        started: startup,
+        retention,
+    } = startup;
+    retention.commit();
     assert!(startup.task_tools_available);
 
     let inventory: codex_app_server_protocol::ListMcpServerStatusResponse = app_server
@@ -1490,6 +1531,7 @@ async fn older_external_server_starts_without_unsupported_dynamic_tools_or_histo
     assert!(!app_server.task_tools_available(started.session.thread_id));
     let startup = crate::app_server_session::start_thread_with_request_handle(
         app_server.request_handle(),
+        app_server.retention_client(),
         &app.local_settings,
         app.config.clone(),
         crate::app_server_session::ThreadParamsMode::Embedded,
@@ -1497,6 +1539,11 @@ async fn older_external_server_starts_without_unsupported_dynamic_tools_or_histo
         app_server.thread_tool_transport(),
     )
     .await?;
+    let crate::app_server_session::PendingStartupThread {
+        started: startup,
+        retention,
+    } = startup;
+    retention.commit();
     assert!(!startup.task_tools_available);
 
     let starts = recorded_params(&requests, "thread/start");
@@ -3297,9 +3344,9 @@ model_reasoning_effort = "low"
     app.start_fresh_session(
         &mut tui,
         &mut server,
-        /*session_start_source*/ None,
         /*initial_user_message*/ None,
         /*new_thread_name*/ None,
+        /*session_start_source*/ None,
     )
     .await;
     assert_eq!(
@@ -3660,9 +3707,9 @@ terminal_visualization_instructions = true
     app.start_fresh_session(
         &mut tui,
         &mut server,
-        /*session_start_source*/ None,
         /*initial_user_message*/ None,
         /*new_thread_name*/ None,
+        /*session_start_source*/ None,
     )
     .await;
     let unsaved = app.chat_widget.thread_id().expect("unsaved thread");
@@ -3819,9 +3866,15 @@ async fn changing_directory_preserves_project_trust_permissions_history_and_hook
         start_recording_app_server(&app.config, no_list, background).await?;
     let (rec, plain, req) = (recorded_params, crate::key_hint::plain, &requests);
     let mut tui = crate::tui::test_support::make_test_tui()?;
-    let (source, message, name) = (None, None, Some("Previous project".to_string()));
-    app.start_fresh_session(&mut tui, &mut server, source, message, name)
-        .await;
+    let (message, name) = (None, Some("Previous project".to_string()));
+    app.start_fresh_session_with_summary_hint(
+        &mut tui,
+        &mut server,
+        message,
+        name,
+        /*session_start_source*/ None,
+    )
+    .await;
     let original = app.chat_widget.thread_id().expect("original thread");
     let rollout = app.chat_widget.rollout_path().expect("original rollout");
     let json = r#"{"type":"message","role":"assistant","content":[{"type":"output_text","text":"saved history"}]}"#;
@@ -4119,9 +4172,9 @@ fn fresh_session_applies_requested_name() -> Result<()> {
                 app.start_fresh_session(
                     &mut tui,
                     &mut app_server,
-                    /*session_start_source*/ None,
                     /*initial_user_message*/ None,
                     /*new_thread_name*/ Some("Add User".to_string()),
+                    /*session_start_source*/ None,
                 )
                 .await;
 
@@ -4150,6 +4203,298 @@ fn fresh_session_applies_requested_name() -> Result<()> {
         })?
         .join()
         .expect("named fresh session test thread")
+}
+
+#[test]
+fn clear_session_uses_exact_displayed_thread_before_unsubscribe_and_attaches_successor()
+-> Result<()> {
+    const TEST_STACK_SIZE_BYTES: usize = 8 * 1024 * 1024;
+
+    std::thread::Builder::new()
+        .name("tui-clear-displayed-predecessor".to_string())
+        .stack_size(TEST_STACK_SIZE_BYTES)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(async {
+                let mut app = make_test_app().await;
+                let codex_home = tempdir()?;
+                app.config.codex_home = codex_home.path().to_path_buf().abs();
+                app.config.sqlite = SqliteConfig::new_for_testing(codex_home.path().abs());
+                let (mut app_server, requests, proxy) = start_recording_app_server(
+                    &app.config,
+                    /*blocked_thread_list*/ None,
+                    /*failed_thread_name*/ None,
+                )
+                .await?;
+                let mut tui = crate::tui::test_support::make_test_tui()?;
+
+                app.start_fresh_session_with_summary_hint(
+                    &mut tui,
+                    &mut app_server,
+                    /*initial_user_message*/ None,
+                    /*new_thread_name*/ None,
+                    /*session_start_source*/ None,
+                )
+                .await;
+                let primary = app
+                    .current_displayed_thread_id()
+                    .expect("first fresh session should be displayed");
+                let predecessor = app_server
+                    .start_thread(&app.config)
+                    .await?
+                    .session
+                    .thread_id;
+                assert_ne!(predecessor, primary);
+                app.active_thread_id = Some(predecessor);
+
+                app.handle_event(&mut tui, &mut app_server, AppEvent::ClearUi { name: None })
+                    .await?;
+
+                let starts = recorded_params(&requests, "thread/start");
+                assert_eq!(starts.len(), 2);
+                assert!(starts.iter().all(|params| {
+                    params.get("sessionStartSource") == Some(&serde_json::Value::Null)
+                        && params.get("clearPredecessorThreadId") == Some(&serde_json::Value::Null)
+                }));
+                assert_eq!(
+                    recorded_params(&requests, "thread/clear"),
+                    vec![serde_json::json!({"threadId": predecessor.to_string()})]
+                );
+                let (clear_index, first_unsubscribe) = {
+                    let recorded = requests.lock().expect("request recorder lock");
+                    let clear_index = recorded
+                        .iter()
+                        .position(|request| request.method == "thread/clear")
+                        .expect("combined clear request should be recorded");
+                    let first_unsubscribe = recorded
+                        .iter()
+                        .position(|request| request.method == "thread/unsubscribe")
+                        .expect("post-clear local cleanup should unsubscribe old listeners");
+                    (clear_index, first_unsubscribe)
+                };
+                assert!(clear_index < first_unsubscribe);
+
+                let successor = app
+                    .current_displayed_thread_id()
+                    .expect("clear successor should be displayed");
+                assert_ne!(successor, predecessor);
+                let retained: codex_app_server_protocol::ThreadRetentionAcquireResponse =
+                    app_server
+                        .request_handle()
+                        .request_typed(ClientRequest::ThreadRetentionAcquire {
+                            request_id: app_server.next_request_id(),
+                            params: codex_app_server_protocol::ThreadRetentionAcquireParams {
+                                thread_id: successor.to_string(),
+                            },
+                        })
+                        .await?;
+                assert!(matches!(
+                    retained,
+                    codex_app_server_protocol::ThreadRetentionAcquireResponse::AlreadyHeld { .. }
+                ));
+                assert_eq!(
+                    app_server
+                        .thread_read(successor, /*include_turns*/ false)
+                        .await?
+                        .id,
+                    successor.to_string()
+                );
+
+                app_server.shutdown().await?;
+                proxy.await??;
+                Ok(())
+            })
+        })?
+        .join()
+        .expect("clear displayed predecessor test thread")
+}
+
+#[test]
+fn clear_then_submit_ui_path_uses_one_combined_request() -> Result<()> {
+    const TEST_STACK_SIZE_BYTES: usize = 8 * 1024 * 1024;
+
+    std::thread::Builder::new()
+        .name("tui-clear-then-submit-combined-request".to_string())
+        .stack_size(TEST_STACK_SIZE_BYTES)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(async {
+                let mut app = make_test_app().await;
+                let codex_home = tempdir()?;
+                app.config.codex_home = codex_home.path().to_path_buf().abs();
+                app.config.sqlite = SqliteConfig::new_for_testing(codex_home.path().abs());
+                let (mut app_server, requests, proxy) = start_recording_app_server(
+                    &app.config,
+                    /*blocked_thread_list*/ None,
+                    /*failed_thread_name*/ None,
+                )
+                .await?;
+                let mut tui = crate::tui::test_support::make_test_tui()?;
+
+                app.start_fresh_session_with_summary_hint(
+                    &mut tui,
+                    &mut app_server,
+                    /*initial_user_message*/ None,
+                    /*new_thread_name*/ None,
+                    /*session_start_source*/ None,
+                )
+                .await;
+                let predecessor = app
+                    .current_displayed_thread_id()
+                    .expect("predecessor should be displayed");
+
+                app.handle_event(
+                    &mut tui,
+                    &mut app_server,
+                    AppEvent::ClearUiAndSubmitUserMessage {
+                        text: "continue on the successor".to_string(),
+                    },
+                )
+                .await?;
+
+                assert_eq!(
+                    recorded_params(&requests, "thread/clear"),
+                    vec![serde_json::json!({"threadId": predecessor.to_string()})]
+                );
+                assert_eq!(recorded_params(&requests, "thread/start").len(), 1);
+                assert_ne!(app.current_displayed_thread_id(), Some(predecessor));
+
+                app_server.shutdown().await?;
+                proxy.await??;
+                Ok(())
+            })
+        })?
+        .join()
+        .expect("clear-then-submit combined request test thread")
+}
+
+#[test]
+fn failed_repeated_clear_keeps_resumed_predecessor_displayed_without_unsubscribe() -> Result<()> {
+    const TEST_STACK_SIZE_BYTES: usize = 8 * 1024 * 1024;
+
+    std::thread::Builder::new()
+        .name("tui-clear-failure-preserves-predecessor".to_string())
+        .stack_size(TEST_STACK_SIZE_BYTES)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(async {
+                let mut app = make_test_app().await;
+                let codex_home = tempdir()?;
+                app.config.codex_home = codex_home.path().to_path_buf().abs();
+                app.config.sqlite = SqliteConfig::new_for_testing(codex_home.path().abs());
+                // Fresh-session startup rebuilds config from launch overrides, not
+                // the resolved SqliteConfig above. Keep that reload isolated too.
+                app.cli_kv_overrides.push((
+                    "sqlite_home".to_string(),
+                    toml::Value::String(codex_home.path().to_string_lossy().into_owned()),
+                ));
+                let reloaded = app
+                    .rebuild_config_for_cwd(app.config.cwd.to_path_buf())
+                    .await?;
+                assert_eq!(reloaded.sqlite, app.config.sqlite);
+                let (mut app_server, requests, proxy) = start_recording_app_server(
+                    &app.config,
+                    /*blocked_thread_list*/ None,
+                    /*failed_thread_name*/ None,
+                )
+                .await?;
+                let mut tui = crate::tui::test_support::make_test_tui()?;
+
+                app.start_fresh_session_with_summary_hint(
+                    &mut tui,
+                    &mut app_server,
+                    /*initial_user_message*/ None,
+                    /*new_thread_name*/ None,
+                    /*session_start_source*/ None,
+                )
+                .await;
+                let predecessor = app
+                    .current_displayed_thread_id()
+                    .expect("predecessor should be displayed");
+                assert_eq!(
+                    app.config.sqlite,
+                    SqliteConfig::new_for_testing(codex_home.path().abs())
+                );
+                let state = codex_state::StateRuntime::init(
+                    app.config.sqlite.clone(),
+                    app.config.model_provider_id.clone(),
+                )
+                .await
+                .map_err(std::io::Error::other)?;
+                let transition_id = codex_state::ClearTransitionId::new();
+                let codex_state::ClearTransitionReserveOutcome::Reserved(_) = state
+                    .reserve_clear_transition(transition_id, predecessor, ThreadId::new())
+                    .await
+                    .map_err(std::io::Error::other)?
+                else {
+                    panic!("expected fresh clear transition reservation");
+                };
+                for (expected, next) in [
+                    (
+                        codex_state::ClearTransitionPhase::Reserved,
+                        codex_state::ClearTransitionPhase::SuccessorCreated,
+                    ),
+                    (
+                        codex_state::ClearTransitionPhase::SuccessorCreated,
+                        codex_state::ClearTransitionPhase::Committed,
+                    ),
+                    (
+                        codex_state::ClearTransitionPhase::Committed,
+                        codex_state::ClearTransitionPhase::EvidenceClaimed,
+                    ),
+                    (
+                        codex_state::ClearTransitionPhase::EvidenceClaimed,
+                        codex_state::ClearTransitionPhase::Completed,
+                    ),
+                ] {
+                    assert!(
+                        state
+                            .advance_clear_transition_phase(transition_id, expected, next)
+                            .await
+                            .map_err(std::io::Error::other)?
+                    );
+                }
+                let request_count_before_failure =
+                    requests.lock().expect("request recorder lock").len();
+
+                app.clear_displayed_session(
+                    &mut tui,
+                    &mut app_server,
+                    /*initial_user_message*/ None,
+                    /*new_thread_name*/ None,
+                )
+                .await;
+
+                assert_eq!(app.current_displayed_thread_id(), Some(predecessor));
+                let failure_request_methods = {
+                    let recorded = requests.lock().expect("request recorder lock");
+                    recorded[request_count_before_failure..]
+                        .iter()
+                        .map(|request| request.method.clone())
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(failure_request_methods, vec!["thread/clear"]);
+                assert_eq!(
+                    app_server
+                        .thread_read(predecessor, /*include_turns*/ false)
+                        .await?
+                        .id,
+                    predecessor.to_string()
+                );
+
+                app_server.shutdown().await?;
+                proxy.await??;
+                Ok(())
+            })
+        })?
+        .join()
+        .expect("clear failure preservation test thread")
 }
 
 #[test]
@@ -4297,9 +4642,9 @@ fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
                 app.start_fresh_session(
                     &mut tui,
                     &mut app_server,
-                    /*session_start_source*/ None,
                     /*initial_user_message*/ None,
                     /*new_thread_name*/ None,
+                    /*session_start_source*/ None,
                 )
                 .await;
 

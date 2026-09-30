@@ -69,7 +69,10 @@ async fn window_id_advances_after_compact_persists_on_resume_and_resets_on_fork(
         .thread_manager
         .fork_legacy_thread(
             /*snapshot*/ 0usize,
-            codex_core::StartThreadOptions::new(resumed.config.clone()),
+            codex_core::StartThreadOptions::new(
+                resumed.config.clone(),
+                /*control_endpoint*/ None,
+            ),
             rollout_path,
         )
         .await?;

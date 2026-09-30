@@ -67,6 +67,7 @@ pub use thread_sections::StoredThreadSectionsPage;
 pub use types::AppendThreadItemsParams;
 pub use types::ArchiveThreadParams;
 pub use types::ArchiveThreadsParams;
+pub use types::ClearThreadLineage;
 pub use types::ClearableField;
 pub use types::CreateThreadParams;
 pub use types::DeleteThreadParams;

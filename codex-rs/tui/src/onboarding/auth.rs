@@ -1192,7 +1192,7 @@ mod tests {
 
     #[tokio::test]
     async fn login_can_complete_while_browser_is_opening() {
-        let (mut widget, _tmp) = widget_forced_chatgpt().await;
+        let (mut widget, _tmp, _host) = widget_forced_chatgpt().await;
         let sign_in_state = widget.sign_in_state.clone();
         let request_frame = widget.request_frame.clone();
         show_chatgpt_login_in_browser(
@@ -1219,7 +1219,11 @@ mod tests {
         ));
     }
 
-    async fn widget_forced_chatgpt() -> (AuthModeWidget, TempDir) {
+    async fn widget_forced_chatgpt() -> (
+        AuthModeWidget,
+        TempDir,
+        Arc<codex_app_server_client::InProcessHost>,
+    ) {
         let codex_home = TempDir::new().unwrap();
         let codex_home_path = codex_home.path().to_path_buf();
         let config = ConfigBuilder::default()
@@ -1228,7 +1232,8 @@ mod tests {
             .await
             .unwrap();
         let mut auth_config = config.auth_config();
-        let client = InProcessAppServerClient::start(InProcessClientStartArgs {
+        let host = Arc::new(codex_app_server_client::InProcessHost::default());
+        let client = InProcessAppServerClient::start_in_host(Arc::clone(&host), InProcessClientStartArgs {
             arg0_paths: Arg0DispatchPaths::default(),
             config: Arc::new(config),
             cli_overrides: Vec::new(),
@@ -1255,6 +1260,7 @@ mod tests {
             client_version: "test".to_string(),
             experimental_api: true,
             mcp_server_openai_form_elicitation: false,
+            interactive_client: false,
             opt_out_notification_methods: Vec::new(),
             channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
         })
@@ -1274,12 +1280,12 @@ mod tests {
             animations_enabled: true,
             animations_suppressed: std::cell::Cell::new(false),
         };
-        (widget, codex_home)
+        (widget, codex_home, host)
     }
 
     #[tokio::test]
     async fn api_key_flow_disabled_when_chatgpt_forced() {
-        let (mut widget, _tmp) = widget_forced_chatgpt().await;
+        let (mut widget, _tmp, _host) = widget_forced_chatgpt().await;
 
         widget.start_api_key_entry();
 
@@ -1295,7 +1301,7 @@ mod tests {
 
     #[tokio::test]
     async fn bedrock_option_requires_feature_and_api_login_permission() {
-        let (mut widget, _tmp) = widget_forced_chatgpt().await;
+        let (mut widget, _tmp, _host) = widget_forced_chatgpt().await;
         widget.auth_config.forced_login_method = None;
         assert_eq!(
             widget.displayed_sign_in_options(),
@@ -1359,7 +1365,7 @@ mod tests {
 
     #[tokio::test]
     async fn saving_api_key_is_blocked_when_chatgpt_forced() {
-        let (mut widget, _tmp) = widget_forced_chatgpt().await;
+        let (mut widget, _tmp, _host) = widget_forced_chatgpt().await;
 
         widget.save_api_key("sk-test".to_string());
 
@@ -1377,7 +1383,7 @@ mod tests {
     #[tokio::test]
     async fn existing_non_oauth_chatgpt_login_counts_as_signed_in() {
         for auth_mode in [AuthMode::ChatgptAuthTokens, AuthMode::PersonalAccessToken] {
-            let (mut widget, _tmp) = widget_forced_chatgpt().await;
+            let (mut widget, _tmp, _host) = widget_forced_chatgpt().await;
             widget.login_status = LoginStatus::AuthMode(auth_mode);
 
             let handled = widget.handle_existing_chatgpt_login();
@@ -1392,7 +1398,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_active_attempt_resets_browser_login_state() {
-        let (widget, _tmp) = widget_forced_chatgpt().await;
+        let (widget, _tmp, _host) = widget_forced_chatgpt().await;
         *widget.error.write().unwrap() = Some("still logging in".to_string());
         *widget.sign_in_state.write().unwrap() =
             SignInState::ChatGptContinueInBrowser(ContinueInBrowserState {
@@ -1411,7 +1417,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_active_attempt_notifies_device_code_login() {
-        let (widget, _tmp) = widget_forced_chatgpt().await;
+        let (widget, _tmp, _host) = widget_forced_chatgpt().await;
         *widget.error.write().unwrap() = Some("still logging in".to_string());
         *widget.sign_in_state.write().unwrap() =
             SignInState::ChatGptDeviceCode(ContinueWithDeviceCodeState::ready(
@@ -1452,7 +1458,7 @@ mod tests {
     #[test]
     fn continue_in_browser_preserves_long_link_and_footer_at_narrow_width() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let (widget, _tmp) = runtime.block_on(widget_forced_chatgpt());
+        let (widget, _tmp, _host) = runtime.block_on(widget_forced_chatgpt());
         widget.set_animations_suppressed(/*suppressed*/ true);
         *widget.sign_in_state.write().unwrap() =
             SignInState::ChatGptContinueInBrowser(ContinueInBrowserState {
@@ -1491,7 +1497,7 @@ mod tests {
     #[test]
     fn chatgpt_success_message_renders_osc8_hyperlinks() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let (widget, _tmp) = runtime.block_on(widget_forced_chatgpt());
+        let (widget, _tmp, _host) = runtime.block_on(widget_forced_chatgpt());
         let area = Rect::new(0, 0, 80, 14);
         let mut buf = Buffer::empty(area);
 
@@ -1554,7 +1560,7 @@ mod tests {
     #[test]
     fn auth_widget_suppresses_animations_when_device_code_is_visible() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let (widget, _tmp) = runtime.block_on(widget_forced_chatgpt());
+        let (widget, _tmp, _host) = runtime.block_on(widget_forced_chatgpt());
         *widget.sign_in_state.write().unwrap() =
             SignInState::ChatGptDeviceCode(ContinueWithDeviceCodeState::ready(
                 "request-1".to_string(),
@@ -1569,7 +1575,7 @@ mod tests {
     #[test]
     fn auth_widget_suppresses_animations_while_requesting_device_code() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let (widget, _tmp) = runtime.block_on(widget_forced_chatgpt());
+        let (widget, _tmp, _host) = runtime.block_on(widget_forced_chatgpt());
         *widget.sign_in_state.write().unwrap() = SignInState::ChatGptDeviceCode(
             ContinueWithDeviceCodeState::pending("request-1".to_string()),
         );
@@ -1579,7 +1585,7 @@ mod tests {
 
     #[tokio::test]
     async fn device_code_login_completion_advances_to_success_message() {
-        let (mut widget, _tmp) = widget_forced_chatgpt().await;
+        let (mut widget, _tmp, _host) = widget_forced_chatgpt().await;
         *widget.sign_in_state.write().unwrap() =
             SignInState::ChatGptDeviceCode(ContinueWithDeviceCodeState::ready(
                 "request-1".to_string(),

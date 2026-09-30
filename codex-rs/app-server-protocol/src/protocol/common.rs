@@ -581,6 +581,42 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::ThreadUnsubscribeResponse,
     },
+    ThreadClear => "thread/clear" {
+        params: v2::ThreadClearParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadClearResponse,
+    },
+    // Deliberately unscoped: observation must not queue behind clear mutation.
+    #[experimental("thread/clear/read")]
+    ThreadClearRead => "thread/clear/read" {
+        params: v2::ThreadClearReadParams,
+        serialization: None,
+        response: v2::ThreadClearReadResponse,
+    },
+    #[experimental("thread/clear/recovery/read")]
+    ThreadClearRecoveryRead => "thread/clear/recovery/read" {
+        params: v2::ThreadClearRecoveryReadParams,
+        serialization: None,
+        response: v2::ThreadClearRecoveryReadResponse,
+    },
+    #[experimental("kcf/thread/interactiveSubscription/list")]
+    ThreadInteractiveSubscriptionList => "kcf/thread/interactiveSubscription/list" {
+        params: v2::ThreadInteractiveSubscriptionListParams,
+        serialization: global_shared_read("thread-attachment"),
+        response: v2::ThreadInteractiveSubscriptionListResponse,
+    },
+    #[experimental("thread/retention/acquire")]
+    ThreadRetentionAcquire => "thread/retention/acquire" {
+        params: v2::ThreadRetentionAcquireParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadRetentionAcquireResponse,
+    },
+    #[experimental("thread/retention/release")]
+    ThreadRetentionRelease => "thread/retention/release" {
+        params: v2::ThreadRetentionReleaseParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadRetentionReleaseResponse,
+    },
     #[experimental("thread/increment_elicitation")]
     /// Increment the thread-local out-of-band elicitation counter.
     ///
@@ -1230,6 +1266,12 @@ client_request_definitions! {
         response: v2::McpServerRefreshResponse,
     },
 
+    McpServerConfigIdentity => "config/mcpServer/identity" {
+        params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
+        serialization: global_shared_read("mcp-registry"),
+        response: v2::McpServerConfigIdentityResponse,
+    },
+
     McpServerStatusList => "mcpServerStatus/list" {
         params: v2::ListMcpServerStatusParams,
         serialization: global("mcp-registry"),
@@ -1298,6 +1340,29 @@ client_request_definitions! {
         params: v2::CancelLoginAccountParams,
         serialization: global("account-auth"),
         response: v2::CancelLoginAccountResponse,
+    },
+
+    // The coordinator owns transition admission. Its long-running start must
+    // not queue independent read/cancel requests behind drain or reset work.
+    #[experimental("account/managedAuthTransition")]
+    ManagedTransitionStart => "account/managedAuthTransition/start" {
+        params: v2::StartManagedTransitionParams,
+        serialization: None,
+        response: v2::StartManagedTransitionResponse,
+    },
+
+    #[experimental("account/managedAuthTransition")]
+    ManagedTransitionRead => "account/managedAuthTransition/read" {
+        params: v2::ReadManagedTransitionParams,
+        serialization: None,
+        response: v2::ReadManagedTransitionResponse,
+    },
+
+    #[experimental("account/managedAuthTransition")]
+    ManagedTransitionCancel => "account/managedAuthTransition/cancel" {
+        params: v2::CancelManagedTransitionParams,
+        serialization: None,
+        response: v2::CancelManagedTransitionResponse,
     },
 
     LogoutAccount => "account/logout" {
@@ -1917,6 +1982,10 @@ server_notification_definitions! {
     /// NEW NOTIFICATIONS
     Error => "error" (v2::ErrorNotification),
     ThreadStarted => "thread/started" (v2::ThreadStartedNotification),
+    ThreadClearEnded => "thread/clear/ended" (v2::ThreadClearEndedNotification),
+    ThreadClearStarted => "thread/clear/started" (v2::ThreadClearStartedNotification),
+    #[experimental("kcf/thread/interactiveSubscription/changed")]
+    ThreadInteractiveSubscriptionChanged => "kcf/thread/interactiveSubscription/changed" (v2::ThreadInteractiveSubscriptionChangedNotification),
     ThreadStatusChanged => "thread/status/changed" (v2::ThreadStatusChangedNotification),
     ThreadArchived => "thread/archived" (v2::ThreadArchivedNotification),
     ThreadDeleted => "thread/deleted" (v2::ThreadDeletedNotification),
@@ -1981,6 +2050,8 @@ server_notification_definitions! {
     McpServerEventStream => "mcpServer/event/stream/notification" (v2::McpServerEventStreamNotification),
     AccountUpdated => "account/updated" (v2::AccountUpdatedNotification),
     GatewayOAuthChanged => "account/gatewayOAuth/changed" (v2::GatewayOAuthChangedNotification),
+    #[experimental("account/managedAuthTransition")]
+    ManagedTransitionStatusUpdated => "account/managedAuthTransition/updated" (v2::ManagedTransitionStatusNotification),
     AccountRateLimitsUpdated => "account/rateLimits/updated" (v2::AccountRateLimitsUpdatedNotification),
     AppListUpdated => "app/list/updated" (v2::AppListUpdatedNotification),
     RemoteControlStatusChanged => "remoteControl/status/changed" (v2::RemoteControlStatusChangedNotification),
@@ -2038,6 +2109,16 @@ server_notification_definitions! {
     AccountLoginCompleted(v2::AccountLoginCompletedNotification),
 
 }
+
+/// Notification methods and payloads intentionally omitted from stable
+/// schema/TypeScript projections. The runtime enum still carries their
+/// `ExperimentalApi` marker so experimental consumers can opt in.
+#[cfg(test)]
+pub(crate) const EXPERIMENTAL_SERVER_NOTIFICATION_METHODS: &[&str] =
+    &["account/managedAuthTransition/updated"];
+#[cfg(test)]
+pub(crate) const EXPERIMENTAL_SERVER_NOTIFICATION_TYPES: &[&str] =
+    &["ManagedTransitionStatusNotification"];
 
 /// Server notification envelope sent over app-server transports.
 ///
@@ -2748,6 +2829,7 @@ mod tests {
                     explicit_gateway_oauth: false,
                     experimental_api: true,
                     request_attestation: true,
+                    interactive_client: true,
                     mcp_server_openai_form_elicitation: true,
                     opt_out_notification_methods: Some(vec![
                         "thread/started".to_string(),
@@ -2776,6 +2858,7 @@ mod tests {
                     "capabilities": {
                         "experimentalApi": true,
                         "requestAttestation": true,
+                        "interactiveClient": true,
                         "mcpServerOpenaiFormElicitation": true,
                         "optOutNotificationMethods": [
                             "thread/started",
@@ -2808,6 +2891,7 @@ mod tests {
                 "capabilities": {
                     "experimentalApi": true,
                     "requestAttestation": true,
+                    "interactiveClient": true,
                     "mcpServerOpenaiFormElicitation": true,
                     "optOutNotificationMethods": [
                         "thread/started",
@@ -2836,6 +2920,7 @@ mod tests {
                         explicit_gateway_oauth: false,
                         experimental_api: true,
                         request_attestation: true,
+                        interactive_client: true,
                         mcp_server_openai_form_elicitation: true,
                         opt_out_notification_methods: Some(vec![
                             "thread/started".to_string(),
@@ -3199,6 +3284,7 @@ mod tests {
         let response = ClientResponse::ThreadStart {
             request_id: RequestId::Integer(7),
             response: v2::ThreadStartResponse {
+                clear_recovery: None,
                 disabled_plugin_ids: Vec::new(),
                 thread: v2::Thread {
                     originator: None,
@@ -3260,6 +3346,7 @@ mod tests {
                 "method": "thread/start",
                 "id": 7,
                 "response": {
+                    "clearRecovery": null,
                     "thread": {
                         "id": "67e55044-10b1-426f-9247-bb680e5fe0c8",
                         "environments": null,

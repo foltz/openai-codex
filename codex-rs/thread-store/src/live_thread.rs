@@ -105,6 +105,16 @@ impl LiveThreadInitGuard {
             warn!("failed to discard thread persistence for failed session init: {err}");
         }
     }
+
+    /// Finish retained acquisition and report disposal to an external cleanup owner.
+    /// The caller must retain this guard until the returned future is terminal.
+    pub async fn discard_with_result(&mut self) -> ThreadStoreResult<()> {
+        self.finish_acquisition().await?;
+        let Some(live_thread) = self.live_thread.take() else {
+            return Ok(());
+        };
+        live_thread.discard().await
+    }
 }
 
 impl Drop for LiveThreadInitGuard {

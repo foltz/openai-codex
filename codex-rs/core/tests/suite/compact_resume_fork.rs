@@ -693,6 +693,7 @@ async fn resume_conversation(
         auth_manager,
         /*parent_trace*/ None,
         ClientMcpExtensions::default(),
+        None,
     ))
     .await
     .expect("resume conversation")
@@ -708,7 +709,7 @@ async fn fork_thread(
 ) -> Arc<CodexThread> {
     Box::pin(manager.fork_legacy_thread(
         nth_user_message,
-        codex_core::StartThreadOptions::new(config.clone()),
+        codex_core::StartThreadOptions::new(config.clone(), /*control_endpoint*/ None),
         path,
     ))
     .await

@@ -7,6 +7,148 @@ use crossterm::event::KeyModifiers;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
+async fn recovery_selects_supported_history_on_a_fresh_connection_without_retry() -> Result<()> {
+    for capabilities in [
+        HistoryCapabilities::Current,
+        HistoryCapabilities::RecoveryWithoutStateDb,
+    ] {
+        let (mut app, _, _) = make_test_app_with_channels().await;
+        let home = tempdir()?;
+        app.config.codex_home = home.path().to_path_buf().abs();
+        app.config.sqlite = SqliteConfig::new_for_testing(home.path().abs());
+        let (mut server, requests, proxy) = start_recording_app_server_with_history(
+            &app.config,
+            capabilities,
+            None,
+            None,
+            crate::app_server_session::ThreadParamsMode::Embedded,
+            LoaderOverrides::default(),
+        )
+        .await?;
+        let a = ThreadId::new();
+        // No start or fork has taught this newly connected session LegacyOnly.
+        let started = server
+            .start_clear_recovery(&app.local_settings, &app.config, Some(a))
+            .await?;
+        assert_ne!(started.session.thread_id, a);
+        let starts = recorded_params(&requests, "thread/start");
+        assert_eq!(starts.len(), 1);
+        assert!(starts[0]["historyMode"].is_null());
+        assert_eq!(
+            starts[0]["clearRecovery"]["predecessorThreadId"],
+            a.to_string()
+        );
+        let read = server
+            .request_handle()
+            .request_typed::<codex_app_server_protocol::ThreadClearRecoveryReadResponse>(
+                codex_app_server_protocol::ClientRequest::ThreadClearRecoveryRead {
+                    request_id: codex_app_server_protocol::RequestId::String(
+                        "recovery-check".into(),
+                    ),
+                    params: codex_app_server_protocol::ThreadClearRecoveryReadParams {
+                        successor_thread_id: Some(started.session.thread_id.to_string()),
+                    },
+                },
+            )
+            .await;
+        if capabilities == HistoryCapabilities::RecoveryWithoutStateDb {
+            assert!(read.is_err());
+        } else {
+            assert!(matches!(
+                read?.observation,
+                codex_app_server_protocol::ThreadClearRecoveryObservation::Complete { .. }
+            ));
+        }
+        server.shutdown().await?;
+        proxy.await??;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn recovery_checks_support_before_creation_and_never_retries_a_failed_start() -> Result<()> {
+    for capabilities in [
+        HistoryCapabilities::RecoveryUnsupported,
+        HistoryCapabilities::RecoveryRevisionMismatch,
+        HistoryCapabilities::ThreadStartFails,
+    ] {
+        let (mut app, mut events, _) = make_test_app_with_channels().await;
+        let home = tempdir()?;
+        app.config.codex_home = home.path().to_path_buf().abs();
+        app.config.sqlite = SqliteConfig::new_for_testing(home.path().abs());
+        let current = ThreadId::new();
+        app.enqueue_primary_thread_session(
+            test_thread_session(current, app.config.cwd.to_path_buf()),
+            Vec::new(),
+        )
+        .await?;
+        app.app_server_target = AppServerTarget::Remote {
+            endpoint: crate::resolve_remote_addr("ws://127.0.0.1:1")?,
+        };
+        app.ensure_thread_channel(current).mark_replay_only();
+        while events.try_recv().is_ok() {}
+        let (mut server, requests, proxy) = start_recording_app_server_with_history(
+            &app.config,
+            capabilities,
+            /*blocked_thread_list*/ None,
+            /*failed_thread_name*/ None,
+            crate::app_server_session::ThreadParamsMode::Embedded,
+            LoaderOverrides::default(),
+        )
+        .await?;
+        let mut tui = crate::tui::test_support::make_test_tui()?;
+        app.clear_displayed_session(
+            &mut tui,
+            &mut server,
+            Some("keep input".into()),
+            /*new_thread_name*/ None,
+        )
+        .await;
+        assert_eq!(app.chat_widget.thread_id(), Some(current));
+        assert_eq!(app.chat_widget.composer_text_with_pending(), "keep input");
+        assert!(recorded_params(&requests, "thread/unsubscribe").is_empty());
+        assert!(recorded_params(&requests, "thread/clear").is_empty());
+        let starts = recorded_params(&requests, "thread/start");
+        assert_eq!(
+            starts.len(),
+            usize::from(capabilities == HistoryCapabilities::ThreadStartFails)
+        );
+        if let Some(start) = starts.first() {
+            assert_eq!(
+                start["clearRecovery"],
+                serde_json::json!({
+                    "contractVersion": 1, "predecessorThreadId": current.to_string()
+                })
+            );
+            assert!(start["clearPredecessorThreadId"].is_null());
+        }
+        let errors = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event {
+                AppEvent::InsertHistoryCell(cell) => {
+                    Some(lines_to_single_string(&cell.display_lines(/*width*/ 1000)))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        match capabilities {
+            HistoryCapabilities::RecoveryUnsupported => {
+                insta::assert_snapshot!(errors, @"■ Failed to start a fresh session through the app server: Clear recovery is unsupported or unavailable; reconnect to a compatible server. No recovery was started")
+            }
+            HistoryCapabilities::RecoveryRevisionMismatch => {
+                insta::assert_snapshot!(errors, @"■ Failed to start a fresh session through the app server: Clear recovery contract mismatch; no recovery was started")
+            }
+            _ => {
+                insta::assert_snapshot!(errors, @"■ Failed to start a fresh session through the app server: Clear recovery outcome is unknown or refused; no automatic retry. A new attempt may create another thread")
+            }
+        }
+        server.shutdown().await?;
+        proxy.await??;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn new_session_preserves_vim_line_yank() -> Result<()> {
     let (mut app, _events, _ops) = make_test_app_with_channels().await;
     let home = tempdir()?;
@@ -33,9 +175,9 @@ async fn new_session_preserves_vim_line_yank() -> Result<()> {
     app.start_fresh_session(
         &mut tui,
         &mut server,
-        /*session_start_source*/ None,
         /*initial_user_message*/ None,
         /*new_thread_name*/ None,
+        /*session_start_source*/ None,
     )
     .await;
 
@@ -151,9 +293,9 @@ async fn replacement_uses_server_defaults_and_preserves_explicit_launch_settings
         app.start_fresh_session(
             &mut tui,
             &mut server,
-            /*session_start_source*/ None,
             /*initial_user_message*/ None,
             /*new_thread_name*/ None,
+            /*session_start_source*/ None,
         )
         .await;
         let starts = recorded_params(&requests, "thread/start");
@@ -218,9 +360,9 @@ async fn replacement_failure_keeps_current_task_and_restores_input() -> Result<(
         app.start_fresh_session(
             &mut tui,
             &mut server,
-            /*session_start_source*/ None,
             Some("keep this request".into()),
             /*new_thread_name*/ None,
+            /*session_start_source*/ None,
         )
         .await;
         assert_eq!(app.chat_widget.thread_id(), Some(current));
@@ -286,9 +428,9 @@ async fn replacement_preserves_remote_launch_paths_and_older_servers() -> Result
         app.start_fresh_session(
             &mut tui,
             &mut server,
-            /*session_start_source*/ None,
             /*initial_user_message*/ None,
             /*new_thread_name*/ None,
+            /*session_start_source*/ None,
         )
         .await;
         assert_eq!(

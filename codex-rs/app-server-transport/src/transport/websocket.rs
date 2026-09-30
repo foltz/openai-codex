@@ -1,5 +1,6 @@
 use super::CHANNEL_CAPACITY;
 use super::ConnectionOrigin;
+use super::ConnectionProvenance;
 use super::TransportEvent;
 use super::forward_incoming_message;
 use super::next_connection_id;
@@ -120,8 +121,13 @@ async fn websocket_upgrade_handler(
     websocket
         .on_upgrade(move |stream| async move {
             let (websocket_writer, websocket_reader) = stream.split();
-            run_websocket_connection(websocket_writer, websocket_reader, state.transport_event_tx)
-                .await;
+            run_websocket_connection(
+                websocket_writer,
+                websocket_reader,
+                state.transport_event_tx,
+                ConnectionProvenance::Unproven,
+            )
+            .await;
         })
         .into_response()
 }
@@ -173,6 +179,7 @@ pub(crate) async fn run_websocket_connection<M, SinkError, StreamError>(
     websocket_writer: impl futures::sink::Sink<M, Error = SinkError> + Send + 'static,
     websocket_reader: impl futures::stream::Stream<Item = Result<M, StreamError>> + Send + 'static,
     transport_event_tx: mpsc::Sender<TransportEvent>,
+    provenance: ConnectionProvenance,
 ) where
     M: AppServerWebSocketMessage + Send + 'static,
     SinkError: Send + 'static,
@@ -188,6 +195,7 @@ pub(crate) async fn run_websocket_connection<M, SinkError, StreamError>(
             connection_id,
             origin: ConnectionOrigin::WebSocket,
             auth: None,
+            provenance,
             writer: writer_tx,
             disconnect_sender: Some(disconnect_token.clone()),
         })

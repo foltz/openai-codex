@@ -109,6 +109,7 @@ mod hooks;
 mod hooks_executor;
 #[cfg(not(target_os = "windows"))]
 mod hooks_mcp;
+mod host_turn_work;
 mod image_rollout;
 mod injected_models_cache;
 #[cfg(not(target_os = "windows"))]

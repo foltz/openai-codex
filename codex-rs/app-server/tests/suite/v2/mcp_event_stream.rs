@@ -1,5 +1,7 @@
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -46,11 +48,16 @@ async fn mcp_event_stream_waits_for_activation_forwards_events_and_cancels() -> 
     let (stream_started_tx, mut stream_started_rx) = mpsc::unbounded_channel::<Value>();
     let allow_activation = Arc::new(Notify::new());
     let activation_gate = Arc::clone(&allow_activation);
+    let allow_reconnect = Arc::new(Notify::new());
+    let reconnect_gate = Arc::clone(&allow_reconnect);
+    let stream_count = Arc::new(AtomicUsize::new(0));
     let router = Router::new().route(
         "/api/codex/ps/mcp",
         post(move |Json(message): Json<Value>| {
             let stream_started_tx = stream_started_tx.clone();
             let allow_activation = Arc::clone(&activation_gate);
+            let allow_reconnect = Arc::clone(&reconnect_gate);
+            let stream_count = Arc::clone(&stream_count);
 
             async move {
                 match message["method"].as_str() {
@@ -78,6 +85,7 @@ async fn mcp_event_stream_waits_for_activation_forwards_events_and_cancels() -> 
                     }))
                     .into_response(),
                     Some("events/stream") => {
+                        let reconnect = stream_count.fetch_add(1, Ordering::SeqCst) > 0;
                         stream_started_tx
                             .send(message.clone())
                             .expect("stream-start receiver must remain open");
@@ -96,9 +104,22 @@ async fn mcp_event_stream_waits_for_activation_forwards_events_and_cancels() -> 
                             "params": {
                                 "_meta": metadata,
                                 "name": "issue.updated",
-                                "data": { "issue": 42 },
+                                "data": { "issue": if reconnect { 43 } else { 42 } },
                             },
                         });
+                        // Reconnects may resume directly with an event, without
+                        // repeating the initial activation notification.
+                        if reconnect {
+                            return Sse::new(
+                                stream::once(async move {
+                                    Ok::<_, Infallible>(
+                                        Event::default().event("message").data(event.to_string()),
+                                    )
+                                })
+                                .chain(stream::pending()),
+                            )
+                            .into_response();
+                        }
                         let events = stream::once(async move {
                             allow_activation.notified().await;
                             Ok::<_, Infallible>(
@@ -110,7 +131,15 @@ async fn mcp_event_stream_waits_for_activation_forwards_events_and_cancels() -> 
                                 Event::default().event("message").data(event.to_string()),
                             )
                         }))
-                        .chain(stream::pending());
+                        .chain(stream::once(async move {
+                            allow_reconnect.notified().await;
+                            Ok::<_, Infallible>(
+                                Event::default().event("message").data(
+                                    json!({"jsonrpc": "2.0", "id": message["id"], "result": {}})
+                                        .to_string(),
+                                ),
+                            )
+                        }));
 
                         Sse::new(events).into_response()
                     }
@@ -226,6 +255,33 @@ async fn mcp_event_stream_waits_for_activation_forwards_events_and_cancels() -> 
                     "_meta": metadata,
                     "name": "issue.updated",
                     "data": { "issue": 42 },
+                }),
+            },
+        }
+    );
+
+    allow_reconnect.notify_one();
+    let retry_request = timeout(Duration::from_secs(5), stream_started_rx.recv())
+        .await?
+        .context("MCP event stream did not reconnect")?;
+    let resumed: McpServerEventStreamNotification = timeout(
+        Duration::from_secs(5),
+        app_server.read_notification("mcpServer/event/stream/notification"),
+    )
+    .await??;
+    assert_eq!(
+        resumed,
+        McpServerEventStreamNotification {
+            subscription_id: "subscription-1".to_string(),
+            notification: McpServerEventNotification {
+                method: "notifications/events/event".to_string(),
+                params: json!({
+                    "_meta": {
+                        "io.modelcontextprotocol/subscriptionId": retry_request["id"],
+                        "provider": "event-test-server",
+                    },
+                    "name": "issue.updated",
+                    "data": { "issue": 43 },
                 }),
             },
         }

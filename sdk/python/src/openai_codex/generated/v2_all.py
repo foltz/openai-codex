@@ -2128,6 +2128,13 @@ class InitializeCapabilities(BaseModel):
         dict[str, Any] | None,
         Field(description="MCP extension settings declared by the app-server client."),
     ] = None
+    interactive_client: Annotated[
+        bool | None,
+        Field(
+            alias="interactiveClient",
+            description="Requests classification as an interactive app-server client. This is a request only; the server must independently establish entitlement.",
+        ),
+    ] = None
     mcp_server_openai_form_elicitation: Annotated[
         bool | None,
         Field(
@@ -2525,6 +2532,22 @@ class McpResourceReadTarget(BaseModel):
             alias="linkId",
             description="Null explicitly requests no-auth access, subject to the app's resource policy.",
         ),
+    ]
+
+
+class McpServerConfigIdentityLayer(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    file_path: Annotated[
+        str,
+        Field(
+            alias="filePath",
+            description="Normalized absolute path spelling from the accepted selected user configuration snapshot. This deliberately does not resolve symlinks.",
+        ),
+    ]
+    version: Annotated[
+        str, Field(description="Existing canonical layer version, in `sha256:...` form.")
     ]
 
 
@@ -5173,6 +5196,86 @@ class ThreadAttachmentUpdatedNotification(BaseModel):
     thread_id: Annotated[str, Field(alias="threadId")]
 
 
+class ThreadClearEndReason(RootModel[Literal["clear"]]):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    root: Literal["clear"]
+
+
+class ThreadClearEndedNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    predecessor_thread_id: Annotated[str, Field(alias="predecessorThreadId")]
+    reason: ThreadClearEndReason
+    successor_thread_id: Annotated[str, Field(alias="successorThreadId")]
+    transition_id: Annotated[str, Field(alias="transitionId")]
+
+
+class ThreadClearParams(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    thread_id: Annotated[
+        str,
+        Field(
+            alias="threadId",
+            description="The predecessor currently displayed by the requesting connection.",
+        ),
+    ]
+
+
+class ThreadClearRecoveryContext(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        populate_by_name=True,
+    )
+    contract_version: Annotated[
+        int,
+        Field(
+            alias="contractVersion",
+            description="Must match the recovery-read contract on this connection before creation.",
+            ge=0,
+        ),
+    ]
+    predecessor_thread_id: Annotated[
+        str | None,
+        Field(
+            alias="predecessorThreadId",
+            description="Null means genuinely no displayed predecessor, not an unavailable known ID.",
+        ),
+    ] = None
+
+
+class ThreadClearRecoveryDurability(Enum):
+    durable = "durable"
+    unavailable = "unavailable"
+
+
+class SupportThreadClearRecoveryObservation(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    type: Annotated[Literal["support"], Field(title="SupportThreadClearRecoveryObservationType")]
+
+
+class NoneThreadClearRecoveryObservation(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    type: Annotated[Literal["none"], Field(title="NoneThreadClearRecoveryObservationType")]
+
+
+class ThreadClearTransition(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    predecessor_thread_id: Annotated[str, Field(alias="predecessorThreadId")]
+    successor_thread_id: Annotated[str, Field(alias="successorThreadId")]
+    transition_id: Annotated[str, Field(alias="transitionId")]
+
+
 class ThreadClosedNotification(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -5300,6 +5403,21 @@ class ThreadInjectItemsResponse(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
+
+
+class ThreadInteractiveSubscriptionEntry(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    interactive_subscription_count: Annotated[
+        int,
+        Field(
+            alias="interactiveSubscriptionCount",
+            description="Distinct live thread-event subscriptions held by server-verified interactive clients. Not evidence of human presence, focus or retention.",
+            ge=0,
+        ),
+    ]
+    thread_id: Annotated[str, Field(alias="threadId")]
 
 
 class HookPromptThreadItem(BaseModel):
@@ -6802,6 +6920,15 @@ class ThreadUnsubscribeRequest(BaseModel):
     params: ThreadUnsubscribeParams
 
 
+class ThreadClearRequest(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    id: RequestId
+    method: Annotated[Literal["thread/clear"], Field(title="Thread/clearRequestMethod")]
+    params: ThreadClearParams
+
+
 class ThreadNameSetRequest(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -7404,6 +7531,17 @@ class ConfigMcpServerReloadRequest(BaseModel):
     id: RequestId
     method: Annotated[
         Literal["config/mcpServer/reload"], Field(title="Config/mcpServer/reloadRequestMethod")
+    ]
+    params: None = None
+
+
+class ConfigMcpServerIdentityRequest(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    id: RequestId
+    method: Annotated[
+        Literal["config/mcpServer/identity"], Field(title="Config/mcpServer/identityRequestMethod")
     ]
     params: None = None
 
@@ -8551,6 +8689,21 @@ class McpResourceReadResponse(BaseModel):
     ] = None
 
 
+class McpServerConfigIdentity(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    layers: list[McpServerConfigIdentityLayer]
+
+
+class McpServerConfigIdentityResponse(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    applied: McpServerConfigIdentity
+    current: McpServerConfigIdentity
+
+
 class McpServerStatus(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -9018,6 +9171,23 @@ class ScheduledTaskSummary(BaseModel):
     name: str
     prompt: str
     schedule: ScheduledTaskSchedule
+
+
+class ThreadClearEndedServerNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    emitted_at_ms: Annotated[
+        int | None,
+        Field(
+            alias="emittedAtMs",
+            description="Unix timestamp (in milliseconds) when app-server emitted this notification.",
+        ),
+    ] = None
+    method: Annotated[
+        Literal["thread/clear/ended"], Field(title="Thread/clear/endedNotificationMethod")
+    ]
+    params: ThreadClearEndedNotification
 
 
 class ThreadStatusChangedServerNotification(BaseModel):
@@ -9686,6 +9856,60 @@ class SubAgentSource(
     root: SubAgentSourceValue | ThreadSpawnSubAgentSource | OtherSubAgentSource
 
 
+class ThreadClearRecovery(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    context: ThreadClearRecoveryContext
+    durability: ThreadClearRecoveryDurability
+    successor_thread_id: Annotated[str, Field(alias="successorThreadId")]
+
+
+class PendingThreadClearRecoveryObservation(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    recovery: ThreadClearRecovery
+    type: Annotated[Literal["pending"], Field(title="PendingThreadClearRecoveryObservationType")]
+
+
+class CompleteThreadClearRecoveryObservation(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    recovery: ThreadClearRecovery
+    type: Annotated[Literal["complete"], Field(title="CompleteThreadClearRecoveryObservationType")]
+
+
+class FailedThreadClearRecoveryObservation(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    recovery: ThreadClearRecovery
+    type: Annotated[Literal["failed"], Field(title="FailedThreadClearRecoveryObservationType")]
+
+
+class ThreadClearRecoveryObservation(
+    RootModel[
+        SupportThreadClearRecoveryObservation
+        | NoneThreadClearRecoveryObservation
+        | PendingThreadClearRecoveryObservation
+        | CompleteThreadClearRecoveryObservation
+        | FailedThreadClearRecoveryObservation
+    ]
+):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    root: (
+        SupportThreadClearRecoveryObservation
+        | NoneThreadClearRecoveryObservation
+        | PendingThreadClearRecoveryObservation
+        | CompleteThreadClearRecoveryObservation
+        | FailedThreadClearRecoveryObservation
+    )
+
+
 class ThreadForkParams(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -9778,6 +10002,15 @@ class ThreadGoalUpdatedNotification(BaseModel):
     goal: ThreadGoal
     thread_id: Annotated[str, Field(alias="threadId")]
     turn_id: Annotated[str | None, Field(alias="turnId")] = None
+
+
+class ThreadInteractiveSubscriptionChangedNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    changes: list[ThreadInteractiveSubscriptionEntry]
+    generation: str
+    revision: Annotated[int, Field(ge=0)]
 
 
 class UserMessageThreadItem(BaseModel):
@@ -11067,6 +11300,24 @@ class ErrorServerNotification(BaseModel):
     params: ErrorNotification
 
 
+class KcfThreadInteractiveSubscriptionChangedServerNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    emitted_at_ms: Annotated[
+        int | None,
+        Field(
+            alias="emittedAtMs",
+            description="Unix timestamp (in milliseconds) when app-server emitted this notification.",
+        ),
+    ] = None
+    method: Annotated[
+        Literal["kcf/thread/interactiveSubscription/changed"],
+        Field(title="Kcf/thread/interactiveSubscription/changedNotificationMethod"),
+    ]
+    params: ThreadInteractiveSubscriptionChangedNotification
+
+
 class ThreadGoalUpdatedServerNotification(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -12075,6 +12326,25 @@ class Thread(BaseModel):
     ]
 
 
+class ThreadClearResponse(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    predecessor_thread_id: Annotated[str, Field(alias="predecessorThreadId")]
+    successor_thread: Annotated[Thread, Field(alias="successorThread")]
+    transition_id: Annotated[str, Field(alias="transitionId")]
+
+
+class ThreadClearStartedNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    predecessor_thread_id: Annotated[str, Field(alias="predecessorThreadId")]
+    start_source: Annotated[ThreadStartSource, Field(alias="startSource")]
+    successor_thread: Annotated[Thread, Field(alias="successorThread")]
+    transition_id: Annotated[str, Field(alias="transitionId")]
+
+
 class ThreadForkResponse(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -12289,6 +12559,20 @@ class ThreadStartedNotification(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
+    clear_predecessor_thread_id: Annotated[
+        str | None,
+        Field(
+            alias="clearPredecessorThreadId",
+            description="The explicit predecessor of a `Clear` start. This is omitted for normal new sessions and forks; resumes do not emit `thread/started`.",
+        ),
+    ] = None
+    session_start_source: Annotated[
+        ThreadStartSource | None,
+        Field(
+            alias="sessionStartSource",
+            description="The client-declared source for this start, when the source was supplied on the corresponding `thread/start` request.",
+        ),
+    ] = None
     thread: Thread
 
 
@@ -12449,6 +12733,7 @@ class ClientRequest(
         | ThreadArchiveRequest
         | ThreadDeleteRequest
         | ThreadUnsubscribeRequest
+        | ThreadClearRequest
         | ThreadNameSetRequest
         | ThreadGoalSetRequest
         | ThreadGoalGetRequest
@@ -12518,6 +12803,7 @@ class ClientRequest(
         | ExperimentalFeatureEnablementSetRequest
         | McpServerOauthLoginRequest
         | ConfigMcpServerReloadRequest
+        | ConfigMcpServerIdentityRequest
         | McpServerStatusListRequest
         | McpServerResourceReadRequest
         | McpServerToolCallRequest
@@ -12559,6 +12845,7 @@ class ClientRequest(
         | ThreadArchiveRequest
         | ThreadDeleteRequest
         | ThreadUnsubscribeRequest
+        | ThreadClearRequest
         | ThreadNameSetRequest
         | ThreadGoalSetRequest
         | ThreadGoalGetRequest
@@ -12628,6 +12915,7 @@ class ClientRequest(
         | ExperimentalFeatureEnablementSetRequest
         | McpServerOauthLoginRequest
         | ConfigMcpServerReloadRequest
+        | ConfigMcpServerIdentityRequest
         | McpServerStatusListRequest
         | McpServerResourceReadRequest
         | McpServerToolCallRequest
@@ -12795,6 +13083,23 @@ class ThreadStartedServerNotification(BaseModel):
     params: ThreadStartedNotification
 
 
+class ThreadClearStartedServerNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    emitted_at_ms: Annotated[
+        int | None,
+        Field(
+            alias="emittedAtMs",
+            description="Unix timestamp (in milliseconds) when app-server emitted this notification.",
+        ),
+    ] = None
+    method: Annotated[
+        Literal["thread/clear/started"], Field(title="Thread/clear/startedNotificationMethod")
+    ]
+    params: ThreadClearStartedNotification
+
+
 class ItemAutoApprovalReviewStartedServerNotification(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -12835,6 +13140,9 @@ class ServerNotification(
     RootModel[
         ErrorServerNotification
         | ThreadStartedServerNotification
+        | ThreadClearEndedServerNotification
+        | ThreadClearStartedServerNotification
+        | KcfThreadInteractiveSubscriptionChangedServerNotification
         | ThreadStatusChangedServerNotification
         | ThreadArchivedServerNotification
         | ThreadDeletedServerNotification
@@ -12924,6 +13232,9 @@ class ServerNotification(
     root: Annotated[
         ErrorServerNotification
         | ThreadStartedServerNotification
+        | ThreadClearEndedServerNotification
+        | ThreadClearStartedServerNotification
+        | KcfThreadInteractiveSubscriptionChangedServerNotification
         | ThreadStatusChangedServerNotification
         | ThreadArchivedServerNotification
         | ThreadDeletedServerNotification

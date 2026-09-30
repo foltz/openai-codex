@@ -92,7 +92,12 @@ async fn handle_resume_agent(
             /*task_name*/ None,
         )?;
         local_agent_control
-            .resume_agent(config, receiver_thread_id, source)
+            .resume_agent(
+                config,
+                receiver_thread_id,
+                source,
+                &crate::ParentTurnAuthority::capture(&session, &turn.sub_id),
+            )
             .await
             .map_err(|err| collab_agent_error(receiver_thread_id, err))
     }

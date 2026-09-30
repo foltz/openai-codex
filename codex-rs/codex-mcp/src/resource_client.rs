@@ -281,12 +281,22 @@ impl McpResourceClient {
         server: &str,
         cursor: Option<String>,
     ) -> Result<McpResourcePage> {
+        self.list_resources_with_authority(server, cursor, crate::McpAttemptAccess::Unscoped)
+            .await
+    }
+
+    pub async fn list_resources_with_authority(
+        &self,
+        server: &str,
+        cursor: Option<String>,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Result<McpResourcePage> {
         let params =
             cursor.map(|cursor| PaginatedRequestParams::default().with_cursor(Some(cursor)));
         let result = self
             .runtime
             .latest_connections()
-            .list_resources(server, params)
+            .list_resources_with_authority(server, params, access)
             .await?;
         let resources = result
             .resources
@@ -304,11 +314,20 @@ impl McpResourceClient {
         &self,
         params: CodexAppsResourceListParams,
     ) -> Result<McpResourcePage> {
+        self.list_codex_apps_resources_with_authority(params, crate::McpAttemptAccess::Unscoped)
+            .await
+    }
+
+    pub async fn list_codex_apps_resources_with_authority(
+        &self,
+        params: CodexAppsResourceListParams,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Result<McpResourcePage> {
         let params = serde_json::to_value(params)
             .context("failed to serialize Codex Apps resource params")?;
         let connections = self.runtime.latest_host_owned_codex_apps_connections()?;
         let (managed, timeout) = connections
-            .client_by_name(CODEX_APPS_MCP_SERVER_NAME)
+            .client_by_name_with_authority(CODEX_APPS_MCP_SERVER_NAME, access)
             .await?;
         let result = managed
             .client
@@ -335,11 +354,21 @@ impl McpResourceClient {
 
     /// Reads one resource from the named server.
     pub async fn read_resource(&self, server: &str, uri: &str) -> Result<McpResourceReadResult> {
+        self.read_resource_with_authority(server, uri, crate::McpAttemptAccess::Unscoped)
+            .await
+    }
+
+    pub async fn read_resource_with_authority(
+        &self,
+        server: &str,
+        uri: &str,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Result<McpResourceReadResult> {
         let params = ReadResourceRequestParams::new(uri.to_string());
         let result = self
             .runtime
             .latest_connections()
-            .read_resource(server, params)
+            .read_resource_with_authority(server, params, access)
             .await?;
         let contents = result
             .contents
@@ -351,12 +380,20 @@ impl McpResourceClient {
 
     /// Lists the events advertised by the MCP event server.
     pub async fn list_events(&self) -> Result<McpEventCatalogSnapshot> {
+        self.list_events_with_authority(crate::McpAttemptAccess::Unscoped)
+            .await
+    }
+
+    pub async fn list_events_with_authority(
+        &self,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Result<McpEventCatalogSnapshot> {
         let (connections, _) = self
             .runtime
             .latest_connections_for_event_server(CODEX_APPS_MCP_SERVER_NAME)?;
         let cache_key = McpResourceClientCacheKey(Arc::downgrade(&connections));
         let (managed, request_timeout) = connections
-            .client_by_name(CODEX_APPS_MCP_SERVER_NAME)
+            .client_by_name_with_authority(CODEX_APPS_MCP_SERVER_NAME, access)
             .await?;
         let result = managed
             .client
@@ -383,11 +420,27 @@ impl McpResourceClient {
         arguments: &Value,
         request_meta: Option<&Map<String, Value>>,
     ) -> Result<McpEventStream> {
+        self.open_event_stream_with_authority(
+            event_name,
+            arguments,
+            request_meta,
+            crate::McpAttemptAccess::Unscoped,
+        )
+        .await
+    }
+
+    pub async fn open_event_stream_with_authority(
+        &self,
+        event_name: &str,
+        arguments: &Value,
+        request_meta: Option<&Map<String, Value>>,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Result<McpEventStream> {
         let (connections, cancel_event_streams_on_server_removal) = self
             .runtime
             .latest_connections_for_event_server(CODEX_APPS_MCP_SERVER_NAME)?;
         let (managed, _) = connections
-            .client_by_name(CODEX_APPS_MCP_SERVER_NAME)
+            .client_by_name_with_authority(CODEX_APPS_MCP_SERVER_NAME, access)
             .await?;
         McpEventStream::open(
             managed.client,

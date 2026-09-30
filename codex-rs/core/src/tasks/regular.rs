@@ -72,15 +72,28 @@ impl SessionTask for RegularTask {
             if prepares_mcp {
                 sess.request_mcp_runtime_reprojection();
             }
-            if preparation.is_err() {
-                return SessionStartupPrewarmResolution::Cancelled;
+            match preparation {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    run_hooks_and_record_inputs(
+                        &sess,
+                        &ctx,
+                        &ctx.capture_current_model_info(),
+                        &input,
+                        PersistContext::Standard,
+                    )
+                    .await;
+                    return Err(err);
+                }
+                Err(_) => return Ok(SessionStartupPrewarmResolution::Cancelled),
             }
             sess.set_server_reasoning_included(/*included*/ false).await;
-            sess.consume_startup_prewarm_for_regular_turn(&cancellation_token)
-                .await
+            Ok(sess
+                .consume_startup_prewarm_for_regular_turn(&cancellation_token)
+                .await)
         }
         .instrument(trace_span!("regular_task.prepare_run_turn"))
-        .await;
+        .await?;
         let prewarmed_client_session = match prewarmed_client_session {
             SessionStartupPrewarmResolution::Cancelled => {
                 run_hooks_and_record_inputs(

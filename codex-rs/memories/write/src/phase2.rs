@@ -375,6 +375,11 @@ mod agent {
     ) {
         tokio::spawn(async move {
             let Some(db) = context.memory_store().await else {
+                if let Err(error) = context.shutdown_consolidation_agent(agent).await {
+                    warn!(
+                        "failed closing memory consolidation agent without a memory store: {error}"
+                    );
+                }
                 return;
             };
             let SpawnedConsolidationAgent { thread_id, thread } = agent;

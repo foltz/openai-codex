@@ -15,6 +15,7 @@ pub struct RemoteControlHandle {
 struct CurrentSession {
     authenticated: bool,
     session: Arc<RemoteControlSession>,
+    retirement: retirement::Receipt,
 }
 
 pub(super) struct RemoteControl {
@@ -25,6 +26,7 @@ pub(super) struct RemoteControl {
     shutdown: CancellationToken,
     tasks: TaskTracker,
     current: StdMutex<Option<CurrentSession>>,
+    retired: retirement::Retirement,
     startup: RemoteControlDesiredState,
     persistence: RemoteControlPersistence,
     client_name: RemoteControlPairingPersistenceKey,
@@ -48,6 +50,8 @@ impl RemoteControl {
         let desired = match current.take() {
             Some(previous) => {
                 previous.session.shutdown_token.cancel();
+                // Register under the current-session lock, before publishing a replacement.
+                self.retired.retain(previous.retirement);
                 if previous.authenticated {
                     RemoteControlDesiredState::Disabled
                 } else {
@@ -57,11 +61,12 @@ impl RemoteControl {
             }
             None => self.startup,
         };
-        let session = self.start_session(auth, desired);
+        let (session, retirement) = self.start_session(auth, desired);
         self.status.send_replace(session.status());
         *current = Some(CurrentSession {
             authenticated,
             session: session.clone(),
+            retirement,
         });
         self.session_changed.send_replace(());
         session
@@ -71,7 +76,7 @@ impl RemoteControl {
         &self,
         auth_manager: RemoteControlAuth,
         desired: RemoteControlDesiredState,
-    ) -> Arc<RemoteControlSession> {
+    ) -> (Arc<RemoteControlSession>, retirement::Receipt) {
         let shutdown = self.shutdown.child_token();
         let (desired_state_tx, _) = watch::channel(desired);
         let desired_state_tx = Arc::new(desired_state_tx);
@@ -121,10 +126,10 @@ impl RemoteControl {
             shutdown.clone(),
             desired_state_tx,
         );
-        let client_name_rx = if self.requires_client_name {
+        let (client_name_rx, name_waiter) = if self.requires_client_name {
             let (tx, rx) = oneshot::channel();
             let mut names = self.client_name.subscribe();
-            self.tasks.spawn(async move {
+            let waiter = self.tasks.spawn(async move {
                 tokio::select! {
                     _ = shutdown.cancelled() => {}
                     name = names.wait_for(Option::is_some) => {
@@ -136,24 +141,34 @@ impl RemoteControl {
                     }
                 }
             });
-            Some(rx)
+            (Some(rx), Some(waiter))
         } else {
-            None
+            (None, None)
         };
         let process_shutdown = self.shutdown.clone();
         let failed_session = session.clone();
-        self.tasks.spawn(async move {
-            if let Err(panic) = AssertUnwindSafe(websocket.run(client_name_rx))
+        let session_shutdown = session.shutdown_token.clone();
+        let task = self.tasks.spawn(async move {
+            let result = AssertUnwindSafe(websocket.run(client_name_rx))
                 .catch_unwind()
-                .await
-            {
-                tracing::error!("remote control websocket task panicked");
-                failed_session.publish_status(RemoteControlConnectionStatus::Disabled);
-                process_shutdown.cancel();
-                std::panic::resume_unwind(panic);
+                .await;
+            session_shutdown.cancel();
+            let waiter_clean = match name_waiter {
+                Some(waiter) => waiter.await.is_ok(),
+                None => true,
+            };
+            match result {
+                Ok(clean) => clean && waiter_clean,
+                Err(panic) => {
+                    tracing::error!("remote control websocket task panicked");
+                    failed_session.publish_status(RemoteControlConnectionStatus::Disabled);
+                    process_shutdown.cancel();
+                    std::panic::resume_unwind(panic);
+                }
             }
         });
-        session
+        let retirement = async move { task.await.unwrap_or(false) }.boxed().shared();
+        (session, retirement)
     }
 }
 
@@ -177,6 +192,39 @@ impl RemoteControlSession {
 }
 
 impl RemoteControlHandle {
+    /// Reconciles the upstream owner policy, then observes every retired session.
+    /// Same-owner sessions are not recycled. A timeout retains the original receipts.
+    pub async fn reset_auth_cycle(&self) -> io::Result<()> {
+        if self.inner.shutdown.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "remote control is stopping",
+            ));
+        }
+        self.inner.session();
+        let retired = self.inner.retired.snapshot();
+        let clean = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            futures::future::join_all(retired)
+                .await
+                .into_iter()
+                .all(|clean| clean)
+        })
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "remote control retirement timed out",
+            )
+        })?;
+        if !clean {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "remote control retirement failed",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn ensure_remote_control_allowed(&self) -> Result<(), RemoteControlDisabledByRequirements> {
         self.inner.session().ensure_remote_control_allowed()
     }
@@ -300,6 +348,7 @@ pub async fn start_remote_control(
         shutdown: shutdown_token,
         tasks: TaskTracker::new(),
         current: StdMutex::new(None),
+        retired: retirement::Retirement::default(),
         startup,
         persistence: RemoteControlPersistence::default(),
         client_name: watch::channel(None).0,
@@ -366,3 +415,7 @@ pub async fn start_remote_control(
     });
     Ok((task, handle))
 }
+
+#[cfg(test)]
+#[path = "controller_tests.rs"]
+mod tests;

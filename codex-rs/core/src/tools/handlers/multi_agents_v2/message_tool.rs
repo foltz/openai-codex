@@ -62,6 +62,7 @@ pub(super) async fn handle_message_string_tool(
         .services
         .agent_control
         .send(SendRequest {
+            parent_authority: Some(crate::ParentTurnAuthority::capture(&session, &turn.sub_id)),
             caller: session.thread_id,
             target: AgentTarget::Id(receiver_thread_id),
             resume_config,

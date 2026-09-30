@@ -54,7 +54,10 @@ impl<C: Send + Sync + 'static> TurnLifecycleContributor for SkillsExtension<C> {
                     .and_then(|state| state.mcp_resources.clone()),
                 executor_capability_discovery: None,
             };
-            if let Err(error) = state.refresh_cloud_catalog(&self.providers, query).await {
+            if let Err(error) = state
+                .refresh_cloud_catalog(&self.providers, query, input.mcp_access)
+                .await
+            {
                 self.emit_warning(
                     input.thread_store.level_id(),
                     Some(input.turn_id),

@@ -23,6 +23,14 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use wiremock::Mock;
+use wiremock::MockServer;
+use wiremock::Request;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
 
 #[tokio::test]
 async fn status_snapshot_only_downgrades_oauth_authentication_failures() {
@@ -51,7 +59,7 @@ async fn status_snapshot_only_downgrades_oauth_authentication_failures() {
     ] {
         let mut client = create_ready_async_managed_client(Vec::new()).await;
         if let Some(error) = startup_error {
-            client.client = futures::future::ready(Err(error)).boxed().shared();
+            client.client = futures::future::ready(Err(error)).boxed().shared().into();
         }
         manager.insert_test_client(name, client);
         auth_status_entries.insert(
@@ -69,6 +77,7 @@ async fn status_snapshot_only_downgrades_oauth_authentication_failures() {
         auth_status_entries,
         server_names,
         McpSnapshotDetail::ToolsAndAuthOnly,
+        crate::McpAttemptAccess::Unscoped,
     )
     .await;
 
@@ -654,6 +663,8 @@ async fn effective_mcp_servers_preserve_runtime_servers() {
             startup_readiness: Default::default(),
             supports_parallel_tool_calls: false,
             tool_input_schema_max_bytes: None,
+            thread_identity_eligible: false,
+            control_endpoint_eligible: false,
             omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,
@@ -684,6 +695,8 @@ async fn effective_mcp_servers_preserve_runtime_servers() {
             startup_readiness: Default::default(),
             supports_parallel_tool_calls: false,
             tool_input_schema_max_bytes: None,
+            thread_identity_eligible: false,
+            control_endpoint_eligible: false,
             omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: None,
@@ -739,4 +752,132 @@ async fn effective_mcp_servers_preserve_runtime_servers() {
         }
         other => panic!("expected streamable http transport, got {other:?}"),
     }
+}
+
+/// A status probe owns no thread identity, but it is still hosted by the
+/// app-server process. An eligible provider must receive that process's
+/// endpoint before status reports its tools, just as it does during session
+/// startup.
+#[tokio::test]
+async fn status_snapshot_discloses_the_process_control_endpoint_to_an_eligible_provider() {
+    // Exercise the production gated status path, including its first-poll
+    // authority transfer, without changing the endpoint-disclosure proof.
+    struct StatusWork;
+    impl crate::McpAttemptWork for StatusWork {
+        fn derive_attempt(
+            &self,
+        ) -> Result<Box<dyn crate::McpAttemptWork>, crate::McpAttemptRefused> {
+            Ok(Box::new(Self))
+        }
+    }
+    const ENDPOINT: &str = "unix:///tmp/kcf-status-control.sock";
+    let server = MockServer::start().await;
+    let endpoint_request_received = Arc::new(AtomicBool::new(false));
+    let endpoint_request_observed = Arc::clone(&endpoint_request_received);
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .respond_with(move |request: &Request| {
+            let body: serde_json::Value = request.body_json().expect("valid JSON-RPC request");
+            match body["method"].as_str() {
+                Some("initialize") => ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {
+                            "tools": {},
+                            "experimental": {
+                                "codex/control-endpoint": {"versions": [1]}
+                            }
+                        },
+                        "serverInfo": {"name": "status-endpoint-test-server", "version": "1.0.0"},
+                    },
+                })),
+                Some("notifications/initialized") => ResponseTemplate::new(202),
+                Some("codex/control-endpoint") => {
+                    let params = body["params"].as_object().expect("endpoint params object");
+                    assert_eq!(params["version"], serde_json::json!(1));
+                    assert_eq!(params["endpoint"], serde_json::json!(ENDPOINT));
+                    endpoint_request_observed.store(true, Ordering::SeqCst);
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": body["id"],
+                        "result": {"version": 1, "accepted": true},
+                    }))
+                }
+                Some("tools/list") => ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": {"tools": []},
+                })),
+                other => panic!("unexpected status MCP method: {other:?}"),
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let codex_home = tempfile::tempdir().expect("tempdir");
+    let mut config = test_mcp_config(codex_home.path().to_path_buf());
+    let mut catalog = ResolvedMcpCatalog::builder();
+    catalog.register(McpServerRegistration::from_config(
+        "eligible-status-provider".to_string(),
+        McpServerConfig {
+            auth: Default::default(),
+            transport: McpServerTransportConfig::StreamableHttp {
+                url: format!("{}/mcp", server.uri()),
+                bearer_token_env_var: None,
+                http_headers: None,
+                env_http_headers: None,
+                http_headers_helper: None,
+            },
+            environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
+            enabled: true,
+            required: false,
+            supports_parallel_tool_calls: false,
+            thread_identity_eligible: false,
+            control_endpoint_eligible: true,
+            omit_tools_from: None,
+            disabled_reason: None,
+            startup_timeout_sec: None,
+            tool_timeout_sec: None,
+            startup_readiness: Default::default(),
+            tool_input_schema_max_bytes: None,
+            default_tools_approval_mode: None,
+            enabled_tools: None,
+            disabled_tools: None,
+            scopes: None,
+            oauth: None,
+            oauth_resource: None,
+            tools: HashMap::new(),
+        },
+    ));
+    config.mcp_server_catalog = catalog.build();
+
+    let snapshot = collect_mcp_server_status_snapshot_with_detail(
+        &config,
+        None,
+        McpRuntimeContext::new(
+            std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+            codex_home.path().to_path_buf(),
+        ),
+        ConnectorRuntimeManager::default(),
+        crate::McpToolCatalogCache::default(),
+        McpSnapshotDetail::ToolsAndAuthOnly,
+        None,
+        Some(ENDPOINT.to_string()),
+        crate::McpAttemptAccess::Admitted(&StatusWork),
+    )
+    .await
+    .expect("status snapshot");
+
+    assert!(
+        endpoint_request_received.load(Ordering::SeqCst),
+        "eligible status provider must receive and acknowledge the process control endpoint"
+    );
+    assert!(
+        snapshot
+            .server_infos
+            .contains_key("eligible-status-provider"),
+        "status may report provider tools only after its endpoint acknowledgement"
+    );
 }

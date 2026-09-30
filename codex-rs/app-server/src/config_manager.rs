@@ -70,6 +70,82 @@ struct ApplicationPolicySnapshot {
 }
 
 impl ConfigManager {
+    /// Unlike ordinary convenience reads, reset refuses poisoned mutable
+    /// inputs. Upstream's thread loader is now immutable, so it needs no lock.
+    pub(crate) async fn load_managed_reset_config(
+        &self,
+    ) -> Result<Config, crate::managed_transition::ResetInventoryError> {
+        use crate::managed_transition::ResetInventoryError;
+        let (cli, cloud, features) = {
+            let cli = self
+                .cli_overrides
+                .read()
+                .map_err(|_| ResetInventoryError::ConfigPublicationUnavailable)?;
+            let cloud = self
+                .cloud_config_bundle
+                .read()
+                .map_err(|_| ResetInventoryError::ConfigPublicationUnavailable)?;
+            let features = self
+                .runtime_feature_enablement
+                .read()
+                .map_err(|_| ResetInventoryError::ConfigPublicationUnavailable)?;
+            (cli.clone(), cloud.clone(), features.clone())
+        };
+        let mut config = ConfigBuilder::default()
+            .codex_home(self.codex_home.clone())
+            .cli_overrides(cli)
+            .loader_overrides(self.loader_overrides.clone())
+            .strict_config(self.strict_config)
+            .cloud_config_bundle(cloud)
+            .thread_config_loader(Arc::clone(&self.thread_config_loader))
+            .build()
+            .await
+            .map_err(|_| ResetInventoryError::ConfigLoadUnavailable)?;
+        let protected = protected_feature_keys(&config.config_layer_stack);
+        for (name, enabled) in features {
+            if protected.contains(&name) {
+                continue;
+            }
+            if let Some(feature) = feature_for_key(&name) {
+                config
+                    .features
+                    .set_enabled(feature, enabled)
+                    .map_err(|_| ResetInventoryError::ConfigLoadUnavailable)?;
+            }
+        }
+        self.apply_arg0_paths(&mut config);
+        Ok(config)
+    }
+
+    /// Retire old account work and resolve the replacement before publishing
+    /// it. Managed reset must not acknowledge a lazy, unobserved loader.
+    pub(crate) async fn reset_managed_cloud_config(
+        &self,
+        auth_manager: Arc<AuthManager>,
+        chatgpt_base_url: String,
+        http_client_factory: codex_http_client::HttpClientFactory,
+    ) -> Result<(), crate::managed_transition::ResetInventoryError> {
+        use crate::managed_transition::ResetInventoryError;
+        let loader = codex_cloud_config::managed_cloud_config_bundle_loader(
+            auth_manager,
+            chatgpt_base_url,
+            self.codex_home.clone(),
+            http_client_factory,
+        )
+        .await
+        .map_err(|_| ResetInventoryError::CloudConfigUnavailable)?;
+        loader
+            .get()
+            .await
+            .map_err(|_| ResetInventoryError::CloudConfigUnavailable)?;
+        let mut current = self
+            .cloud_config_bundle
+            .write()
+            .map_err(|_| ResetInventoryError::ConfigPublicationUnavailable)?;
+        *current = loader;
+        Ok(())
+    }
+
     pub(crate) fn new(
         codex_home: PathBuf,
         cli_overrides: Vec<(String, TomlValue)>,
@@ -566,6 +642,9 @@ impl ConfigManager {
 #[cfg(test)]
 #[path = "application_network_tests.rs"]
 mod application_network_tests;
+#[cfg(test)]
+#[path = "config_manager_reset_tests.rs"]
+mod reset_tests;
 
 #[cfg(test)]
 #[path = "config_manager_provider_tests.rs"]

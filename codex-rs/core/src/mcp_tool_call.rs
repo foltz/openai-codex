@@ -834,7 +834,9 @@ async fn maybe_request_codex_apps_auth_elicitation(
 }
 
 async fn refresh_codex_apps_after_connector_auth(sess: &Arc<Session>, turn_context: &TurnContext) {
-    let mcp_tools_result = sess.hard_refresh_latest_codex_apps_tools().await;
+    let mcp_tools_result = sess
+        .hard_refresh_latest_codex_apps_tools(turn_context)
+        .await;
 
     match mcp_tools_result {
         Ok(mcp_tools) => {

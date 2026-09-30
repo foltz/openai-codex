@@ -4,6 +4,8 @@ use codex_analytics::TurnAnalyticsMetadata;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ThreadIdleCause;
 use codex_extension_api::TurnStartPhase;
+use codex_protocol::error::CodexErr;
+use codex_protocol::error::Result as CodexResult;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnAbortReason;
@@ -17,7 +19,7 @@ impl Session {
         turn_context: &TurnContext,
         token_usage_at_turn_start: Option<&TokenUsage>,
         phase: TurnStartPhase,
-    ) {
+    ) -> CodexResult<()> {
         let metadata: Arc<dyn TurnAnalyticsMetadata> = turn_context.turn_metadata_state.clone();
         turn_context.extension_data.insert(metadata);
         let collaboration_mode = turn_context.collaboration_mode();
@@ -25,13 +27,30 @@ impl Session {
             if contributor.turn_start_phase(&self.services.thread_extension_data) != phase {
                 continue;
             }
+            let work = if phase == TurnStartPhase::RegularTaskStart
+                && contributor.requires_mcp_runtime(&self.services.thread_extension_data)
+            {
+                // Only this post-install phase has a bound turn entry.
+                self
+                    .turn_mcp_work(turn_context)
+                    .map_err(|err| CodexErr::Fatal(err.to_string()))?
+            } else {
+                None
+            };
+            let access = work.as_deref().map_or(
+                codex_mcp::McpAttemptAccess::Unscoped,
+                codex_mcp::McpAttemptAccess::Admitted,
+            );
             if phase == TurnStartPhase::RegularTaskStart
                 && contributor.requires_mcp_runtime(&self.services.thread_extension_data)
             {
-                self.refresh_mcp_if_dirty().await;
+                self.refresh_mcp_if_dirty_with_authority(access)
+                    .await
+                    .map_err(|err| CodexErr::Fatal(err.to_string()))?;
             }
             contributor
                 .on_turn_start(codex_extension_api::TurnStartInput {
+                    mcp_access: Ok(access),
                     turn_id: turn_context.sub_id.as_str(),
                     collaboration_mode: &collaboration_mode,
                     token_usage_at_turn_start,
@@ -41,6 +60,7 @@ impl Session {
                 })
                 .await;
         }
+        Ok(())
     }
 
     pub(super) async fn emit_turn_stop_lifecycle(&self, turn_store: &ExtensionData) {
@@ -53,6 +73,7 @@ impl Session {
                 })
                 .await;
         }
+        self.finish_isolated_turn_work(turn_store.level_id());
     }
 
     pub(crate) async fn emit_thread_idle_lifecycle_if_idle(&self, cause: ThreadIdleCause) {
@@ -97,6 +118,7 @@ impl Session {
                 })
                 .await;
         }
+        self.finish_isolated_turn_work(turn_store.level_id());
     }
 
     pub(crate) async fn emit_turn_error_lifecycle(

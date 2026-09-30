@@ -151,6 +151,19 @@ pub(crate) struct McpServerConnectionIdentity {
     client_mcp_extensions: ClientMcpExtensions,
     agent_plugin: bool,
     requires_read_only_mcp_tools: bool,
+    /// Whether this server opted into thread-identity binding (default
+    /// `false`). Mirrors `McpServerConfig::thread_identity_eligible`.
+    pub(crate) thread_identity_eligible: bool,
+    /// Canonical Codex `ThreadId` for the owning session, or `None` for a
+    /// threadless caller. Part of the connection identity so a thread
+    /// change (fork, delegate, reconstructed resume) forces a fresh
+    /// connection rather than reusing a stale bind; see
+    /// `kcf-runtime/04-mcp-thread-identity-contract.md`.
+    pub(crate) canonical_thread_id: Option<String>,
+    /// Hosting control endpoint. Eligible providers must reconnect if it
+    /// changes so a physical MCP connection cannot retain a stale endpoint.
+    pub(crate) control_endpoint: Option<String>,
+    pub(crate) control_endpoint_eligible: bool,
 }
 
 impl McpServerConnectionIdentity {
@@ -169,6 +182,8 @@ impl McpServerConnectionIdentity {
         codex_apps_cache_identity: Option<(PathBuf, ConnectorRuntimeContextKey)>,
         client_elicitation_capability: ElicitationCapability,
         client_mcp_extensions: ClientMcpExtensions,
+        canonical_thread_id: Option<String>,
+        control_endpoint: Option<String>,
         previous_identity: Option<&Self>,
     ) -> Self {
         let config = server.config();
@@ -279,6 +294,13 @@ impl McpServerConnectionIdentity {
             client_mcp_extensions,
             agent_plugin: server.is_agent_plugin(),
             requires_read_only_mcp_tools: server.requires_read_only_mcp_tools(),
+            thread_identity_eligible: config.thread_identity_eligible,
+            canonical_thread_id,
+            control_endpoint: config
+                .control_endpoint_eligible
+                .then_some(control_endpoint)
+                .flatten(),
+            control_endpoint_eligible: config.control_endpoint_eligible,
         }
     }
 
@@ -318,6 +340,15 @@ impl McpServerConnectionIdentity {
             && self.client_mcp_extensions == other.client_mcp_extensions
             && self.agent_plugin == other.agent_plugin
             && self.requires_read_only_mcp_tools == other.requires_read_only_mcp_tools
+            && self.thread_identity_eligible == other.thread_identity_eligible
+            && self.control_endpoint_eligible == other.control_endpoint_eligible
+            // Ineligible servers never bind an identity, so a thread change
+            // (fork, delegate, reconstructed resume) must not force them to
+            // reconnect; ordinary servers stay unaffected. Eligible servers
+            // must reconnect and rebind on a thread change rather than reuse
+            // a connection bound to a stale thread id.
+            && (!self.thread_identity_eligible || self.canonical_thread_id == other.canonical_thread_id)
+            && (!self.control_endpoint_eligible || self.control_endpoint == other.control_endpoint)
     }
 
     pub(crate) fn oauth_credentials(&self) -> Result<Option<&StoredOAuthTokens>, &String> {

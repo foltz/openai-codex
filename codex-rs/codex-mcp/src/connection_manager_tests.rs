@@ -1,4 +1,8 @@
 use super::*;
+
+#[cfg(unix)]
+#[path = "connection_manager_attempt_work_tests.rs"]
+mod attempt_work_tests;
 use crate::McpBinding;
 use crate::client_tool_catalog::ClientToolCatalog;
 use crate::elicitation::ElicitationLifecycle;
@@ -103,6 +107,7 @@ impl McpConnectionSet {
         prefix_mcp_tool_names: bool,
     ) -> Self {
         Self {
+            retirement: crate::runtime_retirement::RuntimeRetirementRegistry::default(),
             servers: HashMap::new(),
             event_stream_connection: None,
             disabled_servers: Vec::new(),
@@ -130,6 +135,11 @@ impl McpConnectionSet {
         name: impl Into<String>,
         client: AsyncManagedClient,
     ) {
+        // These fixtures bypass production construction, so explicitly register
+        // their cancellation owner rather than relying on a snapshot sweep.
+        self.retirement
+            .register_connection(client.cancel_token.clone())
+            .expect("open fixture registry");
         let name = name.into();
         self.servers.insert(
             name,
@@ -553,7 +563,8 @@ pub(crate) async fn create_ready_async_managed_client(tools: Vec<ToolInfo>) -> A
             create_test_managed_client(tools).await,
         ))
         .boxed()
-        .shared(),
+        .shared()
+        .into(),
         is_codex_apps_mcp_server: false,
         server_capabilities: Arc::new(std::sync::Mutex::new(None)),
         cached_server_info: None,
@@ -596,12 +607,12 @@ async fn connection_statuses_observe_clients_without_starting_them() {
         ("cancelled", StartupOutcomeError::Cancelled),
     ] {
         let mut client = create_ready_async_managed_client(Vec::new()).await;
-        client.client = futures::future::ready(Err(error)).boxed().shared();
+        client.client = futures::future::ready(Err(error)).boxed().shared().into();
         assert!(client.client().await.is_err());
         manager.insert_test_client(name, client);
     }
     let mut pending = create_ready_async_managed_client(Vec::new()).await;
-    pending.client = futures::future::pending().boxed().shared();
+    pending.client = futures::future::pending().boxed().shared().into();
     pending.cached_server_info = Some(create_test_server_info("Cached"));
     manager.insert_test_client("starting", pending.clone());
     manager.insert_test_client("deferred", pending);
@@ -719,7 +730,7 @@ fn create_gated_async_managed_client(
 
     (
         AsyncManagedClient {
-            client,
+            client: client.into(),
             is_codex_apps_mcp_server: false,
             server_capabilities: Arc::new(std::sync::Mutex::new(None)),
             cached_server_info: None,
@@ -787,7 +798,8 @@ pub(crate) async fn create_test_manager_with_ready_apps_client(
                 managed_client,
             ))
             .boxed()
-            .shared(),
+            .shared()
+            .into(),
             is_codex_apps_mcp_server: true,
             server_capabilities: Arc::new(std::sync::Mutex::new(None)),
             cached_server_info: Some(create_test_server_info("Codex Apps")),
@@ -839,14 +851,17 @@ fn create_test_manager_with_failed_apps_startup(
     manager.insert_test_client(
         CODEX_APPS_MCP_SERVER_NAME.to_string(),
         AsyncManagedClient {
-            client,
+            client: client.into(),
             is_codex_apps_mcp_server: true,
             server_capabilities: Arc::new(std::sync::Mutex::new(None)),
             cached_server_info: None,
             codex_apps_tools_cache_context: Some(cache_context),
             tool_catalog_cache_context: None,
             startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            startup_reconnect: Some(Arc::new(CodexAppsStartupReconnect::new(reconnect_factory))),
+            startup_reconnect: Some(Arc::new(CodexAppsStartupReconnect::new(
+                reconnect_factory,
+                crate::McpAttemptRequirement::Ungated,
+            ))),
             cancel_token: CancellationToken::new(),
         },
     );
@@ -2028,6 +2043,8 @@ async fn read_only_apps_discovery_never_uses_a_shared_writable_catalog() -> anyh
             /*previous*/ None,
             McpPublicationGate::already_published(),
             McpRuntimeInput {
+                attempt_requirement: crate::McpAttemptRequirement::Ungated,
+                startup_work: None,
                 startup_policy: McpStartupPolicy::Eager,
                 config: Arc::new(config),
                 plugins_available: false,
@@ -2037,6 +2054,8 @@ async fn read_only_apps_discovery_never_uses_a_shared_writable_catalog() -> anyh
                     EffectiveMcpServer::from_host_config(server_config.clone()),
                 )]),
                 submit_id: "test".to_string(),
+                canonical_thread_id: None,
+                control_endpoint: None,
                 tx_event: None,
                 startup_cancellation_token: cancellation,
                 runtime_context: reusable_server_runtime_context(),
@@ -2101,6 +2120,8 @@ async fn hosted_apps_protocol_mode_is_independent_of_generic_mode() -> anyhow::R
             /*previous*/ None,
             McpPublicationGate::already_published(),
             McpRuntimeInput {
+                attempt_requirement: crate::McpAttemptRequirement::Ungated,
+                startup_work: None,
                 startup_policy: McpStartupPolicy::Eager,
                 config: Arc::new(config),
                 plugins_available: false,
@@ -2116,6 +2137,8 @@ async fn hosted_apps_protocol_mode_is_independent_of_generic_mode() -> anyhow::R
                     ),
                 ]),
                 submit_id: "protocol-mode-scope".to_string(),
+                canonical_thread_id: None,
+                control_endpoint: None,
                 tx_event: None,
                 startup_cancellation_token,
                 runtime_context: McpRuntimeContext::new(
@@ -2207,6 +2230,8 @@ async fn codex_apps_extension_does_not_share_host_owned_tools_cache() -> anyhow:
             /*previous*/ None,
             McpPublicationGate::already_published(),
             McpRuntimeInput {
+                attempt_requirement: crate::McpAttemptRequirement::Ungated,
+                startup_work: None,
                 startup_policy: McpStartupPolicy::Eager,
                 config: Arc::new(config),
                 plugins_available: false,
@@ -2226,6 +2251,8 @@ async fn codex_apps_extension_does_not_share_host_owned_tools_cache() -> anyhow:
                 tool_catalog_cache: McpToolCatalogCache::default(),
                 codex_apps_tools_cache_key: cache_key.clone(),
                 client_mcp_extensions: ClientMcpExtensions::default(),
+                canonical_thread_id: None,
+                control_endpoint: None,
                 auth: None,
                 auth_manager: None,
                 elicitation_reviewer: None,
@@ -2281,7 +2308,7 @@ async fn list_all_tools_uses_shared_codex_apps_cache_while_client_is_pending() {
     manager.insert_test_client(
         CODEX_APPS_MCP_SERVER_NAME.to_string(),
         AsyncManagedClient {
-            client: pending_client,
+            client: pending_client.into(),
             is_codex_apps_mcp_server: true,
             server_capabilities: Arc::new(std::sync::Mutex::new(None)),
             cached_server_info: None,
@@ -2340,7 +2367,10 @@ async fn capture_binding_uses_the_ready_clients_own_tools() {
     manager.insert_test_client(
         CODEX_APPS_MCP_SERVER_NAME.to_string(),
         AsyncManagedClient {
-            client: futures::future::ready(Ok(ready_client)).boxed().shared(),
+            client: futures::future::ready(Ok(ready_client))
+                .boxed()
+                .shared()
+                .into(),
             is_codex_apps_mcp_server: true,
             server_capabilities: Arc::new(std::sync::Mutex::new(None)),
             cached_server_info: None,
@@ -2704,7 +2734,7 @@ async fn list_available_server_infos_uses_cache_while_client_is_pending() {
     manager.insert_test_client(
         CODEX_APPS_MCP_SERVER_NAME.to_string(),
         AsyncManagedClient {
-            client: pending_client,
+            client: pending_client.into(),
             is_codex_apps_mcp_server: true,
             server_capabilities: Arc::new(std::sync::Mutex::new(None)),
             cached_server_info: Some(server_info.clone()),
@@ -2801,7 +2831,7 @@ async fn capture_binding_exposes_cached_tools_before_startup() {
     manager.insert_test_client(
         CODEX_APPS_MCP_SERVER_NAME.to_string(),
         AsyncManagedClient {
-            client: pending_client,
+            client: pending_client.into(),
             is_codex_apps_mcp_server: true,
             server_capabilities: Arc::new(std::sync::Mutex::new(None)),
             cached_server_info: None,
@@ -2903,7 +2933,8 @@ async fn capture_binding_skips_pending_optional_servers_after_configured_shared_
             AsyncManagedClient {
                 client: futures::future::pending::<Result<ManagedClient, StartupOutcomeError>>()
                     .boxed()
-                    .shared(),
+                    .shared()
+                    .into(),
                 is_codex_apps_mcp_server: false,
                 server_capabilities: Arc::new(std::sync::Mutex::new(None)),
                 cached_server_info: None,
@@ -3089,7 +3120,8 @@ async fn stable_catalog_revisions_ignore_terminal_optional_server_failures() {
         },
     ))
     .boxed()
-    .shared();
+    .shared()
+    .into();
     assert!(failed.client().await.is_err());
     manager.insert_test_client("failed", failed);
 
@@ -3155,7 +3187,8 @@ async fn capture_binding_shares_optional_startup_grace_across_connection_sets() 
             AsyncManagedClient {
                 client: futures::future::pending::<Result<ManagedClient, StartupOutcomeError>>()
                     .boxed()
-                    .shared(),
+                    .shared()
+                    .into(),
                 is_codex_apps_mcp_server: false,
                 server_capabilities: Arc::new(std::sync::Mutex::new(None)),
                 cached_server_info: None,
@@ -3789,7 +3822,7 @@ async fn list_all_tools_blocks_while_client_is_pending_without_cached_tools() {
     manager.insert_test_client(
         CODEX_APPS_MCP_SERVER_NAME.to_string(),
         AsyncManagedClient {
-            client: pending_client,
+            client: pending_client.into(),
             is_codex_apps_mcp_server: true,
             server_capabilities: Arc::new(std::sync::Mutex::new(None)),
             cached_server_info: None,
@@ -3801,9 +3834,24 @@ async fn list_all_tools_blocks_while_client_is_pending_without_cached_tools() {
         },
     );
 
+    let (startup_trigger, startup_receiver) = tokio::sync::watch::channel(false);
+    Arc::get_mut(
+        &mut manager
+            .servers
+            .get_mut(CODEX_APPS_MCP_SERVER_NAME)
+            .expect("test server exists")
+            .connection,
+    )
+    .expect("fixture owns the connection")
+    .startup_trigger = Some(startup_trigger);
+
     let timeout_result =
         tokio::time::timeout(Duration::from_millis(10), manager.list_all_tools()).await;
     assert!(timeout_result.is_err());
+    assert!(
+        *startup_receiver.borrow(),
+        "uncached discovery must wake the retained startup driver before polling"
+    );
 }
 
 #[tokio::test]
@@ -3847,7 +3895,7 @@ async fn shutdown_cancels_pending_tool_listing() {
     manager.insert_test_client(
         CODEX_APPS_MCP_SERVER_NAME.to_string(),
         AsyncManagedClient {
-            client: pending_client,
+            client: pending_client.into(),
             is_codex_apps_mcp_server: true,
             server_capabilities: Arc::new(std::sync::Mutex::new(None)),
             cached_server_info: None,
@@ -3891,10 +3939,20 @@ async fn shutdown_continues_after_caller_is_aborted() {
         &permission_profile,
         /*prefix_mcp_tool_names*/ true,
     );
+    let startup_observer = blocking_client.clone();
+    let startup = manager
+        .retirement
+        .task_ticket()
+        .register(move || async move {
+            let _ = startup_observer.await;
+            crate::runtime_retirement::RuntimeTaskOutcome::Complete
+        })
+        .expect("register startup before polling");
+    tokio::spawn(startup);
     manager.insert_test_client(
         CODEX_APPS_MCP_SERVER_NAME.to_string(),
         AsyncManagedClient {
-            client: blocking_client,
+            client: blocking_client.into(),
             is_codex_apps_mcp_server: true,
             server_capabilities: Arc::new(std::sync::Mutex::new(None)),
             cached_server_info: None,
@@ -3906,23 +3964,24 @@ async fn shutdown_continues_after_caller_is_aborted() {
         },
     );
     let manager = Arc::new(manager);
-    let shutdown_task = tokio::spawn({
-        let manager = Arc::clone(&manager);
-        async move { manager.shutdown().await }
-    });
-
-    started_rx.await.expect("client shutdown should start");
-    shutdown_task.abort();
-    let shutdown_error = shutdown_task
-        .await
-        .expect_err("caller shutdown task should be aborted");
-    assert!(shutdown_error.is_cancelled());
+    started_rx.await.expect("registered startup should start");
+    let mut shutdown = Box::pin(manager.shutdown());
+    assert!(futures::poll!(shutdown.as_mut()).is_pending());
+    drop(shutdown);
     release.notify_one();
 
     tokio::time::timeout(Duration::from_secs(1), completed_rx)
         .await
         .expect("client shutdown should survive caller cancellation")
         .expect("client shutdown completion sender should stay alive");
+    let report = manager
+        .retirement
+        .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await;
+    assert!(
+        report.is_complete(),
+        "the retained original must be observable after cancellation"
+    );
 }
 
 #[tokio::test]
@@ -3947,7 +4006,7 @@ async fn list_all_tools_does_not_block_when_shared_codex_apps_cache_is_empty() {
     manager.insert_test_client(
         CODEX_APPS_MCP_SERVER_NAME.to_string(),
         AsyncManagedClient {
-            client: pending_client,
+            client: pending_client.into(),
             is_codex_apps_mcp_server: true,
             server_capabilities: Arc::new(std::sync::Mutex::new(None)),
             cached_server_info: None,
@@ -4000,7 +4059,7 @@ async fn list_all_tools_uses_shared_codex_apps_cache_when_client_startup_fails()
     manager.insert_test_client(
         CODEX_APPS_MCP_SERVER_NAME.to_string(),
         AsyncManagedClient {
-            client: failed_client,
+            client: failed_client.into(),
             is_codex_apps_mcp_server: true,
             server_capabilities: Arc::new(std::sync::Mutex::new(None)),
             cached_server_info: Some(server_info.clone()),
@@ -4574,6 +4633,8 @@ async fn executor_owned_chatgpt_mcp_accepts_only_safe_explicit_authorization() -
                 /*codex_apps_cache_identity*/ None,
                 ElicitationCapability::default(),
                 ClientMcpExtensions::default(),
+                /*canonical_thread_id*/ None,
+                /*control_endpoint*/ None,
                 /*previous_identity*/ None,
             )
         };
@@ -4612,6 +4673,8 @@ async fn executor_owned_chatgpt_mcp_accepts_only_safe_explicit_authorization() -
             /*previous*/ None,
             McpPublicationGate::already_published(),
             McpRuntimeInput {
+                attempt_requirement: crate::McpAttemptRequirement::Ungated,
+                startup_work: None,
                 startup_policy: McpStartupPolicy::Eager,
                 config: Arc::new(runtime_config.clone()),
                 plugins_available: false,
@@ -4631,6 +4694,8 @@ async fn executor_owned_chatgpt_mcp_accepts_only_safe_explicit_authorization() -
                 auth_manager: None,
                 elicitation_reviewer: None,
                 elicitation_lifecycle: None,
+                canonical_thread_id: None,
+                control_endpoint: None,
             },
             ElicitationRequestRouter::default(),
         )
@@ -4680,6 +4745,8 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
                 startup_readiness: Default::default(),
                 supports_parallel_tool_calls: false,
                 tool_input_schema_max_bytes: None,
+                thread_identity_eligible: false,
+                control_endpoint_eligible: false,
                 omit_tools_from: None,
                 disabled_reason: None,
                 startup_timeout_sec: None,
@@ -4710,6 +4777,8 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
                 startup_readiness: Default::default(),
                 supports_parallel_tool_calls: false,
                 tool_input_schema_max_bytes: None,
+                thread_identity_eligible: false,
+                control_endpoint_eligible: false,
                 omit_tools_from: None,
                 disabled_reason: None,
                 startup_timeout_sec: None,
@@ -4730,6 +4799,8 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
         /*previous*/ None,
         McpPublicationGate::already_published(),
         McpRuntimeInput {
+            attempt_requirement: crate::McpAttemptRequirement::Ungated,
+            startup_work: None,
             startup_policy: McpStartupPolicy::Eager,
             config: Arc::new(crate::mcp::tests::test_mcp_config(
                 codex_home.path().to_path_buf(),
@@ -4754,6 +4825,8 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
             auth_manager: None,
             elicitation_reviewer: None,
             elicitation_lifecycle: None,
+            canonical_thread_id: None,
+            control_endpoint: None,
         },
         ElicitationRequestRouter::default(),
     )
@@ -4823,6 +4896,8 @@ fn mcp_init_error_display_prompts_for_github_pat() {
         startup_readiness: Default::default(),
         supports_parallel_tool_calls: false,
         tool_input_schema_max_bytes: None,
+        thread_identity_eligible: false,
+        control_endpoint_eligible: false,
         omit_tools_from: None,
         disabled_reason: None,
         startup_timeout_sec: None,
@@ -4985,6 +5060,8 @@ fn mcp_init_error_display_reports_generic_errors() {
         startup_readiness: Default::default(),
         supports_parallel_tool_calls: false,
         tool_input_schema_max_bytes: None,
+        thread_identity_eligible: false,
+        control_endpoint_eligible: false,
         omit_tools_from: None,
         disabled_reason: None,
         startup_timeout_sec: None,
@@ -5066,6 +5143,8 @@ fn reusable_server_config(url: &str) -> McpServerConfig {
         startup_readiness: Default::default(),
         supports_parallel_tool_calls: false,
         tool_input_schema_max_bytes: None,
+        thread_identity_eligible: false,
+        control_endpoint_eligible: false,
         omit_tools_from: None,
         disabled_reason: None,
         startup_timeout_sec: None,
@@ -5078,6 +5157,311 @@ fn reusable_server_config(url: &str) -> McpServerConfig {
         oauth_resource: None,
         tools: HashMap::new(),
     }
+}
+
+// These retirement proofs use the real runtime/connection/client/stdio construction
+// chain. In particular, do not replace them with insert_test_client: that bypasses
+// the reservation whose completeness these tests need to establish.
+#[cfg(unix)]
+fn retirement_stdio_config(marker: &std::path::Path, generation: &str) -> McpServerConfig {
+    let mut config = reusable_server_config("unused");
+    config.transport = McpServerTransportConfig::Stdio {
+        command: "/bin/sh".to_string(),
+        args: vec![
+            "-c".to_string(),
+            r#"
+printf '%s\n' "$$" >> "$1"
+while IFS= read -r request; do
+    id=$(printf '%s' "$request" | /usr/bin/sed -n 's/.*"id": *\([^,}]*\).*/\1/p')
+    [ -n "$id" ] || continue
+    case "$request" in
+        *'"initialize"'*) result='{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"retirement-proof","version":"1"}}' ;;
+        *'"tools/list"'*) result='{"tools":[{"name":"proof","description":"retirement proof","inputSchema":{"type":"object"}}]}' ;;
+        *'"resources/list"'*) result='{"resources":[{"uri":"test://proof","name":"proof"}]}' ;;
+        *'"resources/templates/list"'*) result='{"resourceTemplates":[{"uriTemplate":"test://{id}","name":"proof-template"}]}' ;;
+        *) result='{}' ;;
+    esac
+    printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$result"
+done
+"#
+            .to_string(),
+            generation.to_string(),
+            marker.display().to_string(),
+        ],
+        env: None,
+        env_vars: Vec::new(),
+        cwd: None,
+    };
+    config.startup_timeout_sec = Some(Duration::from_secs(5));
+    config
+}
+
+#[cfg(unix)]
+fn retirement_runtime_input(
+    home: &std::path::Path,
+    config: McpServerConfig,
+    context: McpRuntimeContext,
+    cache: McpToolCatalogCache,
+    policy: McpStartupPolicy,
+) -> McpRuntimeInput {
+    let mut runtime_config = crate::mcp::tests::test_mcp_config(home.to_path_buf());
+    // A real binding now requires explicit per-server call authority, just as
+    // capture_binding supplies for the other connection-manager fixtures.
+    runtime_config
+        .server_permission_profiles
+        .insert("docs".to_string(), PermissionProfile::default());
+    McpRuntimeInput {
+        attempt_requirement: crate::McpAttemptRequirement::Ungated,
+        startup_work: None,
+        startup_policy: policy,
+        config: Arc::new(runtime_config),
+        plugins_available: false,
+        ready_selected_capability_roots: Vec::new(),
+        mcp_servers: HashMap::from([("docs".to_string(), EffectiveMcpServer::from_host_config(config))]),
+        submit_id: "retirement-proof".to_string(),
+        tx_event: None,
+        startup_cancellation_token: CancellationToken::new(),
+        runtime_context: context,
+        codex_apps_tools_cache: ConnectorRuntimeManager::default(),
+        tool_catalog_cache: cache,
+        codex_apps_tools_cache_key: ConnectorRuntimeContextKey::personal(None, None),
+        client_mcp_extensions: ClientMcpExtensions::default(),
+        auth: None,
+        auth_manager: None,
+        elicitation_reviewer: None,
+        elicitation_lifecycle: None,
+        canonical_thread_id: None,
+        control_endpoint: None,
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn external_runtime_retirement_outlives_real_runtime_and_binding() -> anyhow::Result<()> {
+    let home = tempdir()?;
+    let marker = home.path().join("external-custody-pid");
+    let context = McpRuntimeContext::new(
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        home.path().to_path_buf(),
+    );
+    let control = crate::McpRuntimeRetirement::default();
+    let runtime = crate::McpRuntime::new_in_retirement(
+        retirement_runtime_input(
+            home.path(),
+            retirement_stdio_config(&marker, "external"),
+            context,
+            McpToolCatalogCache::default(),
+            McpStartupPolicy::Eager,
+        ),
+        control.clone(),
+    )
+    .await;
+    let binding = runtime
+        .current_binding_with_requirements(&["docs".to_string()], &HashSet::new())
+        .await
+        .expect("real initialized binding");
+    assert_eq!(binding.tools().len(), 1);
+    let pid: u32 = std::fs::read_to_string(&marker)?.trim().parse()?;
+    drop(binding);
+    drop(runtime);
+    let alive = || -> std::io::Result<bool> {
+        Ok(std::process::Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?
+            .success())
+    };
+    assert!(
+        alive()?,
+        "must not pass by dropping and killing the child before observing retirement"
+    );
+    assert!(!control.is_retired());
+    let report = control
+        .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(5))
+        .await;
+    assert!(report.is_complete(), "{report:?}");
+    assert_eq!(report.connections.len(), 1);
+    assert_eq!(
+        report.connections[0].1.attempts,
+        vec![(0, codex_rmcp_client::PhysicalRetirementOutcome::Complete)]
+    );
+    assert!(!alive()?);
+    assert!(control.is_retired());
+    assert_eq!(
+        control.shutdown_until(tokio::time::Instant::now()).await,
+        report
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_retirement_keeps_superseded_real_stdio_and_deduplicates_reuse()
+-> anyhow::Result<()> {
+    let home = tempdir()?;
+    let marker = home.path().join("launched-pids");
+    let context = McpRuntimeContext::new(
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        home.path().to_path_buf(),
+    );
+    let cache = McpToolCatalogCache::default();
+    let config_a = retirement_stdio_config(&marker, "generation-a");
+    let input = |config| {
+        retirement_runtime_input(
+            home.path(),
+            config,
+            context.clone(),
+            cache.clone(),
+            McpStartupPolicy::Eager,
+        )
+    };
+    let runtime = crate::runtime::McpRuntime::new(input(config_a.clone())).await;
+    let required = ["docs".to_string()];
+    let original = runtime
+        .current_binding_with_requirements(&required, &HashSet::new())
+        .await
+        .expect("published binding");
+    assert_eq!(
+        original.tools().len(),
+        1,
+        "must complete a real handshake and tools request"
+    );
+    runtime.replace(input(config_a)).await;
+    let reused = runtime
+        .current_binding_with_requirements(&required, &HashSet::new())
+        .await
+        .expect("reused binding");
+    assert_eq!(reused.tools().len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(&marker)?.lines().count(),
+        1,
+        "exact reuse must not launch another process"
+    );
+
+    runtime
+        .replace(input(retirement_stdio_config(&marker, "generation-b")))
+        .await;
+    let replacement = runtime
+        .current_binding_with_requirements(&required, &HashSet::new())
+        .await
+        .expect("replacement binding");
+    assert_eq!(replacement.tools().len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(&marker)?.lines().count(),
+        2,
+        "incompatible identity must create a second physical owner"
+    );
+    // Keep both old bindings alive: latest-set shutdown alone would miss A.
+    let report = runtime
+        .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(10))
+        .await;
+    assert!(report.is_complete(), "{report:?}");
+    assert_eq!(
+        report.connections.len(),
+        2,
+        "A must remain owned and exact reuse must not reserve another owner"
+    );
+    for (index, (owner, physical)) in report.connections.iter().enumerate() {
+        assert_eq!(*owner, index);
+        assert_eq!(
+            physical.attempts,
+            vec![(0, codex_rmcp_client::PhysicalRetirementOutcome::Complete)]
+        );
+    }
+    for pid in std::fs::read_to_string(&marker)?.lines() {
+        let pid: u32 = pid.parse()?;
+        assert!(
+            !std::process::Command::new("/bin/kill")
+                .args(["-0", &pid.to_string()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()?
+                .success(),
+            "retirement reported complete while launched process {pid} remains alive"
+        );
+    }
+    assert_eq!(
+        runtime
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await,
+        report
+    );
+    drop((original, reused, replacement));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_retirement_skips_real_dormant_stdio_without_launching() -> anyhow::Result<()> {
+    let home = tempdir()?;
+    let marker = home.path().join("must-not-launch");
+    let context = McpRuntimeContext::new(
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        home.path().to_path_buf(),
+    );
+    let config = retirement_stdio_config(&marker, "dormant");
+    let cache = McpToolCatalogCache::default();
+    let runtime_config = crate::mcp::tests::test_mcp_config(home.path().to_path_buf());
+    let environment = context
+        .resolve_server_environment("docs", &config)
+        .expect("local environment");
+    let cached = cache
+        .context(
+            "docs",
+            &config,
+            &context,
+            environment.as_ref(),
+            (
+                &runtime_config.client_elicitation_capability,
+                &ClientMcpExtensions::default(),
+            ),
+            /*connection_identity*/ None,
+        )
+        .expect("cacheable stdio server");
+    cached.publish_if_newest(cached.begin_fetch(), &[create_test_tool("docs", "proof")]);
+    let runtime = crate::runtime::McpRuntime::empty(true);
+    runtime
+        .replace(retirement_runtime_input(
+            home.path(),
+            config,
+            context,
+            cache,
+            McpStartupPolicy::LazyWhenCached,
+        ))
+        .await;
+    let report = runtime
+        .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(5))
+        .await;
+    assert!(report.is_complete(), "{report:?}");
+    assert_eq!(
+        report.connections.len(),
+        1,
+        "dormant connection is still registered"
+    );
+    assert!(
+        report.connections[0].1.attempts.is_empty(),
+        "no physical attempt may be admitted by shutdown"
+    );
+    assert!(
+        report
+            .tasks
+            .iter()
+            .any(|(_, outcome)| *outcome == crate::runtime_retirement::RuntimeTaskOutcome::Skipped),
+        "{report:?}"
+    );
+    assert!(
+        !marker.exists(),
+        "retirement must not execute the dormant factory"
+    );
+    assert_eq!(
+        runtime
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await,
+        report
+    );
+    assert!(!marker.exists());
+    Ok(())
 }
 
 fn reusable_server_runtime_context() -> McpRuntimeContext {
@@ -5108,6 +5492,8 @@ fn reusable_server_identity(
         /*codex_apps_cache_identity*/ None,
         ElicitationCapability::default(),
         ClientMcpExtensions::default(),
+        /*canonical_thread_id*/ None,
+        /*control_endpoint*/ None,
         /*previous_identity*/ None,
     )
 }
@@ -5176,6 +5562,8 @@ async fn reconcile_reusable_server_with_mcp_config(
         Some(previous),
         McpPublicationGate::already_published(),
         McpRuntimeInput {
+            attempt_requirement: crate::McpAttemptRequirement::Ungated,
+            startup_work: None,
             startup_policy: McpStartupPolicy::Eager,
             config: Arc::new(mcp_config),
             plugins_available: false,
@@ -5198,6 +5586,8 @@ async fn reconcile_reusable_server_with_mcp_config(
             auth_manager: None,
             elicitation_reviewer: None,
             elicitation_lifecycle: None,
+            canonical_thread_id: None,
+            control_endpoint: None,
         },
         ElicitationRequestRouter::default(),
     )
@@ -5559,7 +5949,10 @@ async fn reconciliation_reuses_connection_without_relisting_regular_tools() -> a
             connection: Arc::new(McpServerConnection {
                 identity: Some(reusable_server_identity("docs", &config, &runtime_context)),
                 client: AsyncManagedClient {
-                    client: futures::future::ready(Ok(managed_client)).boxed().shared(),
+                    client: futures::future::ready(Ok(managed_client))
+                        .boxed()
+                        .shared()
+                        .into(),
                     is_codex_apps_mcp_server: false,
                     server_capabilities: Arc::new(std::sync::Mutex::new(None)),
                     cached_server_info: None,
@@ -5750,7 +6143,8 @@ async fn reconciliation_retries_non_oauth_authentication_failures() {
         is_authentication_required: true,
     }))
     .boxed()
-    .shared();
+    .shared()
+    .into();
 
     let reconciled = reconcile_reusable_server(&previous, config, runtime_context).await;
 
@@ -5787,6 +6181,8 @@ fn connection_identity_tracks_only_oauth_credentials_when_oauth_is_active() {
                 /*codex_apps_cache_identity*/ None,
                 ElicitationCapability::default(),
                 ClientMcpExtensions::default(),
+                /*canonical_thread_id*/ None,
+                /*control_endpoint*/ None,
                 /*previous_identity*/ None,
             )
         };
@@ -5869,6 +6265,8 @@ fn connection_identity_uses_effective_authorization_headers() {
                 /*codex_apps_cache_identity*/ None,
                 ElicitationCapability::default(),
                 ClientMcpExtensions::default(),
+                /*canonical_thread_id*/ None,
+                /*control_endpoint*/ None,
                 /*previous_identity*/ None,
             )
         };
@@ -5890,6 +6288,214 @@ fn connection_identity_uses_effective_authorization_headers() {
             has_authorization,
         );
     }
+}
+
+/// Builds a connection identity varying only eligibility and canonical
+/// thread ID, holding every other field fixed via `reusable_server_config`.
+fn thread_identity_reuse_identity(
+    runtime_context: &McpRuntimeContext,
+    thread_identity_eligible: bool,
+    canonical_thread_id: Option<&str>,
+) -> McpServerConnectionIdentity {
+    let mut config = reusable_server_config("http://127.0.0.1:1");
+    config.thread_identity_eligible = thread_identity_eligible;
+    let server = EffectiveMcpServer::from_host_config(config.clone());
+    let resolved_environment = runtime_context.resolve_server_environment("docs", &config);
+    McpServerConnectionIdentity::new(
+        "docs",
+        &server,
+        /*host_plugin_root*/ None,
+        OAuthCredentialsStoreMode::default(),
+        AuthKeyringBackendKind::default(),
+        McpOAuthRefreshMode::Legacy,
+        &resolved_environment,
+        runtime_context,
+        /*runtime_auth_provider*/ None,
+        /*auth*/ None,
+        /*codex_apps_cache_identity*/ None,
+        ElicitationCapability::default(),
+        ClientMcpExtensions::default(),
+        canonical_thread_id.map(str::to_string),
+        /*control_endpoint*/ None,
+        /*previous_identity*/ None,
+    )
+}
+
+#[test]
+fn eligible_server_with_changed_thread_id_does_not_reuse_connection() {
+    let runtime_context = reusable_server_runtime_context();
+    let before = thread_identity_reuse_identity(&runtime_context, true, Some("thread-a"));
+    let after = thread_identity_reuse_identity(&runtime_context, true, Some("thread-b"));
+
+    assert!(
+        !before.has_same_connection_config(&after),
+        "an eligible server must not reuse a connection bound to a different thread"
+    );
+}
+
+#[test]
+fn eligibility_toggle_does_not_reuse_connection_in_either_direction() {
+    let runtime_context = reusable_server_runtime_context();
+    let ineligible = thread_identity_reuse_identity(&runtime_context, false, Some("thread-a"));
+    let eligible = thread_identity_reuse_identity(&runtime_context, true, Some("thread-a"));
+
+    assert!(
+        !ineligible.has_same_connection_config(&eligible),
+        "toggling eligibility off-to-on must not reuse the existing connection"
+    );
+    assert!(
+        !eligible.has_same_connection_config(&ineligible),
+        "toggling eligibility on-to-off must not reuse the existing connection"
+    );
+}
+
+#[test]
+fn ineligible_server_with_changed_thread_id_still_reuses_connection() {
+    let runtime_context = reusable_server_runtime_context();
+    let before = thread_identity_reuse_identity(&runtime_context, false, Some("thread-a"));
+    let after = thread_identity_reuse_identity(&runtime_context, false, Some("thread-b"));
+
+    assert!(
+        before.has_same_connection_config(&after),
+        "an ordinary (ineligible) server's reuse decision must be unaffected by any thread \
+         change — it never binds an identity, so this must remain the pre-existing behavior"
+    );
+}
+
+/// Covers `kcf-runtime/04`'s "an already-live resume and compact retain the
+/// same thread-owned runtime and live bound connection; they do not rebind
+/// solely because the API action ran" — those transitions do not change the
+/// canonical thread ID, so the predicate must keep reusing the connection
+/// for an eligible server exactly as it always did for an ordinary one.
+#[test]
+fn eligible_server_with_unchanged_thread_id_reuses_connection() {
+    let runtime_context = reusable_server_runtime_context();
+    let before = thread_identity_reuse_identity(&runtime_context, true, Some("thread-a"));
+    let after = thread_identity_reuse_identity(&runtime_context, true, Some("thread-a"));
+
+    assert!(
+        before.has_same_connection_config(&after),
+        "an already-live resume or compact keeps the same thread id and must not force a \
+         reconnect for an eligible server"
+    );
+}
+
+/// Connection reuse must re-run the generic endpoint negotiation when a
+/// provider's explicit eligibility changes; otherwise an already-live
+/// physical MCP connection can retain a stale discovery contract.
+fn control_endpoint_reuse_identity(
+    runtime_context: &McpRuntimeContext,
+    control_endpoint_eligible: bool,
+    control_endpoint: Option<&str>,
+) -> McpServerConnectionIdentity {
+    let mut config = reusable_server_config("http://127.0.0.1:1");
+    config.control_endpoint_eligible = control_endpoint_eligible;
+    let server = EffectiveMcpServer::from_host_config(config.clone());
+    let resolved_environment = runtime_context.resolve_server_environment("docs", &config);
+    McpServerConnectionIdentity::new(
+        "docs",
+        &server,
+        /*host_plugin_root*/ None,
+        OAuthCredentialsStoreMode::default(),
+        AuthKeyringBackendKind::default(),
+        McpOAuthRefreshMode::Legacy,
+        &resolved_environment,
+        runtime_context,
+        /*runtime_auth_provider*/ None,
+        /*auth*/ None,
+        /*codex_apps_cache_identity*/ None,
+        ElicitationCapability::default(),
+        ClientMcpExtensions::default(),
+        /*canonical_thread_id*/ None,
+        control_endpoint.map(str::to_string),
+        /*previous_identity*/ None,
+    )
+}
+
+#[test]
+fn control_endpoint_eligibility_toggle_does_not_reuse_connection() {
+    let runtime_context = reusable_server_runtime_context();
+    let ineligible = control_endpoint_reuse_identity(
+        &runtime_context,
+        /*control_endpoint_eligible*/ false,
+        Some("unix:///tmp/kcf-control.sock"),
+    );
+    let eligible = control_endpoint_reuse_identity(
+        &runtime_context,
+        /*control_endpoint_eligible*/ true,
+        Some("unix:///tmp/kcf-control.sock"),
+    );
+
+    assert!(!ineligible.has_same_connection_config(&eligible));
+    assert!(!eligible.has_same_connection_config(&ineligible));
+}
+
+#[test]
+fn ineligible_server_is_never_given_control_endpoint() {
+    let runtime_context = reusable_server_runtime_context();
+    let identity = control_endpoint_reuse_identity(
+        &runtime_context,
+        /*control_endpoint_eligible*/ false,
+        Some("unix:///tmp/kcf-control.sock"),
+    );
+
+    assert_eq!(identity.control_endpoint, None);
+}
+
+#[test]
+fn eligible_server_receives_control_endpoint() {
+    let runtime_context = reusable_server_runtime_context();
+    let identity = control_endpoint_reuse_identity(
+        &runtime_context,
+        /*control_endpoint_eligible*/ true,
+        Some("unix:///tmp/kcf-control.sock"),
+    );
+
+    assert_eq!(
+        identity.control_endpoint.as_deref(),
+        Some("unix:///tmp/kcf-control.sock")
+    );
+}
+
+#[test]
+fn eligible_server_with_changed_control_endpoint_does_not_reuse_connection() {
+    let runtime_context = reusable_server_runtime_context();
+    let before = control_endpoint_reuse_identity(
+        &runtime_context,
+        /*control_endpoint_eligible*/ true,
+        Some("unix:///tmp/kcf-control-a.sock"),
+    );
+    let after = control_endpoint_reuse_identity(
+        &runtime_context,
+        /*control_endpoint_eligible*/ true,
+        Some("unix:///tmp/kcf-control-b.sock"),
+    );
+
+    assert!(
+        !before.has_same_connection_config(&after),
+        "an eligible server must renegotiate discovery after its control endpoint changes"
+    );
+}
+
+#[test]
+fn ineligible_server_with_changed_control_endpoint_reuses_connection() {
+    let runtime_context = reusable_server_runtime_context();
+    let before = control_endpoint_reuse_identity(
+        &runtime_context,
+        /*control_endpoint_eligible*/ false,
+        Some("unix:///tmp/kcf-control-a.sock"),
+    );
+    let after = control_endpoint_reuse_identity(
+        &runtime_context,
+        /*control_endpoint_eligible*/ false,
+        Some("unix:///tmp/kcf-control-b.sock"),
+    );
+
+    assert!(
+        before.has_same_connection_config(&after),
+        "an ineligible server never receives endpoint discovery, so endpoint changes cannot \
+         force a reconnect"
+    );
 }
 
 #[tokio::test]
@@ -6008,6 +6614,8 @@ async fn reconciliation_replaces_connection_when_protocol_mode_changes() {
         Some(&previous),
         McpPublicationGate::already_published(),
         McpRuntimeInput {
+            attempt_requirement: crate::McpAttemptRequirement::Ungated,
+            startup_work: None,
             startup_policy: McpStartupPolicy::Eager,
             config: Arc::new(mcp_config),
             plugins_available: false,
@@ -6030,6 +6638,8 @@ async fn reconciliation_replaces_connection_when_protocol_mode_changes() {
             auth_manager: None,
             elicitation_reviewer: None,
             elicitation_lifecycle: None,
+            canonical_thread_id: None,
+            control_endpoint: None,
         },
         ElicitationRequestRouter::default(),
     )
@@ -6066,6 +6676,8 @@ async fn reconciliation_reuses_legacy_stdio_server_when_modern_protocol_is_enabl
         Some(&previous),
         McpPublicationGate::already_published(),
         McpRuntimeInput {
+            attempt_requirement: crate::McpAttemptRequirement::Ungated,
+            startup_work: None,
             startup_policy: McpStartupPolicy::Eager,
             config: Arc::new(mcp_config),
             plugins_available: false,
@@ -6088,6 +6700,8 @@ async fn reconciliation_reuses_legacy_stdio_server_when_modern_protocol_is_enabl
             auth_manager: None,
             elicitation_reviewer: None,
             elicitation_lifecycle: None,
+            canonical_thread_id: None,
+            control_endpoint: None,
         },
         ElicitationRequestRouter::default(),
     )
@@ -6264,7 +6878,8 @@ async fn reconciliation_replaces_closed_connections() -> anyhow::Result<()> {
         client: AsyncManagedClient {
             client: futures::future::ready(Ok(connected_client))
                 .boxed()
-                .shared(),
+                .shared()
+                .into(),
             is_codex_apps_mcp_server: false,
             server_capabilities: Arc::new(std::sync::Mutex::new(None)),
             cached_server_info: None,
@@ -6347,6 +6962,8 @@ async fn reconciliation_reconnects_when_host_plugin_root_changes() {
         /*codex_apps_cache_identity*/ None,
         ElicitationCapability::default(),
         ClientMcpExtensions::default(),
+        /*canonical_thread_id*/ None,
+        /*control_endpoint*/ None,
         /*previous_identity*/ None,
     );
     Arc::get_mut(
@@ -6428,6 +7045,8 @@ async fn connection_identity_distinguishes_accounts_with_the_same_token() -> any
             /*codex_apps_cache_identity*/ None,
             ElicitationCapability::default(),
             ClientMcpExtensions::default(),
+            /*canonical_thread_id*/ None,
+            /*control_endpoint*/ None,
             /*previous_identity*/ None,
         )
     };
@@ -6482,6 +7101,8 @@ async fn connection_identity_distinguishes_agent_account_runtime_and_task() -> a
             /*codex_apps_cache_identity*/ None,
             ElicitationCapability::default(),
             ClientMcpExtensions::default(),
+            /*canonical_thread_id*/ None,
+            /*control_endpoint*/ None,
             /*previous_identity*/ None,
         )
     };

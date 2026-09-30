@@ -507,6 +507,10 @@ pub(crate) struct SessionStartCommandInput {
     pub permission_mode: String,
     #[schemars(schema_with = "session_start_source_schema")]
     pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clear_predecessor_thread_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clear_transition_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -520,6 +524,8 @@ pub(crate) struct SessionEndCommandInput {
     pub hook_event_name: String,
     #[schemars(schema_with = "session_end_reason_schema")]
     pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clear_transition_id: Option<String>,
 }
 
 impl SessionStartCommandInput {
@@ -530,7 +536,16 @@ impl SessionStartCommandInput {
         model: impl Into<String>,
         permission_mode: impl Into<String>,
         source: impl Into<String>,
+        clear_context: Option<crate::ClearSessionStartContext>,
     ) -> Self {
+        let (clear_predecessor_thread_id, clear_transition_id) = clear_context
+            .map(|context| {
+                (
+                    Some(context.predecessor_thread_id),
+                    Some(context.transition_id),
+                )
+            })
+            .unwrap_or_default();
         Self {
             session_id: session_id.into(),
             transcript_path: NullableString::from_path(transcript_path),
@@ -539,6 +554,8 @@ impl SessionStartCommandInput {
             model: model.into(),
             permission_mode: permission_mode.into(),
             source: source.into(),
+            clear_predecessor_thread_id,
+            clear_transition_id,
         }
     }
 }
@@ -797,7 +814,7 @@ fn session_end_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema {
 }
 
 fn session_end_reason_schema(_gen: &mut SchemaGenerator) -> Schema {
-    string_const_schema("other")
+    string_enum_schema(&["other", "clear"])
 }
 
 fn post_tool_use_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema {
@@ -918,6 +935,8 @@ mod tests {
     use super::SUBAGENT_START_OUTPUT_FIXTURE;
     use super::SUBAGENT_STOP_INPUT_FIXTURE;
     use super::SUBAGENT_STOP_OUTPUT_FIXTURE;
+    use super::SessionEndCommandInput;
+    use super::SessionStartCommandInput;
     use super::SessionStartCommandOutputWire;
     use super::StopCommandInput;
     use super::SubagentCommandInputFields;
@@ -1014,6 +1033,65 @@ mod tests {
 
     fn normalize_newlines(value: &str) -> String {
         value.replace("\r\n", "\n")
+    }
+
+    #[test]
+    fn clear_lifecycle_fields_serialize_only_when_authoritative() {
+        let ordinary_start = SessionStartCommandInput::new(
+            "successor",
+            None,
+            "/tmp",
+            "model",
+            "default",
+            "startup",
+            None,
+        );
+        assert_eq!(
+            json!({
+                "session_id": "successor",
+                "transcript_path": null,
+                "cwd": "/tmp",
+                "hook_event_name": "SessionStart",
+                "model": "model",
+                "permission_mode": "default",
+                "source": "startup"
+            }),
+            serde_json::to_value(ordinary_start).unwrap()
+        );
+
+        let clear_start = SessionStartCommandInput::new(
+            "successor",
+            None,
+            "/tmp",
+            "model",
+            "default",
+            "clear",
+            Some(crate::ClearSessionStartContext {
+                predecessor_thread_id: "predecessor".to_string(),
+                transition_id: "transition".to_string(),
+            }),
+        );
+        assert_eq!(
+            Some(&json!("predecessor")),
+            serde_json::to_value(clear_start)
+                .unwrap()
+                .get("clear_predecessor_thread_id")
+        );
+
+        let clear_end = SessionEndCommandInput {
+            session_id: "predecessor".to_string(),
+            transcript_path: NullableString(None),
+            cwd: "/tmp".to_string(),
+            hook_event_name: "SessionEnd".to_string(),
+            reason: "clear".to_string(),
+            clear_transition_id: Some("transition".to_string()),
+        };
+        let clear_end = serde_json::to_value(clear_end).unwrap();
+        assert_eq!(Some(&json!("clear")), clear_end.get("reason"));
+        assert_eq!(
+            Some(&json!("transition")),
+            clear_end.get("clear_transition_id")
+        );
     }
 
     fn assert_output_hook_event_name_const<T: JsonSchema>(definition: &str, expected: &str) {

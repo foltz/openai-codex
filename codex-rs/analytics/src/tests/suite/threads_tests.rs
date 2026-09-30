@@ -220,6 +220,7 @@ async fn initialize_caches_client_and_thread_lifecycle_publishes_once_initialize
                         explicit_gateway_oauth: false,
                         experimental_api: false,
                         request_attestation: false,
+                        interactive_client: false,
                         opt_out_notification_methods: None,
                         mcp_server_openai_form_elicitation: false,
                         extensions: None,

@@ -21,12 +21,14 @@ fn spawn_startup_thread_start(
     worktree: Option<crate::ManagedTuiWorktree>,
 ) {
     let request_handle = app_server.request_handle();
+    let retention_client = app_server.retention_client();
     let thread_params_mode = app_server.thread_params_mode();
     let remote_cwd_override = app_server.remote_cwd_override().map(Path::to_path_buf);
     let thread_tool_transport = app_server.thread_tool_transport();
     tokio::spawn(async move {
         let result = crate::app_server_session::start_thread_with_request_handle(
             request_handle,
+            retention_client,
             &local_settings,
             config,
             thread_params_mode,
@@ -36,7 +38,7 @@ fn spawn_startup_thread_start(
         .await
         .and_then(|started| {
             if let Some(worktree) = worktree.as_ref() {
-                worktree.bind(started.session.thread_id)?;
+                worktree.bind(started.started.session.thread_id)?;
             }
             Ok(started)
         });
@@ -1011,7 +1013,6 @@ See the Codex keymap documentation for supported actions and examples."
                 &mut app_server,
                 AppEvent::InsertHistoryCell(Box::new(UpdateAvailableHistoryCell::new(
                     latest_version,
-                    crate::update_action::get_update_action(),
                 ))),
             ))
             .await?;

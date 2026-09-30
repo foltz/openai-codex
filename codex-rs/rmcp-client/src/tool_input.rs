@@ -26,7 +26,6 @@ use rmcp::transport::streamable_http_client::StreamableHttpError;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::elicitation_client_service::ElicitationClientService;
 use crate::http_client_adapter::StreamableHttpClientAdapterError;
 
 #[derive(Deserialize)]
@@ -36,8 +35,8 @@ struct ToolInput {
     request_state: Option<String>,
 }
 
-pub(crate) async fn call_tool(
-    service: &RunningService<RoleClient, ElicitationClientService>,
+pub(crate) async fn call_tool<S: Service<RoleClient>>(
+    service: &RunningService<RoleClient, S>,
     mut params: CallToolRequestParams,
 ) -> Result<CallToolResult, ServiceError> {
     let mut state_only_rounds = 0;

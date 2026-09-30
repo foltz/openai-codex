@@ -4,10 +4,15 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 
+use futures::future::BoxFuture;
+
+use crate::account_dependency::AccountDependency;
+use crate::account_dependency::classify;
 use crate::attestation::app_server_attestation_provider;
 use crate::config_manager::ConfigManager;
 use crate::connection_rpc_gate::ConnectionRpcGate;
 use crate::current_time::app_server_time_provider;
+use crate::error_code::account_transition_in_progress;
 use crate::error_code::internal_error;
 use crate::error_code::invalid_params;
 use crate::error_code::invalid_request;
@@ -23,6 +28,7 @@ use crate::outgoing_message::OutgoingMessageSender;
 use crate::outgoing_message::RequestContext;
 use crate::plugin_config_reload;
 use crate::plugin_config_reload::PluginStartupConfig;
+use crate::processor_task_retirement::ProcessorTasks;
 use crate::request_processors::AccountRequestProcessor;
 use crate::request_processors::AppsRequestProcessor;
 use crate::request_processors::CatalogRequestProcessor;
@@ -54,6 +60,12 @@ use crate::request_serialization::RequestSerializationQueueKey;
 use crate::request_serialization::RequestSerializationQueues;
 use crate::skills_watcher::SkillsWatcher;
 use crate::thread_state::ConnectionCapabilities;
+use crate::thread_state::RetentionAcquireOutcome;
+use crate::thread_state::RetentionAuthorityError;
+use crate::thread_state::RetentionGrantId;
+use crate::thread_state::RetentionPrincipalId;
+use crate::thread_state::RetentionPrincipalOwner;
+use crate::thread_state::RetentionReleaseOutcome;
 use crate::thread_state::ThreadStateManager;
 use crate::transport::AppServerTransport;
 use crate::transport::RemoteControlHandle;
@@ -70,6 +82,11 @@ use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::JSONRPCResponse;
+use codex_app_server_protocol::ThreadRetentionAcquireParams;
+use codex_app_server_protocol::ThreadRetentionAcquireResponse;
+use codex_app_server_protocol::ThreadRetentionRefusalReason;
+use codex_app_server_protocol::ThreadRetentionReleaseParams;
+use codex_app_server_protocol::ThreadRetentionReleaseResponse;
 use codex_app_server_protocol::UserVerificationCancelResponse;
 use codex_app_server_protocol::experimental_required_message;
 use codex_arg0::Arg0DispatchPaths;
@@ -101,10 +118,32 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
+use crate::mcp_config_identity::AppliedMcpConfigIdentity;
 use crate::models_refresh_worker::ModelsRefreshWorker;
 use crate::turn_admission::TurnAdmission;
 
 const CONNECTION_RPC_DRAIN_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 30);
+
+#[derive(Clone, Copy, Debug)]
+enum RetentionAcquireAuthority {
+    Ineligible,
+    Unavailable,
+    Eligible(RetentionPrincipalId),
+}
+
+fn retention_principal_or_refusal(
+    authority: RetentionAcquireAuthority,
+) -> Result<RetentionPrincipalId, ThreadRetentionRefusalReason> {
+    match authority {
+        RetentionAcquireAuthority::Ineligible => {
+            Err(ThreadRetentionRefusalReason::IneligiblePrincipal)
+        }
+        RetentionAcquireAuthority::Unavailable => {
+            Err(ThreadRetentionRefusalReason::AuthorityUnavailable)
+        }
+        RetentionAcquireAuthority::Eligible(principal) => Ok(principal),
+    }
+}
 
 fn deserialize_client_request(request: JSONRPCRequest) -> Result<ClientRequest, JSONRPCErrorError> {
     reject_obsolete_request_fields(&request)?;
@@ -137,14 +176,68 @@ fn reject_removed_permission_profile(request: &JSONRPCRequest) -> Result<(), JSO
     Ok(())
 }
 
+fn retention_refusal_reason(error: RetentionAuthorityError) -> ThreadRetentionRefusalReason {
+    match error {
+        RetentionAuthorityError::IneligiblePrincipal => {
+            ThreadRetentionRefusalReason::IneligiblePrincipal
+        }
+        RetentionAuthorityError::AuthorityUnavailable
+        | RetentionAuthorityError::LifecycleClosed => {
+            ThreadRetentionRefusalReason::AuthorityUnavailable
+        }
+        // Self-retention is an ineligible authorization shape, not a separate
+        // client capability. Keep the wire refusal closed while the authority
+        // kernel makes the structural invariant explicit.
+        RetentionAuthorityError::SelfRetention => ThreadRetentionRefusalReason::IneligiblePrincipal,
+        RetentionAuthorityError::UnknownThread => ThreadRetentionRefusalReason::UnknownThread,
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProcessorBackgroundShutdown {
+    pub models: crate::models_refresh_worker::ModelsRefreshShutdown,
+    pub thread_starts: crate::processor_task_retirement::ProcessorTaskDrain,
+    pub apps: crate::request_processors::AppsShutdown,
+    pub skills: crate::skills_watcher::SkillsWatcherShutdown,
+    pub plugins: codex_core_plugins::PluginTaskDrain,
+    pub auxiliary_tasks: crate::processor_task_retirement::ProcessorTaskDrain,
+}
+
+impl ProcessorBackgroundShutdown {
+    pub(crate) fn is_clean(&self) -> bool {
+        matches!(
+            self.models,
+            crate::models_refresh_worker::ModelsRefreshShutdown::Joined
+        ) && self.thread_starts.is_clean()
+            && self.apps.tasks.is_clean()
+            && !self.apps.runtimes.unavailable
+            && self
+                .apps
+                .runtimes
+                .reports
+                .iter()
+                .all(codex_mcp::RuntimeTerminationReport::is_complete)
+            && matches!(
+                self.skills,
+                crate::skills_watcher::SkillsWatcherShutdown::Joined
+            )
+            && self.plugins.is_clean()
+            && self.auxiliary_tasks.is_clean()
+    }
+}
+
 pub(crate) struct MessageProcessor {
     pub(crate) turn_admission: TurnAdmission,
     user_verification: Arc<crate::user_verification::Service>,
     outgoing: Arc<OutgoingMessageSender>,
-    models_refresh_worker: ModelsRefreshWorker,
+    thread_manager: Arc<ThreadManager>,
+    /// Replaceable on managed account adoption; the async mutex also retains
+    /// the current worker while its terminal shutdown is observed.
+    models_refresh_worker: Arc<Mutex<ModelsRefreshWorker>>,
     turn_cost_worker: Option<TurnCostWorker>,
     skills_watcher: Arc<SkillsWatcher>,
     account_processor: Arc<AccountRequestProcessor>,
+    account_tasks: crate::processor_task_retirement::ProcessorTasks,
     apps_processor: AppsRequestProcessor,
     catalog_processor: CatalogRequestProcessor,
     command_exec_processor: CommandExecRequestProcessor,
@@ -156,6 +249,7 @@ pub(crate) struct MessageProcessor {
     fs_processor: FsRequestProcessor,
     git_processor: GitRequestProcessor,
     initialize_processor: InitializeRequestProcessor,
+    managed_transition_coordinator: crate::managed_transition::ManagedTransitionCoordinator,
     marketplace_processor: MarketplaceRequestProcessor,
     mcp_processor: McpRequestProcessor,
     plugin_processor: PluginRequestProcessor,
@@ -165,9 +259,11 @@ pub(crate) struct MessageProcessor {
     thread_goal_processor: ThreadGoalRequestProcessor,
     thread_queue_processor: ThreadQueueRequestProcessor,
     thread_processor: ThreadRequestProcessor,
+    thread_state_manager: ThreadStateManager,
     turn_processor: TurnRequestProcessor,
     windows_sandbox_processor: WindowsSandboxRequestProcessor,
     request_serialization_queues: RequestSerializationQueues,
+    auxiliary_tasks: ProcessorTasks,
 }
 
 #[derive(Debug)]
@@ -175,6 +271,8 @@ pub(crate) struct ConnectionSessionState {
     pub(crate) rpc_gate: Arc<ConnectionRpcGate>,
     pub(crate) origin: crate::transport::ConnectionOrigin,
     pub(crate) mcp_event_streams: McpEventStreams,
+    provenance: crate::transport::ConnectionProvenance,
+    retention_principal: RetentionPrincipalId,
     initialized: OnceLock<InitializedConnectionSessionState>,
 }
 
@@ -185,15 +283,39 @@ pub(crate) struct InitializedConnectionSessionState {
     pub(crate) app_server_client_name: String,
     pub(crate) client_version: String,
     pub(crate) request_attestation: bool,
+    pub(crate) interactive_client_requested: bool,
     pub(crate) client_mcp_extensions: ClientMcpExtensions,
 }
 
 impl ConnectionSessionState {
+    #[cfg(test)]
     pub(crate) fn new(origin: crate::transport::ConnectionOrigin) -> Self {
+        Self::with_provenance(
+            origin,
+            crate::transport::ConnectionProvenance::Unproven,
+            RetentionPrincipalId::unclassified(),
+        )
+    }
+
+    pub(crate) fn in_process() -> Self {
+        Self::with_provenance(
+            crate::transport::ConnectionOrigin::InProcess,
+            crate::transport::ConnectionProvenance::InProcess,
+            RetentionPrincipalId::connection_owned(),
+        )
+    }
+
+    pub(crate) fn with_provenance(
+        origin: crate::transport::ConnectionOrigin,
+        provenance: crate::transport::ConnectionProvenance,
+        retention_principal: RetentionPrincipalId,
+    ) -> Self {
         Self {
             origin,
             rpc_gate: Arc::new(ConnectionRpcGate::new()),
             mcp_event_streams: McpEventStreams::default(),
+            provenance,
+            retention_principal,
             initialized: OnceLock::new(),
         }
     }
@@ -233,6 +355,50 @@ impl ConnectionSessionState {
             .is_some_and(|session| session.request_attestation)
     }
 
+    pub(crate) fn interactive_client_requested(&self) -> bool {
+        self.initialized
+            .get()
+            .is_some_and(|session| session.interactive_client_requested)
+    }
+
+    pub(crate) fn trusted_interactive(&self) -> bool {
+        crate::transport::trusted_interactive(self.interactive_client_requested(), self.provenance)
+    }
+
+    /// A retention principal is minted by the server and released only for a
+    /// positively established local/executable provenance. Client-provided
+    /// initialization fields intentionally do not participate in this check.
+    pub(crate) fn retention_principal(&self) -> Option<RetentionPrincipalId> {
+        matches!(
+            self.retention_acquire_authority(),
+            RetentionAcquireAuthority::Eligible(_)
+        )
+        .then_some(self.retention_principal)
+    }
+
+    fn retention_acquire_authority(&self) -> RetentionAcquireAuthority {
+        if !self.initialized() || !crate::transport::trusted_interactive_provenance(self.provenance)
+        {
+            return RetentionAcquireAuthority::Ineligible;
+        }
+        match self.retention_principal.owner() {
+            RetentionPrincipalOwner::ConnectionOwned | RetentionPrincipalOwner::ThreadOwned(_) => {
+                RetentionAcquireAuthority::Eligible(self.retention_principal)
+            }
+            RetentionPrincipalOwner::Unclassified => RetentionAcquireAuthority::Unavailable,
+        }
+    }
+
+    /// Issue 05 Slice 2's caller-authorization leg (`CODEX-I05-S02-R005`):
+    /// narrower than [`Self::trusted_interactive`], see
+    /// `crate::transport::managed_transition_caller_authorized`.
+    pub(crate) fn managed_transition_caller_authorized(&self) -> bool {
+        crate::transport::managed_transition_caller_authorized(
+            self.interactive_client_requested(),
+            self.provenance,
+        )
+    }
+
     pub(crate) fn client_mcp_extensions(&self) -> ClientMcpExtensions {
         self.initialized
             .get()
@@ -245,6 +411,7 @@ impl ConnectionSessionState {
 }
 
 pub(crate) struct MessageProcessorArgs {
+    pub(crate) telemetry_reset: crate::otel_reset_control::TelemetryResetControl,
     pub(crate) outgoing: Arc<OutgoingMessageSender>,
     pub(crate) analytics_events_client: AnalyticsEventsClient,
     pub(crate) arg0_paths: Arg0DispatchPaths,
@@ -264,6 +431,9 @@ pub(crate) struct MessageProcessorArgs {
     pub(crate) remote_control_handle: Option<RemoteControlHandle>,
     /// `None` skips startup tasks; otherwise preserve the initial config-loading path.
     pub(crate) plugin_startup_tasks: Option<PluginStartupConfig>,
+    pub(crate) managed_transition_control_socket_endpoint: Option<String>,
+    pub(crate) managed_transition_process_instance_id: Option<String>,
+    pub(crate) control_endpoint: Option<String>,
 }
 
 impl MessageProcessor {
@@ -271,6 +441,7 @@ impl MessageProcessor {
     /// `Sender` so handlers can enqueue messages to be written to stdout.
     pub(crate) fn new(args: MessageProcessorArgs) -> Self {
         let MessageProcessorArgs {
+            telemetry_reset,
             outgoing,
             analytics_events_client,
             arg0_paths,
@@ -289,6 +460,9 @@ impl MessageProcessor {
             rpc_transport,
             remote_control_handle,
             plugin_startup_tasks,
+            managed_transition_control_socket_endpoint,
+            managed_transition_process_instance_id,
+            control_endpoint,
         } = args;
         // Startup credential reads must not open a browser before initialize selects the policy.
         let gateway_login_control =
@@ -296,6 +470,7 @@ impl MessageProcessor {
         gateway_login_control.require_explicit_login();
         let thread_state_manager = ThreadStateManager::new();
         outgoing.watch_user_verification_auth(Arc::clone(&auth_manager));
+        thread_state_manager.set_interactive_subscription_notification_outgoing(outgoing.clone());
         // The thread store is intentionally process-scoped. Config reloads can
         // affect per-thread behavior, but they must not move newly started,
         // resumed, or forked threads to a different persistence backend/root.
@@ -319,10 +494,19 @@ impl MessageProcessor {
         );
         let goal_service = Arc::new(GoalService::new());
         let turn_admission = TurnAdmission::default();
-        let turn_start_admission: Arc<dyn TurnStartAdmission> = Arc::new(turn_admission.clone());
+        let account_work_permits = crate::managed_transition::AccountWorkPermits::new();
+        let account_turn_work = crate::account_turn_work::AccountTurnWork::default();
+        let turn_start_admission: Arc<dyn TurnStartAdmission> =
+            Arc::new(crate::account_turn_admission::AccountTurnAdmission {
+                shutdown: turn_admission.clone(),
+                permits: account_work_permits.clone(),
+                work: account_turn_work.clone(),
+            });
         let extension_event_sink =
             app_server_extension_event_sink(outgoing.clone(), thread_state_manager.clone());
         let mut queue_service = None;
+        let applied_mcp_config_identity = AppliedMcpConfigIdentity::from_startup_config(&config);
+        let auxiliary_tasks = ProcessorTasks::default();
         let thread_manager = Arc::new_cyclic(|thread_manager| {
             queue_service = queue_store.map(|queue| {
                 Arc::new(QueuedItemService::new(
@@ -369,17 +553,22 @@ impl MessageProcessor {
                     thread_state_manager.clone(),
                 )),
             );
-            match code_mode_session_provider {
+            let manager = match code_mode_session_provider {
                 Some(provider) => manager.with_code_mode_session_provider(provider),
                 None => manager,
-            }
+            };
+            manager
+                .with_runtime_config_change_gate(applied_mcp_config_identity.apply_gate())
+                .with_runtime_config_change_listener(Arc::new(applied_mcp_config_identity.clone()))
         });
         let model_catalog = Arc::new(crate::model_catalog::ModelCatalog::new(
             config_manager.clone(),
             Arc::clone(&config),
             thread_manager.get_models_manager(),
         ));
-        let models_refresh_worker = crate::models_refresh_worker::spawn(&model_catalog);
+        let models_refresh_worker = Arc::new(Mutex::new(crate::models_refresh_worker::spawn(
+            &model_catalog,
+        )));
         let turn_cost_worker =
             TurnCostWorker::spawn(Arc::clone(&config), Arc::clone(&auth_manager));
         thread_manager
@@ -401,22 +590,20 @@ impl MessageProcessor {
             outgoing.clone(),
             config_manager.clone(),
             thread_manager.clone(),
+            applied_mcp_config_identity.clone(),
             analytics_events_client.clone(),
         );
-        let on_effective_plugins_changed =
-            crate::effective_plugin_change::effective_plugins_changed_callback(
-                auth_manager.clone(),
-                Arc::clone(&thread_manager),
-                config_manager.clone(),
-                config_processor.clone(),
-                request_serialization_queues.clone(),
-            );
+        // Account tasks capture processor clones, so their strong census must
+        // remain outside that cloneable object.
+        let account_tasks = crate::processor_task_retirement::ProcessorTasks::default();
         let account_processor = AccountRequestProcessor::new(
             auth_manager.clone(),
             Arc::clone(&thread_manager),
             outgoing.clone(),
             Arc::clone(&config),
             config_manager.clone(),
+            applied_mcp_config_identity.clone(),
+            account_tasks.ticket(),
         );
         let apps_processor = AppsRequestProcessor::new(
             auth_manager.clone(),
@@ -431,7 +618,7 @@ impl MessageProcessor {
             Arc::clone(&thread_manager),
             Arc::clone(&config),
             config_manager.clone(),
-            model_catalog,
+            Arc::clone(&model_catalog),
         );
         let command_exec_processor = CommandExecRequestProcessor::new(
             arg0_paths.clone(),
@@ -462,6 +649,59 @@ impl MessageProcessor {
             rpc_transport,
             Arc::clone(&user_verification),
         );
+        let managed_transition_control_socket_endpoint = managed_transition_control_socket_endpoint
+            .unwrap_or_else(|| {
+                crate::transport::app_server_control_socket_path(&config.codex_home)
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default()
+            });
+        let reset_inventory: Arc<dyn crate::managed_transition::ResetInventory> =
+            Arc::new(crate::managed_reset::ProductionResetInventory {
+                telemetry_reset,
+                config_manager: config_manager.clone(),
+                chatgpt_base_url: config.chatgpt_base_url.clone(),
+                thread_manager: Arc::clone(&thread_manager),
+                models_refresh_worker: Arc::clone(&models_refresh_worker),
+                model_catalog: Arc::clone(&model_catalog),
+                http_client_factory: config.http_client_factory(),
+                auth_manager: Arc::clone(&auth_manager),
+                remote_control_handle: remote_control_handle.clone(),
+            });
+        let authoritative_auth =
+            crate::managed_transition::AuthoritativeAuthState::from_auth_manager(&auth_manager);
+        let target_evidence_source =
+            Arc::new(crate::managed_transition::ProcessTargetEvidenceSource::new(
+                managed_transition_control_socket_endpoint,
+            ));
+        let managed_transition_coordinator = match managed_transition_process_instance_id {
+            Some(process_instance_id) => crate::managed_transition::ManagedTransitionCoordinator::with_adoption_account_projection_and_process_instance(
+                authoritative_auth,
+                target_evidence_source,
+                process_instance_id,
+                Arc::clone(&auth_manager),
+                reset_inventory,
+                Arc::clone(&outgoing),
+            ),
+            None => crate::managed_transition::ManagedTransitionCoordinator::with_adoption_and_account_projection(
+                authoritative_auth,
+                target_evidence_source,
+                Arc::clone(&auth_manager),
+                reset_inventory,
+                Arc::clone(&outgoing),
+            ),
+        };
+        let managed_transition_coordinator = managed_transition_coordinator
+            .with_account_work(account_work_permits, account_turn_work);
+        let on_effective_plugins_changed =
+            crate::effective_plugin_change::effective_plugins_changed_callback(
+                auth_manager.clone(),
+                Arc::clone(&thread_manager),
+                config_manager.clone(),
+                config_processor.clone(),
+                request_serialization_queues.clone(),
+                auxiliary_tasks.clone(),
+                managed_transition_coordinator.account_work_permits(),
+            );
         let marketplace_processor = MarketplaceRequestProcessor::new(
             Arc::clone(&config),
             config_manager.clone(),
@@ -473,6 +713,9 @@ impl MessageProcessor {
             thread_state_manager.clone(),
             outgoing.clone(),
             config_manager.clone(),
+            applied_mcp_config_identity.clone(),
+            auxiliary_tasks.clone(),
+            control_endpoint.clone(),
         );
         let plugin_processor = PluginRequestProcessor::new(
             auth_manager.clone(),
@@ -480,7 +723,9 @@ impl MessageProcessor {
             outgoing.clone(),
             analytics_events_client.clone(),
             config_manager.clone(),
+            applied_mcp_config_identity,
             on_effective_plugins_changed,
+            auxiliary_tasks.clone(),
         );
         let remote_control_processor = RemoteControlRequestProcessor::new(remote_control_handle);
         let search_processor = SearchRequestProcessor::new(outgoing.clone());
@@ -523,6 +768,7 @@ impl MessageProcessor {
             Arc::clone(&skills_watcher),
             turn_cost_worker.as_ref().map(TurnCostWorker::handle),
             config_warnings,
+            control_endpoint,
         );
         let turn_processor = TurnRequestProcessor::new(
             auth_manager,
@@ -532,7 +778,7 @@ impl MessageProcessor {
             Arc::clone(&config),
             config_manager.clone(),
             pending_thread_unloads,
-            thread_state_manager,
+            thread_state_manager.clone(),
             thread_watch_manager,
             Arc::clone(&skills_watcher),
             turn_cost_worker.as_ref().map(TurnCostWorker::handle),
@@ -585,10 +831,12 @@ impl MessageProcessor {
             turn_admission,
             user_verification,
             outgoing,
+            thread_manager,
             models_refresh_worker,
             turn_cost_worker,
             skills_watcher,
             account_processor,
+            account_tasks,
             apps_processor,
             catalog_processor,
             command_exec_processor,
@@ -600,6 +848,7 @@ impl MessageProcessor {
             fs_processor,
             git_processor,
             initialize_processor,
+            managed_transition_coordinator,
             marketplace_processor,
             mcp_processor,
             plugin_processor,
@@ -609,17 +858,27 @@ impl MessageProcessor {
             thread_goal_processor,
             thread_queue_processor,
             thread_processor,
+            thread_state_manager,
             turn_processor,
             windows_sandbox_processor,
             request_serialization_queues,
+            auxiliary_tasks,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn thread_manager_for_tests(&self) -> &Arc<ThreadManager> {
+        &self.thread_manager
     }
 
     pub(crate) fn clear_runtime_references(&self) {
         self.account_processor.clear_external_auth();
         self.apps_processor.shutdown();
-        self.models_refresh_worker.shutdown();
+        if let Ok(worker) = self.models_refresh_worker.try_lock() {
+            worker.shutdown();
+        }
         self.skills_watcher.shutdown();
+        let _ = self.auxiliary_tasks.close_registration();
     }
 
     pub(crate) async fn process_request(
@@ -799,6 +1058,12 @@ impl MessageProcessor {
         }
     }
 
+    pub(crate) async fn reconcile_incomplete_clear_transitions(&self) {
+        self.thread_processor
+            .reconcile_incomplete_clear_transitions()
+            .await;
+    }
+
     pub(crate) async fn send_initialize_notifications_to_connection(
         &self,
         connection_id: ConnectionId,
@@ -812,6 +1077,8 @@ impl MessageProcessor {
         &self,
         connection_id: ConnectionId,
         request_attestation: bool,
+        trusted_interactive: bool,
+        retention_principal: Option<RetentionPrincipalId>,
     ) {
         self.account_processor
             .notify_workspace_routing_to_connection(connection_id);
@@ -820,9 +1087,81 @@ impl MessageProcessor {
                 connection_id,
                 ConnectionCapabilities {
                     request_attestation,
+                    trusted_interactive,
+                    retention_principal,
                 },
             )
             .await;
+    }
+
+    async fn thread_retention_acquire(
+        &self,
+        params: ThreadRetentionAcquireParams,
+        authority: RetentionAcquireAuthority,
+    ) -> Result<ThreadRetentionAcquireResponse, JSONRPCErrorError> {
+        let principal = match retention_principal_or_refusal(authority) {
+            Ok(principal) => principal,
+            Err(reason) => return Ok(ThreadRetentionAcquireResponse::Refused { reason }),
+        };
+        let Ok(thread_id) = ThreadId::from_string(&params.thread_id) else {
+            return Ok(ThreadRetentionAcquireResponse::Refused {
+                reason: ThreadRetentionRefusalReason::InvalidThreadId,
+            });
+        };
+        match self
+            .thread_state_manager
+            .acquire_retention(thread_id, principal)
+            .await
+        {
+            Ok(RetentionAcquireOutcome::Acquired { grant_id }) => {
+                Ok(ThreadRetentionAcquireResponse::Acquired {
+                    grant_id: grant_id.into_wire(),
+                })
+            }
+            Ok(RetentionAcquireOutcome::AlreadyHeld { grant_id }) => {
+                Ok(ThreadRetentionAcquireResponse::AlreadyHeld {
+                    grant_id: grant_id.into_wire(),
+                })
+            }
+            Err(error) => Ok(ThreadRetentionAcquireResponse::Refused {
+                reason: retention_refusal_reason(error),
+            }),
+        }
+    }
+
+    async fn thread_retention_release(
+        &self,
+        params: ThreadRetentionReleaseParams,
+        authority: RetentionAcquireAuthority,
+    ) -> Result<ThreadRetentionReleaseResponse, JSONRPCErrorError> {
+        let principal = match retention_principal_or_refusal(authority) {
+            Ok(principal) => principal,
+            Err(reason) => return Ok(ThreadRetentionReleaseResponse::Refused { reason }),
+        };
+        let Ok(thread_id) = ThreadId::from_string(&params.thread_id) else {
+            return Ok(ThreadRetentionReleaseResponse::Refused {
+                reason: ThreadRetentionRefusalReason::InvalidThreadId,
+            });
+        };
+        // Preserve the opaque-handle outcome matrix: an unrecognized handle
+        // is not distinguishable from any other nonmatching handle.
+        let grant_id = RetentionGrantId::from_wire(&params.grant_id);
+        match self
+            .thread_state_manager
+            .release_retention(thread_id, principal, &grant_id)
+            .await
+        {
+            Ok(RetentionReleaseOutcome::Released) => {
+                Ok(ThreadRetentionReleaseResponse::Released {})
+            }
+            Ok(RetentionReleaseOutcome::NotHeld) => Ok(ThreadRetentionReleaseResponse::NotHeld {}),
+            Ok(RetentionReleaseOutcome::GrantMismatch) => {
+                Ok(ThreadRetentionReleaseResponse::GrantMismatch {})
+            }
+            Err(error) => Ok(ThreadRetentionReleaseResponse::Refused {
+                reason: retention_refusal_reason(error),
+            }),
+        }
     }
 
     pub(crate) async fn send_initialize_notifications(&self) {
@@ -842,15 +1181,65 @@ impl MessageProcessor {
     }
 
     pub(crate) async fn drain_background_tasks(&self) {
-        self.models_refresh_worker.shutdown();
+        self.models_refresh_worker.lock().await.shutdown();
         if let Some(worker) = &self.turn_cost_worker {
             worker.shutdown();
         }
         self.thread_processor.drain_background_tasks().await;
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the worker lock prevents replacement while shutdown observes its retained join"
+    )]
+    async fn shutdown_models_refresh_worker_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> crate::models_refresh_worker::ModelsRefreshShutdown {
+        let Ok(worker) = tokio::time::timeout_at(deadline, self.models_refresh_worker.lock()).await
+        else {
+            return crate::models_refresh_worker::ModelsRefreshShutdown::TimedOut;
+        };
+        worker.shutdown_until(deadline).await
+    }
+
+    /// Independent terminal observations under one caller-owned deadline.
+    /// Request dispatch must already be stopped before taking this census.
+    /// Each task family has its own census. None substitutes for the separate
+    /// thread/runtime and connection-close cleanup receipts.
+    pub(crate) async fn drain_background_tasks_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> ProcessorBackgroundShutdown {
+        let plugins_manager = self.thread_manager.plugins_manager();
+        let (models, thread_starts, apps, skills, plugins, auxiliary_tasks) = tokio::join!(
+            self.shutdown_models_refresh_worker_until(deadline),
+            self.thread_processor.drain_background_tasks_until(deadline),
+            self.apps_processor.shutdown_until(deadline),
+            self.skills_watcher.shutdown_until(deadline),
+            plugins_manager.shutdown_until(deadline),
+            self.auxiliary_tasks.shutdown_until(deadline),
+        );
+        ProcessorBackgroundShutdown {
+            models,
+            thread_starts,
+            apps,
+            skills,
+            plugins,
+            auxiliary_tasks,
+        }
+    }
+
     pub(crate) async fn cancel_active_login(&self) {
         self.account_processor.cancel_active_login().await;
+    }
+
+    pub(crate) fn begin_login_shutdown(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> std::io::Result<crate::request_processors::AccountLoginShutdown> {
+        self.account_processor
+            .begin_login_shutdown(deadline, &self.account_tasks)
     }
 
     pub(crate) async fn clear_all_thread_listeners(&self) {
@@ -859,6 +1248,17 @@ impl MessageProcessor {
 
     pub(crate) async fn shutdown_threads(&self) {
         self.thread_processor.shutdown_threads().await;
+    }
+
+    /// Establish permanent thread shutdown custody before the host's first wait.
+    pub(crate) fn begin_thread_shutdown(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<
+        crate::request_processors::ProcessorThreadRetirement,
+        codex_core::ThreadManagerRetirementError,
+    > {
+        self.thread_processor.begin_thread_shutdown(deadline)
     }
 
     pub(crate) async fn connection_closed(
@@ -946,8 +1346,13 @@ impl MessageProcessor {
                 )
                 .await?;
             if connection_initialized {
-                self.connection_initialized(connection_id, session.request_attestation())
-                    .await;
+                self.connection_initialized(
+                    connection_id,
+                    session.request_attestation(),
+                    session.trusted_interactive(),
+                    session.retention_principal(),
+                )
+                .await;
             }
             return Ok(());
         }
@@ -977,6 +1382,28 @@ impl MessageProcessor {
         {
             return Err(invalid_request(experimental_required_message(reason)));
         }
+
+        // Classified and gated before any per-request bookkeeping, auth
+        // capture, or provider effect (`CODEX-I05-S03-R009`, `R010`). Only
+        // `Permit`-classified requests need a permit at all; classification
+        // is a plain exhaustive match with no lock or I/O
+        // (`crate::account_dependency::classify`). A closed barrier refuses
+        // here, synchronously, without queueing or spawning the request --
+        // silently deferring it would violate R010's "never queue or
+        // reroute" requirement.
+        let account_work_permit = match classify(&codex_request) {
+            AccountDependency::Permit => {
+                match self
+                    .managed_transition_coordinator
+                    .try_acquire_account_work_permit()
+                {
+                    Some(guard) => Some(guard),
+                    None => return Err(account_transition_in_progress()),
+                }
+            }
+            AccountDependency::Independent => None,
+        };
+
         let connection_id = connection_request_id.connection_id;
         self.initialize_processor.track_initialized_request(
             connection_id,
@@ -986,6 +1413,7 @@ impl MessageProcessor {
 
         let (turn_admission, recheck_turn_admission) = match &codex_request {
             ClientRequest::ThreadStart { .. }
+            | ClientRequest::ThreadClear { .. }
             | ClientRequest::ThreadFork { .. }
             | ClientRequest::ThreadResume { .. }
             | ClientRequest::ThreadRevert { .. }
@@ -1009,12 +1437,27 @@ impl MessageProcessor {
             ClientRequest::McpServerEventStreamStart { params, .. } => Some(
                 session
                     .mcp_event_streams
-                    .start(connection_id, params.clone(), self.mcp_processor.clone())
+                    .start(
+                        connection_id,
+                        params.clone(),
+                        self.mcp_processor.clone(),
+                        // This spawn precedes within_request; capture from the
+                        // actual request permit, not an absent task-local scope.
+                        account_work_permit
+                            .as_ref()
+                            .map(codex_mcp::McpAttemptWork::derive_attempt)
+                            .transpose()
+                            .map_err(|_| account_transition_in_progress())?,
+                    )
                     .await?,
             ),
             _ => None,
         };
         let serialization_scope = codex_request.serialization_scope();
+        // Extracted here, before the request is queued and moved into the
+        // async block below -- server-established at dispatch time, never re-derived
+        // from caller-supplied data (`CODEX-I05-S02-R005`).
+        let managed_transition_caller_authorized = session.managed_transition_caller_authorized();
         let error_request_id = connection_request_id.clone();
         let rpc_gate = Arc::clone(&session.rpc_gate);
         let processor = Arc::clone(self);
@@ -1029,15 +1472,22 @@ impl MessageProcessor {
                     processor.outgoing.send_error(error_request_id, error).await;
                     return;
                 }
+                // Keep request admission through its effects. Each inline turn
+                // start derives separate custody that survives RPC completion
+                // and the session IO hop (`CODEX-I05-S03-R009`).
                 let processor_for_request = Arc::clone(&processor);
                 // Keep queued requests small to avoid large stack temporaries during construction.
-                let result = Box::pin(processor_for_request.handle_initialized_client_request(
-                    connection_request_id,
-                    codex_request,
-                    request_context,
-                    session,
-                    event_stream_ready,
-                ))
+                let result = crate::account_turn_admission::within_request(
+                    account_work_permit,
+                    processor_for_request.handle_initialized_client_request(
+                        connection_request_id,
+                        codex_request,
+                        request_context,
+                        session,
+                        event_stream_ready,
+                        managed_transition_caller_authorized,
+                    ),
+                )
                 .await;
                 if let Err(error) = result {
                     processor.outgoing.send_error(error_request_id, error).await;
@@ -1059,16 +1509,164 @@ impl MessageProcessor {
         Ok(())
     }
 
-    async fn handle_initialized_client_request(
+    // Return before polling any branch so construction temporaries do not
+    // add another async frame below session construction in debug builds.
+    #[inline(never)]
+    fn handle_initialized_client_request(
         self: Arc<Self>,
         connection_request_id: ConnectionRequestId,
         codex_request: ClientRequest,
         request_context: RequestContext,
         session: Arc<ConnectionSessionState>,
         event_stream_ready: Option<McpEventStreamReady>,
+        managed_transition_caller_authorized: bool,
+    ) -> BoxFuture<'static, Result<(), JSONRPCErrorError>> {
+        // Clear, resume, fork and revert construct sessions inline. Select them before polling
+        // the general dispatcher, which has a multi-MiB debug poll frame.
+        // Every path stays inside the same serialized, account-admitted request task.
+        match codex_request {
+            ClientRequest::ThreadClear { request_id, params } => {
+                Box::pin(async move {
+                    // Preserve the original request inputs' lifetime even though
+                    // clear does not read them. Cancellation drops them with this future.
+                    let _request_context = request_context;
+                    let _session = session;
+                    let _event_stream_ready = event_stream_ready;
+                    let request_id = ConnectionRequestId {
+                        connection_id: connection_request_id.connection_id,
+                        request_id,
+                    };
+                    match self
+                        .thread_processor
+                        .thread_clear(request_id.clone(), params)
+                        .await
+                    {
+                        Ok(Some(response)) => {
+                            self.outgoing.send_response_as(request_id, response).await;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            self.outgoing.send_error(request_id, error).await;
+                        }
+                    }
+                    Ok(())
+                })
+            }
+            ClientRequest::ThreadResume { request_id, params } => Box::pin(async move {
+                let _request_context = request_context;
+                let _event_stream_ready = event_stream_ready;
+                let app_server_client_name = session.app_server_client_name().map(str::to_string);
+                let client_version = session.client_version().map(str::to_string);
+                let client_mcp_extensions = session.client_mcp_extensions();
+                let request_id = ConnectionRequestId {
+                    connection_id: connection_request_id.connection_id,
+                    request_id,
+                };
+                match self
+                    .thread_processor
+                    .thread_resume(
+                        ThreadResumeTarget::Client(request_id.clone()),
+                        params,
+                        app_server_client_name,
+                        client_version,
+                        client_mcp_extensions,
+                    )
+                    .await
+                {
+                    Ok(Some(response)) => {
+                        self.outgoing.send_response_as(request_id, response).await;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.outgoing.send_error(request_id, error).await;
+                    }
+                }
+                Ok(())
+            }),
+            ClientRequest::ThreadFork { request_id, params } => Box::pin(async move {
+                let _request_context = request_context;
+                let _event_stream_ready = event_stream_ready;
+                let app_server_client_name = session.app_server_client_name().map(str::to_string);
+                let client_version = session.client_version().map(str::to_string);
+                let client_mcp_extensions = session.client_mcp_extensions();
+                let request_id = ConnectionRequestId {
+                    connection_id: connection_request_id.connection_id,
+                    request_id,
+                };
+                match self
+                    .thread_processor
+                    .thread_fork(
+                        request_id.clone(),
+                        params,
+                        app_server_client_name,
+                        client_version,
+                        client_mcp_extensions,
+                    )
+                    .await
+                {
+                    Ok(Some(response)) => {
+                        self.outgoing.send_response_as(request_id, response).await;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.outgoing.send_error(request_id, error).await;
+                    }
+                }
+                Ok(())
+            }),
+            ClientRequest::ThreadRevert { request_id, params } => Box::pin(async move {
+                let _request_context = request_context;
+                let _event_stream_ready = event_stream_ready;
+                let app_server_client_name = session.app_server_client_name().map(str::to_string);
+                let client_version = session.client_version().map(str::to_string);
+                let request_id = ConnectionRequestId {
+                    connection_id: connection_request_id.connection_id,
+                    request_id,
+                };
+                match self
+                    .thread_processor
+                    .thread_revert(
+                        request_id.clone(),
+                        params,
+                        app_server_client_name,
+                        client_version,
+                    )
+                    .await
+                {
+                    Ok(Some(response)) => {
+                        self.outgoing.send_response_as(request_id, response).await;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.outgoing.send_error(request_id, error).await;
+                    }
+                }
+                Ok(())
+            }),
+            request => Box::pin(self.handle_general_initialized_client_request(
+                connection_request_id,
+                request,
+                request_context,
+                session,
+                event_stream_ready,
+                managed_transition_caller_authorized,
+            )),
+        }
+    }
+
+    async fn handle_general_initialized_client_request(
+        self: Arc<Self>,
+        connection_request_id: ConnectionRequestId,
+        codex_request: ClientRequest,
+        request_context: RequestContext,
+        session: Arc<ConnectionSessionState>,
+        event_stream_ready: Option<McpEventStreamReady>,
+        managed_transition_caller_authorized: bool,
     ) -> Result<(), JSONRPCErrorError> {
         let connection_id = connection_request_id.connection_id;
         let app_server_client_name = session.app_server_client_name().map(str::to_string);
+        let _retention_principal = session.retention_principal();
+        let retention_acquire_authority = session.retention_acquire_authority();
         let client_version = session.client_version().map(str::to_string);
         let client_mcp_extensions = session.client_mcp_extensions();
         let request_id = ConnectionRequestId {
@@ -1295,27 +1893,37 @@ impl MessageProcessor {
                 }
                 Ok(response)
             }
-            ClientRequest::ThreadResume { params, .. } => {
+            ClientRequest::ThreadClear { .. } => {
+                unreachable!("clear is handled before entering the general dispatcher")
+            }
+            ClientRequest::ThreadInteractiveSubscriptionList { params, .. } => {
                 self.thread_processor
-                    .thread_resume(
-                        ThreadResumeTarget::Client(request_id.clone()),
-                        params,
-                        app_server_client_name.clone(),
-                        client_version.clone(),
-                        client_mcp_extensions.clone(),
-                    )
+                    .thread_interactive_subscription_list(params)
                     .await
             }
-            ClientRequest::ThreadFork { params, .. } => {
-                self.thread_processor
-                    .thread_fork(
-                        request_id.clone(),
-                        params,
-                        app_server_client_name.clone(),
-                        client_version.clone(),
-                        client_mcp_extensions.clone(),
-                    )
-                    .await
+            ClientRequest::ThreadClearRead { params, .. } => self
+                .thread_processor
+                .thread_clear_read(params)
+                .await
+                .map(|response| Some(response.into())),
+            ClientRequest::ThreadClearRecoveryRead { params, .. } => self
+                .thread_processor
+                .thread_clear_recovery_read(params)
+                .await
+                .map(|response| Some(response.into())),
+            ClientRequest::ThreadRetentionAcquire { params, .. } => self
+                .thread_retention_acquire(params, retention_acquire_authority)
+                .await
+                .map(|response| Some(response.into())),
+            ClientRequest::ThreadRetentionRelease { params, .. } => self
+                .thread_retention_release(params, retention_acquire_authority)
+                .await
+                .map(|response| Some(response.into())),
+            ClientRequest::ThreadResume { .. } => {
+                unreachable!("resume is selected before polling the general dispatcher")
+            }
+            ClientRequest::ThreadFork { .. } => {
+                unreachable!("fork is selected before polling the general dispatcher")
             }
             ClientRequest::ThreadArchive { params, .. } => {
                 self.thread_processor
@@ -1454,15 +2062,8 @@ impl MessageProcessor {
                     .thread_background_terminals_terminate(params)
                     .await
             }
-            ClientRequest::ThreadRevert { params, .. } => {
-                self.thread_processor
-                    .thread_revert(
-                        request_id.clone(),
-                        params,
-                        app_server_client_name.clone(),
-                        client_version.clone(),
-                    )
-                    .await
+            ClientRequest::ThreadRevert { .. } => {
+                unreachable!("revert is selected by the synchronous request factory")
             }
             ClientRequest::ThreadList { params, .. } => {
                 self.thread_processor.thread_list(params).await
@@ -1685,6 +2286,9 @@ impl MessageProcessor {
             ClientRequest::McpServerRefresh { params, .. } => {
                 self.mcp_processor.mcp_server_refresh(params).await
             }
+            ClientRequest::McpServerConfigIdentity { params, .. } => {
+                self.mcp_processor.mcp_server_config_identity(params).await
+            }
             ClientRequest::McpServerStatusList { params, .. } => {
                 self.mcp_processor
                     .mcp_server_status_list(&request_id, params)
@@ -1772,6 +2376,24 @@ impl MessageProcessor {
             ClientRequest::CancelLoginAccount { params, .. } => {
                 self.account_processor.cancel_login_account(params).await
             }
+            ClientRequest::ManagedTransitionStart { params, .. } => Ok(Some(
+                self.managed_transition_coordinator
+                    .start_dispatch(params, managed_transition_caller_authorized)
+                    .await
+                    .into(),
+            )),
+            ClientRequest::ManagedTransitionRead { params, .. } => Ok(Some(
+                self.managed_transition_coordinator
+                    .read_dispatch(params, managed_transition_caller_authorized)
+                    .await
+                    .into(),
+            )),
+            ClientRequest::ManagedTransitionCancel { params, .. } => Ok(Some(
+                self.managed_transition_coordinator
+                    .cancel_dispatch(params, managed_transition_caller_authorized)
+                    .await
+                    .into(),
+            )),
             ClientRequest::GetAccount { params, .. } => {
                 self.account_processor.get_account(params).await
             }
@@ -1887,3 +2509,45 @@ mod message_processor_tracing_tests;
 #[cfg(test)]
 #[path = "message_processor_gateway_oauth_tests.rs"]
 mod gateway_oauth_tests;
+#[cfg(test)]
+mod retention_authority_tests {
+    use super::ClientMcpExtensions;
+    use super::ConnectionSessionState;
+    use super::InitializedConnectionSessionState;
+    use super::RetentionAcquireAuthority;
+    use super::retention_principal_or_refusal;
+    use crate::thread_state::RetentionPrincipalId;
+    use crate::transport::ConnectionProvenance;
+    use codex_app_server_protocol::ThreadRetentionRefusalReason;
+    use std::collections::HashSet;
+
+    #[test]
+    fn initialized_provenanced_connection_without_owner_classification_refuses() {
+        let session = ConnectionSessionState::with_provenance(
+            crate::transport::ConnectionOrigin::InProcess,
+            ConnectionProvenance::InProcess,
+            RetentionPrincipalId::unclassified(),
+        );
+        session
+            .initialize(InitializedConnectionSessionState {
+                experimental_api_enabled: true,
+                opted_out_notification_methods: HashSet::new(),
+                app_server_client_name: "test".to_string(),
+                client_version: "0.0.0".to_string(),
+                request_attestation: true,
+                interactive_client_requested: true,
+                client_mcp_extensions: ClientMcpExtensions::default(),
+            })
+            .expect("test session initializes once");
+
+        assert!(matches!(
+            session.retention_acquire_authority(),
+            RetentionAcquireAuthority::Unavailable
+        ));
+        assert_eq!(session.retention_principal(), None);
+        assert_eq!(
+            retention_principal_or_refusal(session.retention_acquire_authority()),
+            Err(ThreadRetentionRefusalReason::AuthorityUnavailable)
+        );
+    }
+}

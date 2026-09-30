@@ -12,6 +12,8 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::retirement::ManagedRunningService;
+use crate::retirement::RmcpClientRetirement;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -51,11 +53,8 @@ use rmcp::model::RequestParamsMeta;
 use rmcp::model::ServerPeerInfo;
 use rmcp::model::ServerResult;
 use rmcp::model::Tool;
-use rmcp::service::ClientCacheConfig;
-use rmcp::service::ClientServiceExt;
 use rmcp::service::RequestHandle;
 use rmcp::service::RoleClient;
-use rmcp::service::RunningService;
 use rmcp::service::ServiceError;
 use rmcp::transport::AuthorizationManager;
 use rmcp::transport::StreamableHttpClientTransport;
@@ -74,7 +73,6 @@ use tracing::instrument;
 use tracing::warn;
 
 use crate::elicitation_client_service::ElicitationClientService;
-use crate::event_notification_transport::capture_event_notifications;
 use crate::event_notification_transport::event_notification_channel;
 use crate::http_client_adapter::StreamableHttpClientAdapter;
 use crate::http_client_adapter::StreamableHttpClientAdapterError;
@@ -96,15 +94,17 @@ use crate::protocol_mode::McpProtocolMode;
 use crate::startup_error::is_authentication_required_error;
 use crate::stdio_server_launcher::StdioServerCommand;
 use crate::stdio_server_launcher::StdioServerLauncher;
-use crate::stdio_server_launcher::StdioServerProcessHandle;
 use crate::stdio_server_launcher::StdioServerTransport;
 use crate::utils::build_default_headers;
 use codex_config::types::OAuthCredentialsStoreMode;
 
+#[path = "pending_transport.rs"]
+mod pending_transport;
 #[path = "streamable_http_retry.rs"]
 mod streamable_http_retry;
 
-use self::streamable_http_retry::HandshakeError;
+use self::pending_transport::PendingConnection;
+
 use self::streamable_http_retry::STREAMABLE_HTTP_RETRY_DELAYS_MS;
 use self::streamable_http_retry::sleep_with_retry_deadline;
 
@@ -131,10 +131,10 @@ enum PendingTransport {
 
 enum ClientState {
     Connecting {
-        transport: Option<PendingTransport>,
+        transport: Option<PendingConnection>,
     },
     Ready {
-        service: Arc<RunningService<RoleClient, ElicitationClientService>>,
+        service: Arc<ManagedRunningService>,
         oauth: Option<OAuthRuntime>,
     },
     Closed,
@@ -395,17 +395,89 @@ pub struct CancellableEventStreamRequest {
     pub notifications: crate::EventNotificationReceiver,
 }
 
+/// Narrow, state-independent handle to a physical connection that was just
+/// (re-)established, given to a [`PostReconnectHook`] so it can send one
+/// request against that specific connection without touching
+/// [`RmcpClient`]'s shared state. `RmcpClient::state` is deliberately not
+/// yet updated to reflect this connection as `Ready` while the hook runs
+/// (see `reinitialize_after_session_expiry`), so routing the hook's send
+/// through the normal `self.state`-reading path would both be logically
+/// wrong (it could read the previous, expired connection) and would
+/// deadlock (`state` is a non-reentrant lock held by the caller across the
+/// hook's `.await` in spirit, even though not literally locked — the
+/// invariant is "no other code touches this connection until the hook
+/// decides it").
+pub struct ReconnectContext {
+    service: Arc<ManagedRunningService>,
+    elicitation_pause_state: ElicitationPauseState,
+}
+
+impl ReconnectContext {
+    /// Sends one custom JSON-RPC request directly on this physical
+    /// connection, bypassing `RmcpClient`'s connection-state lookup and
+    /// session-expiry retry machinery (recovery is already in progress;
+    /// retrying it here would re-enter `reinitialize_after_session_expiry`).
+    pub async fn send_custom_request(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+        timeout: Option<Duration>,
+    ) -> Result<ServerResult> {
+        let service = Arc::clone(&self.service);
+        RmcpClient::run_service_operation_once(
+            service,
+            "requests/custom",
+            timeout,
+            self.elicitation_pause_state.clone(),
+            &move |service| {
+                let params = params.clone();
+                async move {
+                    service
+                        .send_request(ClientRequest::CustomRequest(
+                            crate::trace_context::traced_custom_request(method, params),
+                        ))
+                        .await
+                }
+                .boxed()
+            },
+        )
+        .await
+        .map_err(Into::into)
+    }
+}
+
+/// Runs after a physical connection is (re-)established but before it is
+/// published as usable, so it can perform any additional handshake this
+/// connection requires — e.g. binding a capability-gated identity — before
+/// any provider operation is admitted. Returning `Err` makes the
+/// connection permanently unusable; the caller must obtain a fresh one.
+/// `None` (the default for every `RmcpClient`) is a complete no-op: no
+/// extra request, no extra latency, no behavior change for ordinary
+/// connections that never opt in.
+pub type PostReconnectHook = Box<
+    dyn for<'a> Fn(&'a ReconnectContext, &'a ServerPeerInfo) -> BoxFuture<'a, Result<()>>
+        + Send
+        + Sync,
+>;
+
 /// MCP client implemented on top of the official `rmcp` SDK.
 /// https://github.com/modelcontextprotocol/rust-sdk
 pub struct RmcpClient {
     state: Mutex<ClientState>,
-    stdio_process: Option<StdioServerProcessHandle>,
+    retirement: RmcpClientRetirement,
     transport_recipe: TransportRecipe,
     protocol_mode: McpProtocolMode,
     requires_read_only_tools: bool,
     initialize_context: Mutex<Option<InitializeContext>>,
     session_recovery_lock: Semaphore,
     elicitation_pause_state: ElicitationPauseState,
+    /// Invoked only from the internal session-expiry recovery path in
+    /// `reinitialize_after_session_expiry`. Startup binding is a separate,
+    /// explicit responsibility of the caller (`codex-mcp` calls its own
+    /// bind logic directly after `initialize()` returns, before ever
+    /// installing this hook) — this field does not participate in startup.
+    /// `None` for every ordinary connection.
+    post_reconnect_hook: Option<PostReconnectHook>,
 }
 
 impl RmcpClient {
@@ -427,11 +499,31 @@ impl RmcpClient {
         self.protocol_mode
     }
 
+    /// Installs a hook that must succeed after every future session-expiry
+    /// recovery on this client before the recovered connection is usable.
+    /// Consuming builder, matching this crate's existing constructor style;
+    /// call before the client is shared. A `None`/never-called client (the
+    /// default) never allocates or invokes anything extra.
+    #[must_use]
+    pub fn with_post_reconnect_hook(mut self, hook: PostReconnectHook) -> Self {
+        self.post_reconnect_hook = Some(hook);
+        self
+    }
+
     pub async fn new_in_process_client(
         factory: Arc<dyn InProcessTransportFactory>,
     ) -> io::Result<Self> {
+        Self::new_in_process_client_in_retirement(factory, RmcpClientRetirement::default()).await
+    }
+
+    /// Use an owner allocated before construction so cancellation cannot erase
+    /// this attempt from the owning runtime's retirement census.
+    pub async fn new_in_process_client_in_retirement(
+        factory: Arc<dyn InProcessTransportFactory>,
+        retirement: RmcpClientRetirement,
+    ) -> io::Result<Self> {
         let transport_recipe = TransportRecipe::InProcess { factory };
-        let transport = Self::create_pending_transport(&transport_recipe)
+        let transport = Self::create_registered_transport(&transport_recipe, &retirement)
             .await
             .map_err(io::Error::other)?;
 
@@ -439,13 +531,14 @@ impl RmcpClient {
             state: Mutex::new(ClientState::Connecting {
                 transport: Some(transport),
             }),
-            stdio_process: None,
+            retirement,
             transport_recipe,
             protocol_mode: McpProtocolMode::Legacy,
             requires_read_only_tools: false,
             initialize_context: Mutex::new(None),
             session_recovery_lock: Semaphore::new(/*permits*/ 1),
             elicitation_pause_state: ElicitationPauseState::new(),
+            post_reconnect_hook: None,
         })
     }
 
@@ -474,11 +567,36 @@ impl RmcpClient {
     pub async fn new_stdio_client_with_protocol_mode(
         program: OsString,
         args: Vec<OsString>,
+        env: Option<HashMap<OsString, OsString>>,
+        env_vars: &[McpServerEnvVar],
+        cwd: Option<String>,
+        launcher: Arc<dyn StdioServerLauncher>,
+        protocol_mode: McpProtocolMode,
+    ) -> io::Result<Self> {
+        Self::new_stdio_client_in_retirement(
+            program,
+            args,
+            env,
+            env_vars,
+            cwd,
+            launcher,
+            protocol_mode,
+            RmcpClientRetirement::default(),
+        )
+        .await
+    }
+
+    /// Construct a stdio attempt inside an already-retained runtime owner.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_stdio_client_in_retirement(
+        program: OsString,
+        args: Vec<OsString>,
         mut env: Option<HashMap<OsString, OsString>>,
         env_vars: &[McpServerEnvVar],
         cwd: Option<String>,
         launcher: Arc<dyn StdioServerLauncher>,
         protocol_mode: McpProtocolMode,
+        retirement: RmcpClientRetirement,
     ) -> io::Result<Self> {
         let requested_stdio_version = match protocol_mode {
             McpProtocolMode::Legacy => None,
@@ -498,28 +616,22 @@ impl RmcpClient {
             ),
             launcher,
         };
-        let transport = Self::create_pending_transport(&transport_recipe)
+        let transport = Self::create_registered_transport(&transport_recipe, &retirement)
             .await
             .map_err(io::Error::other)?;
-        let stdio_process = match &transport {
-            PendingTransport::Stdio { transport } => Some(transport.process_handle()),
-            PendingTransport::InProcess { .. }
-            | PendingTransport::StreamableHttp { .. }
-            | PendingTransport::StreamableHttpWithOAuth { .. }
-            | PendingTransport::StreamableHttpWithAccessTokenOnly { .. } => None,
-        };
 
         Ok(Self {
             state: Mutex::new(ClientState::Connecting {
                 transport: Some(transport),
             }),
-            stdio_process,
+            retirement,
             transport_recipe,
             protocol_mode,
             initialize_context: Mutex::new(None),
             requires_read_only_tools: false,
             session_recovery_lock: Semaphore::new(/*permits*/ 1),
             elicitation_pause_state: ElicitationPauseState::new(),
+            post_reconnect_hook: None,
         })
     }
 
@@ -598,6 +710,43 @@ impl RmcpClient {
         redirect_mode: StreamableHttpRedirectMode,
         oauth_refresh_mode: McpOAuthRefreshMode,
     ) -> Result<Self> {
+        Self::new_streamable_http_client_in_retirement(
+            server_name,
+            url,
+            bearer_token,
+            http_headers,
+            env_http_headers,
+            oauth_config,
+            store_mode,
+            keyring_backend_kind,
+            http_client,
+            auth_provider,
+            protocol_mode,
+            redirect_mode,
+            oauth_refresh_mode,
+            RmcpClientRetirement::default(),
+        )
+        .await
+    }
+
+    /// Construct an HTTP attempt inside an already-retained runtime owner.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_streamable_http_client_in_retirement(
+        server_name: &str,
+        url: &str,
+        bearer_token: Option<StreamableHttpBearerToken>,
+        http_headers: Option<HashMap<String, String>>,
+        env_http_headers: Option<HashMap<String, String>>,
+        oauth_config: Option<McpServerOAuthConfig>,
+        store_mode: OAuthCredentialsStoreMode,
+        keyring_backend_kind: AuthKeyringBackendKind,
+        http_client: Arc<dyn HttpClient>,
+        auth_provider: Option<SharedAuthProvider>,
+        protocol_mode: McpProtocolMode,
+        redirect_mode: StreamableHttpRedirectMode,
+        oauth_refresh_mode: McpOAuthRefreshMode,
+        retirement: RmcpClientRetirement,
+    ) -> Result<Self> {
         let transport_recipe = TransportRecipe::StreamableHttp {
             server_name: server_name.to_string(),
             url: url.to_string(),
@@ -614,18 +763,19 @@ impl RmcpClient {
             oauth_refresh_mode,
             initialize_deadline: Arc::new(StdMutex::new(None)),
         };
-        let transport = Self::create_pending_transport(&transport_recipe).await?;
+        let transport = Self::create_registered_transport(&transport_recipe, &retirement).await?;
         Ok(Self {
             state: Mutex::new(ClientState::Connecting {
                 transport: Some(transport),
             }),
-            stdio_process: None,
+            retirement,
             transport_recipe,
             protocol_mode,
             initialize_context: Mutex::new(None),
             requires_read_only_tools: false,
             session_recovery_lock: Semaphore::new(/*permits*/ 1),
             elicitation_pause_state: ElicitationPauseState::new(),
+            post_reconnect_hook: None,
         })
     }
 
@@ -875,7 +1025,7 @@ impl RmcpClient {
                         });
                     if modern_session {
                         rmcp_params.meta = meta;
-                        return crate::tool_input::call_tool(&service, rmcp_params).await;
+                        return service.call_tool(rmcp_params).await;
                     }
                     let mut options = rmcp::service::PeerRequestOptions::no_options();
                     options.meta = meta;
@@ -1014,7 +1164,7 @@ impl RmcpClient {
         })
     }
 
-    async fn service(&self) -> Result<Arc<RunningService<RoleClient, ElicitationClientService>>> {
+    async fn service(&self) -> Result<Arc<ManagedRunningService>> {
         let guard = self.state.lock().await;
         match &*guard {
             ClientState::Ready { service, .. } => Ok(Arc::clone(service)),
@@ -1057,18 +1207,33 @@ impl RmcpClient {
 
     /// Stop the MCP transport and any stdio server process owned by this client.
     pub async fn shutdown(&self) {
+        let report = self
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(3))
+            .await;
+        for (attempt, outcome) in report.attempts {
+            if outcome != crate::retirement::PhysicalRetirementOutcome::Complete {
+                warn!(
+                    attempt,
+                    ?outcome,
+                    "MCP physical retirement did not complete"
+                );
+            }
+        }
+    }
+
+    /// Retire every physical attempt under the caller's common absolute budget.
+    /// Incomplete outcomes retain their owner and can be observed again.
+    pub async fn shutdown_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> crate::retirement::PhysicalRetirementReport {
         let previous_state = {
             let mut guard = self.state.lock().await;
             std::mem::replace(&mut *guard, ClientState::Closed)
         };
 
-        if let Some(process) = &self.stdio_process
-            && let Err(error) = process.terminate().await
-        {
-            warn!("failed to terminate MCP stdio server process: {error}");
-        }
-
         drop(previous_state);
+        self.retirement.shutdown_until(deadline).await
     }
 
     /// This should be called after every tool call so that if a given tool call triggered
@@ -1089,8 +1254,36 @@ impl RmcpClient {
         Ok(())
     }
 
+    async fn create_registered_transport(
+        transport_recipe: &TransportRecipe,
+        retirement: &RmcpClientRetirement,
+    ) -> Result<PendingConnection> {
+        let ticket = retirement.reserve_attempt()?;
+        let recipe = transport_recipe.clone();
+        let phase = ticket.start_phase(move |ticket| async move {
+            let result =
+                match Self::create_pending_transport(&recipe, ticket.shutdown.clone()).await {
+                    Ok(transport) => Ok(PendingConnection::new(transport, ticket)),
+                    // A launcher error alone does not prove it never created a
+                    // resource. Keep the attempt incomplete unless its ownership
+                    // boundary supplies positive no-resource evidence.
+                    Err(error) => Err(error),
+                };
+            Arc::new(StdMutex::new(Some(result)))
+        })?;
+        let result = phase
+            .await
+            .ok_or_else(|| anyhow!("MCP client is shut down"))?;
+        result
+            .lock()
+            .map_err(|_| anyhow!("MCP startup result lock poisoned"))?
+            .take()
+            .ok_or_else(|| anyhow!("MCP startup result already consumed"))?
+    }
+
     async fn create_pending_transport(
         transport_recipe: &TransportRecipe,
+        retirement: tokio_util::sync::CancellationToken,
     ) -> Result<PendingTransport> {
         match transport_recipe {
             TransportRecipe::InProcess { factory } => {
@@ -1207,6 +1400,7 @@ impl RmcpClient {
                         *oauth_refresh_mode,
                         Arc::clone(initialize_deadline),
                         oauth_config.as_deref(),
+                        retirement.clone(),
                     )
                     .await
                     {
@@ -1236,6 +1430,7 @@ impl RmcpClient {
                                     has_configured_headers,
                                     *redirect_mode,
                                     Arc::clone(initialize_deadline),
+                                    retirement,
                                 ),
                                 http_config,
                             );
@@ -1258,6 +1453,7 @@ impl RmcpClient {
                             has_configured_headers,
                             *redirect_mode,
                             Arc::clone(initialize_deadline),
+                            retirement,
                         ),
                         http_config,
                     );
@@ -1269,13 +1465,10 @@ impl RmcpClient {
 
     async fn connect_pending_transport(
         &self,
-        pending_transport: PendingTransport,
+        pending_transport: PendingConnection,
         initialize_context: &InitializeContext,
         timeout: Option<Duration>,
-    ) -> Result<(
-        Arc<RunningService<RoleClient, ElicitationClientService>>,
-        Option<OAuthRuntime>,
-    )> {
+    ) -> Result<(Arc<ManagedRunningService>, Option<OAuthRuntime>)> {
         // Request IDs and remembered cancellations belong to this connection, including
         // when a failed initialization or expired HTTP session creates a new transport.
         let send_elicitation = Arc::clone(&initialize_context.send_elicitation);
@@ -1299,78 +1492,14 @@ impl RmcpClient {
             }
             TransportRecipe::InProcess { .. } | TransportRecipe::Stdio { .. } => None,
         };
-        let lifecycle = self.protocol_mode.client_lifecycle();
-        let (transport, oauth_runtime) = match pending_transport {
-            PendingTransport::InProcess { transport } => (
-                client_service
-                    .serve_with_lifecycle(transport, lifecycle)
-                    .boxed(),
-                None,
-            ),
-            PendingTransport::Stdio { transport } => (
-                client_service
-                    .serve_with_lifecycle(*transport, lifecycle)
-                    .boxed(),
-                None,
-            ),
-            PendingTransport::StreamableHttp { transport } => (
-                client_service
-                    .serve_with_lifecycle(capture_event_notifications(transport), lifecycle)
-                    .boxed(),
-                None,
-            ),
-            PendingTransport::StreamableHttpWithOAuth {
-                transport,
-                oauth_runtime,
-            } => (
-                client_service
-                    .serve_with_lifecycle(transport, lifecycle)
-                    .boxed(),
-                Some(oauth_runtime),
-            ),
-            PendingTransport::StreamableHttpWithAccessTokenOnly { transport } => (
-                client_service
-                    .serve_with_lifecycle(transport, lifecycle)
-                    .boxed(),
-                None,
-            ),
-        };
-
-        let service_result = match timeout {
-            Some(duration) => match time::timeout(duration, transport).await {
-                Ok(result) => {
-                    result.map_err(|source| anyhow::Error::from(HandshakeError { source }))
-                }
-                Err(_elapsed) => Err(anyhow!(
-                    "timed out handshaking with MCP server after {duration:?}"
-                )),
-            },
-            None => transport
-                .await
-                .map_err(|source| anyhow::Error::from(HandshakeError { source })),
-        };
-        let service = match service_result {
-            Ok(service) => service,
-            Err(error) => {
-                if let Some(OAuthRuntime::Legacy(runtime)) = oauth_runtime.as_ref()
-                    && let Err(persist_error) = runtime.persist_if_needed().await
-                {
-                    warn!(
-                        "failed to persist OAuth tokens after failed initialize: {persist_error}"
-                    );
-                }
-                return Err(error);
-            }
-        };
-
-        // Preserve Codex's existing snapshot and request-freshness behavior. rmcp 3
-        // enables response caching and stale-on-error fallback by default.
-        service
-            .peer()
-            .set_response_cache_config(ClientCacheConfig::disabled())
-            .await;
-
-        Ok((Arc::new(service), oauth_runtime))
+        pending_transport
+            .connect(
+                client_service,
+                self.protocol_mode.client_lifecycle(),
+                timeout,
+                _initialize_deadline,
+            )
+            .await
     }
 
     async fn run_service_operation<T, F, Fut>(
@@ -1380,7 +1509,7 @@ impl RmcpClient {
         operation: F,
     ) -> Result<T>
     where
-        F: Fn(Arc<RunningService<RoleClient, ElicitationClientService>>) -> Fut,
+        F: Fn(Arc<ManagedRunningService>) -> Fut,
         Fut: std::future::Future<Output = std::result::Result<T, rmcp::service::ServiceError>>,
     {
         let service = self.service().await?;
@@ -1412,14 +1541,14 @@ impl RmcpClient {
     }
 
     async fn run_service_operation_with_transient_retries<T, F, Fut>(
-        service: Arc<RunningService<RoleClient, ElicitationClientService>>,
+        service: Arc<ManagedRunningService>,
         label: &str,
         timeout: Option<Duration>,
         pause_state: ElicitationPauseState,
         operation: &F,
     ) -> std::result::Result<T, ClientOperationError>
     where
-        F: Fn(Arc<RunningService<RoleClient, ElicitationClientService>>) -> Fut,
+        F: Fn(Arc<ManagedRunningService>) -> Fut,
         Fut: std::future::Future<Output = std::result::Result<T, rmcp::service::ServiceError>>,
     {
         let retry_deadline = timeout.map(|duration| Instant::now() + duration);
@@ -1468,14 +1597,14 @@ impl RmcpClient {
     }
 
     async fn run_service_operation_once<T, F, Fut>(
-        service: Arc<RunningService<RoleClient, ElicitationClientService>>,
+        service: Arc<ManagedRunningService>,
         label: &str,
         timeout: Option<Duration>,
         pause_state: ElicitationPauseState,
         operation: &F,
     ) -> std::result::Result<T, ClientOperationError>
     where
-        F: Fn(Arc<RunningService<RoleClient, ElicitationClientService>>) -> Fut,
+        F: Fn(Arc<ManagedRunningService>) -> Fut,
         Fut: std::future::Future<Output = std::result::Result<T, rmcp::service::ServiceError>>,
     {
         match timeout {
@@ -1530,7 +1659,7 @@ impl RmcpClient {
 
     async fn reinitialize_after_session_expiry(
         &self,
-        failed_service: &Arc<RunningService<RoleClient, ElicitationClientService>>,
+        failed_service: &Arc<ManagedRunningService>,
     ) -> Result<()> {
         let _recovery_guard = self
             .session_recovery_lock
@@ -1560,17 +1689,44 @@ impl RmcpClient {
             .await
             .clone()
             .ok_or_else(|| anyhow!("MCP client cannot recover before initialize succeeds"))?;
-        let pending_transport = Self::create_pending_transport(&self.transport_recipe).await?;
+        let pending_transport =
+            Self::create_registered_transport(&self.transport_recipe, &self.retirement).await?;
         let (service, oauth_runtime) = self
             .connect_pending_transport_with_initialize_retries(
                 pending_transport,
                 &initialize_context,
             )
             .await?;
-        service
+        let peer_info = service
             .peer()
             .peer_info()
             .ok_or_else(|| anyhow!("recovered handshake succeeded but server info was missing"))?;
+
+        // Run any configured post-reconnect hook (e.g. thread-identity
+        // rebind) BEFORE this connection is published as `Ready`, and
+        // without touching `self.state` at all — see `ReconnectContext`'s
+        // doc comment for why. If the hook fails, `self.state` is left
+        // untouched here (still pointing at the dead, expired connection);
+        // `shutdown()` then makes it explicitly and permanently unusable,
+        // matching `kcf-runtime/04`'s "the physical connection is unusable
+        // for all provider operations... KCF may retry only through a
+        // fresh ... connection." Any concurrent caller that reads the old
+        // state during this window gets the already-dead service, whose
+        // next real operation fails and re-enters this same
+        // semaphore-serialized recovery path rather than ever observing an
+        // unbound-but-live connection.
+        if let Some(hook) = &self.post_reconnect_hook {
+            let context = ReconnectContext {
+                service: Arc::clone(&service),
+                elicitation_pause_state: self.elicitation_pause_state.clone(),
+            };
+            if let Err(error) = hook(&context, &peer_info).await {
+                self.shutdown().await;
+                return Err(
+                    error.context("post-reconnect binding gate rejected recovered connection")
+                );
+            }
+        }
 
         {
             let mut guard = self.state.lock().await;
@@ -1606,6 +1762,7 @@ async fn create_oauth_transport_and_runtime(
     oauth_refresh_mode: McpOAuthRefreshMode,
     initialize_deadline: Arc<StdMutex<Option<Instant>>>,
     oauth_config: Option<&McpServerOAuthConfig>,
+    retirement: tokio_util::sync::CancellationToken,
 ) -> Result<PendingTransport> {
     OAuthClientCredentials::resolve(oauth_config)?
         .validate_stored_client_id(&initial_tokens.client_id)?;
@@ -1660,6 +1817,7 @@ async fn create_oauth_transport_and_runtime(
             has_configured_headers,
             redirect_mode,
             initialize_deadline,
+            retirement,
         ),
         manager,
     );

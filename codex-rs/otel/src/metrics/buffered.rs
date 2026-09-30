@@ -110,6 +110,9 @@ impl BufferedMetrics {
     }
 
     pub(crate) fn enable(&self, metrics: &MetricsClient) {
+        let Ok(original) = metrics.original_inner() else {
+            return;
+        };
         let mut state = self
             .state
             .lock()
@@ -117,7 +120,7 @@ impl BufferedMetrics {
         // Bind to this installation so a provider replacement cannot split a pair
         // between exporters through the redirectable global MetricsClient handle.
         let metrics = MetricsClient {
-            inner: Arc::clone(&metrics.inner),
+            inner: super::client::MetricsOriginal::Standalone(original),
             active: None,
         };
         if let State::Startup(pending) = &mut *state {
@@ -147,6 +150,9 @@ impl BufferedMetrics {
     }
 
     pub(super) fn suspend(&self, metrics: &MetricsClient) {
+        let Ok(original) = metrics.original_inner() else {
+            return;
+        };
         let mut state = self
             .state
             .lock()
@@ -154,7 +160,8 @@ impl BufferedMetrics {
         // A replaced provider may shut down after its successor is installed.
         // It must neither detach that successor nor undo an explicit opt-out.
         if let State::Ready(current) = &*state
-            && Arc::ptr_eq(&current.inner, &metrics.inner)
+            && let super::client::MetricsOriginal::Standalone(inner) = &current.inner
+            && Arc::ptr_eq(inner, &original)
         {
             *state = State::Startup(Vec::new());
         }

@@ -108,6 +108,54 @@ async fn submit_steer_only(
     .expect("steer-only submission should be valid")
 }
 
+#[test_case(TurnInputMode::StartIfIdle; "start_only")]
+#[test_case(TurnInputMode::StartOrSteer; "start_or_steer")]
+#[tokio::test]
+async fn retired_session_cannot_report_started_for_new_turn_input(mode: TurnInputMode) {
+    let (session, _) = make_session_and_context().await;
+    let session = Arc::new(session);
+    session.close_task_admission().await;
+    let error = handle(
+        &session,
+        TurnInputRequest::new(SubmittedTurnInput::UserInput {
+            content: vec![UserInput::Text {
+                text: "must not start".to_string(),
+                text_elements: Vec::new(),
+            }],
+            client_id: None,
+        }),
+        mode,
+        "retired-input".to_string(),
+    )
+    .await
+    .expect_err("closed task admission must refuse, not report Started");
+    assert!(
+        error
+            .to_string()
+            .contains("thread task admission is closed")
+    );
+    assert!(session.active_turn.lock().await.is_none());
+}
+
+#[tokio::test]
+async fn task_start_reports_retirement_refusal_to_its_caller() {
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    session.close_task_admission().await;
+    session
+        .start_task(
+            Arc::new(turn),
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: true,
+            },
+        )
+        .await
+        .expect_err("a refused task start must not look successful");
+    assert!(session.active_turn.lock().await.is_none());
+}
+
 #[tokio::test]
 #[expect(
     clippy::await_holding_invalid_type,
@@ -238,7 +286,7 @@ async fn start_only_rejects_active_turn_without_injecting() {
         Vec::<TurnInput>::new(),
         session
             .input_queue
-            .get_pending_input(&session.active_turn)
+            .get_pending_input(&session.active_turn, "test-turn")
             .await
             .0
     );
@@ -296,7 +344,7 @@ async fn recovery_rejects_active_turn_without_injecting_or_applying_settings() {
     assert_eq!(
         session
             .input_queue
-            .get_pending_input(&session.active_turn)
+            .get_pending_input(&session.active_turn, "test-turn")
             .await
             .0,
         Vec::<TurnInput>::new()
@@ -376,7 +424,7 @@ async fn start_only_rejects_current_plan_before_validating_settings() {
         Vec::<TurnInput>::new(),
         session
             .input_queue
-            .get_pending_input(&session.active_turn)
+            .get_pending_input(&session.active_turn, "test-turn")
             .await
             .0
     );
@@ -632,7 +680,7 @@ async fn automatic_admission_rechecks_plan_mode_without_committing_sparse_settin
     assert_eq!(
         session
             .input_queue
-            .get_pending_input(&session.active_turn)
+            .get_pending_input(&session.active_turn, "test-turn")
             .await
             .0,
         Vec::<TurnInput>::new()
@@ -722,7 +770,7 @@ async fn admission_revalidates_constraints_before_committing(kind: TurnStartKind
     assert_eq!(
         session
             .input_queue
-            .get_pending_input(&session.active_turn)
+            .get_pending_input(&session.active_turn, "test-turn")
             .await
             .0,
         Vec::<TurnInput>::new()
@@ -1056,7 +1104,7 @@ async fn steer_preserves_request_origin(
     .unwrap();
     let pending = session
         .input_queue
-        .get_pending_input(&session.active_turn)
+        .get_pending_input(&session.active_turn, "test-turn")
         .await
         .0;
     assert_eq!(

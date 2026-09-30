@@ -6,6 +6,7 @@ use super::REMOTE_WORKSPACE_SHARED_WITH_ME_PRIVATE_MARKETPLACE_NAME;
 use super::REMOTE_WORKSPACE_SHARED_WITH_ME_UNLISTED_MARKETPLACE_NAME;
 use super::RemoteInstalledPlugin;
 use super::RemoteInstalledPluginScope;
+use super::RemotePluginBundleSyncGeneration;
 use super::RemotePluginCapabilities;
 use super::RemotePluginCatalogError;
 use super::RemotePluginScope;
@@ -118,11 +119,13 @@ pub async fn sync_remote_installed_plugin_bundles_once(
     config: &RemotePluginServiceConfig,
     auth: Option<&CodexAuth>,
 ) -> Result<RemoteInstalledPluginBundleSyncOutcome, RemoteInstalledPluginBundleSyncError> {
+    let generation = RemotePluginBundleSyncGeneration::capture(&codex_home);
     let result = sync_remote_installed_plugin_bundles_once_with_snapshot(
         codex_home,
         config,
         auth,
         /*previous_plugin_ids*/ &[],
+        generation,
     )
     .await?;
     Ok(result.outcome)
@@ -133,6 +136,7 @@ pub(crate) async fn sync_remote_installed_plugin_bundles_once_with_snapshot(
     config: &RemotePluginServiceConfig,
     auth: Option<&CodexAuth>,
     previous_plugin_ids: &[PluginId],
+    generation: RemotePluginBundleSyncGeneration,
 ) -> Result<RemoteInstalledPluginBundleSyncResult, RemoteInstalledPluginBundleSyncError> {
     let auth = ensure_chatgpt_auth(auth)?;
     let authenticated_account_id = auth.get_account_id();
@@ -233,6 +237,9 @@ pub(crate) async fn sync_remote_installed_plugin_bundles_once_with_snapshot(
         if let Some(release_version) = release_version
             && store.active_plugin_version(&plugin_id).as_deref() == Some(release_version)
         {
+            let _lease = generation
+                .begin_commit()
+                .ok_or(RemoteInstalledPluginBundleSyncError::Superseded)?;
             if let Err(err) = store.write_remote_plugin_id(&plugin_id, &plugin.id) {
                 warn!(
                     remote_plugin_id = %plugin.id,
@@ -275,14 +282,15 @@ pub(crate) async fn sync_remote_installed_plugin_bundles_once_with_snapshot(
         // by the new version. Unchanged bundles never reach this metadata-loading path.
         let mut capabilities = RemotePluginCapabilities::default();
         capabilities.include_active_bundle(&store, &plugin_id).await;
-        match crate::remote_bundle::download_and_install_remote_plugin_bundle(
+        match crate::remote_bundle::download_and_install_remote_plugin_bundle_for_generation(
             config,
             codex_home.clone(),
             bundle,
+            generation.clone(),
         )
         .await
         {
-            Ok(result) => {
+            Ok(Some(result)) => {
                 let plugin_id = result.plugin_id;
                 capabilities.include_active_bundle(&store, &plugin_id).await;
                 changed_plugins.insert(
@@ -302,6 +310,7 @@ pub(crate) async fn sync_remote_installed_plugin_bundles_once_with_snapshot(
                     },
                 );
             }
+            Ok(None) => return Err(RemoteInstalledPluginBundleSyncError::Superseded),
             Err(err) => {
                 warn!(
                     remote_plugin_id = %plugin.id,
@@ -323,10 +332,11 @@ pub(crate) async fn sync_remote_installed_plugin_bundles_once_with_snapshot(
             .then_with(|| left.id.cmp(&right.id))
     });
     let mut removed_cache_plugins = Vec::new();
-    if let Err(err) = remove_stale_remote_plugin_caches(
+    if let Err(err) = remove_stale_remote_plugin_caches_for_generation(
         &store,
         &installed_plugin_names_by_marketplace,
         &mut removed_cache_plugins,
+        &generation,
     )
     .await
     {
@@ -338,6 +348,9 @@ pub(crate) async fn sync_remote_installed_plugin_bundles_once_with_snapshot(
             .or_insert(plugin);
     }
 
+    let _lease = generation
+        .begin_commit()
+        .ok_or(RemoteInstalledPluginBundleSyncError::Superseded)?;
     Ok(RemoteInstalledPluginBundleSyncResult {
         outcome: RemoteInstalledPluginBundleSyncOutcome {
             materialized_remote_plugins: materialized_remote_plugins.into_values().collect(),
@@ -389,10 +402,27 @@ impl Drop for RemotePluginCacheMutationGuard {
     }
 }
 
+#[cfg(test)]
 async fn remove_stale_remote_plugin_caches(
     store: &PluginStore,
     installed_plugin_names_by_marketplace: &BTreeMap<String, BTreeSet<String>>,
     removed_plugins: &mut Vec<RemotePluginChange>,
+) -> Result<(), String> {
+    let generation = RemotePluginBundleSyncGeneration::capture(store.codex_home().as_path());
+    remove_stale_remote_plugin_caches_for_generation(
+        store,
+        installed_plugin_names_by_marketplace,
+        removed_plugins,
+        &generation,
+    )
+    .await
+}
+
+async fn remove_stale_remote_plugin_caches_for_generation(
+    store: &PluginStore,
+    installed_plugin_names_by_marketplace: &BTreeMap<String, BTreeSet<String>>,
+    removed_plugins: &mut Vec<RemotePluginChange>,
+    generation: &RemotePluginBundleSyncGeneration,
 ) -> Result<(), String> {
     let codex_home = store.codex_home().as_path();
     for marketplace_name in [
@@ -444,21 +474,28 @@ async fn remove_stale_remote_plugin_caches(
             if let Ok(plugin_id) = &plugin_id {
                 capabilities.include_active_bundle(store, plugin_id).await;
             }
-            if cache_path.is_dir() {
-                fs::remove_dir_all(&cache_path).await.map_err(|err| {
+            let generation = generation.clone();
+            // The lease belongs to the blocking mutation, not this observer.
+            // Cancelling the async caller cannot make reset forget a deletion
+            // still executing on Tokio's blocking pool.
+            tokio::task::spawn_blocking(move || {
+                let _lease = generation.begin_commit().ok_or_else(|| {
+                    "remote plugin reset superseded stale-cache removal".to_string()
+                })?;
+                let result = if cache_path.is_dir() {
+                    std::fs::remove_dir_all(&cache_path)
+                } else {
+                    std::fs::remove_file(&cache_path)
+                };
+                result.map_err(|err| {
                     format!(
                         "failed to remove stale remote plugin cache entry {}: {err}",
                         cache_path.display()
                     )
-                })?;
-            } else {
-                fs::remove_file(&cache_path).await.map_err(|err| {
-                    format!(
-                        "failed to remove stale remote plugin cache entry {}: {err}",
-                        cache_path.display()
-                    )
-                })?;
-            }
+                })
+            })
+            .await
+            .map_err(|err| format!("failed to join remote plugin cache removal: {err}"))??;
             let plugin_key = plugin_id
                 .map(|plugin_id| plugin_id.as_key())
                 .unwrap_or_else(|_| format!("{plugin_name}@{marketplace_name}"));
@@ -797,6 +834,47 @@ mod tests {
                     .exists()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn reset_fences_stale_removal_without_deleting_new_account_files() {
+        let home = tempfile::tempdir().expect("create codex home");
+        let old = RemotePluginBundleSyncGeneration::capture(home.path());
+        super::super::retire_remote_plugin_bundle_sync(home.path());
+        let cache_path = home
+            .path()
+            .join(PLUGINS_CACHE_DIR)
+            .join(REMOTE_GLOBAL_MARKETPLACE_NAME)
+            .join("new-account");
+        std::fs::create_dir_all(&cache_path).expect("create new account cache");
+        std::fs::write(cache_path.join("marker"), b"new account").expect("write marker");
+        let store = PluginStore::try_new(home.path().to_path_buf()).expect("store");
+        let mut removed = Vec::new();
+        let result = remove_stale_remote_plugin_caches_for_generation(
+            &store,
+            &BTreeMap::new(),
+            &mut removed,
+            &old,
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read(cache_path.join("marker")).unwrap(),
+            b"new account"
+        );
+        assert!(removed.is_empty());
+
+        let current = RemotePluginBundleSyncGeneration::capture(home.path());
+        remove_stale_remote_plugin_caches_for_generation(
+            &store,
+            &BTreeMap::new(),
+            &mut removed,
+            &current,
+        )
+        .await
+        .expect("current cleanup proceeds");
+        assert!(!cache_path.exists());
+        assert_eq!(removed.len(), 1);
     }
 
     #[tokio::test]

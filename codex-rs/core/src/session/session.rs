@@ -61,6 +61,7 @@ pub(crate) struct Session {
     pub(crate) installation_id: String,
     pub(super) tx_event: Sender<Event>,
     pub(super) agent_status: watch::Sender<AgentStatus>,
+    // When nested, acquire active_turn before state and turn_state after state.
     pub(super) state: Mutex<SessionState>,
     /// Orders accepted settings commits and their persisted events with compaction checkpoints.
     /// Keep this separate from `state` so storage I/O does not block runtime state access.
@@ -85,10 +86,19 @@ pub(crate) struct Session {
     pub(super) mcp_elicitation_lifecycle_handle: OnceLock<codex_mcp::ElicitationLifecycle>,
     pub(super) mcp_prewarm_tx: async_channel::Sender<()>,
     pub(super) mcp_prewarm_shutdown: CancellationToken,
-    pub(super) mcp_prewarm_task: std::sync::Mutex<Option<JoinHandle<()>>>,
+    // Retain the original join future when a shutdown observer is cancelled.
+    pub(super) mcp_prewarm_task: std::sync::Mutex<Option<SessionLoopTermination>>,
     pub(crate) conversation: Arc<RealtimeConversationManager>,
     pub(crate) realtime_history: Option<Mutex<crate::realtime_history::RealtimeHistoryState>>,
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
+    // Writes and final task-admission checks are serialized by active_turn.
+    pub(crate) task_admission_closed: std::sync::atomic::AtomicBool,
+    pub(crate) task_joins: crate::tasks::TaskJoinRegistry,
+    pub(super) cleanup_owner:
+        std::sync::Mutex<std::sync::Weak<super::retirement::SessionCleanupOwner>>,
+    // While construction remains fallible, retained startup cleanup must discard
+    // the live writer instead of materializing it through normal shutdown.
+    pub(super) failed_initialization_persistence: std::sync::atomic::AtomicBool,
     pub(crate) async_hook_results: async_channel::Receiver<HookCompletedEvent>,
     pub(crate) input_queue: InputQueue,
     pub(crate) services: SessionServices,
@@ -161,6 +171,9 @@ pub(crate) struct SessionConfiguration {
     pub(super) originator: String,
     pub(super) dynamic_tools: Vec<DynamicToolSpec>,
     pub(super) user_shell_override: Option<shell::Shell>,
+    /// Hosting app-server's control endpoint, carried as a session-local
+    /// runtime input rather than user configuration.
+    pub(super) control_endpoint: Option<String>,
 }
 
 impl SessionConfiguration {
@@ -641,6 +654,35 @@ async fn warm_plugins_and_skills_for_session_init(
 }
 
 impl Session {
+    /// Selects a session identity without changing upstream reserved-ID rules.
+    /// Resumes retain their stored ID and cannot also reserve a new one.
+    pub(super) fn select_thread_id(
+        initial_history: &InitialHistory,
+        reserved_thread_id: Option<ThreadId>,
+        agent_control: &crate::agent::control::AgentControlInit,
+    ) -> anyhow::Result<ThreadId> {
+        match (initial_history, reserved_thread_id) {
+            (
+                InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_),
+                Some(id),
+            ) => Ok(id),
+            (InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_), None) => {
+                Ok(agent_control.runtime().generate_thread_id())
+            }
+            (InitialHistory::Resumed(history), None) => Ok(history.conversation_id),
+            (InitialHistory::Resumed(_), Some(_)) => Err(anyhow::anyhow!(
+                "reserved thread ID cannot be used when resuming a thread"
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn failed_initialization_persistence_for_test(&self) -> bool {
+        self.failed_initialization_persistence
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Returns the concrete identity for this thread.
     pub(crate) fn thread_id(&self) -> ThreadId {
         self.thread_id
@@ -654,6 +696,16 @@ impl Session {
     pub(crate) async fn originator(&self) -> String {
         let state = self.state.lock().await;
         state.session_configuration.originator.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn control_endpoint_for_test(&self) -> Option<String> {
+        self.state
+            .lock()
+            .await
+            .session_configuration
+            .control_endpoint
+            .clone()
     }
 
     pub(crate) async fn responses_metadata(
@@ -758,6 +810,8 @@ impl Session {
         mcp_manager: Arc<McpManager>,
         code_mode_session_provider: Arc<dyn codex_code_mode::CodeModeSessionProvider>,
         extensions: Arc<codex_extension_api::ExtensionRegistry<crate::config::Config>>,
+        host_admission: Option<Arc<dyn codex_extension_api::TurnStartAdmission>>,
+        initial_mcp_work: Option<Box<dyn codex_mcp::McpAttemptWork>>,
         mut thread_extension_init: ExtensionDataInit,
         client_mcp_extensions: ClientMcpExtensions,
         agent_control: AgentControlInit,
@@ -773,6 +827,10 @@ impl Session {
         multi_agent_version: Option<MultiAgentVersion>,
         git_enrichment_policy: GitEnrichmentPolicy,
         windows_sandbox_proxy_settings_mode: codex_sandboxing::WindowsSandboxProxySettingsMode,
+        deferred_clear_session_start: Option<super::DeferredClearSessionStart>,
+        runtime_config_change_listener: Option<Arc<dyn crate::RuntimeConfigChangeListener>>,
+        runtime_config_change_gate: Option<crate::RuntimeConfigChangeGate>,
+        startup_custody: Option<&super::startup_custody::SessionStartupCustody>,
     ) -> anyhow::Result<Arc<Self>> {
         debug!(
             "Configuring session: model={}; provider={:?}",
@@ -849,21 +907,21 @@ impl Session {
         let multi_agent_version = multi_agent_version.map(OnceLock::from).unwrap_or_default();
         let initial_multi_agent_version = multi_agent_version.get().copied();
 
-        let thread_id = match (&initial_history, reserved_thread_id) {
-            (
-                InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_),
-                Some(thread_id),
-            ) => thread_id,
-            (InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_), None) => {
-                agent_control.runtime().generate_thread_id()
+        let reserved_thread_id = match deferred_clear_session_start.as_ref() {
+            Some(deferred) => {
+                if !matches!(initial_history, InitialHistory::Cleared)
+                    || reserved_thread_id.is_some_and(|id| id != deferred.successor_thread_id)
+                {
+                    return Err(anyhow::anyhow!(
+                        "deferred clear start requires matching reserved successor identity"
+                    ));
+                }
+                Some(deferred.successor_thread_id)
             }
-            (InitialHistory::Resumed(resumed_history), None) => resumed_history.conversation_id,
-            (InitialHistory::Resumed(_), Some(_)) => {
-                return Err(anyhow::anyhow!(
-                    "reserved thread ID cannot be used when resuming a thread"
-                ));
-            }
+            None => reserved_thread_id,
         };
+        let thread_id =
+            Self::select_thread_id(&initial_history, reserved_thread_id, &agent_control)?;
         let isolation = thread_extension_init
             .get::<codex_extension_api::SessionIsolation>()
             .map(|policy| *policy)
@@ -1008,8 +1066,20 @@ impl Session {
                 Ok::<_, anyhow::Error>((None, LiveThreadInitGuard::new(/*live_thread*/ None)))
             } else {
                 let mut local_guard = LiveThreadInitGuard::default();
-                let mut managed_guard = match &startup {
-                    Some(startup) => Some(startup.persistence.lock().await),
+                let retained_guard = match (startup_custody, &startup) {
+                    (Some(custody), startup) => {
+                        let guard = startup.as_ref().map_or_else(
+                            || Arc::new(Mutex::new(LiveThreadInitGuard::default())),
+                            |startup| Arc::clone(&startup.persistence),
+                        );
+                        custody.retain_persistence_guard(thread_id, Arc::clone(&guard));
+                        Some(guard)
+                    }
+                    (None, Some(startup)) => Some(Arc::clone(&startup.persistence)),
+                    (None, None) => None,
+                };
+                let mut managed_guard = match &retained_guard {
+                    Some(guard) => Some(guard.lock().await),
                     None => None,
                 };
                 let guard = managed_guard.as_deref_mut().unwrap_or(&mut local_guard);
@@ -1024,6 +1094,12 @@ impl Session {
                             extra_config: config.extra_config.clone(),
                             forked_from_id,
                             parent_thread_id,
+                            clear_lineage: deferred_clear_session_start.as_ref().map(|deferred| {
+                                codex_thread_store::ClearThreadLineage {
+                                    predecessor_thread_id: deferred.predecessor_thread_id,
+                                    transition_id: deferred.transition_id.to_string(),
+                                }
+                            }),
                             source: session_source,
                             thread_source: session_configuration.thread_source.clone(),
                             originator: session_configuration.originator.clone(),
@@ -1099,6 +1175,11 @@ impl Session {
                             .await?
                     }
                 };
+                drop(managed_guard);
+                #[cfg(test)]
+                if let Some(custody) = startup_custody {
+                    custody.wait_after_persistence_for_test().await;
+                }
                 Ok((Some(live_thread), local_guard))
             }
         }
@@ -1695,6 +1776,7 @@ impl Session {
                 plugins_manager: Arc::clone(&plugins_manager),
                 mcp_manager: Arc::clone(&mcp_manager),
                 extensions: Arc::clone(&extensions),
+                host_admission,
                 // TODO(jif): extract session to share between sub-agents
                 session_extension_data,
                 thread_extension_data,
@@ -1761,6 +1843,8 @@ impl Session {
                 ),
                 tool_search_handler_cache: Default::default(),
                 turn_environments: Arc::clone(&turn_environments),
+                runtime_config_change_listener,
+                runtime_config_change_gate,
             };
             let (mcp_prewarm_tx, mcp_prewarm_rx) = async_channel::bounded(1);
             let sess = Arc::new(Session {
@@ -1789,6 +1873,10 @@ impl Session {
                     && services.live_thread.is_some())
                 .then(|| Mutex::new(Default::default())),
                 active_turn: Mutex::new(None),
+                task_admission_closed: std::sync::atomic::AtomicBool::new(false),
+                task_joins: Default::default(),
+                cleanup_owner: Default::default(),
+                failed_initialization_persistence: std::sync::atomic::AtomicBool::new(false),
                 async_hook_results,
                 input_queue: InputQueue::new(),
                 services,
@@ -1799,6 +1887,19 @@ impl Session {
             });
             if let Some(startup) = &startup {
                 let _ = startup.session.set(Arc::clone(&sess));
+            }
+            if let Some(custody) = startup_custody {
+                if !custody.retain(&sess) {
+                    return Err(anyhow::anyhow!("startup persistence custody mismatch"));
+                }
+                sess.failed_initialization_persistence
+                    .store(true, std::sync::atomic::Ordering::Release);
+                // Transfer pre-Session persistence custody to the retained
+                // Session cleanup. The detached-drop guard only owns the
+                // legacy no-custody path.
+                live_thread_init.commit();
+                #[cfg(test)]
+                custody.wait_after_retain_for_test().await;
             }
             if let Some(network_policy_decider_session) = network_policy_decider_session {
                 let mut guard = network_policy_decider_session.write().await;
@@ -1881,8 +1982,13 @@ impl Session {
                 mcp_projection,
                 &resolved_environments,
                 mcp_runtime_cwd,
+                initial_mcp_work.as_deref().map_or(
+                    codex_mcp::McpAttemptAccess::Unscoped,
+                    codex_mcp::McpAttemptAccess::Admitted,
+                ),
             )
             .await?;
+            drop(initial_mcp_work);
             sess.start_mcp_prewarm_worker(mcp_prewarm_rx, mcp_auth_changes);
             sess.schedule_startup_prewarm(super::startup_prewarm::PrewarmInput::Base)
                 .await;
@@ -1914,14 +2020,28 @@ impl Session {
             }
             {
                 let mut state = sess.state.lock().await;
-                state.queue_pending_session_start_source(session_start_source);
+                if let Some(deferred) = deferred_clear_session_start.as_ref() {
+                    state.queue_deferred_clear_session_start(
+                        deferred.predecessor_thread_id.to_string(),
+                        deferred.transition_id.to_string(),
+                    );
+                } else {
+                    state.queue_pending_session_start_source(session_start_source);
+                }
             }
             Ok(sess)
         }
         .await;
         match session_result {
             Ok(sess) => {
+                // The original successful initialization boundary transfers
+                // persistence back to normal session shutdown.
+                sess.failed_initialization_persistence
+                    .store(false, std::sync::atomic::Ordering::Release);
                 live_thread_init.commit();
+                if deferred_clear_session_start.is_none() {
+                    crate::hook_runtime::run_pending_session_start_hooks_eager(&sess).await;
+                }
                 Ok(sess)
             }
             Err(err) => {

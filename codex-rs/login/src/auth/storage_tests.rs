@@ -14,6 +14,484 @@ use tempfile::tempdir;
 use codex_keyring_store::tests::MockKeyringStore;
 use keyring::Error as KeyringError;
 
+#[test]
+fn managed_source_guard_excludes_cooperating_writers_until_cache_commit() -> anyhow::Result<()> {
+    for mode in [
+        AuthCredentialsStoreMode::File,
+        AuthCredentialsStoreMode::Keyring,
+        AuthCredentialsStoreMode::Auto,
+    ] {
+        for backend in [
+            AuthKeyringBackendKind::Direct,
+            AuthKeyringBackendKind::Secrets,
+        ] {
+            let home = tempdir()?;
+            let keyring = Arc::new(MockKeyringStore::default());
+            let storage = create_auth_storage_with_store(
+                home.path().to_path_buf(),
+                mode,
+                keyring.clone(),
+                backend,
+            );
+            storage.save(&auth_with_prefix("prepared-B"))?;
+            let prepared = storage.load_managed()?;
+            let guard = storage.lock_managed_source()?;
+            assert!(guard.verify_managed_preimage(&prepared.preimage)?);
+            let writer =
+                create_auth_storage_with_store(home.path().to_path_buf(), mode, keyring, backend);
+            // This is the manager's verify -> cache-install interval. A separate
+            // descriptor and worker must not mutate the source during it.
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        assert!(writer.save(&auth_with_prefix("replacement-C")).is_err());
+                        assert!(writer.delete().is_err());
+                        assert!(matches!(
+                            writer.load_managed(),
+                            Err(ManagedAuthStorageError::ReadFailed(
+                                ManagedAuthStorageFailure::CoordinationContended
+                            ))
+                        ));
+                    })
+                    .join()
+                    .unwrap();
+            });
+            assert!(guard.verify_managed_preimage(&prepared.preimage)?);
+            drop(guard);
+            writer.save(&auth_with_prefix("replacement-C"))?;
+            assert!(!storage.verify_managed_preimage(&prepared.preimage)?);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct PausedManagedRead {
+    file: FileAuthStorage,
+    entered: Arc<std::sync::Barrier>,
+    resume: Arc<std::sync::Barrier>,
+}
+
+impl AuthStorageBackend for PausedManagedRead {
+    fn load(&self) -> std::io::Result<Option<AuthDotJson>> {
+        self.file.load()
+    }
+    fn read_managed_bytes(&self) -> Result<ManagedAuthStorageBytes, ManagedAuthStorageError> {
+        self.entered.wait();
+        self.resume.wait();
+        self.file.read_managed_bytes()
+    }
+    fn save(&self, auth: &AuthDotJson) -> std::io::Result<()> {
+        self.file.save(auth)
+    }
+    fn delete(&self) -> std::io::Result<bool> {
+        self.file.delete()
+    }
+}
+
+#[test]
+fn managed_prepare_holds_source_lock_across_read_and_parse() -> anyhow::Result<()> {
+    let home = tempdir()?;
+    let writer = create_auth_storage(
+        home.path().to_path_buf(),
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::Direct,
+    );
+    let original = auth_with_prefix("prepared-B");
+    writer.save(&original)?;
+    let entered = Arc::new(std::sync::Barrier::new(2));
+    let resume = Arc::new(std::sync::Barrier::new(2));
+    let reader = LockedAuthStorage {
+        codex_home: home.path().to_path_buf(),
+        backend: Arc::new(PausedManagedRead {
+            file: FileAuthStorage::new(home.path().to_path_buf()),
+            entered: entered.clone(),
+            resume: resume.clone(),
+        }),
+    };
+    std::thread::scope(|scope| {
+        let task = scope.spawn(|| reader.load_managed());
+        entered.wait();
+        let write_result = writer.save(&auth_with_prefix("replacement-C"));
+        resume.wait();
+        assert!(write_result.is_err());
+        assert_eq!(task.join().unwrap().unwrap().auth, Some(original));
+    });
+    Ok(())
+}
+
+#[test]
+fn managed_coordination_preserves_first_write_and_detects_noncooperating_precheck_change()
+-> anyhow::Result<()> {
+    let home = tempdir()?;
+    let new_home = home.path().join("not-yet-created");
+    let storage = create_auth_storage(
+        new_home.clone(),
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::Direct,
+    );
+    assert!(storage.load_managed().is_err());
+    assert!(
+        !new_home.exists(),
+        "managed prepare must not create an absent home"
+    );
+    storage.save(&auth_with_prefix("B"))?;
+    let prepared = storage.load_managed()?;
+    std::fs::write(
+        get_auth_file(&new_home),
+        serde_json::to_vec(&auth_with_prefix("C"))?,
+    )?;
+    let guard = storage.lock_managed_source()?;
+    assert!(!guard.verify_managed_preimage(&prepared.preimage)?);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_coordination_rejects_symlink_and_hardlink_lock_files() -> anyhow::Result<()> {
+    let home = tempdir()?;
+    let target = home.path().join("unrelated");
+    std::fs::write(&target, "sentinel")?;
+    let lock = home.path().join(MANAGED_AUTH_COORDINATION_FILE);
+    std::os::unix::fs::symlink(&target, &lock)?;
+    assert!(acquire_auth_source_lock(home.path()).is_err());
+    std::fs::remove_file(&lock)?;
+    std::fs::hard_link(&target, &lock)?;
+    assert!(acquire_auth_source_lock(home.path()).is_err());
+    assert_eq!(std::fs::read_to_string(&target)?, "sentinel");
+    Ok(())
+}
+
+#[test]
+fn managed_preimage_detects_replacement_without_parsing_replacement_auth() -> anyhow::Result<()> {
+    for mode in [
+        AuthCredentialsStoreMode::File,
+        AuthCredentialsStoreMode::Keyring,
+        AuthCredentialsStoreMode::Auto,
+    ] {
+        for backend in [
+            AuthKeyringBackendKind::Direct,
+            AuthKeyringBackendKind::Secrets,
+        ] {
+            let home = tempdir()?;
+            let keyring = MockKeyringStore::default();
+            let storage = create_auth_storage_with_store(
+                home.path().to_path_buf(),
+                mode,
+                Arc::new(keyring.clone()),
+                backend,
+            );
+            let absent = storage.load_managed()?;
+            assert!(storage.verify_managed_preimage(&absent.preimage)?);
+            let original = auth_with_prefix("prepared-B");
+            storage.save(&original)?;
+            assert!(!storage.verify_managed_preimage(&absent.preimage)?);
+            let prepared = storage.load_managed()?;
+            assert!(storage.verify_managed_preimage(&prepared.preimage)?);
+            storage.save(&auth_with_prefix("replacement-C"))?;
+            assert!(!storage.verify_managed_preimage(&prepared.preimage)?);
+            assert_eq!(prepared.auth, Some(original));
+            // Revalidation must report a changed preimage even if the new
+            // candidate is not JSON; only prepare is allowed to parse auth.
+            match (mode, backend) {
+                (AuthCredentialsStoreMode::File, _) => {
+                    std::fs::write(get_auth_file(home.path()), "{")?
+                }
+                (_, AuthKeyringBackendKind::Direct) => {
+                    keyring.save(KEYRING_SERVICE, &compute_store_key(home.path())?, "{")?
+                }
+                (_, AuthKeyringBackendKind::Secrets) => {
+                    SecretsManager::new_with_keyring_store_and_namespace(
+                        home.path().to_path_buf(),
+                        SecretsBackendKind::Local,
+                        Arc::new(keyring.clone()),
+                        LocalSecretsNamespace::CodexAuth,
+                    )
+                    .set(&SecretScope::Global, &CODEX_AUTH_SECRET_NAME, "{")?
+                }
+            }
+            assert!(!storage.verify_managed_preimage(&prepared.preimage)?);
+            assert!(storage.load_managed().is_err());
+            assert_eq!(
+                format!("{:?}", prepared.preimage),
+                "ManagedAuthStoragePreimage([redacted])"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn managed_auto_preimage_binds_primary_absence_and_fallback_source_identity() -> anyhow::Result<()>
+{
+    let home = tempdir()?;
+    let keyring = MockKeyringStore::default();
+    let storage = AutoAuthStorage::new(
+        home.path().to_path_buf(),
+        Arc::new(keyring.clone()),
+        AuthKeyringBackendKind::Direct,
+    );
+    let original = auth_with_prefix("B");
+    storage.file_storage.save(&original)?;
+    let prepared = storage.load_managed()?;
+    assert!(storage.verify_managed_preimage(&prepared.preimage)?);
+    // Even identical payload in a newly present primary is a source change.
+    storage.keyring_storage.save(&original)?;
+    assert!(!storage.verify_managed_preimage(&prepared.preimage)?);
+    keyring.set_error(
+        &compute_store_key(home.path())?,
+        KeyringError::Invalid("error".into(), "read".into()),
+    );
+    assert!(matches!(
+        storage.verify_managed_preimage(&prepared.preimage),
+        Err(ManagedAuthStorageError::AutoFallbackRequired(
+            ManagedAuthStorageFailure::Keyring
+        ))
+    ));
+
+    let other_home = tempdir()?;
+    let other = FileAuthStorage::new(other_home.path().to_path_buf());
+    other.save(&original)?;
+    let first = FileAuthStorage::new(home.path().to_path_buf());
+    first.save(&original)?;
+    assert!(!other.verify_managed_preimage(&first.load_managed()?.preimage)?);
+    Ok(())
+}
+
+#[test]
+fn managed_secrets_preimage_detects_reencrypted_identical_auth() -> anyhow::Result<()> {
+    let home = tempdir()?;
+    let storage = SecretsKeyringAuthStorage::new(
+        home.path().to_path_buf(),
+        Arc::new(MockKeyringStore::default()),
+    );
+    let auth = auth_with_prefix("B");
+    storage.save(&auth)?;
+    let prepared = storage.load_managed()?;
+    storage.save(&auth)?;
+    assert!(!storage.verify_managed_preimage(&prepared.preimage)?);
+    Ok(())
+}
+
+#[test]
+fn managed_file_load_distinguishes_absence_io_and_parse_failures() -> anyhow::Result<()> {
+    let home = tempdir()?;
+    let storage = FileAuthStorage::new(home.path().to_path_buf());
+    let absent = storage.load_managed()?;
+    assert!(absent.auth.is_none());
+    assert_eq!(absent.source, ManagedAuthStorageSource::File);
+
+    let auth_file = get_auth_file(home.path());
+    std::fs::create_dir(&auth_file)?;
+    assert!(matches!(
+        storage.load_managed(),
+        Err(ManagedAuthStorageError::ReadFailed(
+            ManagedAuthStorageFailure::FileIo(_)
+        ))
+    ));
+    std::fs::remove_dir(&auth_file)?;
+
+    for invalid in [b"{".as_slice(), b"not-json", &[0xff]] {
+        std::fs::write(&auth_file, invalid)?;
+        assert_eq!(
+            storage.load_managed().unwrap_err(),
+            ManagedAuthStorageError::ReadFailed(ManagedAuthStorageFailure::Parse(
+                ManagedAuthStorageSource::File
+            ))
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn managed_load_preserves_exact_snapshot_and_redacts_debug() -> anyhow::Result<()> {
+    let home = tempdir()?;
+    let storage = FileAuthStorage::new(home.path().to_path_buf());
+    let original = auth_with_prefix("managed-secret-sentinel");
+    storage.save(&original)?;
+    let read = storage.load_managed()?;
+    storage.save(&auth_with_prefix("later-source"))?;
+    assert_eq!(read.auth, Some(original));
+    // Unsupported modes must remain present for the manager's explicit mode
+    // refusal; storage must not turn them into authoritative logout absence.
+    assert_eq!(
+        read.auth.as_ref().and_then(|auth| auth.auth_mode),
+        Some(AuthMode::ApiKey)
+    );
+    let debug = format!("{read:?}");
+    assert!(debug.contains("auth_present: true"));
+    assert!(!debug.contains("managed-secret-sentinel"));
+    assert!(!debug.contains("api-key"));
+    Ok(())
+}
+
+#[test]
+fn managed_direct_keyring_distinguishes_absence_failure_and_parse() -> anyhow::Result<()> {
+    let home = tempdir()?;
+    let keyring = MockKeyringStore::default();
+    let storage =
+        DirectKeyringAuthStorage::new(home.path().to_path_buf(), Arc::new(keyring.clone()));
+    assert!(storage.load_managed()?.auth.is_none());
+    let key = compute_store_key(home.path())?;
+    keyring.save(KEYRING_SERVICE, &key, "malformed-secret-sentinel")?;
+    assert_eq!(
+        storage.load_managed().unwrap_err(),
+        ManagedAuthStorageError::ReadFailed(ManagedAuthStorageFailure::Parse(
+            ManagedAuthStorageSource::Keyring
+        ))
+    );
+    keyring.set_error(
+        &key,
+        KeyringError::Invalid("secret-error-sentinel".into(), "load".into()),
+    );
+    let error = storage.load_managed().unwrap_err();
+    assert_eq!(
+        error,
+        ManagedAuthStorageError::ReadFailed(ManagedAuthStorageFailure::Keyring)
+    );
+    assert!(!format!("{error:?}: {error}").contains("secret-error-sentinel"));
+    Ok(())
+}
+
+#[test]
+fn managed_secrets_distinguishes_absence_backend_failure_and_auth_parse() -> anyhow::Result<()> {
+    let home = tempdir()?;
+    let keyring = MockKeyringStore::default();
+    let storage =
+        SecretsKeyringAuthStorage::new(home.path().to_path_buf(), Arc::new(keyring.clone()));
+    assert!(storage.load_managed()?.auth.is_none());
+    storage
+        .secrets_manager
+        .set(&SecretScope::Global, &CODEX_AUTH_SECRET_NAME, "{")?;
+    assert_eq!(
+        storage.load_managed().unwrap_err(),
+        ManagedAuthStorageError::ReadFailed(ManagedAuthStorageFailure::Parse(
+            ManagedAuthStorageSource::Secrets
+        ))
+    );
+    let key = compute_keyring_account(home.path(), LocalSecretsNamespace::CodexAuth);
+    keyring.set_error(
+        &key,
+        KeyringError::Invalid("secret-error-sentinel".into(), "load".into()),
+    );
+    assert_eq!(
+        storage.load_managed().unwrap_err(),
+        ManagedAuthStorageError::ReadFailed(ManagedAuthStorageFailure::Secrets)
+    );
+    Ok(())
+}
+
+#[test]
+fn managed_auto_never_turns_failed_primary_into_fallback_auth_or_absence() -> anyhow::Result<()> {
+    for backend in [
+        AuthKeyringBackendKind::Direct,
+        AuthKeyringBackendKind::Secrets,
+    ] {
+        let home = tempdir()?;
+        let keyring = MockKeyringStore::default();
+        let storage = AutoAuthStorage::new(
+            home.path().to_path_buf(),
+            Arc::new(keyring.clone()),
+            backend,
+        );
+        let absent = storage.load_managed()?;
+        assert!(absent.auth.is_none());
+        assert_eq!(
+            absent.source,
+            ManagedAuthStorageSource::FileAfterKeyringAbsence
+        );
+        let file_auth = auth_with_prefix("fallback");
+        storage.file_storage.save(&file_auth)?;
+        let read = storage.load_managed()?;
+        assert_eq!(read.auth, Some(file_auth));
+        assert_eq!(
+            read.source,
+            ManagedAuthStorageSource::FileAfterKeyringAbsence
+        );
+
+        let (key, cause) = match backend {
+            AuthKeyringBackendKind::Direct => (
+                compute_store_key(home.path())?,
+                ManagedAuthStorageFailure::Keyring,
+            ),
+            AuthKeyringBackendKind::Secrets => {
+                seed_secrets_backend_with_auth(
+                    &keyring,
+                    home.path(),
+                    &auth_with_prefix("primary"),
+                )?;
+                (
+                    compute_keyring_account(home.path(), LocalSecretsNamespace::CodexAuth),
+                    ManagedAuthStorageFailure::Secrets,
+                )
+            }
+        };
+        for fallback_present in [true, false] {
+            if !fallback_present {
+                storage.file_storage.delete()?;
+            }
+            keyring.set_error(&key, KeyringError::Invalid("error".into(), "load".into()));
+            assert_eq!(
+                storage.load_managed().unwrap_err(),
+                ManagedAuthStorageError::AutoFallbackRequired(cause)
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn managed_auto_parse_failure_is_not_erased_by_valid_fallback() -> anyhow::Result<()> {
+    let home = tempdir()?;
+    let keyring = MockKeyringStore::default();
+    let storage = AutoAuthStorage::new(
+        home.path().to_path_buf(),
+        Arc::new(keyring.clone()),
+        AuthKeyringBackendKind::Direct,
+    );
+    storage
+        .file_storage
+        .save(&auth_with_prefix("valid-fallback"))?;
+    keyring.save(KEYRING_SERVICE, &compute_store_key(home.path())?, "{")?;
+    assert_eq!(
+        storage.load_managed().unwrap_err(),
+        ManagedAuthStorageError::AutoFallbackRequired(ManagedAuthStorageFailure::Parse(
+            ManagedAuthStorageSource::Keyring
+        ))
+    );
+    Ok(())
+}
+
+#[test]
+fn managed_load_refuses_ephemeral_even_when_empty() -> anyhow::Result<()> {
+    let home = tempdir()?;
+    let storage = EphemeralAuthStorage::new(home.path().to_path_buf());
+    assert_eq!(
+        storage.load_managed().unwrap_err(),
+        ManagedAuthStorageError::ReadFailed(ManagedAuthStorageFailure::UnsupportedStorage)
+    );
+    Ok(())
+}
+
+#[test]
+fn managed_keyring_never_falls_back_to_an_unresolved_home_identity() -> anyhow::Result<()> {
+    let home = tempdir()?;
+    let missing = home.path().join("missing");
+    let keyring = MockKeyringStore::default();
+    let fallback_key = compute_store_key(&missing)?;
+    keyring.save(
+        KEYRING_SERVICE,
+        &fallback_key,
+        &serde_json::to_string(&auth_with_prefix("wrong-identity"))?,
+    )?;
+    let storage = DirectKeyringAuthStorage::new(missing, Arc::new(keyring));
+    assert_eq!(
+        storage.load_managed().unwrap_err(),
+        ManagedAuthStorageError::ReadFailed(ManagedAuthStorageFailure::Keyring)
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn file_storage_load_returns_auth_dot_json() -> anyhow::Result<()> {
     let codex_home = tempdir()?;

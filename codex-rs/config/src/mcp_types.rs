@@ -263,6 +263,20 @@ pub struct McpServerConfig {
     /// Code Mode also uses an explicitly configured limit when rendering each tool's input type.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_input_schema_max_bytes: Option<NonZeroUsize>,
+    /// When `true`, Codex may disclose the canonical thread identity to this
+    /// server via the `codex/thread-identity` capability-gated bind
+    /// handshake, per `kcf-runtime/04-mcp-thread-identity-contract.md`.
+    /// Default `false`: no server is eligible for thread-identity binding
+    /// unless explicitly opted in.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub thread_identity_eligible: bool,
+
+    /// When `true`, Codex may disclose the hosting app-server control endpoint
+    /// through the capability-gated `codex/control-endpoint` handshake.
+    /// Default `false`: no server receives the endpoint unless explicitly
+    /// opted in.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub control_endpoint_eligible: bool,
 
     /// Model-facing surfaces from which this server's tools must be omitted.
     /// `None` leaves lower-priority configuration unchanged; an empty list clears it.
@@ -424,6 +438,10 @@ pub struct RawMcpServerConfig {
     #[schemars(range(min = 1))]
     pub tool_input_schema_max_bytes: Option<NonZeroUsize>,
     #[serde(default)]
+    pub thread_identity_eligible: Option<bool>,
+    #[serde(default)]
+    pub control_endpoint_eligible: Option<bool>,
+    #[serde(default)]
     pub omit_tools_from: Option<Vec<ToolExposureSurface>>,
     #[serde(default)]
     pub default_tools_approval_mode: Option<AppToolApproval>,
@@ -470,6 +488,8 @@ impl TryFrom<RawMcpServerConfig> for McpServerConfig {
             startup_readiness,
             supports_parallel_tool_calls,
             tool_input_schema_max_bytes,
+            thread_identity_eligible,
+            control_endpoint_eligible,
             omit_tools_from,
             default_tools_approval_mode,
             enabled_tools,
@@ -591,6 +611,8 @@ impl TryFrom<RawMcpServerConfig> for McpServerConfig {
             startup_readiness: startup_readiness.unwrap_or_default(),
             supports_parallel_tool_calls: supports_parallel_tool_calls.unwrap_or_default(),
             tool_input_schema_max_bytes,
+            thread_identity_eligible: thread_identity_eligible.unwrap_or_default(),
+            control_endpoint_eligible: control_endpoint_eligible.unwrap_or_default(),
             omit_tools_from,
             disabled_reason: None,
             default_tools_approval_mode,

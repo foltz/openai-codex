@@ -24,6 +24,7 @@ use codex_extension_api::ToolCallSource;
 use codex_extension_api::ToolExecutor;
 use codex_extension_api::ToolFinishInput;
 use codex_extension_api::ToolPayload;
+use codex_extension_api::TurnAbortInput;
 use codex_extension_api::TurnErrorInput;
 use codex_extension_api::TurnStartInput;
 use codex_extension_api::TurnStopInput;
@@ -47,6 +48,7 @@ use codex_protocol::protocol::ThreadGoalStatus;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TruncationPolicy;
+use codex_protocol::protocol::TurnAbortReason;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use tempfile::TempDir;
@@ -258,6 +260,74 @@ async fn installed_goal_tools_only_replace_complete_goal() -> anyhow::Result<()>
 }
 
 #[tokio::test]
+async fn fork_goal_deferral_survives_preparation_until_stop_or_abort() -> anyhow::Result<()> {
+    for abort_reason in [None, Some(TurnAbortReason::Interrupted)] {
+        let runtime = test_runtime().await?;
+        let thread_id = test_thread_id()?;
+        seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+        let goal = runtime
+            .thread_goals()
+            .replace_thread_goal(
+                thread_id,
+                "inherited goal",
+                codex_state::ThreadGoalStatus::Active,
+                /*token_budget*/ None,
+            )
+            .await?;
+        runtime
+            .thread_goals()
+            .replace_thread_goal_snapshot(&goal)
+            .await?;
+        let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
+
+        // These callbacks run before installation. Abandoning preparation
+        // emits no terminal callback and must leave the durable marker intact.
+        harness
+            .start_turn("abandoned", &TokenUsage::default())
+            .await;
+        harness.resume_thread().await;
+        assert!(
+            runtime
+                .thread_goals()
+                .has_thread_goal_continuation_deferral(thread_id)
+                .await?
+        );
+
+        harness
+            .start_turn("installed", &TokenUsage::default())
+            .await;
+        assert!(
+            runtime
+                .thread_goals()
+                .has_thread_goal_continuation_deferral(thread_id)
+                .await?
+        );
+        if let Some(reason) = abort_reason {
+            let turn_store = ExtensionData::new("installed");
+            for contributor in harness.registry.turn_lifecycle_contributors() {
+                contributor
+                    .on_turn_abort(TurnAbortInput {
+                        reason: reason.clone(),
+                        session_store: &harness.session_store,
+                        thread_store: &harness.thread_store,
+                        turn_store: &turn_store,
+                    })
+                    .await;
+            }
+        } else {
+            harness.stop_turn("installed").await;
+        }
+        assert!(
+            !runtime
+                .thread_goals()
+                .has_thread_goal_continuation_deferral(thread_id)
+                .await?
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn create_goal_resets_baseline_before_turn_stop_accounting() -> anyhow::Result<()> {
     let runtime = test_runtime().await?;
     let thread_id = test_thread_id()?;
@@ -267,6 +337,7 @@ async fn create_goal_resets_baseline_before_turn_stop_accounting() -> anyhow::Re
     for contributor in harness.registry.turn_lifecycle_contributors() {
         contributor
             .on_turn_start(TurnStartInput {
+                mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
                 turn_id: "missing-baseline",
                 collaboration_mode: &default_collaboration_mode(),
                 token_usage_at_turn_start: None,
@@ -1777,6 +1848,7 @@ impl GoalExtensionHarness {
         for contributor in self.registry.turn_lifecycle_contributors() {
             contributor
                 .on_turn_start(TurnStartInput {
+                    mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
                     turn_id,
                     collaboration_mode: &collaboration_mode,
                     token_usage_at_turn_start: Some(usage),
@@ -1930,6 +2002,7 @@ fn tool_call(tool_name: &str, call_id: &str, arguments: serde_json::Value) -> To
         source: ToolCallSource::Direct,
         conversation_history: codex_extension_api::ConversationHistory::default(),
         turn_item_emitter: Arc::new(NoopTurnItemEmitter),
+        mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
         environments: Vec::new(),
         payload: ToolPayload::Function {
             arguments: arguments.to_string(),

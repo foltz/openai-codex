@@ -267,6 +267,7 @@ fn create_thread_params(thread_id: ThreadId) -> CreateThreadParams {
         thread_id,
         extra_config: None,
         forked_from_id: None,
+        clear_lineage: None,
         parent_thread_id: None,
         source: SessionSource::Exec,
         thread_source: None,

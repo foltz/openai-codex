@@ -3614,6 +3614,10 @@
         "command": {
           "type": "string"
         },
+        "control_endpoint_eligible": {
+          "default": null,
+          "type": "boolean"
+        },
         "cwd": {
           "allOf": [
             {
@@ -3738,6 +3742,10 @@
           "type": "number"
         },
         "supports_parallel_tool_calls": {
+          "default": null,
+          "type": "boolean"
+        },
+        "thread_identity_eligible": {
           "default": null,
           "type": "boolean"
         },
@@ -4726,10 +4734,26 @@
           },
           "type": "array"
         },
+        "status_line_prefix": {
+          "default": [],
+          "description": "Ordered entries prepended to the effective status line.\n\nThis is kept separate from `status_line` so managed launchers can add context without replacing the operator's configured selection.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "status_line_use_colors": {
           "default": true,
           "description": "Color status line items with colors derived from the active syntax theme. Defaults to `true`.",
           "type": "boolean"
+        },
+        "status_line_variables": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Values available to `template:` status-line entries.",
+          "type": "object"
         },
         "terminal_resize_reflow_max_rows": {
           "default": null,

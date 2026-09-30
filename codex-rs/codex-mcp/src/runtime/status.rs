@@ -20,6 +20,22 @@ impl McpRuntime {
         detail: McpSnapshotDetail,
         runtime_context: &McpRuntimeContext,
     ) -> anyhow::Result<(Arc<McpConfig>, McpServerStatusSnapshot)> {
+        self.server_status_snapshot_with_authority(
+            server,
+            detail,
+            runtime_context,
+            crate::McpAttemptAccess::Unscoped,
+        )
+        .await
+    }
+
+    pub async fn server_status_snapshot_with_authority(
+        &self,
+        server: &str,
+        detail: McpSnapshotDetail,
+        runtime_context: &McpRuntimeContext,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> anyhow::Result<(Arc<McpConfig>, McpServerStatusSnapshot)> {
         let current = self.current.load_full();
         let runtime_context = runtime_context.clone().with_selected_environments(
             Arc::clone(&current.environment_selections),
@@ -46,6 +62,7 @@ impl McpRuntime {
             auth_statuses,
             servers.into_keys().collect(),
             detail,
+            access,
         )
         .await;
         Ok((config, snapshot))

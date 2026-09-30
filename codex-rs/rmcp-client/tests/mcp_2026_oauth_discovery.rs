@@ -665,6 +665,7 @@ async fn interactive_oauth_rejects_untrusted_authorization_metadata() -> anyhow:
                 /*global_callback_url*/ None,
                 local_http_client(),
                 StreamableHttpRedirectMode::Legacy,
+                /*operation_work*/ None,
             )
             .await
             .err()

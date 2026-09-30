@@ -317,6 +317,7 @@ impl SkillsThreadState {
         &self,
         providers: &SkillProviders,
         query: SkillListQuery,
+        mcp_access: Result<codex_mcp::McpAttemptAccess<'_>, codex_mcp::McpAttemptRefused>,
     ) -> SkillProviderResult<()> {
         if !self.cloud_skill_enabled() {
             return Ok(());
@@ -334,7 +335,7 @@ impl SkillsThreadState {
         {
             return Ok(());
         }
-        let mut catalog = providers.list_cloud_for_turn(query).await?;
+        let mut catalog = providers.list_cloud_for_turn(query, mcp_access).await?;
         catalog.entries.sort_by(|a, b| a.id.0.cmp(&b.id.0));
         let mut catalogs = self
             .skills_extension_state

@@ -1246,6 +1246,7 @@ mod tests {
         let TestClient {
             _codex_home,
             client,
+            _host,
         } = start_test_client(SessionSource::Exec).await;
         let client = AppServerClient::InProcess(client);
         assert_eq!(

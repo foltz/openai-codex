@@ -1018,8 +1018,7 @@ async fn legacy_rollback_replay_retains_only_surviving_steered_answers() -> Resu
             .collect::<Vec<_>>(),
         answers
     );
-    // The current upstream steering window no longer retains either source
-    // call at this rollback boundary. Neither legacy answer may survive.
+    // Legacy answer survival follows the actual source-call boundary.
     thread
         .append_rollout_items(&[RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
             ThreadRolledBackEvent { num_turns: 1 },
@@ -1027,10 +1026,18 @@ async fn legacy_rollback_replay_retains_only_surviving_steered_answers() -> Resu
         .await?;
     thread = resume(&test, &thread).await?;
     let rolled_back = thread.conversation_history_snapshot().await;
-    assert!(!rolled_back.items().any(|item| {
-        matches!(item, ResponseItem::FunctionCall { call_id, .. }
-            if answers.iter().any(|answer| answer.call_id == call_id.as_str()))
-    }));
+    let surviving_calls = rolled_back
+        .items()
+        .filter_map(|item| match item {
+            ResponseItem::FunctionCall { call_id, .. }
+                if answers.iter().any(|answer| answer.call_id == call_id.as_str()) =>
+            {
+                Some(call_id.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(surviving_calls, vec![answers[0].call_id.as_str()]);
     assert_eq!(
         rolled_back
             .retained_context()
@@ -1038,11 +1045,11 @@ async fn legacy_rollback_replay_retains_only_surviving_steered_answers() -> Resu
             .verified_answers()
             .cloned()
             .collect::<Vec<_>>(),
-        Vec::<VerifiedAnswer>::new()
+        answers[..1]
     );
-    compact_and_assert_answers(&test, &thread, &[]).await?;
+    compact_and_assert_answers(&test, &thread, &answers[..1]).await?;
     thread = resume(&test, &thread).await?;
-    compact_and_assert_answers(&test, &thread, &[]).await?;
+    compact_and_assert_answers(&test, &thread, &answers[..1]).await?;
     thread.shutdown_and_wait().await?;
     Ok(())
 }

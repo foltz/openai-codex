@@ -1018,6 +1018,13 @@ async fn legacy_rollback_replay_retains_only_surviving_steered_answers() -> Resu
             .collect::<Vec<_>>(),
         answers
     );
+    let before_rollback = serde_json::to_value(
+        thread
+            .conversation_history_snapshot()
+            .await
+            .retained_context()
+            .expect("legacy answer context"),
+    )?;
     // Legacy answer survival follows the actual source-call boundary.
     thread
         .append_rollout_items(&[RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
@@ -1045,7 +1052,8 @@ async fn legacy_rollback_replay_retains_only_surviving_steered_answers() -> Resu
             .verified_answers()
             .cloned()
             .collect::<Vec<_>>(),
-        answers[..1]
+        answers[..1],
+        "retained context before rollback: {before_rollback}"
     );
     compact_and_assert_answers(&test, &thread, &answers[..1]).await?;
     thread = resume(&test, &thread).await?;

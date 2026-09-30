@@ -131,4 +131,20 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn session_metric_tags_accept_semver_build_metadata() {
+        let tags = SessionMetricTagValues {
+            auth_mode: None,
+            session_source: "cli",
+            originator: "codex_cli",
+            service_name: None,
+            model: "gpt-5.1",
+            app_version: "0.159.1+kcf.1",
+        }
+        .into_tags()
+        .expect("semantic version build metadata is a valid metric tag");
+
+        assert!(tags.contains(&(APP_VERSION_TAG, "0.159.1+kcf.1")));
+    }
 }

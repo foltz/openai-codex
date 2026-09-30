@@ -3,6 +3,7 @@ use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID;
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerTransportConfig;
@@ -130,9 +131,13 @@ async fn refresh_keeps_superseded_mcp_server_alive_for_in_flight_calls() -> anyh
             .expect_err("call should be aborted")
             .is_cancelled()
     );
-    wait_for_process_exit(&superseded_pid).await?;
+    wait_for_process_exit(&superseded_pid)
+        .await
+        .context("superseded MCP process remained alive after in-flight call cancellation")?;
     assert!(process_is_alive(&replacement_pid)?);
 
     fixture.codex.shutdown_and_wait().await?;
-    wait_for_process_exit(&replacement_pid).await
+    wait_for_process_exit(&replacement_pid)
+        .await
+        .context("replacement MCP process remained alive after thread shutdown")
 }

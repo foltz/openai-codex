@@ -1007,7 +1007,17 @@ async fn legacy_rollback_replay_retains_only_surviving_steered_answers() -> Resu
         )
         .await?;
     let mut thread = resume(&test, &test.codex).await?;
-    compact_and_assert_answers(&test, &thread, &answers).await?;
+    assert_eq!(
+        thread
+            .conversation_history_snapshot()
+            .await
+            .retained_context()
+            .expect("legacy answers")
+            .verified_answers()
+            .cloned()
+            .collect::<Vec<_>>(),
+        answers
+    );
     for expected in [&answers[..1], &[]] {
         thread
             .append_rollout_items(&[RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
@@ -1015,10 +1025,21 @@ async fn legacy_rollback_replay_retains_only_surviving_steered_answers() -> Resu
             ))])
             .await?;
         thread = resume(&test, &thread).await?;
-        compact_and_assert_answers(&test, &thread, expected).await?;
-        thread = resume(&test, &thread).await?;
-        compact_and_assert_answers(&test, &thread, expected).await?;
+        assert_eq!(
+            thread
+                .conversation_history_snapshot()
+                .await
+                .retained_context()
+                .expect("rollback retained context")
+                .verified_answers()
+                .cloned()
+                .collect::<Vec<_>>(),
+            expected
+        );
     }
+    compact_and_assert_answers(&test, &thread, &[]).await?;
+    thread = resume(&test, &thread).await?;
+    compact_and_assert_answers(&test, &thread, &[]).await?;
     thread.shutdown_and_wait().await?;
     Ok(())
 }

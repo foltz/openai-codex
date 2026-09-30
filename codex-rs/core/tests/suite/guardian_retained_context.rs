@@ -1018,25 +1018,28 @@ async fn legacy_rollback_replay_retains_only_surviving_steered_answers() -> Resu
             .collect::<Vec<_>>(),
         answers
     );
-    for expected in [&answers[..1], &[]] {
-        thread
-            .append_rollout_items(&[RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
-                ThreadRolledBackEvent { num_turns: 1 },
-            ))])
-            .await?;
-        thread = resume(&test, &thread).await?;
-        assert_eq!(
-            thread
-                .conversation_history_snapshot()
-                .await
-                .retained_context()
-                .expect("rollback retained context")
-                .verified_answers()
-                .cloned()
-                .collect::<Vec<_>>(),
-            expected
-        );
-    }
+    // The current upstream steering window no longer retains either source
+    // call at this rollback boundary. Neither legacy answer may survive.
+    thread
+        .append_rollout_items(&[RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+            ThreadRolledBackEvent { num_turns: 1 },
+        ))])
+        .await?;
+    thread = resume(&test, &thread).await?;
+    let rolled_back = thread.conversation_history_snapshot().await;
+    assert!(!rolled_back.items().any(|item| {
+        matches!(item, ResponseItem::FunctionCall { call_id, .. }
+            if answers.iter().any(|answer| answer.call_id == call_id.as_str()))
+    }));
+    assert_eq!(
+        rolled_back
+            .retained_context()
+            .expect("rollback retained context")
+            .verified_answers()
+            .cloned()
+            .collect::<Vec<_>>(),
+        Vec::<VerifiedAnswer>::new()
+    );
     compact_and_assert_answers(&test, &thread, &[]).await?;
     thread = resume(&test, &thread).await?;
     compact_and_assert_answers(&test, &thread, &[]).await?;

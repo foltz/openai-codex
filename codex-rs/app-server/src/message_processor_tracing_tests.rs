@@ -194,6 +194,17 @@ impl TracingHarness {
             )
             .await;
         assert!(harness.session.initialized());
+        // The transport loop completes stdio connection registration after
+        // initialize; this direct processor fixture must perform that step.
+        harness
+            .processor
+            .connection_initialized(
+                TEST_CONNECTION_ID,
+                harness.session.request_attestation(),
+                harness.session.trusted_interactive(),
+                harness.session.retention_principal(),
+            )
+            .await;
 
         Ok(harness)
     }

@@ -817,20 +817,20 @@ impl ContextManager {
             .iter()
             .filter_map(|item| item.turn_id())
             .collect::<Vec<_>>();
-        // Old checkpoints lack an accepted-input boundary. Their answers still follow
-        // the original source calls, even after the capture opt-out has been retired.
-        if source == RetainedInputSource::Inherited
-            || source.acceptance_order().is_some()
-            || retained_context
-                .ordered_entries()
-                .any(|(_, entry)| matches!(entry, RetainedContextEntry::UserMessage(_)))
-        {
+        // Old answer events lack accepted-input order even when a resumed thread
+        // now captures user messages. Their answers still follow source calls.
+        if source == RetainedInputSource::Inherited || source.acceptance_order().is_some() {
             Arc::make_mut(&mut retained_context).rollback(
                 &removed_turns,
                 first_removed_message_id,
                 source,
             );
         } else {
+            Arc::make_mut(&mut retained_context).rollback_messages(
+                &removed_turns,
+                first_removed_message_id,
+                source,
+            );
             Arc::make_mut(&mut retained_context).retain_answers(|answer| {
                 // Legacy answers follow their original call, not later steers in the same turn.
                 if let Some(source_index) = snapshot.iter().rposition(|item| {

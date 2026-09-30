@@ -782,16 +782,12 @@ async fn legacy_checkpoint_recovers_root_excerpt_before_discarding_backup(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn disabled_capture_stays_incomplete_after_compaction_and_enabled_resume() -> Result<()> {
+async fn legacy_incomplete_capture_stays_incomplete_after_compaction_and_resume() -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
     let test = test_codex()
         .with_config(|config| {
             config.experimental_thread_store = ThreadStoreConfig::Local;
-            config
-                .features
-                .disable(Feature::GuardianThreadContext)
-                .expect("disable instruction capture");
             config
                 .features
                 .disable(Feature::TokenBudget)
@@ -827,24 +823,31 @@ async fn disabled_capture_stays_incomplete_after_compaction_and_enabled_resume()
     .await;
 
     let checkpoint = compact_and_assert_answers(&test, &test.codex, &[]).await?;
-    assert!(!checkpoint.user_messages_complete());
-    assert_eq!(checkpoint.ordered_entries().count(), 0);
+    assert!(checkpoint.user_messages_complete());
 
     let thread_id = test.codex.startup_metadata().thread_id;
     test.codex.shutdown_and_wait().await?;
     test.thread_manager.remove_thread(&thread_id).await;
-    let items: Vec<RolloutItem> = serde_json::from_value(serde_json::to_value(
+    let mut items: Vec<RolloutItem> = serde_json::from_value(serde_json::to_value(
         load_context(&test, &test.codex).await?,
     )?)?;
-    let mut config = test.config.clone();
-    config
-        .features
-        .enable(Feature::GuardianThreadContext)
-        .expect("enable instruction capture on resume");
+    let legacy_checkpoint = items
+        .iter_mut()
+        .rev()
+        .find_map(|item| match item {
+            RolloutItem::Compacted(checkpoint) => Some(checkpoint),
+            _ => None,
+        })
+        .context("compacted rollout item")?;
+    // Pre-capture checkpoints can omit the instruction family. Recreate that
+    // persisted shape explicitly; the removed feature toggle no longer does it.
+    let mut incomplete = RetainedContext::default();
+    incomplete.mark_user_messages_incomplete();
+    legacy_checkpoint.retained_context = Some(incomplete);
     let resumed = test
         .thread_manager
         .resume_thread_with_history(
-            config,
+            test.config.clone(),
             InitialHistory::Resumed(ResumedHistory {
                 conversation_id: thread_id,
                 history: Arc::new(items),
@@ -883,10 +886,6 @@ async fn legacy_rollback_replay_retains_only_surviving_steered_answers() -> Resu
         .with_config(|config| {
             config.experimental_thread_store = ThreadStoreConfig::Local;
             // Legacy saved answers use their source calls, not acceptance-order metadata.
-            config
-                .features
-                .disable(Feature::GuardianThreadContext)
-                .expect("legacy evidence fixture");
             for feature in [Feature::TokenBudget, Feature::DefaultModeRequestUserInput] {
                 config
                     .features

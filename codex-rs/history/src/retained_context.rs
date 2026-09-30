@@ -567,6 +567,27 @@ impl RetainedContext {
         first_removed_message_id: Option<&str>,
         source: RetainedInputSource,
     ) {
+        self.rollback_inner(turn_ids, first_removed_message_id, source, true);
+    }
+
+    /// Trim instructions at a rollback boundary while legacy answers are resolved
+    /// against their surviving source calls by the caller.
+    pub fn rollback_messages(
+        &mut self,
+        turn_ids: &[&str],
+        first_removed_message_id: Option<&str>,
+        source: RetainedInputSource,
+    ) {
+        self.rollback_inner(turn_ids, first_removed_message_id, source, false);
+    }
+
+    fn rollback_inner(
+        &mut self,
+        turn_ids: &[&str],
+        first_removed_message_id: Option<&str>,
+        source: RetainedInputSource,
+        remove_answers: bool,
+    ) {
         let boundary = source.acceptance_order().map(RetainedContextOrder::Local);
         if let Some(boundary) = boundary.or_else(|| {
             first_removed_message_id.and_then(|id| {
@@ -578,7 +599,9 @@ impl RetainedContext {
         }) {
             self.sender_deliveries
                 .retain(|entry| entry.key() < boundary);
-            self.verified_answers.retain(|entry| entry.key() < boundary);
+            if remove_answers {
+                self.verified_answers.retain(|entry| entry.key() < boundary);
+            }
             self.user_messages.retain(|entry| entry.key() < boundary);
             self.assistant_messages
                 .retain(|entry| entry.key() < boundary);
@@ -589,10 +612,12 @@ impl RetainedContext {
                 .user_messages
                 .iter()
                 .any(|message| turn_ids.contains(&message.value.turn_id.as_str()));
-        self.verified_answers.retain(|answer| {
-            source != RetainedInputSource::Inherited
-                && !turn_ids.contains(&answer.value.turn_id.as_str())
-        });
+        if remove_answers {
+            self.verified_answers.retain(|answer| {
+                source != RetainedInputSource::Inherited
+                    && !turn_ids.contains(&answer.value.turn_id.as_str())
+            });
+        }
         self.sender_deliveries.retain(|entry| {
             source != RetainedInputSource::Inherited
                 && !turn_ids.contains(&entry.value.receiver_turn_id.as_str())

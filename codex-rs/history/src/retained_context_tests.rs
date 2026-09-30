@@ -92,6 +92,50 @@ fn retained_evidence_preserves_order_through_recovery_checkpoint_and_rollback() 
 }
 
 #[test]
+fn legacy_answer_rollback_can_trim_messages_without_losing_surviving_source_calls() {
+    let mut context = RetainedContext::default();
+    assert!(context.record(&publish_answer()));
+    context.record_user_message(
+        RetainedUserMessage {
+            phase: None,
+            origin: crate::UserInputOrigin::User,
+            turn_id: "turn-1".to_owned(),
+            message_id: Some("steer".to_owned()),
+            text: "Inspect the README too.".to_owned(),
+            complete: true,
+        },
+        RetainedInputSource::Local(None),
+    );
+    assert!(context.record(&RetainedContextEvent::VerifiedAnswer {
+        answer: VerifiedAnswer {
+            turn_id: "turn-1".to_owned(),
+            call_id: "ask-2".to_owned(),
+            questions: vec![VerifiedQuestionAnswer {
+                question: "Publish the README?".to_owned(),
+                answer: "No".to_owned(),
+            }],
+        },
+        acceptance_order: None,
+    }));
+
+    context.rollback_messages(
+        &["turn-1"],
+        Some("steer"),
+        RetainedInputSource::Local(None),
+    );
+    assert_eq!(context.user_messages.len(), 0);
+    assert_eq!(context.verified_answers().count(), 2);
+    context.retain_answers(|answer| answer.call_id == "ask-1");
+    assert_eq!(
+        context
+            .verified_answers()
+            .map(|answer| answer.call_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["ask-1"]
+    );
+}
+
+#[test]
 fn retained_families_enforce_storage_limits_without_changing_snapshots() {
     let mut context = RetainedContext::default();
     let first = publish_answer();

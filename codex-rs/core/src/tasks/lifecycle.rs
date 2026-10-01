@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use codex_analytics::TurnAnalyticsMetadata;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ThreadIdleCause;
 use codex_extension_api::TurnStartPhase;
@@ -19,28 +20,36 @@ impl Session {
         token_usage_at_turn_start: Option<&TokenUsage>,
         phase: TurnStartPhase,
     ) -> CodexResult<()> {
+        let metadata: Arc<dyn TurnAnalyticsMetadata> = turn_context.turn_metadata_state.clone();
+        turn_context.extension_data.insert(metadata);
         let collaboration_mode = turn_context.collaboration_mode();
         for contributor in self.services.extensions.turn_lifecycle_contributors() {
             if contributor.turn_start_phase(&self.services.thread_extension_data) != phase {
                 continue;
             }
-            if phase == TurnStartPhase::RegularTaskStart
+            let work = if phase == TurnStartPhase::RegularTaskStart
                 && contributor.requires_mcp_runtime(&self.services.thread_extension_data)
             {
                 // Only this post-install phase has a bound turn entry.
-                let work = self
-                    .turn_mcp_work(turn_context)
-                    .map_err(|err| CodexErr::Fatal(err.to_string()))?;
-                let access = work.as_deref().map_or(
-                    codex_mcp::McpAttemptAccess::Unscoped,
-                    codex_mcp::McpAttemptAccess::Admitted,
-                );
+                self.turn_mcp_work(turn_context)
+                    .map_err(|err| CodexErr::Fatal(err.to_string()))?
+            } else {
+                None
+            };
+            let access = work.as_deref().map_or(
+                codex_mcp::McpAttemptAccess::Unscoped,
+                codex_mcp::McpAttemptAccess::Admitted,
+            );
+            if phase == TurnStartPhase::RegularTaskStart
+                && contributor.requires_mcp_runtime(&self.services.thread_extension_data)
+            {
                 self.refresh_mcp_if_dirty_with_authority(access)
                     .await
                     .map_err(|err| CodexErr::Fatal(err.to_string()))?;
             }
             contributor
                 .on_turn_start(codex_extension_api::TurnStartInput {
+                    mcp_access: Ok(access),
                     turn_id: turn_context.sub_id.as_str(),
                     collaboration_mode: &collaboration_mode,
                     token_usage_at_turn_start,

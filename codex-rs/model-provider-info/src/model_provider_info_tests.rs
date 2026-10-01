@@ -6,6 +6,22 @@ use std::num::NonZeroU64;
 use tempfile::tempdir;
 
 #[test]
+fn runtime_internal_metadata_opt_in_is_not_serialized_or_configurable() {
+    let trusted = ModelProviderInfo {
+        include_internal_metadata: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        toml::to_string(&trusted).unwrap(),
+        toml::to_string(&ModelProviderInfo::default()).unwrap(),
+    );
+    assert_eq!(
+        toml::from_str::<ModelProviderInfo>("include_internal_metadata = true").unwrap(),
+        ModelProviderInfo::default(),
+    );
+}
+
+#[test]
 fn residency_publication_replaces_and_clears_exact_state() {
     let state = RwLock::new(None);
     assert_eq!(
@@ -114,6 +130,7 @@ base_url = "http://localhost:11434/v1"
         requires_openai_auth: false,
         supports_websockets: false,
         supports_standalone_web_search: false,
+        include_internal_metadata: false,
     };
 
     let provider: ModelProviderInfo = toml::from_str(azure_provider_toml).unwrap();
@@ -151,6 +168,7 @@ query_params = { api-version = "2025-04-01-preview" }
         requires_openai_auth: false,
         supports_websockets: false,
         supports_standalone_web_search: false,
+        include_internal_metadata: false,
     };
 
     let provider: ModelProviderInfo = toml::from_str(azure_provider_toml).unwrap();
@@ -192,6 +210,7 @@ supports_standalone_web_search = true
         requires_openai_auth: false,
         supports_websockets: false,
         supports_standalone_web_search: true,
+        include_internal_metadata: false,
     };
 
     let provider: ModelProviderInfo = toml::from_str(azure_provider_toml).unwrap();
@@ -380,6 +399,7 @@ fn test_create_amazon_bedrock_provider() {
             requires_openai_auth: false,
             supports_websockets: false,
             supports_standalone_web_search: false,
+            include_internal_metadata: false,
         }
     );
 }
@@ -388,7 +408,6 @@ fn test_create_amazon_bedrock_provider() {
 fn test_create_amazon_bedrock_runtime_provider() {
     let mut expected = ModelProviderInfo::create_amazon_bedrock_provider(/*aws*/ None);
     expected.name = "Amazon Bedrock Runtime".to_string();
-    expected.http_headers = None;
 
     assert_eq!(
         ModelProviderInfo::create_amazon_bedrock_runtime_provider(/*aws*/ None),
@@ -421,7 +440,10 @@ fn test_create_amazon_bedrock_runtime_provider_with_aws_configuration() {
                 credential_export: None,
                 auth_refresh: None,
             }),
-            None,
+            Some(maplit::hashmap! {
+                AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_HEADER.to_string() =>
+                    AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_VALUE.into(),
+            }),
             false,
         )
     );
@@ -441,18 +463,25 @@ fn provider_auth_for_test() -> ModelProviderAuthInfo {
 }
 
 #[test]
-fn test_amazon_bedrock_provider_adds_mantle_client_agent_header() {
-    let api_provider = ModelProviderInfo::create_amazon_bedrock_provider(/*aws*/ None)
-        .to_api_provider(/*auth_mode*/ None)
-        .expect("Amazon Bedrock provider should build API provider");
+fn test_amazon_bedrock_providers_add_mantle_client_agent_header() {
+    for provider in [
+        ModelProviderInfo::create_amazon_bedrock_provider(/*aws*/ None),
+        ModelProviderInfo::create_amazon_bedrock_runtime_provider(/*aws*/ None),
+    ] {
+        let api_provider = provider
+            .to_api_provider(/*auth_mode*/ None)
+            .expect("Amazon Bedrock provider should build API provider");
 
-    assert_eq!(
-        api_provider
-            .headers
-            .get(AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_HEADER)
-            .and_then(|value| value.to_str().ok()),
-        Some(AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_VALUE)
-    );
+        assert_eq!(
+            api_provider
+                .headers
+                .get(AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some(AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_VALUE),
+            "provider: {}",
+            provider.name
+        );
+    }
 }
 
 #[test]

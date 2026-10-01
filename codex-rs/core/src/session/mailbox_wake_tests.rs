@@ -94,12 +94,13 @@ async fn completion_wake_survives_producer_abort_and_is_driven_by_loop() {
     );
     let (reply, response) = tokio::sync::oneshot::channel();
     sender
-        .send(codex_protocol::protocol::Submission {
+        .send(crate::session::Submission {
             id: "suspend-during-mailbox-start".into(),
             op: codex_protocol::protocol::Op::SuspendTurnAndShutdown { reply },
             trace: None,
             parent_turn_id: None,
             root_turn_id: None,
+            residency_guard: None,
         })
         .await
         .unwrap();
@@ -114,12 +115,13 @@ async fn completion_wake_survives_producer_abort_and_is_driven_by_loop() {
     // Do not release the paused start. A queued shutdown must remain
     // dispatchable while the loop owns that preparation future.
     sender
-        .send(codex_protocol::protocol::Submission {
+        .send(crate::session::Submission {
             id: "shutdown-during-mailbox-start".into(),
             op: codex_protocol::protocol::Op::Shutdown,
             trace: None,
             parent_turn_id: None,
             root_turn_id: None,
+            residency_guard: None,
         })
         .await
         .unwrap();

@@ -185,6 +185,7 @@ impl McpEventStreams {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn forward_events(
     connection_id: ConnectionId,
     params: &McpServerEventStreamStartParams,

@@ -68,6 +68,7 @@ impl AccountRequestProcessor {
 }
 
 impl AccountLoginShutdown {
+    #[cfg(test)]
     pub(crate) fn deadline(&self) -> Instant {
         self.deadline
     }

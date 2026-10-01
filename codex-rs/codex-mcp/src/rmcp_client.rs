@@ -4,6 +4,7 @@
 //! initializing the server, listing raw tools, applying per-server tool filters,
 //! and exposing cached Codex Apps tools while a client is still connecting.
 //! Initialization capabilities survive tool-discovery failures and reset on a new attempt.
+//! Executor-discovered environment credentials remain executor-bound across those attempts.
 //! Higher-level aggregation and resource/tool APIs live in
 //! [`crate::connection_manager`].
 
@@ -42,6 +43,7 @@ use crate::pagination::collect_paginated_with_limit;
 use crate::runtime::McpRuntimeContext;
 use crate::runtime::emit_duration;
 use crate::server::EffectiveMcpServer;
+use crate::server::McpCredentialPolicy;
 use crate::server::has_explicit_http_authorization;
 use crate::tool_catalog_cache::McpToolCatalogCacheContext;
 use crate::tool_catalog_cache::McpToolCatalogFetchTicket;
@@ -681,6 +683,7 @@ impl AsyncManagedClient {
         self.ready_client().map(|client| client.client)
     }
 
+    #[cfg(test)]
     pub(crate) async fn reconnect_failed_startup(&self) {
         self.reconnect_failed_startup_with_authority(McpAttemptAccess::Unscoped)
             .await;
@@ -698,17 +701,6 @@ impl AsyncManagedClient {
         }
         if matches!(self.client().await, Err(StartupOutcomeError::Failed { .. })) {
             startup_reconnect.reconnect_in_background(access);
-        }
-    }
-
-    pub(crate) async fn shutdown(&self) {
-        self.cancel_token.cancel();
-        match self.client().await {
-            Ok(client) => client.client.shutdown().await,
-            Err(StartupOutcomeError::Cancelled) => {}
-            Err(error) => {
-                warn!("failed to initialize MCP client during shutdown: {error:#}");
-            }
         }
     }
 
@@ -995,10 +987,17 @@ fn is_untrusted_connector_meta_key(key: &str) -> bool {
 fn resolve_bearer_token(
     server_name: &str,
     bearer_token_env_var: Option<&str>,
+    credential_policy: McpCredentialPolicy,
 ) -> Result<Option<String>> {
     let Some(env_var) = bearer_token_env_var else {
         return Ok(None);
     };
+
+    if credential_policy == McpCredentialPolicy::ExecutorOnly {
+        return Err(anyhow!(
+            "MCP server '{server_name}' requires executor-side environment credential resolution; update the executor to a version that supports it (host fallback is disabled)"
+        ));
+    }
 
     match env::var(env_var) {
         Ok(value) => {
@@ -1520,6 +1519,23 @@ pub(crate) async fn make_rmcp_client(
     retirement: codex_rmcp_client::RmcpClientRetirement,
 ) -> Result<RmcpClient, StartupOutcomeError> {
     let config = server.config().clone();
+    if server.credential_policy() == McpCredentialPolicy::ExecutorOnly {
+        // Executor HTTP declarations cannot acquire host header helpers through
+        // cached registration materialization.
+        let valid_transport = matches!(
+            &config.transport,
+            McpServerTransportConfig::StreamableHttp {
+                env_http_headers,
+                http_headers_helper: None,
+                ..
+            } if env_http_headers.as_ref().is_none_or(HashMap::is_empty)
+        );
+        if config.is_local_environment() || !valid_transport {
+            return Err(StartupOutcomeError::from(anyhow!(
+                "executor-discovered MCP server '{server_name}' requires a remote HTTP transport without host environment headers or helpers"
+            )));
+        }
+    }
     if matches!(config.auth, McpServerAuth::EmaAuth) {
         return Err(StartupOutcomeError::from(anyhow!(
             "EMA MCP connections are not enabled in this version"
@@ -1625,9 +1641,13 @@ pub(crate) async fn make_rmcp_client(
                     Some(StreamableHttpBearerToken::ProvidedByHttpClient),
                 )
             } else {
-                let token = resolve_bearer_token(server_name, bearer_token_env_var.as_deref())
-                    .map_err(StartupOutcomeError::from)?
-                    .map(StreamableHttpBearerToken::Resolved);
+                let token = resolve_bearer_token(
+                    server_name,
+                    bearer_token_env_var.as_deref(),
+                    server.credential_policy(),
+                )
+                .map_err(StartupOutcomeError::from)?
+                .map(StreamableHttpBearerToken::Resolved);
                 (http_client, token)
             };
             let redirect_mode = if server.is_agent_plugin() {
@@ -1641,6 +1661,7 @@ pub(crate) async fn make_rmcp_client(
                 resolved_bearer_token,
                 http_headers,
                 env_http_headers,
+                server.config().oauth.clone(),
                 store_mode,
                 keyring_backend_kind,
                 http_client,
@@ -2971,3 +2992,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "rmcp_client_credential_policy_tests.rs"]
+mod credential_policy_tests;

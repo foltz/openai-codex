@@ -42,7 +42,6 @@ use crate::transport::RemoteControlStartConfig;
 use crate::transport::TransportEvent;
 use crate::transport::acquire_app_server_startup_lock;
 use crate::transport::app_server_startup_lock_path;
-use crate::transport::auth::policy_from_settings;
 use crate::transport::route_outgoing_envelope;
 use crate::transport::start_control_socket_acceptor_with_bound_hook;
 use crate::transport::start_remote_control;
@@ -62,12 +61,14 @@ use codex_core::ExecPolicyError;
 use codex_core::check_execpolicy_for_warnings;
 use codex_core::config::find_codex_home;
 use codex_exec_server::EnvironmentManager;
-use codex_exec_server::ExecServerRuntimePaths;
+use codex_exec_server::ExecServerRuntimeOptions;
 use codex_features::Feature;
 use codex_feedback::CodexFeedback;
 use codex_protocol::protocol::SessionSource;
 use codex_rollout::state_db as rollout_state_db;
 use codex_state::log_db;
+use codex_websocket_auth::WebsocketAuthSettings;
+use codex_websocket_auth::policy_from_settings;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -120,8 +121,10 @@ mod external_auth;
 mod filters;
 mod fs_watch;
 mod fuzzy_file_search;
+mod gateway_oauth_notifications;
 mod image_url;
 pub mod in_process;
+mod log_write_warning;
 mod managed_reset;
 mod managed_target_record;
 mod managed_transition;
@@ -156,9 +159,6 @@ pub use crate::error_code::INVALID_PARAMS_ERROR_CODE;
 pub use crate::transport::AppServerTransport;
 pub use crate::transport::RemoteControlStartupMode;
 pub use crate::transport::app_server_control_socket_path;
-pub use crate::transport::auth::AppServerWebsocketAuthArgs;
-pub use crate::transport::auth::AppServerWebsocketAuthSettings;
-pub use crate::transport::auth::WebsocketAuthCliMode;
 pub use crate::transport::take_remote_control_disabled_env;
 
 const LOG_FORMAT_ENV_VAR: &str = "LOG_FORMAT";
@@ -468,7 +468,7 @@ pub async fn run_main(
         default_analytics_enabled,
         AppServerTransport::Stdio,
         SessionSource::VSCode,
-        AppServerWebsocketAuthSettings::default(),
+        WebsocketAuthSettings::default(),
         AppServerRuntimeOptions::default(),
     )
     .await
@@ -519,7 +519,7 @@ pub async fn run_main_with_transport_options(
     default_analytics_enabled: bool,
     transport: AppServerTransport,
     session_source: SessionSource,
-    auth: AppServerWebsocketAuthSettings,
+    auth: WebsocketAuthSettings,
     runtime_options: AppServerRuntimeOptions,
 ) -> IoResult<AppServerExit> {
     #[cfg(target_os = "windows")]
@@ -544,7 +544,7 @@ pub async fn run_main_with_transport_options(
         )
     })?;
     let codex_home = find_codex_home()?;
-    let local_runtime_paths = ExecServerRuntimePaths::from_optional_paths(
+    let local_runtime_paths = ExecServerRuntimeOptions::from_optional_paths(
         arg0_paths.codex_self_exe.clone(),
         arg0_paths.codex_linux_sandbox_exe.clone(),
     )?;
@@ -558,30 +558,18 @@ pub async fn run_main_with_transport_options(
         arg0_paths.clone(),
         Arc::new(NoopThreadConfigLoader),
     );
-    match config_manager
-        .load_latest_config(/*fallback_cwd*/ None)
-        .await
-    {
-        Ok(config) => {
-            let auth_manager =
-                AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false)
-                    .await
-                    .map_err(std::io::Error::other)?;
-            config_manager.replace_cloud_config_bundle_loader(
-                auth_manager,
-                config.chatgpt_base_url.clone(),
-                config.http_client_factory(),
-            );
-        }
-        Err(err) if is_unsupported_untrusted_approval_policy_error(&err) => {
-            return Err(err);
-        }
-        Err(err) => {
-            warn!(error = %err, "Failed to preload config for cloud config bundle");
-            // If this fails, we cannot install cloud/thread config loaders, so non-strict
-            // startup continues without managed cloud config.
-        }
-    };
+    let bootstrap_config = config_manager
+        .load_startup_config(/*fallback_cwd*/ None)
+        .await?;
+    let bootstrap_auth =
+        AuthManager::shared_from_config(&bootstrap_config, /*enable_codex_api_key_env*/ false)
+            .await
+            .map_err(std::io::Error::other)?;
+    config_manager.replace_cloud_config_bundle_loader(
+        bootstrap_auth,
+        bootstrap_config.chatgpt_base_url.clone(),
+        bootstrap_config.http_client_factory(),
+    );
     let mut config_warnings = Vec::new();
     let mut plugin_startup_config = PluginStartupConfig::Current;
     let config = match config_manager
@@ -609,6 +597,10 @@ pub async fn run_main_with_transport_options(
         }
     };
     config.auth_config().validate()?;
+    config_manager
+        .sync_default_client_residency_requirement()
+        .await;
+
     #[cfg(target_os = "macos")]
     let local_runtime_paths = local_runtime_paths.with_allowed_symlinked_codex_home(
         codex_config::allowed_symlinked_codex_home(&config.config_layer_stack, &config.codex_home),
@@ -631,13 +623,19 @@ pub async fn run_main_with_transport_options(
                 ))
             }
         };
+    // Executor credentials belong to the selected environment, not the current account.
+    // Each request and connection still acquires a revocable application-policy permit.
+    let environment_http_client_factory = config
+        .http_client_factory()
+        .with_network_policy(config.application_network_policy.clone());
     let environment_manager = if ignore_user_config {
-        EnvironmentManager::from_env(Some(local_runtime_paths), config.http_client_factory()).await
+        EnvironmentManager::from_env(Some(local_runtime_paths), environment_http_client_factory)
+            .await
     } else {
         EnvironmentManager::from_codex_home(
             codex_home.clone(),
             Some(local_runtime_paths),
-            config.http_client_factory(),
+            environment_http_client_factory,
         )
         .await
     }
@@ -836,19 +834,6 @@ pub async fn run_main_with_transport_options(
     }
     drop(unix_socket_startup_lock);
 
-    // Do not start the detached database writer until target publication succeeds.
-    let log_db = state_db.clone().map(log_db::start);
-    if log_db_reload.reload(log_db.clone()).is_err() {
-        abort_startup_transports(
-            &transport_shutdown_token,
-            &mut transport_accept_handles,
-            &mut managed_target_record,
-        )
-        .await;
-        return Err(std::io::Error::other(
-            "app-server log database subscriber unavailable",
-        ));
-    }
     for warning in &config_warnings {
         match &warning.details {
             Some(details) => error!("{} {}", warning.summary, details),
@@ -868,7 +853,37 @@ pub async fn run_main_with_transport_options(
                 return Err(std::io::Error::other(error));
             }
         };
-
+    config_manager.replace_cloud_config_bundle_loader(
+        auth_manager.clone(),
+        config.chatgpt_base_url.clone(),
+        config.http_client_factory(),
+    );
+    let analytics_events_client =
+        analytics_events_client_from_config(Arc::clone(&auth_manager), &config);
+    let outgoing_message_sender = Arc::new(OutgoingMessageSender::new(
+        outgoing_tx,
+        analytics_events_client.clone(),
+    ));
+    let log_write_warning = log_write_warning::LogWriteWarningReporter::new(
+        feedback.clone(),
+        &outgoing_message_sender,
+        &config,
+    );
+    // Start the database writer only after the target and dependent auth are ready.
+    let log_db = state_db
+        .clone()
+        .map(|state_db| log_db::start(state_db, log_write_warning.clone()));
+    if log_db_reload.reload(log_db.clone()).is_err() {
+        abort_startup_transports(
+            &transport_shutdown_token,
+            &mut transport_accept_handles,
+            &mut managed_target_record,
+        )
+        .await;
+        return Err(std::io::Error::other(
+            "app-server log database subscriber unavailable",
+        ));
+    }
     let remote_control_enabled = remote_control_policy == RemoteControlPolicy::Allowed
         && remote_control_explicitly_requested
         && state_db.is_some();
@@ -1022,12 +1037,6 @@ pub async fn run_main_with_transport_options(
     let recovery_file = daemon_recovery_file_path(&config.codex_home);
     let processor_handle = tokio::spawn({
         let auth_manager = Arc::clone(&auth_manager);
-        let analytics_events_client =
-            analytics_events_client_from_config(Arc::clone(&auth_manager), &config);
-        let outgoing_message_sender = Arc::new(OutgoingMessageSender::new(
-            outgoing_tx,
-            analytics_events_client.clone(),
-        ));
         let initialize_notification_sender = outgoing_message_sender.clone();
         let outbound_control_tx = outbound_control_tx;
         let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {

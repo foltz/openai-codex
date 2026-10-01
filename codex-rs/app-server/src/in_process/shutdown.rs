@@ -525,10 +525,6 @@ impl EmbeddedTaskOwner {
         }
     }
 
-    pub(super) fn request_abort(&self) {
-        self.terminal_hint.abort();
-    }
-
     pub(super) async fn join(&self) -> TaskTermination {
         self.completion.clone().await
     }

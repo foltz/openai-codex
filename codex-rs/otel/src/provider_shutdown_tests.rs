@@ -81,6 +81,9 @@ fn disabled_provider_removes_previous_global_tracer() {
     let before = opentelemetry::global::tracer("before-disable").start("before");
     assert!(before.span_context().is_valid());
     let settings = crate::OtelSettings {
+        http_client_factory: codex_http_client::HttpClientFactory::new(
+            codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+        ),
         environment: "disabled".to_owned(),
         service_name: "disabled".to_owned(),
         service_version: "1".to_owned(),
@@ -124,6 +127,9 @@ async fn unpublished_provider_construction_preserves_global_metrics_and_settings
     )
     .unwrap();
     let mut settings = crate::OtelSettings {
+        http_client_factory: codex_http_client::HttpClientFactory::new(
+            codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+        ),
         environment: "candidate-b".to_owned(),
         service_name: "candidate-b".to_owned(),
         service_version: "1".to_owned(),
@@ -213,6 +219,9 @@ async fn partial_provider_failure_retains_log_and_metrics_until_retirement() {
         tls: None,
     };
     let settings = crate::OtelSettings {
+        http_client_factory: codex_http_client::HttpClientFactory::new(
+            codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+        ),
         environment: "test".to_owned(),
         service_name: "partial-provider".to_owned(),
         service_version: "1".to_owned(),
@@ -896,60 +905,6 @@ async fn assert_bounded_shutdown_completes() {
     assert_eq!(state.force_flushes.load(Ordering::Relaxed), 0);
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn bounded_shutdown_completes_on_current_thread_runtime() {
-    assert_bounded_shutdown_completes().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn bounded_shutdown_completes_on_multi_thread_runtime() {
-    assert_bounded_shutdown_completes().await;
-}
-
-#[test]
-fn explicit_shutdown_and_drop_shut_down_exporters_once_without_force_flush() {
-    let TestProvider {
-        provider,
-        state,
-        started,
-        completed,
-    } = test_provider(ShutdownBehavior::Complete);
-
-    provider.shutdown();
-    provider.shutdown();
-    drop(provider);
-
-    started
-        .recv_timeout(Duration::from_secs(/*secs*/ 1))
-        .expect("shutdown started");
-    completed
-        .recv_timeout(Duration::from_secs(/*secs*/ 1))
-        .expect("shutdown completed");
-    assert_eq!(state.shutdowns.load(Ordering::Relaxed), 1);
-    assert_eq!(state.force_flushes.load(Ordering::Relaxed), 0);
-}
-
-#[test]
-fn drop_shuts_down_exporters_without_force_flush() {
-    let TestProvider {
-        provider,
-        state,
-        started,
-        completed,
-    } = test_provider(ShutdownBehavior::Complete);
-
-    drop(provider);
-
-    started
-        .recv_timeout(Duration::from_secs(/*secs*/ 1))
-        .expect("shutdown started");
-    completed
-        .recv_timeout(Duration::from_secs(/*secs*/ 1))
-        .expect("shutdown completed");
-    assert_eq!(state.shutdowns.load(Ordering::Relaxed), 1);
-    assert_eq!(state.force_flushes.load(Ordering::Relaxed), 0);
-}
-
 #[test]
 fn checked_shutdown_failure_is_sticky_across_legacy_calls_and_drop() {
     let TestProvider {
@@ -1125,4 +1080,58 @@ async fn retained_retirement_long_observer_survives_short_observer_timeout() {
     assert_eq!(long.await, Ok(()));
     assert_eq!(state.shutdowns.load(Ordering::Relaxed), 1);
     assert_eq!(state.processors_dropped.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn bounded_shutdown_completes_on_current_thread_runtime() {
+    assert_bounded_shutdown_completes().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bounded_shutdown_completes_on_multi_thread_runtime() {
+    assert_bounded_shutdown_completes().await;
+}
+
+#[test]
+fn explicit_shutdown_and_drop_shut_down_exporters_once_without_force_flush() {
+    let TestProvider {
+        provider,
+        state,
+        started,
+        completed,
+    } = test_provider(ShutdownBehavior::Complete);
+
+    provider.shutdown();
+    provider.shutdown();
+    drop(provider);
+
+    started
+        .recv_timeout(Duration::from_secs(/*secs*/ 1))
+        .expect("shutdown started");
+    completed
+        .recv_timeout(Duration::from_secs(/*secs*/ 1))
+        .expect("shutdown completed");
+    assert_eq!(state.shutdowns.load(Ordering::Relaxed), 1);
+    assert_eq!(state.force_flushes.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn drop_shuts_down_exporters_without_force_flush() {
+    let TestProvider {
+        provider,
+        state,
+        started,
+        completed,
+    } = test_provider(ShutdownBehavior::Complete);
+
+    drop(provider);
+
+    started
+        .recv_timeout(Duration::from_secs(/*secs*/ 1))
+        .expect("shutdown started");
+    completed
+        .recv_timeout(Duration::from_secs(/*secs*/ 1))
+        .expect("shutdown completed");
+    assert_eq!(state.shutdowns.load(Ordering::Relaxed), 1);
+    assert_eq!(state.force_flushes.load(Ordering::Relaxed), 0);
 }

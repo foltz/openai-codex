@@ -139,8 +139,8 @@ async fn thread_resubscribe_does_not_retain_idle_thread() -> Result<()> {
                     _ => {}
                 }
             }
-            if closed.is_some() && status.is_some() {
-                return anyhow::Ok((closed.unwrap(), status.unwrap()));
+            if let (Some(closed), Some(status)) = (&closed, &status) {
+                return anyhow::Ok((closed.clone(), status.clone()));
             }
         }
     })

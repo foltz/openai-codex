@@ -249,7 +249,7 @@ async fn derived_delivery_uses_the_resolved_loop_after_lookup_removal() {
     let (parent, gate) = parent().await;
     let authority = crate::ParentTurnAuthority::capture(&parent, "live-parent");
     let work = authority.derive(&child).unwrap();
-    let state = harness.control.upgrade().unwrap();
+    let state = harness.control.runtime.manager.upgrade().unwrap();
     assert!(state.remove_thread(&id).await.is_some());
     assert!(state.get_thread(id).await.is_err());
     state

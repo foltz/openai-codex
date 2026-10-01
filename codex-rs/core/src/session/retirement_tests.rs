@@ -583,7 +583,7 @@ async fn consumed_websocket_prewarm_keeps_its_real_join_registered() {
     let original = task.abort_handle();
     session
         .set_session_startup_prewarm(
-            crate::session_startup_prewarm::SessionStartupPrewarmHandle::new(
+            crate::session::startup_prewarm::SessionStartupPrewarmHandle::new(
                 session.task_joins.register(task),
                 result_rx,
                 std::time::Instant::now(),

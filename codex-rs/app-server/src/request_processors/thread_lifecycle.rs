@@ -441,6 +441,7 @@ pub(super) async fn wait_for_thread_shutdown(thread: &Arc<CodexThread>) -> Threa
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn unload_idle_unretained_thread(
     thread_manager: Arc<ThreadManager>,
     outgoing: Arc<OutgoingMessageSender>,

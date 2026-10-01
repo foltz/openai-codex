@@ -125,11 +125,13 @@ impl MetricsRoute {
         operation(&lease.0.inner)
     }
 
+    #[cfg(test)]
     pub(super) fn replace(&self, inner: Arc<MetricsClientInner>) -> Result<MetricsDrainTicket> {
         Ok(self.publication_guard()?.replace(Some(inner)))
     }
 
     /// Close new operation admission without abandoning already-selected work.
+    #[cfg(test)]
     pub(super) fn disable(&self) -> Result<MetricsDrainTicket> {
         Ok(self.publication_guard()?.replace(None))
     }

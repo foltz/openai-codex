@@ -100,6 +100,7 @@ async fn managed_workspace_default_respects_read_only_availability() -> color_ey
             /*log_db*/ None,
             /*state_db*/ None,
             Arc::new(EnvironmentManager::default_for_tests()),
+            Default::default(),
             Arc::new(codex_app_server_client::InProcessHost::default()),
         )
         .await?;

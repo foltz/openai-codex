@@ -62,6 +62,7 @@ use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
 use codex_config::McpServerTransportConfig;
+use codex_config::McpStartupReadiness;
 use codex_diagnostics::Gauge;
 use codex_diagnostics::GaugeGuard;
 use codex_protocol::mcp::CallToolResult;
@@ -148,10 +149,6 @@ impl McpServerConnection {
         self.client.client_with_authority(access).await
     }
 
-    async fn shutdown(&self) {
-        self.client.shutdown().await;
-    }
-
     fn cancel_startup(&self) {
         if !self.startup_is_dormant() && !self.client.startup_complete.load(Ordering::Acquire) {
             self.client.cancel_token.cancel();
@@ -175,6 +172,7 @@ impl Drop for McpServerConnection {
 struct McpServerView {
     connection: Arc<McpServerConnection>,
     protocol_mode: crate::McpProtocolMode,
+    startup_readiness: McpStartupReadiness,
     metadata: McpServerMetadata,
     tool_filter: ToolFilter,
     tool_timeout: Option<Duration>,
@@ -182,6 +180,28 @@ struct McpServerView {
 }
 
 impl McpServerView {
+    fn allows_cached_startup(&self) -> bool {
+        self.startup_readiness == McpStartupReadiness::Catalog
+            || self.connection.startup_is_dormant()
+    }
+
+    fn cached_startup_tools(&self, fallback: Option<Vec<ToolInfo>>) -> Option<Vec<ToolInfo>> {
+        self.connection
+            .client
+            .cached_tools_or(fallback)
+            .filter(|tools| self.accepts_cached_tools(tools))
+    }
+
+    fn accepts_cached_tools(&self, tools: &[ToolInfo]) -> bool {
+        self.connection.client.is_codex_apps_mcp_server
+            || match self.startup_readiness {
+                McpStartupReadiness::Connection => !tools.is_empty(),
+                McpStartupReadiness::Catalog => tools.iter().any(|tool| {
+                    self.tool_filter.allows(&tool.tool.name) && tool_is_model_visible(tool)
+                }),
+            }
+    }
+
     async fn listed_tools(
         &self,
         tool_plugin_context: &ToolPluginContext,
@@ -562,6 +582,7 @@ impl McpConnectionSet {
                         McpServerView {
                             connection,
                             protocol_mode,
+                            startup_readiness: configured_config.startup_readiness,
                             metadata,
                             tool_filter: configured_tool_filter,
                             tool_timeout: configured_tool_timeout,
@@ -727,6 +748,7 @@ impl McpConnectionSet {
                         _diagnostics_guard: LIVE_CONNECTIONS.track(),
                     }),
                     protocol_mode,
+                    startup_readiness: configured_config.startup_readiness,
                     metadata,
                     tool_filter: configured_tool_filter,
                     tool_timeout: configured_tool_timeout,
@@ -1018,6 +1040,7 @@ impl McpConnectionSet {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn wait_for_server_startup(&self, server_name: &str) -> bool {
         self.wait_for_server_startup_with_authority(server_name, crate::McpAttemptAccess::Unscoped)
             .await
@@ -1036,6 +1059,7 @@ impl McpConnectionSet {
     }
 
     /// Stop all MCP clients owned by this manager and terminate stdio server processes.
+    #[cfg(test)]
     pub async fn shutdown(&self) {
         let report = self
             .retirement
@@ -1062,6 +1086,7 @@ impl McpConnectionSet {
             .is_selected_plugin_mcp_server(server_name)
     }
 
+    #[cfg(test)]
     pub async fn wait_for_server_ready(&self, server_name: &str, timeout: Duration) -> bool {
         self.wait_for_server_ready_with_authority(
             server_name,
@@ -1089,6 +1114,7 @@ impl McpConnectionSet {
 
     /// Invoke the tool indicated by the (server, tool) pair.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub async fn call_tool(
         &self,
         server: &str,
@@ -1196,17 +1222,25 @@ impl McpConnectionSet {
     /// Returns presentation metadata from the current connection.
     /// Codex Apps metadata may come from its existing cache; regular MCP server information is
     /// connection-specific, so pending regular clients are awaited.
-    pub(crate) async fn list_available_server_infos(&self) -> HashMap<String, McpServerInfo> {
-        self.list_available_server_infos_with_authority(crate::McpAttemptAccess::Unscoped)
-            .await
+    #[cfg(test)]
+    pub(crate) async fn list_available_server_infos(
+        &self,
+        include_server: impl Fn(&str) -> bool,
+    ) -> HashMap<String, McpServerInfo> {
+        self.list_available_server_infos_with_authority(
+            include_server,
+            crate::McpAttemptAccess::Unscoped,
+        )
+        .await
     }
 
     pub(crate) async fn list_available_server_infos_with_authority(
         &self,
+        include_server: impl Fn(&str) -> bool,
         access: crate::McpAttemptAccess<'_>,
     ) -> HashMap<String, McpServerInfo> {
         let mut server_infos = HashMap::new();
-        for (server_name, view) in &self.servers {
+        for (server_name, view) in self.servers.iter().filter(|(name, _)| include_server(name)) {
             let client = &view.connection.client;
             if !client.startup_complete.load(Ordering::Acquire)
                 && let Some(server_info) = client.cached_server_info.clone()

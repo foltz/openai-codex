@@ -314,8 +314,10 @@ enum AdoptedAuthUpdate {
 /// not care about target evidence (every existing Slice 1-era test).
 /// `declared_profile: None` and `endpoint: String::new()` are themselves
 /// synthetic, never real production values.
+#[cfg(test)]
 struct UnsetTargetEvidenceSource;
 
+#[cfg(test)]
 impl TargetEvidenceSource for UnsetTargetEvidenceSource {
     fn declared_profile(&self) -> Option<String> {
         None
@@ -545,6 +547,7 @@ struct TransitionRecord {
     prior_auth_fingerprint: Option<String>,
     result_auth_fingerprint: Option<String>,
     refusal: Option<ManagedTransitionRefusalKind>,
+    #[cfg_attr(not(test), allow(dead_code))]
     reset_failure: Option<ResetInventoryError>,
     /// True after auth installation until all reset work has completed.
     /// Cancellation may never waive this obligation.
@@ -556,6 +559,7 @@ struct TransitionRecord {
 }
 
 impl ManagedTransitionCoordinator {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self::from_authoritative_auth_state(AuthoritativeAuthState {
             authority_available: true,
@@ -567,6 +571,7 @@ impl ManagedTransitionCoordinator {
     /// Construction with target evidence unset, for the many existing tests
     /// that exercise coordinator/auth behavior and do not care about Slice
     /// 2's own target-binding leg.
+    #[cfg(test)]
     pub(crate) fn from_authoritative_auth_state(
         authoritative_auth: AuthoritativeAuthState,
     ) -> Self {
@@ -681,6 +686,7 @@ impl ManagedTransitionCoordinator {
         coordinator
     }
 
+    #[cfg(test)]
     pub(crate) async fn process_instance_id(&self) -> String {
         self.state.lock().await.process_instance_id.clone()
     }
@@ -701,6 +707,7 @@ impl ManagedTransitionCoordinator {
     }
 
     /// Listener-independent turn evidence shared with host admission hooks.
+    #[cfg(test)]
     pub(crate) fn account_turn_work(&self) -> crate::account_turn_work::AccountTurnWork {
         self.account_turn_work.clone()
     }

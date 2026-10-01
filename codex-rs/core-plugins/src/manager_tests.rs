@@ -126,6 +126,7 @@ fn plugins_config_input_with_requirements(
         /*remote_plugin_enabled*/ false,
         String::new(),
         test_http_client_factory(),
+        /*product_sku*/ None,
     )
 }
 
@@ -166,6 +167,7 @@ fn curated_repo_sync_stays_deferred_for_remote_chatgpt_catalog() {
         /*remote_plugin_enabled*/ true,
         "https://chatgpt.com".to_string(),
         test_http_client_factory(),
+        /*product_sku*/ None,
     );
     let manager = Arc::new(test_plugins_manager_with_options(
         tmp.path().to_path_buf(),
@@ -978,7 +980,9 @@ async fn load_plugins_loads_default_skills_and_mcp_servers() {
                     environment_id: "local".to_string(),
                     enabled: true,
                     required: false,
+                    startup_readiness: Default::default(),
                     supports_parallel_tool_calls: false,
+                    tool_input_schema_max_bytes: None,
                     thread_identity_eligible: false,
                     control_endpoint_eligible: false,
                     omit_tools_from: None,
@@ -1082,7 +1086,9 @@ enabled = true
                 environment_id: "local".to_string(),
                 enabled: true,
                 required: false,
+                startup_readiness: Default::default(),
                 supports_parallel_tool_calls: false,
+                tool_input_schema_max_bytes: None,
                 thread_identity_eligible: false,
                 control_endpoint_eligible: false,
                 omit_tools_from: None,
@@ -2187,7 +2193,9 @@ async fn load_plugins_uses_manifest_configured_component_paths() {
                     environment_id: "local".to_string(),
                     enabled: true,
                     required: false,
+                    startup_readiness: Default::default(),
                     supports_parallel_tool_calls: false,
+                    tool_input_schema_max_bytes: None,
                     thread_identity_eligible: false,
                     control_endpoint_eligible: false,
                     omit_tools_from: None,
@@ -2528,7 +2536,9 @@ async fn load_plugins_ignores_manifest_component_paths_without_dot_slash() {
                 environment_id: "local".to_string(),
                 enabled: true,
                 required: false,
+                startup_readiness: Default::default(),
                 supports_parallel_tool_calls: false,
+                tool_input_schema_max_bytes: None,
                 thread_identity_eligible: false,
                 control_endpoint_eligible: false,
                 omit_tools_from: None,
@@ -2785,7 +2795,9 @@ fn capability_index_filters_inactive_and_zero_capability_plugins() {
         environment_id: "local".to_string(),
         enabled: true,
         required: false,
+        startup_readiness: Default::default(),
         supports_parallel_tool_calls: false,
+        tool_input_schema_max_bytes: None,
         thread_identity_eligible: false,
         control_endpoint_eligible: false,
         omit_tools_from: None,
@@ -2979,6 +2991,7 @@ async fn plugin_cache_reuses_effective_configurations() {
             /*remote_plugin_enabled*/ false,
             "https://chatgpt.com".to_string(),
             test_http_client_factory(),
+            /*product_sku*/ None,
         )
     };
     let manager = test_plugins_manager(codex_home.path().to_path_buf());
@@ -3243,6 +3256,7 @@ async fn plugins_for_config_discards_in_flight_load_after_account_change() {
         /*remote_plugin_enabled*/ true,
         String::new(),
         test_http_client_factory(),
+        /*product_sku*/ None,
     );
     let auth_manager = test_auth_manager(Some(AuthMode::ChatgptAuthTokens));
     let manager = Arc::new(test_plugins_manager_with_auth_manager(
@@ -7193,6 +7207,7 @@ fn remote_installed_plugins_cache_refresh_coalesces_materializations() {
             service_config: RemotePluginServiceConfig::new(
                 "https://example.com".to_string(),
                 test_http_client_factory(),
+                /*product_sku*/ None,
             ),
             auth: None,
             notify: RemoteInstalledPluginsCacheRefreshNotify::IfCacheChanged,
@@ -7243,6 +7258,7 @@ async fn rejected_remote_cache_refresh_admission_clears_queued_work() {
     let service_config = RemotePluginServiceConfig::new(
         "https://example.com".to_string(),
         test_http_client_factory(),
+        /*product_sku*/ None,
     );
 
     manager.schedule_remote_installed_plugins_cache_refresh(
@@ -7663,6 +7679,7 @@ async fn account_reset_fences_late_remote_installed_success_and_auth_errors() {
             service_config: RemotePluginServiceConfig::new(
                 "https://example.com".to_string(),
                 test_http_client_factory(),
+                /*product_sku*/ None,
             ),
             auth: None,
             notify: RemoteInstalledPluginsCacheRefreshNotify::AfterSuccessfulRefresh,
@@ -7695,6 +7712,7 @@ async fn account_reset_fences_late_remote_installed_success_and_auth_errors() {
                 service_config: RemotePluginServiceConfig::new(
                     "https://example.com".to_string(),
                     test_http_client_factory(),
+                    /*product_sku*/ None,
                 ),
                 auth: None,
                 notify: RemoteInstalledPluginsCacheRefreshNotify::AfterSuccessfulRefresh,
@@ -7749,6 +7767,7 @@ fn account_reset_drops_pending_refresh_and_rejects_late_bundle_callback() {
         service_config: RemotePluginServiceConfig::new(
             "https://example.com".to_string(),
             test_http_client_factory(),
+            /*product_sku*/ None,
         ),
         auth: None,
         notify: RemoteInstalledPluginsCacheRefreshNotify::AfterSuccessfulRefresh,

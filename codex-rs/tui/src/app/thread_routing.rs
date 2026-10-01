@@ -18,7 +18,13 @@ const REALTIME_STOP_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 1);
 
 impl App {
     pub(super) async fn stop_realtime_conversation(&mut self, app_server: &mut AppServerSession) {
-        let Some(thread_id) = self.chat_widget.reset_realtime_conversation() else {
+        let thread_id = self
+            .background_voice
+            .as_mut()
+            .and_then(|owner| owner.reset_realtime_conversation())
+            .or_else(|| self.chat_widget.reset_realtime_conversation());
+        self.retire_background_voice();
+        let Some(thread_id) = thread_id else {
             return;
         };
         match tokio::time::timeout(
@@ -48,8 +54,9 @@ impl App {
         app_server: &mut AppServerSession,
         retained_target: Option<ThreadId>,
     ) {
-        // Re-adopting the displayed thread does not leave its voice session.
-        if retained_target.is_none() || retained_target != self.chat_widget.thread_id() {
+        // A navigation target parks the existing voice owner under its own
+        // listener. An explicit shutdown has no destination and stops it.
+        if retained_target.is_none() {
             self.stop_realtime_conversation(app_server).await;
         }
         let side_thread_ids: Vec<ThreadId> = self.side_threads.keys().copied().collect();
@@ -69,9 +76,17 @@ impl App {
             leaving.push(displayed);
         }
         for thread_id in leaving {
-            if Some(thread_id) != retained_target
-                && let Err(err) = app_server.thread_unsubscribe(thread_id).await
+            if Some(thread_id) == retained_target
+                || (retained_target.is_some() && self.voice_owner_thread_id() == Some(thread_id))
+                || self
+                    .agents_overview
+                    .dispatched_requests
+                    .contains_key(&thread_id)
+                || self.agents_overview.blank_sessions.contains_key(&thread_id)
             {
+                continue;
+            }
+            if let Err(err) = app_server.thread_unsubscribe(thread_id).await {
                 tracing::warn!("failed to unsubscribe thread {thread_id}: {err}");
             }
             self.abort_thread_event_listener(thread_id);
@@ -1174,6 +1189,7 @@ impl App {
         thread_id: ThreadId,
         notification: ServerNotification,
     ) -> Result<()> {
+        self.deliver_background_voice_notification(thread_id, &notification);
         if self.abandoned_side_threads.contains(&thread_id) {
             return Ok(());
         }
@@ -1291,7 +1307,13 @@ impl App {
                 guard.push_notification_ref(&notification);
                 Some(notification)
             } else {
-                self.retain_inactive_realtime_transcript(thread_id, &notification);
+                if self
+                    .background_voice
+                    .as_ref()
+                    .is_none_or(|owner| owner.thread_id() != Some(thread_id))
+                {
+                    self.retain_inactive_realtime_transcript(thread_id, &notification);
+                }
                 guard.push_notification(notification);
                 None
             };
@@ -1603,7 +1625,9 @@ impl App {
             self.chat_widget.set_token_info(/*info*/ None);
         }
         match presentation {
-            ThreadAttachPresentation::Fresh | ThreadAttachPresentation::SessionLineage => {
+            ThreadAttachPresentation::Fresh
+            | ThreadAttachPresentation::FreshWithDraft
+            | ThreadAttachPresentation::SessionLineage => {
                 self.chat_widget.handle_thread_session(session);
             }
         }
@@ -1631,6 +1655,7 @@ impl App {
             &replayed_final_items,
             retained_assistant_captions,
         );
+        self.restore_voice_owner_after_replay();
         let pending = std::mem::take(&mut self.pending_primary_events);
         for pending_event in pending {
             match pending_event {
@@ -1940,6 +1965,7 @@ impl App {
             &replayed_final_items,
             retained_assistant_captions,
         );
+        self.restore_voice_owner_after_replay();
         self.chat_widget
             .set_queue_autosend_suppressed(/*suppressed*/ false);
         self.chat_widget
@@ -2042,8 +2068,13 @@ impl App {
         match event {
             ThreadBufferedEvent::Notification(notification) => {
                 self.cache_collab_receiver_threads_for_notification(notification.as_ref());
+                let tip_ready = self.turn_tips.observe(&notification, Instant::now());
                 self.chat_widget
                     .handle_server_notification(*notification, /*replay_kind*/ None);
+                // History cells queued by completion must be applied before anchoring its tip.
+                if let Some(event) = tip_ready {
+                    self.app_event_tx.send(event);
+                }
             }
             ThreadBufferedEvent::Request(request) => {
                 if self
@@ -2075,6 +2106,7 @@ impl App {
     }
 
     pub(super) fn handle_thread_event_replay(&mut self, event: ThreadBufferedEvent) {
+        self.turn_tips.dismiss();
         match event {
             ThreadBufferedEvent::Notification(notification) => self
                 .chat_widget

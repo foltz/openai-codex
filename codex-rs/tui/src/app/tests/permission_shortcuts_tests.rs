@@ -24,6 +24,7 @@ async fn permission_shortcut_rejections_leave_state_unchanged() -> Result<()> {
             ));
         let original = RuntimePermissionProfileOverride::from_config(app.chat_widget.config_ref());
         let original_reviewer = app.config.approvals_reviewer;
+        let host = Arc::new(codex_app_server_client::InProcessHost::default());
         let client = crate::start_embedded_app_server_with(
             Arg0DispatchPaths::default(),
             app.config.clone(),
@@ -35,9 +36,13 @@ async fn permission_shortcut_rejections_leave_state_unchanged() -> Result<()> {
             /*log_db*/ None,
             /*state_db*/ None,
             Arc::clone(&app.environment_manager),
+            Default::default(),
             |mut args| {
                 args.experimental_api = experimental_api;
-                codex_app_server_client::InProcessAppServerClient::start(args)
+                codex_app_server_client::InProcessAppServerClient::start_in_host(
+                    Arc::clone(&host),
+                    args,
+                )
             },
         )
         .await?;

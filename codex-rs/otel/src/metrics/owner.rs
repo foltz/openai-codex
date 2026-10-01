@@ -115,6 +115,7 @@ impl MetricsShutdownAttempt {
     }
     /// Run on a blocking worker. Concurrent or callback-reentrant callers
     /// receive InProgress, never wait on their own SDK call or claim success.
+    #[cfg(test)]
     pub(super) fn run(&self) -> Outcome {
         match self.claim()? {
             Some(result) => result,

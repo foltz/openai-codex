@@ -34,15 +34,6 @@ impl McpConnectionSet {
             })
     }
 
-    /// Returns resources from servers selected by `include_server`.
-    pub async fn list_all_resources(
-        &self,
-        include_server: impl Fn(&str) -> bool,
-    ) -> HashMap<String, Vec<Resource>> {
-        self.list_all_resources_with_authority(include_server, crate::McpAttemptAccess::Unscoped)
-            .await
-    }
-
     pub(crate) async fn list_all_resources_with_authority(
         &self,
         include_server: impl Fn(&str) -> bool,
@@ -95,18 +86,6 @@ impl McpConnectionSet {
             }
         }
         resources
-    }
-
-    /// Returns resource templates from servers selected by `include_server`.
-    pub async fn list_all_resource_templates(
-        &self,
-        include_server: impl Fn(&str) -> bool,
-    ) -> HashMap<String, Vec<ResourceTemplate>> {
-        self.list_all_resource_templates_with_authority(
-            include_server,
-            crate::McpAttemptAccess::Unscoped,
-        )
-        .await
     }
 
     pub(crate) async fn list_all_resource_templates_with_authority(
@@ -165,15 +144,6 @@ impl McpConnectionSet {
         templates
     }
 
-    pub async fn list_resources(
-        &self,
-        server: &str,
-        params: Option<PaginatedRequestParams>,
-    ) -> Result<ListResourcesResult> {
-        self.list_resources_with_authority(server, params, crate::McpAttemptAccess::Unscoped)
-            .await
-    }
-
     pub(crate) async fn list_resources_with_authority(
         &self,
         server: &str,
@@ -186,19 +156,6 @@ impl McpConnectionSet {
             .list_resources(params, timeout)
             .await
             .with_context(|| format!("resources/list failed for `{server}`"))
-    }
-
-    pub async fn list_resource_templates(
-        &self,
-        server: &str,
-        params: Option<PaginatedRequestParams>,
-    ) -> Result<ListResourceTemplatesResult> {
-        self.list_resource_templates_with_authority(
-            server,
-            params,
-            crate::McpAttemptAccess::Unscoped,
-        )
-        .await
     }
 
     pub(crate) async fn list_resource_templates_with_authority(
@@ -215,15 +172,6 @@ impl McpConnectionSet {
             .with_context(|| format!("resources/templates/list failed for `{server}`"))
     }
 
-    pub async fn read_resource(
-        &self,
-        server: &str,
-        params: ReadResourceRequestParams,
-    ) -> Result<ReadResourceResult> {
-        self.read_resource_with_authority(server, params, crate::McpAttemptAccess::Unscoped)
-            .await
-    }
-
     pub(crate) async fn read_resource_with_authority(
         &self,
         server: &str,
@@ -237,14 +185,6 @@ impl McpConnectionSet {
             .read_resource(params, timeout)
             .await
             .with_context(|| format!("resources/read failed for `{server}` ({uri})"))
-    }
-
-    pub(crate) async fn client_by_name(
-        &self,
-        name: &str,
-    ) -> Result<(ManagedClient, Option<Duration>)> {
-        self.client_by_name_with_authority(name, crate::McpAttemptAccess::Unscoped)
-            .await
     }
 
     pub(crate) async fn client_by_name_with_authority(

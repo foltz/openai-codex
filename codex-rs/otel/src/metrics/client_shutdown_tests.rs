@@ -398,6 +398,7 @@ fn metrics_owner_failure_reobservation_preserves_sole_sdk_attempt() {
         .with_reader(FailFirstStopReader(Arc::clone(&stops)))
         .build();
     let inner = Arc::new(MetricsClientInner {
+        network_policy: codex_http_client::NetworkPolicy::default(),
         meter: provider.meter("failed-first-stop"),
         meter_provider: provider,
         counters: Mutex::new(HashMap::new()),
@@ -458,6 +459,7 @@ fn callback_owner(
         .with_reader(CallbackReader(Box::new(callback)))
         .build();
     crate::metrics::owner::MetricsOwner::new(Arc::new(MetricsClientInner {
+        network_policy: codex_http_client::NetworkPolicy::default(),
         meter: provider.meter("owner-callback"),
         meter_provider: provider,
         counters: Mutex::new(HashMap::new()),
@@ -751,6 +753,7 @@ fn failed_flush_still_stops_reader_and_remains_failure() {
         })
         .build();
     let client = MetricsClientInner {
+        network_policy: codex_http_client::NetworkPolicy::default(),
         meter: provider.meter("retirement-test"),
         meter_provider: provider,
         counters: Mutex::new(HashMap::new()),

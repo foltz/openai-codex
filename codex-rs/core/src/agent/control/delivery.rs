@@ -1,21 +1,15 @@
-//! Delivers captured agent input without exposing local loading and eviction to callers.
-//!
-//! Target checks precede reload, and queue-only messages retain their non-waking semantics.
+//! Converts agent messages into attributed input while preserving their wake mode.
 
-use super::LocalAgentControl;
+use super::*;
 use crate::agent::api::AgentInput;
 use crate::agent::api::DeliveryReceipt;
 use crate::agent::api::SendRequest;
 use crate::agent::types::AgentMessage;
 use crate::agent::types::MessageDeliveryMode;
-use crate::agent_communication::AgentCommunicationContext;
-use crate::agent_communication::AgentCommunicationKind;
 use crate::context::ContextualUserFragment;
 use crate::context::InterAgentMessage;
 use crate::context::InterAgentMessageType;
 use codex_protocol::AgentPath;
-use codex_protocol::error::CodexErr;
-use codex_protocol::error::Result as CodexResult;
 use codex_protocol::protocol::InterAgentCommunication;
 
 impl AgentMessage {
@@ -82,8 +76,9 @@ impl LocalAgentControl {
                 (receiver.unwrap_or_default(), submission_id)
             }
             AgentInput::Message { message, mode } => {
-                let receiver = self.ensure_agent_known(target)?;
+                let receiver = self.runtime.ensure_agent_known(target)?;
                 let author = self
+                    .runtime
                     .ensure_agent_known(caller)?
                     .agent_path
                     .unwrap_or_else(AgentPath::root);

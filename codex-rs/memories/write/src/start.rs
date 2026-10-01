@@ -22,6 +22,7 @@ use tracing::warn;
 ///
 /// The pipeline is skipped for ephemeral sessions, disabled feature flags, and
 /// subagent sessions.
+#[allow(clippy::too_many_arguments)]
 pub fn start_memories_startup_task(
     thread_manager: Arc<ThreadManager>,
     auth_manager: Arc<AuthManager>,

@@ -15,6 +15,7 @@ use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::SortDirection;
 use codex_app_server_protocol::ThreadHistoryMode;
+use codex_app_server_protocol::ThreadItemsListCursor;
 use codex_app_server_protocol::ThreadItemsListParams;
 use codex_app_server_protocol::ThreadItemsListResponse;
 use codex_app_server_protocol::ThreadStatus;
@@ -282,6 +283,7 @@ pub(super) async fn start_recording_app_server_with_realtime_speech(
         /*log_db*/ None,
         state_db,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Default::default(),
         Arc::new(codex_app_server_client::InProcessHost::default()),
     )
     .await?;
@@ -692,7 +694,7 @@ pub(super) fn recorded_params(requests: &RecordedRequests, method: &str) -> Vec<
         .collect()
 }
 
-async fn make_history_test_app() -> Result<(App, tempfile::TempDir)> {
+async fn make_history_test_app() -> Result<(Box<App>, tempfile::TempDir)> {
     let mut app = make_test_app().await;
     let codex_home = tempdir()?;
     app.config.codex_home = codex_home.path().to_path_buf().abs();
@@ -1162,6 +1164,7 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths() 
         .request_typed(ClientRequest::McpServerStatusList {
             request_id: AppServerRequestId::String("tui-tool-inventory".to_string()),
             params: codex_app_server_protocol::ListMcpServerStatusParams {
+                server_name: None,
                 cursor: None,
                 limit: None,
                 detail: Some(codex_app_server_protocol::McpServerStatusDetail::ToolsAndAuthOnly),
@@ -2136,7 +2139,7 @@ async fn older_pagination_reconciles_review_prompts_across_page_boundaries() -> 
             params: ThreadItemsListParams {
                 thread_id: thread_id.to_string(),
                 turn_id: None,
-                cursor: Some(cursor.clone()),
+                cursor: Some(ThreadItemsListCursor::Opaque(cursor.clone())),
                 limit: Some(crate::app_server_session::HISTORY_ITEM_PAGE_LIMIT),
                 sort_direction: Some(SortDirection::Desc),
             },
@@ -3338,7 +3341,7 @@ model_reasoning_effort = "low"
     )
     .await?;
     let mut tui = crate::tui::test_support::make_test_tui()?;
-    app.start_fresh_session_with_summary_hint(
+    app.start_fresh_session(
         &mut tui,
         &mut server,
         /*initial_user_message*/ None,
@@ -3701,7 +3704,7 @@ terminal_visualization_instructions = true
             .map(|entry| &entry.owner),
         Some(&crate::worktree_browser::Owner::Unavailable(missing_owner))
     );
-    app.start_fresh_session_with_summary_hint(
+    app.start_fresh_session(
         &mut tui,
         &mut server,
         /*initial_user_message*/ None,
@@ -4166,7 +4169,7 @@ fn fresh_session_applies_requested_name() -> Result<()> {
                 .await?;
                 let mut tui = crate::tui::test_support::make_test_tui()?;
 
-                app.start_fresh_session_with_summary_hint(
+                app.start_fresh_session(
                     &mut tui,
                     &mut app_server,
                     /*initial_user_message*/ None,
@@ -4216,6 +4219,10 @@ fn clear_session_uses_exact_displayed_thread_before_unsubscribe_and_attaches_suc
                 .build()?;
             runtime.block_on(async {
                 let mut app = make_test_app().await;
+                // Clear qualification must not wait for external plugin catalog sync.
+                app.config.features.disable(Feature::Plugins)?;
+                app.cli_kv_overrides
+                    .push(("features.plugins".to_string(), toml::Value::Boolean(false)));
                 let codex_home = tempdir()?;
                 app.config.codex_home = codex_home.path().to_path_buf().abs();
                 app.config.sqlite = SqliteConfig::new_for_testing(codex_home.path().abs());
@@ -4321,6 +4328,10 @@ fn clear_then_submit_ui_path_uses_one_combined_request() -> Result<()> {
                 .build()?;
             runtime.block_on(async {
                 let mut app = make_test_app().await;
+                // Preserve this fixture isolation when fresh-session config reloads.
+                app.config.features.disable(Feature::Plugins)?;
+                app.cli_kv_overrides
+                    .push(("features.plugins".to_string(), toml::Value::Boolean(false)));
                 let codex_home = tempdir()?;
                 app.config.codex_home = codex_home.path().to_path_buf().abs();
                 app.config.sqlite = SqliteConfig::new_for_testing(codex_home.path().abs());
@@ -4636,7 +4647,7 @@ fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
                 );
                 assert!(matches!(take_backfill_counts(&requests), (0, 0) | (0, 1)));
 
-                app.start_fresh_session_with_summary_hint(
+                app.start_fresh_session(
                     &mut tui,
                     &mut app_server,
                     /*initial_user_message*/ None,

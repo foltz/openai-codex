@@ -327,7 +327,8 @@ impl OtelProvider {
                     settings.service_name.clone(),
                     settings.service_version.clone(),
                     settings.metrics_exporter.clone(),
-                );
+                )
+                .with_http_client_factory(settings.http_client_factory.clone());
                 if settings.runtime_metrics {
                     config = config.with_runtime_reader();
                 }
@@ -337,7 +338,13 @@ impl OtelProvider {
             let log_resource = make_resource(settings, ResourceKind::Logs);
             let trace_resource = make_resource(settings, ResourceKind::Traces);
             let (logger, log_receipt) = log_enabled
-                .then(|| build_logger(&log_resource, &settings.exporter))
+                .then(|| {
+                    build_logger(
+                        &log_resource,
+                        &settings.exporter,
+                        &settings.http_client_factory,
+                    )
+                })
                 .transpose()?
                 .map(|(provider, receipt)| (Some(provider), receipt))
                 .unwrap_or_default();
@@ -350,6 +357,7 @@ impl OtelProvider {
                         &trace_resource,
                         &settings.trace_exporter,
                         settings.span_attributes.clone(),
+                        &settings.http_client_factory,
                     )
                 })
                 .transpose()?
@@ -532,6 +540,7 @@ impl SpanProcessor for SpanAttributesProcessor {
 fn build_logger(
     resource: &Resource,
     exporter: &OtelExporter,
+    factory: &codex_http_client::HttpClientFactory,
 ) -> Result<
     (
         SdkLoggerProvider,
@@ -570,8 +579,12 @@ fn build_logger(
                 .with_tls_config(tls_config)
                 .build()?;
 
-            let (exporter, evidence) =
-                crate::trace_exporter_retirement::AcknowledgedExporter::new(exporter);
+            let (exporter, evidence) = crate::trace_exporter_retirement::AcknowledgedExporter::new(
+                crate::network_policy::PolicyExporter {
+                    exporter,
+                    policy: factory.network_policy().clone(),
+                },
+            );
             receipt = evidence;
             builder = builder.with_batch_exporter(exporter);
         }
@@ -594,15 +607,26 @@ fn build_logger(
                 .with_protocol(protocol)
                 .with_headers(headers);
 
-            if let Some(tls) = tls.as_ref() {
+            if factory.network_policy().is_managed() {
+                let client = crate::otlp::build_async_http_client(
+                    factory,
+                    tls.as_ref(),
+                    OTEL_EXPORTER_OTLP_LOGS_TIMEOUT,
+                )?;
+                exporter_builder = exporter_builder.with_http_client(client);
+            } else if let Some(tls) = tls.as_ref() {
                 let client = crate::otlp::build_http_client(tls, OTEL_EXPORTER_OTLP_LOGS_TIMEOUT)?;
                 exporter_builder = exporter_builder.with_http_client(client);
             }
 
             let exporter = exporter_builder.build()?;
 
-            let (exporter, evidence) =
-                crate::trace_exporter_retirement::AcknowledgedExporter::new(exporter);
+            let (exporter, evidence) = crate::trace_exporter_retirement::AcknowledgedExporter::new(
+                crate::network_policy::PolicyExporter {
+                    exporter,
+                    policy: factory.network_policy().clone(),
+                },
+            );
             receipt = evidence;
             builder = builder.with_batch_exporter(exporter);
         }
@@ -615,6 +639,7 @@ fn build_tracer_provider(
     resource: &Resource,
     exporter: &OtelExporter,
     span_attributes: BTreeMap<String, String>,
+    factory: &codex_http_client::HttpClientFactory,
 ) -> Result<
     (
         SdkTracerProvider,
@@ -676,6 +701,7 @@ fn build_tracer_provider(
                     .with_headers(headers);
 
                 let client = crate::otlp::build_async_http_client(
+                    factory,
                     tls.as_ref(),
                     OTEL_EXPORTER_OTLP_TRACES_TIMEOUT,
                 )?;
@@ -683,7 +709,10 @@ fn build_tracer_provider(
 
                 let (exporter, receipt) =
                     crate::trace_exporter_retirement::AcknowledgedExporter::new(
-                        exporter_builder.build()?,
+                        crate::network_policy::PolicyExporter {
+                            exporter: exporter_builder.build()?,
+                            policy: factory.network_policy().clone(),
+                        },
                     );
                 let processor = TokioBatchSpanProcessor::builder(exporter, runtime::Tokio).build();
 
@@ -706,7 +735,14 @@ fn build_tracer_provider(
                 .with_protocol(protocol)
                 .with_headers(headers);
 
-            if let Some(tls) = tls.as_ref() {
+            if factory.network_policy().is_managed() {
+                let client = crate::otlp::build_async_http_client(
+                    factory,
+                    tls.as_ref(),
+                    OTEL_EXPORTER_OTLP_TRACES_TIMEOUT,
+                )?;
+                exporter_builder = exporter_builder.with_http_client(client);
+            } else if let Some(tls) = tls.as_ref() {
                 let client =
                     crate::otlp::build_http_client(tls, OTEL_EXPORTER_OTLP_TRACES_TIMEOUT)?;
                 exporter_builder = exporter_builder.with_http_client(client);
@@ -716,8 +752,12 @@ fn build_tracer_provider(
         }
     };
 
-    let (span_exporter, receipt) =
-        crate::trace_exporter_retirement::AcknowledgedExporter::new(span_exporter);
+    let (span_exporter, receipt) = crate::trace_exporter_retirement::AcknowledgedExporter::new(
+        crate::network_policy::PolicyExporter {
+            exporter: span_exporter,
+            policy: factory.network_policy().clone(),
+        },
+    );
     let processor = BatchSpanProcessor::builder(span_exporter).build();
 
     Ok((
@@ -746,6 +786,8 @@ mod tests {
     use crate::metrics::TOOL_CALL_DURATION_METRIC;
     use crate::metrics::TURN_COST_MICROUSD_METRIC;
     use crate::metrics::TURN_TOKEN_USAGE_METRIC;
+    use codex_http_client::HttpClientFactory;
+    use codex_http_client::OutboundProxyPolicy;
     use opentelemetry_sdk::metrics::InMemoryMetricExporter;
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
@@ -909,6 +951,7 @@ mod tests {
 
     fn test_otel_settings() -> OtelSettings {
         OtelSettings {
+            http_client_factory: HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
             environment: "test".to_string(),
             service_name: "codex-test".to_string(),
             service_version: "0.0.0".to_string(),

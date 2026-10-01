@@ -1080,7 +1080,9 @@ fn blocking_replace_mcp_servers_round_trips() {
             environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
             enabled: true,
             required: false,
+            startup_readiness: Default::default(),
             supports_parallel_tool_calls: true,
+            tool_input_schema_max_bytes: None,
             thread_identity_eligible: false,
             control_endpoint_eligible: false,
             omit_tools_from: None,
@@ -1115,7 +1117,9 @@ fn blocking_replace_mcp_servers_round_trips() {
             environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
             enabled: false,
             required: false,
+            startup_readiness: Default::default(),
             supports_parallel_tool_calls: false,
+            tool_input_schema_max_bytes: None,
             thread_identity_eligible: false,
             control_endpoint_eligible: false,
             omit_tools_from: None,
@@ -1128,6 +1132,7 @@ fn blocking_replace_mcp_servers_round_trips() {
             scopes: None,
             oauth: Some(McpServerOAuthConfig {
                 client_id: Some("eci-prd-pub-codex-123".to_string()),
+                client_secret: Some("test-client-secret".into()),
                 callback_url: Some("http://127.0.0.1/callback/example".to_string()),
                 callback_port: Some(9876),
                 ..Default::default()
@@ -1169,6 +1174,7 @@ Z-Header = \"z\"
 
 [mcp_servers.http.oauth]
 client_id = \"eci-prd-pub-codex-123\"
+client_secret = \"test-client-secret\"
 callback_url = \"http://127.0.0.1/callback/example\"
 callback_port = 9876
 
@@ -1207,6 +1213,8 @@ fn blocking_replace_mcp_servers_persists_thread_identity_eligible() {
             enabled: true,
             required: false,
             supports_parallel_tool_calls: false,
+            startup_readiness: Default::default(),
+            tool_input_schema_max_bytes: None,
             thread_identity_eligible: true,
             control_endpoint_eligible: false,
             omit_tools_from: None,
@@ -1260,6 +1268,8 @@ fn blocking_replace_mcp_servers_persists_thread_identity_eligible_inline() {
             enabled: true,
             required: false,
             supports_parallel_tool_calls: false,
+            startup_readiness: Default::default(),
+            tool_input_schema_max_bytes: None,
             thread_identity_eligible: true,
             control_endpoint_eligible: false,
             omit_tools_from: None,
@@ -1304,7 +1314,9 @@ fn blocking_replace_mcp_servers_serializes_tool_approval_overrides(output_token_
             environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
             enabled: true,
             required: false,
+            startup_readiness: Default::default(),
             supports_parallel_tool_calls: false,
+            tool_input_schema_max_bytes: None,
             thread_identity_eligible: false,
             control_endpoint_eligible: false,
             omit_tools_from: None,
@@ -1382,7 +1394,9 @@ foo = { command = "cmd" }
             environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
             enabled: true,
             required: false,
+            startup_readiness: Default::default(),
             supports_parallel_tool_calls: false,
+            tool_input_schema_max_bytes: None,
             thread_identity_eligible: false,
             control_endpoint_eligible: false,
             omit_tools_from: None,
@@ -1436,7 +1450,9 @@ foo = { command = "cmd" } # keep me
             environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
             enabled: false,
             required: false,
+            startup_readiness: Default::default(),
             supports_parallel_tool_calls: false,
+            tool_input_schema_max_bytes: None,
             thread_identity_eligible: false,
             control_endpoint_eligible: false,
             omit_tools_from: None,
@@ -1489,7 +1505,9 @@ foo = { command = "cmd", args = ["--flag"] } # keep me
             environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
             enabled: true,
             required: false,
+            startup_readiness: Default::default(),
             supports_parallel_tool_calls: false,
+            tool_input_schema_max_bytes: None,
             thread_identity_eligible: false,
             control_endpoint_eligible: false,
             omit_tools_from: None,
@@ -1543,7 +1561,9 @@ foo = { command = "cmd" }
             environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
             enabled: false,
             required: false,
+            startup_readiness: Default::default(),
             supports_parallel_tool_calls: false,
+            tool_input_schema_max_bytes: None,
             thread_identity_eligible: false,
             control_endpoint_eligible: false,
             omit_tools_from: None,

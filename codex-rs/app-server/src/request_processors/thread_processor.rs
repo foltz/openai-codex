@@ -17,6 +17,8 @@ use crate::processor_task_retirement::ProcessorTasks;
 use codex_app_server_protocol::SelectedCapabilityRoot;
 use codex_app_server_protocol::ThreadHistoryMode as ApiThreadHistoryMode;
 use codex_app_server_protocol::ThreadInteractiveSubscriptionListParams;
+use codex_app_server_protocol::ThreadItemsListAnchor;
+use codex_app_server_protocol::ThreadItemsListCursor;
 use codex_app_server_protocol::ThreadRevertParams;
 use codex_app_server_protocol::ThreadRevertResponse;
 use codex_app_server_protocol::ThreadRevertedNotification;
@@ -1627,7 +1629,29 @@ impl ThreadRequestProcessor {
         } else {
             None
         };
-        start_options.reserved_thread_id = reserved_thread_id;
+        let thread_id = reserved_thread_id
+            .unwrap_or_else(|| listener_task_context.thread_manager.reserve_thread_id());
+        start_options.reserved_thread_id = Some(thread_id);
+        // Startup can prewarm the Responses socket before start_thread returns.
+        // Register the creating client first so that handshake can request attestation.
+        if let Err(error) = listener_task_context
+            .thread_state_manager
+            .try_add_connection_to_thread(thread_id, request_id.connection_id)
+            .await
+        {
+            remove_pending_thread_metadata(thread_store.as_ref(), reserved_thread_id).await;
+            if recovery.is_some()
+                && let (Some(state), Some(successor)) = (&recovery_state, reserved_thread_id)
+                && let Err(record_error) = state
+                    .finish_clear_recovery(successor, codex_state::ClearRecoveryPhase::Failed)
+                    .await
+            {
+                warn!("recovery remains pending after subscription failure: {record_error}");
+            }
+            return Err(internal_error(format!(
+                "failed to subscribe creating client to thread {thread_id}: {error:?}"
+            )));
+        }
         let create_thread_started_at = std::time::Instant::now();
         let new_thread = listener_task_context
             .thread_manager
@@ -1664,6 +1688,10 @@ impl ThreadRequestProcessor {
         } = match new_thread {
             Ok(new_thread) => new_thread,
             Err(err) => {
+                listener_task_context
+                    .thread_state_manager
+                    .remove_thread_state(thread_id)
+                    .await;
                 remove_pending_thread_metadata(thread_store.as_ref(), reserved_thread_id).await;
                 if recovery.is_some()
                     && let (Some(state), Some(successor)) = (&recovery_state, reserved_thread_id)
@@ -1865,6 +1893,17 @@ impl ThreadRequestProcessor {
             .map_err(|err| invalid_request(format!("invalid session id: {err}")))?;
 
         let subtree_thread_ids = self.state_db_spawn_subtree_thread_ids(thread_id).await?;
+
+        // Fresh threads have no rollout until their first turn. Materialize the
+        // loaded persistent thread before looking it up for archival.
+        if let Ok(thread) = self.thread_manager.get_thread(thread_id).await
+            && !thread.config_snapshot().await.ephemeral
+        {
+            self.thread_store
+                .persist_thread(thread_id, PersistContext::Standard)
+                .await
+                .map_err(|err| thread_store_mutation_error("archive", err))?;
+        }
 
         let mut archive_thread_ids = Vec::new();
         match self
@@ -2288,6 +2327,11 @@ impl ThreadRequestProcessor {
         let (thread_id, thread) = self.load_thread(&thread_id).await?;
         ensure_direct_input_allowed(thread.as_ref()).await?;
         let config_snapshot = thread.config_snapshot().await;
+        if config_snapshot.ephemeral {
+            return Err(invalid_request(
+                "ephemeral threads do not support thread/revert",
+            ));
+        }
         if !matches!(config_snapshot.history_mode, ThreadHistoryMode::Paginated) {
             return Err(invalid_request(
                 "thread/revert only supports paginated threads",
@@ -3438,7 +3482,7 @@ impl ThreadRequestProcessor {
                     thread_id,
                     turn_id: Some(turn_id.to_string()),
                     include_archived: true,
-                    cursor: cursor.clone(),
+                    position: cursor.clone().map(StoreListItemsPosition::Cursor),
                     page_size: THREAD_ITEMS_MAX_LIMIT,
                     sort_direction: StoreSortDirection::Asc,
                     sort_key: StoreItemSortKey::CreatedAtOrdinal,
@@ -3554,7 +3598,7 @@ impl ThreadRequestProcessor {
                 thread_id,
                 turn_id: None,
                 include_archived: true,
-                cursor: None,
+                position: None,
                 page_size: 1,
                 sort_direction: StoreSortDirection::Desc,
                 sort_key: StoreItemSortKey::CreatedAtOrdinal,
@@ -3576,6 +3620,18 @@ impl ThreadRequestProcessor {
             limit,
             sort_direction,
         } = params;
+        let position = cursor.map(|cursor| match cursor {
+            ThreadItemsListCursor::Opaque(cursor) => StoreListItemsPosition::Cursor(cursor),
+            ThreadItemsListCursor::Anchor(ThreadItemsListAnchor::Item { item_id }) => {
+                StoreListItemsPosition::ItemAnchor { item_id }
+            }
+        });
+        let has_anchor = matches!(position, Some(StoreListItemsPosition::ItemAnchor { .. }));
+        if has_anchor && turn_id.as_deref().is_none_or(str::is_empty) {
+            return Err(invalid_params(
+                "turnId is required when cursor is an item anchor",
+            ));
+        }
         let thread_id = ThreadId::from_string(&thread_id)
             .map_err(|err| invalid_request(format!("invalid thread id: {err}")))?;
         let page_size = limit
@@ -3588,7 +3644,7 @@ impl ThreadRequestProcessor {
                 thread_id,
                 turn_id,
                 include_archived: true,
-                cursor,
+                position,
                 page_size,
                 sort_direction: match sort_direction.unwrap_or(SortDirection::Asc) {
                     SortDirection::Asc => StoreSortDirection::Asc,
@@ -3599,6 +3655,9 @@ impl ThreadRequestProcessor {
             })
             .await
             .map_err(|err| match err {
+                ThreadStoreError::InvalidRequest { message } if has_anchor => {
+                    invalid_params(message)
+                }
                 ThreadStoreError::InvalidRequest { message } => invalid_request(message),
                 ThreadStoreError::Unsupported { .. } => {
                     method_not_found("thread/items/list is not supported yet")
@@ -3613,8 +3672,15 @@ impl ThreadRequestProcessor {
             .into_iter()
             .map(|stored_item| {
                 let turn_id = stored_item.turn_id.clone();
+                let started_at_ms = stored_item.started_at_ms;
+                let completed_at_ms = stored_item.completed_at_ms;
                 let item = deserialize_stored_thread_item(stored_item)?;
-                Ok(ThreadItemEntry { turn_id, item })
+                Ok(ThreadItemEntry {
+                    turn_id,
+                    item,
+                    started_at_ms,
+                    completed_at_ms,
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
 

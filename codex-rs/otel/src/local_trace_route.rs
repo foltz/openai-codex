@@ -98,6 +98,7 @@ impl LocalTraceRoute {
             .map_err(|_| crate::OtelShutdownError::StateUnavailable)
     }
 
+    #[cfg(test)]
     pub(crate) fn replace(
         &self,
         tracer: Option<Tracer>,

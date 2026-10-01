@@ -16,6 +16,7 @@ use codex_model_provider::is_supported_amazon_bedrock_region;
 
 mod bedrock_setup;
 mod browser_logins;
+mod gateway_oauth;
 mod login_shutdown;
 pub(crate) use login_shutdown::AccountLoginReport;
 pub(crate) use login_shutdown::AccountLoginShutdown;
@@ -102,6 +103,9 @@ pub(crate) struct AccountRequestProcessor {
     workspace_routing: Arc<Mutex<Option<workspace_routing::CachedWorkspaceRouting>>>,
     workspace_routing_fetches: Arc<Mutex<workspace_routing::WorkspaceRoutingFetches>>,
     workspace_routing_shutdown: CancellationToken,
+    gateway_login: Arc<std::sync::Mutex<Option<gateway_oauth::ActiveGatewayLogin>>>,
+    gateway_client: Arc<std::sync::Mutex<Option<Arc<codex_login::GatewayAuthManager>>>>,
+    _gateway_notifications: Arc<tokio_util::task::AbortOnDropHandle<()>>,
     browser_logins: browser_logins::BrowserLogins,
     login_tasks: crate::processor_task_retirement::ProcessorTaskTicket,
     login_shutdown: CancellationToken,
@@ -118,7 +122,13 @@ impl AccountRequestProcessor {
         applied_mcp_config_identity: AppliedMcpConfigIdentity,
         login_tasks: crate::processor_task_retirement::ProcessorTaskTicket,
     ) -> Arc<Self> {
+        let gateway_notifications = crate::gateway_oauth_notifications::spawn(
+            Arc::clone(&auth_manager),
+            config_manager.clone(),
+            Arc::clone(&outgoing),
+        );
         let processor = Arc::new(Self {
+            _gateway_notifications: Arc::new(gateway_notifications),
             auth_manager,
             thread_manager,
             outgoing,
@@ -126,6 +136,8 @@ impl AccountRequestProcessor {
             config_manager,
             applied_mcp_config_identity,
             active_login: Arc::new(Mutex::new(None)),
+            gateway_login: Arc::new(std::sync::Mutex::new(/*t*/ None)),
+            gateway_client: Arc::new(std::sync::Mutex::new(/*t*/ None)),
             browser_logins: browser_logins::BrowserLogins::default(),
             login_tasks,
             login_shutdown: CancellationToken::new(),
@@ -214,6 +226,7 @@ impl AccountRequestProcessor {
     }
 
     pub(crate) async fn cancel_active_login(&self) {
+        self.cancel_gateway_login();
         let mut guard = self.active_login.lock().await;
         if let Some(active_login) = guard.take() {
             drop(active_login);
@@ -1020,13 +1033,7 @@ impl AccountRequestProcessor {
         }
         let config = self.load_latest_config().await;
 
-        // Cancel any active login attempt.
-        {
-            let mut guard = self.active_login.lock().await;
-            if let Some(active) = guard.take() {
-                drop(active);
-            }
-        }
+        self.cancel_active_login().await;
 
         match self.auth_manager.logout_with_revoke().await {
             Ok(_) => {}
@@ -1035,11 +1042,12 @@ impl AccountRequestProcessor {
             }
         }
 
+        self.config_manager.clear_cloud_config_bundle_loader();
+
         if config.model_provider.is_amazon_bedrock() {
             clear_user_model_provider_if_bedrock(&self.config_manager, &config).await?;
         }
 
-        self.config_manager.clear_cloud_config_bundle_loader();
         *self.workspace_routing.lock().await = None;
 
         Self::maybe_refresh_plugin_caches_for_current_config(
@@ -1176,7 +1184,9 @@ impl AccountRequestProcessor {
         &self,
         params: GetAccountRateLimitsParams,
     ) -> Result<GetAccountRateLimitsResponse, JSONRPCErrorError> {
-        let Some(auth) = self.auth_manager.auth().await else {
+        let Some((auth, http_client_factory)) =
+            self.auth_manager.auth_with_http_client_factory().await
+        else {
             return Err(invalid_request(
                 "codex account authentication required to read rate limits",
             ));
@@ -1191,7 +1201,7 @@ impl AccountRequestProcessor {
         let client = BackendClient::from_auth(
             self.config.chatgpt_base_url.clone(),
             &auth,
-            self.config.http_client_factory(),
+            http_client_factory,
         );
 
         let usage_request = async {
@@ -1291,7 +1301,9 @@ impl AccountRequestProcessor {
             })
             .transpose()?;
 
-        let Some(auth) = self.auth_manager.auth().await else {
+        let Some((auth, http_client_factory)) =
+            self.auth_manager.auth_with_http_client_factory().await
+        else {
             return Err(invalid_request(
                 "codex account authentication required to read token usage",
             ));
@@ -1306,7 +1318,7 @@ impl AccountRequestProcessor {
         let client = BackendClient::from_auth(
             self.config.chatgpt_base_url.clone(),
             &auth,
-            self.config.http_client_factory(),
+            http_client_factory,
         );
         if let Some(thread_id) = thread_id {
             let thread_id = thread_id.to_string();
@@ -1376,7 +1388,9 @@ impl AccountRequestProcessor {
     async fn get_workspace_messages_response(
         &self,
     ) -> Result<GetWorkspaceMessagesResponse, JSONRPCErrorError> {
-        let Some(auth) = self.auth_manager.auth().await else {
+        let Some((auth, http_client_factory)) =
+            self.auth_manager.auth_with_http_client_factory().await
+        else {
             return Err(invalid_request(
                 "codex account authentication required to read workspace messages",
             ));
@@ -1391,7 +1405,7 @@ impl AccountRequestProcessor {
         let client = BackendClient::from_auth(
             self.config.chatgpt_base_url.clone(),
             &auth,
-            self.config.http_client_factory(),
+            http_client_factory,
         );
         let messages = tokio::time::timeout(
             ACCOUNT_WORKSPACE_MESSAGES_FETCH_TIMEOUT,
@@ -1468,7 +1482,9 @@ impl AccountRequestProcessor {
         &self,
         params: SendAddCreditsNudgeEmailParams,
     ) -> Result<AddCreditsNudgeEmailStatus, JSONRPCErrorError> {
-        let Some(auth) = self.auth_manager.auth().await else {
+        let Some((auth, http_client_factory)) =
+            self.auth_manager.auth_with_http_client_factory().await
+        else {
             return Err(invalid_request(
                 "codex account authentication required to notify workspace owner",
             ));
@@ -1483,7 +1499,7 @@ impl AccountRequestProcessor {
         let client = BackendClient::from_auth(
             self.config.chatgpt_base_url.clone(),
             &auth,
-            self.config.http_client_factory(),
+            http_client_factory,
         );
 
         match client

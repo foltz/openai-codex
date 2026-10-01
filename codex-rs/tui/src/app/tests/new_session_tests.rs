@@ -172,7 +172,7 @@ async fn new_session_preserves_vim_line_yank() -> Result<()> {
     )
     .await?;
     let mut tui = crate::tui::test_support::make_test_tui()?;
-    app.start_fresh_session_with_summary_hint(
+    app.start_fresh_session(
         &mut tui,
         &mut server,
         /*initial_user_message*/ None,
@@ -290,7 +290,7 @@ async fn replacement_uses_server_defaults_and_preserves_explicit_launch_settings
             _ => {}
         }
         let mut tui = crate::tui::test_support::make_test_tui()?;
-        app.start_fresh_session_with_summary_hint(
+        app.start_fresh_session(
             &mut tui,
             &mut server,
             /*initial_user_message*/ None,
@@ -357,7 +357,7 @@ async fn replacement_failure_keeps_current_task_and_restores_input() -> Result<(
             std::fs::write(home.path().join("config.toml"), "invalid = [")?;
         }
         let mut tui = crate::tui::test_support::make_test_tui()?;
-        app.start_fresh_session_with_summary_hint(
+        app.start_fresh_session(
             &mut tui,
             &mut server,
             Some("keep this request".into()),
@@ -425,7 +425,7 @@ async fn replacement_preserves_remote_launch_paths_and_older_servers() -> Result
         .await?;
         let mut server = server.with_remote_cwd_override(remote_cwd.clone());
         let mut tui = crate::tui::test_support::make_test_tui()?;
-        app.start_fresh_session_with_summary_hint(
+        app.start_fresh_session(
             &mut tui,
             &mut server,
             /*initial_user_message*/ None,

@@ -35,6 +35,7 @@ async fn experimental_features_use_selected_server_profile_and_preserve_task_set
         /*log_db*/ None,
         /*state_db*/ None,
         Arc::new(EnvironmentManager::default_for_tests()),
+        Default::default(),
         Arc::new(codex_app_server_client::InProcessHost::default()),
     ))
     .await?;

@@ -185,6 +185,7 @@ impl MemoryStartupContext {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_with_provider(
         thread_manager: Arc<ThreadManager>,
         auth_manager: Arc<AuthManager>,
@@ -347,6 +348,7 @@ impl MemoryStartupContext {
             /*attestation_provider*/ None,
             config.http_client_factory(),
             config.workspace_routing_context(),
+            Vec::new(),
         );
 
         let mut client_session = model_client.new_session();

@@ -121,6 +121,7 @@ impl SessionStartupCustody {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn pause_after_persistence_for_test(
         &self,
         entered: Arc<tokio::sync::Notify>,
@@ -146,6 +147,7 @@ impl SessionStartupCustody {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn has_pre_session_persistence_for_test(&self) -> bool {
         self.state
             .lock()
@@ -153,6 +155,7 @@ impl SessionStartupCustody {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn pause_after_retain_for_test(
         &self,
         entered: Arc<tokio::sync::Notify>,

@@ -7,6 +7,9 @@ use std::sync::atomic::Ordering;
 fn worker_preparation_failure_precedes_every_exporter_and_publication() {
     let calls = AtomicUsize::new(0);
     let settings = OtelSettings {
+        http_client_factory: codex_http_client::HttpClientFactory::new(
+            codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+        ),
         environment: "test".to_owned(),
         service_name: "birth-worker".to_owned(),
         service_version: "1".to_owned(),

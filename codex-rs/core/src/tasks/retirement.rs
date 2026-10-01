@@ -194,7 +194,3 @@ impl TaskJoinRegistry {
         }
     }
 }
-
-#[cfg(test)]
-#[path = "retirement_tests.rs"]
-mod tests;

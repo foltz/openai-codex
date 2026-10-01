@@ -194,6 +194,11 @@ export type { FsWatchParams } from "./FsWatchParams";
 export type { FsWatchResponse } from "./FsWatchResponse";
 export type { FsWriteFileParams } from "./FsWriteFileParams";
 export type { FsWriteFileResponse } from "./FsWriteFileResponse";
+export type { GatewayOAuthCancelResponse } from "./GatewayOAuthCancelResponse";
+export type { GatewayOAuthChangedNotification } from "./GatewayOAuthChangedNotification";
+export type { GatewayOAuthLoginResponse } from "./GatewayOAuthLoginResponse";
+export type { GatewayOAuthReadResponse } from "./GatewayOAuthReadResponse";
+export type { GatewayOAuthStatus } from "./GatewayOAuthStatus";
 export type { GetAccountParams } from "./GetAccountParams";
 export type { GetAccountRateLimitsParams } from "./GetAccountRateLimitsParams";
 export type { GetAccountRateLimitsResponse } from "./GetAccountRateLimitsResponse";
@@ -278,6 +283,7 @@ export type { McpElicitationUntitledMultiSelectEnumSchema } from "./McpElicitati
 export type { McpElicitationUntitledSingleSelectEnumSchema } from "./McpElicitationUntitledSingleSelectEnumSchema";
 export type { McpResourceReadParams } from "./McpResourceReadParams";
 export type { McpResourceReadResponse } from "./McpResourceReadResponse";
+export type { McpResourceReadTarget } from "./McpResourceReadTarget";
 export type { McpServerConfigIdentity } from "./McpServerConfigIdentity";
 export type { McpServerConfigIdentityLayer } from "./McpServerConfigIdentityLayer";
 export type { McpServerConfigIdentityResponse } from "./McpServerConfigIdentityResponse";
@@ -523,6 +529,8 @@ export type { ThreadInteractiveSubscriptionChangedNotification } from "./ThreadI
 export type { ThreadInteractiveSubscriptionEntry } from "./ThreadInteractiveSubscriptionEntry";
 export type { ThreadItem } from "./ThreadItem";
 export type { ThreadItemEntry } from "./ThreadItemEntry";
+export type { ThreadItemsListAnchor } from "./ThreadItemsListAnchor";
+export type { ThreadItemsListCursor } from "./ThreadItemsListCursor";
 export type { ThreadItemsListParams } from "./ThreadItemsListParams";
 export type { ThreadItemsListResponse } from "./ThreadItemsListResponse";
 export type { ThreadListParams } from "./ThreadListParams";

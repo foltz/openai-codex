@@ -54,6 +54,7 @@ impl Mailbox {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn enqueue(
         &self,
         communication: InterAgentCommunication,

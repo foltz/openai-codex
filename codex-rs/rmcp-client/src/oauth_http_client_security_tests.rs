@@ -388,6 +388,12 @@ async fn oauth_registration_redirects_never_forward_resource_only_headers() -> R
 async fn same_origin_redirects_preserve_timeout_and_response_body_limits() -> Result<()> {
     for oversized_redirect_body in [false, true] {
         let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/warmup"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
         let resource_url = format!("{}/mcp", server.uri());
         let redirect = ResponseTemplate::new(307).insert_header("location", "/register/");
         let redirect = if oversized_redirect_body {
@@ -423,21 +429,20 @@ async fn same_origin_redirects_preserve_timeout_and_response_body_limits() -> Re
             )?,
             &resource_url,
         );
-        // Client construction is intentionally charged to request deadlines.
-        // Warm this same-origin route first so this fixture isolates the shared
-        // redirect budget, rather than platform-dependent first-client setup.
+        // Client construction is charged to request deadlines. Warm the native
+        // client first so this fixture isolates the shared redirect budget.
         let warmup = adapter
             .execute_request(
                 oauth2::http::Request::builder()
                     .method("GET")
-                    .uri(format!("{}/client-warmup", server.uri()))
+                    .uri(format!("{}/warmup", server.uri()))
                     .body(Vec::new())?,
-                OAuthHttpRedirectPolicy::Follow,
-                None,
+                OAuthHttpRedirectPolicy::Stop,
+                /*timeout*/ None,
             )
             .await
             .expect("client warm-up must reach the mock server");
-        assert_eq!(warmup.status(), oauth2::http::StatusCode::NOT_FOUND);
+        assert_eq!(warmup.status(), oauth2::http::StatusCode::NO_CONTENT);
         let error = adapter
             .execute_request(
                 oauth2::http::Request::builder()

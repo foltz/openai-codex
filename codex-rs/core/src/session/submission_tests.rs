@@ -9,6 +9,7 @@ fn submission(id: &str) -> Submission {
         root_turn_id: None,
         trace: None,
         parent_turn_id: None,
+        residency_guard: None,
     }
 }
 

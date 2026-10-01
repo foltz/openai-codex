@@ -161,10 +161,7 @@ fn load_shared_plugin_ids_by_local_path(
 }
 
 fn remote_plugin_service_config(config: &Config) -> RemotePluginServiceConfig {
-    RemotePluginServiceConfig::new(
-        config.chatgpt_base_url.clone(),
-        config.http_client_factory(),
-    )
+    config.plugins_config_input().remote_plugin_service_config()
 }
 
 fn share_context_for_source(
@@ -404,6 +401,7 @@ fn plugin_share_principal_from_remote(
 }
 
 impl PluginRequestProcessor {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         auth_manager: Arc<AuthManager>,
         thread_manager: Arc<ThreadManager>,
@@ -1031,9 +1029,15 @@ impl PluginRequestProcessor {
             marketplace_path.as_path().parent().map(Path::to_path_buf)
         });
 
-        let config = self.load_latest_config(config_cwd).await?;
+        let mut config = self.load_latest_config(config_cwd).await?;
+        let auth = match self.auth_manager.auth_with_http_client_factory().await {
+            Some((auth, factory)) => {
+                config.application_network_policy = factory.network_policy().clone();
+                Some(auth)
+            }
+            None => None,
+        };
         let plugins_input = config.plugins_config_input();
-        let auth = self.auth_manager.auth().await;
 
         let plugin = match read_source {
             Ok(marketplace_path) => {
@@ -1492,8 +1496,14 @@ impl PluginRequestProcessor {
             }
         };
         let config_cwd = marketplace_path.as_path().parent().map(Path::to_path_buf);
-        let config = self.load_latest_config(config_cwd.clone()).await?;
-        let auth = self.auth_manager.auth().await;
+        let mut config = self.load_latest_config(config_cwd.clone()).await?;
+        let auth = match self.auth_manager.auth_with_http_client_factory().await {
+            Some((auth, factory)) => {
+                config.application_network_policy = factory.network_policy().clone();
+                Some(auth)
+            }
+            None => None,
+        };
 
         let plugins_manager = self.thread_manager.plugins_manager();
         let marketplace_display = marketplace_path.display().to_string();
@@ -1518,7 +1528,11 @@ impl PluginRequestProcessor {
             }
         };
         let config = match self.load_latest_config(config_cwd).await {
-            Ok(config) => config,
+            Ok(mut reloaded_config) => {
+                // Keep the policy captured with this installation's auth snapshot.
+                reloaded_config.application_network_policy = config.application_network_policy;
+                reloaded_config
+            }
             Err(err) => {
                 warn!(
                     "failed to reload config after plugin install, using current config: {err:?}"
@@ -1578,8 +1592,14 @@ impl PluginRequestProcessor {
         remote_plugin_id: String,
         install_attempt_id: Option<String>,
     ) -> Result<PluginInstallResponse, JSONRPCErrorError> {
-        let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
-        let auth = self.auth_manager.auth().await;
+        let mut config = self.load_latest_config(/*fallback_cwd*/ None).await?;
+        let auth = match self.auth_manager.auth_with_http_client_factory().await {
+            Some((auth, factory)) => {
+                config.application_network_policy = factory.network_policy().clone();
+                Some(auth)
+            }
+            None => None,
+        };
         let plugins_manager = self.thread_manager.plugins_manager();
         let installation = plugins_manager
             .install_remote_plugin(
@@ -1919,7 +1939,7 @@ impl PluginRequestProcessor {
                 // Silent login awaits the flow inline. The actual task owns
                 // custody through both attempts, credential storage and its tail.
                 let _account_work = account_work;
-                let oauth_client_id = server.oauth_client_id();
+                let oauth_client_config = server.oauth.as_ref();
                 let first_attempt = perform_oauth_login_silent(
                     &oauth_credential_name,
                     &oauth_config.url,
@@ -1928,7 +1948,7 @@ impl PluginRequestProcessor {
                     oauth_config.http_headers.clone(),
                     oauth_config.env_http_headers.clone(),
                     &resolved_scopes.scopes,
-                    oauth_client_id,
+                    oauth_client_config,
                     McpOAuthClientRegistration::Auto,
                     server.oauth_resource.as_deref(),
                     callback_port,
@@ -1949,7 +1969,7 @@ impl PluginRequestProcessor {
                             oauth_config.http_headers,
                             oauth_config.env_http_headers,
                             &[],
-                            oauth_client_id,
+                            oauth_client_config,
                             McpOAuthClientRegistration::Auto,
                             server.oauth_resource.as_deref(),
                             callback_port,

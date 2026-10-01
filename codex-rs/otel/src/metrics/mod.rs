@@ -1,3 +1,4 @@
+pub(crate) mod buffered;
 mod client;
 mod config;
 mod error;
@@ -12,6 +13,7 @@ pub(crate) mod timer;
 pub(crate) mod validation;
 
 use crate::config::StatsigMetricsSettings;
+pub use crate::metrics::buffered::record_global_operation;
 pub use crate::metrics::client::MetricsClient;
 pub use crate::metrics::config::MetricsConfig;
 pub use crate::metrics::config::MetricsExporter;
@@ -164,6 +166,7 @@ fn install_in(
     metrics.inner = client::MetricsOriginal::Routed(owner);
     global.current = Some(metrics.clone());
     global.statsig = settings;
+    buffered::GLOBAL.enable(&metrics);
     drop(global);
     drop(release);
     Ok(metrics)
@@ -190,6 +193,7 @@ pub(crate) fn disable_global() -> Result<()> {
     global.statsig = None;
     drop(global);
     drop(release);
+    buffered::GLOBAL.disable();
     Ok(())
 }
 
@@ -228,5 +232,13 @@ pub(crate) async fn retire_for(
 }
 
 pub(crate) fn global_statsig_settings() -> Option<StatsigMetricsSettings> {
-    GLOBAL_METRICS.lock().ok()?.statsig.clone()
+    let global = GLOBAL_METRICS.lock().ok()?;
+    if global.current.as_ref().is_some_and(|metrics| {
+        metrics
+            .original_inner()
+            .is_ok_and(|inner| inner.network_policy.is_managed())
+    }) {
+        return None;
+    }
+    global.statsig.clone()
 }

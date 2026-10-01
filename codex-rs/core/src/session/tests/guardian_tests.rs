@@ -117,7 +117,7 @@ async fn activate_turn_with_new_review_authority(session: &Arc<Session>) -> Arc<
         .await
         .expect("install test turn with new review authority");
 
-    let (active_turn, _, _) = session
+    let (active_turn, _, _, _) = session
         .active_turn_context_and_strict_auto_review()
         .await
         .expect("next turn should have active review authority");
@@ -801,8 +801,7 @@ async fn network_approval_uses_published_task_authority_within_same_turn(
             .task
             .as_ref()
             .expect("active task");
-        let current = task.turn_context.next_step_input.load_full();
-        let mut settings = Arc::clone(&current.settings);
+        let mut settings = task.turn_context.next_step_settings.load_full();
         update_selected_settings_for_test(Arc::make_mut(&mut settings), |selected| {
             selected
                 .approval_policy
@@ -810,12 +809,7 @@ async fn network_approval_uses_published_task_authority_within_same_turn(
                 .expect("update policy");
             selected.approvals_reviewer = ApprovalsReviewer::User;
         });
-        task.turn_context
-            .next_step_input
-            .store(Arc::new(StepInputs {
-                settings,
-                environments: current.environments.clone(),
-            }));
+        task.turn_context.next_step_settings.store(settings);
     }
     let decision = session
         .services
@@ -1336,7 +1330,7 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
         parent_thread_id: None,
         thread_source: None,
         originator: "test_originator".to_string(),
-        agent_control: LocalAgentControl::default(),
+        agent_control: LocalAgentControl::default().into(),
         dynamic_tools: Vec::new(),
         metrics_service_name: None,
         inherited_environments: None,

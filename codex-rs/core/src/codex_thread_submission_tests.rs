@@ -1,4 +1,5 @@
 use super::*;
+use crate::session::Submission;
 use crate::session::completed_session_loop_termination;
 use crate::session::tests::make_session_and_context;
 use codex_extension_api::ExtensionData;
@@ -11,7 +12,6 @@ use codex_protocol::host_turn_work::HostTurnWork;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::ReviewTarget;
 use codex_protocol::protocol::SessionConfiguredEvent;
-use codex_protocol::protocol::Submission;
 use pretty_assertions::assert_eq;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;

@@ -104,6 +104,7 @@ impl MetricReader for SharedManualReader {
 
 #[derive(Debug)]
 pub(super) struct MetricsClientInner {
+    pub(super) network_policy: codex_http_client::NetworkPolicy,
     meter_provider: SdkMeterProvider,
     meter: Meter,
     counters: Mutex<HashMap<InstrumentKey, Counter<u64>>>,
@@ -336,6 +337,7 @@ impl MetricsClient {
     /// Build a metrics client from configuration and validate defaults.
     pub fn new(config: MetricsConfig) -> Result<Self> {
         let MetricsConfig {
+            http_client_factory,
             environment,
             service_name,
             service_version,
@@ -374,13 +376,21 @@ impl MetricsClient {
                 build_provider(resource, exporter, export_interval, runtime_reader.clone())
             }
             MetricsExporter::Otlp(exporter) => {
-                let exporter = build_otlp_metric_exporter(exporter, Temporality::Delta)?;
+                let exporter = crate::network_policy::PolicyExporter {
+                    exporter: build_otlp_metric_exporter(
+                        exporter,
+                        Temporality::Delta,
+                        &http_client_factory,
+                    )?,
+                    policy: http_client_factory.network_policy().clone(),
+                };
                 build_provider(resource, exporter, export_interval, runtime_reader.clone())
             }
         };
 
         Ok(Self {
             inner: MetricsOriginal::Standalone(Arc::new(MetricsClientInner {
+                network_policy: http_client_factory.network_policy().clone(),
                 meter_provider,
                 meter,
                 counters: Mutex::new(HashMap::new()),
@@ -576,6 +586,7 @@ impl MetricsClient {
 
     /// Flush metrics and stop this handle's original OTEL meter provider.
     pub fn shutdown(&self) -> Result<()> {
+        super::buffered::GLOBAL.suspend(self);
         match &self.inner {
             MetricsOriginal::Standalone(inner) => inner.shutdown(),
             MetricsOriginal::Routed(owner) => owner
@@ -630,12 +641,14 @@ where
 fn build_otlp_metric_exporter(
     exporter: OtelExporter,
     temporality: Temporality,
+    factory: &codex_http_client::HttpClientFactory,
 ) -> Result<opentelemetry_otlp::MetricExporter> {
     match exporter {
         OtelExporter::None => Err(MetricsError::ExporterDisabled),
         OtelExporter::Statsig => build_otlp_metric_exporter(
             crate::config::resolve_exporter(&OtelExporter::Statsig),
             temporality,
+            factory,
         ),
         OtelExporter::OtlpGrpc {
             endpoint,
@@ -687,7 +700,17 @@ fn build_otlp_metric_exporter(
                 .with_protocol(protocol)
                 .with_headers(headers);
 
-            if let Some(tls) = tls.as_ref() {
+            if factory.network_policy().is_managed() {
+                let client = crate::otlp::build_async_http_client(
+                    factory,
+                    tls.as_ref(),
+                    OTEL_EXPORTER_OTLP_METRICS_TIMEOUT,
+                )
+                .map_err(|err| MetricsError::InvalidConfig {
+                    message: err.to_string(),
+                })?;
+                exporter_builder = exporter_builder.with_http_client(client);
+            } else if let Some(tls) = tls.as_ref() {
                 let client =
                     crate::otlp::build_http_client(tls, OTEL_EXPORTER_OTLP_METRICS_TIMEOUT)
                         .map_err(|err| MetricsError::InvalidConfig {

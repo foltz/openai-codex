@@ -57,12 +57,13 @@ use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 use tracing_subscriber::layer::SubscriberExt;
 use wiremock::MockServer;
 
-const TEST_CONNECTION_ID: ConnectionId = ConnectionId(7);
+pub(super) const TEST_CONNECTION_ID: ConnectionId = ConnectionId(7);
 
 struct TestTracing {
     exporter: InMemorySpanExporter,
@@ -151,7 +152,13 @@ impl TracingHarness {
         let mut config = build_test_config(codex_home.path(), &server.uri()).await?;
         config.chatgpt_base_url = format!("{}/backend-api", server.uri());
         let config = Arc::new(config);
-        let (processor, outgoing_rx, telemetry) = build_test_processor(config, telemetry).await;
+        let auth_manager = AuthManager::shared_from_config(
+            config.as_ref(),
+            /*enable_codex_api_key_env*/ false,
+        )
+        .await?;
+        let (processor, outgoing_rx, telemetry) =
+            build_test_processor_with_telemetry(config, auth_manager, telemetry).await;
         let tracing = init_test_tracing();
         tracing.exporter.reset();
         tracing::callsite::rebuild_interest_cache();
@@ -187,6 +194,17 @@ impl TracingHarness {
             )
             .await;
         assert!(harness.session.initialized());
+        // The transport loop completes stdio connection registration after
+        // initialize; this direct processor fixture must perform that step.
+        harness
+            .processor
+            .connection_initialized(
+                TEST_CONNECTION_ID,
+                harness.session.request_attestation(),
+                harness.session.trusted_interactive(),
+                harness.session.retention_principal(),
+            )
+            .await;
 
         Ok(harness)
     }
@@ -269,8 +287,21 @@ async fn build_test_config(codex_home: &Path, server_uri: &str) -> Result<Config
         .await?)
 }
 
-async fn build_test_processor(
+pub(super) async fn build_test_processor(
     config: Arc<Config>,
+    auth_manager: Arc<AuthManager>,
+) -> (
+    Arc<MessageProcessor>,
+    mpsc::Receiver<crate::outgoing_message::OutgoingEnvelope>,
+) {
+    let (processor, outgoing, _) =
+        build_test_processor_with_telemetry(config, auth_manager, TestTelemetry::Unavailable).await;
+    (processor, outgoing)
+}
+
+async fn build_test_processor_with_telemetry(
+    config: Arc<Config>,
+    auth_manager: Arc<AuthManager>,
     telemetry: TestTelemetry,
 ) -> (
     Arc<MessageProcessor>,
@@ -278,14 +309,12 @@ async fn build_test_processor(
     Option<TestManagedTelemetry>,
 ) {
     let (outgoing_tx, outgoing_rx) = mpsc::channel(16);
-    let auth_manager =
-        AuthManager::shared_from_config(config.as_ref(), /*enable_codex_api_key_env*/ false)
-            .await
-            .expect("test auth manager");
     let config_manager = ConfigManager::new(
         config.codex_home.to_path_buf(),
         Vec::new(),
-        LoaderOverrides::default(),
+        LoaderOverrides::with_managed_config_path_for_tests(
+            config.codex_home.join("managed_config.toml").to_path_buf(),
+        ),
         /*strict_config*/ false,
         CloudConfigBundleLoader::default(),
         Arg0DispatchPaths::default(),
@@ -368,12 +397,27 @@ async fn build_test_processor(
     (processor, outgoing_rx, telemetry)
 }
 
+async fn build_test_processor_for_retirement(
+    config: Arc<Config>,
+    telemetry: TestTelemetry,
+) -> (
+    Arc<MessageProcessor>,
+    mpsc::Receiver<crate::outgoing_message::OutgoingEnvelope>,
+    Option<TestManagedTelemetry>,
+) {
+    let auth_manager =
+        AuthManager::shared_from_config(config.as_ref(), /*enable_codex_api_key_env*/ false)
+            .await
+            .expect("create test auth manager");
+    build_test_processor_with_telemetry(config, auth_manager, telemetry).await
+}
+
 #[tokio::test]
 async fn processor_login_shutdown_facade_binds_first_deadline() -> Result<()> {
     let home = TempDir::new()?;
     let config = Arc::new(build_test_config(home.path(), "http://127.0.0.1:1").await?);
     let (processor, _outgoing, _telemetry) =
-        build_test_processor(config, TestTelemetry::Unavailable).await;
+        build_test_processor_for_retirement(config, TestTelemetry::Unavailable).await;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
     drop(processor.begin_login_shutdown(deadline)?);
     let ticket = processor.begin_login_shutdown(deadline + std::time::Duration::from_secs(60))?;
@@ -393,7 +437,7 @@ async fn processor_thread_shutdown_facade_retains_first_attempt() -> Result<()> 
     let home = TempDir::new()?;
     let config = Arc::new(build_test_config(home.path(), "http://127.0.0.1:1").await?);
     let (processor, _outgoing, _telemetry) =
-        build_test_processor(config, TestTelemetry::Unavailable).await;
+        build_test_processor_for_retirement(config, TestTelemetry::Unavailable).await;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
     drop(processor.begin_thread_shutdown(deadline).unwrap());
     let ticket = processor
@@ -425,7 +469,7 @@ async fn background_drain_timeout_retains_work_and_reobserves_completion() -> Re
     let home = TempDir::new()?;
     let config = Arc::new(build_test_config(home.path(), "http://127.0.0.1:1").await?);
     let (processor, _outgoing, _telemetry) =
-        build_test_processor(config, TestTelemetry::Unavailable).await;
+        build_test_processor_for_retirement(config, TestTelemetry::Unavailable).await;
     assert_eq!(
         processor
             .models_refresh_worker
@@ -682,12 +726,20 @@ fn assert_has_internal_descendant_at_min_depth(
     );
 }
 
-async fn read_response<T: serde::de::DeserializeOwned>(
+pub(super) async fn read_response<T: serde::de::DeserializeOwned>(
     outgoing_rx: &mut mpsc::Receiver<crate::outgoing_message::OutgoingEnvelope>,
     request_id: i64,
 ) -> T {
+    read_response_from(outgoing_rx, TEST_CONNECTION_ID, request_id).await
+}
+
+pub(super) async fn read_response_from<T: serde::de::DeserializeOwned>(
+    outgoing_rx: &mut mpsc::Receiver<crate::outgoing_message::OutgoingEnvelope>,
+    expected_connection_id: ConnectionId,
+    request_id: i64,
+) -> T {
     loop {
-        let envelope = tokio::time::timeout(std::time::Duration::from_secs(5), outgoing_rx.recv())
+        let envelope = tokio::time::timeout(Duration::from_secs(/*secs*/ 30), outgoing_rx.recv())
             .await
             .expect("timed out waiting for response")
             .expect("outgoing channel closed");
@@ -699,11 +751,17 @@ async fn read_response<T: serde::de::DeserializeOwned>(
         else {
             continue;
         };
-        if connection_id != TEST_CONNECTION_ID {
+        if connection_id != expected_connection_id {
             continue;
         }
-        let crate::outgoing_message::OutgoingMessage::Response(response) = message else {
-            continue;
+        let response = match message {
+            crate::outgoing_message::OutgoingMessage::Response(response) => response,
+            crate::outgoing_message::OutgoingMessage::Error(error)
+                if error.id == RequestId::Integer(request_id) =>
+            {
+                panic!("request {request_id} failed: {:?}", error.error);
+            }
+            _ => continue,
         };
         if response.id != RequestId::Integer(request_id) {
             continue;

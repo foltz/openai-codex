@@ -148,6 +148,7 @@ async fn thread_status_changed_can_be_opted_out() -> Result<()> {
                 version: "0.1.0".to_string(),
             },
             Some(InitializeCapabilities {
+                explicit_gateway_oauth: false,
                 experimental_api: true,
                 request_attestation: false,
                 interactive_client: false,

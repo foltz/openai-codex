@@ -54,6 +54,7 @@ pub(crate) enum RetentionPrincipalOwner {
     /// No lifecycle census has established whether this principal is
     /// connection-owned or belongs to a thread runtime. This state must never
     /// grant retention authority.
+    #[allow(dead_code)] // Retained as the fail-closed principal classification.
     Unclassified,
     /// The principal belongs to a connection whose lifetime is independent of
     /// any app-server thread.
@@ -94,6 +95,7 @@ fn record_retention_action(
 }
 
 impl RetentionPrincipalId {
+    #[cfg(test)]
     pub(crate) fn unclassified() -> Self {
         Self {
             id: Uuid::now_v7(),
@@ -2506,6 +2508,7 @@ impl ThreadStateManager {
         thread_ids
     }
 
+    #[cfg(test)]
     pub(crate) async fn subscribe_to_has_connections(
         &self,
         thread_id: ThreadId,

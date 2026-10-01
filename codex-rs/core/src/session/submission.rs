@@ -1,4 +1,5 @@
-//! Submission admission linearizes at each channel-send poll, not at future creation.
+//! Core-owned queue metadata; forwarding transfers the residency guard with the operation.
+
 use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::Arc;
@@ -6,12 +7,27 @@ use std::sync::Mutex;
 use std::task::Poll;
 
 use async_channel::Sender;
-use codex_protocol::protocol::Submission;
+use codex_protocol::protocol::Op;
+use codex_protocol::protocol::W3cTraceContext;
+use tokio::sync::OwnedRwLockReadGuard;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
 #[path = "submission_tests.rs"]
 mod tests;
+
+#[derive(Debug)]
+#[allow(dead_code, reason = "Turn ancestry is retained in Debug diagnostics.")]
+pub(crate) struct Submission {
+    pub id: String,
+    pub op: Op,
+    /// Optional W3C trace carrier propagated across async submission handoffs.
+    pub trace: Option<W3cTraceContext>,
+    pub parent_turn_id: Option<String>,
+    pub root_turn_id: Option<String>,
+    /// Keeps a V2 recipient resident until this submission is handled or dropped.
+    pub residency_guard: Option<OwnedRwLockReadGuard<()>>,
+}
 
 #[derive(Clone)]
 pub(crate) struct SubmissionSender {

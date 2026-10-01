@@ -90,6 +90,7 @@ async fn thread_interactive_subscription_list_is_empty_without_server_entitlemen
                 interactive_client: true,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,
+                explicit_gateway_oauth: false,
                 extensions: None,
             }),
         )
@@ -129,6 +130,7 @@ async fn embedded_interactive_client_populates_public_subscription_snapshot() ->
         loader_overrides,
         strict_config: false,
         cloud_config_bundle: CloudConfigBundleLoader::default(),
+        embedded_network_policy: Default::default(),
         thread_config_loader: Arc::new(codex_config::NoopThreadConfigLoader),
         feedback: CodexFeedback::new(),
         log_db: None,

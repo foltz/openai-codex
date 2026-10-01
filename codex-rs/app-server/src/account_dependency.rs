@@ -92,6 +92,9 @@ pub(crate) fn classify(request: &ClientRequest) -> AccountDependency {
         | ClientRequest::AppsInstalled { .. }
         | ClientRequest::LoginAccount { .. }
         | ClientRequest::LogoutAccount { .. }
+        | ClientRequest::GatewayOAuthRead { .. }
+        | ClientRequest::GatewayOAuthLogin { .. }
+        | ClientRequest::GatewayOAuthCancel { .. }
         | ClientRequest::SkillsList { .. }
         | ClientRequest::SkillsExtraRootsSet { .. }
         | ClientRequest::SkillsConfigWrite { .. }

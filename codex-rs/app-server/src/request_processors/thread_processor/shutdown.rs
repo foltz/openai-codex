@@ -145,6 +145,7 @@ impl ThreadShutdownOwner {
 }
 
 impl ProcessorThreadRetirement {
+    #[cfg(test)]
     pub(crate) fn deadline(&self) -> Instant {
         self.deadline
     }

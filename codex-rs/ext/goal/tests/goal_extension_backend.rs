@@ -337,6 +337,7 @@ async fn create_goal_resets_baseline_before_turn_stop_accounting() -> anyhow::Re
     for contributor in harness.registry.turn_lifecycle_contributors() {
         contributor
             .on_turn_start(TurnStartInput {
+                mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
                 turn_id: "missing-baseline",
                 collaboration_mode: &default_collaboration_mode(),
                 token_usage_at_turn_start: None,
@@ -1847,6 +1848,7 @@ impl GoalExtensionHarness {
         for contributor in self.registry.turn_lifecycle_contributors() {
             contributor
                 .on_turn_start(TurnStartInput {
+                    mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
                     turn_id,
                     collaboration_mode: &collaboration_mode,
                     token_usage_at_turn_start: Some(usage),

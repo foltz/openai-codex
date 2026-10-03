@@ -137,7 +137,8 @@ impl McpConnectionSet {
     ) {
         // These fixtures bypass production construction, so explicitly register
         // their cancellation owner rather than relying on a snapshot sweep.
-        self.retirement
+        let retirement_owner = self
+            .retirement
             .register_connection(client.cancel_token.clone())
             .expect("open fixture registry");
         let name = name.into();
@@ -148,6 +149,10 @@ impl McpConnectionSet {
                 protocol_mode: crate::McpProtocolMode::Legacy,
                 startup_readiness: Default::default(),
                 connection: Arc::new(McpServerConnection {
+                    retirement: retirement::ConnectionRetirement::new(
+                        self.retirement.clone(),
+                        &retirement_owner,
+                    ),
                     identity: None,
                     client,
                     startup_timeout: DEFAULT_STARTUP_TIMEOUT,
@@ -190,7 +195,7 @@ impl McpConnectionSet {
     }
 }
 
-fn create_test_tool(server_name: &str, tool_name: &str) -> ToolInfo {
+pub(crate) fn create_test_tool(server_name: &str, tool_name: &str) -> ToolInfo {
     ToolInfo {
         server_name: server_name.to_string(),
         supports_parallel_tool_calls: false,
@@ -5163,7 +5168,10 @@ fn reusable_server_config(url: &str) -> McpServerConfig {
 // chain. In particular, do not replace them with insert_test_client: that bypasses
 // the reservation whose completeness these tests need to establish.
 #[cfg(unix)]
-fn retirement_stdio_config(marker: &std::path::Path, generation: &str) -> McpServerConfig {
+pub(crate) fn retirement_stdio_config(
+    marker: &std::path::Path,
+    generation: &str,
+) -> McpServerConfig {
     let mut config = reusable_server_config("unused");
     config.transport = McpServerTransportConfig::Stdio {
         command: "/bin/sh".to_string(),
@@ -5197,7 +5205,7 @@ done
 }
 
 #[cfg(unix)]
-fn retirement_runtime_input(
+pub(crate) fn retirement_runtime_input(
     home: &std::path::Path,
     config: McpServerConfig,
     context: McpRuntimeContext,
@@ -5520,6 +5528,7 @@ async fn manager_with_reusable_ready_server(
             protocol_mode: crate::McpProtocolMode::Legacy,
             startup_readiness: Default::default(),
             connection: Arc::new(McpServerConnection {
+                retirement: Default::default(),
                 identity: Some(reusable_server_identity("docs", config, runtime_context)),
                 client: create_ready_async_managed_client(tools).await,
                 startup_timeout: config
@@ -5950,6 +5959,7 @@ async fn reconciliation_reuses_connection_without_relisting_regular_tools() -> a
             protocol_mode: crate::McpProtocolMode::Legacy,
             startup_readiness: Default::default(),
             connection: Arc::new(McpServerConnection {
+                retirement: Default::default(),
                 identity: Some(reusable_server_identity("docs", &config, &runtime_context)),
                 client: AsyncManagedClient {
                     client: futures::future::ready(Ok(managed_client))
@@ -6877,6 +6887,7 @@ async fn reconciliation_replaces_closed_connections() -> anyhow::Result<()> {
     let mut connected_client = view.connection.client().await?;
     connected_client.client = Arc::clone(&client);
     view.connection = Arc::new(McpServerConnection {
+        retirement: Default::default(),
         identity: Some(reusable_server_identity("docs", &config, &runtime_context)),
         client: AsyncManagedClient {
             client: futures::future::ready(Ok(connected_client))
@@ -7201,3 +7212,19 @@ async fn view_only_changes_reuse_connection_and_preserve_the_old_step() {
     );
     assert_eq!(new_call.tool_approval_mode(), AppToolApproval::Approve);
 }
+
+// Synthetic client fixtures do not use the production lower registry. Give
+// each a real acyclic custody handle without enabling supersession cleanup.
+impl Default for retirement::ConnectionRetirement {
+    fn default() -> Self {
+        let registry = crate::runtime_retirement::RuntimeRetirementRegistry::default();
+        let owner = registry
+            .register_connection(CancellationToken::new())
+            .unwrap();
+        Self::new(registry, &owner)
+    }
+}
+
+#[cfg(unix)]
+#[path = "connection_manager_supersession_tests.rs"]
+mod supersession_tests;

@@ -9,6 +9,8 @@
 mod required;
 #[path = "connection_manager/resources.rs"]
 mod resources;
+#[path = "connection_manager/retirement.rs"]
+mod retirement;
 #[path = "connection_manager/startup.rs"]
 mod startup;
 #[path = "connection_manager/status.rs"]
@@ -84,6 +86,7 @@ static LIVE_CONNECTIONS: Gauge = Gauge::new("mcp.connections.live");
 pub(crate) struct McpServerConnection {
     identity: Option<McpServerConnectionIdentity>,
     client: AsyncManagedClient,
+    retirement: retirement::ConnectionRetirement,
     // Startup-only budget; changing it must not replace a ready connection.
     startup_timeout: Duration,
     startup_trigger: Option<watch::Sender<bool>>,
@@ -165,6 +168,7 @@ impl McpServerConnection {
 impl Drop for McpServerConnection {
     fn drop(&mut self) {
         self.client.cancel_token.cancel();
+        let _ = self.retirement.retire_if_superseded();
     }
 }
 
@@ -741,6 +745,10 @@ impl McpConnectionSet {
                 server_name.clone(),
                 McpServerView {
                     connection: Arc::new(McpServerConnection {
+                        retirement: retirement::ConnectionRetirement::new(
+                            retirement.clone(),
+                            &retirement_owner,
+                        ),
                         identity: Some(connection_identity),
                         client: async_managed_client.clone(),
                         startup_timeout,

@@ -124,6 +124,7 @@ pub struct McpRuntime {
     retirement: crate::runtime_retirement::RuntimeRetirementRegistry,
     current: ArcSwap<PublishedMcpRuntime>,
     event_stream_cancellation: Mutex<EventStreamCancellation>,
+    replacement_gate: tokio::sync::Semaphore,
     reconnect_pending: AtomicBool,
     resource_cache_generation: AtomicU64,
     elicitation_router: ElicitationRequestRouter,
@@ -264,6 +265,7 @@ impl McpRuntime {
                 cancel_event_streams_on_server_removal: watch::channel(()).0,
                 retained_subscription_cancellation: None,
             }),
+            replacement_gate: tokio::sync::Semaphore::new(1),
             reconnect_pending: AtomicBool::new(false),
             resource_cache_generation: AtomicU64::new(0),
             elicitation_router: ElicitationRequestRouter::default(),
@@ -360,6 +362,10 @@ impl McpRuntime {
 
     /// Reconciles configured servers and publishes their immutable runtime snapshot.
     pub async fn replace(&self, input: McpRuntimeInput) {
+        let Ok(_replacement) = self.replacement_gate.acquire().await else {
+            tracing::warn!("MCP runtime replacement gate is closed");
+            return;
+        };
         let current = self.current.load_full();
         let mut reconnect = McpReconnectGuard {
             pending: &self.reconnect_pending,
@@ -384,7 +390,10 @@ impl McpRuntime {
         input: McpRuntimeInput,
         access: crate::McpAttemptAccess<'_>,
     ) -> anyhow::Result<Vec<ToolInfo>> {
-        self.publish(input, /*previous*/ None).await;
+        {
+            let _replacement = self.replacement_gate.acquire().await?;
+            self.publish(input, /*previous*/ None).await;
+        }
         self.latest_hard_refresh_codex_apps_tools_cache_with_authority(access)
             .await
     }
@@ -428,7 +437,7 @@ impl McpRuntime {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.current.store(Arc::new(PublishedMcpRuntime {
-            connections,
+            connections: Arc::clone(&connections),
             config: Some(config),
             auth,
             auth_token,
@@ -439,6 +448,9 @@ impl McpRuntime {
             ready_environments,
             cached_binding: Mutex::new(None),
         }));
+        // Compare actual outgoing identities even when reconnect forbids reuse.
+        // No await separates publication, marking and release of this snapshot.
+        current.connections.mark_superseded_by(&connections);
         let _ = publish.send(true);
         cancellation.event_server_available = hosted_event_server_retained;
         if !hosted_event_server_retained {
@@ -1620,3 +1632,7 @@ mod tests {
         assert!(resolved_runtime.is_some());
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "runtime_publication_tests.rs"]
+mod publication_tests;

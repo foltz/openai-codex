@@ -85,12 +85,14 @@ pub struct McpEventStream {
     request: Option<CancellableEventStreamRequest>,
     runtime_handle: Handle,
     client: Option<Arc<RmcpClient>>,
+    connection: Option<Arc<McpServerConnection>>,
     cancel_event_streams_on_server_removal: watch::Receiver<()>,
 }
 
 impl McpEventStream {
     pub(crate) async fn open(
         client: Arc<RmcpClient>,
+        connection: Option<Arc<McpServerConnection>>,
         cancel_event_streams_on_server_removal: watch::Receiver<()>,
         event_name: &str,
         arguments: &Value,
@@ -108,6 +110,7 @@ impl McpEventStream {
             request: Some(request),
             runtime_handle: Handle::current(),
             client: Some(client),
+            connection,
             cancel_event_streams_on_server_removal,
         })
     }
@@ -139,6 +142,7 @@ impl McpEventStream {
             response = &mut request.handle.rx => {
                 self.request = None;
                 self.client = None;
+                self.connection = None;
 
                 match response {
                     Ok(Ok(_))
@@ -159,6 +163,7 @@ impl McpEventStream {
         {
             drop(notifications);
             let client = self.client.take();
+            let connection = self.connection.take();
             self.runtime_handle.spawn(async move {
                 let _ = tokio::time::timeout(
                     Duration::from_secs(30),
@@ -166,6 +171,7 @@ impl McpEventStream {
                 )
                 .await;
                 drop(client);
+                drop(connection);
             });
         }
     }
@@ -442,8 +448,12 @@ impl McpResourceClient {
         let (managed, _) = connections
             .client_by_name_with_authority(CODEX_APPS_MCP_SERVER_NAME, access)
             .await?;
+        let connection = connections
+            .connection_by_name(CODEX_APPS_MCP_SERVER_NAME)
+            .context("event server connection disappeared")?;
         McpEventStream::open(
             managed.client,
+            Some(connection),
             cancel_event_streams_on_server_removal,
             event_name,
             arguments,

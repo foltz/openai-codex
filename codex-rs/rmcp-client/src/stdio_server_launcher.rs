@@ -237,7 +237,7 @@ const PROCESS_GROUP_TERM_GRACE_PERIOD: Duration = Duration::from_secs(2);
 // Keep queued stderr diagnostics before closing the reader, even when an
 // escaped descendant prevents the pipe from reaching EOF.
 const STDERR_READER_DRAIN_GRACE_PERIOD: Duration = Duration::from_millis(250);
-pub(super) const PROCESS_RETIREMENT_TIMEOUT: Duration = Duration::from_secs(3);
+pub(super) const PROCESS_RETIREMENT_TIMEOUT: Duration = crate::DEFAULT_RETIREMENT_TIMEOUT;
 
 #[cfg(unix)]
 struct LocalProcessTerminator {

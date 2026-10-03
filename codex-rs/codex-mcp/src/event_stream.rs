@@ -107,6 +107,7 @@ impl McpEventStreamOpener {
                 ).await?;
                 McpEventStream::open(
                     client,
+                    /*connection*/ None,
                     self.cancellation_receiver.clone(),
                     event_name,
                     arguments,

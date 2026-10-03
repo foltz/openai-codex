@@ -118,7 +118,6 @@ pub(crate) struct RuntimeTaskTicket {
 }
 
 impl ConnectionRetirementOwner {
-    #[cfg(test)]
     pub(crate) fn id(&self) -> usize {
         self.id
     }

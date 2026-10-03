@@ -1208,7 +1208,7 @@ impl RmcpClient {
     /// Stop the MCP transport and any stdio server process owned by this client.
     pub async fn shutdown(&self) {
         let report = self
-            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(3))
+            .shutdown_until(tokio::time::Instant::now() + crate::DEFAULT_RETIREMENT_TIMEOUT)
             .await;
         for (attempt, outcome) in report.attempts {
             if outcome != crate::retirement::PhysicalRetirementOutcome::Complete {

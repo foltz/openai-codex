@@ -935,3 +935,6 @@ impl Deref for ManagedRunningService {
 #[cfg(test)]
 #[path = "retirement_tests.rs"]
 mod tests;
+
+/// Default observation budget shared by client, process and early retirement.
+pub const DEFAULT_RETIREMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);

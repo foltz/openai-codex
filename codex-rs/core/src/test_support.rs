@@ -96,6 +96,11 @@ pub fn mcp_attribution_snapshot(
         .mcp_attribution_snapshot()
 }
 
+/// Closes the production final-admission gate while a test contributor is paused.
+pub async fn close_task_admission(thread: &crate::CodexThread) {
+    thread.session.close_task_admission().await;
+}
+
 /// Test-only provider that supplies no user instructions.
 #[derive(Debug, Default)]
 pub struct EmptyUserInstructionsProvider;

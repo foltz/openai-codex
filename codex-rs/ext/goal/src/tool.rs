@@ -226,6 +226,7 @@ impl GoalToolExecutor {
                         .to_string(),
                 )
             })?;
+        self.accounting_state.note_goal_status(&goal);
         fill_empty_thread_preview_if_possible(self.state_db.as_ref(), self.thread_id, &goal).await;
         let turn_id = self
             .accounting_state
@@ -293,6 +294,7 @@ impl GoalToolExecutor {
                     "cannot update goal because this thread has no goal".to_string(),
                 )
             })?;
+        self.accounting_state.note_goal_status(&goal);
         self.metrics
             .record_terminal_if_status_changed(previous_status, &goal);
         self.analytics.status_changed(

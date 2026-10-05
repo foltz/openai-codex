@@ -380,6 +380,7 @@ impl GoalRuntimeHandle {
         else {
             return Ok(());
         };
+        self.inner.accounting_state.note_goal_status(&goal);
         self.inner
             .metrics
             .record_terminal_if_status_changed(previous_status, &goal);

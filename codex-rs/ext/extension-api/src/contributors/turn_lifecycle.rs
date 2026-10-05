@@ -14,6 +14,18 @@ pub enum TurnStartPhase {
     RegularTaskStart,
 }
 
+/// Input supplied at the host's irrevocable turn commit boundary.
+pub struct TurnCommittedInput<'a> {
+    /// Exact identifier of the accepted turn.
+    pub turn_id: &'a str,
+    /// Store scoped to the host session runtime.
+    pub session_store: &'a ExtensionData,
+    /// Store scoped to this thread runtime.
+    pub thread_store: &'a ExtensionData,
+    /// The same turn store supplied during preparation and terminal callbacks.
+    pub turn_store: &'a ExtensionData,
+}
+
 /// Input supplied when the host starts a turn.
 pub struct TurnStartInput<'a> {
     /// MCP attempt authority retained by this turn's host work.

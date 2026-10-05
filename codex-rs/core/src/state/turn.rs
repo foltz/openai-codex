@@ -71,6 +71,8 @@ pub(crate) enum TaskKind {
 }
 
 pub(crate) struct RunningTask {
+    /// Task execution and terminal cleanup wait for synchronous publication.
+    pub(crate) commit_ready: CancellationToken,
     pub(crate) done: Arc<Notify>,
     pub(crate) kind: TaskKind,
     pub(crate) task: Arc<dyn AnySessionTask>,

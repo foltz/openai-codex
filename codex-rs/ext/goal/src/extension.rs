@@ -23,6 +23,7 @@ use codex_extension_api::ToolFinishInput;
 use codex_extension_api::ToolLifecycleContributor;
 use codex_extension_api::ToolLifecycleFuture;
 use codex_extension_api::TurnAbortInput;
+use codex_extension_api::TurnCommittedInput;
 use codex_extension_api::TurnErrorInput;
 use codex_extension_api::TurnLifecycleContributor;
 use codex_extension_api::TurnStartInput;
@@ -38,6 +39,7 @@ use codex_protocol::protocol::TokenUsageInfo;
 
 use crate::accounting::BudgetLimitedGoalDisposition;
 use crate::accounting::GoalAccountingState;
+use crate::accounting::GoalTurnPreparation;
 use crate::analytics::GoalAnalytics;
 use crate::api::GoalService;
 use crate::events::GoalEventEmitter;
@@ -254,7 +256,7 @@ where
             };
 
             let accounting = runtime.accounting_state();
-            accounting.start_turn(
+            let mut prepared = accounting.prepare_turn(
                 input.turn_id,
                 input.collaboration_mode.mode,
                 token_usage_at_turn_start,
@@ -263,7 +265,7 @@ where
                 input.collaboration_mode.mode,
                 codex_protocol::config_types::ModeKind::Plan
             ) {
-                accounting.clear_current_turn_goal();
+                input.turn_store.insert(prepared);
                 return;
             }
             let Ok(goal) = self
@@ -272,6 +274,7 @@ where
                 .get_thread_goal(runtime.thread_id())
                 .await
             else {
+                input.turn_store.insert(prepared);
                 return;
             };
             if let Some(goal) = goal
@@ -281,9 +284,22 @@ where
                         | codex_state::ThreadGoalStatus::BudgetLimited
                 )
             {
-                accounting.mark_turn_goal_active(input.turn_id, goal.goal_id);
+                prepared.activate_goal(goal.goal_id, &accounting);
             }
+            input.turn_store.insert(prepared);
         })
+    }
+
+    fn on_turn_committed(&self, input: TurnCommittedInput<'_>) {
+        let Some(runtime) = goal_runtime_handle(input.thread_store) else {
+            return;
+        };
+        let Some(prepared) = input.turn_store.remove::<GoalTurnPreparation>() else {
+            return;
+        };
+        runtime
+            .accounting_state()
+            .commit_prepared_turn(input.turn_id, &prepared);
     }
 
     fn on_item_completed<'a>(

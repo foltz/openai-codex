@@ -88,6 +88,7 @@ pub use contributors::ToolStartInput;
 pub use contributors::ToolTimingBoundary;
 pub use contributors::ToolTimingInput;
 pub use contributors::TurnAbortInput;
+pub use contributors::TurnCommittedInput;
 pub use contributors::TurnContextContributionInput;
 pub use contributors::TurnErrorInput;
 pub use contributors::TurnInputContext;

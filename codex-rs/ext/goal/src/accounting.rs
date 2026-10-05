@@ -1,6 +1,5 @@
 use codex_extension_api::ToolCallOutcome;
 use codex_extension_api::ToolName;
-use codex_protocol::config_types::ModeKind;
 use codex_protocol::items::AgentMessageContent;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::MessagePhase;
@@ -15,6 +14,10 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::Semaphore;
 use tokio::sync::SemaphorePermit;
+
+#[path = "accounting/preparation.rs"]
+mod preparation;
+pub(crate) use preparation::GoalTurnPreparation;
 
 #[derive(Debug)]
 pub(crate) struct GoalAccountingState {
@@ -34,6 +37,8 @@ struct GoalAccountingInner {
     automatic_goal_turn_id: Option<String>,
     consecutive_empty_turns: u8,
     last_accounted_descendant_token_usage: i64,
+    goal_mutation_revision: u64,
+    latest_goal_mutation: Option<preparation::GoalMutation>,
 }
 
 #[derive(Debug)]
@@ -84,24 +89,6 @@ pub(crate) struct RecordedTokenDelta {
 }
 
 impl GoalAccountingState {
-    pub(crate) fn start_turn(
-        &self,
-        turn_id: impl Into<String>,
-        collaboration_mode: ModeKind,
-        token_usage_at_turn_start: &TokenUsage,
-    ) {
-        let turn_id = turn_id.into();
-        let mut inner = self.inner();
-        inner.current_turn_id = Some(turn_id.clone());
-        inner.turns.insert(
-            turn_id,
-            GoalTurnAccounting::new(
-                token_usage_at_turn_start.clone(),
-                !matches!(collaboration_mode, ModeKind::Plan),
-            ),
-        );
-    }
-
     pub(crate) fn current_turn_id(&self) -> Option<String> {
         self.inner().current_turn_id.clone()
     }
@@ -280,25 +267,6 @@ impl GoalAccountingState {
         if delta > 0 {
             self.descendant_token_usage
                 .fetch_add(delta, Ordering::Relaxed);
-        }
-    }
-
-    pub(crate) fn mark_turn_goal_active(&self, turn_id: &str, goal_id: impl Into<String>) {
-        let mut inner = self.inner();
-        let goal_id = goal_id.into();
-        if inner.budget_limit_reported_goal_id.as_deref() != Some(goal_id.as_str()) {
-            inner.budget_limit_reported_goal_id = None;
-        }
-        if let Some(turn) = inner.turns.get_mut(turn_id) {
-            turn.active_goal_id = Some(goal_id.clone());
-            if inner.current_turn_id.as_deref() == Some(turn_id) {
-                if inner.wall_clock.active_goal_id.as_deref() != Some(goal_id.as_str()) {
-                    inner.consecutive_empty_turns = 0;
-                    inner.last_accounted_descendant_token_usage =
-                        self.descendant_token_usage.load(Ordering::Relaxed);
-                }
-                inner.wall_clock.mark_active_goal(goal_id);
-            }
         }
     }
 
@@ -543,6 +511,8 @@ impl Default for GoalAccountingInner {
             automatic_goal_turn_id: None,
             consecutive_empty_turns: 0,
             last_accounted_descendant_token_usage: 0,
+            goal_mutation_revision: 0,
+            latest_goal_mutation: None,
         }
     }
 }

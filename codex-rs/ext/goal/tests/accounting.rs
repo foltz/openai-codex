@@ -249,6 +249,20 @@ fn goal_accounting_preserves_concurrent_descendant_usage_across_checkpoints() {
     assert_eq!(8, second.token_delta);
 }
 
+// Existing accounting scenarios model an accepted turn. Publish through the
+// same preparation/commit path as the host instead of seeding the owner early.
+impl GoalAccountingState {
+    fn start_turn(&self, turn_id: &str, mode: ModeKind, usage: &TokenUsage) {
+        let prepared: accounting::GoalTurnPreparation = self.prepare_turn(turn_id, mode, usage);
+        self.commit_prepared_turn(turn_id, &prepared);
+    }
+
+    fn mark_turn_goal_active(&self, turn_id: &str, goal_id: &str) {
+        assert_eq!(Some(turn_id.to_owned()), self.current_turn_id());
+        self.mark_current_turn_goal_active(goal_id);
+    }
+}
+
 fn token_usage(
     input_tokens: i64,
     cached_input_tokens: i64,

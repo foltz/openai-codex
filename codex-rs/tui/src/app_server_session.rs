@@ -75,6 +75,7 @@ use codex_app_server_protocol::ThreadArchiveParams;
 use codex_app_server_protocol::ThreadArchiveResponse;
 use codex_app_server_protocol::ThreadBackgroundTerminalsCleanParams;
 use codex_app_server_protocol::ThreadBackgroundTerminalsCleanResponse;
+use codex_app_server_protocol::ThreadClearModelSettings;
 use codex_app_server_protocol::ThreadClearParams;
 use codex_app_server_protocol::ThreadClearResponse;
 use codex_app_server_protocol::ThreadCompactStartParams;
@@ -1539,6 +1540,7 @@ impl AppServerSession {
     pub(crate) async fn thread_clear(
         &mut self,
         thread_id: ThreadId,
+        model_settings: ThreadClearModelSettings,
     ) -> Result<ThreadClearResponse> {
         let request_id = self.next_request_id();
         self.client
@@ -1546,6 +1548,7 @@ impl AppServerSession {
                 request_id,
                 params: ThreadClearParams {
                     thread_id: thread_id.to_string(),
+                    model_settings: Some(model_settings),
                 },
             })
             .await

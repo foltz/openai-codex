@@ -5213,10 +5213,34 @@ class ThreadClearEndedNotification(BaseModel):
     transition_id: Annotated[str, Field(alias="transitionId")]
 
 
+class ModelSettings(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    model: Annotated[
+        str | None,
+        Field(description="An unset model uses ordinary server model-default resolution."),
+    ] = None
+    reasoning_effort: Annotated[
+        ReasoningEffort | None,
+        Field(
+            alias="reasoningEffort",
+            description="An unset effort replaces the predecessor's configured effort with no override.",
+        ),
+    ] = None
+
+
 class ThreadClearParams(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
+    model_settings: Annotated[
+        ModelSettings,
+        Field(
+            alias="modelSettings",
+            description="Required for successful clear: model settings resolved for a fresh session. Missing or null input is decoded so the server can preserve authority checks, then refused before creating a durable clear transition.",
+        ),
+    ]
     thread_id: Annotated[
         str,
         Field(

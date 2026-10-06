@@ -4866,9 +4866,16 @@ fn thread_start_params_preserve_explicit_null_service_tier() {
 fn thread_clear_wire_contract_uses_public_string_identities() {
     let params = ThreadClearParams {
         thread_id: "predecessor".to_string(),
+        model_settings: Some(ThreadClearModelSettings {
+            model: None,
+            reasoning_effort: None,
+        }),
     };
     assert_eq!(
-        json!({ "threadId": "predecessor" }),
+        json!({
+            "threadId": "predecessor",
+            "modelSettings": { "model": null, "reasoningEffort": null }
+        }),
         serde_json::to_value(params).unwrap()
     );
 

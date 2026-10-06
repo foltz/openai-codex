@@ -494,6 +494,7 @@ export type { ThreadAttachmentRemoveResponse } from "./ThreadAttachmentRemoveRes
 export type { ThreadAttachmentUpdatedNotification } from "./ThreadAttachmentUpdatedNotification";
 export type { ThreadClearEndReason } from "./ThreadClearEndReason";
 export type { ThreadClearEndedNotification } from "./ThreadClearEndedNotification";
+export type { ThreadClearModelSettings } from "./ThreadClearModelSettings";
 export type { ThreadClearParams } from "./ThreadClearParams";
 export type { ThreadClearRecovery } from "./ThreadClearRecovery";
 export type { ThreadClearRecoveryContext } from "./ThreadClearRecoveryContext";

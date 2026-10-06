@@ -208,6 +208,7 @@ use codex_app_server_protocol::ThreadBackgroundTerminalsTerminateResponse;
 use codex_app_server_protocol::ThreadClearEndReason;
 use codex_app_server_protocol::ThreadClearEndedNotification;
 use codex_app_server_protocol::ThreadClearErrorCode;
+use codex_app_server_protocol::ThreadClearModelSettings;
 use codex_app_server_protocol::ThreadClearParams;
 use codex_app_server_protocol::ThreadClearResponse;
 use codex_app_server_protocol::ThreadClearStartedNotification;

@@ -215,6 +215,10 @@ async fn interactive_resume_fork_and_clear_retain_the_adopted_thread() -> Result
         )
         .await?;
     let predecessor_grant = held_grant(&mut session, thread_id).await?;
+    let clear_model_settings = codex_app_server_protocol::ThreadClearModelSettings {
+        model: config.model.clone(),
+        reasoning_effort: config.model_reasoning_effort.clone(),
+    };
     let mut fork_config = config;
     fork_config.ephemeral = true;
     let local_settings = crate::local_settings::LocalSettings::from(&fork_config);
@@ -226,7 +230,9 @@ async fn interactive_resume_fork_and_clear_retain_the_adopted_thread() -> Result
         .fork_side_thread(&local_settings, fork_config, thread_id)
         .await?;
     held_grant(&mut session, side.session.thread_id).await?;
-    let cleared = session.thread_clear(thread_id).await?;
+    let cleared = session
+        .thread_clear(thread_id, clear_model_settings)
+        .await?;
     let successor_id = ThreadId::from_string(&cleared.successor_thread.id)?;
     session
         .retain_clear_successor(&cleared.successor_thread.id)

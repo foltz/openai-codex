@@ -21392,12 +21392,37 @@
         "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Parameters for the server-owned clear-and-replace operation.",
         "properties": {
+          "modelSettings": {
+            "description": "Required for successful clear: model settings resolved for a fresh session. Missing or null input is decoded so the server can preserve authority checks, then refused before creating a durable clear transition.",
+            "properties": {
+              "model": {
+                "description": "An unset model uses ordinary server model-default resolution.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "reasoningEffort": {
+                "anyOf": [
+                  {
+                    "$ref": "#/definitions/v2/ReasoningEffort"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "An unset effort replaces the predecessor's configured effort with no override."
+              }
+            },
+            "type": "object"
+          },
           "threadId": {
             "description": "The predecessor currently displayed by the requesting connection.",
             "type": "string"
           }
         },
         "required": [
+          "modelSettings",
           "threadId"
         ],
         "title": "ThreadClearParams",

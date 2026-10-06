@@ -1,4 +1,7 @@
 use super::*;
+
+#[path = "clear_settings_tests.rs"]
+mod clear_settings;
 use crate::app_event::TranscriptExportDestination;
 use crate::bottom_pane::BottomPaneView;
 use app_test_support::create_fake_paginated_rollout;
@@ -4262,10 +4265,10 @@ fn clear_session_uses_exact_displayed_thread_before_unsubscribe_and_attaches_suc
                     params.get("sessionStartSource") == Some(&serde_json::Value::Null)
                         && params.get("clearPredecessorThreadId") == Some(&serde_json::Value::Null)
                 }));
-                assert_eq!(
-                    recorded_params(&requests, "thread/clear"),
-                    vec![serde_json::json!({"threadId": predecessor.to_string()})]
-                );
+                let clears = recorded_params(&requests, "thread/clear");
+                assert_eq!(clears.len(), 1);
+                assert_eq!(clears[0]["threadId"], predecessor.to_string());
+                assert!(clears[0]["modelSettings"].is_object());
                 let (clear_index, first_unsubscribe) = {
                     let recorded = requests.lock().expect("request recorder lock");
                     let clear_index = recorded
@@ -4327,7 +4330,7 @@ fn clear_then_submit_ui_path_uses_one_combined_request() -> Result<()> {
                 .enable_all()
                 .build()?;
             runtime.block_on(async {
-                let mut app = make_test_app().await;
+                let (mut app, mut events, _ops) = make_test_app_with_channels().await;
                 // Preserve this fixture isolation when fresh-session config reloads.
                 app.config.features.disable(Feature::Plugins)?;
                 app.cli_kv_overrides
@@ -4364,12 +4367,26 @@ fn clear_then_submit_ui_path_uses_one_combined_request() -> Result<()> {
                 )
                 .await?;
 
-                assert_eq!(
-                    recorded_params(&requests, "thread/clear"),
-                    vec![serde_json::json!({"threadId": predecessor.to_string()})]
-                );
+                let clears = recorded_params(&requests, "thread/clear");
+                assert_eq!(clears.len(), 1);
+                assert_eq!(clears[0]["threadId"], predecessor.to_string());
+                assert!(clears[0]["modelSettings"].is_object());
+                clear_settings::pump_until_turn_request(
+                    &mut app,
+                    &mut tui,
+                    &mut app_server,
+                    &mut events,
+                    &requests,
+                    1,
+                )
+                .await?;
+                let successor = app.current_displayed_thread_id().expect("successor");
                 assert_eq!(recorded_params(&requests, "thread/start").len(), 1);
-                assert_ne!(app.current_displayed_thread_id(), Some(predecessor));
+                assert_ne!(successor, predecessor);
+                assert_eq!(
+                    recorded_params(&requests, "turn/start")[0]["threadId"],
+                    successor.to_string()
+                );
 
                 app_server.shutdown().await?;
                 proxy.await??;
@@ -4487,7 +4504,7 @@ fn failed_repeated_clear_keeps_resumed_predecessor_displayed_without_unsubscribe
                         .map(|request| request.method.clone())
                         .collect::<Vec<_>>()
                 };
-                assert_eq!(failure_request_methods, vec!["thread/clear"]);
+                assert_eq!(failure_request_methods, vec!["config/read", "thread/clear"]);
                 assert_eq!(
                     app_server
                         .thread_read(predecessor, /*include_turns*/ false)

@@ -229,6 +229,22 @@ authoritative successor. Its `transitionId` correlates the requester-scoped
 `thread/started` notifications are not succession authority. Protocol-only
 builds reject clear until the corresponding orchestration is enabled.
 
+Successful clear requests must supply `modelSettings` containing freshly resolved
+model and reasoning effort. The TUI uses the same current defaults and launch/profile
+precedence as a fresh session; it resets Plan mode to Default. These values are not
+an instruction to inherit the predecessor's live settings.
+
+```json
+{"id": 42, "method": "thread/clear", "params": {"threadId": "A", "modelSettings": {"model": "gpt-5.5", "reasoningEffort": "high"}}}
+```
+
+A missing or null `modelSettings` is rejected after ordinary authority checks and
+before creating a durable transition or successor. Clients using the older
+identity-only request must update. Within a supplied object, an unset model uses
+ordinary server model-default resolution, and unset effort removes the configured
+effort override. There is no experimental API opt-in for this input. The response's
+`successorThread.model` and `reasoningEffort` report the effective successor values.
+
 ## Stored thread attachments
 
 ### KCF interactive-subscription terminology

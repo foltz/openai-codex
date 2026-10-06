@@ -377,6 +377,14 @@ impl Session {
                     "thread already has an active task".to_string(),
                 ));
             }
+            if let Some(ready) = self.input_queue.preparation.pending_publication() {
+                // An abort may have taken the preceding task while its
+                // synchronous handoff is still running. Order all publishers,
+                // including a different direct replacer, outside the core lock.
+                drop(active);
+                ready.cancelled().await;
+                continue;
+            }
             match &reservation {
                 TaskReservation::New => {
                     let completed = if replacement.is_some() {
@@ -477,6 +485,12 @@ impl Session {
         // recording this turn. From commit through install there is no await.
         self.commit_started_turn(&turn_context.sub_id, &turn.turn_state, mailbox)
             .await;
+        let commit_ready = CancellationToken::new();
+        // On unwind, cancel execution before releasing readiness, including
+        // the window where a spawned task has not yet been assigned.
+        let commit_guard = commit_ready.clone().drop_guard();
+        let commit_cancel_guard = cancellation_token.clone().drop_guard();
+        let ready_for_run = commit_ready.clone();
         let agent_execution_guard = self.services.agent_control.admit_turn(
             turn_context.multi_agent_version,
             &turn_context.session_source,
@@ -507,6 +521,11 @@ impl Session {
         );
         let handle = tokio::spawn(
             async move {
+                ready_for_run.cancelled().await;
+                if task_cancellation_token.is_cancelled() {
+                    done_clone.notify_waiters();
+                    return;
+                }
                 let ctx_for_finish = Arc::clone(&ctx);
                 let task_result = task_for_run
                     .run(
@@ -551,6 +570,7 @@ impl Session {
             .start_timer(TURN_E2E_DURATION_METRIC, &[])
             .ok();
         let running_task = RunningTask {
+            commit_ready,
             done,
             handle,
             kind: task_kind,
@@ -561,7 +581,16 @@ impl Session {
             _diagnostics_guard: ACTIVE_TURNS.track(),
             _timer: timer,
         };
+        self.input_queue
+            .preparation
+            .register_publication(running_task.commit_ready.clone());
         turn.task = Some(running_task);
+        drop(active);
+        // The exact task is installed, but its run and abort paths cannot pass
+        // the handoff yet. Contributor mutexes never wait under active_turn.
+        self.emit_turn_committed_lifecycle(turn_context.as_ref());
+        commit_cancel_guard.disarm();
+        drop(commit_guard);
         Ok(())
     }
 
@@ -1150,13 +1179,22 @@ impl Session {
         turn_state: &Mutex<TurnState>,
         error: Option<ErrorEvent>,
     ) {
+        // Register completion before cancellation: the gated task may exit
+        // immediately when publication releases it.
+        let done = task.done.notified();
+        tokio::pin!(done);
+        done.as_mut().enable();
+        let already_cancelled = task.cancellation_token.is_cancelled();
+        task.cancellation_token.cancel();
+        // take_active_turn/finish_turn_abort have released the core lock.
+        // Publication must finish before the matching terminal callback.
+        task.commit_ready.cancelled().await;
         let sub_id = task.turn_context.sub_id.clone();
-        if task.cancellation_token.is_cancelled() {
+        if already_cancelled {
             return;
         }
 
         trace!(task_kind = ?task.kind, sub_id, "aborting running task");
-        task.cancellation_token.cancel();
         if reason == TurnAbortReason::Interrupted
             && task
                 .turn_context
@@ -1175,7 +1213,7 @@ impl Session {
         let session_task = task.task;
 
         select! {
-            _ = task.done.notified() => {
+            _ = &mut done => {
             },
             _ = tokio::time::sleep(Duration::from_millis(GRACEFULL_INTERRUPTION_TIMEOUT_MS)) => {
                 warn!("task {sub_id} didn't complete gracefully after {}ms", GRACEFULL_INTERRUPTION_TIMEOUT_MS);

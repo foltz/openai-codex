@@ -323,6 +323,36 @@ async fn replacement_uses_server_defaults_and_preserves_explicit_launch_settings
               server-model high · <PROJECT>
             ");
         }
+        let predecessor = app
+            .current_displayed_thread_id()
+            .expect("fresh predecessor");
+        app.clear_displayed_session(
+            &mut tui,
+            &mut server,
+            /*initial_user_message*/ None,
+            /*new_thread_name*/ None,
+        )
+        .await;
+        let successor = app.current_displayed_thread_id().expect("clear successor");
+        assert_ne!(successor, predecessor);
+        assert_eq!(
+            recorded_params(&requests, "thread/clear"),
+            vec![serde_json::json!({
+                "threadId": predecessor.to_string(),
+                "modelSettings": {"model": expected_model, "reasoningEffort": expected_effort}
+            })]
+        );
+        let actual = server
+            .thread_read(successor, /*include_turns*/ false)
+            .await?;
+        assert_eq!(
+            serde_json::json!({"model": actual.model, "effort": actual.reasoning_effort}),
+            serde_json::json!({"model": expected_model, "effort": expected_effort})
+        );
+        assert_eq!(
+            app.chat_widget.active_collaboration_mode_kind(),
+            ModeKind::Default
+        );
         server.shutdown().await?;
         proxy.await??;
     }

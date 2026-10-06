@@ -14,6 +14,7 @@ pub(crate) struct MailboxPreparationSlot {
 struct PreparationState {
     current: Option<Arc<Preparation>>,
     replacing: usize,
+    publication: Option<CancellationToken>,
 }
 
 struct Preparation {
@@ -32,6 +33,33 @@ pub(super) struct MailboxReplacement<'a> {
 }
 
 impl MailboxPreparationSlot {
+    #[expect(
+        clippy::expect_used,
+        reason = "publication ordering requires unpoisoned state"
+    )]
+    pub(super) fn pending_publication(&self) -> Option<CancellationToken> {
+        self.state
+            .lock()
+            .expect("mailbox preparation poisoned")
+            .publication
+            .as_ref()
+            .filter(|ready| !ready.is_cancelled())
+            .cloned()
+    }
+
+    /// Called under active_turn at installation. The witness survives an abort
+    /// taking that task, so a different replacer cannot publish ahead of it.
+    #[expect(
+        clippy::expect_used,
+        reason = "publication ordering requires unpoisoned state"
+    )]
+    pub(super) fn register_publication(&self, ready: CancellationToken) {
+        self.state
+            .lock()
+            .expect("mailbox preparation poisoned")
+            .publication = Some(ready);
+    }
+
     #[expect(
         clippy::expect_used,
         reason = "poisoned preparation state cannot authorize a new start"

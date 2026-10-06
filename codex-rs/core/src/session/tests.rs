@@ -3,6 +3,8 @@ use crate::agent::LocalAgentControl;
 mod notification_tests;
 
 use super::mcp_refresh::McpRefresh;
+#[path = "turn_commit_tests.rs"]
+mod turn_commit_tests;
 #[path = "turn_start_mcp_tests.rs"]
 mod turn_start_mcp_tests;
 use super::step_settings::ResolvedStepSettings;

@@ -57,6 +57,7 @@ pub use tool_lifecycle::ToolTimingInput;
 pub use turn_input::TurnInputContext;
 pub use turn_input::TurnInputEnvironment;
 pub use turn_lifecycle::TurnAbortInput;
+pub use turn_lifecycle::TurnCommittedInput;
 pub use turn_lifecycle::TurnErrorInput;
 pub use turn_lifecycle::TurnStartInput;
 pub use turn_lifecycle::TurnStartPhase;
@@ -235,6 +236,16 @@ pub trait TurnLifecycleContributor: Send + Sync {
             let _input = input;
         })
     }
+
+    /// Publishes prepared state for an accepted turn, for every task kind.
+    ///
+    /// Called once after the final admission and reservation fences and mailbox
+    /// commit and task assignment, outside the host's active-turn lock and with
+    /// no await. Task execution and abort cleanup wait until dispatch finishes.
+    /// Never called for abandoned preparation. Implementations must perform
+    /// bounded synchronous publication, without host calls, I/O or panic.
+    /// A panic is contained so it cannot undo the already committed turn.
+    fn on_turn_committed(&self, _input: TurnCommittedInput<'_>) {}
 
     /// Observes a completed item without changing it or delaying streamed deltas.
     fn on_item_completed<'a>(

@@ -276,6 +276,9 @@ impl GoalService {
         };
 
         if let Some(runtime) = runtime.as_ref() {
+            // Publish freshness before any post-write await. Runtime effects
+            // may be applied later, after rollout/event delivery.
+            runtime.accounting_state().note_goal_status(&goal);
             runtime.clear_pending_turn_start_options().await;
         }
 
@@ -321,6 +324,7 @@ impl GoalService {
             })?;
         let cleared = cleared_goal.is_some();
         if cleared && let Some(runtime) = runtime.as_ref() {
+            runtime.accounting_state().note_goal_mutation(None);
             runtime.clear_pending_turn_start_options().await;
         }
         drop(goal_state_permit);

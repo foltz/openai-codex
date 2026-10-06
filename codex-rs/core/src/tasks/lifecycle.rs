@@ -14,6 +14,24 @@ use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 
 impl Session {
+    pub(super) fn emit_turn_committed_lifecycle(&self, turn_context: &TurnContext) {
+        for contributor in self.services.extensions.turn_lifecycle_contributors() {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                contributor.on_turn_committed(codex_extension_api::TurnCommittedInput {
+                    turn_id: turn_context.sub_id.as_str(),
+                    session_store: &self.services.session_extension_data,
+                    thread_store: &self.services.thread_extension_data,
+                    turn_store: turn_context.extension_data.as_ref(),
+                });
+            }));
+            if result.is_err() {
+                tracing::error!(
+                    "turn commit contributor panicked; continuing committed installation"
+                );
+            }
+        }
+    }
+
     pub(super) async fn emit_turn_start_lifecycle(
         self: &Arc<Self>,
         turn_context: &TurnContext,

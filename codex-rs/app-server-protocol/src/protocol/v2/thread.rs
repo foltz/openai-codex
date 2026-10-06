@@ -912,6 +912,23 @@ pub struct ThreadUnsubscribeResponse {
 pub struct ThreadClearParams {
     /// The predecessor currently displayed by the requesting connection.
     pub thread_id: String,
+    /// Required for successful clear: model settings resolved for a fresh session.
+    /// Missing or null input is decoded so the server can preserve authority checks,
+    /// then refused before creating a durable clear transition.
+    #[schemars(required)]
+    #[ts(as = "ThreadClearModelSettings")]
+    pub model_settings: Option<ThreadClearModelSettings>,
+}
+
+/// Fresh-session values supplied by the clearing client, not inherited live settings.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadClearModelSettings {
+    /// An unset model uses ordinary server model-default resolution.
+    pub model: Option<String>,
+    /// An unset effort replaces the predecessor's configured effort with no override.
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

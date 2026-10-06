@@ -21,6 +21,7 @@ use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadClearEndedNotification;
 use codex_app_server_protocol::ThreadClearErrorCode;
+use codex_app_server_protocol::ThreadClearModelSettings;
 use codex_app_server_protocol::ThreadClearParams;
 use codex_app_server_protocol::ThreadClearResponse;
 use codex_app_server_protocol::ThreadClearStartedNotification;
@@ -51,6 +52,9 @@ use tokio::time::timeout;
 mod clear_read;
 #[path = "thread_clear_recovery.rs"]
 mod clear_recovery;
+
+#[path = "thread_clear_settings.rs"]
+mod clear_settings;
 
 #[derive(Debug)]
 enum ClearEvidence {
@@ -1231,6 +1235,10 @@ async fn send_clear(stream: &mut WsClient, id: i64, thread_id: &str) -> Result<(
         id,
         Some(serde_json::to_value(ThreadClearParams {
             thread_id: thread_id.to_string(),
+            model_settings: Some(ThreadClearModelSettings {
+                model: Some("mock-model".to_string()),
+                reasoning_effort: None,
+            }),
         })?),
     )
     .await

@@ -90,6 +90,7 @@ impl ThreadRequestProcessor {
                 request_id.connection_id,
                 predecessor_thread_id,
                 predecessor,
+                params.model_settings,
                 state_db,
             )
             .await;
@@ -270,8 +271,11 @@ impl ThreadRequestProcessor {
         connection_id: ConnectionId,
         predecessor_thread_id: ThreadId,
         predecessor: Arc<CodexThread>,
+        model_settings: Option<ThreadClearModelSettings>,
         state_db: StateDbHandle,
     ) -> Result<ThreadClearResponse, JSONRPCErrorError> {
+        let model_settings = model_settings
+            .ok_or_else(|| invalid_request("thread/clear requires resolved modelSettings"))?;
         let transition_id = ClearTransitionId::new();
         let successor_thread_id = ThreadId::new();
         match state_db
@@ -309,7 +313,9 @@ impl ThreadRequestProcessor {
             }
         }
 
-        let config = (*predecessor.config().await).clone();
+        let mut config = (*predecessor.config().await).clone();
+        config.model = model_settings.model;
+        config.model_reasoning_effort = model_settings.reasoning_effort;
         let predecessor_snapshot = predecessor.config_snapshot().await;
         let successor = match self
             .thread_manager

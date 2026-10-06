@@ -1143,6 +1143,28 @@ impl App {
         let Some(predecessor_thread_id) = displayed else {
             return;
         };
+        let mut config = match self.load_new_session_config(app_server).await {
+            Ok(config) => config,
+            Err(err) => {
+                if let Some(message) = initial_user_message {
+                    self.chat_widget.restore_user_message_to_composer(message);
+                }
+                self.chat_widget
+                    .add_error_message(format!("Failed to read new session defaults: {err}"));
+                tui.frame_requester().schedule_frame();
+                return;
+            }
+        };
+        apply_managed_new_thread_defaults(
+            &mut config,
+            app_server.managed_new_thread_defaults(),
+            &self.cli_kv_overrides,
+            &self.harness_overrides,
+        );
+        let model_settings = codex_app_server_protocol::ThreadClearModelSettings {
+            model: config.model,
+            reasoning_effort: config.model_reasoning_effort,
+        };
         let summary = session_summary(
             self.chat_widget.token_usage(),
             self.chat_widget.thread_id(),
@@ -1150,7 +1172,10 @@ impl App {
             self.chat_widget.rollout_path().as_deref(),
         );
 
-        let response = match app_server.thread_clear(predecessor_thread_id).await {
+        let response = match app_server
+            .thread_clear(predecessor_thread_id, model_settings)
+            .await
+        {
             Ok(response) => response,
             Err(err) => {
                 self.chat_widget
@@ -1181,9 +1206,10 @@ impl App {
         let retention = app_server
             .retain_clear_successor(&response.successor_thread.id)
             .await;
-        let session = self
+        let mut session = self
             .session_state_for_thread_read(successor_thread_id, &response.successor_thread)
             .await;
+        session.reasoning_effort = response.successor_thread.reasoning_effort.clone();
         let blocks_direct_input =
             crate::app_server_session::thread_blocks_direct_input(&response.successor_thread);
         let mut started = AppServerStartedThread {

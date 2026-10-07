@@ -580,7 +580,9 @@ impl MessageProcessor {
             outgoing.clone(),
         );
 
-        let pending_thread_unloads = Arc::new(Mutex::new(HashSet::new()));
+        let pending_thread_unloads = Arc::new(Mutex::new(
+            crate::thread_state::recovery::PendingThreadUnloads::default(),
+        ));
         let thread_watch_manager =
             crate::thread_status::ThreadWatchManager::new_with_outgoing(outgoing.clone());
         let thread_list_state_permit = Arc::new(Semaphore::new(/*permits*/ 1));

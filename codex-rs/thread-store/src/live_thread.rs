@@ -12,6 +12,8 @@ use codex_rollout::persisted_rollout_items;
 use tokio::sync::Mutex;
 use tracing::warn;
 
+mod retirement;
+
 use crate::AppendThreadItemsParams;
 use crate::CreateThreadParams;
 use crate::LoadThreadHistoryParams;
@@ -40,6 +42,8 @@ pub struct LiveThread {
     history_mode: ThreadHistoryMode,
     thread_store: Arc<dyn ThreadStore>,
     metadata_sync: Arc<Mutex<ThreadMetadataSync>>,
+    // Shared by every clone; serialize mutations with irreversible writer sealing.
+    write_gate: Arc<Mutex<bool>>,
     persistence_telemetry: RolloutPersistenceTelemetry,
 }
 
@@ -156,6 +160,7 @@ impl LiveThread {
             history_mode,
             thread_store,
             metadata_sync: Arc::new(Mutex::new(metadata_sync)),
+            write_gate: Arc::new(Mutex::new(false)),
             persistence_telemetry: RolloutPersistenceTelemetry::new(thread_id),
         })
     }
@@ -236,6 +241,7 @@ impl LiveThread {
             history_mode,
             thread_store,
             metadata_sync: Arc::new(Mutex::new(metadata_sync)),
+            write_gate: Arc::new(Mutex::new(false)),
             persistence_telemetry: RolloutPersistenceTelemetry::new(thread_id),
         })
     }
@@ -245,7 +251,12 @@ impl LiveThread {
         skip_all,
         fields(item_count = raw_items.len())
     )]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the incarnation write gate must remain held until admitted persistence completes"
+    )]
     pub async fn append_items(&self, raw_items: &[RolloutItem]) -> ThreadStoreResult<()> {
+        let _write = self.mutation_guard().await?;
         let items = self.persist_appended_items(raw_items).await?;
         if items.is_empty() {
             return Ok(());
@@ -299,7 +310,12 @@ impl LiveThread {
         Ok(items)
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the incarnation write gate must remain held until admitted persistence completes"
+    )]
     pub async fn persist(&self, context: PersistContext) -> ThreadStoreResult<()> {
+        let _write = self.mutation_guard().await?;
         if context.allows_background_persistence() {
             let update = self
                 .metadata_sync
@@ -315,30 +331,15 @@ impl LiveThread {
         self.apply_pending_metadata_update(update, context).await
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the incarnation write gate must remain held until admitted persistence completes"
+    )]
     pub async fn flush(&self) -> ThreadStoreResult<()> {
+        let _write = self.mutation_guard().await?;
         self.thread_store.flush_thread(self.thread_id).await?;
         self.flush_pending_metadata_update_for_existing_history()
             .await
-    }
-
-    pub async fn shutdown(&self) -> ThreadStoreResult<()> {
-        let metadata_result = self
-            .flush_pending_metadata_update_for_existing_history()
-            .await;
-        let shutdown_result = self.thread_store.shutdown_thread(self.thread_id).await;
-        match (metadata_result, shutdown_result) {
-            (Err(metadata_error), Err(shutdown_error)) => Err(ThreadStoreError::Internal {
-                message: format!(
-                    "thread metadata update failed: {metadata_error}; thread shutdown failed: {shutdown_error}"
-                ),
-            }),
-            (Err(metadata_error), Ok(())) => Err(metadata_error),
-            (Ok(()), result) => result,
-        }
-    }
-
-    pub async fn discard(&self) -> ThreadStoreResult<()> {
-        self.thread_store.discard_thread(self.thread_id).await
     }
 
     pub async fn load_history(
@@ -367,11 +368,16 @@ impl LiveThread {
             .await
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the incarnation write gate must remain held until admitted persistence completes"
+    )]
     pub async fn update_memory_mode(
         &self,
         mode: ThreadMemoryMode,
         include_archived: bool,
     ) -> ThreadStoreResult<()> {
+        let _write = self.mutation_guard().await?;
         self.flush_pending_metadata_update().await?;
         self.thread_store
             .update_thread_metadata(UpdateThreadMetadataParams {
@@ -390,11 +396,16 @@ impl LiveThread {
     ///
     /// Stores may successfully return no thread for a no-op update, so this reads the thread as a
     /// fallback in that case.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the incarnation write gate must remain held until admitted persistence completes"
+    )]
     pub async fn update_metadata(
         &self,
         patch: ThreadMetadataPatch,
         include_archived: bool,
     ) -> ThreadStoreResult<StoredThread> {
+        let _write = self.mutation_guard().await?;
         self.flush_pending_metadata_update().await?;
         let updated = self
             .thread_store

@@ -794,6 +794,8 @@ impl ThreadStore for LocalThreadStore {
 mod tests {
     #[path = "acquisition_tests.rs"]
     mod acquisition_tests;
+    #[path = "recovery_tests.rs"]
+    mod recovery_tests;
     use std::sync::Arc;
 
     use codex_protocol::ThreadId;

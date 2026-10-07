@@ -24,6 +24,7 @@ pub(crate) struct ProcessorThreadShutdown {
     // None means not yet observed, never an empty successful population.
     pub manager: Option<Result<ThreadManagerRetirementReport, ThreadManagerRetirementError>>,
     pub prior: Option<Vec<(ThreadId, Uuid, ThreadRetirementReport)>>,
+    pub reconciled_prior: std::collections::HashSet<(ThreadId, Uuid)>,
     pub panicked: bool,
     pub deadline_expired: bool,
 }
@@ -37,10 +38,14 @@ impl ProcessorThreadShutdown {
                     .as_ref()
                     .is_ok_and(ThreadManagerRetirementReport::is_complete)
             })
-            && self
-                .prior
-                .as_ref()
-                .is_some_and(|reports| reports.iter().all(|(_, _, report)| report.is_complete()))
+            && self.prior.as_ref().is_some_and(|reports| {
+                reports.iter().all(|(id, generation, report)| {
+                    report.is_complete()
+                        || (report.ordinary == codex_core::ThreadShutdownOutcome::Complete
+                            && report.session_loop == codex_core::ThreadLoopOutcome::Normal
+                            && self.reconciled_prior.contains(&(*id, *generation)))
+                })
+            })
     }
 }
 
@@ -108,7 +113,11 @@ impl ThreadShutdownOwner {
                     .into_iter()
                     .map(|(claim, report)| (claim.thread_id, claim.generation, report))
                     .collect();
-                progress_tx.send_modify(|report| report.prior = Some(reports));
+                let reconciled = state.reconciled_retirements().await;
+                progress_tx.send_modify(|report| {
+                    report.prior = Some(reports);
+                    report.reconciled_prior = reconciled;
+                });
             };
             // Neither an unavailable/contended lifecycle table nor a manager
             // failure may starve the other population's actual cleanup.

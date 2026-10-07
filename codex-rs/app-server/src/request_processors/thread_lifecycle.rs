@@ -10,7 +10,8 @@ pub(super) struct ListenerTaskContext {
     pub(super) thread_manager: Arc<ThreadManager>,
     pub(super) thread_state_manager: ThreadStateManager,
     pub(super) outgoing: Arc<OutgoingMessageSender>,
-    pub(super) pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
+    pub(super) pending_thread_unloads:
+        Arc<Mutex<crate::thread_state::recovery::PendingThreadUnloads>>,
     pub(super) thread_watch_manager: ThreadWatchManager,
     pub(super) codex_home: PathBuf,
     pub(super) thread_unload_delay: Duration,
@@ -164,7 +165,7 @@ pub(super) async fn ensure_conversation_listener(
     };
     let thread_state = {
         let pending_thread_unloads = listener_task_context.pending_thread_unloads.lock().await;
-        if pending_thread_unloads.contains(&conversation_id) {
+        if pending_thread_unloads.blocks(&conversation_id) || conversation.is_closing() {
             return Err(invalid_request(format!(
                 "thread {conversation_id} is closing; retry after the thread is closed"
             )));
@@ -260,16 +261,33 @@ pub(super) async fn ensure_listener_task_running(
         .await;
     let config_snapshot = conversation.config_snapshot().await;
     let thread_settings_baseline = thread_settings_from_config_snapshot(&config_snapshot);
+    let (joined, joining) = tokio::sync::oneshot::channel::<tokio::task::JoinHandle<()>>();
     let (mut listener_command_rx, listener_generation) = {
         let mut thread_state = thread_state.lock().await;
         if thread_state.listener_matches(&conversation) {
             return Ok(());
+        }
+        if unloading_state.retention_rx.borrow().retiring {
+            return Err(invalid_request(format!(
+                "thread {conversation_id} is retiring"
+            )));
         }
         let (listener_command_rx, listener_generation) = thread_state.set_listener(
             cancel_tx,
             &conversation,
             watch_registration,
             thread_settings_baseline,
+        );
+        use futures::FutureExt;
+        thread_state.listener_completion = Some(
+            async move {
+                match joining.await {
+                    Ok(listener) => listener.await.is_ok(),
+                    Err(_) => false,
+                }
+            }
+            .boxed()
+            .shared(),
         );
         let Some(listener_command_tx) = thread_state.listener_command_tx() else {
             tracing::warn!(
@@ -293,7 +311,7 @@ pub(super) async fn ensure_listener_task_running(
         ..
     } = listener_task_context;
     let outgoing_for_task = Arc::clone(&outgoing);
-    tokio::spawn(async move {
+    let listener = tokio::spawn(async move {
         loop {
             tokio::select! {
                 biased;
@@ -424,6 +442,8 @@ pub(super) async fn ensure_listener_task_running(
             thread_state.clear_listener();
         }
     });
+    // No await between registration and handing the exact task to its retained join.
+    let _ = joined.send(listener);
     Ok(())
 }
 
@@ -445,7 +465,7 @@ pub(super) async fn wait_for_thread_shutdown(thread: &Arc<CodexThread>) -> Threa
 pub(super) async fn unload_idle_unretained_thread(
     thread_manager: Arc<ThreadManager>,
     outgoing: Arc<OutgoingMessageSender>,
-    pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
+    pending_thread_unloads: Arc<Mutex<crate::thread_state::recovery::PendingThreadUnloads>>,
     thread_state_manager: ThreadStateManager,
     thread_watch_manager: ThreadWatchManager,
     thread_id: ThreadId,
@@ -480,14 +500,10 @@ pub(super) async fn unload_idle_unretained_thread(
     };
     let (claim, ticket) = ticket;
     let report = ticket.wait().await;
-    if !report_is_complete(report) {
+    if !observe_idle_retirement_report(&thread_state_manager, claim, report).await {
         pending_thread_unloads.lock().await.remove(&thread_id);
-        warn!(thread_id = %thread_id, ?report, "idle thread retirement remains incomplete");
         return;
     }
-    thread_state_manager
-        .record_retirement_report(claim, report)
-        .await;
     let removed = thread_manager
         .remove_thread_if_same(&thread_id, &thread)
         .await;
@@ -509,8 +525,20 @@ pub(super) async fn unload_idle_unretained_thread(
     pending_thread_unloads.lock().await.remove(&thread_id);
 }
 
-fn report_is_complete(report: codex_core::ThreadRetirementReport) -> bool {
-    report.is_complete()
+/// Save the exact-generation observation before deciding whether ordinary unload is safe.
+pub(crate) async fn observe_idle_retirement_report(
+    manager: &ThreadStateManager,
+    claim: crate::thread_state::RetentionRetirementClaim,
+    report: codex_core::ThreadRetirementReport,
+) -> bool {
+    if !manager.record_retirement_report(claim, report).await {
+        return false;
+    }
+    if !report.is_complete() {
+        warn!(thread_id = %claim.thread_id, ?report, "idle thread retirement remains incomplete");
+        return false;
+    }
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -522,7 +550,7 @@ pub(super) async fn handle_thread_listener_command(
     thread_state: &Arc<Mutex<ThreadState>>,
     thread_watch_manager: &ThreadWatchManager,
     outgoing: &Arc<OutgoingMessageSender>,
-    pending_thread_unloads: &Arc<Mutex<HashSet<ThreadId>>>,
+    pending_thread_unloads: &Arc<Mutex<crate::thread_state::recovery::PendingThreadUnloads>>,
     listener_command: ThreadListenerCommand,
 ) {
     match listener_command {
@@ -616,7 +644,7 @@ pub(super) async fn handle_pending_thread_resume_request(
     thread_state: &Arc<Mutex<ThreadState>>,
     thread_watch_manager: &ThreadWatchManager,
     outgoing: &Arc<OutgoingMessageSender>,
-    pending_thread_unloads: &Arc<Mutex<HashSet<ThreadId>>>,
+    pending_thread_unloads: &Arc<Mutex<crate::thread_state::recovery::PendingThreadUnloads>>,
     mut pending: crate::thread_state::PendingThreadResumeRequest,
 ) {
     let (active_turn_metadata, active_turn) = {
@@ -735,7 +763,7 @@ pub(super) async fn handle_pending_thread_resume_request(
 
     {
         let pending_thread_unloads = pending_thread_unloads.lock().await;
-        if pending_thread_unloads.contains(&conversation_id) {
+        if pending_thread_unloads.blocks(&conversation_id) || conversation.is_closing() {
             drop(pending_thread_unloads);
             outgoing
                 .send_error(

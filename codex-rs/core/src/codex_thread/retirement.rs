@@ -102,7 +102,7 @@ pub enum ThreadRetirementError {
 #[derive(Clone)]
 pub struct ThreadRetirement {
     deadline: Instant,
-    completion: Shared<BoxFuture<'static, ThreadRetirementReport>>,
+    pub(super) completion: Shared<BoxFuture<'static, ThreadRetirementReport>>,
     progress: tokio::sync::watch::Sender<ThreadRetirementReport>,
 }
 
@@ -135,10 +135,11 @@ impl CodexThread {
     /// Used for custody compaction, not to invent an ordinary classification
     /// or certify that legacy work ran under a newly supplied deadline.
     pub(crate) fn observed_terminal_cleanup(&self) -> Option<SessionLoopOutcome> {
-        if self.session.cleanup_owner().completed()
-            != Some(CleanupExecution::Finished {
-                persistence_failed: false,
-            })
+        if !self.session.cleanup_owner().reconciled()
+            && self.session.cleanup_owner().completed()
+                != Some(CleanupExecution::Finished {
+                    persistence_failed: false,
+                })
         {
             return None;
         }

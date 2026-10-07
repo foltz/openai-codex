@@ -85,7 +85,9 @@ use codex_rollout::state_db::StateDbHandle;
 
 static LIVE_THREADS: Gauge = Gauge::new("core.threads.live");
 
+mod recovery;
 mod retirement;
+pub use recovery::ThreadRecoveryOutcome;
 pub use retirement::ThreadCleanupOutcome;
 pub use retirement::ThreadLoopOutcome;
 pub use retirement::ThreadRetirement;

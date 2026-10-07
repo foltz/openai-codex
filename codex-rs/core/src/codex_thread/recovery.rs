@@ -36,7 +36,10 @@ impl CodexThread {
             && original.session_loop == ThreadLoopOutcome::Normal
             && self.io.tx_sub.is_closed()
             && self.session.task_admission_closed.load(Ordering::Acquire)
-            && self.session.cleanup_owner().recovery_ready()
+            // Complete original cleanup already proves every owner joined,
+            // including a historically panicked task. The stricter non-panicked
+            // component proof remains mandatory for incomplete handoff/retry.
+            && (original.is_complete() || self.session.cleanup_owner().recovery_ready())
             && self
                 .session
                 .services

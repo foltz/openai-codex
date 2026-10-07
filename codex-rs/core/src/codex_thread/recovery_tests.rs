@@ -144,3 +144,58 @@ async fn recovery_population_retains_handoff_until_separate_positive_mcp_proof()
     assert!(report.is_complete(), "{report:?}");
     drop((current, next));
 }
+
+#[tokio::test]
+async fn recovery_complete_cleanup_accepts_historical_task_panic_but_incomplete_does_not() {
+    let thread = exact_thread_fixture(ThreadLoopFixture::Ordinary).await;
+    let task = thread.session.task_joins.register(tokio::spawn(async {
+        panic!("historical task panic, actual registered join");
+    }));
+    assert!(!task.wait().await);
+    let ticket = thread
+        .begin_retirement(Instant::now() + Duration::from_secs(20))
+        .unwrap();
+    let complete = ticket.wait().await;
+    assert!(complete.is_complete(), "{complete:?}");
+    assert!(
+        !thread.session.cleanup_owner().recovery_ready(),
+        "the panic bit must remain recorded"
+    );
+    assert!(
+        thread.retirement_is_quiescent(),
+        "original complete proof is sufficient"
+    );
+    assert_eq!(
+        thread.reconcile_retirement_until(Instant::now()).await,
+        ThreadRecoveryOutcome::Quiescent
+    );
+    assert!(
+        !thread.retirement_reconciled(),
+        "no separate receipt is synthesized for original success"
+    );
+    assert_eq!(ticket.wait().await, complete);
+
+    let mut incomplete = complete;
+    incomplete.cleanup = ThreadCleanupOutcome::McpFailed;
+    let failed = futures::future::ready(incomplete).boxed().shared();
+    failed.clone().await;
+    thread
+        .retirement
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .completion = failed;
+    crate::session::retirement::recovery_tests::inject_completed_mcp_failure(
+        &thread.session.cleanup_owner(),
+    );
+    assert!(
+        !thread.retirement_is_quiescent(),
+        "incomplete cleanup still requires non-panicked task proof"
+    );
+    assert_eq!(
+        thread.reconcile_retirement_until(Instant::now()).await,
+        ThreadRecoveryOutcome::Ineligible
+    );
+    assert!(!thread.retirement_reconciled());
+}

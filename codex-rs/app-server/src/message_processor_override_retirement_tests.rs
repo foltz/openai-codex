@@ -10,6 +10,31 @@ use codex_app_server_protocol::ThreadRetentionAcquireResponse;
 use codex_protocol::ThreadId;
 use pretty_assertions::assert_eq;
 
+#[derive(Default)]
+struct HistoricalPanicFixture {
+    armed: std::sync::atomic::AtomicBool,
+    observed: tokio::sync::Notify,
+}
+impl codex_extension_api::TurnLifecycleContributor for HistoricalPanicFixture {
+    fn on_turn_stop<'a>(
+        &'a self,
+        _input: codex_extension_api::TurnStopInput<'a>,
+    ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+        Box::pin(async move {
+            if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                self.observed.notify_one();
+                panic!("injected historical turn task panic");
+            }
+        })
+    }
+}
+struct TestContributorGuard(Option<Arc<dyn codex_extension_api::TurnLifecycleContributor>>);
+impl Drop for TestContributorGuard {
+    fn drop(&mut self) {
+        crate::extensions::replace_test_turn_contributor(self.0.take());
+    }
+}
+
 struct TerminationFailureFixture {
     url: String,
     failures: Arc<std::sync::atomic::AtomicUsize>,
@@ -104,8 +129,15 @@ impl TerminationFailureFixture {
     }
 }
 
-async fn cached_override(closed_mcp: bool) -> Result<()> {
+async fn cached_override(closed_mcp: bool, panic_history: bool) -> Result<()> {
+    let panic_fixture = panic_history.then(|| Arc::new(HistoricalPanicFixture::default()));
+    let fixture_scope = TestContributorGuard(crate::extensions::replace_test_turn_contributor(
+        panic_fixture.as_ref().map(|fixture| {
+            Arc::clone(fixture) as Arc<dyn codex_extension_api::TurnLifecycleContributor>
+        }),
+    ));
     let mut harness = TracingHarness::new_for_recovery().await?;
+    drop(fixture_scope);
     let executor = if closed_mcp {
         Some(TerminationFailureFixture::start().await?)
     } else {
@@ -163,6 +195,34 @@ async fn cached_override(closed_mcp: bool) -> Result<()> {
         "cached override predecessor",
     )
     .await;
+    if let Some(fixture) = &panic_fixture {
+        fixture
+            .armed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let params = serde_json::from_value(serde_json::json!({
+            "threadId": started.thread.id,
+            "input": [{"type": "text", "text": "turn whose registered task will panic"}],
+        }))?;
+        let _: TurnStartResponse = harness
+            .request(
+                ClientRequest::TurnStart {
+                    request_id: RequestId::Integer(30),
+                    params,
+                },
+                None,
+            )
+            .await;
+        tokio::time::timeout(Duration::from_secs(20), fixture.observed.notified()).await?;
+        // A later normal turn reaps the actual panicked join and restores idle
+        // status. No fabricated cleanup or task outcome is injected.
+        completed_turn(
+            &mut harness,
+            &started.thread.id,
+            31,
+            "normal turn after historical panic",
+        )
+        .await;
+    }
     let old = harness
         .processor
         .thread_manager
@@ -293,13 +353,13 @@ async fn cached_override(closed_mcp: bool) -> Result<()> {
 #[test]
 #[serial(app_server_tracing)]
 fn recovery_cached_override_claims_before_shutdown_and_persists_first_turn() -> Result<()> {
-    run_current_thread_test_with_stack("cached override custody", cached_override(false))
+    run_current_thread_test_with_stack("cached override custody", cached_override(false, false))
 }
 
 #[test]
 #[serial(app_server_tracing)]
 fn recovery_cached_override_survives_failed_mcp_termination_receipt() -> Result<()> {
-    run_current_thread_test_with_stack("cached override MCP close", cached_override(true))
+    run_current_thread_test_with_stack("cached override MCP close", cached_override(true, false))
 }
 
 #[test]
@@ -604,4 +664,13 @@ fn recovery_cached_override_cancelled_after_claim_can_observe_original_and_resum
         harness.shutdown().await;
         Ok(())
     })
+}
+
+#[test]
+#[serial(app_server_tracing)]
+fn recovery_cached_override_complete_cleanup_with_historical_task_panic() -> Result<()> {
+    run_current_thread_test_with_stack(
+        "historical panic complete override",
+        cached_override(false, true),
+    )
 }

@@ -1516,11 +1516,14 @@ impl ModelClientSession {
                         handle_unauthorized(
                             unauthorized_transport,
                             &mut auth_recovery,
+                            client_setup.auth.as_ref(),
                             &mut provider_auth_recovery_attempted,
                             session_telemetry,
                             &provider,
-                            self.client.event_sender.as_ref(),
-                            responses_metadata.turn_id.as_deref(),
+                            (
+                                self.client.event_sender.as_ref(),
+                                responses_metadata.turn_id.as_deref(),
+                            ),
                         )
                         .await?,
                     );
@@ -1792,11 +1795,14 @@ impl ModelClientSession {
                         handle_unauthorized(
                             unauthorized_transport,
                             &mut auth_recovery,
+                            client_setup.auth.as_ref(),
                             &mut provider_auth_recovery_attempted,
                             session_telemetry,
                             &self.client.state.provider,
-                            self.client.event_sender.as_ref(),
-                            responses_metadata.turn_id.as_deref(),
+                            (
+                                self.client.event_sender.as_ref(),
+                                responses_metadata.turn_id.as_deref(),
+                            ),
                         )
                         .await?,
                     );
@@ -1930,11 +1936,14 @@ impl ModelClientSession {
                         handle_unauthorized(
                             unauthorized_transport,
                             &mut auth_recovery,
+                            client_setup.auth.as_ref(),
                             &mut provider_auth_recovery_attempted,
                             session_telemetry,
                             &provider,
-                            self.client.event_sender.as_ref(),
-                            responses_metadata.turn_id.as_deref(),
+                            (
+                                self.client.event_sender.as_ref(),
+                                responses_metadata.turn_id.as_deref(),
+                            ),
                         )
                         .await?,
                     );
@@ -2621,13 +2630,17 @@ fn emit_auth_recovery_event(
 async fn handle_unauthorized(
     transport: TransportError,
     auth_recovery: &mut Option<UnauthorizedRecovery>,
+    failed_auth: Option<&CodexAuth>,
     provider_auth_recovery_attempted: &mut bool,
     session_telemetry: &SessionTelemetry,
     provider: &SharedModelProvider,
-    event_sender: Option<&Sender<ProtocolEvent>>,
-    turn_id: Option<&str>,
+    event_context: (Option<&Sender<ProtocolEvent>>, Option<&str>),
 ) -> Result<UnauthorizedRecoveryExecution> {
+    let (event_sender, turn_id) = event_context;
     let debug = extract_response_debug_context(&transport);
+    if let Some(recovery) = auth_recovery.as_mut() {
+        recovery.record_failed_auth(failed_auth);
+    }
     if !*provider_auth_recovery_attempted {
         *provider_auth_recovery_attempted = true;
         let messages = provider.auth_recovery_messages();

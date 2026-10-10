@@ -160,6 +160,7 @@ pub use crate::transport::AppServerTransport;
 pub use crate::transport::RemoteControlStartupMode;
 pub use crate::transport::app_server_control_socket_path;
 pub use crate::transport::take_remote_control_disabled_env;
+pub use codex_app_server_transport::PeerExecutableIdentity;
 
 const LOG_FORMAT_ENV_VAR: &str = "LOG_FORMAT";
 const OTEL_SERVICE_NAME: &str = "codex-app-server";
@@ -1326,6 +1327,7 @@ pub async fn run_main_with_transport_options(
                                                     connection_state
                                                         .session
                                                         .retention_principal(),
+                                                    connection_state.session.auth_observation_only(),
                                                 )
                                                 .await;
                                             connection_state

@@ -2584,6 +2584,7 @@ mod tests {
         let account_read = ClientRequest::GetAccount {
             request_id: request_id(),
             params: v2::GetAccountParams {
+                cache_only: false,
                 refresh_token: false,
             },
         };
@@ -3634,6 +3635,7 @@ mod tests {
         let request = ClientRequest::GetAccount {
             request_id: RequestId::Integer(6),
             params: v2::GetAccountParams {
+                cache_only: false,
                 refresh_token: false,
             },
         };
@@ -3648,6 +3650,7 @@ mod tests {
         let request = ClientRequest::GetAccount {
             request_id: RequestId::Integer(7),
             params: v2::GetAccountParams {
+                cache_only: false,
                 refresh_token: true,
             },
         };

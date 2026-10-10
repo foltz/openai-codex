@@ -786,6 +786,15 @@ async fn connect_unix_socket_endpoint(
                 "failed to connect to remote app server at `{endpoint}`: {err}"
             ))
         })?;
+    if let Some(policy) = std::env::var_os("CODEX_UNIX_PEER_POLICY") {
+        if policy != "same-image" {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                "unsupported Unix peer policy",
+            ));
+        }
+        codex_app_server::PeerExecutableIdentity::verify_same_image_peer(&stream)?;
+    }
     match peer_policy {
         SocketPeerPolicy::ExplicitEndpoint => {}
         #[cfg(windows)]

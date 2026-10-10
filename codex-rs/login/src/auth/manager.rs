@@ -703,7 +703,7 @@ impl CodexAuth {
     }
 
     /// Returns `None` if token-backed ChatGPT auth is unavailable.
-    fn get_current_auth_json(&self) -> Option<AuthDotJson> {
+    pub(super) fn get_current_auth_json(&self) -> Option<AuthDotJson> {
         let state = match self {
             Self::Chatgpt(auth) => &auth.state,
             Self::ChatgptAuthTokens(auth) => &auth.state,
@@ -1999,10 +1999,25 @@ enum UnauthorizedRecoveryMode {
 // For external auth sources, UnauthorizedRecovery retries once by asking the
 // configured provider to refresh and caching the returned auth through the same
 // path used by other auth sources.
+/// Request-local credential identity. Never log or expose it through status APIs.
+#[derive(Clone)]
+pub struct AuthCredentialFingerprint(String);
+
+impl AuthCredentialFingerprint {
+    pub fn from_bearer_header(value: &str) -> Option<Self> {
+        use sha2::Digest;
+        value
+            .strip_prefix("Bearer ")
+            .filter(|token| !token.is_empty())
+            .map(|token| Self(format!("{:x}", sha2::Sha256::digest(token.as_bytes()))))
+    }
+}
+
 pub struct UnauthorizedRecovery {
     manager: Arc<AuthManager>,
     step: UnauthorizedRecoveryStep,
     expected_account_id: Option<String>,
+    expected_credential_fingerprint: Option<String>,
     mode: UnauthorizedRecoveryMode,
 }
 
@@ -2030,11 +2045,39 @@ impl UnauthorizedRecovery {
             UnauthorizedRecoveryMode::Managed => UnauthorizedRecoveryStep::Reload,
             UnauthorizedRecoveryMode::External => UnauthorizedRecoveryStep::ExternalRefresh,
         };
+        let expected_credential_fingerprint = cached_auth
+            .and_then(|auth| auth.get_token_data().ok())
+            .map(|tokens| {
+                use sha2::Digest;
+                format!("{:x}", sha2::Sha256::digest(tokens.access_token.as_bytes()))
+            });
         Self {
             manager,
             step,
             expected_account_id,
+            expected_credential_fingerprint,
             mode,
+        }
+    }
+
+    /// Bind command-source recovery to the credential actually rejected by the
+    /// request, rather than a cache that may have renewed after it was prepared.
+    /// Ordinary auth recovery keeps its existing account/mode behaviour.
+    pub fn record_failed_auth(&mut self, auth: Option<&CodexAuth>) {
+        if self.manager.command_source.is_some() {
+            self.expected_credential_fingerprint = auth
+                .and_then(|auth| auth.get_token_data().ok())
+                .map(|tokens| {
+                    use sha2::Digest;
+                    format!("{:x}", sha2::Sha256::digest(tokens.access_token.as_bytes()))
+                });
+        }
+    }
+
+    /// Record the frozen API auth header when a caller does not retain CodexAuth.
+    pub fn record_failed_credential(&mut self, value: Option<AuthCredentialFingerprint>) {
+        if self.manager.command_source.is_some() {
+            self.expected_credential_fingerprint = value.map(|value| value.0);
         }
     }
 
@@ -2157,7 +2200,16 @@ impl UnauthorizedRecovery {
                 });
             }
             UnauthorizedRecoveryStep::ExternalRefresh => {
-                self.manager.refresh_token_from_authority().await?;
+                if let Some(source) = &self.manager.command_source {
+                    let auth = source
+                        .obtain(self.expected_credential_fingerprint.clone())
+                        .await
+                        .map_err(RefreshTokenError::Transient)?;
+                    self.manager.validate_external_auth(&auth, source)?;
+                    self.manager.commit_external_auth(auth)?;
+                } else {
+                    self.manager.refresh_token_from_authority().await?;
+                }
                 self.step = UnauthorizedRecoveryStep::Done;
                 return Ok(UnauthorizedRecoveryStepResult {
                     auth_state_changed: Some(true),
@@ -2200,6 +2252,7 @@ pub struct AuthManager {
     agent_identity_bootstrap_cooldown: Mutex<AgentIdentityBootstrapCooldown>,
     external_auth: RwLock<Option<Arc<dyn ExternalAuth>>>,
     workload_identity_selected: bool,
+    command_source: Option<Arc<super::command_source::CommandSource>>,
     auth_route_config: AuthRouteConfig,
 }
 
@@ -2361,6 +2414,7 @@ impl AuthManager {
             agent_identity_bootstrap_cooldown: Mutex::default(),
             external_auth: RwLock::new(None),
             workload_identity_selected: false,
+            command_source: None,
             auth_route_config,
         }
     }
@@ -2400,6 +2454,7 @@ impl AuthManager {
             agent_identity_bootstrap_cooldown: Mutex::default(),
             external_auth: RwLock::new(None),
             workload_identity_selected: false,
+            command_source: None,
             auth_route_config: crate::test_support::transport_default_auth_route_config(),
         })
     }
@@ -2433,6 +2488,7 @@ impl AuthManager {
             agent_identity_bootstrap_cooldown: Mutex::default(),
             external_auth: RwLock::new(None),
             workload_identity_selected: false,
+            command_source: None,
             auth_route_config: crate::test_support::transport_default_auth_route_config(),
         })
     }
@@ -2474,6 +2530,7 @@ impl AuthManager {
             agent_identity_bootstrap_cooldown: Mutex::default(),
             external_auth: RwLock::new(None),
             workload_identity_selected: false,
+            command_source: None,
             auth_route_config: crate::test_support::transport_default_auth_route_config(),
         })
     }
@@ -2505,6 +2562,7 @@ impl AuthManager {
             agent_identity_bootstrap_cooldown: Mutex::default(),
             external_auth: RwLock::new(Some(Arc::new(BearerTokenRefresher::new(config)))),
             workload_identity_selected: false,
+            command_source: None,
             // External bearer auth refreshes by running the provider's command and never makes
             // auth-owned HTTP requests, so this route is intentionally inert.
             auth_route_config: AuthRouteConfig::from_http_client_factory(HttpClientFactory::new(
@@ -2607,7 +2665,21 @@ impl AuthManager {
     pub async fn auth(&self) -> Option<CodexAuth> {
         if self.has_external_auth() {
             self.reload().await;
-            return self.auth_cached();
+            let auth = self.auth_cached();
+            if self.command_source.as_ref().is_some_and(|source| {
+                !source.usable_auth(auth.as_ref())
+                    || auth.as_ref().is_none_or(|auth| {
+                        validate_auth_restrictions(
+                            Some(&self.allowed_login_methods()),
+                            self.effective_chatgpt_workspaces().as_deref(),
+                            auth,
+                        )
+                        .is_err()
+                    })
+            }) {
+                return None;
+            }
+            return auth;
         }
 
         let auth = self.auth_cached()?;
@@ -2623,7 +2695,10 @@ impl AuthManager {
     /// Refreshes auth, then captures credentials and their account-bound factory together.
     /// The auth read lock prevents an identity change between the two snapshots.
     pub async fn auth_with_http_client_factory(&self) -> Option<(CodexAuth, HttpClientFactory)> {
-        self.auth().await;
+        let resolved = self.auth().await;
+        if self.command_source.is_some() && resolved.is_none() {
+            return None;
+        }
         let cached = self.inner.read().ok()?;
         Some((cached.auth.clone()?, self.http_client_factory()))
     }
@@ -2840,7 +2915,34 @@ impl AuthManager {
         })
     }
 
-    fn set_cached_auth(&self, new_auth: Option<CodexAuth>) -> bool {
+    pub(super) fn set_cached_auth(&self, new_auth: Option<CodexAuth>) -> bool {
+        // Hold the source revision stable through cache installation, so a delayed
+        // resolve/reload cannot overwrite an auth from a newer publication.
+        let source_guard = self
+            .command_source
+            .as_ref()
+            .map(|source| source.state.lock());
+        if let Some(result) = &source_guard {
+            let Ok(state) = result else { return false };
+            if !self
+                .command_source
+                .as_ref()
+                .is_some_and(|source| source.accepts(new_auth.as_ref(), state))
+            {
+                return false;
+            }
+        }
+        let _disk_guard = if let Some(Ok(state)) = &source_guard {
+            let Some(expected) = state.as_ref() else {
+                return false;
+            };
+            match super::command_store::locked_current(&self.codex_home, expected) {
+                Ok(guard) => Some(guard),
+                Err(_) => return false,
+            }
+        } else {
+            None
+        };
         if let Ok(mut guard) = self.inner.write() {
             let previous = guard.auth.as_ref();
             let changed = !AuthManager::auths_equal(previous, new_auth.as_ref());
@@ -3412,7 +3514,7 @@ impl AuthManager {
         &self,
         external_auth: Arc<dyn ExternalAuth>,
     ) -> Result<(), RefreshTokenError> {
-        if self.workload_identity_selected {
+        if self.is_host_owned_auth() {
             return Err(permanent_external_auth_error(
                 "workload identity auth cannot be replaced at runtime",
             ));
@@ -3437,7 +3539,7 @@ impl AuthManager {
     }
 
     pub fn clear_external_auth(&self) {
-        if self.workload_identity_selected {
+        if self.is_host_owned_auth() {
             return;
         }
         if let Ok(mut external_auth) = self.external_auth.write()
@@ -3489,6 +3591,44 @@ impl AuthManager {
 
     pub fn is_workload_identity_selected(&self) -> bool {
         self.workload_identity_selected
+    }
+
+    /// Selection is authoritative even when the current credential cache is empty.
+    pub fn is_host_owned_auth(&self) -> bool {
+        self.workload_identity_selected || self.command_source.is_some()
+    }
+
+    pub fn is_command_auth_selected(&self) -> bool {
+        self.command_source.is_some()
+    }
+
+    /// Token-free cache observation; this never resolves or refreshes credentials.
+    pub fn auth_observation(&self) -> serde_json::Value {
+        let auth = self.auth_cached();
+        let mut provider = self
+            .command_source
+            .as_ref()
+            .map(|source| source.receipt(auth.as_ref()));
+        if let Some(receipt) = provider.as_mut()
+            && auth.as_ref().is_none_or(|auth| {
+                validate_auth_restrictions(
+                    Some(&self.allowed_login_methods()),
+                    self.effective_chatgpt_workspaces().as_deref(),
+                    auth,
+                )
+                .is_err()
+            })
+        {
+            receipt["coherent"] = serde_json::Value::Bool(false);
+        }
+        serde_json::json!({
+            "version": 1,
+            "mode": auth.as_ref().map(CodexAuth::api_auth_mode),
+            "accountId": auth.as_ref().and_then(CodexAuth::get_account_id),
+            "principal": auth.as_ref().and_then(CodexAuth::get_chatgpt_user_id),
+            "provider": provider,
+            "stateKnown": self.inner.read().map(|state| !state.initial_load_failed).unwrap_or(false),
+        })
     }
 
     pub fn is_external_chatgpt_auth_active(&self) -> bool {
@@ -3546,10 +3686,33 @@ impl AuthManager {
         auth_config: AuthConfig,
         enable_codex_api_key_env: bool,
     ) -> Result<Arc<Self>, AuthManagerInitializationError> {
+        let command_source =
+            super::command_source::CommandSource::selected(&auth_config).map_err(|error| {
+                AuthManagerInitializationError::from(RefreshTokenError::Transient(error))
+            })?;
         let external_auth = WorkloadIdentityExternalAuth::from_process_config(&auth_config)?;
+        if command_source.is_some() && external_auth.is_some() {
+            return Err(RefreshTokenError::Transient(std::io::Error::other(
+                "conflicting external auth sources",
+            ))
+            .into());
+        }
         let mut manager = Self::new_from_auth_config(auth_config, enable_codex_api_key_env).await;
         manager.workload_identity_selected = external_auth.is_some();
+        manager.command_source = command_source.clone();
         let manager = Arc::new(manager);
+        if let Some(source) = command_source {
+            manager
+                .install_external_auth(Arc::new(source.clone()))
+                .await?;
+            let mut managers = source.managers.lock().map_err(|_| {
+                RefreshTokenError::Transient(std::io::Error::other(
+                    "command manager registry unavailable",
+                ))
+            })?;
+            managers.retain(|manager| manager.strong_count() > 0);
+            managers.push(Arc::downgrade(&manager));
+        }
         if let Some(external_auth) = external_auth {
             manager
                 .install_external_auth(Arc::new(external_auth))
@@ -3725,7 +3888,7 @@ impl AuthManager {
     }
 
     fn ensure_logout_allowed(&self) -> std::io::Result<()> {
-        if self.workload_identity_selected {
+        if self.is_host_owned_auth() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "workload identity auth is managed by the host and cannot be logged out",
@@ -3801,7 +3964,7 @@ impl AuthManager {
     }
 
     fn commit_external_auth(&self, auth: CodexAuth) -> Result<(), RefreshTokenError> {
-        if auth.is_external_chatgpt_tokens() {
+        if auth.is_external_chatgpt_tokens() && self.command_source.is_none() {
             let auth_dot_json = auth.get_current_auth_json().ok_or_else(|| {
                 RefreshTokenError::Transient(std::io::Error::other(
                     "external ChatGPT auth tokens are missing auth state",
@@ -3818,6 +3981,15 @@ impl AuthManager {
         }
 
         self.set_cached_auth(Some(auth));
+        if self
+            .command_source
+            .as_ref()
+            .is_some_and(|source| !source.usable_auth(self.auth_cached().as_ref()))
+        {
+            return Err(RefreshTokenError::Transient(std::io::Error::other(
+                "external auth cache adoption incomplete",
+            )));
+        }
         Ok(())
     }
 

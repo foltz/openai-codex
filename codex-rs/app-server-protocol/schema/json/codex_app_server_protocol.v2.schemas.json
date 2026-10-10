@@ -1360,6 +1360,55 @@
         }
       ]
     },
+    "AuthObservation": {
+      "properties": {
+        "accountId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mode": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AuthMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "principal": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ExternalAuthReceipt"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stateKnown": {
+          "type": "boolean"
+        },
+        "version": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "stateKnown",
+        "version"
+      ],
+      "type": "object"
+    },
     "AuthRecoveryNotification": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
@@ -7568,6 +7617,36 @@
       ],
       "type": "string"
     },
+    "ExternalAuthReceipt": {
+      "properties": {
+        "coherent": {
+          "type": "boolean"
+        },
+        "expiresAt": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "generation": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "protectionMode": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "coherent",
+        "expiresAt",
+        "generation",
+        "protectionMode",
+        "source"
+      ],
+      "type": "object"
+    },
     "FeedbackRequirements": {
       "properties": {
         "enabled": {
@@ -8653,6 +8732,10 @@
     "GetAccountParams": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
+        "cacheOnly": {
+          "description": "Observe cached auth only, without issuer, provider or routing discovery.",
+          "type": "boolean"
+        },
         "refreshToken": {
           "description": "When `true`, requests a proactive token refresh before returning.\n\nIn managed auth mode this triggers the normal refresh-token flow. In external auth mode this flag is ignored. Clients should refresh tokens themselves and call `account/login/start` with `chatgptAuthTokens`.",
           "type": "boolean"
@@ -8742,6 +8825,17 @@
               "type": "null"
             }
           ]
+        },
+        "authObservation": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AuthObservation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Present only for the explicit cache-only read."
         },
         "requiresOpenaiAuth": {
           "type": "boolean"

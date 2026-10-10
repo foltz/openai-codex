@@ -217,6 +217,7 @@ impl TracingHarness {
                 harness.session.request_attestation(),
                 harness.session.trusted_interactive(),
                 harness.session.retention_principal(),
+                harness.session.auth_observation_only(),
             )
             .await;
 

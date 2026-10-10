@@ -10,4 +10,8 @@ export type GetAccountParams = {
  * external auth mode this flag is ignored. Clients should refresh tokens
  * themselves and call `account/login/start` with `chatgptAuthTokens`.
  */
-refreshToken?: boolean, };
+refreshToken?: boolean,
+/**
+ * Observe cached auth only, without issuer, provider or routing discovery.
+ */
+cacheOnly?: boolean, };

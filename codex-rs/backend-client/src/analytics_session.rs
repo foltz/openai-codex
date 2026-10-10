@@ -108,6 +108,7 @@ impl AnalyticsSession {
         F: std::future::Future<Output = Result<T, RequestError>>,
     {
         let mut recovery = self.auth_manager.unauthorized_recovery();
+        recovery.record_failed_auth(Some(&self.auth));
         loop {
             self.ensure_identity()
                 .await

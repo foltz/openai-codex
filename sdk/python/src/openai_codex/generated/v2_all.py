@@ -1427,6 +1427,17 @@ class ExternalAgentImportedConnectorSource(RootModel[Literal["remoteMcpServersCo
     root: Literal["remoteMcpServersConfig"]
 
 
+class ExternalAuthReceipt(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    coherent: bool
+    expires_at: Annotated[int, Field(alias="expiresAt")]
+    generation: Annotated[int, Field(ge=0)]
+    protection_mode: Annotated[str, Field(alias="protectionMode")]
+    source: str
+
+
 class FeedbackRequirements(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -1857,6 +1868,13 @@ class GetAccountParams(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
+    cache_only: Annotated[
+        bool | None,
+        Field(
+            alias="cacheOnly",
+            description="Observe cached auth only, without issuer, provider or routing discovery.",
+        ),
+    ] = None
     refresh_token: Annotated[
         bool | None,
         Field(
@@ -6883,6 +6901,18 @@ class AppsReadResponse(BaseModel):
     missing_app_ids: Annotated[list[str], Field(alias="missingAppIds")]
 
 
+class AuthObservation(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    account_id: Annotated[str | None, Field(alias="accountId")] = None
+    mode: AuthMode | None = None
+    principal: str | None = None
+    provider: ExternalAuthReceipt | None = None
+    state_known: Annotated[bool, Field(alias="stateKnown")]
+    version: Annotated[int, Field(ge=0)]
+
+
 class BrowserUseConfig(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -8374,6 +8404,12 @@ class GetAccountResponse(BaseModel):
         populate_by_name=True,
     )
     account: Account | None = None
+    auth_observation: Annotated[
+        AuthObservation | None,
+        Field(
+            alias="authObservation", description="Present only for the explicit cache-only read."
+        ),
+    ] = None
     requires_openai_auth: Annotated[bool, Field(alias="requiresOpenaiAuth")]
 
 

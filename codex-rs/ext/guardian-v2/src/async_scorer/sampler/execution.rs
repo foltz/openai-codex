@@ -173,6 +173,9 @@ impl SamplingExecution {
                 }
             };
             ensure_account_owner()?;
+            if let Some(recovery) = auth_recovery.as_mut() {
+                recovery.record_failed_credential(lease.credential_fingerprint.clone());
+            }
             self.request.service_tier = if lease.request_kind == RequestMode::GuardianClassifier {
                 None
             } else {

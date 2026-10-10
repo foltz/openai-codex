@@ -1561,6 +1561,10 @@
     },
     "GetAccountParams": {
       "properties": {
+        "cacheOnly": {
+          "description": "Observe cached auth only, without issuer, provider or routing discovery.",
+          "type": "boolean"
+        },
         "refreshToken": {
           "description": "When `true`, requests a proactive token refresh before returning.\n\nIn managed auth mode this triggers the normal refresh-token flow. In external auth mode this flag is ignored. Clients should refresh tokens themselves and call `account/login/start` with `chatgptAuthTokens`.",
           "type": "boolean"

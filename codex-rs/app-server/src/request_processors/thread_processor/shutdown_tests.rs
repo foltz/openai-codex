@@ -235,3 +235,45 @@ async fn processor_thread_ready_failed_cleanup_keeps_independent_custody() {
     assert!(weak_manager.upgrade().is_none());
     assert!(weak_thread.upgrade().is_none());
 }
+
+#[tokio::test]
+async fn recovery_census_requires_positive_proof_for_the_exact_retired_generation() {
+    let (_home, manager, _) = fixture().await;
+    let manager_report = manager
+        .begin_shutdown(Instant::now() + Duration::from_secs(20))
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    let id = ThreadId::new();
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    let failed = ThreadRetirementReport {
+        ordinary: ThreadShutdownOutcome::Complete,
+        session_loop: ThreadLoopOutcome::Normal,
+        cleanup: ThreadCleanupOutcome::McpFailed,
+    };
+    let mut census = ProcessorThreadShutdown {
+        manager: Some(Ok(manager_report)),
+        prior: Some(vec![(id, first, failed), (id, second, failed)]),
+        ..Default::default()
+    };
+    assert!(
+        !census.is_complete(),
+        "handoff alone proves no physical completion"
+    );
+    census.reconciled_prior.insert((id, first));
+    assert!(
+        !census.is_complete(),
+        "one generation cannot acknowledge another"
+    );
+    census.reconciled_prior.insert((id, second));
+    assert!(census.is_complete());
+    assert_eq!(
+        census.prior.as_ref().unwrap()[0].2,
+        failed,
+        "history is immutable"
+    );
+    census.prior.as_mut().unwrap()[1].2.session_loop = ThreadLoopOutcome::Panicked;
+    assert!(!census.is_complete());
+}

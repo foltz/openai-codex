@@ -47,6 +47,7 @@ export type { AskForApproval } from "./AskForApproval";
 export type { AsyncUserInputQuestion } from "./AsyncUserInputQuestion";
 export type { AttestationGenerateParams } from "./AttestationGenerateParams";
 export type { AttestationGenerateResponse } from "./AttestationGenerateResponse";
+export type { AuthObservation } from "./AuthObservation";
 export type { AuthRecoveryNotification } from "./AuthRecoveryNotification";
 export type { AutoReviewDecisionSource } from "./AutoReviewDecisionSource";
 export type { AutoReviewRequirements } from "./AutoReviewRequirements";
@@ -160,6 +161,7 @@ export type { ExternalAgentDetectedConnectorCandidate } from "./ExternalAgentDet
 export type { ExternalAgentDetectedConnectorSource } from "./ExternalAgentDetectedConnectorSource";
 export type { ExternalAgentImportedConnectorCandidate } from "./ExternalAgentImportedConnectorCandidate";
 export type { ExternalAgentImportedConnectorSource } from "./ExternalAgentImportedConnectorSource";
+export type { ExternalAuthReceipt } from "./ExternalAuthReceipt";
 export type { FeedbackRequirements } from "./FeedbackRequirements";
 export type { FeedbackUploadParams } from "./FeedbackUploadParams";
 export type { FeedbackUploadResponse } from "./FeedbackUploadResponse";

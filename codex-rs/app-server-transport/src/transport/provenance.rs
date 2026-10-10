@@ -42,6 +42,20 @@ impl PeerExecutableIdentity {
         platform::running_process_identity()
     }
 
+    /// Verify the connected Unix peer is the same exact running code image.
+    /// This is an explicit client opt-in; a prior probe does not authorize a
+    /// later socket. Reconnect callers must invoke it on each new connection.
+    pub fn verify_same_image_peer(stream: &UnixStream) -> io::Result<()> {
+        let running = Self::capture_running_process()?;
+        if Self::from_unix_stream(stream)? != Some(running) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Unix peer code identity differs",
+            ));
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub fn current_process() -> io::Result<Self> {
         Self::capture_running_process()

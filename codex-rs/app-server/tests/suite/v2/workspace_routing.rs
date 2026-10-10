@@ -62,6 +62,7 @@ async fn start(home: &TempDir) -> Result<TestAppServer> {
 async fn read(server: &mut TestAppServer) -> Result<Value> {
     let request = server
         .send_get_account_request(GetAccountParams {
+            cache_only: false,
             refresh_token: false,
         })
         .await?;
@@ -220,6 +221,7 @@ async fn stable_clients_do_not_treat_failed_workspace_discovery_as_unrestricted(
     .await??;
     let request = server
         .send_get_account_request(GetAccountParams {
+            cache_only: false,
             refresh_token: false,
         })
         .await?;
@@ -312,7 +314,8 @@ async fn unavailable_or_malformed_discovery_never_returns_unrestricted_success()
         config(&home, &backend).await?;
         write_chatgpt_auth(home.path(), ChatGptAuthFixture::new("token").account_id("selected"), AuthCredentialsStoreMode::File)?;
         let mut server = start(&home).await?;
-        let request = server.send_get_account_request(GetAccountParams { refresh_token: false }).await?;
+        let request = server.send_get_account_request(GetAccountParams { cache_only: false,
+                refresh_token: false }).await?;
         let error = timeout(READ_TIMEOUT, server.read_stream_until_error_message(RequestId::Integer(request))).await??;
         assert!(error.error.message.contains("routing"), "{error:?}");
         backend.reset().await;
@@ -424,6 +427,7 @@ async fn failed_workspace_requirements_do_not_fall_back_to_startup_config() -> R
     assert_eq!(notification.params.unwrap()["success"], false);
     let request = server
         .send_get_account_request(GetAccountParams {
+            cache_only: false,
             refresh_token: false,
         })
         .await?;

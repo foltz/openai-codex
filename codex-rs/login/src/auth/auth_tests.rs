@@ -1261,6 +1261,7 @@ async fn unauthorized_recovery_reports_mode_and_step_names() {
     )
     .await;
     let managed = UnauthorizedRecovery {
+        expected_credential_fingerprint: None,
         manager: Arc::clone(&manager),
         step: UnauthorizedRecoveryStep::Reload,
         expected_account_id: None,
@@ -1270,6 +1271,7 @@ async fn unauthorized_recovery_reports_mode_and_step_names() {
     assert_eq!(managed.step_name(), "reload");
 
     let external = UnauthorizedRecovery {
+        expected_credential_fingerprint: None,
         manager,
         step: UnauthorizedRecoveryStep::ExternalRefresh,
         expected_account_id: None,

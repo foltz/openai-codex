@@ -254,8 +254,10 @@ where
         let mut attempt = 1;
         let mut last_status_code: Option<u16> = None;
         let mut auth_recovery = self.auth_manager.unauthorized_recovery();
+        auth_recovery.record_failed_auth(Some(&auth));
 
         while attempt <= CLOUD_CONFIG_BUNDLE_MAX_ATTEMPTS {
+            auth_recovery.record_failed_auth(Some(&auth));
             match self.client.get_bundle(&auth).await {
                 Ok(bundle) => {
                     return self

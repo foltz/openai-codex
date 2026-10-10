@@ -148,6 +148,18 @@ impl TracingHarness {
     }
 
     async fn with_telemetry(codex_home: TempDir, telemetry: TestTelemetry) -> Result<Self> {
+        Self::with_retention_authority(codex_home, telemetry, false).await
+    }
+
+    async fn new_for_recovery() -> Result<Self> {
+        Self::with_retention_authority(TempDir::new()?, TestTelemetry::Unavailable, true).await
+    }
+
+    async fn with_retention_authority(
+        codex_home: TempDir,
+        telemetry: TestTelemetry,
+        retention_enabled: bool,
+    ) -> Result<Self> {
         let server = create_mock_responses_server_repeating_assistant("Done").await;
         let mut config = build_test_config(codex_home.path(), &server.uri()).await?;
         config.chatgpt_base_url = format!("{}/backend-api", server.uri());
@@ -167,9 +179,11 @@ impl TracingHarness {
             _codex_home: codex_home,
             processor,
             outgoing_rx,
-            session: Arc::new(ConnectionSessionState::new(
-                crate::transport::ConnectionOrigin::Stdio,
-            )),
+            session: Arc::new(if retention_enabled {
+                ConnectionSessionState::in_process()
+            } else {
+                ConnectionSessionState::new(crate::transport::ConnectionOrigin::Stdio)
+            }),
             tracing,
             telemetry,
         };
@@ -203,6 +217,7 @@ impl TracingHarness {
                 harness.session.request_attestation(),
                 harness.session.trusted_interactive(),
                 harness.session.retention_principal(),
+                harness.session.auth_observation_only(),
             )
             .await;
 
@@ -1296,3 +1311,12 @@ fn managed_transition_adoption_completes_reset_with_shared_plugin_auth() -> Resu
         },
     )
 }
+
+#[path = "message_processor_recovery_tests.rs"]
+mod recovery_tests;
+
+#[path = "message_processor_recovery_compatibility_tests.rs"]
+mod recovery_compatibility_tests;
+
+#[path = "message_processor_override_retirement_tests.rs"]
+mod override_retirement_tests;

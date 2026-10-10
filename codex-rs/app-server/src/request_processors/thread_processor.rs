@@ -37,6 +37,7 @@ use codex_protocol::protocol::ThreadHistoryMode;
 use codex_thread_store::PersistContext;
 use std::ops::ControlFlow;
 
+mod recovery;
 mod shutdown;
 pub(crate) use shutdown::ProcessorThreadRetirement;
 pub(crate) use shutdown::ProcessorThreadShutdown;
@@ -461,7 +462,8 @@ pub(crate) struct ThreadRequestProcessor {
     pub(super) config: Arc<Config>,
     pub(super) config_manager: ConfigManager,
     pub(super) thread_store: Arc<dyn ThreadStore>,
-    pub(super) pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
+    pub(super) pending_thread_unloads:
+        Arc<Mutex<crate::thread_state::recovery::PendingThreadUnloads>>,
     pub(super) thread_state_manager: ThreadStateManager,
     pub(super) thread_watch_manager: ThreadWatchManager,
     pub(super) thread_list_state_permit: Arc<Semaphore>,
@@ -503,7 +505,7 @@ impl ThreadRequestProcessor {
         config: Arc<Config>,
         config_manager: ConfigManager,
         thread_store: Arc<dyn ThreadStore>,
-        pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
+        pending_thread_unloads: Arc<Mutex<crate::thread_state::recovery::PendingThreadUnloads>>,
         thread_state_manager: ThreadStateManager,
         thread_watch_manager: ThreadWatchManager,
         thread_list_state_permit: Arc<Semaphore>,
@@ -590,20 +592,23 @@ impl ThreadRequestProcessor {
         app_server_client_version: Option<String>,
         client_mcp_extensions: ClientMcpExtensions,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        let mut prepared_config = None;
-        // Keep the resume future off the request handler's stack.
-        while Box::pin(self.thread_resume_inner(
-            &target,
-            &params,
-            app_server_client_name.clone(),
-            app_server_client_version.clone(),
-            client_mcp_extensions.clone(),
-            &mut prepared_config,
-        ))
-        .await?
-        .is_continue()
-        {}
-        Ok(None)
+        crate::thread_state::recovery::resume_scope(async {
+            let mut prepared_config = None;
+            // Keep the resume future off the request handler's stack.
+            while Box::pin(self.thread_resume_inner(
+                &target,
+                &params,
+                app_server_client_name.clone(),
+                app_server_client_version.clone(),
+                client_mcp_extensions.clone(),
+                &mut prepared_config,
+            ))
+            .await?
+            .is_continue()
+            {}
+            Ok(None)
+        })
+        .await
     }
 
     pub(crate) async fn thread_fork(
@@ -3828,11 +3833,7 @@ impl ThreadRequestProcessor {
         prepared_config: &mut Option<PreparedResumeConfig>,
     ) -> Result<ControlFlow<()>, JSONRPCErrorError> {
         if let Ok(thread_id) = ThreadId::from_string(&params.thread_id)
-            && self
-                .pending_thread_unloads
-                .lock()
-                .await
-                .contains(&thread_id)
+            && self.pending_thread_unloads.lock().await.blocks(&thread_id)
         {
             return Err(invalid_request(format!(
                 "thread {thread_id} is closing; retry thread/resume after the thread is closed"
@@ -3848,6 +3849,9 @@ impl ThreadRequestProcessor {
             should_redact_thread_resume_payloads(app_server_client_name.as_deref());
 
         let _thread_list_state_permit = self.acquire_thread_list_state_permit().await?;
+        if let Ok(id) = ThreadId::from_string(&params.thread_id) {
+            self.recover_retiring_thread(id).await?;
+        }
         let stored_thread_from_running_probe = match target {
             ThreadResumeTarget::Client(request_id) => match self
                 .resume_running_thread(
@@ -3934,12 +3938,20 @@ impl ThreadRequestProcessor {
                 .pending_thread_unloads
                 .lock()
                 .await
-                .contains(&resumed.conversation_id)
+                .blocks(&resumed.conversation_id)
         {
             return Err(invalid_request(format!(
                 "thread {} is closing; retry thread/resume after the thread is closed",
                 resumed.conversation_id
             )));
+        }
+        if let InitialHistory::Resumed(resumed) = &thread_history
+            && self
+                .recover_retiring_thread(resumed.conversation_id)
+                .await?
+        {
+            // Recovery seals old persistence. Reload history, not the pre-recovery snapshot.
+            return Ok(ControlFlow::Continue(()));
         }
         let paginated_thread_id = resume_source_thread.as_ref().and_then(|thread| {
             matches!(thread.history_mode, ThreadHistoryMode::Paginated).then_some(thread.thread_id)
@@ -4499,6 +4511,9 @@ impl ThreadRequestProcessor {
         };
 
         if let Some((existing_thread_id, existing_thread, mut source_thread)) = running_thread {
+            if self.recover_retiring_thread(existing_thread_id).await? {
+                return Ok(RunningThreadResumeResult::NotRunning(None));
+            }
             let paginated_resume =
                 matches!(source_thread.history_mode, ThreadHistoryMode::Paginated);
             let existing_thread_rollout_path = existing_thread.rollout_path();
@@ -4536,29 +4551,16 @@ impl ThreadRequestProcessor {
                 ) && !has_subscribers
                     && matches!(loaded_status, ThreadStatus::Idle)
                     && !is_running
+                    && self
+                        .retire_cached_thread_for_resume(existing_thread_id, &existing_thread)
+                        .await?
                 {
-                    // A loaded idle thread is only a cache entry. Shut it down
-                    // before removing it so cold resume cannot duplicate a
-                    // thread that timed out during shutdown.
-                    match wait_for_thread_shutdown(&existing_thread).await {
-                        ThreadShutdownResult::Complete => {
-                            self.thread_manager.remove_thread(&existing_thread_id).await;
-                            self.finalize_thread_teardown(existing_thread_id).await;
-                            // Shutdown can flush newer rollout items, so reload the
-                            // stored thread before starting the replacement session.
-                            return Ok(RunningThreadResumeResult::NotRunning(None));
-                        }
-                        ThreadShutdownResult::SubmitFailed => {
-                            warn!("failed to submit Shutdown to thread {existing_thread_id}");
-                        }
-                        ThreadShutdownResult::TimedOut => {
-                            warn!("thread {existing_thread_id} shutdown timed out");
-                        }
-                    }
+                    // Retirement flushes history; reload it for the successor.
+                    return Ok(RunningThreadResumeResult::NotRunning(None));
                 }
 
                 // Preserve rejoin semantics when another client can still observe
-                // the loaded thread or shutdown did not complete.
+                // the loaded thread.
                 tracing::warn!(
                     "thread/resume overrides ignored for loaded thread {}: {}",
                     existing_thread_id,

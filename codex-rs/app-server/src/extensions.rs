@@ -47,6 +47,18 @@ pub(crate) struct ThreadExtensionDependencies {
     pub(crate) turn_start_admission: Option<Arc<dyn TurnStartAdmission>>,
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_TURN_CONTRIBUTOR: std::cell::RefCell<Option<Arc<dyn codex_extension_api::TurnLifecycleContributor>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn replace_test_turn_contributor(
+    contributor: Option<Arc<dyn codex_extension_api::TurnLifecycleContributor>>,
+) -> Option<Arc<dyn codex_extension_api::TurnLifecycleContributor>> {
+    TEST_TURN_CONTRIBUTOR.with(|slot| slot.replace(contributor))
+}
+
 pub(crate) fn thread_extensions(
     dependencies: ThreadExtensionDependencies,
 ) -> Arc<ExtensionRegistry<Config>> {
@@ -123,6 +135,12 @@ pub(crate) fn thread_extensions(
     builder.turn_lifecycle_contributor(Arc::new(
         crate::account_turn_admission::AccountTurnLifecycle,
     ));
+    #[cfg(test)]
+    TEST_TURN_CONTRIBUTOR.with(|slot| {
+        if let Some(contributor) = slot.borrow().as_ref() {
+            builder.turn_lifecycle_contributor(Arc::clone(contributor));
+        }
+    });
     Arc::new(builder.build())
 }
 

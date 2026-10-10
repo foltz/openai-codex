@@ -346,7 +346,7 @@ impl AccountRequestProcessor {
         request_id: ConnectionRequestId,
         params: LoginAccountParams,
     ) -> Result<(), JSONRPCErrorError> {
-        if self.auth_manager.is_workload_identity_selected() {
+        if self.auth_manager.is_host_owned_auth() {
             return Err(self.configured_auth_owned_by_host_error());
         }
         match params {
@@ -434,7 +434,7 @@ impl AccountRequestProcessor {
     }
 
     fn ensure_bedrock_login_allowed(&self) -> Result<(), JSONRPCErrorError> {
-        if self.auth_manager.is_workload_identity_selected() {
+        if self.auth_manager.is_host_owned_auth() {
             return Err(self.configured_auth_owned_by_host_error());
         }
         if self.auth_manager.is_external_chatgpt_auth_active() {
@@ -897,6 +897,9 @@ impl AccountRequestProcessor {
         chatgpt_account_id: String,
         chatgpt_plan_type: Option<String>,
     ) -> Result<LoginAccountResponse, JSONRPCErrorError> {
+        if self.auth_manager.is_host_owned_auth() {
+            return Err(self.configured_auth_owned_by_host_error());
+        }
         if !self
             .auth_manager
             .is_login_method_allowed(ForcedLoginMethod::Chatgpt)
@@ -1028,7 +1031,7 @@ impl AccountRequestProcessor {
     }
 
     async fn logout_common(&self) -> std::result::Result<Option<AuthMode>, JSONRPCErrorError> {
-        if self.auth_manager.is_workload_identity_selected() {
+        if self.auth_manager.is_host_owned_auth() {
             return Err(self.configured_auth_owned_by_host_error());
         }
         let config = self.load_latest_config().await;
@@ -1113,6 +1116,19 @@ impl AccountRequestProcessor {
         let include_token = params.include_token.unwrap_or(false);
         let do_refresh = params.refresh_token.unwrap_or(false);
 
+        if self.auth_manager.is_command_auth_selected() && !do_refresh {
+            // Do not rebuild config or auth-owning loaders for a selected-mode
+            // observation: that can resolve a near-expiry external credential.
+            return Ok(GetAuthStatusResponse {
+                auth_method: self
+                    .auth_manager
+                    .auth_cached()
+                    .as_ref()
+                    .map(|auth| auth_mode_to_api(auth.api_auth_mode())),
+                auth_token: None,
+                requires_openai_auth: Some(self.config.model_provider.requires_openai_auth),
+            });
+        }
         self.refresh_token_if_requested(do_refresh).await;
 
         // Determine whether auth is required based on the active model provider.
@@ -1128,7 +1144,7 @@ impl AccountRequestProcessor {
                 requires_openai_auth: Some(false),
             }
         } else {
-            let auth = if do_refresh {
+            let auth = if do_refresh || self.auth_manager.is_command_auth_selected() {
                 self.auth_manager.auth_cached()
             } else {
                 self.auth_manager.auth().await
@@ -1139,7 +1155,7 @@ impl AccountRequestProcessor {
                         self.auth_manager.refresh_failure_for_auth(&auth).is_some();
                     let auth_mode = auth_mode_to_api(auth.api_auth_mode());
                     let (reported_auth_method, token_opt) =
-                        if self.auth_manager.is_workload_identity_selected()
+                        if self.auth_manager.is_host_owned_auth()
                             || matches!(
                                 auth,
                                 CodexAuth::Headers(_)

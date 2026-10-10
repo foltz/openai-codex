@@ -99,6 +99,7 @@ enum Connection {
 pub(super) struct ConnectionLease {
     pub(super) thread_id: String,
     pub(super) request_kind: RequestMode,
+    pub(super) credential_fingerprint: Option<codex_login::AuthCredentialFingerprint>,
     connection: Connection,
     pool: Arc<ConnectionPool>,
     _permit: OwnedSemaphorePermit,
@@ -189,6 +190,12 @@ impl ConnectionPool {
             key,
             auth_changes,
         } = self.client_setup().await?;
+        let mut frozen_headers = http::HeaderMap::new();
+        auth.add_auth_headers(&mut frozen_headers);
+        let credential_fingerprint = frozen_headers
+            .get(http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(codex_login::AuthCredentialFingerprint::from_bearer_header);
         let connection = loop {
             let idle = self
                 .idle_connections
@@ -286,6 +293,7 @@ impl ConnectionPool {
         Ok(ConnectionLease {
             thread_id,
             request_kind,
+            credential_fingerprint,
             connection,
             pool: Arc::clone(self),
             _permit: permit,

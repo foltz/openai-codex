@@ -194,6 +194,7 @@ async fn personal_access_token_without_email_supports_auth_status_and_account_re
 
     let request_id = mcp
         .send_get_account_request(GetAccountParams {
+            cache_only: false,
             refresh_token: false,
         })
         .await?;
@@ -220,6 +221,7 @@ async fn personal_access_token_without_email_supports_auth_status_and_account_re
     assert_eq!(
         to_response::<GetAccountResponse>(response)?,
         GetAccountResponse {
+            auth_observation: None,
             workspace_routing: Some(codex_app_server_protocol::WorkspaceRouting {
                 chatgpt_account_id: "account-123".to_string(),
                 backend_origin: "https://chatgpt.com".to_string(),

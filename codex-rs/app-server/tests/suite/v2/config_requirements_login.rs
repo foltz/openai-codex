@@ -159,6 +159,7 @@ command = "print-token"
     );
     let id = server
         .send_get_account_request(GetAccountParams {
+            cache_only: false,
             refresh_token: false,
         })
         .await?;
@@ -166,6 +167,7 @@ command = "print-token"
     assert_eq!(
         account,
         GetAccountResponse {
+            auth_observation: None,
             account: Some(Account::AmazonBedrock {
                 uses_codex_managed_credentials: false
             }),

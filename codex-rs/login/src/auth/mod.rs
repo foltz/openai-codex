@@ -4,6 +4,8 @@ mod auth_headers;
 mod bedrock_access_keys;
 mod bedrock_api_key;
 mod change_state;
+mod command_source;
+mod command_store;
 pub mod default_client;
 pub mod error;
 mod personal_access_token;

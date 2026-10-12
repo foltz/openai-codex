@@ -27,6 +27,9 @@ pub(super) struct RetentionLifecycle {
     snapshot: watch::Sender<RetentionSnapshot>,
     ticket: Option<codex_core::ThreadRetirement>,
     report: Option<codex_core::ThreadRetirementReport>,
+    runtime: Weak<codex_core::CodexThread>,
+    reconciled: bool,
+    listener_completion: Option<futures::future::Shared<futures::future::BoxFuture<'static, bool>>>,
 }
 
 impl RetentionLifecycle {
@@ -35,6 +38,9 @@ impl RetentionLifecycle {
             identity,
             ticket: None,
             report: None,
+            runtime: Weak::new(),
+            reconciled: false,
+            listener_completion: None,
             snapshot: watch::channel(RetentionSnapshot {
                 generation: Uuid::now_v7(),
                 revision: Uuid::now_v7(),
@@ -100,7 +106,110 @@ impl ThreadStateManagerInner {
     }
 }
 
+pub(crate) struct RetirementCandidate {
+    pub(crate) ticket: codex_core::ThreadRetirement,
+    pub(crate) claim: RetentionRetirementClaim,
+    pub(crate) runtime: Arc<codex_core::CodexThread>,
+    pub(crate) listener: Option<Arc<Mutex<ThreadState>>>,
+    pub(crate) completion:
+        Option<futures::future::Shared<futures::future::BoxFuture<'static, bool>>>,
+}
+
 impl ThreadStateManager {
+    pub(crate) async fn retirement_candidate(
+        &self,
+        thread_id: ThreadId,
+    ) -> Result<Option<RetirementCandidate>, &'static str> {
+        let state = self.state.lock().await;
+        let record = match state.lifecycle.get(&thread_id) {
+            Some(record) if record.is_retiring() => Some(record),
+            Some(_) => None,
+            None => state.threads.get(&thread_id).and_then(|entry| {
+                state
+                    .retired_lifecycle
+                    .iter()
+                    .find_map(|((id, _), record)| {
+                        (*id == thread_id && record.identity.ptr_eq(&Arc::downgrade(&entry.state)))
+                            .then_some(record)
+                    })
+            }),
+        };
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        let runtime = record
+            .runtime
+            .upgrade()
+            .ok_or("retired runtime custody unavailable")?;
+        let ticket = record
+            .ticket
+            .clone()
+            .ok_or("original retirement ticket custody unavailable")?;
+        Ok(Some(RetirementCandidate {
+            ticket,
+            claim: RetentionRetirementClaim {
+                thread_id,
+                generation: record.snapshot.borrow().generation,
+            },
+            runtime,
+            listener: record.identity.upgrade(),
+            completion: record.listener_completion.clone(),
+        }))
+    }
+
+    /// Move history/custody before observation removal; a fresh current entry gets fresh grants.
+    pub(crate) async fn archive_retirement(
+        &self,
+        claim: RetentionRetirementClaim,
+        runtime: &Arc<codex_core::CodexThread>,
+    ) -> bool {
+        let mut state = self.state.lock().await;
+        if state.retirement_claims_closed {
+            return false;
+        }
+        let Some(record) = state.lifecycle.get(&claim.thread_id) else {
+            let Some(record) = state
+                .retired_lifecycle
+                .get_mut(&(claim.thread_id, claim.generation))
+            else {
+                return false;
+            };
+            if !record.runtime.ptr_eq(&Arc::downgrade(runtime))
+                || !runtime.retirement_is_quiescent()
+            {
+                return false;
+            }
+            record.reconciled |= runtime.retirement_reconciled();
+            return true;
+        };
+        if !record.is_retiring()
+            || record.snapshot.borrow().generation != claim.generation
+            || !record.runtime.ptr_eq(&Arc::downgrade(runtime))
+            || !runtime.retirement_is_quiescent()
+        {
+            return false;
+        }
+        let Some(mut record) = state.lifecycle.remove(&claim.thread_id) else {
+            return false;
+        };
+        record.reconciled = runtime.retirement_reconciled();
+        state
+            .retired_lifecycle
+            .insert((claim.thread_id, claim.generation), record);
+        true
+    }
+
+    pub(crate) async fn reconciled_retirements(
+        &self,
+    ) -> std::collections::HashSet<(ThreadId, Uuid)> {
+        let state = self.state.lock().await;
+        state
+            .retired_lifecycle
+            .iter()
+            .filter_map(|(claim, record)| record.reconciled.then_some(*claim))
+            .collect()
+    }
+
     /// Drive every committed ticket, including one whose original caller was
     /// lost before its first poll. The table retains the originals throughout;
     /// cancellation of this observer cannot abandon ownership or refresh bounds.
@@ -115,11 +224,18 @@ impl ThreadStateManager {
             state
                 .lifecycle
                 .iter()
+                .map(|(id, record)| (*id, record))
+                .chain(
+                    state
+                        .retired_lifecycle
+                        .iter()
+                        .map(|((id, _), record)| (*id, record)),
+                )
                 .filter_map(|(thread_id, record)| {
                     record.ticket.clone().map(|ticket| {
                         (
                             RetentionRetirementClaim {
-                                thread_id: *thread_id,
+                                thread_id,
                                 generation: record.snapshot.borrow().generation,
                             },
                             ticket,
@@ -225,6 +341,8 @@ impl ThreadStateManager {
         // No fallible step remains after the core admission fence closes.
         // Keep the original ticket before observation state can be removed.
         record.ticket = Some(ticket.clone());
+        record.runtime = Arc::downgrade(thread);
+        record.listener_completion = listener.listener_completion.clone();
         record
             .snapshot
             .send_modify(|snapshot| snapshot.retiring = true);

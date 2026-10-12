@@ -39,6 +39,7 @@ pub use success_page::LoginSuccessPageBrand;
 pub use auth::AgentIdentityAuthPolicy;
 pub use auth::AuthChangeState;
 pub use auth::AuthConfig;
+pub use auth::AuthCredentialFingerprint;
 pub use auth::AuthDotJson;
 pub use auth::AuthHeaders;
 pub use auth::AuthKeyringBackendKind;

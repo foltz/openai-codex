@@ -69,6 +69,7 @@ pub(super) async fn resolve_attribution_policy(
             }
             let enabled = match auth {
                 Some(auth) if auth.uses_codex_backend() => {
+                    auth_recovery.record_failed_auth(Some(&auth));
                     let client =
                         BackendClient::from_auth(base_url, &auth, http_client_factory.clone());
                     let settings = client.get_user_settings().await;

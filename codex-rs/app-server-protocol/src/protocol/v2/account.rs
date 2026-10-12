@@ -549,6 +549,9 @@ pub struct GetAccountParams {
     /// themselves and call `account/login/start` with `chatgptAuthTokens`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub refresh_token: bool,
+    /// Observe cached auth only, without issuer, provider or routing discovery.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cache_only: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
@@ -559,6 +562,33 @@ pub struct GetAccountResponse {
     pub requires_openai_auth: bool,
     #[experimental("account/read.workspaceRouting")]
     pub workspace_routing: Option<WorkspaceRouting>,
+    /// Present only for the explicit cache-only read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_observation: Option<AuthObservation>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AuthObservation {
+    pub version: u32,
+    pub mode: Option<crate::protocol::common::AuthMode>,
+    pub account_id: Option<String>,
+    pub principal: Option<String>,
+    pub state_known: bool,
+    pub provider: Option<ExternalAuthReceipt>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ExternalAuthReceipt {
+    pub source: String,
+    #[ts(type = "number")]
+    pub generation: u64,
+    pub expires_at: i64,
+    pub coherent: bool,
+    pub protection_mode: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

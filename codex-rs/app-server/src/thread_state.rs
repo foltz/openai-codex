@@ -41,7 +41,10 @@ use uuid::Uuid;
 
 type PendingInterruptQueue = Vec<ConnectionRequestId>;
 
+pub(crate) mod recovery;
 mod retirement;
+pub(crate) use retirement::RetentionRetirementClaim;
+pub(crate) use retirement::RetentionRetirementRefusal;
 pub(crate) use retirement::RetentionSnapshot;
 
 /// A server-minted, process-local identity for one eligible connection.
@@ -246,6 +249,8 @@ pub(crate) struct ThreadState {
     /// `ShutdownComplete` event before that listener is superseded.
     shutdown_drain_waiter: Option<oneshot::Sender<()>>,
     pub(crate) cancel_tx: Option<oneshot::Sender<()>>,
+    pub(crate) listener_completion:
+        Option<futures::future::Shared<futures::future::BoxFuture<'static, bool>>>,
     pub(crate) experimental_raw_events: bool,
     pub(crate) listener_generation: u64,
     last_thread_settings: Option<ThreadSettings>,
@@ -1554,6 +1559,7 @@ impl ThreadEntry {
 struct ThreadStateManagerInner {
     retirement_claims_closed: bool,
     lifecycle: HashMap<ThreadId, retirement::RetentionLifecycle>,
+    retired_lifecycle: HashMap<(ThreadId, uuid::Uuid), retirement::RetentionLifecycle>,
     live_connections: HashMap<ConnectionId, ConnectionCapabilities>,
     threads: HashMap<ThreadId, ThreadEntry>,
     thread_ids_by_connection: HashMap<ConnectionId, HashSet<ThreadId>>,

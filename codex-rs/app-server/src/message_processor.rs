@@ -278,6 +278,7 @@ pub(crate) struct ConnectionSessionState {
 
 #[derive(Debug)]
 pub(crate) struct InitializedConnectionSessionState {
+    pub(crate) auth_observation_only: bool,
     pub(crate) experimental_api_enabled: bool,
     pub(crate) opted_out_notification_methods: HashSet<String>,
     pub(crate) app_server_client_name: String,
@@ -318,6 +319,12 @@ impl ConnectionSessionState {
             retention_principal,
             initialized: OnceLock::new(),
         }
+    }
+
+    pub(crate) fn auth_observation_only(&self) -> bool {
+        self.initialized
+            .get()
+            .is_some_and(|state| state.auth_observation_only)
     }
 
     pub(crate) fn initialized(&self) -> bool {
@@ -580,7 +587,9 @@ impl MessageProcessor {
             outgoing.clone(),
         );
 
-        let pending_thread_unloads = Arc::new(Mutex::new(HashSet::new()));
+        let pending_thread_unloads = Arc::new(Mutex::new(
+            crate::thread_state::recovery::PendingThreadUnloads::default(),
+        ));
         let thread_watch_manager =
             crate::thread_status::ThreadWatchManager::new_with_outgoing(outgoing.clone());
         let thread_list_state_permit = Arc::new(Semaphore::new(/*permits*/ 1));
@@ -1079,9 +1088,12 @@ impl MessageProcessor {
         request_attestation: bool,
         trusted_interactive: bool,
         retention_principal: Option<RetentionPrincipalId>,
+        auth_observation_only: bool,
     ) {
-        self.account_processor
-            .notify_workspace_routing_to_connection(connection_id);
+        if !auth_observation_only {
+            self.account_processor
+                .notify_workspace_routing_to_connection(connection_id);
+        }
         self.thread_processor
             .connection_initialized(
                 connection_id,
@@ -1351,6 +1363,7 @@ impl MessageProcessor {
                     session.request_attestation(),
                     session.trusted_interactive(),
                     session.retention_principal(),
+                    session.auth_observation_only(),
                 )
                 .await;
             }
@@ -2530,6 +2543,7 @@ mod retention_authority_tests {
         );
         session
             .initialize(InitializedConnectionSessionState {
+                auth_observation_only: false,
                 experimental_api_enabled: true,
                 opted_out_notification_methods: HashSet::new(),
                 app_server_client_name: "test".to_string(),

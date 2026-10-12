@@ -88,7 +88,7 @@ async fn managed_legacy_cleanup_in_progress_is_retained_as_incomplete() {
 }
 
 #[derive(Clone, Copy)]
-enum ThreadLoopFixture {
+pub(crate) enum ThreadLoopFixture {
     Ordinary,
     Hung,
     Gone,
@@ -96,7 +96,7 @@ enum ThreadLoopFixture {
     Panicked,
 }
 
-async fn exact_thread_fixture(mode: ThreadLoopFixture) -> crate::CodexThread {
+pub(crate) async fn exact_thread_fixture(mode: ThreadLoopFixture) -> crate::CodexThread {
     exact_thread_fixture_with(mode, |_| {}).await
 }
 

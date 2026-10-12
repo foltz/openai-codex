@@ -245,7 +245,7 @@ fn coordination_error(error: std::io::Error) -> ManagedAuthStorageError {
     ))
 }
 
-fn acquire_auth_source_lock(codex_home: &Path) -> Result<File, ManagedAuthStorageError> {
+pub(super) fn acquire_auth_source_lock(codex_home: &Path) -> Result<File, ManagedAuthStorageError> {
     let canonical_home = codex_home.canonicalize().map_err(coordination_error)?;
     let path = canonical_home.join(MANAGED_AUTH_COORDINATION_FILE);
     let mut options = OpenOptions::new();
@@ -334,6 +334,7 @@ impl AuthStorageBackend for LockedAuthStorage {
         // Match the ordinary file writer's ability to initialize CODEX_HOME.
         std::fs::create_dir_all(&self.codex_home)?;
         let _guard = self.lock_managed_source().map_err(std::io::Error::other)?;
+        super::command_store::refuse_native_write(&self.codex_home)?;
         self.backend.save(auth)
     }
 

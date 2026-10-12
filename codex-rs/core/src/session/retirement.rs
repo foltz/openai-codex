@@ -52,6 +52,7 @@ struct CleanupState {
     task_completion: Option<Shared<BoxFuture<'static, crate::tasks::TaskJoinOutcome>>>,
     common_completion: Option<Shared<BoxFuture<'static, CleanupExecution>>>,
     deadline: Option<Instant>,
+    reconciliation: Option<Arc<codex_mcp::RuntimeTerminationReport>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,6 +76,44 @@ impl Default for SessionCleanupOwner {
 }
 
 impl SessionCleanupOwner {
+    pub(crate) fn recovery_ready(&self) -> bool {
+        let Ok(state) = self.state.lock() else {
+            return false;
+        };
+        state
+            .common_completion
+            .as_ref()
+            .and_then(|work| work.peek())
+            == Some(&CleanupExecution::Finished {
+                persistence_failed: false,
+            })
+            && state.task_completion.as_ref().and_then(|work| work.peek())
+                == Some(&crate::tasks::TaskJoinOutcome::Complete { panicked: false })
+    }
+
+    pub(crate) fn reconciled(&self) -> bool {
+        self.state.lock().is_ok_and(|state| {
+            state
+                .reconciliation
+                .as_ref()
+                .is_some_and(|report| report.is_complete())
+        })
+    }
+
+    pub(crate) fn record_reconciliation(
+        &self,
+        report: codex_mcp::RuntimeTerminationReport,
+    ) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        if !report.is_complete() {
+            return false;
+        }
+        state.reconciliation = Some(Arc::new(report));
+        true
+    }
+
     /// Read an already recorded cleanup result without creating or polling work.
     /// This does not retroactively bind legacy cleanup to a later deadline.
     pub(crate) fn completed(&self) -> Option<CleanupExecution> {
@@ -271,4 +310,8 @@ impl Session {
 
 #[cfg(test)]
 #[path = "retirement_tests.rs"]
-mod tests;
+pub(crate) mod tests;
+
+#[cfg(test)]
+#[path = "retirement_recovery_tests.rs"]
+pub(crate) mod recovery_tests;

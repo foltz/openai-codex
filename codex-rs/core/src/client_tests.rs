@@ -1619,11 +1619,11 @@ async fn bedrock_unauthorized_error_uses_provider_mapping() {
             ),
         },
         &mut auth_recovery,
+        /*failed_auth*/ None,
         &mut provider_auth_recovery_attempted,
         &test_session_telemetry(),
         &provider,
-        /*event_sender*/ None,
-        /*turn_id*/ None,
+        /*event_context*/ (None, None),
     )
     .await
     .expect_err("expired Bedrock signature should fail");
@@ -1716,11 +1716,11 @@ async fn provider_owned_auth_recovery_is_bounded_and_preserves_unauthorized_fail
         let result = super::handle_unauthorized(
             unauthorized(),
             &mut auth_recovery,
+            /*failed_auth*/ None,
             &mut provider_auth_recovery_attempted,
             &telemetry,
             &provider,
-            Some(&event_sender),
-            Some("turn-1"),
+            (Some(&event_sender), Some("turn-1")),
         )
         .await;
 
@@ -1735,11 +1735,11 @@ async fn provider_owned_auth_recovery_is_bounded_and_preserves_unauthorized_fail
             super::handle_unauthorized(
                 unauthorized(),
                 &mut auth_recovery,
+                /*failed_auth*/ None,
                 &mut provider_auth_recovery_attempted,
                 &telemetry,
                 &provider,
-                Some(&event_sender),
-                Some("turn-1"),
+                (Some(&event_sender), Some("turn-1")),
             )
             .await
             .expect_err("provider recovery should not run more than once")

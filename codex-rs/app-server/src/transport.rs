@@ -241,6 +241,7 @@ mod provenance_tests {
         connection
             .session
             .initialize(InitializedConnectionSessionState {
+                auth_observation_only: false,
                 experimental_api_enabled: true,
                 opted_out_notification_methods: HashSet::new(),
                 app_server_client_name: "test".to_string(),

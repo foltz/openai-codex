@@ -54,6 +54,7 @@ pub use codex_thread::GuardianRootSnapshot;
 pub use codex_thread::ThreadCleanupOutcome;
 pub use codex_thread::ThreadConfigSnapshot;
 pub use codex_thread::ThreadLoopOutcome;
+pub use codex_thread::ThreadRecoveryOutcome;
 pub use codex_thread::ThreadRetirement;
 pub use codex_thread::ThreadRetirementError;
 pub use codex_thread::ThreadRetirementReport;

@@ -44,6 +44,7 @@ pub(crate) fn classify(request: &ClientRequest) -> AccountDependency {
         | ClientRequest::ThreadShellCommand { .. }
         | ClientRequest::ThreadApproveGuardianDeniedAction { .. }
         | ClientRequest::TurnStart { .. }
+        | ClientRequest::TurnStartIfIdle { .. }
         | ClientRequest::ThreadQueueAdd { .. }
         | ClientRequest::ThreadQueueStart { .. }
         | ClientRequest::ThreadInjectItems { .. }

@@ -265,8 +265,7 @@ async fn unix_peer_entitlement_reaches_public_subscription_aggregate() -> Result
                 "--interactive-subscription-peer-helper-expect-unproven",
             ])
             .env("CODEX_HOME", &codex_home)
-            .status()
-            .await?;
+            .status()?;
         assert!(
             unentitled.success(),
             "different-image helper must remain absent from the aggregate"

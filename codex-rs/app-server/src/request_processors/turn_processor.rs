@@ -4,6 +4,8 @@ use codex_agent_extension::AgentInvocation;
 use codex_agent_extension::AgentRun;
 use codex_agent_extension::AgentRunner;
 use codex_app_server_protocol::ImageReference as V2ImageReference;
+use codex_app_server_protocol::TurnStartIfIdleParams;
+use codex_app_server_protocol::TurnStartIfIdleResponse;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
@@ -184,9 +186,43 @@ impl TurnRequestProcessor {
             params,
             app_server_client_name,
             app_server_client_version,
+            /*start_if_idle*/ false,
         )
         .await
         .map(|response| Some(response.into()))
+    }
+
+    /// Preserve all normal input admission, settings and validation, changing
+    /// only Core's serialized start-versus-steer decision.
+    pub(crate) async fn turn_start_if_idle(
+        &self,
+        request_id: ConnectionRequestId,
+        params: TurnStartIfIdleParams,
+        app_server_client_name: Option<String>,
+        app_server_client_version: Option<String>,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        validate_user_input_image_urls(&params.input)?;
+        self.turn_start_inner(
+            request_id,
+            TurnStartParams {
+                thread_id: params.thread_id,
+                input: params.input,
+                client_user_message_id: params.client_user_message_id,
+                ..Default::default()
+            },
+            app_server_client_name,
+            app_server_client_version,
+            /*start_if_idle*/ true,
+        )
+        .await
+        .map(|response| {
+            Some(
+                TurnStartIfIdleResponse {
+                    turn: response.turn,
+                }
+                .into(),
+            )
+        })
     }
 
     pub(crate) async fn thread_inject_items(
@@ -525,6 +561,7 @@ impl TurnRequestProcessor {
         params: TurnStartParams,
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
+        start_if_idle: bool,
     ) -> Result<TurnStartResponse, JSONRPCErrorError> {
         let (thread_id, thread) =
             self.load_thread(&params.thread_id)
@@ -651,33 +688,46 @@ impl TurnRequestProcessor {
         // Core's queued submission carries its own host lease. The request's
         // admission remains scoped by the executing dispatcher, not a listener.
         let request_trace_context = self.request_trace_context(&request_id).await;
-        let submission = thread
-            .start_or_steer_turn(
-                TurnInputRequest::new(input)
-                    .with_thread_settings(thread_settings)
-                    .on_start(TurnStartOptions {
-                        turn_trigger: params.turn_trigger,
-                        final_output_json_schema: params.output_schema,
-                        service_tier: params.service_tier_for_turn,
-                        cyber_access_program: params.cyber_access_program.map(Into::into),
-                        ..Default::default()
-                    })
-                    .with_additional_context(additional_context)
-                    .with_responses_metadata(params.responsesapi_client_metadata)
-                    .with_trace(request_trace_context),
-            )
-            .await
-            .map_err(|err| {
-                let error = internal_error(format!("failed to submit turn input: {err}"));
-                self.track_error_response(&request_id, &error, /*error_type*/ None);
-                error
-            })?;
+        let input_request = TurnInputRequest::new(input)
+            .with_thread_settings(thread_settings)
+            .on_start(TurnStartOptions {
+                turn_trigger: params.turn_trigger,
+                final_output_json_schema: params.output_schema,
+                service_tier: params.service_tier_for_turn,
+                cyber_access_program: params.cyber_access_program.map(Into::into),
+                ..Default::default()
+            })
+            .with_additional_context(additional_context)
+            .with_responses_metadata(params.responsesapi_client_metadata)
+            .with_trace(request_trace_context);
+        let submission = if start_if_idle {
+            thread
+                .start_turn_if_idle(input_request)
+                .await
+                .map(|result| match result {
+                    codex_protocol::turn_input::StartIfIdleSubmission::Started { turn_id } => {
+                        TurnInputSubmission::Started { turn_id }
+                    }
+                    codex_protocol::turn_input::StartIfIdleSubmission::NotSubmitted { reason } => {
+                        TurnInputSubmission::NotSubmitted { reason }
+                    }
+                })
+        } else {
+            thread.start_or_steer_turn(input_request).await
+        }
+        .map_err(|err| {
+            let error = internal_error(format!("failed to submit turn input: {err}"));
+            self.track_error_response(&request_id, &error, /*error_type*/ None);
+            error
+        })?;
         let (turn_id, started) = match submission {
             TurnInputSubmission::Started { turn_id } => (turn_id, true),
             TurnInputSubmission::Steered { turn_id } => (turn_id, false),
             TurnInputSubmission::NotSubmitted { reason } => {
                 let error = if reason == NotSubmittedReason::ServerDraining {
                     crate::error_code::server_draining_error()
+                } else if start_if_idle && reason == NotSubmittedReason::NotIdle {
+                    invalid_request("thread is not idle; input was not submitted")
                 } else {
                     internal_error(format!("failed to submit turn input: {reason:?}"))
                 };

@@ -278,6 +278,26 @@ pub struct TurnStartParams {
     pub cyber_access_program: Option<CyberAccessProgram>,
 }
 
+/// Conditional user input with no implicit settings or permission changes.
+#[derive(
+    Serialize, Deserialize, Debug, Default, Clone, PartialEq, JsonSchema, TS, ExperimentalApi,
+)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct TurnStartIfIdleParams {
+    pub thread_id: String,
+    pub input: Vec<UserInput>,
+    #[ts(optional = nullable)]
+    pub client_user_message_id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct TurnStartIfIdleResponse {
+    pub turn: Turn,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]

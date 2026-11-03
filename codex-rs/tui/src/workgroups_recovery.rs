@@ -1,5 +1,5 @@
 //! Optional per-client recovery checkpoints. They are written by the TUI, never
-//! by the shared app-server. A transition is durable before its effects begin.
+//! by the shared app-server. The initial assignment never follows later navigation.
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -14,6 +14,7 @@ struct Context {
     context_id: String,
     binding_digest: String,
     provider: String,
+    conversation_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -34,6 +35,7 @@ struct Checkpoint<'a> {
     pane_id: &'a str,
     pid: u32,
     process: &'a ProcessBirth,
+    assignment_id: Option<String>,
     conversation_id: Option<String>,
     phase: &'a str,
     intent: &'a str,
@@ -45,6 +47,8 @@ pub(crate) struct RecoveryObserver {
     path: PathBuf,
     pane: String,
     process: ProcessBirth,
+    assignment: Option<ThreadId>,
+    initial_observed: bool,
     last: Option<(Option<ThreadId>, &'static str, &'static str)>,
 }
 
@@ -95,7 +99,7 @@ impl RecoveryObserver {
             return Err(Error::other("recovery context exceeds bound"));
         }
         let context: Context = serde_json::from_slice(&bytes)?;
-        if context.format_version != 1
+        if context.format_version != 2
             || context.provider != "codex"
             || uuid::Uuid::parse_str(&context.context_id).is_err()
             || context.binding_digest.len() != 64
@@ -106,25 +110,50 @@ impl RecoveryObserver {
         {
             return Err(Error::other("unsupported Workgroups recovery context"));
         }
+        let assignment = context
+            .conversation_id
+            .as_deref()
+            .map(ThreadId::from_string)
+            .transpose()
+            .map_err(Error::other)?;
         Ok(Self {
             context,
             path: path.with_extension("checkpoint.json"),
             pane,
             process: process_birth()?,
+            assignment,
+            initial_observed: false,
             last: None,
         })
     }
 
-    pub(crate) fn transition(&mut self) -> std::io::Result<()> {
-        self.write(/*thread_id*/ None, "transition", "unknown")
+    pub(crate) fn interrupted(&mut self) -> std::io::Result<()> {
+        self.write(self.assignment, "observed", "recover")
     }
 
     pub(crate) fn observed(&mut self, thread_id: Option<ThreadId>) -> std::io::Result<()> {
-        self.write(thread_id, "observed", "recover")
+        if self.initial_observed {
+            return Ok(());
+        }
+        let Some(thread_id) = thread_id else {
+            return Ok(());
+        };
+        if self
+            .assignment
+            .is_some_and(|assigned| assigned != thread_id)
+        {
+            return Err(std::io::Error::other(
+                "Workgroups assigned conversation did not resume",
+            ));
+        }
+        self.assignment = Some(thread_id);
+        self.write(Some(thread_id), "observed", "recover")?;
+        self.initial_observed = true;
+        Ok(())
     }
 
-    pub(crate) fn stopped(&mut self, thread_id: Option<ThreadId>) -> std::io::Result<()> {
-        self.write(thread_id, "observed", "stopped")
+    pub(crate) fn stopped(&mut self) -> std::io::Result<()> {
+        self.write(self.assignment, "observed", "stopped")
     }
 
     fn write(
@@ -138,13 +167,14 @@ impl RecoveryObserver {
             return Ok(());
         }
         let value = Checkpoint {
-            format_version: 1,
+            format_version: 2,
             context_id: &self.context.context_id,
             binding_digest: &self.context.binding_digest,
             provider: "codex",
             pane_id: &self.pane,
             pid: std::process::id(),
             process: &self.process,
+            assignment_id: self.assignment.map(|id| id.to_string()),
             conversation_id: thread_id.map(|id| id.to_string()),
             phase,
             intent,
@@ -243,10 +273,12 @@ fn process_birth() -> std::io::Result<ProcessBirth> {
     let start = std::process::Command::new("/bin/ps")
         .args(["-p", &std::process::id().to_string(), "-o", "lstart="])
         .env("LC_ALL", "C")
+        .env("TZ", "UTC")
         .output()?;
     let boot = std::process::Command::new("/usr/sbin/sysctl")
         .args(["-n", "kern.boottime"])
         .env("LC_ALL", "C")
+        .env("TZ", "UTC")
         .output()?;
     if !start.status.success() || !boot.status.success() {
         return Err(std::io::Error::other("process birth unavailable"));

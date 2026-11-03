@@ -1033,18 +1033,7 @@ See the Codex keymap documentation for supported actions and examples."
         } else {
             loop {
                 if let Some(observer) = recovery_observer.as_mut() {
-                    if app.reconnect.offline
-                        || app.pending_open_resume_picker
-                        || app.pending_working_directory_change.is_some()
-                        || app.pending_start_managed_worktree.is_some()
-                        || app.pending_managed_worktree_attach.is_some()
-                        || app.pending_managed_worktree_transition.is_some()
-                        || app.pending_managed_worktree_created.is_some()
-                    {
-                        observer.transition()?;
-                    } else {
-                        observer.observed(app.current_displayed_thread_id())?;
-                    }
+                    observer.observed(app.current_displayed_thread_id())?;
                 }
                 // Reconnect can dismiss an overlay from the server-event path.
                 if app.overlay.is_none() {
@@ -1125,7 +1114,6 @@ See the Codex keymap documentation for supported actions and examples."
                     .and_then(|interval| app.rate_limit_refresh_state.poll_deadline(interval));
                 let control = select! {
                     Some(event) = app_event_rx.recv() => {
-                        if let Some(observer) = recovery_observer.as_mut() { observer.transition()?; }
                         let is_initial_session_header = matches!(
                             &event,
                             AppEvent::InsertHistoryCell(cell)
@@ -1160,7 +1148,6 @@ See the Codex keymap documentation for supported actions and examples."
                         waiting_for_initial_session_configured,
                         app.active_thread_rx.is_some()
                     ) && !has_pending_app_events && !app.reconnect.offline => {
-                        if let Some(observer) = recovery_observer.as_mut() { observer.transition()?; }
                         if let Some(event) = active {
                             if let Err(err) = app.handle_active_thread_event(tui, &mut app_server, event).await {
                                 break Err(err);
@@ -1173,7 +1160,6 @@ See the Codex keymap documentation for supported actions and examples."
                     event = tui_events.next(), if app.pending_thread_switch_resets == 0
                         && (app.reconnect.offline || !block_terminal_input_for_pending_startup_events) => {
                         if let Some(event) = event {
-                            if let Some(observer) = recovery_observer.as_mut() { observer.transition()?; }
                             if (matches!(
                                 &event,
                                 TuiEvent::Key(key)
@@ -1207,7 +1193,6 @@ See the Codex keymap documentation for supported actions and examples."
                     }
                     app_server_event = app_server.next_event(), if listen_for_app_server_events && !app.reconnect.offline
                         && (matches!(app.app_server_target, AppServerTarget::Embedded) || !has_pending_app_events) => {
-                        if let Some(observer) = recovery_observer.as_mut() { observer.transition()?; }
                         match app_server_event {
                             Some(event) => app.handle_app_server_event(&app_server, event).await,
                             None => {
@@ -1219,7 +1204,6 @@ See the Codex keymap documentation for supported actions and examples."
                         AppRunControl::Continue
                     }
                     result = async { match reconnect.as_mut() { Some(future) => future.await, None => std::future::pending().await } }, if reconnect.is_some() && !has_pending_app_events => {
-                        if let Some(observer) = recovery_observer.as_mut() { observer.transition()?; }
                         reconnect = None;
                         match result {
                             Ok(connected) => {
@@ -1324,12 +1308,12 @@ See the Codex keymap documentation for supported actions and examples."
                     | ExitReason::ThreadRemoved,
                 ) => {
                     if recovery_terminal_closed {
-                        observer.transition()?;
+                        observer.interrupted()?;
                     } else {
-                        observer.stopped(app.current_displayed_thread_id())?;
+                        observer.stopped()?;
                     }
                 }
-                Ok(ExitReason::Fatal(_)) | Err(_) => observer.transition()?,
+                Ok(ExitReason::Fatal(_)) | Err(_) => observer.interrupted()?,
             }
         }
         if let Err(err) = app_server.shutdown().await {

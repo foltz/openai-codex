@@ -2845,7 +2845,7 @@ mod tests {
             &self,
             _uri: Arc<str>,
             message: ClientJsonRpcMessage,
-            _session_id: Option<Arc<str>>,
+            session_id: Option<Arc<str>>,
             _auth_header: Option<String>,
             _custom_headers: HashMap<HeaderName, HeaderValue>,
         ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
@@ -2856,11 +2856,27 @@ mod tests {
             if let Some(recovery_stall) = self.recovery_stall {
                 let initializes = self.posts().iter().filter(|method| method.as_str() == "initialize").count();
                 if method == "tools/list" {
+                    if session_id.as_deref() == Some("recovered-session") {
+                        let response = serde_json::from_value(json!({
+                            "jsonrpc": "2.0", "id": request["id"], "result": {"tools": []}
+                        })).expect("tools response");
+                        return Ok(StreamableHttpPostResponse::Json(response, None));
+                    }
                     return Err(StreamableHttpError::SessionExpired);
                 }
                 if initializes > 1 && method == "initialize" {
                     if recovery_stall == StartupStall::InitializePost {
                         return futures::future::pending().await;
+                    }
+                    if recovery_stall == StartupStall::InitializeBody
+                        || (recovery_stall == StartupStall::InitializedPost && initializes > 2)
+                    {
+                        let response = serde_json::from_value(json!({
+                            "jsonrpc": "2.0", "id": request["id"],
+                            "result": {"protocolVersion": "2025-06-18", "capabilities": {},
+                                "serverInfo": {"name": "recovery-test", "version": "1"}}
+                        })).expect("recovered initialize response");
+                        return Ok(StreamableHttpPostResponse::Json(response, Some("recovered-session".into())));
                     }
                     let response = serde_json::from_value(json!({
                         "jsonrpc": "2.0", "id": request["id"],
@@ -3329,6 +3345,42 @@ mod tests {
             if cancel {
                 assert!(send.take().expect("request handle").await.expect("cancelled request task").is_err());
             }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn successful_recovery_deletes_new_session_without_erasing_prior_uncertainty() {
+        for prior_failure in [false, true] {
+            let mut client = StartupClient::new(StartupStall::Nothing, DeleteOutcome::Succeeds);
+            client.recovery_stall = Some(if prior_failure {
+                StartupStall::InitializedPost
+            } else {
+                StartupStall::InitializeBody
+            });
+            let mut worker = startup_worker(&client);
+            worker.config.reinit_on_expired_session = true;
+            let mut transport = StartupTransport::spawn(worker);
+            deliver_initialize_response(&mut transport).await;
+            transport.send(initialized_notification()).await.expect("initialized");
+            if prior_failure {
+                let request = serde_json::from_value(json!({
+                    "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+                })).expect("first request");
+                assert!(transport.send(request).await.is_err());
+            }
+            let request = serde_json::from_value(json!({
+                "jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}
+            })).expect("second request");
+            tokio::time::timeout(Duration::from_secs(3), transport.send(request))
+                .await.expect("recovery completes").expect("retry succeeds");
+            assert!(transport.receive().await.is_some());
+            let result = close_within(&mut transport, Duration::from_secs(2)).await;
+            if prior_failure {
+                assert_eq!(incomplete_reason(&result), Some("session recovery may have created an unaccounted session"));
+            } else {
+                result.expect("successful recovery has complete cleanup");
+            }
+            assert_eq!(client.deletes(), vec!["recovered-session".to_owned()]);
         }
     }
 

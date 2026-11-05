@@ -511,15 +511,7 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
             .map_err(StreamableHttpClientAdapterError::from)
             .map_err(StreamableHttpError::Client)?;
 
-        if response.status == StatusCode::METHOD_NOT_ALLOWED.as_u16() {
-            return Ok(());
-        }
-        if !status_is_success(response.status) {
-            return Err(StreamableHttpError::UnexpectedServerResponse(
-                format!("DELETE returned HTTP {}", response.status).into(),
-            ));
-        }
-        Ok(())
+        delete_session_result(response.status)
     }
 
     async fn get_stream(
@@ -764,6 +756,25 @@ fn response_header(headers: &[HttpHeader], name: impl AsRef<str>) -> Option<Stri
         .iter()
         .find(|header| header.name.eq_ignore_ascii_case(name))
         .map(|header| header.value.clone())
+}
+
+/// Distinguish local release from established-session absence.
+/// The worker accepts 404 only when it has the initialized session identity.
+fn delete_session_result(
+    status: u16,
+) -> std::result::Result<(), StreamableHttpError<StreamableHttpClientAdapterError>> {
+    if status == StatusCode::METHOD_NOT_ALLOWED.as_u16() {
+        return Err(StreamableHttpError::ServerDoesNotSupportDeleteSession);
+    }
+    if status == StatusCode::NOT_FOUND.as_u16() {
+        return Err(StreamableHttpError::SessionExpired);
+    }
+    if !status_is_success(status) {
+        return Err(StreamableHttpError::UnexpectedServerResponse(
+            format!("DELETE returned HTTP {status}").into(),
+        ));
+    }
+    Ok(())
 }
 
 fn status_is_success(status: u16) -> bool {

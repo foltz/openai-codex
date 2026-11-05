@@ -162,7 +162,7 @@ impl StreamableHttpClient for reqwest::Client {
         // if method no allowed
         if response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED {
             tracing::debug!("this server doesn't support deleting session");
-            return Ok(());
+            return Err(StreamableHttpError::ServerDoesNotSupportDeleteSession);
         }
         // The server does not know this session: it is already gone.
         if response.status() == reqwest::StatusCode::NOT_FOUND {
@@ -419,6 +419,34 @@ mod tests {
         model::{ClientJsonRpcMessage, ClientRequest, JsonRpcMessage, PingRequest, RequestId},
         transport::streamable_http_client::{AuthRequiredError, InsufficientScopeError},
     };
+
+    #[tokio::test]
+    async fn delete_status_preserves_absence_and_local_release() -> anyhow::Result<()> {
+        use std::{collections::HashMap, sync::Arc};
+        use crate::transport::streamable_http_client::{StreamableHttpClient, StreamableHttpError};
+        for status in [204, 404, 405, 500] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let addr = listener.local_addr()?;
+            let server = tokio::spawn(async move {
+                axum::serve(listener, axum::Router::new().route("/mcp", axum::routing::delete(move || async move {
+                    http::StatusCode::from_u16(status).expect("fixture status")
+                }))).await
+            });
+            let result = reqwest::Client::new().delete_session(
+                Arc::from(format!("http://{addr}/mcp")), Arc::from("established-session"),
+                None, HashMap::new(),
+            ).await;
+            server.abort();
+            let _ = server.await;
+            match status {
+                204 => assert!(result.is_ok()),
+                404 => assert!(matches!(result, Err(StreamableHttpError::SessionExpired))),
+                405 => assert!(matches!(result, Err(StreamableHttpError::ServerDoesNotSupportDeleteSession))),
+                _ => assert!(matches!(result, Err(StreamableHttpError::Client(_)))),
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn auth_required_error_new() {

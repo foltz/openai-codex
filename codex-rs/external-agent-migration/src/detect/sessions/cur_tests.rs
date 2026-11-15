@@ -430,3 +430,48 @@ fn encode_project_path(path: &Path) -> String {
         .trim_start_matches('/')
         .replace('/', "-")
 }
+
+#[test]
+fn resolves_independently_punctuated_project_ancestors() {
+    let root = TempDir::new().expect("tempdir");
+    let project = root
+        .path()
+        .join("first-parent")
+        .join("second.parent")
+        .join("third leaf");
+    fs::create_dir_all(&project).expect("project");
+    assert_eq!(
+        decode_cur_project_path(&encode_project_path(&project)),
+        Some(project)
+    );
+}
+
+#[test]
+fn cur_project_entry_budget_exhaustion_refuses_partial_matches() {
+    let root = TempDir::new().expect("tempdir");
+    fs::create_dir(root.path().join("project")).expect("project");
+    let mut budget = CurProjectProbeBudget {
+        paths: 1,
+        entries: 0,
+    };
+    assert_eq!(
+        cur_project_children(root.path(), &["project"], 0, &mut budget),
+        None
+    );
+}
+
+#[test]
+fn small_cur_candidate_sets_do_not_enumerate_unrelated_entries() {
+    let root = TempDir::new().expect("tempdir");
+    let project = root.path().join("project");
+    fs::create_dir(&project).expect("project");
+    let mut budget = CurProjectProbeBudget {
+        paths: 128,
+        entries: 0,
+    };
+    assert_eq!(
+        cur_project_children(root.path(), &["project"], 0, &mut budget),
+        Some(vec![(project, 1)])
+    );
+    assert_eq!(budget.entries, 0);
+}

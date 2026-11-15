@@ -272,6 +272,26 @@ impl PhysicalAttemptTicket {
 }
 
 impl RmcpClientRetirement {
+    #[cfg(test)]
+    pub(crate) fn attached_service_count(&self) -> usize {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .attempts
+            .iter()
+            .filter(|attempt| {
+                attempt
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .service
+                    .is_some()
+            })
+            .count()
+    }
+
     pub fn downgrade(&self) -> WeakRmcpClientRetirement {
         WeakRmcpClientRetirement {
             state: Arc::downgrade(&self.state),
@@ -715,6 +735,7 @@ impl<T: Transport<RoleClient> + 'static> ReturnedTransportOwner for TransportLea
 /// Records the real close result before rmcp can discard it.
 pub(crate) struct AcknowledgedTransport<T> {
     inner: Option<T>,
+    on_return: Option<fn(&mut T)>,
     lease: Arc<TransportLease<T>>,
 }
 
@@ -733,6 +754,11 @@ impl<T: Transport<RoleClient> + 'static> AcknowledgedTransport<T> {
     pub(crate) fn inner(&self) -> &T {
         self.inner.as_ref().expect("live transport")
     }
+    pub(crate) fn with_on_return(mut self, callback: fn(&mut T)) -> Self {
+        self.on_return = Some(callback);
+        self
+    }
+
     pub(crate) fn new(inner: T) -> (Self, TransportCloseReceipt) {
         let (closed, state) = watch::channel(CloseState::Pending);
         let lease = Arc::new(TransportLease {
@@ -742,6 +768,7 @@ impl<T: Transport<RoleClient> + 'static> AcknowledgedTransport<T> {
         (
             Self {
                 inner: Some(inner),
+                on_return: None,
                 lease: Arc::clone(&lease),
             },
             TransportCloseReceipt {
@@ -754,7 +781,12 @@ impl<T: Transport<RoleClient> + 'static> AcknowledgedTransport<T> {
 
 impl<T> Drop for AcknowledgedTransport<T> {
     fn drop(&mut self) {
-        if let Some(transport) = self.inner.take() {
+        if let Some(mut transport) = self.inner.take() {
+            if *self.lease.closed.borrow() == CloseState::Pending
+                && let Some(on_return) = self.on_return.take()
+            {
+                on_return(&mut transport);
+            }
             *self
                 .lease
                 .state
@@ -882,9 +914,10 @@ impl<S: Service<RoleClient>> ServiceOperationLease<S> {
 impl<S: Service<RoleClient>> Deref for ServiceOperationLease<S> {
     type Target = RunningService<RoleClient, S>;
     fn deref(&self) -> &Self::Target {
-        self.service
-            .as_ref()
-            .expect("lease retains its service until drop")
+        let Some(service) = self.service.as_ref() else {
+            panic!("lease retains its service until drop");
+        };
+        service
     }
 }
 

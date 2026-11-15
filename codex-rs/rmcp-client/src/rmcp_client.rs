@@ -148,9 +148,21 @@ enum RawPendingTransport {
     },
 }
 
+// Enforce Send at this local ownership boundary instead of requiring every
+// consumer of RmcpClient to traverse the concrete transport's nested types.
+trait ConnectingTransport: Send {
+    fn into_registered(self: Box<Self>) -> RegisteredTransport;
+}
+
+impl ConnectingTransport for RegisteredTransport {
+    fn into_registered(self: Box<Self>) -> RegisteredTransport {
+        *self
+    }
+}
+
 enum ClientState {
     Connecting {
-        transport: Option<RegisteredTransport>,
+        transport: Option<Box<dyn ConnectingTransport>>,
     },
     Ready {
         service: Arc<ManagedRunningService<ElicitationClientService>>,
@@ -487,7 +499,7 @@ impl RmcpClient {
 
         Ok(Self {
             state: Mutex::new(ClientState::Connecting {
-                transport: Some(transport),
+                transport: Some(Box::new(transport)),
             }),
             stdio_process: None,
             transport_recipe,
@@ -588,7 +600,7 @@ impl RmcpClient {
 
         Ok(Self {
             state: Mutex::new(ClientState::Connecting {
-                transport: Some(transport),
+                transport: Some(Box::new(transport)),
             }),
             stdio_process,
             transport_recipe,
@@ -734,7 +746,7 @@ impl RmcpClient {
         let transport = create_registered_transport(transport_recipe.clone(), &retirement).await?;
         Ok(Self {
             state: Mutex::new(ClientState::Connecting {
-                transport: Some(transport),
+                transport: Some(Box::new(transport)),
             }),
             stdio_process: None,
             transport_recipe,
@@ -767,7 +779,7 @@ impl RmcpClient {
             let mut guard = self.state.lock().await;
             match &mut *guard {
                 ClientState::Connecting { transport } => match transport.take() {
-                    Some(transport) => transport,
+                    Some(transport) => transport.into_registered(),
                     None => return Err(anyhow!("client already initializing")),
                 },
                 ClientState::Ready { .. } => return Err(anyhow!("client already initialized")),

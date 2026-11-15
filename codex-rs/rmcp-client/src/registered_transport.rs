@@ -73,7 +73,9 @@ impl RegisteredTransport {
                 let (transport, receipt) = AcknowledgedTransport::new(*transport);
                 (
                     PendingTransport::Stdio {
-                        transport: Box::new(transport),
+                        transport: Box::new(
+                            transport.with_on_return(StdioServerTransport::finish_discovery),
+                        ),
                     },
                     receipt,
                 )
@@ -169,9 +171,20 @@ where
             >,
         > + Send,
 {
-    let service = future
-        .await
-        .map_err(|source| super::streamable_http_retry::HandshakeError { source })?;
+    let service = match future.await {
+        Ok(service) => service,
+        Err(source) => {
+            // Preserve EOF-before-restart. A failed initialization returns its
+            // exact transport to the receipt; close failure stays recorded there
+            // and never changes the upstream handshake classification.
+            let _ = receipt
+                .close_returned_until(
+                    tokio::time::Instant::now() + crate::retirement::DEFAULT_RETIREMENT_TIMEOUT,
+                )
+                .await;
+            return Err(super::streamable_http_retry::HandshakeError { source }.into());
+        }
+    };
     service
         .peer()
         .set_response_cache_config(ClientCacheConfig::disabled())

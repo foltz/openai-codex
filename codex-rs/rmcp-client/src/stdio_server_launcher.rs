@@ -341,6 +341,12 @@ impl Drop for StdioServerTransport {
 }
 
 impl StdioServerTransport {
+    pub(super) fn finish_discovery(&mut self) {
+        if let StdioServerTransportInner::Local(local) = &mut self.inner {
+            local.finish_discovery();
+        }
+    }
+
     pub(super) fn protocol_mode(&self) -> McpProtocolMode {
         self.protocol_mode
     }

@@ -2147,8 +2147,8 @@ async fn pooled_worker_context_preserves_connection_identity_and_external_proces
     );
 }
 
-#[test]
-fn account_required_and_ungated_clients_cannot_share_a_pool_key() {
+#[tokio::test]
+async fn account_required_and_ungated_clients_cannot_share_a_pool_key() {
     let context = context();
     let first = key(&context, &config());
     let mut required = first.clone();

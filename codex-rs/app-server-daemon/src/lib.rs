@@ -16,7 +16,9 @@ pub use launch::restart_with_features;
 pub use launch::start_with_features;
 pub use launch::start_with_features_classified;
 mod managed_install;
+#[allow(dead_code)] // Managed builds never install or replace their own package.
 mod prepare_install;
+#[allow(dead_code)] // Retained for upstream tests; managed packages are externally retained.
 mod release_pruning;
 pub use prepare_install::InstallRequest;
 pub use prepare_install::update_from_cli;
@@ -24,6 +26,7 @@ mod remote_control_client;
 mod settings;
 pub mod telemetry;
 mod thread_recovery;
+#[allow(dead_code)] // Legacy update internals stay testable without production authority.
 mod update_loop;
 
 use std::collections::BTreeMap;
@@ -69,6 +72,8 @@ const DAEMON_UPDATE_PID_FILE_NAME: &str = "daemon-updater.pid";
 const OPERATION_LOCK_FILE_NAME: &str = "daemon.lock";
 const SETTINGS_FILE_NAME: &str = "settings.json";
 const STATE_DIR_NAME: &str = "app-server-daemon";
+
+pub const MANAGED_UPDATE_DISABLED_MESSAGE: &str = "codex self-update is disabled in this managed distribution; use the managed release and promotion workflow instead";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LifecycleCommand {
@@ -296,15 +301,11 @@ pub async fn set_remote_control(mode: RemoteControlMode) -> Result<RemoteControl
 }
 
 pub async fn run_pid_update_loop(
-    http_client_factory: codex_http_client::HttpClientFactory,
-    restore_release: Option<String>,
+    _http_client_factory: codex_http_client::HttpClientFactory,
+    _restore_release: Option<String>,
 ) -> Result<()> {
-    ensure_supported_platform()?;
-    #[cfg(windows)]
-    backend::windows::ensure_not_elevated()?;
-    update_loop::run(http_client_factory, restore_release).await
+    anyhow::bail!(MANAGED_UPDATE_DISABLED_MESSAGE)
 }
-
 pub use backend::stderr_log::stderr_writer;
 
 /// Routes managed app-server logs through a bounded queue to a dedicated file worker.
@@ -320,14 +321,10 @@ pub fn maintain_stderr_log() -> Result<()> {
 }
 
 pub async fn update(
-    http_client_factory: codex_http_client::HttpClientFactory,
+    _http_client_factory: codex_http_client::HttpClientFactory,
 ) -> Result<UpdateOutput> {
-    ensure_supported_platform()?;
-    #[cfg(windows)]
-    backend::windows::ensure_not_elevated()?;
-    update_loop::request_manual_update(&Daemon::from_environment()?, http_client_factory).await
+    anyhow::bail!(MANAGED_UPDATE_DISABLED_MESSAGE)
 }
-
 #[cfg(any(unix, windows))]
 fn ensure_supported_platform() -> Result<()> {
     Ok(())
@@ -449,6 +446,7 @@ impl Daemon {
     ) -> Result<LifecycleOutput, StartError> {
         let mut managed = self.clone();
         let mut settings = self.load_settings().await?;
+        self.stop_pid_update_loop(&settings).await?;
         let (status, backend, pid, info) = if let Ok(info) = client::probe(&self.socket_path).await
         {
             (
@@ -507,6 +505,7 @@ impl Daemon {
     }
 
     async fn restart_with_settings(&self, settings: DaemonSettings) -> Result<LifecycleOutput> {
+        self.stop_pid_update_loop(&settings).await?;
         if client::probe(&self.socket_path).await.is_ok()
             && self.running_backend(&settings).await?.is_none()
         {
@@ -560,7 +559,7 @@ impl Daemon {
         &self,
         mode: RestartMode,
         managed_codex_bin: &Path,
-        package_root: &Path,
+        _package_root: &Path,
     ) -> Result<RestartIfRunningOutcome> {
         let operation_lock = self.open_operation_lock_file().await?;
         if !try_lock_file(&operation_lock)? {
@@ -656,20 +655,7 @@ impl Daemon {
         {
             return Ok(RestartIfRunningOutcome::AlreadyCurrent);
         }
-        // All exits for busy, not-ready or superseded selections precede cleanup.
-        // Keep the operation lock, and recheck readiness's selection under both locks.
-        if package_root.ends_with("app-server-daemon")
-            && let Ok(_install_lock) = install_lock::acquire_install_lock(package_root).await
-            && let Ok(current_bin) = self.current_managed_codex_bin()
-            && managed_install::resolved_managed_codex_bin(&current_bin)
-                .await
-                .ok()
-                .as_deref()
-                == Some(managed_codex_bin)
-            && let Err(error) = release_pruning::prune(self, package_root, &settings).await
-        {
-            tracing::debug!(%error, "skipped daemon release pruning");
-        }
+        // Package retention and pruning belong to the external release owner.
         Ok(outcome)
     }
 
@@ -885,6 +871,7 @@ impl Daemon {
     async fn bootstrap_locked(&self, options: BootstrapOptions) -> Result<BootstrapOutput> {
         let mut settings = self.load_settings().await?;
         settings.remote_control_enabled = options.remote_control_enabled;
+        self.stop_pid_update_loop(&settings).await?;
         if client::probe(&self.socket_path).await.is_ok()
             && self.running_backend(&settings).await?.is_none()
         {
@@ -1015,44 +1002,9 @@ impl Daemon {
     }
 
     async fn ensure_managed_updater(&self, settings: &DaemonSettings) -> Result<bool> {
-        let updater = backend::pid_update_loop_backend(self.backend_paths(settings));
-        if !settings.auto_update_enabled {
-            updater.stop().await?;
-            return Ok(false);
-        }
-        if !self.is_stable_standalone_release()? {
-            // An installer publishes current and the latest marker separately.
-            // Keep its updater alive while that publication may be in progress.
-            if !self.has_latest_selection_marker() {
-                updater.stop().await?;
-            }
-            return Ok(false);
-        }
-        let Ok(codex_bin) =
-            managed_install::resolved_managed_codex_bin(&self.managed_codex_bin).await
-        else {
-            if !self.has_latest_selection_marker() {
-                updater.stop().await?;
-            }
-            return Ok(false);
-        };
-        if !managed_install::supports_daemon_update_loop(&codex_bin).await
-            || !self.is_stable_standalone_release()?
-            || !managed_install::resolved_managed_codex_bin(&self.managed_codex_bin)
-                .await
-                .is_ok_and(|selected| selected == codex_bin)
-        {
-            if !self.has_latest_selection_marker() {
-                updater.stop().await?;
-            }
-            return Ok(false);
-        }
-        backend::pid_update_loop_backend(self.backend_paths_with_bin(settings, &codex_bin))
-            .start()
-            .await?;
-        Ok(true)
+        self.stop_pid_update_loop(settings).await?;
+        Ok(false)
     }
-
     fn is_stable_standalone_release(&self) -> Result<bool> {
         let codex_home = self
             .settings_file
@@ -1087,16 +1039,14 @@ impl Daemon {
     }
 
     async fn is_bootstrapped(&self, settings: &DaemonSettings) -> Result<bool> {
-        if !settings.auto_update_enabled
-            || !self.is_stable_standalone_release()?
-            || !managed_install::supports_daemon_update_loop(&self.managed_codex_bin).await
-        {
-            return Ok(self.running_backend_instance(settings).await?.is_some());
-        }
-        let updater = backend::pid_update_loop_backend(self.backend_paths(settings));
-        updater.is_starting_or_running().await
+        Ok(self.running_backend_instance(settings).await?.is_some())
     }
 
+    async fn stop_pid_update_loop(&self, settings: &DaemonSettings) -> Result<()> {
+        backend::pid_update_loop_backend(self.backend_paths(settings))
+            .stop()
+            .await
+    }
     fn ensure_managed_codex_bin(&self) -> Result<()> {
         if self.managed_codex_bin.is_file() {
             #[cfg(windows)]
@@ -1602,4 +1552,18 @@ mod tests {
             "early_child_exit"
         );
     }
+    #[tokio::test]
+    async fn pid_update_loop_is_refused_before_constructing_the_update_loop() {
+        let error = super::run_pid_update_loop(
+            codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            ),
+            /*restore_release*/ None,
+        )
+        .await
+        .expect_err("managed distribution must refuse the pid update loop");
+
+        assert_eq!(error.to_string(), super::MANAGED_UPDATE_DISABLED_MESSAGE);
+    }
+
 }

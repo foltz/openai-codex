@@ -1,3 +1,4 @@
+use super::SessionLoopOutcome;
 use super::Submission;
 use crate::McpRefreshReason;
 use crate::WithTurnExtensionData;

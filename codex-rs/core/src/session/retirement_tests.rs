@@ -584,43 +584,51 @@ impl Drop for GatedLegacyWork {
 
 #[tokio::test]
 async fn normal_loop_without_its_attached_cleanup_receipt_is_refused() {
-    let (tx_sub, rx_sub) = async_channel::bounded(1);
-    drop(rx_sub);
-    let (_tx_event, rx_event) = async_channel::unbounded();
-    let mut termination =
-        super::super::session_loop_termination_from_handle(tokio::spawn(async {}));
-    let owner = Arc::new(SessionCleanupOwner::default());
-    termination.cleanup_owner = Some(Arc::clone(&owner));
-    let io = super::super::SessionIo {
-        tx_sub,
-        rx_event,
-        agent_status: tokio::sync::watch::channel(super::super::AgentStatus::PendingInit).1,
-        session_loop_termination: termination,
+    let clean = CleanupExecution::Finished {
+        persistence_failed: false,
     };
-    assert!(
-        io.shutdown_and_wait().await.is_err(),
-        "normal loop lacks cleanup evidence"
-    );
-    owner.state.lock().unwrap().completion = Some(
-        futures::future::ready(CleanupExecution::Finished {
-            persistence_failed: false,
-        })
-        .boxed()
-        .shared(),
-    );
-    assert!(
-        io.shutdown_and_wait().await.is_ok(),
-        "recorded original clean receipt"
-    );
-    owner.state.lock().unwrap().completion = Some(
-        futures::future::ready(CleanupExecution::McpFailed)
-            .boxed()
-            .shared(),
-    );
-    assert!(
-        io.shutdown_and_wait().await.is_err(),
-        "normal loop cannot erase failed cleanup"
-    );
+    for receipt in [
+        None,
+        Some(clean),
+        Some(CleanupExecution::McpFailed),
+        Some(CleanupExecution::Finished {
+            persistence_failed: true,
+        }),
+    ] {
+        let (tx_sub, rx_sub) = async_channel::bounded(1);
+        drop(rx_sub);
+        let (_tx_event, rx_event) = async_channel::unbounded();
+        let mut termination =
+            super::super::session_loop_termination_from_handle(tokio::spawn(async {}));
+        let owner = Arc::new(SessionCleanupOwner::default());
+        termination.cleanup_owner = Some(Arc::clone(&owner));
+        let io = super::super::SessionIo {
+            tx_sub,
+            rx_event,
+            agent_status: tokio::sync::watch::channel(super::super::AgentStatus::PendingInit).1,
+            session_loop_termination: termination,
+        };
+        assert!(
+            io.shutdown_and_wait().await.is_err(),
+            "normal loop lacks cleanup evidence"
+        );
+        if let Some(receipt) = receipt {
+            let original = futures::future::ready(receipt).boxed().shared();
+            owner.state.lock().unwrap().completion = Some(original.clone());
+            assert!(
+                io.shutdown_and_wait().await.is_err(),
+                "ready but unobserved is not recorded"
+            );
+            assert_eq!(original.await, receipt);
+            assert_eq!(owner.completed(), Some(receipt));
+            assert_eq!(io.shutdown_and_wait().await.is_ok(), receipt == clean);
+            assert_eq!(
+                owner.completed(),
+                Some(receipt),
+                "observation did not change the original receipt"
+            );
+        }
+    }
 }
 
 #[tokio::test(start_paused = true)]

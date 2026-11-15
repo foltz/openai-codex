@@ -137,7 +137,7 @@ impl MailboxPreparationSlot {
 }
 
 impl MailboxPreparation {
-    pub(super) async fn cancelled(&self) {
+    pub(crate) async fn cancelled(&self) {
         self.preparation.cancellation.cancelled().await;
     }
 

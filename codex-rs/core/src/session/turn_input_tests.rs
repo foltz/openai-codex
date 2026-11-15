@@ -1288,3 +1288,157 @@ async fn closed_task_admission_never_reports_a_started_submission() {
         crate::tasks::TaskJoinOutcome::Complete { panicked: false }
     );
 }
+
+#[derive(Default)]
+struct HoldFirstIdlePreparation {
+    entered: CancellationToken,
+    dropped: CancellationToken,
+    first: std::sync::atomic::AtomicBool,
+    committed: std::sync::Mutex<Vec<String>>,
+}
+
+impl codex_extension_api::TurnLifecycleContributor for HoldFirstIdlePreparation {
+    fn on_turn_start<'a>(
+        &'a self,
+        _: codex_extension_api::TurnStartInput<'a>,
+    ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+        Box::pin(async move {
+            if !self.first.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                let _original = self.dropped.clone().drop_guard();
+                self.entered.cancel();
+                // There is deliberately no release signal: only cancellation
+                // of the actual preparation future can unblock its replacer.
+                std::future::pending::<()>().await;
+            }
+        })
+    }
+
+    fn on_turn_committed(&self, input: codex_extension_api::TurnCommittedInput<'_>) {
+        self.committed
+            .lock()
+            .unwrap()
+            .push(input.turn_id.to_owned());
+    }
+}
+
+#[derive(Debug)]
+struct IdlePreparationMailWork(Arc<std::sync::Mutex<Vec<String>>>);
+impl codex_protocol::host_turn_work::HostTurnWork for IdlePreparationMailWork {
+    fn bind_submission(&mut self, turn_id: &str) {
+        self.0.lock().unwrap().push(format!("bound:{turn_id}"));
+    }
+    fn retain_until_terminal(self: Box<Self>) {
+        self.0.lock().unwrap().push("retained".to_owned());
+    }
+}
+impl Drop for IdlePreparationMailWork {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().push("released".to_owned());
+    }
+}
+
+#[test_case(false; "replacement")]
+#[test_case(true; "shutdown")]
+#[tokio::test]
+async fn idle_preparation_cancellation_drops_original_before_replacement_or_shutdown(
+    closing: bool,
+) {
+    let (mut session, _) = make_session_and_context().await;
+    let held = Arc::new(HoldFirstIdlePreparation::default());
+    let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
+    extensions.turn_lifecycle_contributor(held.clone());
+    session.services.extensions = Arc::new(extensions.build());
+    let session = Arc::new(session);
+    let before = session.state.lock().await.last_started_turn_id.clone();
+    let work = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let message = InterAgentCommunication::new(
+        AgentPath::root(),
+        AgentPath::try_from("/root/worker").unwrap(),
+        Vec::new(),
+        "queue-only mail survives abandoned idle preparation".into(),
+        false,
+    );
+    session.input_queue.enqueue_mailbox_with_work(
+        message.into(),
+        Default::default(),
+        Some(Box::new(IdlePreparationMailWork(Arc::clone(&work)))),
+    );
+    let old_session = Arc::clone(&session);
+    let old = tokio::spawn(async move {
+        handle(
+            &old_session,
+            TurnInputRequest::new(SubmittedTurnInput::ResponseItem(user_message("abandoned"))),
+            TurnInputMode::StartIfIdle,
+            "abandoned-idle".to_owned(),
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(10), held.entered.cancelled())
+        .await
+        .expect("actual idle request reaches the held contributor");
+    assert!(!session.input_queue.has_pending_mailbox_items().await);
+    assert!(work.lock().unwrap().is_empty());
+    let replacement = if closing {
+        session.close_task_admission().await;
+        None
+    } else {
+        let context = session
+            .new_turn_with_default_settings("winning-replacement".into(), Default::default())
+            .await;
+        let new_session = Arc::clone(&session);
+        Some(tokio::spawn(async move {
+            new_session
+                .try_spawn_task(
+                    context,
+                    Vec::new(),
+                    NeverEndingTask {
+                        kind: TaskKind::Regular,
+                        listen_to_cancellation_token: true,
+                    },
+                )
+                .await
+        }))
+    };
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), old)
+        .await
+        .expect("cancellation does not wait for a contributor release")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        result,
+        TurnInputSubmission::NotSubmitted {
+            reason: if closing {
+                NotSubmittedReason::ServerDraining
+            } else {
+                NotSubmittedReason::Superseded
+            }
+        }
+    );
+    assert!(held.dropped.is_cancelled());
+    if let Some(replacement) = replacement {
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(10), replacement)
+                .await
+                .expect("replacement finishes after the original owner drops")
+                .unwrap()
+        );
+        assert_eq!(*held.committed.lock().unwrap(), ["winning-replacement"]);
+        assert_eq!(
+            session.state.lock().await.last_started_turn_id.as_deref(),
+            Some("winning-replacement")
+        );
+        assert_eq!(
+            *work.lock().unwrap(),
+            ["bound:winning-replacement", "retained", "released"]
+        );
+        assert!(!session.input_queue.has_pending_mailbox_items().await);
+        session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+    } else {
+        assert!(held.committed.lock().unwrap().is_empty());
+        assert_eq!(session.state.lock().await.last_started_turn_id, before);
+        assert!(session.active_turn.lock().await.is_none());
+        assert!(session.input_queue.has_pending_mailbox_items().await);
+        assert!(work.lock().unwrap().is_empty());
+    }
+    assert!(!session.input_queue.preparation.is_busy());
+}

@@ -594,8 +594,17 @@ async fn start_if_idle(
         });
     }
 
-    let (turn_state, _registration) = {
+    let (turn_state, registration) = {
         let mut active_turn = session.active_turn.lock().await;
+        // Closure can race the optimistic check before this reservation lock.
+        if session
+            .task_admission_closed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(TurnInputSubmission::NotSubmitted {
+                reason: NotSubmittedReason::ServerDraining,
+            });
+        }
         if active_turn.is_some() || session.input_queue.preparation.is_busy() {
             return Ok(TurnInputSubmission::NotSubmitted {
                 reason: NotSubmittedReason::NotIdle,
@@ -615,112 +624,127 @@ async fn start_if_idle(
         )
     };
 
-    if session.input_queue.has_trigger_turn_mailbox_items().await {
-        session.clear_reserved_idle_turn(&turn_state).await;
-        session.input_queue.completion_wake.notify_one();
-        return Ok(TurnInputSubmission::NotSubmitted {
-            reason: NotSubmittedReason::PendingTriggerTurn,
-        });
-    }
-
-    let settings = match PreparedTurnInputSettings::prepare(
-        session,
-        WithTurnExtensionData {
-            request: thread_settings,
-            turn_extension_init,
-        },
-        start,
-    )
-    .await
-    {
-        Ok(settings) => settings,
-        Err(error) => {
-            session.clear_reserved_idle_turn(&turn_state).await;
-            return Err(error);
-        }
-    };
-    let turn_context = match settings
-        .apply_started(session, submission_id.clone(), kind)
-        .await
-    {
-        Ok(Some(turn_context)) => turn_context,
-        Ok(None) => {
-            session.clear_reserved_idle_turn(&turn_state).await;
-            return Ok(TurnInputSubmission::NotSubmitted {
-                reason: NotSubmittedReason::PlanMode,
-            });
-        }
-        Err(error) => {
-            session.clear_reserved_idle_turn(&turn_state).await;
-            return Err(error);
-        }
-    };
-    turn_context
-        .turn_metadata_state
-        .update_responsesapi_client_metadata(responsesapi_client_metadata);
-    session
-        .maybe_emit_model_warnings_for_turn(turn_context.as_ref())
-        .await;
-
-    let mut task_input =
-        merge_additional_context_input(session, &turn_context, additional_context).await;
-    let sender_messages = capture_sender_user_messages(session, &mut input).await;
-    match kind {
-        TurnStartKind::User => {
-            session.clear_connector_selection().await;
-            task_input.push(
-                pending_turn_input(
-                    session,
-                    input,
-                    sender_messages.as_ref(),
-                    &turn_context.sub_id,
-                    input_metadata,
-                )
-                .await,
-            );
-        }
-        TurnStartKind::Automatic | TurnStartKind::Recovery => {
-            // Empty automatic user input resumes sampling without a new message.
-            if !matches!(&input, SubmittedTurnInput::UserInput { .. }) {
-                task_input.push(
-                    pending_turn_input(
-                        session,
-                        input,
-                        sender_messages.as_ref(),
-                        &turn_context.sub_id,
-                        input_metadata,
-                    )
-                    .await,
-                );
-                // Automatic turns drain their queued input before sampling. Keep the
-                // context and the input it describes together for the first request.
-                session
-                    .input_queue
-                    .extend_pending_input_for_turn_state(
-                        turn_state.as_ref(),
-                        std::mem::take(&mut task_input),
-                    )
-                    .await;
+    // Keep all post-reservation waits under the same cancellable owner.
+    // The losing future drops its private mail and contributor resources before
+    // cleanup clears only this reservation or releases replacement waiters.
+    let result = {
+        let prepare = async {
+            if session.input_queue.has_trigger_turn_mailbox_items().await {
+                return Ok(TurnInputSubmission::NotSubmitted {
+                    reason: NotSubmittedReason::PendingTriggerTurn,
+                });
             }
+
+            let settings = PreparedTurnInputSettings::prepare(
+                session,
+                WithTurnExtensionData {
+                    request: thread_settings,
+                    turn_extension_init,
+                },
+                start,
+            )
+            .await?;
+            let turn_context = match settings
+                .apply_started(session, submission_id.clone(), kind)
+                .await?
+            {
+                Some(turn_context) => turn_context,
+                None => {
+                    return Ok(TurnInputSubmission::NotSubmitted {
+                        reason: NotSubmittedReason::PlanMode,
+                    });
+                }
+            };
+            turn_context
+                .turn_metadata_state
+                .update_responsesapi_client_metadata(responsesapi_client_metadata);
+            session
+                .maybe_emit_model_warnings_for_turn(turn_context.as_ref())
+                .await;
+
+            let mut task_input =
+                merge_additional_context_input(session, &turn_context, additional_context).await;
+            let sender_messages = capture_sender_user_messages(session, &mut input).await;
+            match kind {
+                TurnStartKind::User => {
+                    session.clear_connector_selection().await;
+                    task_input.push(
+                        pending_turn_input(
+                            session,
+                            input,
+                            sender_messages.as_ref(),
+                            &turn_context.sub_id,
+                            input_metadata,
+                        )
+                        .await,
+                    );
+                }
+                TurnStartKind::Automatic | TurnStartKind::Recovery => {
+                    // Empty automatic user input resumes sampling without a new message.
+                    if !matches!(&input, SubmittedTurnInput::UserInput { .. }) {
+                        task_input.push(
+                            pending_turn_input(
+                                session,
+                                input,
+                                sender_messages.as_ref(),
+                                &turn_context.sub_id,
+                                input_metadata,
+                            )
+                            .await,
+                        );
+                        // Automatic turns drain their queued input before sampling. Keep the
+                        // context and the input it describes together for the first request.
+                        session
+                            .input_queue
+                            .extend_pending_input_for_turn_state(
+                                turn_state.as_ref(),
+                                std::mem::take(&mut task_input),
+                            )
+                            .await;
+                    }
+                }
+            }
+            if !session
+                .start_reserved_task(
+                    Arc::clone(&turn_context),
+                    task_input,
+                    RegularTask::new(),
+                    Arc::clone(&turn_state),
+                )
+                .await
+            {
+                return Ok(TurnInputSubmission::NotSubmitted {
+                    reason: NotSubmittedReason::ServerDraining,
+                });
+            }
+            Ok(TurnInputSubmission::Started {
+                turn_id: submission_id,
+                root_turn_id: turn_context.root_turn_id(),
+            })
+        };
+        tokio::select! {
+            biased;
+            _ = registration.cancelled() => Ok(TurnInputSubmission::NotSubmitted {
+                reason: if session.task_admission_closed.load(std::sync::atomic::Ordering::Acquire) {
+                    NotSubmittedReason::ServerDraining
+                } else {
+                    NotSubmittedReason::Superseded
+                },
+            }),
+            result = prepare => result,
+        }
+    };
+    if !matches!(&result, Ok(TurnInputSubmission::Started { .. })) {
+        session.clear_reserved_idle_turn(&turn_state).await;
+        if !session
+            .task_admission_closed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            session.input_queue.completion_wake.notify_one();
         }
     }
-    if !session
-        .start_reserved_task(
-            Arc::clone(&turn_context),
-            task_input,
-            RegularTask::new(),
-            turn_state,
-        )
-        .await
-    {
-        return Ok(TurnInputSubmission::NotSubmitted {
-            reason: NotSubmittedReason::ServerDraining,
-        });
-    }
-    Ok(TurnInputSubmission::Started {
-        turn_id: submission_id,
-        root_turn_id: turn_context.root_turn_id(),
-    })
+    drop(registration);
+    result
 }
 
 async fn steer(

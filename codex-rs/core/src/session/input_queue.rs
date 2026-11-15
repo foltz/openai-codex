@@ -129,6 +129,7 @@ pub(crate) struct InputQueue {
     mailbox: super::mailbox::Mailbox,
     pub(crate) completion_wake: Arc<tokio::sync::Notify>,
     pub(crate) preparation: crate::tasks::MailboxPreparationSlot,
+    pub(crate) work_retry: super::turn_work::MailboxWorkRetry,
 }
 
 impl InputQueue {
@@ -139,6 +140,7 @@ impl InputQueue {
             activity_tx,
             completion_wake: Arc::new(tokio::sync::Notify::new()),
             preparation: crate::tasks::MailboxPreparationSlot::default(),
+            work_retry: super::turn_work::MailboxWorkRetry::default(),
         }
     }
 

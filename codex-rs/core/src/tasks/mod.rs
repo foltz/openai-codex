@@ -292,6 +292,9 @@ impl Session {
             let mut active = self.active_turn.lock().await;
             self.task_admission_closed
                 .store(true, std::sync::atomic::Ordering::Release);
+            // A reservation can register while this closer waits for active_turn.
+            // Recheck under that same lock before declaring admission closed.
+            let _ = self.input_queue.preparation.cancel_for_replacement();
             if active.as_ref().is_some_and(|turn| turn.task.is_none()) {
                 active.take()
             } else {
@@ -704,8 +707,8 @@ impl Session {
         if !self.input_queue.has_pending_mailbox_items().await {
             return;
         }
-        let Some((turn_state, previous_options, mut mailbox, preparation)) =
-            self.reserve_pending_work_turn().await
+        let Some((turn_state, previous_options, mut mailbox, host_work, preparation)) =
+            self.reserve_pending_work_turn(&sub_id).await
         else {
             return;
         };
@@ -787,7 +790,13 @@ impl Session {
             _ = preparation.cancelled() => false,
             started = prepare => started,
         };
-        if !started {
+        if started {
+            if let Some(work) = host_work {
+                work.retain_until_terminal();
+            }
+        } else {
+            // The losing future restored its private batch before cleanup.
+            drop(host_work);
             let cleared = self.clear_task_reservation(&turn_state).await;
             if (cleared || preparation.was_replaced())
                 && !self

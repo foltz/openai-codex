@@ -303,6 +303,7 @@ pub(crate) mod turn;
 pub(crate) mod turn_context;
 mod turn_input;
 mod turn_suspension;
+mod turn_work;
 mod world_state;
 use self::code_mode_warning::unsupported_code_mode_warning;
 pub(crate) use self::environment::ThreadEnvironmentDefaults;
@@ -1302,7 +1303,11 @@ impl Session {
         let session_for_loop = Arc::clone(&session);
         let cleanup_owner = session.cleanup_owner();
         let loop_cleanup_owner = Arc::clone(&cleanup_owner);
+        let (loop_ready, ready) = tokio::sync::oneshot::channel();
         let session_loop_handle = tokio::spawn(Box::pin(storage_originator.scope(async move {
+            if ready.await.is_err() {
+                return;
+            }
             submission_loop_with_dispatch(
                 session_for_loop,
                 configured_config,
@@ -1317,6 +1322,14 @@ impl Session {
             drop(loop_cleanup_owner);
         })));
         let mut termination = session_loop_termination_from_handle(session_loop_handle);
+        // Publish original join-only evidence before the loop can admit work.
+        // This receipt retains neither a sender nor the Session cleanup owner.
+        session
+            .services
+            .thread_extension_data
+            .insert(turn_work::SessionLoopWorkReceipt(
+                termination.completion.clone(),
+            ));
         termination.cleanup_owner = Some(cleanup_owner);
         let io = SessionIo {
             tx_sub: tx_sub.into(),
@@ -1324,6 +1337,7 @@ impl Session {
             agent_status: agent_status_rx,
             session_loop_termination: termination,
         };
+        let _ = loop_ready.send(());
 
         if let Some(startup) = startup {
             let _ = startup.io.set(io.clone());

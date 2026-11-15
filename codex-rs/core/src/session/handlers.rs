@@ -622,6 +622,9 @@ pub(super) async fn submission_loop_with_dispatch(
         updates.mark_changed();
     }
     let mut mailbox_start: Option<futures::future::BoxFuture<'static, ()>> = None;
+    // Retain this original observer across select iterations and dispatch.
+    // A losing arm must not discard a previously taken host reopen signal.
+    let mut mailbox_retry = Box::pin(sess.input_queue.work_retry.wait());
     loop {
         if rx_sub.is_closed() && rx_sub.is_empty() {
             break;
@@ -678,6 +681,11 @@ pub(super) async fn submission_loop_with_dispatch(
                     Ok(false) => {}
                     Err(_) => mailbox = None,
                 }
+                continue;
+            }
+            _ = &mut mailbox_retry => {
+                mailbox_retry = Box::pin(sess.input_queue.work_retry.wait());
+                sess.input_queue.completion_wake.notify_one();
                 continue;
             }
             _ = sess.input_queue.completion_wake.notified(), if mailbox_start.is_none() => {
@@ -1013,6 +1021,10 @@ pub(super) async fn submission_loop_with_dispatch(
         let should_exit = loop {
             tokio::select! {
                 result = &mut dispatch => break result,
+                _ = &mut mailbox_retry => {
+                    mailbox_retry = Box::pin(sess.input_queue.work_retry.wait());
+                    sess.input_queue.completion_wake.notify_one();
+                }
                 _ = async { mailbox_start.as_mut().expect("guarded mailbox start").await }, if mailbox_start.is_some() => {
                     mailbox_start = None;
                 }

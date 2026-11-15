@@ -893,10 +893,12 @@ impl Session {
     )]
     pub(crate) async fn reserve_pending_work_turn(
         &self,
+        submission_id: &str,
     ) -> Option<(
         Arc<tokio::sync::Mutex<TurnState>>,
         TurnStartOptions,
         super::MailboxReservation,
+        Option<Box<dyn codex_protocol::host_turn_work::HostTurnWork>>,
         crate::tasks::MailboxPreparation,
     )> {
         let mut active_turn = self.active_turn.lock().await;
@@ -924,6 +926,26 @@ impl Session {
         if mailbox.is_empty() {
             return None;
         }
+        // Carried trigger work already owns this exact private batch. Otherwise
+        // fresh account admission must precede model discovery or other effects.
+        // Keep the native shutdown-only mailbox bypass as a separate policy.
+        let mut work = if mailbox.has_turn_work() {
+            None
+        } else {
+            match self.admit_turn_work(self.turn_work_termination()) {
+                Ok(work) => work,
+                Err(refusal) => {
+                    if let codex_extension_api::TurnWorkRefused::RetryAfter(retry) = refusal {
+                        self.input_queue.work_retry.defer(retry);
+                    }
+                    tracing::debug!("mailbox start deferred by host account admission");
+                    return None;
+                }
+            }
+        };
+        if let Some(work) = &mut work {
+            work.bind_submission(submission_id);
+        }
         let has_trigger_turn = mailbox.start_metadata().1.is_some();
         let previous_options = if has_trigger_turn {
             Default::default()
@@ -941,6 +963,7 @@ impl Session {
             Arc::clone(&active_turn.turn_state),
             previous_options,
             mailbox,
+            work,
             self.input_queue.preparation.register(),
         ))
     }
@@ -996,6 +1019,12 @@ impl Session {
         text: String,
     ) -> Result<(), &'static str> {
         let submission_id = Uuid::now_v7().to_string();
+        let mut work = self
+            .admit_turn_work(self.turn_work_termination())
+            .map_err(|_| "Server is draining; retry the turn after reconnecting")?;
+        if let Some(work) = &mut work {
+            work.bind_submission(&submission_id);
+        }
         let submission = handle(
             self,
             TurnInputRequest::user_input(vec![UserInput::Text {
@@ -1010,6 +1039,15 @@ impl Session {
             submission_id.clone(),
         )
         .await;
+        // Exact installation and Started return have no intervening await.
+        // A steering/refused handoff releases only its own temporary work.
+        if matches!(&submission, Ok(TurnInputSubmission::Started { .. })) {
+            if let Some(work) = work {
+                work.retain_until_terminal();
+            }
+        } else {
+            drop(work);
+        }
         match submission {
             Ok(TurnInputSubmission::Accepted) => {
                 unreachable!("realtime user input returns a turn outcome")

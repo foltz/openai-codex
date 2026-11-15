@@ -637,6 +637,11 @@ pub(super) async fn submission_loop_with_dispatch(
                 if update.is_err() {
                     catalog_updates = None;
                 } else {
+                    let _work = match submissions.as_ref().map(|control| control.begin_work()) {
+                        Some(Some(work)) => Some(work),
+                        Some(None) => continue,
+                        None => None,
+                    };
                     super::model_catalog_settings::apply(&sess).await;
                 }
                 continue;
@@ -653,6 +658,11 @@ pub(super) async fn submission_loop_with_dispatch(
             } => {
                 match update {
                     Ok(true) => {
+                    let _work = match submissions.as_ref().map(|control| control.begin_work()) {
+                        Some(Some(work)) => Some(work),
+                        Some(None) => continue,
+                        None => None,
+                    };
                         sess.input_queue.notify_mailbox();
                         if sess.features.enabled(Feature::WakeOnAgentMessages)
                             || sess.has_outstanding_durable_sleep()

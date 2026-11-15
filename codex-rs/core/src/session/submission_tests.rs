@@ -132,3 +132,51 @@ async fn accepted_non_task_work_blocks_idle_claim_until_dispatch_finishes() {
     assert_eq!(sender.with_idle_admission(|| Ok::<_, ()>(())), Ok(Ok(())));
     assert_eq!(sender.send(submission("late")).await, Err(()));
 }
+
+#[tokio::test]
+async fn internal_work_and_public_dispatch_keep_independent_idle_credits() {
+    let (raw, receiver) = async_channel::bounded(1);
+    let sender = SubmissionSender::from(raw);
+    let control = sender.dispatch_control();
+    let internal = control.begin_work().expect("internal work admitted");
+    sender.send(submission("public")).await.unwrap();
+    receiver.recv().await.unwrap();
+    let public = control.begin();
+    drop(public);
+    assert_eq!(
+        sender.with_idle_admission(|| Ok::<_, ()>(())),
+        Err(IdleAdmissionError::Outstanding)
+    );
+    drop(internal);
+    assert_eq!(sender.with_idle_admission(|| Ok::<_, ()>(())), Ok(Ok(())));
+    assert!(
+        control.begin_work().is_none(),
+        "commit fences later internal work"
+    );
+    sender.send_shutdown(submission("private")).await.unwrap();
+    receiver.recv().await.unwrap();
+    drop(control.begin());
+    assert_eq!(sender.closed.lock().unwrap().outstanding, 0);
+}
+
+#[test]
+fn internal_work_refuses_closed_or_poisoned_admission() {
+    let (raw, _receiver) = async_channel::bounded(1);
+    let sender = SubmissionSender::from(raw);
+    let control = sender.dispatch_control();
+    sender.close_admission();
+    assert!(control.begin_work().is_none());
+    let (raw, _receiver) = async_channel::bounded(1);
+    let sender = SubmissionSender::from(raw);
+    let control = sender.dispatch_control();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = sender.closed.lock().unwrap();
+        panic!("poisoned internal-work admission witness");
+    }));
+    assert!(result.is_err());
+    assert!(control.begin_work().is_none());
+    assert_eq!(
+        sender.with_idle_admission(|| Ok::<_, ()>(())),
+        Err(IdleAdmissionError::Unavailable)
+    );
+}

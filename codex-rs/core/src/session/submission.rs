@@ -73,6 +73,20 @@ pub(crate) struct DispatchGuard {
 }
 
 impl SubmissionDispatch {
+    /// Internal catalog/mailbox dispatch is work even without a public queue entry.
+    /// Use the same admission mutex so an idle claim cannot interleave its effects.
+    pub(crate) fn begin_work(&self) -> Option<DispatchGuard> {
+        let mut admission = self.0.lock().ok()?;
+        if admission.closed || admission.failed {
+            return None;
+        }
+        admission.outstanding += 1;
+        Some(DispatchGuard {
+            admission: Arc::clone(&self.0),
+            kind: Some(SubmissionKind::Public),
+        })
+    }
+
     pub(crate) fn begin(&self) -> DispatchGuard {
         let kind = self.0.lock().ok().and_then(|mut admission| {
             let kind = admission.queued.pop_front();

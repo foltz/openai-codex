@@ -718,7 +718,7 @@ async fn exact_thread_fixture_with(
     let submissions = tx_sub.dispatch_control();
     let loop_session = Arc::clone(&session);
     let config = Arc::clone(&turn.config);
-    let task = tokio::spawn(async move {
+    let task = tokio::spawn(Box::pin(async move {
         let _owner = loop_cleanup_owner;
         match mode {
             ThreadLoopFixture::Ordinary => {
@@ -737,7 +737,7 @@ async fn exact_thread_fixture_with(
             ThreadLoopFixture::Gone => drop(rx_sub),
             ThreadLoopFixture::Panicked => panic!("loop panic fixture"),
         }
-    });
+    }));
     if matches!(mode, ThreadLoopFixture::Cancelled) {
         task.abort();
     }

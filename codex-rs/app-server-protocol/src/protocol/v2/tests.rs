@@ -5606,3 +5606,69 @@ fn feedback_paths_preserve_native_wire_spelling_before_host_validation() {
         );
     }
 }
+
+#[test]
+fn legacy_thread_started_client_ignores_additive_clear_fields() {
+    #[derive(Debug, PartialEq, serde::Deserialize)]
+    struct LegacyThreadStartedNotification {
+        thread: Thread,
+    }
+
+    let thread: Thread = serde_json::from_value(json!({
+            "id": "successor",
+            "sessionId": "successor",
+            "forkedFromId": null,
+            "preview": "",
+            "ephemeral": false,
+            "modelProvider": "openai",
+            "createdAt": 1,
+            "updatedAt": 1,
+            "status": { "type": "idle" },
+            "path": null,
+            "cwd": absolute_path_string("tmp"),
+            "cliVersion": "0.0.0",
+            "source": "cli",
+            "agentNickname": null,
+            "agentRole": null,
+            "gitInfo": null,
+            "name": null,
+            "turns": []
+    }))
+    .expect("current thread should deserialize");
+    let notification = serde_json::to_value(ThreadStartedNotification {
+        thread,
+        session_start_source: Some(ThreadStartSource::Clear),
+        clear_predecessor_thread_id: Some("predecessor".to_string()),
+    })
+    .expect("current thread/started should serialize");
+
+    assert_eq!(notification["sessionStartSource"], json!("clear"));
+    assert_eq!(
+        notification["clearPredecessorThreadId"],
+        json!("predecessor")
+    );
+
+    let legacy: LegacyThreadStartedNotification = serde_json::from_value(notification)
+        .expect("pre-clear client should ignore additive clear fields");
+    assert_eq!(legacy.thread.id, "successor");
+}
+
+#[test]
+fn thread_started_defaults_missing_client_lifecycle_fields() {
+    let response = json!({
+        "thread": {
+            "id": "thread-id", "sessionId": "thread-id", "forkedFromId": null,
+            "preview": "", "ephemeral": false, "modelProvider": "openai",
+            "createdAt": 1, "updatedAt": 1, "status": {"type": "idle"},
+            "path": null, "cwd": absolute_path_string("tmp"), "cliVersion": "0.0.0",
+            "source": "exec", "agentNickname": null, "agentRole": null,
+            "gitInfo": null, "name": null, "turns": []
+        }
+    });
+    let notification: ThreadStartedNotification = serde_json::from_value(response).unwrap();
+    assert_eq!(notification.session_start_source, None);
+    assert_eq!(notification.clear_predecessor_thread_id, None);
+    let value = serde_json::to_value(notification).unwrap();
+    assert!(value.get("sessionStartSource").is_none());
+    assert!(value.get("clearPredecessorThreadId").is_none());
+}

@@ -121,6 +121,11 @@ pub struct ThreadStartParams {
     pub history_mode: Option<ThreadHistoryMode>,
     #[ts(optional = nullable)]
     pub session_start_source: Option<ThreadStartSource>,
+    /// Explicit client-declared predecessor for a Clear start only. This is
+    /// not authority to infer a global newest thread in the workspace.
+    #[experimental("thread/start.clearPredecessor")]
+    #[ts(optional = nullable)]
+    pub clear_predecessor_thread_id: Option<String>,
     /// Optional client-supplied analytics source classification for this thread.
     #[ts(optional = nullable)]
     pub thread_source: Option<ThreadSource>,
@@ -2200,6 +2205,15 @@ impl From<CoreTokenUsage> for TokenUsageBreakdown {
 #[ts(export_to = "v2/")]
 pub struct ThreadStartedNotification {
     pub thread: Thread,
+    /// Client-declared source from the corresponding thread/start request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub session_start_source: Option<ThreadStartSource>,
+    /// Explicit Clear predecessor; absent for ordinary starts and forks.
+    /// Resumes do not emit thread/started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub clear_predecessor_thread_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

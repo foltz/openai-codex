@@ -231,6 +231,7 @@ impl App {
                 &local_settings,
                 &config,
                 /*session_start_source*/ None,
+                /*clear_predecessor_thread_id*/ None,
                 /*remote_cwd_override*/ None,
                 /*selected_profile*/ None,
                 host_project_cwd.as_deref(),

@@ -7380,6 +7380,8 @@ async fn inactive_thread_started_notification_initializes_replay_session() -> Re
     app.enqueue_thread_notification(
         agent_thread_id,
         ServerNotification::ThreadStarted(ThreadStartedNotification {
+            session_start_source: None,
+            clear_predecessor_thread_id: None,
             thread: Thread {
                 originator: None,
                 environments: Some(vec![codex_app_server_protocol::ThreadEnvironment {
@@ -7491,6 +7493,8 @@ async fn inactive_thread_started_notification_preserves_primary_model_when_path_
     app.enqueue_thread_notification(
         agent_thread_id,
         ServerNotification::ThreadStarted(ThreadStartedNotification {
+            session_start_source: None,
+            clear_predecessor_thread_id: None,
             thread: Thread {
                 originator: None,
                 environments: None,

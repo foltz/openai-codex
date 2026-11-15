@@ -740,6 +740,7 @@ async fn command_center_new_preserves_only_selected_server_profiles() -> Result<
             &app.local_settings,
             &app.config,
             /*session_start_source*/ None,
+            /*clear_predecessor_thread_id*/ None,
             /*remote_cwd_override*/ None,
             Some(&selection),
             /*host_project_cwd*/ None,

@@ -243,7 +243,10 @@ impl PhysicalAttemptTicket {
         self.close_deadline.clone()
     }
 
-    pub(crate) fn attach_service<S: Service<RoleClient> + 'static>(&self, service: Arc<ManagedRunningService<S>>) {
+    pub(crate) fn attach_service<S: Service<RoleClient> + 'static>(
+        &self,
+        service: Arc<ManagedRunningService<S>>,
+    ) {
         if let Some(attempt) = self.attempt.upgrade() {
             let mut state = attempt
                 .state
@@ -303,6 +306,15 @@ impl RmcpClientRetirement {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .proven,
         ))
+    }
+
+    pub(crate) fn close_registration_until(&self, deadline: Instant) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .close_deadline
+            .latch(deadline);
+        self.close_registration();
     }
 
     /// Close launch admission before the upper owner cancels/drains its tasks.
@@ -373,6 +385,15 @@ impl RmcpClientRetirement {
 
     /// Cancelled callers leave every original launch/close future retained.
     pub async fn shutdown_until(&self, deadline: Instant) -> PhysicalRetirementReport {
+        self.shutdown_for_until(StdioTermination::Shutdown, deadline)
+            .await
+    }
+
+    pub(crate) async fn shutdown_for_until(
+        &self,
+        reason: StdioTermination,
+        deadline: Instant,
+    ) -> PhysicalRetirementReport {
         // Latch before closing registration, which can already start a close.
         // Latching keeps the earliest deadline, so a later call never extends it.
         self.state
@@ -388,12 +409,9 @@ impl RmcpClientRetirement {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.attempts.clone()
         };
-        let outcomes = futures::future::join_all(
-            attempts
-                .into_iter()
-                .enumerate()
-                .map(|(id, attempt)| async move { (id, retire_attempt(attempt, deadline).await) }),
-        )
+        let outcomes = futures::future::join_all(attempts.into_iter().enumerate().map(
+            |(id, attempt)| async move { (id, retire_attempt(attempt, reason, deadline).await) },
+        ))
         .await;
         let report = PhysicalRetirementReport { attempts: outcomes };
         if report.is_complete() {
@@ -409,7 +427,11 @@ impl RmcpClientRetirement {
     }
 }
 
-async fn retire_attempt(attempt: Arc<Attempt>, deadline: Instant) -> PhysicalRetirementOutcome {
+async fn retire_attempt(
+    attempt: Arc<Attempt>,
+    reason: StdioTermination,
+    deadline: Instant,
+) -> PhysicalRetirementOutcome {
     let startup = {
         let state = attempt
             .state
@@ -455,9 +477,15 @@ async fn retire_attempt(attempt: Arc<Attempt>, deadline: Instant) -> PhysicalRet
             }
             // Process termination must progress even while admitted startup is
             // stuck. The independent ticket is safe to retry after cancellation.
+            if let Some(service) = &service {
+                service.request_close();
+            }
             let process_close = async {
                 match process {
-                    Some(process) => process.terminate_until(StdioTermination::Shutdown, deadline).await.map_err(|_| ()),
+                    Some(process) => process
+                        .terminate_until(reason, deadline)
+                        .await
+                        .map_err(|_| ()),
                     None => Ok(()),
                 }
             };
@@ -691,6 +719,20 @@ pub(crate) struct AcknowledgedTransport<T> {
 }
 
 impl<T: Transport<RoleClient> + 'static> AcknowledgedTransport<T> {
+    #[expect(
+        clippy::expect_used,
+        reason = "inner is taken only by Drop, after these borrows end"
+    )]
+    pub(crate) fn inner_mut(&mut self) -> &mut T {
+        self.inner.as_mut().expect("live transport")
+    }
+    #[expect(
+        clippy::expect_used,
+        reason = "inner is taken only by Drop, after these borrows end"
+    )]
+    pub(crate) fn inner(&self) -> &T {
+        self.inner.as_ref().expect("live transport")
+    }
     pub(crate) fn new(inner: T) -> (Self, TransportCloseReceipt) {
         let (closed, state) = watch::channel(CloseState::Pending);
         let lease = Arc::new(TransportLease {
@@ -831,17 +873,28 @@ impl<S: Service<RoleClient>> ServiceLeaseOwner<S> {
     }
 }
 
+impl<S: Service<RoleClient>> ServiceOperationLease<S> {
+    pub(crate) fn reacquire(&self) -> Result<Arc<Self>, rmcp::service::ServiceError> {
+        self.owner.acquire().map(Arc::new)
+    }
+}
+
 impl<S: Service<RoleClient>> Deref for ServiceOperationLease<S> {
     type Target = RunningService<RoleClient, S>;
     fn deref(&self) -> &Self::Target {
-        self.service.as_ref().expect("lease retains its service until drop")
+        self.service
+            .as_ref()
+            .expect("lease retains its service until drop")
     }
 }
 
 /// The registry erases only terminal observation, never request execution.
 trait RetainedService: Send + Sync {
     fn request_close(&self);
-    fn wait_until(&self, deadline: Instant) -> BoxFuture<'_, Result<LogicalCloseAck, LogicalCloseError>>;
+    fn wait_until(
+        &self,
+        deadline: Instant,
+    ) -> BoxFuture<'_, Result<LogicalCloseAck, LogicalCloseError>>;
 }
 
 /// Owns the original service join future, while requests use its cloned peer.
@@ -931,7 +984,9 @@ impl<S: Service<RoleClient> + 'static> ManagedRunningService<S> {
 
     /// A request keeps the original typed service alive through every upstream
     /// continuation, cancellation and request-scoped input path.
-    pub(crate) fn lease(&self) -> Result<Arc<ServiceOperationLease<S>>, rmcp::service::ServiceError> {
+    pub(crate) fn lease(
+        &self,
+    ) -> Result<Arc<ServiceOperationLease<S>>, rmcp::service::ServiceError> {
         self.owner.acquire().map(Arc::new)
     }
 
@@ -945,7 +1000,11 @@ impl<S: Service<RoleClient> + 'static> ManagedRunningService<S> {
 
     /// Request cancellation synchronously; this is not a terminal receipt.
     pub(crate) fn request_close(&self) {
-        self.owner.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).closing = true;
+        self.owner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .closing = true;
         let token = self
             .cancellation
             .lock()
@@ -956,18 +1015,12 @@ impl<S: Service<RoleClient> + 'static> ManagedRunningService<S> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn call_tool(
         &self,
         params: rmcp::model::CallToolRequestParams,
     ) -> Result<rmcp::model::CallToolResult, rmcp::service::ServiceError> {
         self.lease()?.call_tool(params).await
-    }
-
-    pub(crate) async fn read_resource(
-        &self,
-        params: rmcp::model::ReadResourceRequestParams,
-    ) -> Result<rmcp::model::ReadResourceResult, rmcp::service::ServiceError> {
-        self.lease()?.read_resource(params).await
     }
 
     /// Diagnostic compatibility only; retirement must use `wait_until`.
@@ -1009,8 +1062,13 @@ impl<S: Service<RoleClient> + 'static> Deref for ManagedRunningService<S> {
 }
 
 impl<S: Service<RoleClient> + 'static> RetainedService for ManagedRunningService<S> {
-    fn request_close(&self) { ManagedRunningService::request_close(self); }
-    fn wait_until(&self, deadline: Instant) -> BoxFuture<'_, Result<LogicalCloseAck, LogicalCloseError>> {
+    fn request_close(&self) {
+        ManagedRunningService::request_close(self);
+    }
+    fn wait_until(
+        &self,
+        deadline: Instant,
+    ) -> BoxFuture<'_, Result<LogicalCloseAck, LogicalCloseError>> {
         ManagedRunningService::wait_until(self, deadline).boxed()
     }
 }

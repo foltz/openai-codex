@@ -704,14 +704,14 @@ mod tests {
             )
             .await
             .expect("state db");
-            let mut builder =
-                ThreadMetadataBuilder::new(thread_id, path.clone(), Utc::now(), SessionSource::Cli);
-            builder.thread_source = source.clone();
-            builder.agent_path = agent_path.clone();
-            let mut metadata = builder.build(&config.default_model_provider_id);
+            let mut metadata =
+                ThreadMetadataBuilder::new(thread_id, path.clone(), Utc::now(), SessionSource::Cli)
+                    .with_thread_source(source.clone())
+                    .with_agent_path(agent_path.clone())
+                    .with_creator_user_id(Some("fixture-user".to_string()))
+                    .with_creator_account_id(Some("fixture-account".to_string()))
+                    .build(&config.default_model_provider_id);
             metadata.first_user_message = Some("Hello from user".to_string());
-            metadata.creator_user_id = Some("fixture-user".to_string());
-            metadata.creator_account_id = Some("fixture-account".to_string());
             runtime
                 .upsert_thread(&metadata)
                 .await
@@ -741,7 +741,10 @@ mod tests {
                         assert_eq!(thread.thread_source, source);
                         assert_eq!(thread.agent_path, agent_path);
                         assert_eq!(thread.creator_user_id.as_deref(), Some("fixture-user"));
-                        assert_eq!(thread.creator_account_id.as_deref(), Some("fixture-account"));
+                        assert_eq!(
+                            thread.creator_account_id.as_deref(),
+                            Some("fixture-account")
+                        );
                     }
                 }
             }

@@ -6289,7 +6289,7 @@ async fn warm_v2_lookup_needs_no_parent_work_but_cold_reload_requires_exact_live
         .local_agent_runtime
         .control(root.session.session_id());
     let child =
-        spawn_v2_reload_test_child(&control, harness.config.clone(), &root, "account-worker").await;
+        spawn_v2_reload_test_child(&control, harness.config.clone(), &root, "account_worker").await;
     let (parent, gate) = crate::agent::turn_authority::tests::parent().await;
     let authority = crate::ParentTurnAuthority::capture(&parent, "live-parent");
     gate.active.store(false, Ordering::SeqCst);

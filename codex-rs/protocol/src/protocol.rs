@@ -715,6 +715,12 @@ impl AdditionalContextEntry {
 #[allow(clippy::large_enum_variant)]
 #[non_exhaustive]
 pub enum Op {
+    /// In-process custody for legacy standalone task starts; never serialized.
+    #[debug("HostTurn")]
+    HostTurn {
+        action: crate::host_turn_work::HostTurnAction,
+        work: Box<dyn crate::host_turn_work::HostTurnWork>,
+    },
     /// Abort current task without terminating background terminal processes.
     /// This server sends [`EventMsg::TurnAborted`] in response.
     Interrupt,
@@ -779,6 +785,7 @@ pub enum Op {
     TurnInput {
         request: Box<TurnInputRequest>,
         mode: TurnInputMode,
+        host_work: Option<Box<dyn crate::host_turn_work::HostTurnWork>>,
         reply: oneshot::Sender<CodexResult<TurnInputSubmission>>,
     },
 
@@ -787,6 +794,7 @@ pub enum Op {
     RecoverTurn {
         thread_settings: ThreadSettingsOverrides,
         start_options: TurnStartOptions,
+        host_work: Option<Box<dyn crate::host_turn_work::HostTurnWork>>,
         reply: oneshot::Sender<CodexResult<TurnInputSubmission>>,
     },
 
@@ -1123,6 +1131,10 @@ impl InterAgentCommunication {
 impl Op {
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::HostTurn { action, .. } => match action {
+                crate::host_turn_work::HostTurnAction::Compact => "compact",
+                crate::host_turn_work::HostTurnAction::Review(_) => "review",
+            },
             Self::Interrupt => "interrupt",
             Self::InterruptIfNoPendingInput { .. } => "interrupt_if_no_pending_input",
             Self::CleanBackgroundTerminals => "clean_background_terminals",

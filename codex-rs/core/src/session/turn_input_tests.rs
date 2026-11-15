@@ -242,7 +242,7 @@ async fn start_only_rejects_active_turn_without_injecting() {
         Vec::<TurnInput>::new(),
         session
             .input_queue
-            .get_pending_input(&session.active_turn, "test-turn")
+            .get_pending_input(&session.active_turn, &turn_context.sub_id)
             .await
             .0
     );
@@ -300,7 +300,7 @@ async fn recovery_rejects_active_turn_without_injecting_or_applying_settings() {
     assert_eq!(
         session
             .input_queue
-            .get_pending_input(&session.active_turn, "test-turn")
+            .get_pending_input(&session.active_turn, &turn_context.sub_id)
             .await
             .0,
         Vec::<TurnInput>::new()
@@ -1128,7 +1128,7 @@ async fn steer_preserves_request_origin(
     .unwrap();
     let pending = session
         .input_queue
-        .get_pending_input(&session.active_turn, "test-turn")
+        .get_pending_input(&session.active_turn, &turn_context.sub_id)
         .await
         .0;
     assert_eq!(
@@ -1184,7 +1184,7 @@ async fn scored_prompt_keeps_its_submission_item_id() {
     }
     let (pending, _) = session
         .input_queue
-        .get_pending_input(&session.active_turn, "test-turn")
+        .get_pending_input(&session.active_turn, &turn.sub_id)
         .await;
     for input in pending {
         let TurnInput::UserInput {

@@ -232,6 +232,10 @@ pub struct BackgroundTerminalInfo {
     pub cwd: PathUri,
 }
 
+#[cfg(test)]
+#[path = "codex_thread_submission_tests.rs"]
+mod submission_tests;
+
 /// Conduit for the bidirectional stream of messages that compose a thread
 /// (formerly called a conversation) in Codex.
 impl CodexThread {
@@ -522,6 +526,28 @@ impl CodexThread {
         op: Op,
         trace: Option<W3cTraceContext>,
     ) -> CodexResult<String> {
+        // Capture finite account work before crossing the submission IO hop.
+        let op = if matches!(&op, Op::Compact | Op::Review { .. }) {
+            match self
+                .session
+                .admit_turn_work(Box::pin(self.termination_receipt()))
+                .map_err(|_| CodexErr::Fatal("account work admission is closed".to_string()))?
+            {
+                Some(work) => {
+                    let action = match op {
+                        Op::Compact => codex_protocol::host_turn_work::HostTurnAction::Compact,
+                        Op::Review { review_request } => {
+                            codex_protocol::host_turn_work::HostTurnAction::Review(review_request)
+                        }
+                        _ => unreachable!("only compact/review acquire legacy turn work"),
+                    };
+                    Op::HostTurn { action, work }
+                }
+                None => op,
+            }
+        } else {
+            op
+        };
         // Use the same admission guard as MAv2 sends, retaining it through dispatch.
         let residency_guard = if matches!(op, Op::InterAgentCommunication { .. }) {
             self.session
@@ -631,6 +657,17 @@ impl CodexThread {
         &self,
         request: impl Into<WithTurnExtensionData<RecoverTurnRequest>>,
     ) -> CodexResult<StartIfIdleSubmission> {
+        let host_work = match self
+            .session
+            .admit_turn_work(Box::pin(self.termination_receipt()))
+        {
+            Ok(work) => work,
+            Err(_) => {
+                return Ok(StartIfIdleSubmission::NotSubmitted {
+                    reason: codex_protocol::turn_input::NotSubmittedReason::ServerDraining,
+                });
+            }
+        };
         self.ensure_execution_capacity_for_turn_start(self.session.services.agent_control.as_ref())
             .await?;
         let WithTurnExtensionData {
@@ -657,6 +694,7 @@ impl CodexThread {
                 trace,
                 turn_id,
                 turn_extension_init,
+                host_work,
             )
             .await?
         {
@@ -748,13 +786,46 @@ impl CodexThread {
         request: impl Into<WithTurnExtensionData<TurnInputRequest>>,
         mode: TurnInputMode,
     ) -> CodexResult<TurnInputSubmission> {
+        let request = request.into();
+        let host_work = if matches!(mode, TurnInputMode::Steer { .. }) {
+            None
+        } else {
+            match self
+                .session
+                .admit_turn_work(Box::pin(self.termination_receipt()))
+            {
+                Ok(work) => work,
+                Err(_) => {
+                    return Ok(TurnInputSubmission::NotSubmitted {
+                        reason: codex_protocol::turn_input::NotSubmittedReason::ServerDraining,
+                    });
+                }
+            }
+        };
+        // Match legacy MAv2 delivery: the queued op, not the reply waiter,
+        // owns residency through actual dispatch or refusal.
+        let residency_guard = if matches!(mode, TurnInputMode::StartOrSteer)
+            && matches!(
+                &request.request.input,
+                codex_protocol::turn_input::TurnInput::InterAgentCommunication(_)
+            ) {
+            self.session
+                .services
+                .local_agent_runtime
+                .pin_v2_residency(self)
+                .await?
+        } else {
+            None
+        };
         if !matches!(mode, TurnInputMode::Steer { .. }) {
             self.ensure_execution_capacity_for_turn_start(
                 self.session.services.agent_control.as_ref(),
             )
             .await?;
         }
-        self.io.submit_turn_input(request, mode).await
+        self.io
+            .submit_turn_input(request, mode, host_work, residency_guard)
+            .await
     }
 
     /// Persist whether this thread is eligible for future memory generation.

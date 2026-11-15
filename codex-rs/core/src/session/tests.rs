@@ -12975,22 +12975,43 @@ async fn queue_only_mailbox_mail_waits_for_next_turn_after_answer_boundary() {
     );
     assert_eq!(
         sess.input_queue
-            .get_pending_input(&sess.active_turn, "test-turn")
+            .get_pending_input(&sess.active_turn, &tc.sub_id)
             .await
             .0,
         Vec::new()
     );
 
     sess.abort_all_tasks(TurnAbortReason::Replaced).await;
+    assert!(
+        sess.input_queue
+            .get_pending_input(&sess.active_turn, &tc.sub_id)
+            .await
+            .0
+            .is_empty()
+    );
+    assert!(sess.input_queue.has_pending_mailbox_items().await);
+    let next = sess
+        .new_turn_with_default_settings("next-mailbox-turn".into(), Default::default())
+        .await;
+    sess.spawn_task(
+        Arc::clone(&next),
+        Vec::new(),
+        NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: true,
+        },
+    )
+    .await;
 
     assert_eq!(
         (sess
             .input_queue
-            .get_pending_input(&sess.active_turn, "test-turn")
+            .get_pending_input(&sess.active_turn, &next.sub_id)
             .await)
             .0,
         vec![TurnInput::InterAgentCommunication(communication.into())],
     );
+    sess.abort_all_tasks(TurnAbortReason::Replaced).await;
 }
 
 #[tokio::test]
@@ -13090,7 +13111,7 @@ async fn active_turn_keeps_first_root_when_mail_coalesces(inherited_root: Option
     assert_eq!(
         (sess
             .input_queue
-            .get_pending_input(&sess.active_turn, "test-turn")
+            .get_pending_input(&sess.active_turn, &tc.sub_id)
             .await)
             .0,
         vec![
@@ -13147,7 +13168,7 @@ async fn steered_input_reopens_mailbox_delivery_for_current_turn() {
     assert_eq!(
         (sess
             .input_queue
-            .get_pending_input(&sess.active_turn, "test-turn")
+            .get_pending_input(&sess.active_turn, &tc.sub_id)
             .await)
             .0,
         vec![
@@ -13211,7 +13232,7 @@ async fn stale_defer_mailbox_delivery_does_not_override_steered_input() {
     assert_eq!(
         (sess
             .input_queue
-            .get_pending_input(&sess.active_turn, "test-turn")
+            .get_pending_input(&sess.active_turn, &tc.sub_id)
             .await)
             .0,
         vec![
@@ -13289,7 +13310,7 @@ async fn tool_calls_reopen_mailbox_delivery_for_current_turn() {
     assert_eq!(
         (sess
             .input_queue
-            .get_pending_input(&sess.active_turn, "test-turn")
+            .get_pending_input(&sess.active_turn, &tc.sub_id)
             .await)
             .0,
         vec![TurnInput::InterAgentCommunication(communication.into())],

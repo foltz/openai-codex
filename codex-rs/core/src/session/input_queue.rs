@@ -443,34 +443,26 @@ impl InputQueue {
         active_turn: &Mutex<Option<ActiveTurn>>,
         turn_id: &str,
     ) -> (Vec<TurnInput>, TurnStartOptions) {
-        let (pending_input, accepts_mailbox_delivery) = {
-            let mut active = active_turn.lock().await;
-            match active.as_mut() {
-                Some(active_turn) => {
-                    let mut turn_state = active_turn.turn_state.lock().await;
-                    let accepts_mailbox_delivery =
-                        turn_state.accepts_mailbox_delivery_for_current_turn();
-                    let pending_input = if accepts_mailbox_delivery {
-                        std::mem::take(&mut turn_state.pending_input).items
-                    } else {
-                        Vec::new()
-                    };
-                    (pending_input, accepts_mailbox_delivery)
-                }
-                None => (Vec::new(), true),
-            }
+        let mut active = active_turn.lock().await;
+        let Some(turn) = active.as_mut().filter(|turn| {
+            turn.task.as_ref().is_some_and(|task| {
+                task.turn_context.sub_id == turn_id && task.commit_ready.is_cancelled()
+            })
+        }) else {
+            // A stale worker must not take its replacement's input or bind
+            // mailbox work to an ID that is no longer installed.
+            return (Vec::new(), TurnStartOptions::default());
         };
-        if !accepts_mailbox_delivery {
-            return (pending_input, TurnStartOptions::default());
+        let mut turn_state = turn.turn_state.lock().await;
+        if !turn_state.accepts_mailbox_delivery_for_current_turn() {
+            return (Vec::new(), TurnStartOptions::default());
         }
+        let mut pending_input = std::mem::take(&mut turn_state.pending_input).items;
+        // No suspension separates exact-turn validation, consuming the private
+        // batch and binding its work. Replacement needs the same active lock.
         let (mailbox_items, start_options) = self.mailbox.reserve().into_input(turn_id);
-        if pending_input.is_empty() {
-            (mailbox_items, start_options)
-        } else {
-            let mut pending_input = pending_input;
-            pending_input.extend(mailbox_items);
-            (pending_input, start_options)
-        }
+        pending_input.extend(mailbox_items);
+        (pending_input, start_options)
     }
 
     #[expect(

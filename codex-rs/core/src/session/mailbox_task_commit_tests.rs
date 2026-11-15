@@ -336,3 +336,89 @@ async fn owned_completion_preparation_does_not_block_control_dispatch_or_shutdow
     assert!(session.input_queue.has_pending_mailbox_items().await);
     assert!(!session.input_queue.preparation.is_busy());
 }
+
+#[tokio::test]
+async fn only_exact_installed_worker_consumes_and_binds_counted_mail() {
+    let (session, ctx, gate, events) = fixture().await;
+    gate.release.cancel();
+    let ran = CancellationToken::new();
+    assert!(
+        session
+            .start_task(Arc::clone(&ctx), Vec::new(), InstalledTask(ran.clone()))
+            .await
+    );
+    tokio::time::timeout(Duration::from_secs(10), ran.cancelled())
+        .await
+        .unwrap();
+    events.lock().unwrap().clear();
+    let enqueue = |text: &str| {
+        session.input_queue.enqueue_mailbox_with_work(
+            InterAgentCommunication::new(
+                codex_protocol::AgentPath::root(),
+                codex_protocol::AgentPath::root(),
+                Vec::new(),
+                text.into(),
+                true,
+            )
+            .into(),
+            Default::default(),
+            Some(Box::new(Work(Arc::clone(&events)))),
+        );
+    };
+    enqueue("exact-worker input");
+    assert!(
+        session
+            .input_queue
+            .get_pending_input(&session.active_turn, "stale-worker")
+            .await
+            .0
+            .is_empty()
+    );
+    assert!(events.lock().unwrap().is_empty());
+    assert!(session.input_queue.has_pending_mailbox_items().await);
+    assert_eq!(
+        session
+            .input_queue
+            .get_pending_input(&session.active_turn, &ctx.sub_id)
+            .await
+            .0
+            .len(),
+        2,
+        "initial installed mail plus newly consumed input"
+    );
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            format!("bound:{}", ctx.sub_id),
+            "retained".into(),
+            "released".into()
+        ]
+    );
+    events.lock().unwrap().clear();
+    enqueue("next-worker input");
+    session.abort_all_tasks(TurnAbortReason::Replaced).await;
+    assert!(
+        session
+            .input_queue
+            .get_pending_input(&session.active_turn, &ctx.sub_id)
+            .await
+            .0
+            .is_empty()
+    );
+    assert!(events.lock().unwrap().is_empty());
+    assert!(session.input_queue.has_pending_mailbox_items().await);
+    let next = session
+        .new_turn_with_default_settings("exact-next-worker".into(), Default::default())
+        .await;
+    assert!(
+        session
+            .start_task(next, Vec::new(), InstalledTask(CancellationToken::new()))
+            .await
+    );
+    assert_eq!(
+        *events.lock().unwrap(),
+        ["bound:exact-next-worker", "retained", "released"]
+    );
+    assert!(!session.input_queue.has_pending_mailbox_items().await);
+    session.abort_all_tasks(TurnAbortReason::Replaced).await;
+}

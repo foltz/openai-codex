@@ -825,7 +825,12 @@ impl codex_guardian_reviewer::ReviewerRuntime for GuardianReviewSession {
     async fn submit_turn(&self, request: TurnInputRequest) -> anyhow::Result<TurnInputSubmission> {
         Ok(self
             .io
-            .submit_turn_input(request, TurnInputMode::StartIfIdle)
+            .submit_turn_input(
+                request,
+                TurnInputMode::StartIfIdle,
+                /*host_work*/ None,
+                /*residency_guard*/ None,
+            )
             .await?)
     }
 

@@ -19,6 +19,7 @@ pub(super) async fn submit(
     session: &Arc<Session>,
     request: WithTurnExtensionData<TurnInputRequest>,
     submission_id: String,
+    work: Option<Box<dyn codex_protocol::host_turn_work::HostTurnWork>>,
 ) -> CodexResult<TurnInputSubmission> {
     let WithTurnExtensionData { request, .. } = request;
     let TurnInputRequest { input, start, .. } = request;
@@ -55,6 +56,7 @@ pub(super) async fn submit(
         submission_id,
         pending,
         start,
+        work,
     ))
     .await;
     Ok(TurnInputSubmission::Accepted)

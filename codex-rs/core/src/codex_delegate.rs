@@ -282,6 +282,8 @@ pub(crate) async fn run_codex_thread_one_shot(
                 ..Default::default()
             }),
             TurnInputMode::StartIfIdle,
+            /*host_work*/ None,
+            /*residency_guard*/ None,
         )
         .await?;
     match submission {

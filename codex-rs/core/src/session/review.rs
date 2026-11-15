@@ -9,7 +9,7 @@ pub(super) async fn spawn_review_thread(
     parent_turn_context: Arc<TurnContext>,
     sub_id: String,
     resolved: crate::review_prompts::ResolvedReviewRequest,
-) {
+) -> bool {
     let model = config
         .review_model
         .clone()
@@ -175,5 +175,5 @@ pub(super) async fn spawn_review_thread(
     // emit a parent TurnStarted. Consider giving review a full parent turn lifecycle
     // (TurnStarted + TurnComplete) for consistency with other standalone tasks.
     sess.start_task(Arc::clone(&tc), input, ReviewTask::new())
-        .await;
+        .await
 }

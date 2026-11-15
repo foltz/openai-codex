@@ -282,6 +282,8 @@ pub(crate) use mcp_work::McpOperationWork;
 mod model_catalog_settings;
 pub(crate) mod multi_agents;
 mod plugin_selection;
+#[cfg(test)]
+mod public_submission_work_tests;
 mod realtime_history;
 mod retained_context;
 pub(crate) mod retirement;
@@ -1415,6 +1417,8 @@ impl SessionIo {
         &self,
         request: impl Into<WithTurnExtensionData<TurnInputRequest>>,
         mode: TurnInputMode,
+        host_work: Option<Box<dyn codex_protocol::host_turn_work::HostTurnWork>>,
+        residency_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
     ) -> CodexResult<TurnInputSubmission> {
         let id = new_submission_id();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -1428,13 +1432,14 @@ impl SessionIo {
             op: Op::TurnInput {
                 request: Box::new(request),
                 mode,
+                host_work,
                 reply: reply_tx,
             },
             trace,
             turn_extension_init,
             parent_turn_id: None,
             root_turn_id: None,
-            residency_guard: None,
+            residency_guard,
             message_delivery: None,
         })
         .await?;
@@ -1448,6 +1453,7 @@ impl SessionIo {
         trace: Option<W3cTraceContext>,
         turn_id: String,
         turn_extension_init: Option<ExtensionDataInit>,
+        host_work: Option<Box<dyn codex_protocol::host_turn_work::HostTurnWork>>,
     ) -> CodexResult<TurnInputSubmission> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.submit_with_id(Submission {
@@ -1455,6 +1461,7 @@ impl SessionIo {
             op: Op::RecoverTurn {
                 thread_settings,
                 start_options,
+                host_work,
                 reply: reply_tx,
             },
             trace,

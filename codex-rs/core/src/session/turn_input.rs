@@ -241,17 +241,29 @@ impl PreparedTurnInputSettings {
     }
 }
 
+/// Internal uncounted entrypoint. Public IO callers carry admitted work through
+/// handle_with_work; one-shot/delegated producers are ported separately.
+pub(super) async fn handle(
+    session: &Arc<Session>,
+    request: impl Into<WithTurnExtensionData<TurnInputRequest>>,
+    mode: TurnInputMode,
+    submission_id: String,
+) -> CodexResult<TurnInputSubmission> {
+    handle_with_work(session, request, mode, submission_id, None).await
+}
+
 #[tracing::instrument(
     name = "codex.turn_input",
     level = "trace",
     skip_all,
     fields(conversation.id = %session.thread_id, turn.id)
 )]
-pub(super) async fn handle(
+pub(super) async fn handle_with_work(
     session: &Arc<Session>,
     request: impl Into<WithTurnExtensionData<TurnInputRequest>>,
     mode: TurnInputMode,
     submission_id: String,
+    mut host_work: Option<Box<dyn codex_protocol::host_turn_work::HostTurnWork>>,
 ) -> CodexResult<TurnInputSubmission> {
     let request = request.into();
     if request.request.start.service_tier.is_some()
@@ -290,8 +302,24 @@ pub(super) async fn handle(
             reason: NotSubmittedReason::ServerDraining,
         });
     }
+    let agent_work = if matches!(mode, TurnInputMode::StartOrSteer)
+        && matches!(
+            &request.request.input,
+            SubmittedTurnInput::InterAgentCommunication(_)
+        ) {
+        // Accepted agent mail owns its work until actual consumption, not until
+        // the RPC reply. It must not bind to this receipt-only submission ID.
+        host_work.take()
+    } else {
+        if let Some(work) = &mut host_work {
+            work.bind_submission(&submission_id);
+        }
+        None
+    };
     let result = match mode {
-        TurnInputMode::StartOrSteer => start_or_steer(session, request, submission_id).await,
+        TurnInputMode::StartOrSteer => {
+            start_or_steer(session, request, submission_id, agent_work).await
+        }
         TurnInputMode::StartIfIdle => {
             let kind = match &request.request.input {
                 SubmittedTurnInput::UserInput { content, .. } if !content.is_empty() => {
@@ -335,6 +363,12 @@ pub(super) async fn handle(
             steer(session, request, expected_turn_id, submission_id).await
         }
     };
+    if matches!(&result, Ok(TurnInputSubmission::Started { .. }))
+        && let Some(work) = host_work.take()
+    {
+        // No suspension separates exact installation from transferring custody.
+        work.retain_until_terminal();
+    }
     // Link this request's trace to the accepted turn, which may have an older trace.
     if let Ok(
         TurnInputSubmission::Started { turn_id, .. } | TurnInputSubmission::Steered { turn_id, .. },
@@ -394,12 +428,13 @@ async fn start_or_steer(
     session: &Arc<Session>,
     request: WithTurnExtensionData<TurnInputRequest>,
     submission_id: String,
+    agent_work: Option<Box<dyn codex_protocol::host_turn_work::HostTurnWork>>,
 ) -> CodexResult<TurnInputSubmission> {
     if matches!(
         request.request.input,
         SubmittedTurnInput::InterAgentCommunication(_)
     ) {
-        return agent::submit(session, request, submission_id).await;
+        return agent::submit(session, request, submission_id, agent_work).await;
     }
     let WithTurnExtensionData {
         request,

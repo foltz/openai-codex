@@ -1154,7 +1154,9 @@ impl McpConnectionSet {
                     drop(deferred_owner.spawn(
                         &tokio::runtime::Handle::current(),
                         crate::McpWorkerKind::DeferredStartup,
-                        worker,
+                        async move {
+                            let _ = worker.await;
+                        },
                     ));
                 }
                 let outcomes = JoinSet::from_iter(eager_workers).join_all().await;

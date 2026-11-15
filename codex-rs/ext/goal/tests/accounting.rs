@@ -285,3 +285,15 @@ fn token_usage(
         codex_rollout_budget_units: None,
     }
 }
+
+// Accepted-turn fixture helpers go through the production staged commit path.
+impl GoalAccountingState {
+    fn start_turn(&self, id: &str, mode: ModeKind, usage: &TokenUsage) {
+        let prepared = self.prepare_turn(id, mode, usage);
+        self.commit_prepared_turn(id, &prepared);
+    }
+    fn mark_turn_goal_active(&self, id: &str, goal: &str) {
+        assert_eq!(Some(id.to_owned()), self.current_turn_id());
+        self.mark_current_turn_goal_active(goal);
+    }
+}

@@ -27,6 +27,7 @@ use codex_extension_api::TurnErrorInput;
 use codex_extension_api::TurnLifecycleContributor;
 use codex_extension_api::TurnStartInput;
 use codex_extension_api::TurnStopInput;
+use codex_extension_api::{TurnCommittedInput, TurnPreparationAccess};
 use codex_otel::MetricsClient;
 use codex_protocol::ThreadId;
 use codex_protocol::items::TurnItem;
@@ -38,6 +39,7 @@ use codex_protocol::protocol::TokenUsageInfo;
 
 use crate::accounting::BudgetLimitedGoalDisposition;
 use crate::accounting::GoalAccountingState;
+use crate::accounting::GoalTurnPreparation;
 use crate::analytics::GoalAnalytics;
 use crate::api::GoalService;
 use crate::events::GoalEventEmitter;
@@ -91,6 +93,18 @@ impl<C> GoalExtension<C> {
             thread_manager,
             goal_service,
             goal_config: Arc::new(goal_config),
+        }
+    }
+    async fn clear_continuation_deferral_after_turn(&self, thread_id: ThreadId) {
+        // Preparation may be abandoned. Only an installed turn's terminal
+        // callback consumes the durable fork deferral; a crash keeps it deferred.
+        if let Err(err) = self
+            .state_dbs
+            .thread_goals()
+            .clear_thread_goal_continuation_deferral(thread_id)
+            .await
+        {
+            tracing::warn!("failed to clear deferred goal continuation: {err}");
         }
     }
 }
@@ -249,20 +263,19 @@ where
                 return;
             };
 
-            let accounting = runtime.accounting_state();
-            let Ok(_turn_start_permit) = accounting.turn_start_permit().await else {
+            let Some(resources) = input.turn_store.get::<TurnPreparationAccess>() else {
+                tracing::warn!("skipping goal preparation: no host preparation owner");
                 return;
             };
-            if let Err(err) = self
-                .state_dbs
-                .thread_goals()
-                .clear_thread_goal_continuation_deferral(runtime.thread_id())
-                .await
-            {
-                tracing::warn!("failed to clear deferred goal continuation: {err}");
+            let accounting = runtime.accounting_state();
+            let Ok(permit) = accounting.turn_start_permit().await else {
+                return;
+            };
+            if resources.retain(input.turn_id, permit).is_err() {
+                tracing::warn!("skipping goal preparation: host preparation ended");
+                return;
             }
-
-            accounting.start_turn(
+            let mut prepared = accounting.prepare_turn(
                 input.turn_id,
                 input.collaboration_mode.mode,
                 token_usage_at_turn_start,
@@ -271,7 +284,7 @@ where
                 input.collaboration_mode.mode,
                 codex_protocol::config_types::ModeKind::Plan
             ) {
-                accounting.clear_current_turn_goal();
+                input.turn_store.insert(prepared);
                 return;
             }
             let Ok(goal) = self
@@ -280,6 +293,7 @@ where
                 .get_thread_goal(runtime.thread_id())
                 .await
             else {
+                input.turn_store.insert(prepared);
                 return;
             };
             if let Some(goal) = goal
@@ -289,9 +303,22 @@ where
                         | codex_state::ThreadGoalStatus::BudgetLimited
                 )
             {
-                accounting.mark_turn_goal_active(input.turn_id, goal.goal_id);
+                prepared.activate_goal(goal.goal_id, &accounting);
             }
+            input.turn_store.insert(prepared);
         })
+    }
+
+    fn on_turn_committed(&self, input: TurnCommittedInput<'_>) {
+        let Some(runtime) = goal_runtime_handle(input.thread_store) else {
+            return;
+        };
+        let Some(prepared) = input.turn_store.remove::<GoalTurnPreparation>() else {
+            return;
+        };
+        runtime
+            .accounting_state()
+            .commit_prepared_turn(input.turn_id, &prepared);
     }
 
     fn on_item_completed<'a>(
@@ -320,6 +347,8 @@ where
                 return;
             }
 
+            self.clear_continuation_deferral_after_turn(runtime.thread_id())
+                .await;
             let turn_id = input.turn_store.level_id();
             if let Some(expected_goal_id) =
                 runtime.accounting_state().execution_failure_goal(turn_id)
@@ -387,6 +416,8 @@ where
                 return;
             }
 
+            self.clear_continuation_deferral_after_turn(runtime.thread_id())
+                .await;
             let turn_id = input.turn_store.level_id();
             input.thread_store.remove::<TurnStartOptions>();
             if input.reason != codex_protocol::protocol::TurnAbortReason::Interrupted {

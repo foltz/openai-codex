@@ -3,4 +3,5 @@ load("//:defs.bzl", "codex_rust_crate")
 codex_rust_crate(
     name = "extension-api",
     crate_name = "codex_extension_api",
+    integration_compile_data_extra = ["src/turn_preparation.rs"],
 )

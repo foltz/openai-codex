@@ -8,6 +8,8 @@ mod session_isolation;
 mod state;
 mod tool_policy;
 mod turn_admission;
+mod turn_preparation;
+pub use turn_preparation::{TurnPreparationAccess, TurnPreparationOwner};
 mod user_instructions;
 
 pub use message_lifecycle::MessageLifecycleContributor;

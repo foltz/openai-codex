@@ -2,6 +2,7 @@
 #![allow(clippy::expect_used)]
 
 use codex_utils_absolute_path::test_support::PathExt;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::PoisonError;
@@ -27,6 +28,7 @@ use codex_extension_api::ToolPayload;
 use codex_extension_api::TurnErrorInput;
 use codex_extension_api::TurnStartInput;
 use codex_extension_api::TurnStopInput;
+use codex_extension_api::{TurnAbortInput, TurnCommittedInput, TurnPreparationOwner};
 use codex_goal_extension::GoalExtensionConfig;
 use codex_goal_extension::GoalObjectiveUpdate;
 use codex_goal_extension::GoalRuntimeHandle;
@@ -48,6 +50,7 @@ use codex_protocol::protocol::ThreadGoalStatus;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TruncationPolicy;
+use codex_protocol::protocol::TurnAbortReason;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use tempfile::TempDir;
@@ -1696,10 +1699,16 @@ fn tool_names(tools: &[Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>]) -> Ve
     tools.iter().map(|tool| tool.tool_name().name).collect()
 }
 
+struct PreparedTurn {
+    store: Arc<ExtensionData>,
+    owner: Mutex<Option<TurnPreparationOwner>>,
+}
+
 struct GoalExtensionHarness {
     registry: Arc<codex_extension_api::ExtensionRegistry<()>>,
     session_store: ExtensionData,
     thread_store: ExtensionData,
+    turn_stores: Mutex<HashMap<String, Arc<ExtensionData>>>,
     goal_service: Arc<GoalService>,
     sink: Arc<RecordingEventSink>,
 }
@@ -1746,6 +1755,7 @@ impl GoalExtensionHarness {
             registry,
             session_store,
             thread_store,
+            turn_stores: Mutex::new(HashMap::new()),
             goal_service,
             sink,
         })
@@ -1789,6 +1799,7 @@ impl GoalExtensionHarness {
             registry: Arc::clone(&self.registry),
             session_store,
             thread_store,
+            turn_stores: Mutex::new(HashMap::new()),
             goal_service: Arc::clone(&self.goal_service),
             sink: Arc::clone(&self.sink),
         })
@@ -1808,7 +1819,23 @@ impl GoalExtensionHarness {
     }
 
     async fn start_turn_with_mode(&self, turn_id: &str, mode: ModeKind, usage: &TokenUsage) {
-        let turn_store = ExtensionData::new(turn_id);
+        let prepared = self.prepare_turn(turn_id, mode, usage).await;
+        self.commit_turn(&prepared);
+    }
+
+    async fn prepare_turn(
+        &self,
+        turn_id: &str,
+        mode: ModeKind,
+        usage: &TokenUsage,
+    ) -> PreparedTurn {
+        let owner = TurnPreparationOwner::new(turn_id);
+        let turn_store = Arc::new(ExtensionData::new(turn_id));
+        turn_store.insert(owner.access());
+        self.turn_stores
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(turn_id.to_owned(), Arc::clone(&turn_store));
         let mut collaboration_mode = default_collaboration_mode();
         collaboration_mode.mode = mode;
         for contributor in self.registry.turn_lifecycle_contributors() {
@@ -1823,10 +1850,41 @@ impl GoalExtensionHarness {
                 })
                 .await;
         }
+        PreparedTurn {
+            store: turn_store,
+            owner: Mutex::new(Some(owner)),
+        }
+    }
+
+    fn commit_turn(&self, prepared: &PreparedTurn) {
+        for contributor in self.registry.turn_lifecycle_contributors() {
+            contributor.on_turn_committed(TurnCommittedInput {
+                turn_id: prepared.store.level_id(),
+                session_store: &self.session_store,
+                thread_store: &self.thread_store,
+                turn_store: &prepared.store,
+            });
+        }
+        drop(
+            prepared
+                .owner
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take(),
+        );
+    }
+
+    fn turn_store(&self, turn_id: &str) -> Arc<ExtensionData> {
+        self.turn_stores
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(turn_id)
+            .cloned()
+            .expect("turn must have been prepared")
     }
 
     async fn stop_turn(&self, turn_id: &str) {
-        let turn_store = ExtensionData::new(turn_id);
+        let turn_store = self.turn_store(turn_id);
         for contributor in self.registry.turn_lifecycle_contributors() {
             contributor
                 .on_turn_stop(TurnStopInput {
@@ -1849,7 +1907,7 @@ impl GoalExtensionHarness {
         usage: &TokenUsage,
         last_usage: &TokenUsage,
     ) {
-        let turn_store = ExtensionData::new(turn_id);
+        let turn_store = self.turn_store(turn_id);
         let token_usage = TokenUsageInfo {
             total_token_usage: usage.clone(),
             last_usage_includes_reasoning: None,
@@ -1907,7 +1965,7 @@ impl GoalExtensionHarness {
         tool_name: &str,
         outcome: ToolCallOutcome,
     ) {
-        let turn_store = ExtensionData::new(turn_id);
+        let turn_store = self.turn_store(turn_id);
         let tool_name = codex_extension_api::ToolName::plain(tool_name);
         for contributor in self.registry.tool_lifecycle_contributors() {
             contributor
@@ -1926,7 +1984,7 @@ impl GoalExtensionHarness {
     }
 
     async fn notify_turn_error(&self, turn_id: &str, error: CodexErr) {
-        let turn_store = ExtensionData::new(turn_id);
+        let turn_store = self.turn_store(turn_id);
         for contributor in self.registry.turn_lifecycle_contributors() {
             contributor
                 .on_turn_error(TurnErrorInput {
@@ -2101,4 +2159,196 @@ fn protocol_status(status: codex_state::ThreadGoalStatus) -> ThreadGoalStatus {
         codex_state::ThreadGoalStatus::BudgetLimited => ThreadGoalStatus::BudgetLimited,
         codex_state::ThreadGoalStatus::Complete => ThreadGoalStatus::Complete,
     }
+}
+
+#[tokio::test]
+async fn fork_goal_deferral_survives_preparation_until_stop_or_abort() -> anyhow::Result<()> {
+    for abort_reason in [None, Some(TurnAbortReason::Interrupted)] {
+        let runtime = test_runtime().await?;
+        let thread_id = test_thread_id()?;
+        seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+        let goal = runtime
+            .thread_goals()
+            .replace_thread_goal(
+                thread_id,
+                "inherited goal",
+                codex_state::ThreadGoalStatus::Active,
+                /*token_budget*/ None,
+            )
+            .await?;
+        runtime
+            .thread_goals()
+            .replace_thread_goal_snapshot(&goal)
+            .await?;
+        let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
+
+        // These callbacks run before installation. Abandoning preparation
+        // emits no terminal callback and must leave the durable marker intact.
+        harness
+            .prepare_turn("abandoned", ModeKind::Default, &TokenUsage::default())
+            .await;
+        harness.resume_thread().await;
+        assert!(
+            runtime
+                .thread_goals()
+                .has_thread_goal_continuation_deferral(thread_id)
+                .await?
+        );
+
+        harness
+            .start_turn("installed", &TokenUsage::default())
+            .await;
+        assert!(
+            runtime
+                .thread_goals()
+                .has_thread_goal_continuation_deferral(thread_id)
+                .await?
+        );
+        if let Some(reason) = abort_reason {
+            let turn_store = harness.turn_store("installed");
+            for contributor in harness.registry.turn_lifecycle_contributors() {
+                contributor
+                    .on_turn_abort(TurnAbortInput {
+                        reason: reason.clone(),
+                        session_store: &harness.session_store,
+                        thread_store: &harness.thread_store,
+                        turn_store: &turn_store,
+                    })
+                    .await;
+            }
+        } else {
+            harness.stop_turn("installed").await;
+        }
+        assert!(
+            !runtime
+                .thread_goals()
+                .has_thread_goal_continuation_deferral(thread_id)
+                .await?
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn staged_goal_preparation_respects_persisted_set_before_runtime_effects_and_clear()
+-> anyhow::Result<()> {
+    for status in [
+        ThreadGoalStatus::Active,
+        ThreadGoalStatus::Paused,
+        ThreadGoalStatus::BudgetLimited,
+    ] {
+        let runtime = test_runtime().await?;
+        let thread_id = test_thread_id()?;
+        seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+        runtime
+            .thread_goals()
+            .replace_thread_goal(
+                thread_id,
+                "cached goal",
+                codex_state::ThreadGoalStatus::Active,
+                /*token_budget*/ None,
+            )
+            .await?;
+        let harness = GoalExtensionHarness::new(Arc::clone(&runtime), thread_id).await?;
+        let staged = harness
+            .prepare_turn("accepted", ModeKind::Default, &TokenUsage::default())
+            .await;
+        let outcome = harness
+            .goal_service
+            .set_thread_goal(
+                runtime.as_ref(),
+                GoalSetRequest {
+                    thread_id,
+                    objective: GoalObjectiveUpdate::Keep,
+                    status: Some(status),
+                    token_budget: GoalTokenBudgetUpdate::Keep,
+                    max_goal_token_budget: None,
+                },
+            )
+            .await?;
+        // Deliberately commit before the separate runtime-effects phase.
+        harness.commit_turn(&staged);
+        harness
+            .record_token_usage("accepted", &input_token_usage(23))
+            .await;
+        harness
+            .runtime_handle()
+            .prepare_external_goal_mutation()
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let goal = runtime
+            .thread_goals()
+            .get_thread_goal(thread_id)
+            .await?
+            .expect("goal exists");
+        assert_eq!(
+            if matches!(
+                status,
+                ThreadGoalStatus::Active | ThreadGoalStatus::BudgetLimited
+            ) {
+                23
+            } else {
+                0
+            },
+            goal.tokens_used
+        );
+        outcome.apply_runtime_effects(&harness.goal_service).await;
+        let staged = harness
+            .prepare_turn("cleared", ModeKind::Default, &TokenUsage::default())
+            .await;
+        assert!(
+            harness
+                .goal_service
+                .clear_thread_goal(runtime.as_ref(), thread_id)
+                .await?
+        );
+        harness.commit_turn(&staged);
+        harness
+            .record_token_usage("cleared", &input_token_usage(30))
+            .await;
+        harness
+            .runtime_handle()
+            .prepare_external_goal_mutation()
+            .await
+            .map_err(anyhow::Error::msg)?;
+        assert!(
+            runtime
+                .thread_goals()
+                .get_thread_goal(thread_id)
+                .await?
+                .is_none()
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn actual_goal_preparation_permit_releases_on_drop_and_commit_with_retained_store()
+-> anyhow::Result<()> {
+    let runtime = test_runtime().await?;
+    let thread_id = test_thread_id()?;
+    seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+    let harness = GoalExtensionHarness::new(runtime, thread_id).await?;
+    let abandoned = harness
+        .prepare_turn("abandoned", ModeKind::Default, &TokenUsage::default())
+        .await;
+    let retained = Arc::clone(&abandoned.store);
+    let baseline = TokenUsage::default();
+    let mut next = Box::pin(harness.prepare_turn("accepted", ModeKind::Default, &baseline));
+    tokio::select! {
+        _ = &mut next => panic!("a competing actual Goal preparation overtook the retained permit"),
+        _ = tokio::time::sleep(Duration::from_millis(30)) => {}
+    }
+    drop(abandoned);
+    let accepted = tokio::time::timeout(Duration::from_secs(5), next).await?;
+    assert_eq!("abandoned", retained.level_id());
+    harness.commit_turn(&accepted);
+    // A retained committed preparation also cannot retain the permit.
+    let following = tokio::time::timeout(
+        Duration::from_secs(5),
+        harness.prepare_turn("following", ModeKind::Default, &baseline),
+    )
+    .await?;
+    drop(following);
+    Ok(())
 }

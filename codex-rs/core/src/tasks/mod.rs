@@ -481,6 +481,12 @@ impl Session {
 
         mailbox.append(self.input_queue.reserve_mailbox());
         turn_state.lock().await.token_usage_at_turn_start = token_usage_at_turn_start.clone();
+        // The future owns resources; a retained context receives only weak access.
+        let preparation_resources =
+            codex_extension_api::TurnPreparationOwner::new(&turn_context.sub_id);
+        turn_context
+            .extension_data
+            .insert(preparation_resources.access());
         self.emit_turn_start_lifecycle(
             turn_context.as_ref(),
             Some(&token_usage_at_turn_start),
@@ -657,6 +663,7 @@ impl Session {
         // Exact assignment is irrevocable; publish outside active_turn. Run,
         // abort and replacement wait for this publication before proceeding.
         self.emit_turn_committed_lifecycle(turn_context.as_ref());
+        drop(preparation_resources);
         commit_cancel_guard.disarm();
         drop(commit_guard);
         true

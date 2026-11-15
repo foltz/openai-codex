@@ -1194,6 +1194,12 @@ async fn cancelled_pool_constructor_retains_its_late_transport_owner() {
     assert_eq!(workers.counts[0].joined, 1);
     assert_eq!(workers.counts[1].joined, 1);
     assert_eq!(workers.counts[0].pending + workers.counts[1].pending, 0);
+    let compacted = pool
+        .retire_released_until(tokio::time::Instant::now())
+        .await;
+    assert_eq!(compacted.retired_before, 1);
+    assert!(compacted.connections.is_empty());
+    assert!(compacted.constructing_connections.is_empty());
 }
 
 #[tokio::test]

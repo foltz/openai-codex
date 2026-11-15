@@ -6,6 +6,7 @@ use std::sync::Mutex;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use futures::future::Shared;
+use futures::future::WeakShared;
 use tokio::runtime::Handle;
 use tokio::time::Instant;
 
@@ -23,6 +24,7 @@ pub(super) enum WorkerExit {
 }
 
 pub(super) type Completion = Shared<BoxFuture<'static, WorkerExit>>;
+pub(super) type WeakCompletion = WeakShared<BoxFuture<'static, WorkerExit>>;
 
 /// Worker exit counts are not protocol acknowledgements or physical retirement.
 #[derive(Clone, Debug, Eq, PartialEq)]

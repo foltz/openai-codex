@@ -10,6 +10,9 @@ use codex_rmcp_client::RmcpClient;
 use codex_rmcp_client::RmcpClientRetirement;
 use tokio::time::Instant;
 
+use super::worker_joins::Completion;
+use super::worker_joins::WeakCompletion;
+
 /// Open-admission snapshot, never a whole-process termination claim.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PoolPhysicalSnapshot {
@@ -35,10 +38,34 @@ pub(super) struct PhysicalOwner {
 #[derive(Default)]
 struct BindingState {
     settled: bool,
+    startup_join: Option<WeakCompletion>,
     foreign: Vec<RmcpClientRetirement>,
 }
 
 impl PhysicalOwner {
+    pub(super) fn observe_startup(&self, completion: &Completion) {
+        self.binding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .startup_join = completion.downgrade();
+    }
+
+    async fn wait_startup_until(&self, deadline: Instant) {
+        if Instant::now() >= deadline {
+            return;
+        }
+        let completion = self
+            .binding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .startup_join
+            .as_ref()
+            .and_then(WeakCompletion::upgrade);
+        if let Some(completion) = completion {
+            let _ = tokio::time::timeout_at(deadline, completion).await;
+        }
+    }
+
     pub(super) fn mark_released(&self) {
         self.lower.close_registration();
         self.released.store(true, Ordering::Release);
@@ -162,11 +189,20 @@ impl PoolPhysicalOwners {
                 held_connections.push(owner.id);
             }
         }
-        let connections = futures::future::join_all(
-            released
-                .iter()
-                .map(|owner| async { (owner.id, owner.lower.shutdown_until(deadline).await) }),
-        )
+        let connections = futures::future::join_all(released.iter().map(|owner| async {
+            // Closing the lower gate fences late constructors. Observe
+            // only this owner's original startup join, not other chats.
+            let (mut report, ()) = tokio::join!(
+                owner.lower.shutdown_until(deadline),
+                owner.wait_startup_until(deadline),
+            );
+            // Startup can return its transport lease after the first
+            // lower sample. Reconcile once, within the same budget.
+            if !report.is_complete() && Instant::now() < deadline {
+                report = owner.lower.shutdown_until(deadline).await;
+            }
+            (owner.id, report)
+        }))
         .await;
         let mut state = self
             .state

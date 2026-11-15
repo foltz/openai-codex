@@ -148,6 +148,12 @@ pub(crate) struct McpAbortOnDrop {
     abort: AbortHandle,
 }
 
+impl McpAbortOnDrop {
+    pub(crate) fn stop(&self) {
+        self.abort.abort();
+    }
+}
+
 impl Drop for McpAbortOnDrop {
     fn drop(&mut self) {
         self.abort.abort();

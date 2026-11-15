@@ -123,3 +123,65 @@ async fn auth_notifications_require_opt_in_and_follow_client_lifetime() -> Resul
     client.shutdown().await;
     Ok(())
 }
+
+#[tokio::test]
+async fn explicit_private_shutdown_stops_its_watcher_even_with_retained_client_bindings()
+-> Result<()> {
+    let session_context = crate::connection_pool::tests::context();
+    let workers = session_context.workers.clone();
+    let pool = crate::McpConnectionPool::default();
+    let (notifications, mut received) = mpsc::channel(8);
+    let client =
+        RmcpClient::new_in_process_client(Arc::new(NotificationServer(notifications))).await?;
+    client
+        .initialize(
+            InitializeRequestParams::new(
+                ClientCapabilities::default(),
+                Implementation::new("private-watch", "1"),
+            ),
+            Some(SEND_TIMEOUT),
+            Box::new(|_, _| async { anyhow::bail!("unexpected elicitation") }.boxed()),
+        )
+        .await?;
+    let mut managed = crate::connection_manager::tests::create_test_managed_client_for_transport(
+        Vec::new(),
+        client,
+    );
+    let (changes, receiver) = watch::channel(AuthChangeState::default());
+    let mut capabilities = ServerCapabilities::default();
+    capabilities.experimental = Some([(CAPABILITY.to_string(), Default::default())].into());
+    managed._auth_change_notifications = start(
+        &workers,
+        Arc::clone(&managed.client),
+        &capabilities,
+        Some(receiver),
+    )
+    .await?;
+    assert!(managed._auth_change_notifications.is_some());
+    assert!(timeout(SEND_TIMEOUT, received.recv()).await?.is_some());
+    let retained = managed.clone();
+    let mut async_client =
+        crate::connection_manager::tests::create_ready_async_managed_client(Vec::new()).await;
+    async_client.client = futures::future::ready(Ok(managed)).boxed().shared();
+    async_client.shutdown().await;
+    timeout(SEND_TIMEOUT, changes.closed()).await?;
+    assert!(retained._auth_change_notifications.is_some());
+    assert!(retained.client.is_closed().await);
+    let result = workers
+        .observe_until(tokio::time::Instant::now() + SEND_TIMEOUT)
+        .await;
+    let watcher = result
+        .counts
+        .iter()
+        .find(|c| c.kind == crate::McpWorkerKind::AuthNotification)
+        .unwrap();
+    assert_eq!(watcher.cancelled, 1);
+    assert_eq!(watcher.pending + watcher.joined + watcher.panicked, 0);
+    assert_eq!(
+        pool.observe_background_workers_until(tokio::time::Instant::now())
+            .await
+            .registered_at_end,
+        0
+    );
+    Ok(())
+}

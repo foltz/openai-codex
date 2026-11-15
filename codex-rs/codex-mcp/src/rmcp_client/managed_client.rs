@@ -41,6 +41,14 @@ pub(crate) struct ManagedClient {
 }
 
 impl ManagedClient {
+    /// Only the actual private/final transport authority may stop this watcher.
+    /// Non-final shared lease release must leave it serving other chats.
+    pub(crate) fn stop_auth_change_notifications(&self) {
+        if let Some(watcher) = &self._auth_change_notifications {
+            watcher.stop();
+        }
+    }
+
     pub(crate) async fn with_active_shared_lease<T>(
         &self,
         operation: impl Future<Output = T>,

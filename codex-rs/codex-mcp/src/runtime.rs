@@ -1155,6 +1155,11 @@ pub fn apply_http_headers_helper(
 }
 
 impl McpRuntimeContext {
+    pub(crate) fn for_pooled_connection(mut self, pool: &McpConnectionPool) -> Self {
+        self.workers = pool.background_worker_owner();
+        self
+    }
+
     pub(crate) fn without_retirement_owner(mut self) -> Self {
         self.retirement = None;
         self

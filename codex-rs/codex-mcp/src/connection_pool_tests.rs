@@ -183,12 +183,31 @@ pub(crate) fn startup(
     Option<CancellationToken>,
     Option<RmcpClientRetirement>,
 ) -> ManagedClientFuture {
+    startup_with_auth(sharing, starts, first_started, release_first, server, None)
+}
+
+fn startup_with_auth(
+    sharing: ConnectionSharing,
+    starts: Arc<AtomicUsize>,
+    first_started: Arc<Notify>,
+    release_first: Arc<Notify>,
+    server: impl InProcessTransportFactory + Clone + 'static,
+    auth: Option<(
+        crate::McpWorkerOwner,
+        tokio::sync::watch::Receiver<AuthChangeState>,
+    )>,
+) -> impl Fn(
+    CancellationToken,
+    Option<CancellationToken>,
+    Option<RmcpClientRetirement>,
+) -> ManagedClientFuture {
     move |cancellation, _sharing_declined, retirement| {
         let sharing = sharing.clone();
         let starts = Arc::clone(&starts);
         let first_started = Arc::clone(&first_started);
         let release_first = Arc::clone(&release_first);
         let server = server.clone();
+        let auth = auth.clone();
         async move {
             async {
                 if starts.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -202,7 +221,7 @@ pub(crate) fn startup(
                 .await
                 .expect("create test MCP client");
                 let mut client = create_test_managed_client_for_transport(Vec::new(), transport);
-                client
+                let initialized = client
                     .client
                     .initialize(
                         InitializeRequestParams::new(
@@ -221,6 +240,15 @@ pub(crate) fn startup(
                         }),
                     )
                     .await?;
+                if let Some((workers, receiver)) = auth {
+                    client._auth_change_notifications = crate::auth_changes::start(
+                        &workers,
+                        Arc::clone(&client.client),
+                        &initialized.capabilities,
+                        Some(receiver),
+                    )
+                    .await?;
+                }
                 let (tools, meta) = list_tools_for_client_uncached(
                     "test_server",
                     /*is_codex_apps_mcp_server*/ false,
@@ -259,7 +287,7 @@ impl LeaseFrame {
 }
 
 #[derive(Clone)]
-struct LeaseTransport(mpsc::UnboundedSender<LeaseFrame>);
+struct LeaseTransport(mpsc::UnboundedSender<LeaseFrame>, bool);
 
 impl InProcessTransportFactory for LeaseTransport {
     fn open(&self) -> BoxFuture<'static, std::io::Result<tokio::io::DuplexStream>> {
@@ -267,6 +295,7 @@ impl InProcessTransportFactory for LeaseTransport {
         let (reader, mut writer) = tokio::io::split(server);
         let mut lines = BufReader::new(reader).lines();
         let frames = self.0.clone();
+        let auth_changes = self.1;
         let (replies, mut responses) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             loop {
@@ -281,10 +310,15 @@ impl InProcessTransportFactory for LeaseTransport {
                             replies: replies.clone(),
                         };
                         match frame.message["method"].as_str().unwrap() {
-                            "initialize" => frame.reply(json!({
-                                "protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
-                                "serverInfo": {"name": "test", "version": "1"}
-                            })),
+                            "initialize" => {
+                                let capabilities = if auth_changes {
+                                    json!({"tools": {}, "experimental": {"codex/auth-change": {}}})
+                                } else { json!({"tools": {}}) };
+                                frame.reply(json!({
+                                    "protocolVersion": "2025-06-18", "capabilities": capabilities,
+                                    "serverInfo": {"name": "test", "version": "1"}
+                                }));
+                            },
                             "notifications/initialized" => {}
                             "tools/list" => frame.reply(json!({"tools": []})),
                             _ => frames.send(frame).unwrap(),
@@ -310,7 +344,7 @@ impl LeasePeer {
         Self {
             pool: McpConnectionPool::default(),
             key: key(&context(), &config()),
-            transport: LeaseTransport(tx),
+            transport: LeaseTransport(tx, false),
             frames,
         }
     }
@@ -1392,7 +1426,7 @@ async fn private_event_stream(
         Arc::default(),
         Arc::default(),
         ready,
-        LeaseTransport(tx),
+        LeaseTransport(tx, false),
     );
     let managed = launch(CancellationToken::new(), None, Some(lease.retirement()))
         .await
@@ -1931,4 +1965,182 @@ async fn retained_runtime_census_does_not_keep_an_ordinary_chat_lease_alive() {
     assert!(!other.client.is_closed().await);
     drop(other);
     assert_event_pool_retired(&peer.pool).await;
+}
+
+#[tokio::test]
+async fn pooled_auth_watcher_survives_creator_release_and_stops_on_final_transport_release() {
+    let mut peer = LeasePeer::new();
+    peer.transport.1 = true;
+    let session_context = context();
+    let session_workers = session_context.workers.clone();
+    let process_workers = session_context
+        .clone()
+        .for_pooled_connection(&peer.pool)
+        .workers;
+    let (changes, receiver) = tokio::sync::watch::channel(AuthChangeState::default());
+    let pool = peer.pool.clone();
+    let key = peer.key.clone();
+    let transport = peer.transport.clone();
+    let attached = tokio::spawn(async move {
+        let ready = Arc::<Notify>::default();
+        ready.notify_one();
+        let launch = startup_with_auth(
+            ConnectionSharing::Negotiated,
+            Arc::default(),
+            Arc::default(),
+            ready,
+            transport,
+            Some((process_workers, receiver)),
+        );
+        pool.connect(
+            Arc::default(),
+            key,
+            Arc::new(Mutex::new(Some(
+                json!({"extensions": {LEASE_CAPABILITY: {}}}),
+            ))),
+            None,
+            CancellationToken::new(),
+            launch,
+        )
+        .await
+    });
+    let initial = peer.next("notifications/codex/authChanged").await;
+    assert_eq!(
+        initial.message["params"],
+        json!({"_meta": {}, "generation": 0, "ownerGeneration": 0})
+    );
+    peer.next("codex/connection/open").await.reply(json!({}));
+    let first = attached.await.unwrap().unwrap();
+    assert!(
+        first._auth_change_notifications.is_some(),
+        "actual opt-in initialization must create the watcher"
+    );
+    let (other, _) = peer.chat().await;
+    assert!(Arc::ptr_eq(&first.client, &other.client));
+    let ConnectionSharing::Shared(lease) = &first.connection_sharing else {
+        panic!("shared lease");
+    };
+    let root = session_context.retirement.as_ref().unwrap();
+    root.register_connection(
+        Default::default(),
+        Some(Arc::clone(&lease.slot)),
+        CancellationToken::new(),
+    )
+    .unwrap();
+    root.close_registration();
+    peer.next("codex/connection/release").await.reply(json!({}));
+    assert!(
+        root.shutdown_until(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .are_connections_released()
+    );
+    assert_eq!(
+        session_workers
+            .observe_until(tokio::time::Instant::now())
+            .await
+            .registered_at_end,
+        0
+    );
+    let shared = peer
+        .pool
+        .observe_background_workers_until(tokio::time::Instant::now())
+        .await;
+    let watcher = shared
+        .counts
+        .iter()
+        .find(|c| c.kind == crate::McpWorkerKind::AuthNotification)
+        .unwrap();
+    assert_eq!(watcher.pending, 1);
+    assert_eq!(watcher.cancelled + watcher.panicked + watcher.joined, 0);
+    changes.send_modify(|state| state.generation += 1);
+    let update = peer.next("notifications/codex/authChanged").await;
+    assert_eq!(
+        update.message["params"],
+        json!({"_meta": {}, "generation": 1, "ownerGeneration": 0})
+    );
+    let (result, ()) = tokio::join!(
+        other.call_tool("test".into(), None, |_| Ok(None), None),
+        async {
+            peer.next("tools/call").await.reply(json!({"content": []}));
+        }
+    );
+    result.unwrap();
+    let ConnectionSharing::Shared(last) = &other.connection_sharing else {
+        panic!("shared lease");
+    };
+    last.release().unwrap().wait_for_shutdown().await;
+    tokio::time::timeout(Duration::from_secs(1), changes.closed())
+        .await
+        .unwrap();
+    let finished = peer
+        .pool
+        .observe_background_workers_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await;
+    let watcher = finished
+        .counts
+        .iter()
+        .find(|c| c.kind == crate::McpWorkerKind::AuthNotification)
+        .unwrap();
+    assert_eq!(watcher.cancelled, 1);
+    assert_eq!(watcher.pending + watcher.panicked + watcher.joined, 0);
+    assert!(
+        first._auth_change_notifications.is_some(),
+        "retained old bindings must not keep a stopped watcher alive"
+    );
+    assert!(other.client.is_closed().await);
+    assert_event_pool_retired(&peer.pool).await;
+}
+
+#[tokio::test]
+async fn pooled_worker_context_preserves_connection_identity_and_external_process_custody() {
+    let pool = McpConnectionPool::default();
+    let session = context();
+    let session_owner = session.workers.clone();
+    let identity = key(&session, &config());
+    let pooled = session.clone().for_pooled_connection(&pool);
+    assert!(identity == key(&pooled, &config()));
+    let release = Arc::<Notify>::default();
+    let resume = Arc::clone(&release);
+    drop(pooled.workers.spawn(
+        &tokio::runtime::Handle::current(),
+        crate::McpWorkerKind::DiscoveryCleanup,
+        async move {
+            resume.notified().await;
+        },
+    ));
+    drop(pooled);
+    drop(session);
+    assert_eq!(
+        session_owner
+            .observe_until(tokio::time::Instant::now())
+            .await
+            .registered_at_end,
+        0
+    );
+    let pending = pool
+        .observe_background_workers_until(tokio::time::Instant::now())
+        .await;
+    assert_eq!(pending.registered_at_end, 1);
+    assert_eq!(
+        pending
+            .counts
+            .iter()
+            .find(|c| c.kind == crate::McpWorkerKind::DiscoveryCleanup)
+            .unwrap()
+            .pending,
+        1
+    );
+    release.notify_one();
+    let joined = pool
+        .observe_background_workers_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await;
+    assert_eq!(
+        joined
+            .counts
+            .iter()
+            .find(|c| c.kind == crate::McpWorkerKind::DiscoveryCleanup)
+            .unwrap()
+            .joined,
+        1
+    );
 }

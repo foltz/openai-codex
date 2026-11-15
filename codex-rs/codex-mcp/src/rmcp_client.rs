@@ -646,11 +646,15 @@ impl AsyncManagedClient {
                             let mut shared_startup = (*startup).clone();
                             shared_startup.cancel_token = cancellation;
                             match retirement {
-                                Some(retirement) => shared_startup.start_in_retirement(
-                                    sharing_declined,
-                                    /*publish_apps*/ None,
-                                    retirement,
-                                ),
+                                Some(retirement) => {
+                                    shared_startup.runtime_context =
+                                        shared_startup.runtime_context.for_pooled_connection(&pool);
+                                    shared_startup.start_in_retirement(
+                                        sharing_declined,
+                                        /*publish_apps*/ None,
+                                        retirement,
+                                    )
+                                }
                                 None => shared_startup
                                     .start(sharing_declined, /*publish_apps*/ None),
                             }
@@ -788,10 +792,12 @@ impl AsyncManagedClient {
                         slot.wait_for_shutdown().await;
                     } else if matches!(&client.connection_sharing, ConnectionSharing::Owned(_)) {
                         // Waiters from startup may still hold leases even though sharing was declined.
+                        client.stop_auth_change_notifications();
                         client.client.shutdown().await;
                     }
                 }
                 ConnectionSharing::Private | ConnectionSharing::Negotiated => {
+                    client.stop_auth_change_notifications();
                     client.client.shutdown().await;
                 }
             },

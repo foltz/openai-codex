@@ -98,6 +98,7 @@ pub struct McpConnectionPool {
     // Process-owned custody independent of ordinary chat/client ownership.
     workers: Arc<PoolWorkerJoins>,
     physical: Arc<PoolPhysicalOwners>,
+    background: crate::McpWorkerOwner,
 }
 
 #[derive(Clone)]
@@ -293,6 +294,19 @@ impl ConnectionSharing {
 }
 
 impl McpConnectionPool {
+    pub(crate) fn background_worker_owner(&self) -> crate::McpWorkerOwner {
+        self.background.clone()
+    }
+
+    /// Shared connection watchers belong to the process pool, not to the
+    /// creating chat. This open census is separate from per-slot release.
+    pub async fn observe_background_workers_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> crate::McpWorkerSnapshot {
+        self.background.observe_until(deadline).await
+    }
+
     /// Observe a snapshot of original pool-worker joins without cancelling work.
     /// This does not close admission or prove physical transport retirement.
     pub async fn observe_workers_until(
@@ -600,6 +614,7 @@ impl ConnectionLease {
                         slot_retirement::SlotReleaseOutcome::ForeignRegistry
                     }
                     (Ok(client), None) => {
+                        client.stop_auth_change_notifications();
                         client.client.shutdown().await;
                         slot_retirement::SlotReleaseOutcome::RequiresPhysicalProof
                     }

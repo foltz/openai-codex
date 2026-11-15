@@ -565,7 +565,13 @@ mod tests {
         let mut config = (*turn_context.config).clone();
         config
             .features
-            .enable(codex_features::Feature::RuntimeAgentInstances);
+            .enable(codex_features::Feature::RuntimeAgentInstances)
+            .expect("enable runtime auth for the preparation-refusal fixture");
+        assert!(
+            config
+                .features
+                .enabled(codex_features::Feature::RuntimeAgentInstances)
+        );
         config.chatgpt_base_url = "https://chatgpt.com/backend-api".to_string();
         turn_context.config = Arc::new(config);
         let step = StepContext::for_test(Arc::new(turn_context));

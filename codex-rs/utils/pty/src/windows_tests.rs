@@ -516,3 +516,72 @@ async fn conpty_ctrl_c_interrupts_powershell_foreground_child() -> anyhow::Resul
     );
     Ok(())
 }
+
+/// Source-carried regression; requires native Windows execution for qualification.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn contained_retirement_error_keeps_job_for_fresh_budget_retry() -> anyhow::Result<()> {
+    use winapi::um::jobapi2::QueryInformationJobObject;
+    use winapi::um::winnt::JOBOBJECT_BASIC_ACCOUNTING_INFORMATION;
+    use winapi::um::winnt::JobObjectBasicAccountingInformation;
+
+    let python = find_python()
+        .ok_or_else(|| anyhow::anyhow!("Python required for job retirement regression"))?;
+    let mut command = Command::new(python);
+    command.args([
+        "-u", "-c",
+        "import subprocess,sys; child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); print(child.pid,flush=True); child.wait()",
+    ]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    let job = crate::JobObject::create_without_breakaway()?;
+    let mut root = job.spawn_contained(&mut command)?;
+    let stdout = root
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("missing root stdout"))?;
+    let mut stdout = BufReader::new(stdout);
+    let mut pid = String::new();
+    tokio::time::timeout(Duration::from_secs(10), stdout.read_line(&mut pid)).await??;
+    let pid: u32 = pid.trim().parse()?;
+    let child = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
+    anyhow::ensure!(!child.is_null(), "failed to capture descendant handle");
+    let child = unsafe { OwnedHandle::from_raw_handle(child.cast()) };
+    let raw_root = root
+        .raw_handle()
+        .ok_or_else(|| anyhow::anyhow!("missing root handle"))?;
+    let root_handle = unsafe { BorrowedHandle::borrow_raw(raw_root) }.try_clone_to_owned()?;
+
+    // A zero budget deterministically fails before a complete census. The
+    // job remains owned/queryable, even if best-effort stop finishes quickly.
+    assert!(
+        job.terminate_and_wait(&root_handle, Duration::ZERO)
+            .is_err()
+    );
+    let accounting = || -> anyhow::Result<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION> {
+        let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+        let queried = unsafe {
+            QueryInformationJobObject(
+                job.as_raw_handle().cast(),
+                JobObjectBasicAccountingInformation,
+                (&mut info as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                std::mem::size_of_val(&info) as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        anyhow::ensure!(
+            queried != 0,
+            "retained job is not queryable: {}",
+            std::io::Error::last_os_error()
+        );
+        Ok(info)
+    };
+    let _ = accounting()?;
+    job.terminate_and_wait(&root_handle, Duration::from_secs(10))?;
+    assert_eq!(accounting()?.ActiveProcesses, 0);
+    for process in [&root_handle, &child] {
+        assert_eq!(
+            unsafe { WaitForSingleObject(process.as_raw_handle().cast(), 0) },
+            WAIT_OBJECT_0
+        );
+    }
+    tokio::time::timeout(Duration::from_secs(10), root.wait()).await??;
+    Ok(())
+}

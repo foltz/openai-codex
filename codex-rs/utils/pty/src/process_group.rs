@@ -288,6 +288,20 @@ pub fn kill_process_group(_process_group_id: u32) -> io::Result<()> {
     Ok(())
 }
 
+/// Observe an owned group's presence without delivering a destructive signal.
+/// Permission failures prove presence, never successful cleanup.
+#[cfg(unix)]
+pub fn process_group_exists(process_group_id: u32) -> io::Result<bool> {
+    let pgid = libc::pid_t::try_from(process_group_id)
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid process group ID"))?;
+    match signal_process_group_id(pgid, 0) {
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok(true),
+        result => result,
+    }
+}
+
 /// Wait up to `grace` for a signaled group's members to release their resources.
 /// After that, allow the caller to proceed. An unreaped zombie or a recycled group ID
 /// can remain visible after the original processes have released their resources.

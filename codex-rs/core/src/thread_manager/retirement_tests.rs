@@ -2038,12 +2038,20 @@ async fn agent_constructor_retains_exact_parent_work_across_held_mcp_and_caller_
     assert_eq!(gate.live.load(Ordering::SeqCst), 4);
     gate.active.store(false, Ordering::SeqCst);
     drop(start);
-    tokio::time::timeout(
-        Duration::from_secs(20),
-        manager.drive_admitted_constructions(),
-    )
+    // This is a continuous progress observer, not a completion future. Keep
+    // polling it only until the counted original has actually released work.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let progress = manager.drive_admitted_constructions();
+        tokio::pin!(progress);
+        while gate.live.load(Ordering::SeqCst) != 0 {
+            tokio::select! {
+                _ = &mut progress => panic!("account progress observer stopped"),
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+        }
+    })
     .await
-    .expect("agent original drains");
+    .expect("agent original releases counted work");
     assert_eq!(gate.live.load(Ordering::SeqCst), 0);
     assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
     assert!(manager.state.threads.read().await.is_empty());

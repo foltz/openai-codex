@@ -1364,6 +1364,3 @@ impl Session {
 #[cfg(test)]
 #[path = "mod_tests.rs"]
 mod tests;
-
-#[cfg(test)]
-mod mailbox_commit_tests;

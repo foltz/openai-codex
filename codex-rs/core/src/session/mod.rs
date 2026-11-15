@@ -309,7 +309,7 @@ pub(crate) use self::environment::ThreadEnvironmentDefaults;
 #[cfg(test)]
 use self::handlers::submission_dispatch_span;
 #[cfg(test)]
-pub(crate) use self::handlers::submission_loop;
+use self::handlers::submission_loop;
 use self::handlers::submission_loop_with_dispatch;
 pub(crate) use self::input_queue::InputQueueActivity;
 pub(crate) use self::input_queue::TurnInput;
@@ -6419,3 +6419,6 @@ pub(crate) mod tests;
 #[cfg(test)]
 #[path = "world_state_item_tests.rs"]
 mod world_state_item_tests;
+
+#[cfg(test)]
+mod mailbox_task_commit_tests;

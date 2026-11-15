@@ -27,6 +27,8 @@ use codex_history::ResponseItemEnvelope;
 use codex_history::TurnAttribution;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
+use codex_protocol::protocol::HookCompletedEvent;
+use codex_protocol::protocol::HookRunSummary;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
@@ -118,6 +120,9 @@ pub(crate) struct SessionState {
     pub(crate) current_time_reminder: CurrentTimeReminderState,
     pub(crate) active_connector_selection: HashSet<String>,
     pub(crate) pending_session_start_sources: VecDeque<codex_hooks::SessionStartSource>,
+    /// Lifecycle records and context from an eagerly completed start hook.
+    /// Replayed once when the first turn supplies its persistence context.
+    pending_eager_session_start_outcomes: VecDeque<EagerSessionStartOutcome>,
     next_turn_is_first: bool,
     initial_settings_pending: bool,
 }
@@ -170,6 +175,7 @@ impl SessionState {
             current_time_reminder: CurrentTimeReminderState::default(),
             active_connector_selection: HashSet::new(),
             pending_session_start_sources: VecDeque::new(),
+            pending_eager_session_start_outcomes: VecDeque::new(),
             next_turn_is_first: true,
             initial_settings_pending: true,
         }
@@ -471,6 +477,36 @@ impl SessionState {
     ) -> Option<codex_hooks::SessionStartSource> {
         self.pending_session_start_sources.pop_front()
     }
+
+    pub(crate) fn queue_eager_session_start_outcome(
+        &mut self,
+        source: codex_hooks::SessionStartSource,
+        preview_runs: Vec<HookRunSummary>,
+        hook_events: Vec<HookCompletedEvent>,
+        should_stop: bool,
+        additional_contexts: Vec<codex_hooks::HookContext>,
+    ) {
+        self.pending_eager_session_start_outcomes
+            .push_back(EagerSessionStartOutcome {
+                source,
+                preview_runs,
+                hook_events,
+                should_stop,
+                additional_contexts,
+            });
+    }
+
+    pub(crate) fn take_eager_session_start_outcome(&mut self) -> Option<EagerSessionStartOutcome> {
+        self.pending_eager_session_start_outcomes.pop_front()
+    }
+}
+
+pub(crate) struct EagerSessionStartOutcome {
+    pub(crate) source: codex_hooks::SessionStartSource,
+    pub(crate) preview_runs: Vec<HookRunSummary>,
+    pub(crate) hook_events: Vec<HookCompletedEvent>,
+    pub(crate) should_stop: bool,
+    pub(crate) additional_contexts: Vec<codex_hooks::HookContext>,
 }
 
 // Sometimes new snapshots don't include credits or plan information.

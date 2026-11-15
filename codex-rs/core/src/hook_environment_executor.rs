@@ -47,6 +47,21 @@ pub(crate) fn with_environment_hooks(
     )
 }
 
+pub(crate) fn with_only_environment_hooks(
+    session: &Arc<Session>,
+    turn: &Arc<TurnContext>,
+    environments: &TurnEnvironmentSnapshot,
+) -> Hooks {
+    session.hooks().with_only_environment_hooks(
+        environment_hook_sources(environments, &[]),
+        Arc::new(EnvironmentCommandExecutor {
+            environments: environments.clone(),
+            session: Arc::clone(session),
+            turn: Arc::clone(turn),
+        }),
+    )
+}
+
 pub(crate) fn with_tool_environment_hooks(
     session: &Arc<Session>,
     turn: &Arc<TurnContext>,

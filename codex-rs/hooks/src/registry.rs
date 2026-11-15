@@ -129,6 +129,18 @@ impl Hooks {
         hooks
     }
 
+    /// Keep admitted environment handlers without replaying eager local hooks.
+    pub fn with_only_environment_hooks(
+        &self,
+        sources: Vec<crate::EnvironmentHookSource>,
+        executor: Arc<dyn crate::HookEnvironmentExecutor>,
+    ) -> Self {
+        let mut hooks = self.with_environment_hooks(sources, executor);
+        Arc::make_mut(&mut hooks.engine.handlers)
+            .retain(ConfiguredHandler::is_environment_scoped);
+        hooks
+    }
+
     /// List this session's declarations, including hooks that are disabled or not yet trusted.
     pub fn list_with_environment_hooks(
         &self,

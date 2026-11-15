@@ -3,12 +3,15 @@ use super::common::detect_recent_sessions;
 use crate::model::ExternalAgentSessionImportLimits;
 use crate::sessions::ExternalAgentSessionMigration;
 use crate::sessions::SessionRecordFormat;
+use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 
 const MAX_CUR_PROJECT_PATH_PROBES: usize = 128;
+const MAX_CUR_PROJECT_DIRECTORY_ENTRIES: usize = 4096;
 const CUR_PROJECT_SEPARATORS: [&str; 11] =
     ["-", "_", ".", " ", "--", "..", "__", "  ", "+", "@", "&"];
 
@@ -99,114 +102,141 @@ fn cur_project_cwd(project_storage: &Path, external_agent_home: &Path) -> Option
 
 fn decode_cur_project_path(encoded: &str) -> Option<PathBuf> {
     #[cfg(not(windows))]
-    let mut path = PathBuf::from("/");
+    let path = PathBuf::from("/");
 
     #[cfg(windows)]
-    let (encoded, mut path) = {
+    let (encoded, path) = {
         let (drive, encoded) = decode_cur_windows_project_drive(encoded)?;
         (encoded, PathBuf::from(format!("{drive}:\\")))
     };
 
     let encoded = encoded.strip_prefix('-').unwrap_or(encoded);
-    for component in encoded.split('-') {
-        if component.is_empty()
-            || matches!(component, "." | "..")
+    let components = encoded.split('-').collect::<Vec<_>>();
+    if components.iter().any(|component| {
+        component.is_empty()
+            || matches!(*component, "." | "..")
             || component.contains(['/', '\\', ':'])
-        {
-            return None;
-        }
-        path.push(component);
+    }) {
+        return None;
     }
 
-    let mut matched_path = None;
-    let mut probes = 0;
-    let mut inspect = |candidate: PathBuf| {
-        if probes >= MAX_CUR_PROJECT_PATH_PROBES {
-            return None;
-        }
-        probes += 1;
-        if candidate.is_dir() {
-            if matched_path
-                .as_ref()
-                .is_some_and(|matched_path| matched_path != &candidate)
-            {
-                return None;
-            }
-            matched_path = Some(candidate);
-        }
-        Some(())
+    // Resolve each existing prefix before its descendants. Independent
+    // punctuation in several ancestors must be combined, not guessed one
+    // merge at a time. Exhausting either bound refuses the whole decode,
+    // even when one candidate has already matched: uniqueness is unproven.
+    let mut budget = CurProjectProbeBudget {
+        paths: MAX_CUR_PROJECT_PATH_PROBES,
+        entries: MAX_CUR_PROJECT_DIRECTORY_ENTRIES,
     };
-    inspect(path.clone())?;
-
-    for suffix_length in 2..=4 {
-        let mut parent = path.as_path();
-        let mut suffix = Vec::with_capacity(suffix_length);
-        for _ in 0..suffix_length {
-            let Some(component) = parent.file_name().and_then(|name| name.to_str()) else {
-                break;
-            };
-            suffix.push(component);
-            let Some(ancestor) = parent.parent() else {
-                break;
-            };
-            parent = ancestor;
+    let mut pending = vec![(path, 0)];
+    let mut visited = HashSet::new();
+    let mut matched_path = None;
+    while let Some((parent, offset)) = pending.pop() {
+        if !visited.insert((parent.clone(), offset)) {
+            continue;
         }
-        if suffix.len() != suffix_length {
-            break;
-        }
-        suffix.reverse();
-
-        for separator in CUR_PROJECT_SEPARATORS {
-            inspect(parent.join(suffix.join(separator)))?;
-        }
-    }
-
-    let mut ancestor = path.parent();
-    while let Some(right) = ancestor {
-        let Some(right_name) = right.file_name().and_then(|name| name.to_str()) else {
-            break;
-        };
-        let Some(left) = right.parent() else {
-            break;
-        };
-        let Some(left_name) = left.file_name().and_then(|name| name.to_str()) else {
-            break;
-        };
-        let Some(prefix) = left.parent() else {
-            break;
-        };
-        let Ok(trailing) = path.strip_prefix(right) else {
-            return None;
-        };
-
-        for separator in CUR_PROJECT_SEPARATORS {
-            let merged_prefix = prefix.join(format!("{left_name}{separator}{right_name}"));
-            if probes >= MAX_CUR_PROJECT_PATH_PROBES {
-                return None;
-            }
-            probes += 1;
-            if !merged_prefix.is_dir() {
-                continue;
-            }
-
-            if probes >= MAX_CUR_PROJECT_PATH_PROBES {
-                return None;
-            }
-            probes += 1;
-            let candidate = merged_prefix.join(trailing);
-            if !candidate.is_dir()
-                || matched_path
+        for (candidate, next) in cur_project_children(&parent, &components, offset, &mut budget)? {
+            if next == components.len() {
+                if matched_path
                     .as_ref()
-                    .is_some_and(|matched_path| matched_path != &candidate)
-            {
-                return None;
+                    .is_some_and(|matched| matched != &candidate)
+                {
+                    return None;
+                }
+                matched_path = Some(candidate);
+            } else {
+                pending.push((candidate, next));
             }
-            matched_path = Some(candidate);
         }
-        ancestor = Some(left);
+    }
+    matched_path
+}
+
+struct CurProjectProbeBudget {
+    paths: usize,
+    entries: usize,
+}
+
+impl CurProjectProbeBudget {
+    fn path(&mut self) -> Option<()> {
+        self.paths = self.paths.checked_sub(1)?;
+        Some(())
     }
 
-    matched_path
+    fn entry(&mut self) -> Option<()> {
+        self.entries = self.entries.checked_sub(1)?;
+        Some(())
+    }
+}
+
+fn cur_project_children(
+    parent: &Path,
+    components: &[&str],
+    offset: usize,
+    budget: &mut CurProjectProbeBudget,
+) -> Option<Vec<(PathBuf, usize)>> {
+    let mut names = BTreeMap::<String, Vec<usize>>::new();
+    for next in offset + 1..=components.len() {
+        let suffix = &components[offset..next];
+        if suffix.len() == 1 {
+            names.entry(suffix[0].to_owned()).or_default().push(next);
+        } else {
+            for separator in CUR_PROJECT_SEPARATORS {
+                let ends = names.entry(suffix.join(separator)).or_default();
+                if !ends.contains(&next) {
+                    ends.push(next);
+                }
+            }
+        }
+    }
+
+    let mut children = Vec::new();
+    // Small candidate sets are cheaper and independent of unrelated entries
+    // in crowded temporary ancestors. Reserve half the remaining probes for
+    // descendants; larger sets use bounded directory enumeration instead.
+    if names.len() <= budget.paths / 2 {
+        for (name, ends) in names {
+            budget.path()?;
+            let candidate = parent.join(name);
+            if candidate.is_dir() {
+                children.extend(ends.into_iter().map(|next| (candidate.clone(), next)));
+            }
+        }
+        return Some(children);
+    }
+    budget.path()?;
+    match fs::read_dir(parent) {
+        Ok(entries) => {
+            for entry in entries {
+                budget.entry()?;
+                let entry = entry.ok()?;
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                let Some(ends) = names.get(name) else {
+                    continue;
+                };
+                budget.path()?;
+                let candidate = entry.path();
+                if candidate.is_dir() {
+                    children.extend(ends.iter().map(|next| (candidate.clone(), *next)));
+                }
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            // Search-only ancestors can be traversed but not enumerated.
+            // Probe the bounded candidate names without requiring directory
+            // read permission; ambiguity and budget exhaustion still refuse.
+            for (name, ends) in names {
+                budget.path()?;
+                let candidate = parent.join(name);
+                if candidate.is_dir() {
+                    children.extend(ends.into_iter().map(|next| (candidate.clone(), next)));
+                }
+            }
+        }
+        Err(_) => return None,
+    }
+    Some(children)
 }
 
 #[cfg(any(windows, test))]

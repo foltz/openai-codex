@@ -28,6 +28,7 @@ use codex_tools::ToolSpec;
 use codex_tools::coalesce_loadable_tool_specs;
 use serde::Serialize;
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::Weak;
@@ -340,12 +341,67 @@ impl ToolSearchHandler {
     }
 
     fn search_entries(&self, query: &str) -> impl Iterator<Item = &ToolSearchEntry> + '_ {
-        self.search_scorer
-            .matches(&self.search_embedder.embed(query))
+        let exact_ids = self.exact_name_match_ids(query);
+        let mut seen_ids = HashSet::new();
+        exact_ids
             .into_iter()
-            .filter_map(|result| self.search_infos.get(result.id))
+            .chain(
+                self.search_scorer
+                    .matches(&self.search_embedder.embed(query))
+                    .into_iter()
+                    .map(|result| result.id),
+            )
+            .filter(move |id| seen_ids.insert(*id))
+            .filter_map(|id| self.search_infos.get(id))
             .map(|search_info| &search_info.entry)
     }
+
+    fn exact_name_match_ids(&self, query: &str) -> Vec<usize> {
+        let tokens = exact_match_query_tokens(query);
+        if tokens.is_empty() {
+            return Vec::new();
+        }
+        self.search_infos
+            .iter()
+            .enumerate()
+            .filter_map(|(id, info)| {
+                info.entry
+                    .tool_names()
+                    .any(|name| {
+                        let namespace = name.namespace.as_deref().unwrap_or("functions");
+                        let flattened = format!("{namespace}{}", name.name);
+                        let code_mode = codex_tools::code_mode_name_for_tool_name(&name);
+                        [
+                            name.name.as_str(),
+                            namespace,
+                            flattened.as_str(),
+                            code_mode.as_str(),
+                        ]
+                        .into_iter()
+                        .any(|candidate| {
+                            tokens
+                                .iter()
+                                .any(|token| tool_name_matches_token(candidate, token))
+                        })
+                    })
+                    .then_some(id)
+            })
+            .collect()
+    }
+}
+
+fn exact_match_query_tokens(query: &str) -> Vec<String> {
+    query
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+fn tool_name_matches_token(name: &str, token: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name == token || name.ends_with(&format!("_{token}"))
 }
 
 #[cfg(test)]
@@ -584,6 +640,319 @@ mod tests {
                 }),
             ],
         );
+    }
+
+    #[test]
+    fn search_promotes_exact_tool_name_matches_before_bm25_results() {
+        let mcp_tools = [
+            tool_info(
+                "ironclaw_workflow",
+                "workflow_run_dispatch_round",
+                "Coordinate the next workflow round",
+            ),
+            tool_info(
+                "ironclaw_workflow",
+                "workflow_run_complete",
+                "dispatch_round dispatch_round dispatch_round complete workflow",
+            ),
+            tool_info(
+                "ironclaw_workflow",
+                "workflow_run_spawn",
+                "dispatch_round dispatch_round dispatch_round spawn workflow",
+            ),
+        ];
+        let search_infos = mcp_tools
+            .iter()
+            .map(|tool| {
+                McpHandler::new(tool.clone())
+                    .expect("MCP tool should convert")
+                    .search_info()
+                    .expect("MCP handler should return search info")
+            })
+            .collect::<Vec<_>>();
+        let handler = tool_search_handler(search_infos);
+
+        let tools = handler.search("dispatch_round", /*limit*/ 1);
+
+        assert_eq!(
+            tools,
+            vec![LoadableToolSpec::Namespace(ResponsesApiNamespace {
+                name: "mcp__ironclaw_workflow".to_string(),
+                description: "Tools in the mcp__ironclaw_workflow namespace.".to_string(),
+                tools: vec![ResponsesApiNamespaceTool::Function(ResponsesApiTool {
+                    name: "workflow_run_dispatch_round".to_string(),
+                    description: "Coordinate the next workflow round desktop tool".to_string(),
+                    strict: false,
+                    defer_loading: Some(true),
+                    parameters: codex_tools::JsonSchema::object(
+                        Default::default(),
+                        /*required*/ None,
+                        Some(false.into()),
+                    ),
+                    output_schema: None,
+                })],
+            })]
+        );
+    }
+
+    #[test]
+    fn search_matches_a_full_tool_name_case_insensitively() {
+        let handler = tool_search_handler(vec![
+            McpHandler::new(tool_info(
+                "ironclaw_workflow",
+                "workflow_run_dispatch_round",
+                "Coordinate the next workflow round",
+            ))
+            .expect("MCP tool should convert")
+            .search_info()
+            .expect("MCP handler should return search info"),
+        ]);
+
+        let tools = handler.search("WORKFLOW_RUN_DISPATCH_ROUND", /*limit*/ 1);
+
+        assert_eq!(loadable_tool_names(&tools), ["workflow_run_dispatch_round"]);
+    }
+
+    #[test]
+    fn exact_name_matching_finds_a_tool_identifier_embedded_in_prose() {
+        let handler = tool_search_handler(vec![
+            McpHandler::new(tool_info(
+                "ironclaw_workflow",
+                "workflow_run_dispatch_round",
+                "Coordinate the next workflow round",
+            ))
+            .expect("MCP tool should convert")
+            .search_info()
+            .expect("MCP handler should return search info"),
+        ]);
+
+        assert_eq!(
+            handler.exact_name_match_ids("Please call `WORKFLOW_RUN_DISPATCH_ROUND` next."),
+            [0]
+        );
+    }
+
+    #[test]
+    fn search_matches_the_runtime_flattened_namespaced_tool_name() {
+        let handler = tool_search_handler(vec![
+            McpHandler::new(tool_info(
+                "ironclaw_workflow",
+                "workflow_run_dispatch_round",
+                "Coordinate the next workflow round",
+            ))
+            .expect("MCP tool should convert")
+            .search_info()
+            .expect("MCP handler should return search info"),
+        ]);
+
+        let tools = handler.search(
+            "mcp__ironclaw_workflowworkflow_run_dispatch_round",
+            /*limit*/ 1,
+        );
+
+        assert_eq!(loadable_tool_names(&tools), ["workflow_run_dispatch_round"]);
+    }
+
+    #[test]
+    fn search_prioritizes_all_exact_leaf_matches_before_bm25_and_respects_limit() {
+        let mcp_tools = [
+            tool_info("workflow", "first_dispatch_round", "first exact match"),
+            tool_info("workflow", "second_dispatch_round", "second exact match"),
+            tool_info(
+                "workflow",
+                "unrelated_tool",
+                "dispatch_round dispatch_round dispatch_round",
+            ),
+        ];
+        let handler = tool_search_handler(
+            mcp_tools
+                .iter()
+                .map(|tool| {
+                    McpHandler::new(tool.clone())
+                        .expect("MCP tool should convert")
+                        .search_info()
+                        .expect("MCP handler should return search info")
+                })
+                .collect(),
+        );
+
+        let tools = handler.search("dispatch_round", /*limit*/ 2);
+
+        assert_eq!(
+            loadable_tool_names(&tools),
+            ["first_dispatch_round", "second_dispatch_round"]
+        );
+    }
+
+    #[test]
+    fn search_backfills_exact_results_with_distinct_bm25_results() {
+        let mcp_tools = [
+            tool_info("workflow", "workflow_run_dispatch_round", "exact match"),
+            tool_info(
+                "workflow",
+                "workflow_run_complete",
+                "dispatch_round dispatch_round dispatch_round",
+            ),
+        ];
+        let handler = tool_search_handler(
+            mcp_tools
+                .iter()
+                .map(|tool| {
+                    McpHandler::new(tool.clone())
+                        .expect("MCP tool should convert")
+                        .search_info()
+                        .expect("MCP handler should return search info")
+                })
+                .collect(),
+        );
+
+        let tools = handler.search("dispatch_round", /*limit*/ 2);
+
+        assert_eq!(
+            loadable_tool_names(&tools),
+            ["workflow_run_dispatch_round", "workflow_run_complete"]
+        );
+    }
+
+    #[test]
+    fn exact_name_matching_does_not_promote_partial_tokens() {
+        assert!(tool_name_matches_token(
+            "workflow_run_dispatch_round",
+            "dispatch_round"
+        ));
+        assert!(!tool_name_matches_token(
+            "workflow_run_dispatch_round",
+            "dispatch"
+        ));
+        assert!(!tool_name_matches_token(
+            "workflow_run_dispatch_round",
+            "rounds"
+        ));
+    }
+
+    #[test]
+    fn search_matches_an_exact_custom_namespace_tool_name() {
+        let custom_tool = codex_tools::FreeformTool {
+            name: "workflow_apply_patch".to_string(),
+            description: "Apply a workflow patch".to_string(),
+            defer_loading: Some(true),
+            format: codex_tools::FreeformToolFormat {
+                r#type: "grammar".to_string(),
+                syntax: "patch".to_string(),
+                definition: "patch grammar".to_string(),
+            },
+        };
+        let search_info = ToolSearchInfo::from_spec(
+            "workflow_apply_patch".to_string(),
+            ToolSpec::Namespace(ResponsesApiNamespace {
+                name: "mcp__workflow__".to_string(),
+                description: "Workflow tools".to_string(),
+                tools: vec![ResponsesApiNamespaceTool::Custom(custom_tool)],
+            }),
+            None,
+        )
+        .expect("custom tool namespace should be searchable");
+        let handler = tool_search_handler(vec![search_info]);
+
+        let tools = handler.search("workflow_apply_patch", /*limit*/ 1);
+
+        assert_eq!(loadable_tool_names(&tools), ["workflow_apply_patch"]);
+    }
+
+    #[test]
+    fn search_matches_code_mode_namespaced_tool_name() {
+        let handler = tool_search_handler(vec![
+            McpHandler::new(tool_info("workflow", "dispatch", "Coordinate work"))
+                .expect("MCP tool should convert")
+                .search_info()
+                .expect("MCP handler should return search info"),
+        ]);
+        assert_eq!(
+            loadable_tool_names(&handler.search("mcp__workflow__dispatch", /*limit*/ 1)),
+            ["dispatch"]
+        );
+    }
+
+    #[test]
+    fn code_mode_search_promotes_exact_match_before_limiting() {
+        let (handler, router) = code_mode_search_fixture(/*include_exact*/ true);
+        let prefixes =
+            IndirectNamespacePrefixes::new(None, []).expect("no prefixes should conflict");
+        let tools = handler.search_code_mode(
+            "dispatch", /*limit*/ 1, &router, /*code_mode_input_schema_max_bytes*/ None,
+            &prefixes,
+        );
+        assert_eq!(
+            tools.into_iter().map(|tool| tool.name).collect::<Vec<_>>(),
+            ["mcp__workflow__dispatch"]
+        );
+    }
+
+    #[test]
+    fn code_mode_search_excluded_exact_match_does_not_consume_limit() {
+        let (handler, router) = code_mode_search_fixture(/*include_exact*/ false);
+        let prefixes =
+            IndirectNamespacePrefixes::new(None, []).expect("no prefixes should conflict");
+        let tools = handler.search_code_mode(
+            "dispatch", /*limit*/ 1, &router, /*code_mode_input_schema_max_bytes*/ None,
+            &prefixes,
+        );
+        assert_eq!(
+            tools.into_iter().map(|tool| tool.name).collect::<Vec<_>>(),
+            ["mcp__workflow__other"]
+        );
+    }
+
+    fn code_mode_search_fixture(include_exact: bool) -> (ToolSearchHandler, ToolRouter) {
+        let mut registry = ToolRegistry::default();
+        let mut infos = Vec::new();
+        let mut names = std::collections::BTreeMap::new();
+        for tool in [
+            tool_info("workflow", "dispatch", "Coordinate work"),
+            tool_info("workflow", "other", "dispatch dispatch dispatch dispatch"),
+        ] {
+            let name = ToolName::namespaced(&tool.callable_namespace, &tool.callable_name);
+            if include_exact || tool.callable_name != "dispatch" {
+                names.insert(codex_tools::code_mode_name_for_tool_name(&name), name);
+            }
+            let runtime = Arc::new(McpHandler::new(tool).expect("MCP tool should convert"));
+            infos.push(
+                runtime
+                    .search_info()
+                    .expect("MCP tool should be searchable"),
+            );
+            registry.register_trusted_with_exposure(runtime, ToolExposure::Deferred);
+        }
+        let router = ToolRouter::from_parts(
+            registry,
+            Vec::new(),
+            codex_protocol::openai_models::ToolMode::CodeMode,
+            names,
+            None,
+            &[],
+        );
+        (tool_search_handler(infos), router)
+    }
+
+    fn loadable_tool_names(specs: &[LoadableToolSpec]) -> Vec<&str> {
+        specs
+            .iter()
+            .flat_map(|spec| match spec {
+                LoadableToolSpec::Function(tool) => vec![tool.name.as_str()],
+                LoadableToolSpec::Namespace(namespace) => namespace
+                    .tools
+                    .iter()
+                    .map(|tool| match tool {
+                        ResponsesApiNamespaceTool::Function(tool) => tool.name.as_str(),
+                        ResponsesApiNamespaceTool::Custom(tool) => tool.name.as_str(),
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    fn tool_search_handler(search_infos: Vec<ToolSearchInfo>) -> ToolSearchHandler {
+        ToolSearchHandler::new(search_infos, ToolSearchSourceListing::Include)
     }
 
     fn tool_info(server_name: &str, tool_name: &str, description_prefix: &str) -> ToolInfo {

@@ -128,6 +128,7 @@ pub struct McpRuntimeInput {
 pub struct McpRuntime {
     retirement: crate::McpRuntimeRetirement,
     workers: crate::McpWorkerOwner,
+    shutdown_once: OnceLock<crate::worker_joins::Completion>,
     current: ArcSwap<PublishedMcpRuntime>,
     // This mutex is held only through synchronous publication, never network I/O or call drain.
     catalog_publication: Mutex<u64>,
@@ -299,6 +300,7 @@ impl McpRuntime {
         Self {
             retirement: retirement.clone(),
             workers: workers.clone(),
+            shutdown_once: OnceLock::new(),
             current: ArcSwap::from_pointee(PublishedMcpRuntime {
                 connections: Arc::new(
                     McpConnectionSet::empty(prefix_mcp_tool_names)
@@ -1075,28 +1077,36 @@ impl McpRuntime {
 
     pub async fn shutdown(&self) {
         self.retirement.close_registration();
-        self.elicitation_router.close().await;
-        let superseded = std::mem::take(
-            &mut *self
-                .superseded_connections
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
-        let current = self.latest_connections();
-        // Keep every publication's cleanup alive if the caller is interrupted.
-        let shutdown = self.workers.spawn(
-            &tokio::runtime::Handle::current(),
-            crate::McpWorkerKind::RuntimeShutdown,
-            async move {
-                for connections in superseded
-                    .into_iter()
-                    .filter_map(|connections| connections.upgrade())
-                {
-                    connections.shutdown_shared_connections().await;
-                }
-                current.shutdown().await;
-            },
-        );
+        // Register the one original cleanup worker before the first await.
+        // Repeated callers observe that join; an interrupted caller cannot
+        // strand the router before connection cleanup has an owner.
+        let shutdown = self
+            .shutdown_once
+            .get_or_init(|| {
+                let superseded = std::mem::take(
+                    &mut *self
+                        .superseded_connections
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                );
+                let current = self.latest_connections();
+                let router = self.elicitation_router.clone();
+                self.workers.spawn(
+                    &tokio::runtime::Handle::current(),
+                    crate::McpWorkerKind::RuntimeShutdown,
+                    async move {
+                        router.close().await;
+                        for connections in superseded
+                            .into_iter()
+                            .filter_map(|connections| connections.upgrade())
+                        {
+                            connections.shutdown_shared_connections().await;
+                        }
+                        current.shutdown().await;
+                    },
+                )
+            })
+            .clone();
         if !matches!(shutdown.await, crate::worker_joins::WorkerExit::Joined) {
             warn!("MCP runtime shutdown worker did not join normally");
         }

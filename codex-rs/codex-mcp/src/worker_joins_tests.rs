@@ -570,3 +570,59 @@ async fn eager_admission_closure_aborts_only_already_born_children_without_summa
     assert_eq!(eager.pending + eager.panicked + eager.joined, 0);
     assert_eq!(called.load(Ordering::SeqCst), 0);
 }
+
+#[tokio::test]
+async fn concurrent_and_repeated_runtime_shutdown_observe_one_original_worker() {
+    let runtime = crate::McpRuntime::empty(true);
+    let external = runtime.worker_owner();
+    let mut first = Box::pin(runtime.shutdown());
+    let mut second = Box::pin(runtime.shutdown());
+    assert!(futures::poll!(&mut first).is_pending());
+    assert!(futures::poll!(&mut second).is_pending());
+    let pending = external.observe_until(Instant::now()).await;
+    assert_eq!(count(&pending, McpWorkerKind::RuntimeShutdown).pending, 1);
+    assert_eq!(pending.registered_at_end, 1);
+    drop(first);
+    second.await;
+    let finished = external
+        .observe_until(Instant::now() + Duration::from_secs(1))
+        .await;
+    assert_eq!(count(&finished, McpWorkerKind::RuntimeShutdown).joined, 1);
+    assert_eq!(
+        count(&finished, McpWorkerKind::ConnectionShutdown).joined,
+        1
+    );
+    runtime.shutdown().await;
+    runtime.shutdown().await;
+    let replay = external.observe_until(Instant::now()).await;
+    assert_eq!(replay.registered_at_end, finished.registered_at_end);
+    assert_eq!(replay.counts, finished.counts);
+    assert!(replay.startup_admission_closed);
+}
+
+#[tokio::test]
+async fn dropping_shutdown_caller_and_runtime_retains_original_router_and_connection_cleanup() {
+    let runtime = crate::McpRuntime::empty(true);
+    let external = runtime.worker_owner();
+    let mut caller = Box::pin(runtime.shutdown());
+    assert!(futures::poll!(&mut caller).is_pending());
+    drop(caller);
+    drop(runtime);
+    let report = external
+        .observe_until(Instant::now() + Duration::from_secs(1))
+        .await;
+    assert_eq!(count(&report, McpWorkerKind::RuntimeShutdown).joined, 1);
+    // The child can be born after the snapshot's original population, so
+    // explicitly observe the stable follow-up rather than claiming it joined.
+    let stable = external
+        .observe_until(Instant::now() + Duration::from_secs(1))
+        .await;
+    assert_eq!(count(&stable, McpWorkerKind::ConnectionShutdown).joined, 1);
+    assert_eq!(stable.registered_at_end, 2);
+    assert!(
+        stable
+            .counts
+            .iter()
+            .all(|c| c.pending + c.cancelled + c.panicked == 0)
+    );
+}

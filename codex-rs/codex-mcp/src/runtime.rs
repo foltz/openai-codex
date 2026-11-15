@@ -126,6 +126,7 @@ pub struct McpRuntimeInput {
 /// Publication replaces the latest state atomically. Existing bindings retain
 /// their exact connections and configuration for as long as they are needed.
 pub struct McpRuntime {
+    workers: crate::McpWorkerOwner,
     current: ArcSwap<PublishedMcpRuntime>,
     // This mutex is held only through synchronous publication, never network I/O or call drain.
     catalog_publication: Mutex<u64>,
@@ -282,9 +283,13 @@ impl McpRuntime {
     /// This is useful while constructing a thread that must publish a stable
     /// runtime handle before its full MCP inputs are available.
     pub fn empty(prefix_mcp_tool_names: bool) -> Self {
+        let workers = crate::McpWorkerOwner::default();
         Self {
+            workers: workers.clone(),
             current: ArcSwap::from_pointee(PublishedMcpRuntime {
-                connections: Arc::new(McpConnectionSet::empty(prefix_mcp_tool_names)),
+                connections: Arc::new(
+                    McpConnectionSet::empty(prefix_mcp_tool_names).with_worker_owner(workers),
+                ),
                 config: None,
                 auth: None,
                 auth_token: None,
@@ -403,7 +408,8 @@ impl McpRuntime {
         }
     }
 
-    async fn publish(&self, input: McpRuntimeInput, reuse_previous: bool) {
+    async fn publish(&self, mut input: McpRuntimeInput, reuse_previous: bool) {
+        input.runtime_context.workers = self.workers.clone();
         // Also cover callers which replace the runtime without Core's dirty-state machinery.
         self.invalidate_apps_tool_refresh();
         let current = self.current.load_full();
@@ -1029,6 +1035,12 @@ impl McpRuntime {
         cancellation.retained_subscription_cancellation = Some(retained);
     }
 
+    /// Retain this owner before async publication or retirement observers can be cancelled.
+    /// Its snapshots keep worker joins separate from physical transport evidence.
+    pub fn worker_owner(&self) -> crate::McpWorkerOwner {
+        self.workers.clone()
+    }
+
     pub async fn shutdown(&self) {
         self.elicitation_router.close().await;
         let superseded = std::mem::take(
@@ -1039,17 +1051,21 @@ impl McpRuntime {
         );
         let current = self.latest_connections();
         // Keep every publication's cleanup alive if the caller is interrupted.
-        let shutdown = tokio::spawn(async move {
-            for connections in superseded
-                .into_iter()
-                .filter_map(|connections| connections.upgrade())
-            {
-                connections.shutdown_shared_connections().await;
-            }
-            current.shutdown().await;
-        });
-        if let Err(error) = shutdown.await {
-            warn!("MCP runtime shutdown task failed: {error}");
+        let shutdown = self.workers.spawn(
+            &tokio::runtime::Handle::current(),
+            crate::McpWorkerKind::RuntimeShutdown,
+            async move {
+                for connections in superseded
+                    .into_iter()
+                    .filter_map(|connections| connections.upgrade())
+                {
+                    connections.shutdown_shared_connections().await;
+                }
+                current.shutdown().await;
+            },
+        );
+        if !matches!(shutdown.await, crate::worker_joins::WorkerExit::Joined) {
+            warn!("MCP runtime shutdown worker did not join normally");
         }
     }
 }
@@ -1060,6 +1076,7 @@ impl McpRuntime {
 /// environment registry, captured thread selections, and the host-local cwd used by MCP processes.
 #[derive(Clone)]
 pub struct McpRuntimeContext {
+    pub(crate) workers: crate::McpWorkerOwner,
     pub(crate) connection_pool: Option<McpConnectionPool>,
     environment_manager: Arc<EnvironmentManager>,
     environment_selections: Arc<[TurnEnvironmentSelection]>,
@@ -1111,6 +1128,7 @@ impl McpRuntimeContext {
                 .with_tls_backend_fallback(),
         );
         Self {
+            workers: crate::McpWorkerOwner::default(),
             connection_pool: None,
             environment_manager,
             environment_selections: Arc::default(),

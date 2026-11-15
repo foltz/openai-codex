@@ -41,6 +41,7 @@ impl InProcessTransportFactory for NotificationServer {
 
 #[tokio::test]
 async fn auth_notifications_require_opt_in_and_follow_client_lifetime() -> Result<()> {
+    let workers = crate::McpWorkerOwner::default();
     let (notifications, mut received) = mpsc::channel(/*buffer*/ 8);
     let client = Arc::new(
         RmcpClient::new_in_process_client(Arc::new(NotificationServer(notifications))).await?,
@@ -58,18 +59,28 @@ async fn auth_notifications_require_opt_in_and_follow_client_lifetime() -> Resul
     let (changes, receiver) = watch::channel(AuthChangeState::default());
     let mut capabilities = ServerCapabilities::default();
     assert!(
-        start(Arc::clone(&client), &capabilities, Some(receiver.clone()))
-            .await?
-            .is_none()
+        start(
+            &workers,
+            Arc::clone(&client),
+            &capabilities,
+            Some(receiver.clone())
+        )
+        .await?
+        .is_none()
     );
     capabilities.experimental = Some([(CAPABILITY.to_string(), Default::default())].into());
     assert!(
-        start(Arc::clone(&client), &capabilities, /*changes*/ None)
-            .await?
-            .is_none()
+        start(
+            &workers,
+            Arc::clone(&client),
+            &capabilities,
+            /*changes*/ None
+        )
+        .await?
+        .is_none()
     );
     assert_eq!(received.try_recv(), Err(mpsc::error::TryRecvError::Empty));
-    let watcher = start(Arc::clone(&client), &capabilities, Some(receiver))
+    let watcher = start(&workers, Arc::clone(&client), &capabilities, Some(receiver))
         .await?
         .unwrap();
     assert_eq!(
@@ -99,6 +110,16 @@ async fn auth_notifications_require_opt_in_and_follow_client_lifetime() -> Resul
     );
     drop(watcher);
     timeout(SEND_TIMEOUT, changes.closed()).await?;
+    let report = workers
+        .observe_until(tokio::time::Instant::now() + SEND_TIMEOUT)
+        .await;
+    let watcher = report
+        .counts
+        .iter()
+        .find(|count| count.kind == crate::McpWorkerKind::AuthNotification)
+        .unwrap();
+    assert_eq!(watcher.cancelled, 1);
+    assert_eq!(watcher.pending + watcher.panicked + watcher.joined, 0);
     client.shutdown().await;
     Ok(())
 }

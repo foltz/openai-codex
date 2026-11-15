@@ -155,14 +155,19 @@ struct CodexAppsStartupStatusContext {
 }
 
 pub(crate) struct CodexAppsStartupReconnect {
+    workers: crate::McpWorkerOwner,
     factory: Arc<dyn Fn() -> ManagedClientFuture + Send + Sync>,
     state: StdMutex<CodexAppsStartupReconnectState>,
     startup_status_context: Option<CodexAppsStartupStatusContext>,
 }
 
 impl CodexAppsStartupReconnect {
-    pub(crate) fn new(factory: Arc<dyn Fn() -> ManagedClientFuture + Send + Sync>) -> Self {
+    pub(crate) fn new(
+        factory: Arc<dyn Fn() -> ManagedClientFuture + Send + Sync>,
+        workers: crate::McpWorkerOwner,
+    ) -> Self {
         Self {
+            workers,
             factory,
             state: StdMutex::new(CodexAppsStartupReconnectState::default()),
             startup_status_context: None,
@@ -259,7 +264,14 @@ impl CodexAppsStartupReconnect {
         state.reconnect_in_flight = Some(attempt.clone());
         drop(state);
         // Keep recovery running if the invocation waiting for it is cancelled.
-        tokio::spawn(attempt.clone());
+        let background = attempt.clone();
+        drop(self.workers.spawn(
+            &tokio::runtime::Handle::current(),
+            crate::McpWorkerKind::Reconnect,
+            async move {
+                let _ = background.await;
+            },
+        ));
         Some(attempt)
     }
 }
@@ -353,6 +365,7 @@ impl ManagedClientStartup {
             .unwrap_or(DEFAULT_STARTUP_TIMEOUT);
         let cancel_token_for_fut = cancel_token;
         let startup = async move {
+            let workers = runtime_context.workers.clone();
             let connection_bindings = runtime_context.connection_bindings(server.config());
             let tool_catalog_fetch_ticket = tool_catalog_cache_context
                 .as_ref()
@@ -405,6 +418,7 @@ impl ManagedClientStartup {
                     server_name.clone(),
                     client,
                     StartServerTaskParams {
+                        workers: workers.clone(),
                         connection_bindings,
                         sharing_declined,
                         publish_apps,
@@ -433,11 +447,18 @@ impl ManagedClientStartup {
                     {
                         // Report the startup error now. A retry waits for the helper to exit.
                         *shutdown = Some(
-                            tokio::spawn(async move { client.shutdown_before_retry().await })
-                                .map(|joined| match joined {
-                                    Ok(result) => result.map_err(|error| error.to_string()),
-                                    Err(error) => Err(error.to_string()),
-                                })
+                            workers
+                                .spawn_result(
+                                    &tokio::runtime::Handle::current(),
+                                    crate::McpWorkerKind::DiscoveryCleanup,
+                                    async move {
+                                        client
+                                            .shutdown_before_retry()
+                                            .await
+                                            .map_err(|error| error.to_string())
+                                    },
+                                )
+                                .map(|joined| joined.unwrap_or_else(Err))
                                 .boxed()
                                 .shared(),
                         );
@@ -637,11 +658,15 @@ impl AsyncManagedClient {
             (startup.start(/*sharing_declined*/ None, publish_apps), None)
         };
         let startup_reconnect = is_codex_apps_mcp_server.then(|| {
+            let workers = startup.runtime_context.workers.clone();
             let startup = Arc::clone(&startup);
             Arc::new(
-                CodexAppsStartupReconnect::new(Arc::new(move || {
-                    startup.start(/*sharing_declined*/ None, /*publish_apps*/ None)
-                }))
+                CodexAppsStartupReconnect::new(
+                    Arc::new(move || {
+                        startup.start(/*sharing_declined*/ None, /*publish_apps*/ None)
+                    }),
+                    workers,
+                )
                 .with_startup_status_context(
                     startup_submit_id,
                     reconnect_server_name,
@@ -1173,6 +1198,7 @@ async fn start_server_task(
     params: StartServerTaskParams,
 ) -> Result<ManagedClient, StartupOutcomeError> {
     let StartServerTaskParams {
+        workers,
         connection_bindings,
         sharing_declined,
         publish_apps,
@@ -1256,6 +1282,7 @@ async fn start_server_task(
         Some(serde_json::json!(initialize_result.capabilities));
 
     let auth_change_notifications = crate::auth_changes::start(
+        &workers,
         Arc::clone(&client),
         &initialize_result.capabilities,
         auth_changes,
@@ -1464,6 +1491,7 @@ fn mcp_server_info_from_implementation(
 }
 
 struct StartServerTaskParams {
+    workers: crate::McpWorkerOwner,
     connection_bindings: crate::connection_handshake::ConnectionBindings,
     publish_apps: Option<watch::Sender<Option<std::sync::Weak<RmcpClient>>>>,
     sharing_declined: Option<CancellationToken>,

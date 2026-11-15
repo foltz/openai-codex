@@ -333,6 +333,7 @@ pub(crate) struct PreviousMcpConnections<'a> {
 
 /// A published view over a set of running MCP server connections.
 pub(crate) struct McpConnectionSet {
+    pub(crate) workers: crate::McpWorkerOwner,
     config: Option<Arc<crate::McpConfig>>,
     network_policy_metadata: Option<Arc<dyn NetworkPolicyMetadataProvider>>,
     servers: HashMap<String, McpServerView>,
@@ -349,6 +350,11 @@ pub(crate) struct McpConnectionSet {
 }
 
 impl McpConnectionSet {
+    pub(crate) fn with_worker_owner(mut self, workers: crate::McpWorkerOwner) -> Self {
+        self.workers = workers;
+        self
+    }
+
     /// Creates an MCP connection manager. Threadless callers can pass no `tx_event`; startup
     /// notifications are then skipped and interactive elicitations are declined.
     pub async fn new(
@@ -383,6 +389,7 @@ impl McpConnectionSet {
             elicitation_reviewer,
             elicitation_lifecycle,
         } = input;
+        let workers = runtime_context.workers.clone();
         let event_pool = runtime_context.connection_pool.clone().unwrap_or_default();
         let store_mode = config.mcp_oauth_credentials_store_mode;
         let keyring_backend_kind = config.auth_keyring_backend_kind;
@@ -1105,6 +1112,7 @@ impl McpConnectionSet {
             }
         }
         let manager = Self {
+            workers: workers.clone(),
             config: Some(config),
             network_policy_metadata,
             servers,
@@ -1119,70 +1127,82 @@ impl McpConnectionSet {
             elicitation_requests: elicitation_requests.clone(),
             trusted_access,
         };
-        tokio::spawn(async move {
-            if !publication_gate.wait().await {
-                return;
-            }
-            // Announce the complete eager batch before a fast helper can report Ready.
-            // Dormant helpers announce themselves separately when their first caller arrives.
-            if let Some(tx_event) = &tx_event {
-                for server in eager_starts {
-                    let _ = emit_update(
-                        startup_submit_id.as_str(),
-                        tx_event,
-                        McpStartupUpdateEvent {
-                            server,
-                            status: McpStartupStatus::Starting,
-                        },
-                    )
-                    .await;
+        let deferred_owner = workers.clone();
+        drop(workers.spawn(
+            &tokio::runtime::Handle::current(),
+            crate::McpWorkerKind::StartupSummary,
+            async move {
+                if !publication_gate.wait().await {
+                    return;
                 }
-            }
-            for worker in deferred_workers {
-                tokio::spawn(worker);
-            }
-            let outcomes = JoinSet::from_iter(eager_workers).join_all().await;
-            if let Some(tx_event) = tx_event {
-                let mut summary = McpStartupCompleteEvent {
-                    ready: reused_ready,
-                    ..Default::default()
-                };
-                for server_name in &summary.ready {
-                    let _ = emit_update(
-                        startup_submit_id.as_str(),
-                        &tx_event,
-                        McpStartupUpdateEvent {
-                            server: server_name.clone(),
-                            status: McpStartupStatus::Ready,
-                        },
-                    )
-                    .await;
-                }
-                for (server_name, outcome) in outcomes {
-                    match outcome {
-                        Ok(_) => summary.ready.push(server_name),
-                        Err(StartupOutcomeError::Cancelled) => summary.cancelled.push(server_name),
-                        Err(StartupOutcomeError::Failed { error, .. }) => {
-                            summary.failed.push(McpStartupFailure {
-                                server: server_name,
-                                error,
-                            })
-                        }
+                // Announce the complete eager batch before a fast helper can report Ready.
+                // Dormant helpers announce themselves separately when their first caller arrives.
+                if let Some(tx_event) = &tx_event {
+                    for server in eager_starts {
+                        let _ = emit_update(
+                            startup_submit_id.as_str(),
+                            tx_event,
+                            McpStartupUpdateEvent {
+                                server,
+                                status: McpStartupStatus::Starting,
+                            },
+                        )
+                        .await;
                     }
                 }
-                let _ = tx_event
-                    .send(Event {
-                        id: startup_submit_id,
-                        msg: EventMsg::McpStartupComplete(summary),
-                    })
-                    .await;
-            }
-        });
+                for worker in deferred_workers {
+                    drop(deferred_owner.spawn(
+                        &tokio::runtime::Handle::current(),
+                        crate::McpWorkerKind::DeferredStartup,
+                        worker,
+                    ));
+                }
+                let outcomes = JoinSet::from_iter(eager_workers).join_all().await;
+                if let Some(tx_event) = tx_event {
+                    let mut summary = McpStartupCompleteEvent {
+                        ready: reused_ready,
+                        ..Default::default()
+                    };
+                    for server_name in &summary.ready {
+                        let _ = emit_update(
+                            startup_submit_id.as_str(),
+                            &tx_event,
+                            McpStartupUpdateEvent {
+                                server: server_name.clone(),
+                                status: McpStartupStatus::Ready,
+                            },
+                        )
+                        .await;
+                    }
+                    for (server_name, outcome) in outcomes {
+                        match outcome {
+                            Ok(_) => summary.ready.push(server_name),
+                            Err(StartupOutcomeError::Cancelled) => {
+                                summary.cancelled.push(server_name)
+                            }
+                            Err(StartupOutcomeError::Failed { error, .. }) => {
+                                summary.failed.push(McpStartupFailure {
+                                    server: server_name,
+                                    error,
+                                })
+                            }
+                        }
+                    }
+                    let _ = tx_event
+                        .send(Event {
+                            id: startup_submit_id,
+                            msg: EventMsg::McpStartupComplete(summary),
+                        })
+                        .await;
+                }
+            },
+        ));
         manager
     }
 
     pub fn empty(prefix_mcp_tool_names: bool) -> Self {
         Self {
+            workers: crate::McpWorkerOwner::default(),
             config: None,
             network_policy_metadata: None,
             servers: HashMap::new(),
@@ -1286,7 +1306,7 @@ impl McpConnectionSet {
             .values()
             .map(|view| Arc::clone(&view.connection))
             .collect::<Vec<_>>();
-        Self::shutdown_connections(connections).await;
+        self.shutdown_connections(connections).await;
     }
 
     /// Releases pool leases retained by older bindings.
@@ -1297,16 +1317,20 @@ impl McpConnectionSet {
             .filter(|view| view.connection.client.connection_slot.is_some())
             .map(|view| Arc::clone(&view.connection))
             .collect();
-        Self::shutdown_connections(connections).await;
+        self.shutdown_connections(connections).await;
     }
 
     /// Keeps cleanup alive if an interrupt cancels the refresh that requested it.
-    async fn shutdown_connections(connections: Vec<Arc<McpServerConnection>>) {
-        let shutdown_task = tokio::spawn(async move {
-            join_all(connections.iter().map(|connection| connection.shutdown())).await;
-        });
-        if let Err(error) = shutdown_task.await {
-            warn!("MCP client shutdown task failed: {error}");
+    async fn shutdown_connections(&self, connections: Vec<Arc<McpServerConnection>>) {
+        let shutdown_task = self.workers.spawn(
+            &tokio::runtime::Handle::current(),
+            crate::McpWorkerKind::ConnectionShutdown,
+            async move {
+                join_all(connections.iter().map(|connection| connection.shutdown())).await;
+            },
+        );
+        if !matches!(shutdown_task.await, crate::worker_joins::WorkerExit::Joined) {
+            warn!("MCP client shutdown worker did not join normally");
         }
     }
 

@@ -158,3 +158,9 @@ mod tool_catalog_cache;
 mod tool_request_meta;
 pub(crate) mod tools;
 mod trusted_access;
+
+pub use worker_joins::McpWorkerCounts;
+pub use worker_joins::McpWorkerKind;
+pub use worker_joins::McpWorkerOwner;
+pub use worker_joins::McpWorkerSnapshot;
+mod worker_joins;

@@ -111,6 +111,7 @@ impl McpConnectionSet {
             config: None,
             network_policy_metadata: None,
             servers: HashMap::new(),
+            workers: crate::McpWorkerOwner::default(),
             event_stream_connection: None,
             event_pool: Default::default(),
             disabled_servers: Vec::new(),
@@ -968,7 +969,10 @@ fn create_test_manager_with_failed_apps_startup(
             tool_catalog_cache_context: None,
             startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             connection_slot: None,
-            startup_reconnect: Some(Arc::new(CodexAppsStartupReconnect::new(reconnect_factory))),
+            startup_reconnect: Some(Arc::new(CodexAppsStartupReconnect::new(
+                reconnect_factory,
+                crate::McpWorkerOwner::default(),
+            ))),
             cancel_token: CancellationToken::new(),
         },
     );
@@ -4247,12 +4251,36 @@ async fn shutdown_continues_after_caller_is_aborted() {
         .await
         .expect_err("caller shutdown task should be aborted");
     assert!(shutdown_error.is_cancelled());
+    let pending = manager
+        .workers
+        .observe_until(tokio::time::Instant::now())
+        .await;
+    assert_eq!(
+        pending
+            .counts
+            .iter()
+            .find(|c| c.kind == crate::McpWorkerKind::ConnectionShutdown)
+            .unwrap()
+            .pending,
+        1
+    );
     release.notify_one();
 
     tokio::time::timeout(Duration::from_secs(1), completed_rx)
         .await
         .expect("client shutdown should survive caller cancellation")
         .expect("client shutdown completion sender should stay alive");
+    let joined = manager
+        .workers
+        .observe_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await;
+    let count = joined
+        .counts
+        .iter()
+        .find(|c| c.kind == crate::McpWorkerKind::ConnectionShutdown)
+        .unwrap();
+    assert_eq!(count.joined, 1);
+    assert_eq!(count.pending + count.panicked + count.cancelled, 0);
 }
 
 #[tokio::test]
@@ -7197,4 +7225,23 @@ async fn view_only_changes_reuse_connection_and_preserve_the_old_step() {
         vec!["search".to_string()]
     );
     assert_eq!(new_call.tool_approval_mode(), AppToolApproval::Approve);
+}
+
+#[tokio::test]
+async fn startup_summary_join_is_retained_after_configuration_reconciliation() {
+    let context = reusable_server_runtime_context();
+    let config = reusable_server_config("http://127.0.0.1:1");
+    let previous = manager_with_reusable_ready_server(&config, &context, Vec::new()).await;
+    let next = reconcile_reusable_server(&previous, config, context).await;
+    let report = next
+        .workers
+        .observe_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await;
+    let summary = report
+        .counts
+        .iter()
+        .find(|c| c.kind == crate::McpWorkerKind::StartupSummary)
+        .unwrap();
+    assert_eq!(summary.joined, 1);
+    assert_eq!(summary.pending + summary.panicked + summary.cancelled, 0);
 }

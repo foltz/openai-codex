@@ -3,23 +3,24 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::worker_joins::McpAbortOnDrop;
 use anyhow::Result;
 use codex_login::AuthChangeState;
 use codex_rmcp_client::RmcpClient;
 use rmcp::model::ServerCapabilities;
 use serde_json::json;
 use tokio::sync::watch;
-use tokio_util::task::AbortOnDropHandle;
 
 pub(crate) const CAPABILITY: &str = "codex/auth-change";
 const NOTIFICATION: &str = "notifications/codex/authChanged";
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) async fn start(
+    workers: &crate::McpWorkerOwner,
     client: Arc<RmcpClient>,
     capabilities: &ServerCapabilities,
     changes: Option<watch::Receiver<AuthChangeState>>,
-) -> Result<Option<Arc<AbortOnDropHandle<()>>>> {
+) -> Result<Option<Arc<McpAbortOnDrop>>> {
     let Some(mut changes) = changes.filter(|_| {
         capabilities
             .experimental
@@ -30,16 +31,20 @@ pub(crate) async fn start(
     };
 
     notify(&client, &mut changes).await?;
-    let task = tokio::spawn(async move {
-        while changes.changed().await.is_ok() {
-            if notify(&client, &mut changes).await.is_err() {
-                tracing::warn!("MCP auth invalidation delivery failed; closing connection");
-                client.shutdown().await;
-                break;
+    let task = workers.spawn_abort_on_drop(
+        &tokio::runtime::Handle::current(),
+        crate::McpWorkerKind::AuthNotification,
+        async move {
+            while changes.changed().await.is_ok() {
+                if notify(&client, &mut changes).await.is_err() {
+                    tracing::warn!("MCP auth invalidation delivery failed; closing connection");
+                    client.shutdown().await;
+                    break;
+                }
             }
-        }
-    });
-    Ok(Some(Arc::new(AbortOnDropHandle::new(task))))
+        },
+    );
+    Ok(Some(Arc::new(task)))
 }
 
 async fn notify(client: &RmcpClient, changes: &mut watch::Receiver<AuthChangeState>) -> Result<()> {

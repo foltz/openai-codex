@@ -11,6 +11,7 @@ use crate::client_tool_catalog::ClientToolCatalog;
 use crate::connection_pool::ConnectionSharing;
 use crate::runtime::emit_duration;
 use crate::tools::ToolInfo;
+use crate::worker_joins::McpAbortOnDrop;
 use anyhow::Result;
 use anyhow::anyhow;
 use codex_connectors::ConnectorRuntimeContext;
@@ -22,14 +23,13 @@ use rmcp::model::ListResourcesResult;
 use rmcp::model::PaginatedRequestParams;
 use rmcp::model::ServerCapabilities;
 use serde_json::Value;
-use tokio_util::task::AbortOnDropHandle;
 
 #[derive(Clone)]
 pub(crate) struct ManagedClient {
     pub(crate) connection_sharing: ConnectionSharing,
     /// The calling chat's input handler, separate from the shared transport's startup handler.
     pub(crate) shared_elicitation: Option<Arc<SendElicitation>>,
-    pub(crate) _auth_change_notifications: Option<Arc<AbortOnDropHandle<()>>>,
+    pub(crate) _auth_change_notifications: Option<Arc<McpAbortOnDrop>>,
     pub(crate) client: Arc<RmcpClient>,
     pub(crate) server_info: McpServerInfo,
     pub(crate) tool_catalog: Arc<ClientToolCatalog>,

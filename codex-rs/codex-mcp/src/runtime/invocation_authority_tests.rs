@@ -341,9 +341,13 @@ async fn check_paths(paths: &[Path]) {
         );
         assert_eq!(f.starts.load(Ordering::SeqCst), 1, "{path:?}");
         assert_eq!(f.work.live.load(Ordering::SeqCst), 2, "{path:?}");
-        // Release through a borrowed Sender so the fixture stays borrowed by
-        // the invocation. Tokio oneshot ownership is moved only below.
+        // Drop the API observer while retaining the same shared startup original.
         drop(admitted);
+        assert_eq!(
+            f.work.live.load(Ordering::SeqCst),
+            2,
+            "original custody survives dropped API observer: {path:?}"
+        );
         let Fixture {
             finish,
             runtime,
@@ -361,7 +365,13 @@ async fn check_paths(paths: &[Path]) {
             .expect("original completes after observer release");
         assert_eq!(starts.load(Ordering::SeqCst), 1);
         assert_eq!(work.live.load(Ordering::SeqCst), 1);
+        let live = Arc::clone(&work.live);
         drop(work);
+        assert_eq!(
+            live.load(Ordering::SeqCst),
+            0,
+            "idle runtime/client retain no work: {path:?}"
+        );
         runtime.shutdown().await;
         drop((tool, name));
     }

@@ -245,21 +245,6 @@ impl ResourceOrigin {
             + self.uri.len()
     }
 
-    pub(crate) async fn read(
-        &self,
-        binding: &McpBinding,
-        thread_id: ThreadId,
-        params: ReadResourceRequestParams,
-    ) -> anyhow::Result<ReadResourceResult> {
-        self.read_with_authority(
-            binding,
-            thread_id,
-            params,
-            crate::McpAttemptAccess::Unscoped,
-        )
-        .await
-    }
-
     pub(crate) async fn read_with_authority(
         &self,
         binding: &McpBinding,

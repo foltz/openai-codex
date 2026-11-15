@@ -157,15 +157,6 @@ impl McpConnectionSet {
         templates
     }
 
-    pub async fn list_resources(
-        &self,
-        server: &str,
-        params: Option<PaginatedRequestParams>,
-    ) -> Result<ListResourcesResult> {
-        self.list_resources_with_authority(server, params, crate::McpAttemptAccess::Unscoped)
-            .await
-    }
-
     pub async fn list_resources_with_authority(
         &self,
         server: &str,
@@ -177,19 +168,6 @@ impl McpConnectionSet {
             .list_resources(params, timeout)
             .await
             .with_context(|| format!("resources/list failed for `{server}`"))
-    }
-
-    pub async fn list_resource_templates(
-        &self,
-        server: &str,
-        params: Option<PaginatedRequestParams>,
-    ) -> Result<ListResourceTemplatesResult> {
-        self.list_resource_templates_with_authority(
-            server,
-            params,
-            crate::McpAttemptAccess::Unscoped,
-        )
-        .await
     }
 
     pub async fn list_resource_templates_with_authority(
@@ -266,14 +244,6 @@ impl McpConnectionSet {
         }
     }
 
-    pub(crate) async fn client_by_name(
-        &self,
-        name: &str,
-    ) -> Result<(ManagedClient, Option<Duration>)> {
-        self.client_by_name_with_authority(name, crate::McpAttemptAccess::Unscoped)
-            .await
-    }
-
     pub(crate) async fn client_by_name_with_authority(
         &self,
         name: &str,
@@ -295,20 +265,6 @@ impl McpConnectionSet {
 impl McpServerConnection {
     /// Borrows the authenticated transport while startup owns its inventory. Discard the page
     /// if startup fails or the runtime replaces its connection, auth scope, or resource generation.
-    pub(crate) async fn with_early_apps_client(
-        self: &Arc<Self>,
-        runtime: &McpRuntime,
-        timeout: Option<Duration>,
-        request: impl AsyncFnOnce(Arc<RmcpClient>, Option<Duration>) -> Result<ServerResult>,
-    ) -> Result<ServerResult> {
-        self.with_early_apps_client_with_authority(
-            runtime,
-            timeout,
-            request,
-            crate::McpAttemptAccess::Unscoped,
-        )
-        .await
-    }
 
     pub(crate) async fn with_early_apps_client_with_authority(
         self: &Arc<Self>,
@@ -340,6 +296,7 @@ impl McpServerConnection {
         Ok(response)
     }
 
+    #[cfg(test)]
     pub(super) async fn initialized_apps_client(&self) -> Result<Arc<RmcpClient>> {
         self.initialized_apps_client_with_authority(crate::McpAttemptAccess::Unscoped)
             .await

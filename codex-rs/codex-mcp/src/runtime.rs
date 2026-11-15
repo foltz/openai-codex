@@ -736,6 +736,7 @@ impl McpRuntime {
         .await
     }
 
+    #[cfg(test)]
     async fn binding_from_published_runtime(
         current: Arc<PublishedMcpRuntime>,
         required_servers: &[String],

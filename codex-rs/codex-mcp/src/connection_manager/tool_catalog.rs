@@ -325,6 +325,7 @@ impl McpConnectionSet {
     }
 
     #[instrument(level = "trace", skip_all)]
+    #[cfg(test)]
     pub(crate) async fn capture_binding_with_metadata(
         self: &Arc<Self>,
         config: Arc<crate::McpConfig>,
@@ -625,6 +626,7 @@ impl McpConnectionSet {
     }
 
     #[instrument(level = "trace", skip_all)]
+    #[cfg(test)]
     pub(crate) async fn prepare_call_for_tool(
         self: &Arc<Self>,
         config: Arc<crate::McpConfig>,
@@ -725,6 +727,7 @@ impl McpConnectionSet {
     }
 
     /// Refreshes one exact Apps catalog, preserving the raw inventory for app policy.
+    #[cfg(test)]
     pub(crate) async fn refresh_codex_apps_client_catalog<G>(
         &self,
         config: &crate::McpConfig,
@@ -782,6 +785,7 @@ impl McpConnectionSet {
     }
 
     /// Refreshes Apps tools and returns the prepared shared-cache winner for discovery.
+    #[cfg(test)]
     pub async fn refresh_codex_apps_tools_for_discovery(&self) -> Result<Vec<ToolInfo>> {
         self.refresh_codex_apps_tools_for_discovery_with_authority(
             crate::McpAttemptAccess::Unscoped,

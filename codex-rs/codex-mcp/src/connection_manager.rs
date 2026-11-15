@@ -216,11 +216,6 @@ impl McpServerConnection {
         self.client.client_with_authority(access).await
     }
 
-    async fn client_for_call(&self) -> Result<ManagedClient, StartupOutcomeError> {
-        self.client_for_call_with_authority(crate::McpAttemptAccess::Unscoped)
-            .await
-    }
-
     async fn client_for_call_with_authority(
         &self,
         access: crate::McpAttemptAccess<'_>,

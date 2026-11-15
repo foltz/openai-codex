@@ -233,7 +233,7 @@ impl Command {
     /// Explicit launch attachments, including CLOEXEC descriptors. The caller
     /// owns them through spawn; only the child's flags are changed.
     #[cfg(unix)]
-    pub(crate) fn inherit_fds(&mut self, fds: &[std::os::fd::RawFd]) -> &mut Self {
+    pub fn inherit_fds(&mut self, fds: &[std::os::fd::RawFd]) -> &mut Self {
         self.inherited_fds = fds.to_vec();
         self
     }

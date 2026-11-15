@@ -1545,6 +1545,7 @@ async fn real_account_constructor_case(explicit: bool, hold_mcp: bool) {
     struct RequestHost {
         request_alive: std::sync::atomic::AtomicBool,
         operations: AtomicUsize,
+        request_derivations: AtomicUsize,
         released: tokio::sync::Notify,
     }
     #[derive(Debug)]
@@ -1583,12 +1584,24 @@ async fn real_account_constructor_case(explicit: bool, hold_mcp: bool) {
         fn admit_turn_start(&self) -> Option<Box<dyn Send>> {
             Some(Box::new(()))
         }
+        fn requires_account_work(&self) -> bool {
+            true
+        }
+        fn admit_operation_work(
+            &self,
+        ) -> Result<
+            Option<Box<dyn codex_extension_api::HostOperationWork>>,
+            codex_extension_api::TurnWorkRefused,
+        > {
+            panic!("constructor must never acquire fresh operation admission");
+        }
         fn derive_request_operation_work(
             &self,
         ) -> Result<
             Option<Box<dyn codex_extension_api::HostOperationWork>>,
             codex_extension_api::TurnWorkRefused,
         > {
+            self.0.request_derivations.fetch_add(1, Ordering::SeqCst);
             if !self.0.request_alive.load(Ordering::SeqCst) {
                 return Err(codex_extension_api::TurnWorkRefused::Unavailable);
             }
@@ -1666,6 +1679,11 @@ async fn real_account_constructor_case(explicit: bool, hold_mcp: bool) {
     .await
     .expect("constructor reaches held instructions");
     assert_eq!(provider.entered.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        host.request_derivations.load(Ordering::SeqCst),
+        usize::from(!explicit),
+        "retained construction must not rediscover request authority"
+    );
     assert_eq!(host.operations.load(Ordering::SeqCst), 2);
     if let Some(mcp) = &held_mcp {
         instruction_release
@@ -1754,4 +1772,9 @@ async fn real_account_constructor_case(explicit: bool, hold_mcp: bool) {
     );
     assert_eq!(manager.constructions.drain_until(deadline).await, report);
     assert_eq!(provider.entered.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        host.request_derivations.load(Ordering::SeqCst),
+        usize::from(!explicit),
+        "retained construction must not rediscover request authority"
+    );
 }

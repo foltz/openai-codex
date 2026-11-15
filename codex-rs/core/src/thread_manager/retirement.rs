@@ -222,7 +222,10 @@ impl ConstructionPublication {
         let state = registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.deadline
+        match (state.deadline, state.shutdown_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     /// Resolves at the earliest of `local` and the registry's latched
@@ -316,14 +319,32 @@ impl ThreadConstructions {
             .shutdown_deadline
             .map_or(deadline, |latched| latched.min(deadline));
         state.shutdown_deadline = Some(deadline);
-        state.published.clone()
+        let published = state.published.clone();
+        let startups = state
+            .constructions
+            .iter()
+            .map(|entry| Arc::clone(&entry.startup))
+            .collect::<Vec<_>>();
+        drop(state);
+        // Early resources need the same permanent clock as already-published Sessions.
+        // Never take a startup/cleanup mutex under the registry mutex.
+        for startup in startups {
+            startup.tighten_shutdown_edge(deadline);
+        }
+        self.activity.notify_waiters();
+        published
     }
 
     pub(super) fn close_until(&self, deadline: Instant) -> CodexResult<Instant> {
         let mut state = self.state.lock().map_err(|_| CodexErr::InternalAgentDied)?;
         state.closed = true;
         self.activity.notify_waiters();
-        Ok(*state.deadline.get_or_insert(deadline))
+        let deadline = state
+            .shutdown_deadline
+            .map_or(deadline, |edge| edge.min(deadline));
+        let bound = state.deadline.map_or(deadline, |first| first.min(deadline));
+        state.deadline = Some(bound);
+        Ok(bound)
     }
 
     pub(super) fn ticket(&self) -> ConstructionTicket {
@@ -415,6 +436,9 @@ impl ThreadConstructions {
             if !unavailable && let Some(report) = &state.terminal {
                 return report.clone();
             }
+            let deadline = state
+                .shutdown_deadline
+                .map_or(deadline, |edge| edge.min(deadline));
             let deadline = *state.deadline.get_or_insert(deadline);
             let pending = state
                 .constructions
@@ -515,7 +539,10 @@ impl ConstructionTicket {
         let state = registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.deadline
+        match (state.deadline, state.shutdown_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     /// Resolves at the earliest of `local` and the registry's latched
@@ -557,7 +584,11 @@ impl ConstructionTicket {
         let registry = self.0.upgrade().ok_or(CodexErr::InternalAgentDied)?;
         population::compact(&registry);
         let mut state = registry.lock().map_err(|_| CodexErr::InternalAgentDied)?;
-        if state.closed {
+        if state.closed
+            || state
+                .shutdown_deadline
+                .is_some_and(|edge| Instant::now() >= edge)
+        {
             return Err(CodexErr::InternalAgentDied);
         }
         state.panicked |= state
@@ -568,6 +599,9 @@ impl ConstructionTicket {
             .constructions
             .retain(|entry| entry.completion.peek().is_none() || !entry.startup.is_empty());
         let startup = Arc::new(SessionStartupCustody::default());
+        if let Some(edge) = state.shutdown_deadline {
+            startup.tighten_shutdown_edge(edge);
+        }
         // Lets lifetime cleanup outside this registry prove registry expiry.
         let probe = self.clone();
         startup.set_registry_deadline_probe(Box::new(move || probe.deadline()));

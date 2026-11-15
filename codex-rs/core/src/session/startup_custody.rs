@@ -66,6 +66,8 @@ pub(crate) struct SessionStartupCustody {
     state: Mutex<StartupState>,
     /// Weak view of the owning registry's latched deadline.
     registry_deadline: std::sync::OnceLock<RegistryDeadlineProbe>,
+    /// Permanent edge is separate from ordinary reset binding and Legacy phase.
+    shutdown_clock: std::sync::OnceLock<tokio::sync::watch::Sender<Option<Instant>>>,
     #[cfg(test)]
     pause_after_retain: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     #[cfg(test)]
@@ -458,6 +460,12 @@ impl SessionStartupCustody {
     /// Permanent manager edge, distinct from ordinary reset/retirement binding.
     pub(crate) fn tighten_shutdown_edge(&self, deadline: Instant) {
         self.tighten_deadline(deadline);
+        let clock = self
+            .shutdown_clock
+            .get_or_init(|| tokio::sync::watch::channel(None).0);
+        clock.send_modify(|bound| {
+            *bound = Some(bound.map_or(deadline, |previous| previous.min(deadline)));
+        });
         let owners = self.state.lock().ok().map(|state| {
             (
                 state.resources.clone(),
@@ -744,7 +752,34 @@ impl SessionStartupCustody {
     /// terminal. This does not relabel legacy work with a later deadline.
     pub(crate) fn shutdown_legacy(&self) -> futures::future::BoxFuture<'_, bool> {
         Box::pin(async move {
-            let complete = self.shutdown_legacy_observed().await;
+            let clock = self
+                .shutdown_clock
+                .get_or_init(|| tokio::sync::watch::channel(None).0);
+            let mut changes = clock.subscribe();
+            let cleanup = self.shutdown_legacy_observed();
+            tokio::pin!(cleanup);
+            let complete = loop {
+                // A settled positive receipt remains observable after expiry.
+                if self.is_empty() {
+                    break true;
+                }
+                let deadline = *changes.borrow_and_update();
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    break false;
+                }
+                let expiry = async move {
+                    match deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                };
+                tokio::select! {
+                    biased;
+                    changed = changes.changed() => if changed.is_err() { break false; },
+                    _ = expiry => break false,
+                    complete = &mut cleanup => break complete,
+                }
+            };
             if complete {
                 // Only positive proof releases adopted membership here; an
                 // incomplete legacy observation keeps it with this cell.

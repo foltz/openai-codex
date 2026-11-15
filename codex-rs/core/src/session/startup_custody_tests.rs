@@ -599,3 +599,31 @@ async fn expired_cell_refuses_constructor_birth_without_resource_effects() {
     assert!(custody.state.lock().unwrap().resources.is_none());
     assert!(custody.is_empty());
 }
+
+#[tokio::test(start_paused = true)]
+async fn permanent_edge_stops_legacy_disposal_without_reclassifying_or_restarting_it() {
+    let custody = SessionStartupCustody::default();
+    let held = custody
+        .retain_blocked_persistence_for_test(ThreadId::new())
+        .await;
+    let mut observer = custody.shutdown_legacy();
+    assert!(futures::poll!(observer.as_mut()).is_pending());
+    custody.tighten_shutdown_edge(Instant::now() + std::time::Duration::from_secs(1));
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    assert!(!observer.await);
+    drop(held);
+    assert!(!custody.shutdown_legacy().await);
+    let state = custody.state.lock().unwrap();
+    let disposal = state
+        .persistence
+        .as_ref()
+        .unwrap()
+        .disposal
+        .as_ref()
+        .unwrap();
+    assert!(disposal.phase == PersistenceDisposalPhase::Legacy);
+    assert!(
+        disposal.receipt.peek().is_none(),
+        "elapsed legacy original must not be driven after lock release"
+    );
+}

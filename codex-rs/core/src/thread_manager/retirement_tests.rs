@@ -1493,3 +1493,31 @@ async fn first_visible_runtime_is_already_bound_to_the_shutdown_edge() {
     );
     drop(started);
 }
+
+#[tokio::test(start_paused = true)]
+async fn permanent_edge_clamps_unpublished_custody_and_refuses_late_birth() {
+    let owner = ThreadConstructions::default();
+    let observer = owner
+        .ticket()
+        .register(None, |_, _| async { Err(CodexErr::InternalAgentDied) })
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    assert!(owner.latch_shutdown_deadline(deadline).is_empty());
+    assert_eq!(owner.ticket().deadline(), Some(deadline));
+    let startup = Arc::clone(&owner.state.lock().unwrap().constructions[0].startup);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert_eq!(startup.elapsed_deadline(), Some(deadline));
+    assert!(
+        owner
+            .ticket()
+            .register(None, |_, _| async { panic!("late constructor ran") })
+            .is_err()
+    );
+    assert_eq!(
+        owner
+            .close_until(deadline + Duration::from_secs(30))
+            .unwrap(),
+        deadline
+    );
+    drop(observer);
+}

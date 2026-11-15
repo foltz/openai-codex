@@ -428,6 +428,63 @@ pub struct CancellableEventStreamRequest {
     pub notifications: crate::EventNotificationReceiver,
 }
 
+/// Narrow handle to the exact recovered physical connection before Ready
+/// publication. Sending through the ordinary client would select the expired
+/// service or recursively enter the semaphore-serialized recovery path.
+/// This context sends directly and acquires a typed lease for each operation.
+pub struct ReconnectContext {
+    service: Arc<ManagedRunningService<ElicitationClientService>>,
+    elicitation_pause_state: ElicitationPauseState,
+}
+
+impl ReconnectContext {
+    /// Sends one custom JSON-RPC request directly on this physical
+    /// connection, bypassing `RmcpClient`'s connection-state lookup and
+    /// session-expiry retry machinery (recovery is already in progress;
+    /// retrying it here would re-enter `reinitialize_after_session_expiry`).
+    pub async fn send_custom_request(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+        timeout: Option<Duration>,
+    ) -> Result<ServerResult> {
+        let service = self.service.lease()?;
+        RmcpClient::run_service_operation_once(
+            service,
+            "requests/custom",
+            timeout,
+            self.elicitation_pause_state.clone(),
+            &move |service| {
+                let params = params.clone();
+                async move {
+                    service
+                        .send_request(ClientRequest::CustomRequest(
+                            crate::trace_context::traced_custom_request(method, params),
+                        ))
+                        .await
+                }
+                .boxed()
+            },
+        )
+        .await
+        .map_err(Into::into)
+    }
+}
+
+/// Runs after a recovered physical connection is established but before it is
+/// published as usable, so it can perform any additional handshake this
+/// connection requires — e.g. binding a capability-gated identity — before
+/// any provider operation is admitted. Returning `Err` makes the
+/// connection permanently unusable; the caller must obtain a fresh one.
+/// `None` (the default for every `RmcpClient`) is a complete no-op: no
+/// extra request, no extra latency, no behavior change for ordinary
+/// connections that never opt in.
+pub type PostReconnectHook = Box<
+    dyn for<'a> Fn(&'a ReconnectContext, &'a ServerPeerInfo) -> BoxFuture<'a, Result<()>>
+        + Send
+        + Sync,
+>;
+
 /// MCP client implemented on top of the official `rmcp` SDK.
 /// https://github.com/modelcontextprotocol/rust-sdk
 pub struct RmcpClient {
@@ -443,9 +500,17 @@ pub struct RmcpClient {
     tool_list_revision: Arc<AtomicU64>,
     cancel_requests_on_drop: AtomicBool,
     retirement: RmcpClientRetirement,
+    post_reconnect_hook: Option<PostReconnectHook>,
 }
 
 impl RmcpClient {
+    /// Installs a connection-local binding gate for recovered transports.
+    /// Ordinary clients keep the default no-op path.
+    pub fn with_post_reconnect_hook(mut self, hook: PostReconnectHook) -> Self {
+        self.post_reconnect_hook = Some(hook);
+        self
+    }
+
     /// Extend tool-call cancellation to catalog, resource, and custom requests on a shared connection.
     pub fn enable_request_cancellation(&self) {
         self.cancel_requests_on_drop.store(true, Ordering::Relaxed);
@@ -511,6 +576,7 @@ impl RmcpClient {
             tool_list_revision: Arc::default(),
             cancel_requests_on_drop: AtomicBool::new(false),
             retirement,
+            post_reconnect_hook: None,
         })
     }
 
@@ -612,6 +678,7 @@ impl RmcpClient {
             tool_list_revision: Arc::default(),
             cancel_requests_on_drop: AtomicBool::new(false),
             retirement,
+            post_reconnect_hook: None,
         })
     }
 
@@ -758,6 +825,7 @@ impl RmcpClient {
             tool_list_revision: Arc::default(),
             cancel_requests_on_drop: AtomicBool::new(false),
             retirement,
+            post_reconnect_hook: None,
         })
     }
 
@@ -1900,10 +1968,28 @@ impl RmcpClient {
                 &initialize_context,
             )
             .await?;
-        service
+        let peer_info = service
             .peer()
             .peer_info()
             .ok_or_else(|| anyhow!("recovered handshake succeeded but server info was missing"))?;
+
+        // This exact physical service is not published as Ready until the gate
+        // accepts it. The context sends directly on it, never through the old
+        // shared state or recursive recovery. Each send owns a typed lease only
+        // for its own operation; rejection retains no lease across shutdown.
+        if let Some(hook) = &self.post_reconnect_hook {
+            let context = ReconnectContext {
+                service: Arc::clone(&service),
+                elicitation_pause_state: self.elicitation_pause_state.clone(),
+            };
+            if let Err(error) = hook(&context, &peer_info).await {
+                service.request_close();
+                self.shutdown().await;
+                return Err(
+                    error.context("post-reconnect binding gate rejected recovered connection")
+                );
+            }
+        }
 
         let previous = {
             let mut guard = self.state.lock().await;

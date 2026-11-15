@@ -7246,3 +7246,68 @@ async fn startup_summary_join_is_retained_after_configuration_reconciliation() {
     assert_eq!(summary.joined, 1);
     assert_eq!(summary.pending + summary.panicked + summary.cancelled, 0);
 }
+
+#[tokio::test]
+async fn closed_reconnect_admission_never_invokes_caller_driven_factory() {
+    let workers = crate::McpWorkerOwner::default();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&calls);
+    let reconnect = Arc::new(CodexAppsStartupReconnect::new(
+        Arc::new(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+            async { Err(StartupOutcomeError::Cancelled) }
+                .boxed()
+                .shared()
+        }),
+        workers.clone(),
+    ));
+    workers.close_startup_admission();
+    assert!(reconnect.reconnect_in_background().is_none());
+    assert!(reconnect.reconnect_in_background().is_none());
+    let report = workers.observe_until(tokio::time::Instant::now()).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(report.registered_at_end, 0);
+    assert_eq!(report.refused_at_end, 2);
+}
+
+#[tokio::test]
+async fn admitted_reconnect_original_worker_outlives_dropped_callers() {
+    let workers = crate::McpWorkerOwner::default();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&calls);
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let starting = Arc::clone(&entered);
+    let resume = Arc::clone(&release);
+    let reconnect = Arc::new(CodexAppsStartupReconnect::new(
+        Arc::new(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+            let starting = Arc::clone(&starting);
+            let resume = Arc::clone(&resume);
+            async move {
+                starting.notify_one();
+                resume.notified().await;
+                Err(StartupOutcomeError::Cancelled)
+            }
+            .boxed()
+            .shared()
+        }),
+        workers.clone(),
+    ));
+    let first = reconnect.reconnect_in_background().unwrap();
+    let other = reconnect.reconnect_in_background().unwrap();
+    drop(first);
+    entered.notified().await;
+    workers.close_startup_admission();
+    let pending = workers.observe_until(tokio::time::Instant::now()).await;
+    assert_eq!(pending.registered_at_end, 1);
+    assert_eq!(pending.counts.iter().map(|c| c.pending).sum::<u64>(), 1);
+    release.notify_one();
+    assert!(matches!(other.await, Err(StartupOutcomeError::Cancelled)));
+    let report = workers
+        .observe_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await;
+    assert_eq!(report.registered_at_end, 1);
+    assert_eq!(report.counts.iter().map(|c| c.joined).sum::<u64>(), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}

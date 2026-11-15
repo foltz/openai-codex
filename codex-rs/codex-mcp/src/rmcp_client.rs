@@ -213,65 +213,66 @@ impl CodexAppsStartupReconnect {
         }
 
         let reconnect = Arc::clone(self);
-        let attempt = async move {
-            let result = (reconnect.factory)().await;
-            let startup_status_context = reconnect.startup_status_context.clone();
-            let recovered = {
-                let mut state = reconnect
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                state.reconnect_in_flight = None;
-                match &result {
-                    Ok(client) => {
-                        state.current_client = Some(client.clone());
-                        state.last_error = None;
-                        state.consecutive_failures = 0;
-                        state.retry_not_before = None;
-                        true
-                    }
-                    Err(error) => {
-                        state.last_error = Some(error.clone());
-                        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
-                        let retry_after = codex_apps_reconnect_backoff(state.consecutive_failures);
-                        state.retry_not_before = Some(TokioInstant::now() + retry_after);
-                        warn!(
-                            error = %error,
-                            retry_after_ms = retry_after.as_millis(),
-                            "Apps MCP startup reconnect failed; continuing with cached tools"
-                        );
-                        false
-                    }
-                }
-            };
-
-            if recovered && let Some(context) = startup_status_context {
-                let _ = context
-                    .tx_event
-                    .send(Event {
-                        id: context.submit_id,
-                        msg: EventMsg::McpStartupUpdate(McpStartupUpdateEvent {
-                            server: context.server_name,
-                            status: McpStartupStatus::Ready,
-                        }),
-                    })
-                    .await;
-            }
-            result
-        }
-        .boxed()
-        .shared();
-        state.reconnect_in_flight = Some(attempt.clone());
-        drop(state);
-        // Keep recovery running if the invocation waiting for it is cancelled.
-        let background = attempt.clone();
-        drop(self.workers.spawn(
+        let (send, receive) = tokio::sync::oneshot::channel();
+        // Callers observe the result channel only. They cannot independently
+        // drive a refused factory or escape original background worker custody.
+        let attempt = async move { receive.await.unwrap_or(Err(StartupOutcomeError::Cancelled)) }
+            .boxed()
+            .shared();
+        let completion = self.workers.try_spawn(
             &tokio::runtime::Handle::current(),
             crate::McpWorkerKind::Reconnect,
             async move {
-                let _ = background.await;
+                let result = (reconnect.factory)().await;
+                let startup_status_context = reconnect.startup_status_context.clone();
+                let recovered = {
+                    let mut state = reconnect
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    state.reconnect_in_flight = None;
+                    match &result {
+                        Ok(client) => {
+                            state.current_client = Some(client.clone());
+                            state.last_error = None;
+                            state.consecutive_failures = 0;
+                            state.retry_not_before = None;
+                            true
+                        }
+                        Err(error) => {
+                            state.last_error = Some(error.clone());
+                            state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+                            let retry_after = codex_apps_reconnect_backoff(state.consecutive_failures);
+                            state.retry_not_before = Some(TokioInstant::now() + retry_after);
+                            warn!(
+                                error = %error,
+                                retry_after_ms = retry_after.as_millis(),
+                                "Apps MCP startup reconnect failed; continuing with cached tools"
+                            );
+                            false
+                        }
+                    }
+                };
+
+                if recovered && let Some(context) = startup_status_context {
+                    let _ = context
+                        .tx_event
+                        .send(Event {
+                            id: context.submit_id,
+                            msg: EventMsg::McpStartupUpdate(McpStartupUpdateEvent {
+                                server: context.server_name,
+                                status: McpStartupStatus::Ready,
+                            }),
+                        })
+                        .await;
+                }
+                let _ = send.send(result);
             },
-        ));
+        ).ok()?;
+        state.reconnect_in_flight = Some(attempt.clone());
+        drop(state);
+        // The ledger retains the original join even if every caller goes away.
+        drop(completion);
         Some(attempt)
     }
 }

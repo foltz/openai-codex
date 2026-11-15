@@ -84,11 +84,13 @@ async fn panic_and_abort_outcomes_survive_later_compaction() {
             panic!("injected reconnect worker panic")
         }),
     );
-    let abort = owner.spawn_abort_on_drop(
-        &Handle::current(),
-        McpWorkerKind::AuthNotification,
-        std::future::pending(),
-    );
+    let abort = owner
+        .spawn_abort_on_drop(
+            &Handle::current(),
+            McpWorkerKind::AuthNotification,
+            std::future::pending(),
+        )
+        .unwrap();
     drop(abort);
     let first = owner
         .observe_until(Instant::now() + Duration::from_secs(1))
@@ -331,6 +333,7 @@ async fn eager_results_do_not_remain_as_ordinary_holders_in_the_join_ledger() {
     let result = owner
         .join_eager_batch(vec![async move { resource }.boxed()])
         .await
+        .unwrap()
         .unwrap();
     assert!(weak.upgrade().is_some());
     drop(result);
@@ -349,15 +352,19 @@ async fn ema_abort_guard_follows_final_ordinary_owner_and_retains_original_join(
     let seen = Arc::clone(&entered);
     let resource = Arc::new(());
     let weak = Arc::downgrade(&resource);
-    let guard = Arc::new(owner.spawn_abort_on_drop(
-        &Handle::current(),
-        McpWorkerKind::EmaRevocation,
-        async move {
-            let _resource = resource;
-            seen.notify_one();
-            std::future::pending::<()>().await;
-        },
-    ));
+    let guard = Arc::new(
+        owner
+            .spawn_abort_on_drop(
+                &Handle::current(),
+                McpWorkerKind::EmaRevocation,
+                async move {
+                    let _resource = resource;
+                    seen.notify_one();
+                    std::future::pending::<()>().await;
+                },
+            )
+            .unwrap(),
+    );
     entered.notified().await;
     let other = Arc::clone(&guard);
     drop(guard);
@@ -375,11 +382,13 @@ async fn ema_abort_guard_follows_final_ordinary_owner_and_retains_original_join(
 #[tokio::test]
 async fn stop_request_is_not_completion_and_survives_dropped_observer() {
     let owner = McpWorkerOwner::default();
-    let guard = owner.spawn_abort_on_drop(
-        &Handle::current(),
-        McpWorkerKind::AuthNotification,
-        std::future::pending(),
-    );
+    let guard = owner
+        .spawn_abort_on_drop(
+            &Handle::current(),
+            McpWorkerKind::AuthNotification,
+            std::future::pending(),
+        )
+        .unwrap();
     guard.stop();
     let unobserved = owner.observe_until(Instant::now()).await;
     let unobserved = count(&unobserved, McpWorkerKind::AuthNotification);
@@ -407,11 +416,13 @@ async fn stop_request_is_not_completion_and_survives_dropped_observer() {
 #[tokio::test]
 async fn late_guard_drop_does_not_reclassify_unrequested_cancellation() {
     let owner = McpWorkerOwner::default();
-    let guard = owner.spawn_abort_on_drop(
-        &Handle::current(),
-        McpWorkerKind::EmaRevocation,
-        std::future::pending(),
-    );
+    let guard = owner
+        .spawn_abort_on_drop(
+            &Handle::current(),
+            McpWorkerKind::EmaRevocation,
+            std::future::pending(),
+        )
+        .unwrap();
     // Simulate cancellation outside the retained stop authority.
     guard.abort.handle.abort();
     let first = owner
@@ -432,13 +443,15 @@ async fn late_guard_drop_does_not_reclassify_unrequested_cancellation() {
 #[tokio::test]
 async fn stop_requests_do_not_relabel_natural_exit_or_panic() {
     let owner = McpWorkerOwner::default();
-    let natural =
-        owner.spawn_abort_on_drop(&Handle::current(), McpWorkerKind::AuthNotification, async {
-        });
-    let panicked =
-        owner.spawn_abort_on_drop(&Handle::current(), McpWorkerKind::EmaRevocation, async {
+    let natural = owner
+        .spawn_abort_on_drop(&Handle::current(), McpWorkerKind::AuthNotification, async {
+        })
+        .unwrap();
+    let panicked = owner
+        .spawn_abort_on_drop(&Handle::current(), McpWorkerKind::EmaRevocation, async {
             panic!("injected watcher panic");
-        });
+        })
+        .unwrap();
     let first = owner
         .observe_until(Instant::now() + Duration::from_secs(1))
         .await;
@@ -456,4 +469,104 @@ async fn stop_requests_do_not_relabel_natural_exit_or_panic() {
             .iter()
             .all(|c| c.cancelled + c.requested_cancelled == 0)
     );
+}
+
+#[tokio::test]
+async fn closed_worker_admission_refuses_startup_but_keeps_actual_cleanup_joins() {
+    let owner = McpWorkerOwner::default();
+    let called = Arc::new(AtomicUsize::new(0));
+    owner.close_startup_admission();
+    for kind in [
+        McpWorkerKind::StartupSummary,
+        McpWorkerKind::DeferredStartup,
+        McpWorkerKind::Reconnect,
+        McpWorkerKind::AuthNotification,
+        McpWorkerKind::EagerStartup,
+        McpWorkerKind::EmaRevocation,
+    ] {
+        let observed = Arc::clone(&called);
+        assert!(matches!(
+            owner
+                .spawn(&Handle::current(), kind, async move {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                })
+                .await,
+            WorkerExit::NotAdmitted
+        ));
+    }
+    assert!(
+        owner
+            .spawn_abort_on_drop(
+                &Handle::current(),
+                McpWorkerKind::AuthNotification,
+                std::future::pending()
+            )
+            .is_err()
+    );
+    let observed = Arc::clone(&called);
+    assert!(
+        owner
+            .spawn_result(&Handle::current(), McpWorkerKind::Reconnect, async move {
+                observed.fetch_add(1, Ordering::SeqCst)
+            })
+            .await
+            .is_err()
+    );
+    assert_eq!(called.load(Ordering::SeqCst), 0);
+    for kind in [
+        McpWorkerKind::DiscoveryCleanup,
+        McpWorkerKind::ConnectionShutdown,
+        McpWorkerKind::RuntimeShutdown,
+    ] {
+        let observed = Arc::clone(&called);
+        assert!(matches!(
+            owner
+                .spawn(&Handle::current(), kind, async move {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                })
+                .await,
+            WorkerExit::Joined
+        ));
+    }
+    let report = owner
+        .observe_until(Instant::now() + Duration::from_secs(1))
+        .await;
+    assert!(report.startup_admission_closed);
+    assert_eq!(report.refused_at_end, 8);
+    assert_eq!(report.registered_at_end, 3);
+    assert_eq!(called.load(Ordering::SeqCst), 3);
+    assert!(
+        report
+            .counts
+            .iter()
+            .all(|c| c.pending + c.cancelled + c.panicked == 0)
+    );
+}
+
+#[tokio::test]
+async fn eager_admission_closure_aborts_only_already_born_children_without_summary_panic() {
+    let owner = McpWorkerOwner::default();
+    let called = Arc::new(AtomicUsize::new(0));
+    let closing = owner.clone();
+    let bodies = (0..2).map(|index| {
+        if index == 1 {
+            closing.close_startup_admission();
+        }
+        let called = Arc::clone(&called);
+        async move {
+            called.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        }
+    });
+    assert!(owner.join_eager_batch(bodies).await.unwrap().is_none());
+    let report = owner
+        .observe_until(Instant::now() + Duration::from_secs(1))
+        .await;
+    let eager = count(&report, McpWorkerKind::EagerStartup);
+    assert_eq!(report.registered_at_end, 1);
+    assert_eq!(report.refused_at_end, 1);
+    assert_eq!(eager.cancelled, 1);
+    assert_eq!(eager.requested_cancelled, 1);
+    assert_eq!(eager.pending + eager.panicked + eager.joined, 0);
+    assert_eq!(called.load(Ordering::SeqCst), 0);
 }

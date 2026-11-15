@@ -71,6 +71,7 @@ struct State {
     generations_published: u64,
     constructing_generations: BTreeSet<u64>,
     connections: Vec<Arc<ConnectionOwner>>,
+    workers: Vec<crate::McpWorkerOwner>,
 }
 
 /// Retain before asynchronous connection construction or cleanup can be dropped.
@@ -131,6 +132,23 @@ impl Drop for RuntimeGenerationPermit {
 }
 
 impl McpRuntimeRetirement {
+    pub(crate) fn register_workers(&self, workers: crate::McpWorkerOwner) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.closed || self.state.is_poisoned() {
+            workers.close_startup_admission();
+        }
+        if !state
+            .workers
+            .iter()
+            .any(|existing| existing.same_owner(&workers))
+        {
+            state.workers.push(workers);
+        }
+    }
+
     pub(crate) fn admit_generation(&self) -> Result<RuntimeGenerationPermit, ()> {
         let mut state = self.state.lock().map_err(|_| ())?;
         if state.closed {
@@ -201,6 +219,9 @@ impl McpRuntimeRetirement {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.closed = true;
+            for workers in &state.workers {
+                workers.close_startup_admission();
+            }
             // Globally fence every registered gate before the first cancellation
             // can wake work on another executor thread.
             for record in &state.connections {

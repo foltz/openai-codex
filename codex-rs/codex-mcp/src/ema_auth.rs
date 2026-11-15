@@ -93,30 +93,32 @@ impl EmaAuth {
         })
         .with_policy(policy.clone());
         authority.check_new_request()?;
-        let revocation = workers.spawn_abort_on_drop(
-            &tokio::runtime::Handle::current(),
-            crate::McpWorkerKind::EmaRevocation,
-            async move {
-                tokio::select! {
-                    biased;
-                    () = cancellation.cancelled() => {}
-                    () = async {
-                        match policy {
-                            Some(policy) => policy.invalidated().await,
-                            None => std::future::pending().await,
-                        }
-                    } => {}
-                    () = async {
-                        while changes.changed().await.is_ok() {
-                            if changes.borrow().login_generation != login_generation {
-                                break;
+        let revocation = workers
+            .spawn_abort_on_drop(
+                &tokio::runtime::Handle::current(),
+                crate::McpWorkerKind::EmaRevocation,
+                async move {
+                    tokio::select! {
+                        biased;
+                        () = cancellation.cancelled() => {}
+                        () = async {
+                            match policy {
+                                Some(policy) => policy.invalidated().await,
+                                None => std::future::pending().await,
                             }
-                        }
-                    } => {}
-                }
-                cancellation.cancel();
-            },
-        );
+                        } => {}
+                        () = async {
+                            while changes.changed().await.is_ok() {
+                                if changes.borrow().login_generation != login_generation {
+                                    break;
+                                }
+                            }
+                        } => {}
+                    }
+                    cancellation.cancel();
+                },
+            )
+            .map_err(|()| anyhow::anyhow!("MCP worker startup admission closed"))?;
         Ok(Arc::new(Self {
             scope,
             config,

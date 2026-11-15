@@ -187,3 +187,41 @@ async fn explicit_private_shutdown_stops_its_watcher_even_with_retained_client_b
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn closed_auth_worker_admission_refuses_before_initial_notification() -> Result<()> {
+    let workers = crate::McpWorkerOwner::default();
+    let (notifications, mut received) = mpsc::channel(8);
+    let client = Arc::new(
+        RmcpClient::new_in_process_client(Arc::new(NotificationServer(notifications))).await?,
+    );
+    client
+        .initialize(
+            InitializeRequestParams::new(
+                ClientCapabilities::default(),
+                Implementation::new("test", "1"),
+            ),
+            Some(SEND_TIMEOUT),
+            Box::new(|_, _| async { anyhow::bail!("unexpected elicitation") }.boxed()),
+        )
+        .await?;
+    let (changes, receiver) = watch::channel(AuthChangeState::default());
+    let mut capabilities = ServerCapabilities::default();
+    capabilities.experimental = Some([(CAPABILITY.to_owned(), json!({}))].into());
+    workers.close_startup_admission();
+    assert!(
+        start(&workers, Arc::clone(&client), &capabilities, Some(receiver))
+            .await
+            .is_err()
+    );
+    timeout(SEND_TIMEOUT, changes.closed()).await?;
+    assert!(matches!(
+        received.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    let report = workers.observe_until(tokio::time::Instant::now()).await;
+    assert_eq!(report.registered_at_end, 0);
+    assert_eq!(report.refused_at_end, 1);
+    client.shutdown().await;
+    Ok(())
+}

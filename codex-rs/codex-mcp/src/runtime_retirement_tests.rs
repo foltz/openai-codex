@@ -361,3 +361,82 @@ async fn closed_generation_skips_synchronous_preparation_effects() {
             .are_connections_released()
     );
 }
+
+#[tokio::test]
+async fn runtime_closes_registered_worker_gates_before_cancelling_any_connection() {
+    let root = McpRuntimeRetirement::default();
+    let workers = crate::McpWorkerOwner::default();
+    root.register_workers(workers.clone());
+    root.register_workers(workers.clone());
+    assert_eq!(root.state.lock().unwrap().workers.len(), 1);
+    let cancelled = CancellationToken::new();
+    root.register_connection(Default::default(), None, cancelled.clone())
+        .unwrap();
+    let observer_workers = workers.clone();
+    let observer = tokio::spawn(async move {
+        cancelled.cancelled().await;
+        let completion = observer_workers.spawn(
+            &tokio::runtime::Handle::current(),
+            crate::McpWorkerKind::Reconnect,
+            async {
+                panic!("closed reconnect body");
+            },
+        );
+        assert!(matches!(
+            completion.await,
+            crate::worker_joins::WorkerExit::NotAdmitted
+        ));
+    });
+    root.close_registration();
+    observer.await.unwrap();
+    let after = crate::McpWorkerOwner::default();
+    root.register_workers(after.clone());
+    assert!(
+        after
+            .observe_until(Instant::now())
+            .await
+            .startup_admission_closed
+    );
+    let report = workers.observe_until(Instant::now()).await;
+    assert!(report.startup_admission_closed);
+    assert_eq!(report.registered_at_end, 0);
+    assert_eq!(report.refused_at_end, 1);
+}
+
+#[tokio::test]
+async fn closing_session_worker_admission_does_not_close_shared_process_owner() {
+    let context = crate::connection_pool::tests::context();
+    let session = context.workers.clone();
+    let root = context.retirement.clone().unwrap();
+    let pool = crate::McpConnectionPool::default();
+    let pooled = context.for_pooled_connection(&pool);
+    root.close_registration();
+    assert!(
+        session
+            .observe_until(Instant::now())
+            .await
+            .startup_admission_closed
+    );
+    assert!(
+        !pooled
+            .workers
+            .observe_until(Instant::now())
+            .await
+            .startup_admission_closed
+    );
+    let actual = pooled.workers.spawn(
+        &tokio::runtime::Handle::current(),
+        crate::McpWorkerKind::AuthNotification,
+        async {},
+    );
+    assert!(matches!(
+        actual.await,
+        crate::worker_joins::WorkerExit::Joined
+    ));
+    assert_eq!(
+        pool.observe_background_workers_until(Instant::now())
+            .await
+            .registered_at_end,
+        1
+    );
+}

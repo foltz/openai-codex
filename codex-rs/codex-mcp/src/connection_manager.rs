@@ -351,11 +351,13 @@ pub(crate) struct McpConnectionSet {
 
 impl McpConnectionSet {
     pub(crate) fn with_retirement_owner(mut self, retirement: crate::McpRuntimeRetirement) -> Self {
+        retirement.register_workers(self.workers.clone());
         self.retirement = retirement;
         self
     }
 
     pub(crate) fn with_worker_owner(mut self, workers: crate::McpWorkerOwner) -> Self {
+        self.retirement.register_workers(workers.clone());
         self.workers = workers;
         self
     }
@@ -396,6 +398,7 @@ impl McpConnectionSet {
         } = input;
         let retirement = runtime_context.retirement.clone().unwrap_or_default();
         let workers = runtime_context.workers.clone();
+        retirement.register_workers(workers.clone());
         let event_pool = runtime_context.connection_pool.clone().unwrap_or_default();
         let store_mode = config.mcp_oauth_credentials_store_mode;
         let keyring_backend_kind = config.auth_keyring_backend_kind;
@@ -1166,10 +1169,13 @@ impl McpConnectionSet {
                         },
                     ));
                 }
-                let outcomes = deferred_owner
+                let Some(outcomes) = deferred_owner
                     .join_eager_batch(eager_workers)
                     .await
-                    .expect("MCP eager startup worker failed");
+                    .expect("MCP eager startup worker failed")
+                else {
+                    return;
+                };
                 if let Some(tx_event) = tx_event {
                     let mut summary = McpStartupCompleteEvent {
                         ready: reused_ready,
@@ -1213,9 +1219,12 @@ impl McpConnectionSet {
     }
 
     pub fn empty(prefix_mcp_tool_names: bool) -> Self {
+        let retirement = crate::McpRuntimeRetirement::default();
+        let workers = crate::McpWorkerOwner::default();
+        retirement.register_workers(workers.clone());
         Self {
-            retirement: crate::McpRuntimeRetirement::default(),
-            workers: crate::McpWorkerOwner::default(),
+            retirement,
+            workers,
             config: None,
             network_policy_metadata: None,
             servers: HashMap::new(),

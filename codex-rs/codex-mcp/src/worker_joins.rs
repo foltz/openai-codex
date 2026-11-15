@@ -28,6 +28,7 @@ pub enum McpWorkerKind {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum WorkerExit {
+    NotAdmitted,
     Joined,
     Panicked,
     Cancelled { stop_requested: bool },
@@ -62,6 +63,7 @@ impl McpWorkerCounts {
 
     fn add(&mut self, exit: WorkerExit) {
         match exit {
+            WorkerExit::NotAdmitted => unreachable!("refusal is never an original worker join"),
             WorkerExit::Joined => self.joined += 1,
             WorkerExit::Panicked => self.panicked += 1,
             WorkerExit::Cancelled { stop_requested } => {
@@ -76,6 +78,9 @@ impl McpWorkerCounts {
 /// A positive join is never substituted for a lower physical-retirement report.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct McpWorkerSnapshot {
+    pub startup_admission_closed: bool,
+    pub refused_at_start: u64,
+    pub refused_at_end: u64,
     pub registered_at_start: u64,
     pub registered_at_end: u64,
     pub counts: Vec<McpWorkerCounts>,
@@ -83,6 +88,8 @@ pub struct McpWorkerSnapshot {
 }
 
 struct State {
+    startup_closed: bool,
+    refused: u64,
     registered: u64,
     completed: Vec<McpWorkerCounts>,
     pending: Vec<(McpWorkerKind, Completion)>,
@@ -91,6 +98,8 @@ struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
+            startup_closed: false,
+            refused: 0,
             registered: 0,
             completed: [
                 McpWorkerKind::StartupSummary,
@@ -125,7 +134,25 @@ fn index(kind: McpWorkerKind) -> usize {
     }
 }
 
+impl McpWorkerKind {
+    fn is_cleanup(self) -> bool {
+        matches!(
+            self,
+            Self::DiscoveryCleanup | Self::ConnectionShutdown | Self::RuntimeShutdown
+        )
+    }
+}
+
 impl State {
+    fn admit(&mut self, kind: McpWorkerKind, poisoned: bool) -> bool {
+        if !kind.is_cleanup() && (self.startup_closed || poisoned) {
+            self.refused += 1;
+            false
+        } else {
+            true
+        }
+    }
+
     fn compact(&mut self, poll: bool) {
         let completed = &mut self.completed;
         // Only Tokio JoinHandles are polled, never an undriven worker body.
@@ -196,6 +223,17 @@ impl Drop for EagerAbortGroup {
 }
 
 impl McpWorkerOwner {
+    pub fn close_startup_admission(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .startup_closed = true;
+    }
+
+    pub(crate) fn same_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+
     /// Like the previous JoinSet batch, failure or caller cancellation aborts
     /// siblings. Every child's original join stays observable after that abort.
     /// Payloads travel through a separate channel: the ledger must not become
@@ -203,19 +241,23 @@ impl McpWorkerOwner {
     pub(crate) async fn join_eager_batch<T: Send + 'static>(
         &self,
         bodies: impl IntoIterator<Item = impl Future<Output = T> + Send + 'static>,
-    ) -> Result<Vec<T>, String> {
+    ) -> Result<Option<Vec<T>>, String> {
         use futures::StreamExt;
         let mut aborts = EagerAbortGroup(Vec::new());
         let mut pending = futures::stream::FuturesUnordered::new();
         for body in bodies {
             let (send, receive) = tokio::sync::oneshot::channel();
-            let (completion, abort) = self.spawn_tracked(
+            let Ok((completion, abort)) = self.try_spawn_tracked(
                 &Handle::current(),
                 McpWorkerKind::EagerStartup,
                 async move {
                     let _ = send.send(body.await);
                 },
-            );
+            ) else {
+                // Refusal drops all remaining bodies and requests abort on
+                // already-born siblings; every original join remains retained.
+                return Ok(None);
+            };
             aborts.0.push(abort);
             pending.push(async move {
                 let value = receive.await;
@@ -232,7 +274,7 @@ impl McpWorkerOwner {
             outputs.push(result?);
         }
         aborts.0.clear();
-        Ok(outputs)
+        Ok(Some(outputs))
     }
 
     pub(crate) fn spawn_result<T: Clone + Send + Sync + 'static>(
@@ -245,6 +287,11 @@ impl McpWorkerOwner {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.admit(kind, self.state.is_poisoned()) {
+            return futures::future::ready(Err("MCP worker startup admission closed".to_owned()))
+                .boxed()
+                .shared();
+        }
         state.compact(true);
         let handle = runtime.spawn(body);
         let result = async move {
@@ -286,7 +333,21 @@ impl McpWorkerOwner {
         kind: McpWorkerKind,
         body: impl Future<Output = ()> + Send + 'static,
     ) -> Completion {
-        self.spawn_tracked(runtime, kind, body).0
+        self.try_spawn(runtime, kind, body).unwrap_or_else(|()| {
+            futures::future::ready(WorkerExit::NotAdmitted)
+                .boxed()
+                .shared()
+        })
+    }
+
+    pub(crate) fn try_spawn(
+        &self,
+        runtime: &Handle,
+        kind: McpWorkerKind,
+        body: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<Completion, ()> {
+        self.try_spawn_tracked(runtime, kind, body)
+            .map(|(completion, _)| completion)
     }
 
     pub(crate) fn spawn_abort_on_drop(
@@ -294,21 +355,24 @@ impl McpWorkerOwner {
         runtime: &Handle,
         kind: McpWorkerKind,
         body: impl Future<Output = ()> + Send + 'static,
-    ) -> McpAbortOnDrop {
-        let (_, abort) = self.spawn_tracked(runtime, kind, body);
-        McpAbortOnDrop { abort }
+    ) -> Result<McpAbortOnDrop, ()> {
+        self.try_spawn_tracked(runtime, kind, body)
+            .map(|(_, abort)| McpAbortOnDrop { abort })
     }
 
-    fn spawn_tracked(
+    fn try_spawn_tracked(
         &self,
         runtime: &Handle,
         kind: McpWorkerKind,
         body: impl Future<Output = ()> + Send + 'static,
-    ) -> (Completion, TrackedAbort) {
+    ) -> Result<(Completion, TrackedAbort), ()> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.admit(kind, self.state.is_poisoned()) {
+            return Err(());
+        }
         state.compact(true);
         let handle = runtime.spawn(body);
         let requested = Arc::new(AtomicBool::new(false));
@@ -329,11 +393,11 @@ impl McpWorkerOwner {
         .shared();
         state.registered += 1;
         state.pending.push((kind, completion.clone()));
-        (completion, abort)
+        Ok((completion, abort))
     }
 
     pub async fn observe_until(&self, deadline: Instant) -> McpWorkerSnapshot {
-        let (registered_at_start, mut counts, pending) = {
+        let (registered_at_start, refused_at_start, mut counts, pending) = {
             let mut state = self
                 .state
                 .lock()
@@ -341,6 +405,7 @@ impl McpWorkerOwner {
             state.compact(false);
             (
                 state.registered,
+                state.refused,
                 state.completed.clone(),
                 state.pending.clone(),
             )
@@ -365,6 +430,9 @@ impl McpWorkerOwner {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.compact(false);
         McpWorkerSnapshot {
+            startup_admission_closed: state.startup_closed,
+            refused_at_start,
+            refused_at_end: state.refused,
             registered_at_start,
             registered_at_end: state.registered,
             counts,

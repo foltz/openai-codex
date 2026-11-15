@@ -295,6 +295,7 @@ impl McpRuntime {
         retirement: crate::McpRuntimeRetirement,
     ) -> Self {
         let workers = crate::McpWorkerOwner::default();
+        retirement.register_workers(workers.clone());
         Self {
             retirement: retirement.clone(),
             workers: workers.clone(),
@@ -1170,9 +1171,12 @@ impl McpRuntimeContext {
             RouteAwareHttpClient::new(environment_manager.http_client_factory().clone())
                 .with_tls_backend_fallback(),
         );
+        let retirement = crate::McpRuntimeRetirement::default();
+        let workers = crate::McpWorkerOwner::default();
+        retirement.register_workers(workers.clone());
         Self {
-            retirement: Some(crate::McpRuntimeRetirement::default()),
-            workers: crate::McpWorkerOwner::default(),
+            retirement: Some(retirement),
+            workers,
             connection_pool: None,
             environment_manager,
             environment_selections: Arc::default(),

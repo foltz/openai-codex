@@ -30,20 +30,30 @@ pub(crate) async fn start(
         return Ok(None);
     };
 
-    notify(&client, &mut changes).await?;
-    let task = workers.spawn_abort_on_drop(
-        &tokio::runtime::Handle::current(),
-        crate::McpWorkerKind::AuthNotification,
-        async move {
-            while changes.changed().await.is_ok() {
-                if notify(&client, &mut changes).await.is_err() {
-                    tracing::warn!("MCP auth invalidation delivery failed; closing connection");
-                    client.shutdown().await;
-                    break;
+    let (send_initial, initial) = tokio::sync::oneshot::channel();
+    let task = workers
+        .spawn_abort_on_drop(
+            &tokio::runtime::Handle::current(),
+            crate::McpWorkerKind::AuthNotification,
+            async move {
+                let result = notify(&client, &mut changes).await;
+                let succeeded = result.is_ok();
+                if send_initial.send(result).is_err() || !succeeded {
+                    return;
                 }
-            }
-        },
-    );
+                while changes.changed().await.is_ok() {
+                    if notify(&client, &mut changes).await.is_err() {
+                        tracing::warn!("MCP auth invalidation delivery failed; closing connection");
+                        client.shutdown().await;
+                        break;
+                    }
+                }
+            },
+        )
+        .map_err(|()| anyhow::anyhow!("MCP worker startup admission closed"))?;
+    initial
+        .await
+        .map_err(|_| anyhow::anyhow!("MCP auth initial notification worker stopped"))??;
     Ok(Some(Arc::new(task)))
 }
 

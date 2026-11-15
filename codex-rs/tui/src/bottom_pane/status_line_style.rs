@@ -6,6 +6,8 @@ use ratatui::style::Styled;
 use ratatui::text::Span;
 
 use super::status_line_setup::StatusLineItem;
+use super::status_line_template::RenderedStatusLineSegment;
+use super::status_line_template::StatusLineDisplayClass;
 use crate::render::highlight::foreground_style_for_scopes;
 use crate::style::readable_color_on;
 use crate::style::secondary_text_style;
@@ -41,6 +43,8 @@ pub(crate) enum StatusLineAccent {
     Thread,
     #[serde(rename = "status-progress")]
     Progress,
+    #[serde(rename = "status-template")]
+    Template,
 }
 
 impl StatusLineAccent {
@@ -80,6 +84,13 @@ impl StatusLineAccent {
         }
     }
 
+    fn for_display_class(display_class: StatusLineDisplayClass) -> Self {
+        match display_class {
+            StatusLineDisplayClass::BuiltIn(item) => Self::for_item(item),
+            StatusLineDisplayClass::Template => Self::Template,
+        }
+    }
+
     pub(crate) fn scopes(self) -> &'static [&'static str] {
         match self {
             Self::Model => &["entity.name.type", "support.type", "variable"],
@@ -92,12 +103,13 @@ impl StatusLineAccent {
             Self::Mode => &["storage.modifier", "keyword.operator"],
             Self::Thread => &["markup.heading", "entity.name.section"],
             Self::Progress => &["markup.inserted", "constant.numeric"],
+            Self::Template => &["comment", "constant.other"],
         }
     }
 
     pub(crate) fn fallback_color(self) -> Color {
         match self {
-            Self::Model | Self::State | Self::Metadata | Self::Mode => Color::Cyan,
+            Self::Model | Self::State | Self::Metadata | Self::Mode | Self::Template => Color::Cyan,
             Self::Path | Self::Usage | Self::Progress => Color::Green,
             Self::Branch | Self::Limit | Self::Thread => Color::Magenta,
         }
@@ -111,7 +123,8 @@ pub(crate) fn status_line_from_segments<I>(
     pull_request_url: Option<&str>,
 ) -> Option<HyperlinkLine>
 where
-    I: IntoIterator<Item = (StatusLineItem, String)>,
+    I: IntoIterator,
+    I::Item: Into<RenderedStatusLineSegment>,
 {
     status_line_from_segments_with_resolver(
         segments,
@@ -130,27 +143,31 @@ fn status_line_from_segments_with_resolver<I, F>(
     theme_style_for_accent: F,
 ) -> Option<HyperlinkLine>
 where
-    I: IntoIterator<Item = (StatusLineItem, String)>,
+    I: IntoIterator,
+    I::Item: Into<RenderedStatusLineSegment>,
     F: Fn(StatusLineAccent) -> Option<Style>,
 {
     let mut line = HyperlinkLine::default();
-    for (item, mut text) in segments {
-        // Paragraph skips control characters, so they must not enter this single row's link offsets.
-        text.retain(|ch| !ch.is_control());
+    for segment in segments {
+        let mut segment = segment.into();
+        // Keep control characters out of the rendered row and hyperlink offsets.
+        segment.text.retain(|ch| !ch.is_control());
         if !line.line.spans.is_empty() {
             line.line
                 .push_span(STATUS_LINE_SEPARATOR.set_style(secondary_text_style()));
         }
         let style = if use_theme_colors
             && matches!(
-                item,
-                StatusLineItem::ThreadName | StatusLineItem::ThreadTitle
+                segment.display_class,
+                StatusLineDisplayClass::BuiltIn(
+                    StatusLineItem::ThreadName | StatusLineItem::ThreadTitle
+                )
             )
             && let Some(thread_id) = thread_id
         {
             Style::default().fg(thread_color(thread_id))
         } else if use_theme_colors {
-            let accent = StatusLineAccent::for_item(item);
+            let accent = StatusLineAccent::for_display_class(segment.display_class);
             soften_status_line_style(
                 theme_style_for_accent(accent)
                     .unwrap_or_else(|| Style::default().fg(accent.fallback_color())),
@@ -163,17 +180,17 @@ where
             if effective_stdout_color_level() == StdoutColorLevel::Ansi16
                 && matches!(foreground, Color::Rgb(..) | Color::Indexed(16..))
             {
-                style.fg(StatusLineAccent::for_item(item).fallback_color())
+                style.fg(StatusLineAccent::for_display_class(segment.display_class).fallback_color())
             } else {
                 style.fg(readable_color_on(foreground, /*background*/ None))
             }
         } else {
             style
         };
-        if item == StatusLineItem::PullRequestNumber {
-            line.push_span(Span::styled(text, style.underlined()), pull_request_url);
+        if segment.display_class == StatusLineDisplayClass::BuiltIn(StatusLineItem::PullRequestNumber) {
+            line.push_span(Span::styled(segment.text, style.underlined()), pull_request_url);
         } else {
-            line.line.push_span(Span::styled(text, style));
+            line.line.push_span(Span::styled(segment.text, style));
         }
     }
 
@@ -248,6 +265,28 @@ mod tests {
     }
 
     #[test]
+    fn template_segments_preserve_builtin_hyperlinks_and_strip_controls() {
+        let line = status_line_from_segments_with_resolver(
+            [
+                RenderedStatusLineSegment {
+                    text: "KCF\n".to_string(),
+                    display_class: StatusLineDisplayClass::Template,
+                },
+                RenderedStatusLineSegment::from((StatusLineItem::PullRequestNumber, "#42".to_string())),
+            ],
+            true,
+            None,
+            Some("https://example.invalid/pull/42"),
+            |_| None,
+        ).expect("rendered footer");
+        assert_eq!(line_text(&line.line), "KCF · #42");
+        assert_eq!(line.hyperlinks.len(), 1);
+        assert_eq!(line.hyperlinks[0].columns, 6..9);
+        assert_eq!(line.hyperlinks[0].destination, "https://example.invalid/pull/42");
+        assert_eq!(line.line.spans[0].style.fg, Some(Color::Cyan));
+    }
+
+    #[test]
     fn status_line_segments_preserve_order_and_plain_text() {
         let line = status_line_from_segments_with_resolver(
             [
@@ -315,6 +354,36 @@ mod tests {
         assert_eq!(line_text(&line), "5.2 credits · ~$0.21");
         assert_eq!(line.spans[0].style, line.spans[2].style);
         assert_eq!(line.spans[1].style, secondary_text_style());
+    }
+
+    #[test]
+    fn template_segments_use_metadata_accent_and_preserve_mixed_order() {
+        let line = status_line_from_segments_with_resolver(
+            [
+                RenderedStatusLineSegment {
+                    text: "gpt-5".to_string(),
+                    display_class: StatusLineDisplayClass::BuiltIn(StatusLineItem::ModelName),
+                },
+                RenderedStatusLineSegment {
+                    text: "(k:dev)".to_string(),
+                    display_class: StatusLineDisplayClass::Template,
+                },
+                RenderedStatusLineSegment {
+                    text: "/repo".to_string(),
+                    display_class: StatusLineDisplayClass::BuiltIn(StatusLineItem::CurrentDir),
+                },
+            ],
+            /*use_theme_colors*/ true,
+            /*thread_id*/ None,
+            |accent| match accent {
+                StatusLineAccent::Template => Some(Style::default().yellow()),
+                _ => None,
+            },
+        )
+        .expect("status line");
+
+        assert_eq!(line_text(&line), "gpt-5 · (k:dev) · /repo");
+        assert_eq!(line.spans[2].style.fg, Some(Color::Yellow));
     }
 
     #[test]

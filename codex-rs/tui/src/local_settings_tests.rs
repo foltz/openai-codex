@@ -128,6 +128,8 @@ animations = false
 show_tooltips = false
 show_server_version_notice = false
 auto_recap = false
+status_line_prefix = ["template:(k:{lane})"]
+status_line_variables = { lane = "dev" }
 fullscreen_transcript = true
 mouse_scroll_speed = 0.5
 copy_on_select = "never"

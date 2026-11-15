@@ -2223,8 +2223,8 @@ async fn token_usage_update_refreshes_status_line_with_runtime_context_window() 
     let mut app = make_test_app().await;
     app.chat_widget.setup_status_line(
         vec![
-            StatusLineItem::ContextWindowSize,
-            StatusLineItem::UsedTokens,
+            crate::bottom_pane::StatusLineConfigEntry::BuiltIn(StatusLineItem::ContextWindowSize),
+            crate::bottom_pane::StatusLineConfigEntry::BuiltIn(StatusLineItem::UsedTokens),
         ],
         /*use_theme_colors*/ true,
     );

@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::bottom_pane::footer_content::FooterContent;
+use crate::bottom_pane::StatusLineConfigEntry;
 use crate::status::thread_cost_micros;
 
 impl ChatWidget {
@@ -121,11 +122,11 @@ impl ChatWidget {
     /// Applies status-line item selection from the setup view to in-memory config.
     ///
     /// An empty selection persists as an explicit empty list.
-    pub(crate) fn setup_status_line(&mut self, items: Vec<StatusLineItem>, use_theme_colors: bool) {
+    pub(crate) fn setup_status_line(&mut self, items: Vec<StatusLineConfigEntry>, use_theme_colors: bool) {
         tracing::info!(
             "status line setup confirmed with items: {items:#?}, use_theme_colors: {use_theme_colors}"
         );
-        let ids = items.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let ids = items.iter().map(StatusLineConfigEntry::raw_config).collect::<Vec<_>>();
         self.config_panel_tui.status_line = Some(ids.clone());
         self.config_panel_tui.status_line_use_colors = use_theme_colors;
         self.local_settings.tui.status_line = Some(ids);
@@ -337,10 +338,15 @@ impl ChatWidget {
 
     pub(super) fn open_status_line_setup(&mut self) {
         let configured_status_line_items = self.configured_status_line_items();
-        let view = StatusLineSetupView::new(
+        let status_line_prefix = self.local_settings.tui.status_line_prefix.clone();
+        let status_line_variables = self.local_settings.tui.status_line_variables.clone();
+        let preview_data = self.status_surface_preview_data();
+        let view = StatusLineSetupView::new_with_templates(
             Some(configured_status_line_items.as_slice()),
+            &status_line_prefix,
+            &status_line_variables,
             self.local_settings.tui.status_line_use_colors,
-            self.status_surface_preview_data(),
+            preview_data,
             self.app_event_tx.clone(),
             self.bottom_pane.list_keymap(),
         );

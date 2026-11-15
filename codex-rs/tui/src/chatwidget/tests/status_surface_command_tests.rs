@@ -194,7 +194,7 @@ async fn session_status_surface_overrides_follow_thread_state_and_editor_saves()
 
     restored.setup_terminal_title(vec![TerminalTitleItem::Project]);
     restored.setup_status_line(
-        vec![StatusLineItem::ModelName],
+        vec![crate::bottom_pane::StatusLineConfigEntry::BuiltIn(StatusLineItem::ModelName)],
         /*use_theme_colors*/ true,
     );
     assert_eq!(

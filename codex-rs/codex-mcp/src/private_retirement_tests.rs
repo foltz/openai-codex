@@ -474,3 +474,55 @@ async fn private_internal_budget_stays_latched_but_explicit_retry_can_drain() {
     assert_eq!(report.tasks, vec![(0, PrivateTaskOutcome::Complete)]);
     assert!(report.is_complete());
 }
+
+#[tokio::test]
+async fn private_adapter_refuses_foreign_owner_without_closing_its_transport() {
+    use tokio::io::AsyncReadExt;
+    let control = PrivateClientRetirement::default();
+    let (stream, mut peer) = tokio::io::duplex(64);
+    let release = Arc::new(Semaphore::new(1));
+    let factory = Arc::new(PausedConnectionFactory {
+        entered: Arc::new(Semaphore::new(0)),
+        release,
+        stream: Arc::new(Mutex::new(Some(stream))),
+    });
+    let foreign = codex_rmcp_client::RmcpClient::new_in_process_client_in_retirement(
+        factory,
+        RmcpClientRetirement::default(),
+    )
+    .await
+    .unwrap();
+    let client = crate::connection_manager::tests::create_test_managed_client_for_transport(
+        Vec::new(),
+        foreign,
+    );
+    let held = Arc::clone(&client.client);
+    let startup = control.track_startup(CancellationToken::new(), |_| {
+        futures::future::ready(Ok(client)).boxed().shared()
+    });
+    let result = startup.await;
+    assert!(
+        matches!(result, Err(ref error) if error.to_string().contains("retained retirement owner"))
+    );
+    let report = control
+        .shutdown_until(Instant::now() + Duration::from_secs(1))
+        .await;
+    assert_eq!(report.foreign_connections, vec![0]);
+    assert!(!report.is_complete());
+    assert!(!control.is_retired());
+    assert!(!held.is_closed().await);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), peer.read(&mut [0]))
+            .await
+            .is_err(),
+        "foreign pending transport must stay open until its actual owner closes it"
+    );
+    held.shutdown().await;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), peer.read(&mut [0]))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+}

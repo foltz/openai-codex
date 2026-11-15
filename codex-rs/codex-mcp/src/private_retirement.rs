@@ -28,13 +28,16 @@ pub enum PrivateTaskOutcome {
 pub struct PrivateTerminationReport {
     pub connections: Vec<(usize, PhysicalRetirementReport)>,
     pub tasks: Vec<(usize, PrivateTaskOutcome)>,
+    pub foreign_connections: Vec<usize>,
 }
 
 impl PrivateTerminationReport {
     pub fn is_complete(&self) -> bool {
-        self.connections
-            .iter()
-            .all(|(_, report)| report.is_complete())
+        self.foreign_connections.is_empty()
+            && self
+                .connections
+                .iter()
+                .all(|(_, report)| report.is_complete())
             && self.tasks.iter().all(|(_, result)| {
                 matches!(
                     result,
@@ -69,6 +72,8 @@ struct RegistryState {
     internal_deadline: Option<Instant>,
     connections: Vec<Arc<ConnectionRetirementOwner>>,
     tasks: Vec<TaskOwner>,
+    // Retain unexpected custody, but never claim authority to close it.
+    foreign: Vec<(usize, RmcpClientRetirement)>,
     terminal: Option<PrivateTerminationReport>,
 }
 
@@ -103,7 +108,17 @@ impl PrivateClientRetirement {
         let Ok(owner) = self.registry.register_connection(cancellation) else {
             return refused();
         };
-        let startup = factory(owner.lower());
+        let binding = Arc::clone(&owner);
+        let startup = factory(owner.lower()).then(move |result| async move {
+            if let Ok(client) = &result
+                && !binding.accepts(&client.client)
+            {
+                return Err(StartupOutcomeError::from(anyhow::anyhow!(
+                    "private MCP factory returned a client outside its retained retirement owner"
+                )));
+            }
+            result
+        }).boxed().shared();
         let observed = startup.clone();
         let Ok(completion) = owner.task_ticket().register(move || async move {
             // Settled work is separate from positive lower physical proof.
@@ -179,6 +194,24 @@ pub(crate) struct PrivateTaskTicket {
 }
 
 impl ConnectionRetirementOwner {
+    fn accepts(&self, client: &codex_rmcp_client::RmcpClient) -> bool {
+        let lower = client.retirement();
+        if self.lower.downgrade().same_registry(&lower.downgrade()) {
+            return true;
+        }
+        if let Some(registry) = self.registry.upgrade() {
+            let mut state = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !state.foreign.iter().any(|(id, observed)| {
+                *id == self.id && observed.downgrade().same_registry(&lower.downgrade())
+            }) {
+                state.foreign.push((self.id, lower));
+            }
+        }
+        false
+    }
+
     pub(crate) fn id(&self) -> usize {
         self.id
     }
@@ -302,9 +335,20 @@ impl PrivateRetirementRegistry {
         if self.state.is_poisoned() {
             tasks.push((tasks.len(), PrivateTaskOutcome::Failed));
         }
+        let mut foreign_connections: Vec<_> = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .foreign
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        foreign_connections.sort_unstable();
+        foreign_connections.dedup();
         let report = PrivateTerminationReport {
             connections: reports,
             tasks,
+            foreign_connections,
         };
         if report.is_complete() {
             let retired = {
@@ -327,7 +371,7 @@ impl PrivateRetirementRegistry {
 impl PrivateTaskTicket {
     /// Retains the original completion before first poll. Poll returned clones
     /// to drive normal startup. Factories must not capture a strong registry or
-    /// connection owner: that would create a registry/future ownership cycle.
+    /// registry: that would create a registry/future ownership cycle.
     pub(crate) fn register<F, Fut>(
         &self,
         factory: F,

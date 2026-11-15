@@ -110,12 +110,18 @@ impl PrivateClientRetirement {
         };
         let binding = Arc::clone(&owner);
         let startup = factory(owner.lower()).then(move |result| async move {
-            if let Ok(client) = &result
-                && !binding.accepts(&client.client)
-            {
-                return Err(StartupOutcomeError::from(anyhow::anyhow!(
-                    "private MCP factory returned a client outside its retained retirement owner"
-                )));
+            if let Ok(client) = &result {
+                if !binding.accepts(&client.client) {
+                    return Err(StartupOutcomeError::from(anyhow::anyhow!(
+                        "private MCP factory returned a client outside its retained retirement owner"
+                    )));
+                }
+                if matches!(client.connection_sharing,
+                    crate::connection_pool::ConnectionSharing::Private |
+                    crate::connection_pool::ConnectionSharing::Negotiated)
+                    && let Some(watcher) = &client._auth_change_notifications {
+                    binding.bind_auth_stop(watcher);
+                }
             }
             result
         }).boxed().shared();
@@ -189,6 +195,7 @@ pub(crate) struct ConnectionRetirementOwner {
     lower: RmcpClientRetirement,
     cancellation: CancellationToken,
     registry: Weak<Mutex<RegistryState>>,
+    auth_stop: Mutex<Option<Weak<crate::worker_joins::McpAbortOnDrop>>>,
 }
 
 /// Tasks capture this weak ticket, not their strong containing runtime owner.
@@ -198,6 +205,36 @@ pub(crate) struct PrivateTaskTicket {
 }
 
 impl ConnectionRetirementOwner {
+    fn bind_auth_stop(&self, watcher: &Arc<crate::worker_joins::McpAbortOnDrop>) {
+        let Some(registry) = self.registry.upgrade() else {
+            return;
+        };
+        let state = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *self
+            .auth_stop
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::downgrade(watcher));
+        // Same registry lock as closure: either its stop pass sees this weak
+        // authority, or a late checked binding requests the stop here.
+        if state.closed {
+            watcher.stop();
+        }
+    }
+
+    fn stop_auth_notifications(&self) {
+        let watcher = self
+            .auth_stop
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(Weak::upgrade);
+        if let Some(watcher) = watcher {
+            watcher.stop();
+        }
+    }
+
     fn accepts(&self, client: &codex_rmcp_client::RmcpClient) -> bool {
         let lower = client.retirement();
         if self.lower.downgrade().same_registry(&lower.downgrade()) {
@@ -244,6 +281,7 @@ impl PrivateRetirementRegistry {
             lower: RmcpClientRetirement::default(),
             cancellation,
             registry: Arc::downgrade(&self.state),
+            auth_stop: Mutex::new(None),
         });
         state.connections.push(Arc::clone(&owner));
         Ok(owner)
@@ -288,6 +326,7 @@ impl PrivateRetirementRegistry {
             .connections
             .clone();
         for owner in owners {
+            owner.stop_auth_notifications();
             owner.cancellation.cancel();
         }
     }

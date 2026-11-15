@@ -180,15 +180,21 @@ where
             if effective_stdout_color_level() == StdoutColorLevel::Ansi16
                 && matches!(foreground, Color::Rgb(..) | Color::Indexed(16..))
             {
-                style.fg(StatusLineAccent::for_display_class(segment.display_class).fallback_color())
+                style
+                    .fg(StatusLineAccent::for_display_class(segment.display_class).fallback_color())
             } else {
                 style.fg(readable_color_on(foreground, /*background*/ None))
             }
         } else {
             style
         };
-        if segment.display_class == StatusLineDisplayClass::BuiltIn(StatusLineItem::PullRequestNumber) {
-            line.push_span(Span::styled(segment.text, style.underlined()), pull_request_url);
+        if segment.display_class
+            == StatusLineDisplayClass::BuiltIn(StatusLineItem::PullRequestNumber)
+        {
+            line.push_span(
+                Span::styled(segment.text, style.underlined()),
+                pull_request_url,
+            );
         } else {
             line.line.push_span(Span::styled(segment.text, style));
         }
@@ -272,17 +278,24 @@ mod tests {
                     text: "KCF\n".to_string(),
                     display_class: StatusLineDisplayClass::Template,
                 },
-                RenderedStatusLineSegment::from((StatusLineItem::PullRequestNumber, "#42".to_string())),
+                RenderedStatusLineSegment::from((
+                    StatusLineItem::PullRequestNumber,
+                    "#42".to_string(),
+                )),
             ],
             true,
             None,
             Some("https://example.invalid/pull/42"),
             |_| None,
-        ).expect("rendered footer");
+        )
+        .expect("rendered footer");
         assert_eq!(line_text(&line.line), "KCF · #42");
         assert_eq!(line.hyperlinks.len(), 1);
         assert_eq!(line.hyperlinks[0].columns, 6..9);
-        assert_eq!(line.hyperlinks[0].destination, "https://example.invalid/pull/42");
+        assert_eq!(
+            line.hyperlinks[0].destination,
+            "https://example.invalid/pull/42"
+        );
         assert_eq!(line.line.spans[0].style.fg, Some(Color::Cyan));
     }
 
@@ -375,12 +388,14 @@ mod tests {
             ],
             /*use_theme_colors*/ true,
             /*thread_id*/ None,
+            /*pull_request_url*/ None,
             |accent| match accent {
                 StatusLineAccent::Template => Some(Style::default().yellow()),
                 _ => None,
             },
         )
-        .expect("status line");
+        .expect("status line")
+        .line;
 
         assert_eq!(line_text(&line), "gpt-5 · (k:dev) · /repo");
         assert_eq!(line.spans[2].style.fg, Some(Color::Yellow));

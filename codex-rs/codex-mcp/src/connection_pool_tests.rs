@@ -1760,10 +1760,11 @@ async fn nonfinal_connection_without_remote_lease_has_explicit_logical_receipt()
         TestServer::default(),
     );
     let first_slot = Arc::new(ConnectionSlot::default());
+    let shared_key = key(&context(), &config());
     let first = pool
         .connect(
             Arc::clone(&first_slot),
-            key(&context(), &config()),
+            shared_key.clone(),
             Arc::default(),
             None,
             CancellationToken::new(),
@@ -1774,7 +1775,7 @@ async fn nonfinal_connection_without_remote_lease_has_explicit_logical_receipt()
     let other = pool
         .connect(
             Arc::default(),
-            key(&context(), &config()),
+            shared_key,
             Arc::default(),
             None,
             CancellationToken::new(),
@@ -1782,6 +1783,10 @@ async fn nonfinal_connection_without_remote_lease_has_explicit_logical_receipt()
         )
         .await
         .unwrap();
+    assert!(
+        Arc::ptr_eq(&first.client, &other.client),
+        "fixture must hold the same actual transport twice"
+    );
     let ConnectionSharing::Shared(lease) = &first.connection_sharing else {
         panic!("shared lease");
     };

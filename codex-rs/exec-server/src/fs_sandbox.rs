@@ -1,8 +1,11 @@
+use std::cell::Cell;
 use std::collections::HashMap;
-#[cfg(any(windows, test))]
+use std::future::Future;
 use std::time::Duration;
 
 use codex_exec_server_protocol::JSONRPCErrorError;
+use codex_file_system::SandboxLaunch;
+use codex_file_system::merge_optional_sandbox_cleanup;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
@@ -10,6 +13,9 @@ use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_sandboxing::SandboxCleanupCustody;
+use codex_sandboxing::SandboxCleanupState;
+use codex_sandboxing::SandboxCleanupSummary;
 use codex_sandboxing::SandboxCommand;
 use codex_sandboxing::SandboxDirectSpawnTransformRequest;
 use codex_sandboxing::SandboxExecRequest;
@@ -45,7 +51,8 @@ use crate::rpc::internal_error;
 use crate::rpc::invalid_request;
 
 const FS_HELPER_ENV_ALLOWLIST: &[&str] = &["PATH", "TMPDIR", "TMP", "TEMP"];
-#[cfg(any(windows, test))]
+/// Bounds a helper's exit after its response, and its sandbox launcher's
+/// cleanup once the executor retires the helper launch.
 const FS_HELPER_EXIT_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 2);
 #[cfg(any(windows, test))]
 const MAX_FS_HELPER_STDERR_BYTES: u64 = 4096;
@@ -58,6 +65,104 @@ const FS_HELPER_BAZEL_BWRAP_ENV_ALLOWLIST: &[&str] = &[
     "TEST_SRCDIR",
     "TEST_WORKSPACE",
 ];
+
+/// Receipt state of one filesystem request: the merged cleanup summary and
+/// whether any Linux sandbox launch was made.
+#[derive(Clone, Copy, Default)]
+struct FsHelperReceipt {
+    sandbox_cleanup: Option<SandboxCleanupSummary>,
+    launched: usize,
+    collected: usize,
+}
+
+tokio::task_local! {
+    /// Merged cleanup receipt of the helper launches made while serving one
+    /// filesystem request. `ExecutorFileSystem` results cannot carry it, so the
+    /// helper owner records it here for the RPC layer that builds the response.
+    static FS_HELPER_CLEANUP_RECEIPT: Cell<FsHelperReceipt>;
+}
+
+/// Runs one filesystem request and returns, next to its output, the merged
+/// cleanup summary of every sandboxed helper launch it made and the launch
+/// evidence. Every Linux sandbox launch of this filesystem layer goes through
+/// [`spawn_command`], which registers it, so a request that registered none
+/// positively launched nothing (`SandboxLaunch::NotLaunched`).
+pub(crate) async fn with_fs_helper_cleanup_receipt<F: Future>(
+    operation: F,
+) -> (F::Output, Option<SandboxCleanupSummary>, SandboxLaunch) {
+    FS_HELPER_CLEANUP_RECEIPT
+        .scope(Cell::new(FsHelperReceipt::default()), async move {
+            let output = operation.await;
+            let receipt = FS_HELPER_CLEANUP_RECEIPT.with(Cell::get);
+            let launch = if receipt.launched != 0 {
+                SandboxLaunch::Launched
+            } else {
+                SandboxLaunch::NotLaunched
+            };
+            // A failed spawn or cancelled collection still owes its own receipt.
+            let cleanup = if receipt.launched == receipt.collected {
+                receipt.sandbox_cleanup
+            } else {
+                None
+            };
+            (output, cleanup, launch)
+        })
+        .await
+}
+
+/// Registers a Linux sandbox launch with the current request, if a request
+/// is collecting receipts.
+fn record_fs_helper_launch() {
+    let _ = FS_HELPER_CLEANUP_RECEIPT.try_with(|receipt| {
+        let current = receipt.get();
+        receipt.set(FsHelperReceipt {
+            launched: current
+                .launched
+                .checked_add(1)
+                .expect("filesystem launch count overflow"),
+            ..current
+        });
+    });
+}
+
+/// Adds one helper launch's summary to the current request's receipt, if a
+/// request is collecting one.
+fn record_fs_helper_cleanup(summary: SandboxCleanupSummary) {
+    let _ = FS_HELPER_CLEANUP_RECEIPT.try_with(|receipt| {
+        let current = receipt.get();
+        receipt.set(FsHelperReceipt {
+            sandbox_cleanup: merge_optional_sandbox_cleanup(current.sandbox_cleanup, Some(summary)),
+            collected: current
+                .collected
+                .checked_add(1)
+                .expect("filesystem receipt count overflow"),
+            ..current
+        });
+    });
+}
+
+/// The executor's custody of one filesystem helper's sandbox launch. A helper
+/// has no original retirement deadline: it is retired when it exits.
+#[must_use = "collect the helper's sandbox cleanup after the helper exits"]
+pub(crate) struct FsHelperSandboxCleanup(Option<SandboxCleanupCustody>);
+
+impl FsHelperSandboxCleanup {
+    /// Retires the launch once the helper has exited (or was killed): the
+    /// launcher gets [`FS_HELPER_EXIT_TIMEOUT`] to clean up, and its report is
+    /// collected off the async runtime.
+    pub(crate) async fn collect(self) -> Option<SandboxCleanupSummary> {
+        let custody = self.0?;
+        custody.tighten(std::time::Instant::now() + FS_HELPER_EXIT_TIMEOUT);
+        let sandbox_cleanup = custody.collect(FS_HELPER_EXIT_TIMEOUT).await;
+        if sandbox_cleanup.state == SandboxCleanupState::Complete {
+            tracing::debug!(sandbox_cleanup = ?sandbox_cleanup, "fs sandbox helper cleanup");
+        } else {
+            tracing::warn!(sandbox_cleanup = ?sandbox_cleanup, "fs sandbox helper cleanup");
+        }
+        record_fs_helper_cleanup(sandbox_cleanup);
+        Some(sandbox_cleanup)
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 struct SandboxCwd {
@@ -386,12 +491,30 @@ fn bazel_bwrap_env_key_is_allowed(_key: &str) -> bool {
     false
 }
 
-#[tracing::instrument(name = "fs.sandbox_execute", skip_all)]
+#[tracing::instrument(
+    name = "fs.sandbox_execute",
+    skip_all,
+    fields(sandbox_cleanup = tracing::field::Empty)
+)]
 async fn run_command(
     command: SandboxExecRequest,
     request_json: Vec<u8>,
 ) -> Result<FsHelperPayload, JSONRPCErrorError> {
-    let mut child = spawn_command(command, ChildStdin::Piped)?;
+    let (child, sandbox_cleanup) = spawn_command(command, ChildStdin::Piped)?;
+    // The exchange consumes the helper (reaped, or killed on drop) before the
+    // launch is retired and its cleanup collected.
+    let result = exchange_with_helper(child, request_json).await;
+    let sandbox_cleanup = sandbox_cleanup.collect().await;
+    if let Some(sandbox_cleanup) = &sandbox_cleanup {
+        tracing::Span::current().record("sandbox_cleanup", tracing::field::debug(sandbox_cleanup));
+    }
+    result
+}
+
+async fn exchange_with_helper(
+    mut child: Child,
+    request_json: Vec<u8>,
+) -> Result<FsHelperPayload, JSONRPCErrorError> {
     let mut stdin = child
         .stdin
         .take()
@@ -514,16 +637,34 @@ pub(crate) async fn wait_for_helper_output(
     Ok(output)
 }
 
+/// Spawns a filesystem helper and takes the executor's custody of its
+/// sandbox launch. The caller collects the cleanup after the helper exits.
 pub(crate) fn spawn_command(
     SandboxExecRequest {
-        command: argv,
+        command: mut argv,
         cwd,
         mut env,
         arg0,
+        sandbox,
         ..
     }: SandboxExecRequest,
     stdin: ChildStdin,
-) -> Result<Child, JSONRPCErrorError> {
+) -> Result<(Child, FsHelperSandboxCleanup), JSONRPCErrorError> {
+    if argv.is_empty() {
+        return Err(invalid_request("fs sandbox command was empty".to_string()));
+    }
+    // No original deadline: the helper launch is retired when the helper exits.
+    let mut custody = SandboxCleanupCustody::for_launch(
+        sandbox, /*cleanup_deadline*/ None, /*scope*/ None,
+    )
+    .map_err(io_error)?;
+    if let Some(custody) = &custody {
+        custody
+            .attach_to_launcher_argv(&mut argv)
+            .map_err(io_error)?;
+        // From here on the request owes a receipt, even if the spawn fails.
+        record_fs_helper_launch();
+    }
     let Some((program, args)) = argv.split_first() else {
         return Err(invalid_request("fs sandbox command was empty".to_string()));
     };
@@ -546,7 +687,18 @@ pub(crate) fn spawn_command(
     // macOS cannot receive passed fds with close-on-exec set atomically.
     #[cfg(target_os = "macos")]
     command.descriptor_policy(DescriptorPolicy::Explicit);
-    command.spawn().map_err(io_error)
+    // The custody's launcher ends are CLOEXEC; only the helper's copies are
+    // made inheritable. The custody keeps them open until `spawned`.
+    #[cfg(unix)]
+    if let Some(custody) = &custody {
+        command.inherit_fds(&custody.inherited_fds());
+    }
+    let child = command.spawn();
+    if let Some(custody) = &mut custody {
+        // Pin the launcher (our own, not yet reaped child) for the join.
+        custody.spawned(child.as_ref().ok().and_then(Child::id));
+    }
+    Ok((child.map_err(io_error)?, FsHelperSandboxCleanup(custody)))
 }
 
 pub(crate) fn io_error(err: std::io::Error) -> JSONRPCErrorError {
@@ -591,6 +743,63 @@ mod tests {
     use super::helper_env_key_is_allowed;
     use super::helper_read_roots;
     use super::sandbox_cwd;
+
+    use super::{
+        SandboxCleanupState, SandboxCleanupSummary, SandboxLaunch, record_fs_helper_cleanup,
+        record_fs_helper_launch, with_fs_helper_cleanup_receipt,
+    };
+
+    fn cleanup_complete() -> SandboxCleanupSummary {
+        SandboxCleanupSummary {
+            state: SandboxCleanupState::Complete,
+            reaped: 1,
+            preserved_unproven: 0,
+            host_owned: 0,
+            handed_off: 0,
+            timed_out: 0,
+            joined: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn request_receipt_missing_launch_cannot_be_hidden() {
+        for missing_first in [true, false] {
+            let ((), receipt, launch) = with_fs_helper_cleanup_receipt(async {
+                if missing_first {
+                    record_fs_helper_launch();
+                }
+                record_fs_helper_launch();
+                record_fs_helper_cleanup(cleanup_complete());
+                if !missing_first {
+                    record_fs_helper_launch();
+                }
+            })
+            .await;
+            assert_eq!(launch, SandboxLaunch::Launched);
+            assert_eq!(receipt, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn request_receipt_requires_one_collection_per_launch() {
+        let ((), receipt, launch) = with_fs_helper_cleanup_receipt(async {
+            record_fs_helper_launch();
+            record_fs_helper_launch();
+            record_fs_helper_cleanup(cleanup_complete());
+            record_fs_helper_cleanup(cleanup_complete());
+        })
+        .await;
+        assert_eq!(launch, SandboxLaunch::Launched);
+        let receipt = receipt.unwrap();
+        assert_eq!(receipt.reaped, 2);
+        assert_eq!(receipt.state, SandboxCleanupState::Complete);
+    }
+
+    #[tokio::test]
+    async fn request_receipt_no_launch_is_positive_absence() {
+        let ((), receipt, launch) = with_fs_helper_cleanup_receipt(async {}).await;
+        assert_eq!((receipt, launch), (None, SandboxLaunch::NotLaunched));
+    }
 
     #[test]
     fn helper_permissions_enable_minimal_reads_for_restricted_profile() {

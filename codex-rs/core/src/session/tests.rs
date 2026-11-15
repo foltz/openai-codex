@@ -650,14 +650,16 @@ async fn regular_turn_emits_turn_started_with_trace_id_without_waiting_for_start
         Some("00000000000000000000000000000011")
     );
     let (_tx, startup_prewarm_rx) = tokio::sync::oneshot::channel::<()>();
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     let handle = tokio::spawn(async move {
         let _ = startup_prewarm_rx.await;
-        Ok(test_model_client_session())
+        let _ = result_tx.send(Ok(test_model_client_session()));
     });
 
     sess.set_session_startup_prewarm(
         crate::session::startup_prewarm::SessionStartupPrewarmHandle::new(
-            handle,
+            sess.task_joins.register(handle),
+            result_rx,
             std::time::Instant::now(),
             crate::client::WEBSOCKET_CONNECT_TIMEOUT,
         ),
@@ -788,14 +790,16 @@ async fn request_mcp_server_elicitation_waits_for_user_response(
 async fn interrupting_regular_turn_waiting_on_startup_prewarm_emits_turn_aborted() {
     let (sess, tc, rx) = make_session_and_context_with_rx().await;
     let (_tx, startup_prewarm_rx) = tokio::sync::oneshot::channel::<()>();
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     let handle = tokio::spawn(async move {
         let _ = startup_prewarm_rx.await;
-        Ok(test_model_client_session())
+        let _ = result_tx.send(Ok(test_model_client_session()));
     });
 
     sess.set_session_startup_prewarm(
         crate::session::startup_prewarm::SessionStartupPrewarmHandle::new(
-            handle,
+            sess.task_joins.register(handle),
+            result_rx,
             std::time::Instant::now(),
             crate::client::WEBSOCKET_CONNECT_TIMEOUT,
         ),
@@ -13796,4 +13800,69 @@ async fn task_retirement_preserves_active_task_until_abort_and_original_join() {
         crate::tasks::TaskJoinOutcome::Complete { panicked: false }
     );
     assert!(session.active_turn.lock().await.is_none());
+}
+
+#[tokio::test]
+async fn startup_prewarm_and_auxiliary_refuse_after_task_admission_closes() {
+    let (session, _) = make_session_and_context().await;
+    let session = Arc::new(session);
+    session.close_task_admission().await;
+    session
+        .schedule_startup_prewarm(super::startup_prewarm::PrewarmInput::Base)
+        .await;
+    let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let work_ran = Arc::clone(&ran);
+    session
+        .spawn_startup_auxiliary(async move {
+            work_ran.store(true, std::sync::atomic::Ordering::Release);
+        })
+        .await;
+    tokio::task::yield_now().await;
+    assert!(!ran.load(std::sync::atomic::Ordering::Acquire));
+    assert!(session.state.lock().await.startup_prewarm.is_none());
+    assert_eq!(
+        session
+            .task_joins
+            .shutdown_until(tokio::time::Instant::now())
+            .await,
+        crate::tasks::TaskJoinOutcome::Complete { panicked: false }
+    );
+}
+
+#[tokio::test]
+async fn startup_auxiliary_original_join_observes_body_destruction() {
+    struct Destruction(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for Destruction {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let (session, _) = make_session_and_context().await;
+    let destroyed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let guard = Destruction(Arc::clone(&destroyed));
+    let (send, receive) = tokio::sync::oneshot::channel();
+    session
+        .spawn_startup_auxiliary(async move {
+            let _guard = guard;
+            let _ = send.send(());
+            std::future::pending::<()>().await;
+        })
+        .await;
+    tokio::time::timeout(Duration::from_secs(1), receive)
+        .await
+        .expect("body started")
+        .expect("start signal");
+    assert!(!destroyed.load(std::sync::atomic::Ordering::Acquire));
+    session.close_task_admission().await;
+    assert_eq!(
+        session
+            .task_joins
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await,
+        crate::tasks::TaskJoinOutcome::Complete { panicked: false }
+    );
+    assert!(
+        destroyed.load(std::sync::atomic::Ordering::Acquire),
+        "join must observe original body destruction"
+    );
 }

@@ -8,9 +8,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use futures::FutureExt;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
 use tracing::info;
 use tracing::instrument;
@@ -46,7 +44,8 @@ impl PrewarmInput {
 }
 
 pub(crate) struct SessionStartupPrewarmHandle {
-    task: AbortOnDropHandle<CodexResult<ModelClientSession>>,
+    task: crate::tasks::TaskAbortHandle,
+    result: tokio::sync::oneshot::Receiver<CodexResult<ModelClientSession>>,
     started_at: Instant,
     timeout: Duration,
 }
@@ -62,12 +61,14 @@ pub(crate) enum SessionStartupPrewarmResolution {
 
 impl SessionStartupPrewarmHandle {
     pub(crate) fn new(
-        task: JoinHandle<CodexResult<ModelClientSession>>,
+        task: crate::tasks::TaskAbortHandle,
+        result: tokio::sync::oneshot::Receiver<CodexResult<ModelClientSession>>,
         started_at: Instant,
         timeout: Duration,
     ) -> Self {
         Self {
-            task: AbortOnDropHandle::new(task),
+            task,
+            result,
             started_at,
             timeout,
         }
@@ -75,7 +76,9 @@ impl SessionStartupPrewarmHandle {
 
     pub(crate) async fn abort(self) {
         self.task.abort();
-        let _ = self.task.await;
+        if !self.task.wait().await {
+            warn!("startup websocket prewarm task panicked");
+        }
     }
 
     #[instrument(name = "startup_prewarm.resolve", level = "trace", skip_all)]
@@ -86,7 +89,8 @@ impl SessionStartupPrewarmHandle {
     ) -> SessionStartupPrewarmResolution {
         let resolve_started_at = Instant::now();
         let Self {
-            mut task,
+            task,
+            mut result,
             started_at,
             timeout,
         } = self;
@@ -94,11 +98,11 @@ impl SessionStartupPrewarmHandle {
         let remaining = timeout.saturating_sub(age_at_first_turn);
 
         let resolution = if task.is_finished() {
-            Self::resolution_from_join_result(task.await, started_at)
+            Self::resolution_from_join_result(result.await, started_at)
         } else {
             match tokio::select! {
                 _ = cancellation_token.cancelled() => None,
-                result = tokio::time::timeout(remaining, &mut task) => Some(result),
+                result = tokio::time::timeout(remaining, &mut result) => Some(result),
             } {
                 Some(Ok(result)) => Self::resolution_from_join_result(result, started_at),
                 Some(Err(_elapsed)) => {
@@ -178,7 +182,10 @@ impl SessionStartupPrewarmHandle {
     }
 
     fn resolution_from_join_result(
-        result: std::result::Result<CodexResult<ModelClientSession>, tokio::task::JoinError>,
+        result: std::result::Result<
+            CodexResult<ModelClientSession>,
+            tokio::sync::oneshot::error::RecvError,
+        >,
         started_at: Instant,
     ) -> SessionStartupPrewarmResolution {
         match result {
@@ -204,10 +211,29 @@ impl SessionStartupPrewarmHandle {
 }
 
 impl Session {
+    #[cfg(test)]
+    pub(crate) async fn spawn_startup_auxiliary(
+        &self,
+        work: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        let _admission = self.active_turn.lock().await;
+        if self
+            .task_admission_closed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        drop(self.task_joins.register(tokio::spawn(work)).detach());
+    }
+
     pub(crate) async fn schedule_startup_prewarm(self: &Arc<Self>, input: PrewarmInput) {
         let websocket_connect_timeout = self.provider().await.websocket_connect_timeout();
         let mut state = self.state.lock().await;
-        if state.shutting_down {
+        if state.shutting_down
+            || self
+                .task_admission_closed
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
             return;
         }
         // Publish the warmup before another turn can be admitted. No network work
@@ -215,11 +241,15 @@ impl Session {
         let Ok(active_turn) = self.active_turn.try_lock() else {
             return;
         };
-        if active_turn.is_some() {
+        if active_turn.is_some()
+            || self
+                .task_admission_closed
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
             return;
         }
         if let Some(prewarm) = state.startup_prewarm.as_mut() {
-            let Some(completed) = (&mut prewarm.task).now_or_never() else {
+            let Some(completed) = (&mut prewarm.result).now_or_never() else {
                 return;
             };
             // Return a completed warmup's client to the existing cache before
@@ -232,28 +262,37 @@ impl Session {
             && self.services.code_mode_service.is_available()
         {
             let session = Arc::clone(self);
-            tokio::spawn(async move {
-                if session.services.code_mode_service.session().await.is_err() {
-                    warn!("code-mode host startup prewarm failed");
-                }
-            });
+            drop(
+                self.task_joins
+                    .register(tokio::spawn(async move {
+                        if session.services.code_mode_service.session().await.is_err() {
+                            warn!("code-mode host startup prewarm failed");
+                        }
+                    }))
+                    .detach(),
+            );
         }
 
         if !self.services.model_client.responses_websocket_enabled() {
             // Without websocket prewarm, resolve auth once so Agent Identity bootstrap can
             // register or engage this session's bearer fallback before the first user request.
             let model_client = self.services.model_client.clone();
-            tokio::spawn(async move {
-                if let Err(err) = model_client.prewarm_auth().await {
-                    warn!("startup auth prewarm failed: {err:#}");
-                }
-            });
+            drop(
+                self.task_joins
+                    .register(tokio::spawn(async move {
+                        if let Err(err) = model_client.prewarm_auth().await {
+                            warn!("startup auth prewarm failed: {err:#}");
+                        }
+                    }))
+                    .detach(),
+            );
             return;
         }
 
         let session_telemetry = self.services.session_telemetry.clone();
         let started_at = Instant::now();
         let startup_prewarm_session = Arc::clone(self);
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let startup_prewarm = tokio::spawn(
             async move {
                 let result = schedule_startup_prewarm_inner(startup_prewarm_session, input).await;
@@ -268,7 +307,7 @@ impl Session {
                     started_at.elapsed(),
                     &[("status", status), ("input", input.as_str())],
                 );
-                result
+                let _ = result_tx.send(result);
             }
             .instrument(trace_span!(
                 "startup_prewarm",
@@ -278,7 +317,8 @@ impl Session {
             )),
         );
         state.set_session_startup_prewarm(SessionStartupPrewarmHandle::new(
-            startup_prewarm,
+            self.task_joins.register(startup_prewarm),
+            result_rx,
             started_at,
             websocket_connect_timeout,
         ));

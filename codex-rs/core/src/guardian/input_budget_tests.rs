@@ -187,10 +187,14 @@ async fn cancelled_startup_does_not_record_unselected_review_evidence() {
             context,
             elastic: None,
         });
+    let (_result_tx, result_rx) = tokio::sync::oneshot::channel();
     session
         .set_session_startup_prewarm(
             crate::session::startup_prewarm::SessionStartupPrewarmHandle::new(
-                tokio::spawn(std::future::pending()),
+                session
+                    .task_joins
+                    .register(tokio::spawn(std::future::pending())),
+                result_rx,
                 std::time::Instant::now(),
                 crate::client::WEBSOCKET_CONNECT_TIMEOUT,
             ),

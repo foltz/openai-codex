@@ -84,22 +84,38 @@ mod stderr_logging_tests;
 
 #[cfg(unix)]
 #[test]
-fn hosting_control_endpoint_requires_an_absolute_unix_listener() {
+fn hosting_control_endpoint_uses_the_bound_absolute_listener_path() {
     use super::AppServerTransport;
     use super::mcp_control_endpoint_uri;
+    use codex_utils_absolute_path::AbsolutePathBuf;
 
     assert_eq!(mcp_control_endpoint_uri(&AppServerTransport::Stdio), None);
     assert_eq!(mcp_control_endpoint_uri(&AppServerTransport::Off), None);
     assert_eq!(
-        mcp_control_endpoint_uri(&AppServerTransport::UnixSocket {
-            socket_path: "relative.sock".into()
+        mcp_control_endpoint_uri(&AppServerTransport::WebSocket {
+            bind_address: "127.0.0.1:0".parse().unwrap(),
         }),
         None
     );
+    assert!(AbsolutePathBuf::from_absolute_path("relative.sock").is_err());
     assert_eq!(
         mcp_control_endpoint_uri(&AppServerTransport::UnixSocket {
-            socket_path: "/tmp/host socket?#.sock".into()
+            socket_path: AbsolutePathBuf::from_absolute_path("/tmp/host socket?#.sock").unwrap(),
         }),
-        Some("unix:///tmp/host%20socket%3F%23.sock".to_string())
+        Some("unix:///tmp/host%20socket%3F%23.sock".to_string()),
+    );
+    // 0.169 resolves CLI-relative listen arguments before the transport binds.
+    // Disclosure uses that resolved listener, never the raw relative argument.
+    let resolved = AppServerTransport::from_listen_url("unix://relative.sock").unwrap();
+    let AppServerTransport::UnixSocket { socket_path } = &resolved else {
+        panic!("Unix listener");
+    };
+    assert!(socket_path.is_absolute());
+    let disclosed = url::Url::parse(&mcp_control_endpoint_uri(&resolved).unwrap()).unwrap();
+    assert_eq!(disclosed.scheme(), "unix");
+    let file_uri = format!("file:{}", disclosed.as_str().strip_prefix("unix:").unwrap());
+    assert_eq!(
+        url::Url::parse(&file_uri).unwrap().to_file_path().unwrap(),
+        socket_path.to_path_buf()
     );
 }

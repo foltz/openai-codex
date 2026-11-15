@@ -160,12 +160,28 @@ impl ProcessStore {
 pub(crate) struct UnifiedExecProcessManager {
     process_store: Mutex<ProcessStore>,
     max_write_stdin_yield_time_ms: u64,
+    sandbox_cleanup_census: Arc<crate::sandboxing::cleanup_census::SandboxCleanupCensus>,
 }
 
 impl UnifiedExecProcessManager {
+    pub(crate) fn with_sandbox_cleanup_census(
+        mut self,
+        census: Arc<crate::sandboxing::cleanup_census::SandboxCleanupCensus>,
+    ) -> Self {
+        self.sandbox_cleanup_census = census;
+        self
+    }
+
+    pub(crate) fn sandbox_cleanup_census(
+        &self,
+    ) -> &Arc<crate::sandboxing::cleanup_census::SandboxCleanupCensus> {
+        &self.sandbox_cleanup_census
+    }
+
     pub(crate) fn new(max_write_stdin_yield_time_ms: u64) -> Self {
         Self {
             process_store: Mutex::new(ProcessStore::default()),
+            sandbox_cleanup_census: Arc::default(),
             max_write_stdin_yield_time_ms: max_write_stdin_yield_time_ms
                 .max(MIN_EMPTY_YIELD_TIME_MS),
         }

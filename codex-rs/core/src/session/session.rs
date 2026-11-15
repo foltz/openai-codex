@@ -1645,7 +1645,13 @@ impl Session {
             let resolved_environments = turn_environments
                 .resolve_snapshot(configured_environments)
                 .await;
-            let agents_md_manager = Arc::new(AgentsMdManager::new(instructions));
+            let sandbox_cleanup_census = Arc::new(
+                crate::sandboxing::cleanup_census::SandboxCleanupCensus::default(),
+            );
+            let agents_md_manager = Arc::new(
+                AgentsMdManager::new(instructions)
+                    .with_sandbox_cleanup_census(Arc::clone(&sandbox_cleanup_census)),
+            );
             // Keep discovery's future out of the large embedded startup/resume frame.
             let plugin_skill_warmup = Box::pin(warm_plugins_and_skills_for_session_init(
                 Arc::clone(&config),
@@ -2001,7 +2007,8 @@ impl Session {
                 mcp_handler_cache: Default::default(),
                 unified_exec_manager: UnifiedExecProcessManager::new(
                     config.background_terminal_max_timeout,
-                ),
+                )
+                .with_sandbox_cleanup_census(sandbox_cleanup_census),
                 elicitations: crate::elicitation::ElicitationService::new(),
                 analytics_events_client,
                 hooks: arc_swap::ArcSwap::from_pointee(hooks),

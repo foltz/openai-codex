@@ -178,6 +178,14 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
         let started_at = Instant::now();
         let fs = req.turn_environment.environment().get_filesystem();
         let sandbox = Self::file_system_sandbox_context_for_attempt(req, attempt);
+        let collector = codex_file_system::SandboxCleanupReceiptCollector::new(fs.as_ref());
+        let operation = crate::sandboxing::cleanup_census::SandboxCleanupOperation::new(
+            std::sync::Arc::clone(ctx.session.services.sandbox_cleanup_census()),
+            crate::sandboxing::cleanup_census::may_launch_sandboxed_helper(
+                sandbox.as_ref(),
+                req.turn_environment.environment(),
+            ),
+        );
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let result = codex_apply_patch::apply_patch_with_options(
@@ -195,10 +203,11 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
             &req.action.cwd,
             &mut stdout,
             &mut stderr,
-            fs.as_ref(),
+            &collector,
             sandbox.as_ref(),
         )
         .await;
+        operation.finish(collector.launch(), collector.receipt());
         let stdout = String::from_utf8_lossy(&stdout).into_owned();
         let stderr = String::from_utf8_lossy(&stderr).into_owned();
         let failed = result.is_err();

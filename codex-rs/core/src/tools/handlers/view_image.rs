@@ -151,9 +151,24 @@ impl ViewImageHandler {
         let sandbox = turn_environment.sandbox_context(/*additional_permissions*/ None);
         let fs = turn_environment.environment().get_filesystem();
 
-        let metadata = fs
-            .get_metadata(&path_uri, GetMetadataOptions::default(), Some(&sandbox))
-            .await
+        let census = std::sync::Arc::clone(session.services.sandbox_cleanup_census());
+        let may_launch = crate::sandboxing::cleanup_census::may_launch_sandboxed_read_helper(
+            Some(&sandbox),
+            turn_environment.environment(),
+        );
+        let metadata_operation = crate::sandboxing::cleanup_census::SandboxCleanupOperation::new(
+            std::sync::Arc::clone(&census),
+            may_launch,
+        );
+        let metadata = metadata_operation
+            .finish_outcome(
+                fs.get_metadata_with_receipt(
+                    &path_uri,
+                    GetMetadataOptions::default(),
+                    Some(&sandbox),
+                )
+                .await,
+            )
             .map_err(|error| {
                 FunctionCallError::RespondToModel(format!(
                     "unable to locate image at `{model_visible_path}`: {error}"
@@ -165,9 +180,13 @@ impl ViewImageHandler {
                 "image path `{model_visible_path}` is not a file"
             )));
         }
-        let file_bytes = fs
-            .read_file(&path_uri, ReadFileOptions::default(), Some(&sandbox))
-            .await
+        let read_operation =
+            crate::sandboxing::cleanup_census::SandboxCleanupOperation::new(census, may_launch);
+        let file_bytes = read_operation
+            .finish_outcome(
+                fs.read_file_with_receipt(&path_uri, ReadFileOptions::default(), Some(&sandbox))
+                    .await,
+            )
             .map_err(|error| {
                 FunctionCallError::RespondToModel(format!(
                     "unable to read image at `{model_visible_path}`: {error}"
@@ -387,6 +406,8 @@ mod tests {
             ));
         let turn = Arc::new(turn);
 
+        let census = Arc::clone(session.services.sandbox_cleanup_census());
+        let before = census.totals();
         let result = ViewImageHandler::default()
             .handle(ToolInvocation {
                 session: Arc::new(session),
@@ -404,6 +425,9 @@ mod tests {
                 },
             })
             .await;
+        let after = census.totals();
+        assert_eq!(after.no_launch, before.no_launch + 1);
+        assert_eq!(after.operations, before.operations);
 
         let Err(FunctionCallError::RespondToModel(message)) = result else {
             panic!("expected sandboxed filesystem error");
@@ -464,6 +488,8 @@ mod tests {
             PermissionProfileSnapshot::legacy(PermissionProfile::Disabled);
         let turn = Arc::new(turn);
 
+        let census = Arc::clone(session.services.sandbox_cleanup_census());
+        let before = census.totals();
         let result = ViewImageHandler::default()
             .handle(ToolInvocation {
                 session: Arc::new(session),
@@ -481,6 +507,9 @@ mod tests {
                 },
             })
             .await;
+        let after = census.totals();
+        assert_eq!(after.no_launch, before.no_launch + 2);
+        assert_eq!(after.operations, before.operations);
 
         result.expect("explicit high detail should be accepted");
     }
@@ -504,6 +533,8 @@ mod tests {
             PermissionProfileSnapshot::legacy(PermissionProfile::Disabled);
         let turn = Arc::new(turn);
 
+        let census = Arc::clone(session.services.sandbox_cleanup_census());
+        let before = census.totals();
         let result = ViewImageHandler::default()
             .handle(ToolInvocation {
                 session: Arc::new(session),
@@ -524,6 +555,9 @@ mod tests {
                 },
             })
             .await;
+        let after = census.totals();
+        assert_eq!(after.no_launch, before.no_launch + 2);
+        assert_eq!(after.operations, before.operations);
 
         let Err(FunctionCallError::RespondToModel(message)) = result else {
             panic!("expected invalid image error");

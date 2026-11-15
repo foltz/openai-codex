@@ -226,6 +226,23 @@ impl PendingStreamReceipts {
         }
     }
 
+    /// Registers launch debt before invoking the backend, not only before
+    /// polling its future. Transfer it to the retained receipt without an await gap.
+    pub(crate) async fn open<F>(
+        &self,
+        open: impl FnOnce() -> F,
+    ) -> FileSystemResult<FileSystemReadStream>
+    where
+        F: std::future::Future<Output = ReadStreamOutcome>,
+    {
+        let mut operation =
+            SandboxCleanupOperation::new(Arc::clone(&self.census), self.may_have_launched);
+        let outcome = open().await;
+        let result = self.track(outcome);
+        operation.recorded = true;
+        result
+    }
+
     /// Tracks an open's receipt and hands back its result.
     pub(crate) fn track(&self, open: ReadStreamOutcome) -> FileSystemResult<FileSystemReadStream> {
         let launch = resolve_launch(open.launch, self.may_have_launched);

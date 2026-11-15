@@ -11,6 +11,8 @@
 //! The model-facing local-path schema is owned by `codex-mcp` alongside MCP tool inventory, so this
 //! module only handles uploading the files and rewriting the execution-time arguments.
 
+use crate::sandboxing::cleanup_census::PendingStreamReceipts;
+use crate::sandboxing::cleanup_census::STREAM_RECEIPT_SETTLE_GRACE;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use codex_api::HostedFileUploadContext;
@@ -189,9 +191,24 @@ async fn build_uploaded_argument_value(
         }
     }
     let fs = turn_environment.environment().get_filesystem();
-    let metadata = fs
-        .get_metadata(&path_uri, GetMetadataOptions::default(), sandbox.as_ref())
-        .await
+    let census = Arc::clone(sess.services.sandbox_cleanup_census());
+    let may_have_launched = crate::sandboxing::cleanup_census::may_launch_sandboxed_read_helper(
+        sandbox.as_ref(),
+        turn_environment.environment(),
+    );
+    let metadata_operation = crate::sandboxing::cleanup_census::SandboxCleanupOperation::new(
+        Arc::clone(&census),
+        may_have_launched,
+    );
+    let metadata = metadata_operation
+        .finish_outcome(
+            fs.get_metadata_with_receipt(
+                &path_uri,
+                GetMetadataOptions::default(),
+                sandbox.as_ref(),
+            )
+            .await,
+        )
         .map_err(|error| contextualize_error(error.to_string()))?;
     if !metadata.is_file {
         return Err(contextualize_error(format!(
@@ -208,73 +225,92 @@ async fn build_uploaded_argument_value(
         )));
     }
     // Keep the initial read permission check before allocating a remote file record.
-    let mut first_contents = Some(
-        fs.read_file_stream(&path_uri, sandbox.as_ref())
-            .await
-            .map_err(|error| contextualize_error(error.to_string()))?,
-    );
-    let file_name = path_uri
-        .basename()
-        .or_else(|| {
-            path_uri.infer_path_convention().and_then(|convention| {
-                convention
-                    .path_segments(file_path)
-                    .rfind(|segment| !segment.is_empty())
-                    .map(str::to_string)
-            })
-        })
-        .unwrap_or_else(|| "file".to_string());
-    let open_contents = move || {
-        let first_contents = first_contents.take();
-        let fs = Arc::clone(&fs);
-        let path_uri = path_uri.clone();
-        let sandbox = sandbox.clone();
-        async move {
-            match first_contents {
-                Some(contents) => Ok(contents),
-                None => fs.read_file_stream(&path_uri, sandbox.as_ref()).await,
-            }
+    let stream_receipts = Arc::new(PendingStreamReceipts::new(census, may_have_launched));
+    let first_stream = match stream_receipts
+        .open(|| fs.read_file_stream_with_receipt(&path_uri, sandbox.as_ref()))
+        .await
+    {
+        Ok(stream) => stream,
+        Err(error) => {
+            stream_receipts.settle(STREAM_RECEIPT_SETTLE_GRACE).await;
+            return Err(contextualize_error(error.to_string()));
         }
     };
-    let runtime = if turn_context
-        .config
-        .features
-        .enabled(codex_features::Feature::RuntimeAgentInstances)
-        && codex_http_client::classify_openai_api_url(&turn_context.config.chatgpt_base_url)
-            != codex_http_client::OpenAiDestination::Other
-    {
-        codex_model_provider::validate_runtime_destination(Some(
-            &turn_context.config.chatgpt_base_url,
-        ))
+    let reopen_receipts = Arc::clone(&stream_receipts);
+    // Own the initial stream and every reopen across the current auth/preparation
+    // stages. This block drops unused streams/closures before common settlement.
+    let uploaded = settle_upload_receipts(&stream_receipts, async move {
+        let mut first_contents = Some(first_stream);
+        let file_name = path_uri
+            .basename()
+            .or_else(|| {
+                path_uri.infer_path_convention().and_then(|convention| {
+                    convention
+                        .path_segments(file_path)
+                        .rfind(|segment| !segment.is_empty())
+                        .map(str::to_string)
+                })
+            })
+            .unwrap_or_else(|| "file".to_string());
+        let open_contents = move || {
+            let first_contents = first_contents.take();
+            let fs = Arc::clone(&fs);
+            let path_uri = path_uri.clone();
+            let sandbox = sandbox.clone();
+            let stream_receipts = Arc::clone(&reopen_receipts);
+            async move {
+                match first_contents {
+                    Some(contents) => Ok(contents),
+                    None => {
+                        stream_receipts
+                            .open(|| fs.read_file_stream_with_receipt(&path_uri, sandbox.as_ref()))
+                            .await
+                    }
+                }
+            }
+        };
+        let runtime = if turn_context
+            .config
+            .features
+            .enabled(codex_features::Feature::RuntimeAgentInstances)
+            && codex_http_client::classify_openai_api_url(&turn_context.config.chatgpt_base_url)
+                != codex_http_client::OpenAiDestination::Other
+        {
+            codex_model_provider::validate_runtime_destination(Some(
+                &turn_context.config.chatgpt_base_url,
+            ))
+            .map_err(|error| contextualize_error(error.to_string()))?;
+            let manager = sess.services.runtime_auth.get().ok_or_else(|| {
+                contextualize_error("runtime authentication has not been initialized".to_string())
+            })?;
+            Some((Arc::clone(manager), turn_context.config.runtime_auth_mode))
+        } else {
+            None
+        };
+        let upload_auth = codex_model_provider::auth_provider_for_request(
+            auth,
+            runtime.as_ref(),
+            &http::HeaderMap::new(),
+        )
+        .await
         .map_err(|error| contextualize_error(error.to_string()))?;
-        let manager = sess.services.runtime_auth.get().ok_or_else(|| {
-            contextualize_error("runtime authentication has not been initialized".to_string())
-        })?;
-        Some((Arc::clone(manager), turn_context.config.runtime_auth_mode))
-    } else {
-        None
-    };
-    let upload_auth = codex_model_provider::auth_provider_for_request(
-        auth,
-        runtime.as_ref(),
-        &http::HeaderMap::new(),
-    )
-    .await
-    .map_err(|error| contextualize_error(error.to_string()))?;
-    let upload_clients = upload_auth
-        .bind_http_client_pool(&sess.services.openai_file_upload_client_pool)
+        let upload_clients = upload_auth
+            .bind_http_client_pool(&sess.services.openai_file_upload_client_pool)
+            .map_err(|error| contextualize_error(error.to_string()))?;
+        let uploaded = upload_openai_file(
+            turn_context.config.chatgpt_base_url.trim_end_matches('/'),
+            upload_auth.auth.as_ref(),
+            &upload_clients,
+            file_name,
+            metadata.size,
+            open_contents,
+            hosted_upload,
+        )
+        .await
         .map_err(|error| contextualize_error(error.to_string()))?;
-    let uploaded = upload_openai_file(
-        turn_context.config.chatgpt_base_url.trim_end_matches('/'),
-        upload_auth.auth.as_ref(),
-        &upload_clients,
-        file_name,
-        metadata.size,
-        open_contents,
-        hosted_upload,
-    )
-    .await
-    .map_err(|error| contextualize_error(error.to_string()))?;
+        Ok::<_, String>(uploaded)
+    })
+    .await?;
     let mut payload = serde_json::Map::new();
     payload.insert(
         "download_url".to_string(),
@@ -298,6 +334,17 @@ async fn build_uploaded_argument_value(
         );
     }
     Ok(JsonValue::Object(payload))
+}
+
+/// Settle at the common result boundary, including errors in auth preparation.
+/// The operation owns its streams and must drop/transfer them before returning.
+async fn settle_upload_receipts<T>(
+    receipts: &PendingStreamReceipts,
+    upload: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    let result = upload.await;
+    receipts.settle(STREAM_RECEIPT_SETTLE_GRACE).await;
+    result
 }
 
 #[cfg(test)]
@@ -461,6 +508,90 @@ mod tests {
                 "file_name": "file_report.csv",
             })
         );
+    }
+
+    #[tokio::test]
+    async fn preparation_error_settles_reported_stream_before_returning() {
+        use crate::sandboxing::cleanup_census::SandboxCleanupCensus;
+        use codex_file_system::FileSystemReadStream;
+        use codex_file_system::ReadStreamOutcome;
+        use codex_file_system::SandboxLaunch;
+        use codex_protocol::exec_output::{SandboxCleanupState, SandboxCleanupSummary};
+        let census = Arc::new(SandboxCleanupCensus::default());
+        let receipts = PendingStreamReceipts::new(Arc::clone(&census), true);
+        let complete = SandboxCleanupSummary {
+            state: SandboxCleanupState::Complete,
+            reaped: 1,
+            preserved_unproven: 0,
+            host_owned: 0,
+            handed_off: 0,
+            timed_out: 0,
+            joined: true,
+        };
+        let stream = receipts
+            .open(|| async {
+                ReadStreamOutcome::from_open(
+                    Ok(FileSystemReadStream::new(futures::stream::pending())),
+                    Some(complete),
+                    SandboxLaunch::Launched,
+                )
+            })
+            .await
+            .unwrap();
+        let result: Result<(), String> = settle_upload_receipts(&receipts, async move {
+            drop(stream);
+            Err("preparation refused".to_string())
+        })
+        .await;
+        assert_eq!(result, Err("preparation refused".to_string()));
+        drop(receipts);
+        let totals = census.totals();
+        assert_eq!(
+            (totals.operations, totals.complete, totals.missing_receipt),
+            (1, 1, 0)
+        );
+        assert!(!totals.has_unproven());
+    }
+
+    #[tokio::test]
+    async fn runtime_auth_preparation_failure_keeps_metadata_and_stream_accounted() {
+        let (session, mut turn_context) = make_session_and_context().await;
+        assert!(session.services.runtime_auth.get().is_none());
+        let dir = tempdir().unwrap();
+        tokio::fs::write(dir.path().join("prepared.txt"), b"data")
+            .await
+            .unwrap();
+        set_primary_environment_cwd(&mut turn_context, dir.path());
+        let mut config = (*turn_context.config).clone();
+        config
+            .features
+            .enable(codex_features::Feature::RuntimeAgentInstances);
+        config.chatgpt_base_url = "https://chatgpt.com/backend-api".to_string();
+        turn_context.config = Arc::new(config);
+        let step = StepContext::for_test(Arc::new(turn_context));
+        let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
+        let before = session.services.sandbox_cleanup_census().totals();
+        let error = build_uploaded_argument_value(
+            &session,
+            &step,
+            Some(&auth),
+            FileArgumentLocation {
+                field_name: "file",
+                index: None,
+            },
+            &[],
+            "prepared.txt",
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.contains("runtime authentication has not been initialized"),
+            "{error}"
+        );
+        let after = session.services.sandbox_cleanup_census().totals();
+        assert_eq!(after.no_launch, before.no_launch + 2);
+        assert_eq!(after.operations, before.operations);
     }
 
     #[tokio::test]

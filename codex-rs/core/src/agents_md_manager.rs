@@ -3,7 +3,7 @@
 //! Isolated reviewers can pin a captured repository snapshot without executor discovery.
 
 use crate::agents_md::LoadedAgentsMd;
-use crate::agents_md::load_project_instructions;
+use crate::agents_md::load_project_instructions_with_census;
 use crate::config::Config;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use codex_extension_api::Instructions;
@@ -21,6 +21,7 @@ use tokio::sync::Semaphore;
 
 /// Owns instruction sources, refresh serialization, and the applied snapshot.
 pub(crate) struct AgentsMdManager {
+    sandbox_cleanup_census: Option<Arc<crate::sandboxing::cleanup_census::SandboxCleanupCensus>>,
     refresh_lock: Semaphore,
     state: Mutex<AgentsMdState>,
 }
@@ -54,12 +55,21 @@ impl AgentsMdManager {
         instructions.user = normalize_instructions(instructions.user);
         instructions.thread = normalize_instructions(instructions.thread);
         Self {
+            sandbox_cleanup_census: None,
             refresh_lock: Semaphore::new(/*permits*/ 1),
             state: Mutex::new(AgentsMdState {
                 instructions,
                 cache: AgentsMdCache::default(),
             }),
         }
+    }
+
+    pub(crate) fn with_sandbox_cleanup_census(
+        mut self,
+        census: Arc<crate::sandboxing::cleanup_census::SandboxCleanupCensus>,
+    ) -> Self {
+        self.sandbox_cleanup_census = Some(census);
+        self
     }
 
     /// Resolves and validates one coherent snapshot for startup or a request boundary.
@@ -129,7 +139,9 @@ impl AgentsMdManager {
             let loaded = if let Some(project) = &instructions.project_snapshot {
                 project.as_ref().clone()
             } else if refresh_repository {
-                load_project_instructions(config, environments, &mut warnings).await?
+                load_project_instructions_with_census(
+                    config, environments, &mut warnings, self.sandbox_cleanup_census.as_ref(),
+                ).await?
             } else {
                 cached.as_deref().cloned().unwrap_or_default()
             }

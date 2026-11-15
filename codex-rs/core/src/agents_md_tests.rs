@@ -1798,3 +1798,40 @@ fn create_skill(codex_home: PathBuf, name: &str, description: &str) {
     let content = format!("---\nname: {name}\ndescription: {description}\n---\n\n# Body\n");
     fs::write(skill_dir.join("SKILL.md"), content).unwrap();
 }
+
+#[tokio::test]
+async fn manager_discovery_records_cleanup_once_and_keeps_cached_snapshot() {
+    let tmp = tempfile::tempdir().expect("workspace");
+    fs::write(tmp.path().join("AGENTS.md"), "guarded instructions").unwrap();
+    let config = make_config(&tmp, 4096, None).await;
+    let environments = resolved_local_environments([("local", config.cwd.clone())]);
+    let census = Arc::new(crate::sandboxing::cleanup_census::SandboxCleanupCensus::default());
+    let manager = crate::agents_md_manager::AgentsMdManager::new(Default::default())
+        .with_sandbox_cleanup_census(Arc::clone(&census));
+    let (loaded, warnings) = manager.refresh(&config.config, &environments).await;
+    assert!(warnings.is_empty());
+    assert!(
+        loaded
+            .unwrap()
+            .unwrap()
+            .text()
+            .contains("guarded instructions")
+    );
+    assert_eq!(
+        (census.totals().no_launch, census.totals().operations),
+        (1, 0)
+    );
+    let (loaded, _) = manager.refresh(&config.config, &environments).await;
+    assert!(
+        loaded
+            .unwrap()
+            .unwrap()
+            .text()
+            .contains("guarded instructions")
+    );
+    assert_eq!(
+        census.totals().no_launch,
+        1,
+        "cached discovery launches nothing new"
+    );
+}

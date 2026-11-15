@@ -30,6 +30,7 @@ use codex_exec_server::ReadFileOptions;
 use codex_extension_api::Instructions;
 use codex_file_system::FileSystemSandboxContext;
 use codex_file_system::FindUpErrorPolicy;
+use codex_file_system::SandboxCleanupReceiptCollector;
 use codex_file_system::find_nearest_ancestor_with_markers;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathConvention;
@@ -55,11 +56,22 @@ const PROJECT_DOC_BUDGET_GUIDANCE: &str = "Trim your project instructions to fit
 // transport when independent startup discovery runs concurrently.
 const MAX_CONCURRENT_ANCESTOR_PROBES: usize = 256;
 
-/// Loads repository instructions across the selected environments.
+/// Test-only entry point without a session census.
+#[cfg(test)]
 pub(crate) async fn load_project_instructions(
     config: &Config,
     environments: &TurnEnvironmentSnapshot,
     warnings: &mut Vec<String>,
+) -> io::Result<LoadedAgentsMd> {
+    load_project_instructions_with_census(config, environments, warnings, None).await
+}
+
+/// Loads repository instructions and accounts for each environment's discovery.
+pub(crate) async fn load_project_instructions_with_census(
+    config: &Config,
+    environments: &TurnEnvironmentSnapshot,
+    warnings: &mut Vec<String>,
+    census: Option<&std::sync::Arc<crate::sandboxing::cleanup_census::SandboxCleanupCensus>>,
 ) -> io::Result<LoadedAgentsMd> {
     let mut loaded = LoadedAgentsMd::default();
     if config.active_project.is_untrusted() || config.project_doc_max_bytes == 0 {
@@ -83,17 +95,30 @@ pub(crate) async fn load_project_instructions(
             .file_system_sandbox_policy()
             .has_full_disk_read_access())
         .then(|| turn_environment.sandbox_context(/*additional_permissions*/ None));
-        match read_agents_md(
+        let operation = census.map(|census| {
+            crate::sandboxing::cleanup_census::SandboxCleanupOperation::new(
+                std::sync::Arc::clone(census),
+                crate::sandboxing::cleanup_census::may_launch_sandboxed_read_helper(
+                    sandbox.as_ref(),
+                    turn_environment.environment(),
+                ),
+            )
+        });
+        let collector = SandboxCleanupReceiptCollector::new(filesystem.as_ref());
+        let result = read_agents_md(
             config,
-            filesystem.as_ref(),
+            &collector,
             &turn_environment.selection.environment_id,
             turn_environment.cwd(),
             remaining,
             sandbox.as_ref(),
             warnings,
         )
-        .await
-        {
+        .await;
+        if let Some(operation) = operation {
+            operation.finish(collector.launch(), collector.receipt());
+        }
+        match result {
             Ok(Some(docs)) => {
                 for entry in docs.entries {
                     remaining = remaining.saturating_sub(entry.contents.len());

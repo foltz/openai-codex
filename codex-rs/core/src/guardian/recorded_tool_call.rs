@@ -180,6 +180,7 @@ pub(crate) async fn review_tool_call(
                         fs.as_ref(),
                         &prepared.turn_environment,
                         step,
+                        session.services.sandbox_cleanup_census(),
                     )
                     .await
                     .map_err(tool_error)?
@@ -196,9 +197,14 @@ pub(crate) async fn review_tool_call(
                     let environment =
                         selected_executor(&invocation.environments, &step.environments)
                             .map_err(tool_error)?;
-                    let prepared = prepare_patch_request(input, environment, step)
-                        .await
-                        .map_err(tool_error)?;
+                    let prepared = prepare_patch_request(
+                        input,
+                        environment,
+                        step,
+                        session.services.sandbox_cleanup_census(),
+                    )
+                    .await
+                    .map_err(tool_error)?;
                     let action = prepared.approval_action(&invocation.call_id);
                     (Some(prepared.exec_approval_requirement), action)
                 }

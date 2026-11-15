@@ -18,6 +18,7 @@ use codex_sandboxing::policy_transforms::effective_file_system_sandbox_policy;
 use codex_sandboxing::policy_transforms::effective_network_sandbox_policy;
 use codex_utils_path_uri::PathUri;
 use core_test_support::PathBufExt;
+use core_test_support::PathExt;
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
 fn test_turn_environment(environment_id: &str) -> crate::session::turn_context::TurnEnvironment {
@@ -356,5 +357,127 @@ async fn file_system_sandbox_context_respects_sandbox_request() {
             windows_sandbox_proxy_settings_mode: None,
             use_legacy_landlock: false,
         })
+    );
+}
+
+#[tokio::test]
+async fn every_patch_application_attempt_records_its_own_cleanup() {
+    let workspace = tempfile::tempdir().unwrap();
+    let path = PathUri::from_abs_path(&workspace.path().join("applied.txt").abs());
+    let mut action = ApplyPatchAction::new_add_for_test(&path, "hello".to_string());
+    // The metadata-only helper carries an Update patch; this witness executes
+    // a real Add patch, consistent with its Add change map.
+    action.patch =
+        "*** Begin Patch\n*** Add File: applied.txt\n+hello\n*** End Patch\n".to_string();
+    let request = ApplyPatchRequest {
+        turn_environment: test_turn_environment(codex_exec_server::LOCAL_ENVIRONMENT_ID),
+        action,
+        file_paths: vec![path],
+        changes: Arc::new(HashMap::new()),
+        exec_approval_requirement: ExecApprovalRequirement::Skip {
+            bypass_sandbox: false,
+            proposed_execpolicy_amendment: None,
+        },
+        additional_permissions: None,
+        permissions_preapproved: false,
+    };
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let step = session
+        .capture_step_context(Arc::clone(&turn), &cancellation)
+        .await
+        .unwrap();
+    let ctx = ToolCtx {
+        session: Arc::clone(&session),
+        step_context: step,
+        cancellation_token: cancellation,
+        call_id: "cleanup-attempt".into(),
+        tool_name: codex_tools::ToolName::plain("apply_patch"),
+    };
+    let permissions = PermissionProfile::Disabled;
+    let manager = SandboxManager::new();
+    let cwd = PathUri::from_abs_path(&workspace.path().abs());
+    let attempt = SandboxAttempt {
+        sandbox_override: SandboxOverride::NoOverride,
+        sandbox: SandboxType::None,
+        sandbox_requested: false,
+        permissions: &permissions,
+        exec_server_permissions: &permissions,
+        enforce_managed_network: false,
+        manager: &manager,
+        sandbox_cwd: &cwd,
+        workspace_roots: std::slice::from_ref(&cwd),
+        sandbox_exe: None,
+        use_legacy_landlock: false,
+        windows_sandbox_type: SandboxType::None,
+        windows_sandbox_level: WindowsSandboxLevel::Disabled,
+        network_denial_cancellation_token: None,
+        network_proxy: None,
+    };
+    let before = session.services.sandbox_cleanup_census().totals();
+    let mut runtime = ApplyPatchRuntime::new();
+    for _ in 0..2 {
+        let output = runtime.run(&request, &attempt, &ctx).await.unwrap();
+        assert_eq!(
+            output.exec_output.exit_code, 0,
+            "{}",
+            output.exec_output.stderr.text
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("applied.txt")).unwrap(),
+        "hello\n"
+    );
+    let after = session.services.sandbox_cleanup_census().totals();
+    assert_eq!(after.no_launch, before.no_launch + 2);
+    assert_eq!(after.operations, before.operations);
+}
+
+#[tokio::test]
+async fn direct_and_intercepted_patch_verification_record_separate_cleanup() {
+    let workspace = tempfile::tempdir().unwrap();
+    let target = workspace.path().join("verified.txt");
+    std::fs::write(&target, "before\n").unwrap();
+    let patch = format!(
+        "*** Begin Patch\n*** Update File: {}\n@@\n-before\n+after\n*** End Patch\n",
+        target.display()
+    );
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let turn = Arc::new(turn);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let step = session.capture_step_context(turn, &cancel).await.unwrap();
+    let mut environment = step.environments.primary().unwrap().clone();
+    environment.selection.cwd = PathUri::from_abs_path(&workspace.path().abs());
+    environment.config_mut().permission_profile =
+        PermissionProfileSnapshot::legacy(PermissionProfile::Disabled);
+    let census = session.services.sandbox_cleanup_census();
+    let before = census.totals();
+    crate::tools::handlers::apply_patch::prepare_patch_request(&patch, &environment, &step, census)
+        .await
+        .unwrap();
+    let command = vec!["apply_patch".to_string(), patch];
+    let fs = environment.environment().get_filesystem();
+    assert!(
+        crate::tools::handlers::apply_patch::prepare_intercepted_patch(
+            &command,
+            environment.cwd(),
+            fs.as_ref(),
+            &environment,
+            &step,
+            census
+        )
+        .await
+        .unwrap()
+        .is_some()
+    );
+    let after = census.totals();
+    assert_eq!(after.no_launch, before.no_launch + 2);
+    assert_eq!(after.operations, before.operations);
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "before\n",
+        "verification must not apply the patch"
     );
 }

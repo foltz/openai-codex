@@ -108,6 +108,12 @@ pub(crate) struct SessionServices {
 }
 
 impl SessionServices {
+    pub(crate) fn sandbox_cleanup_census(
+        &self,
+    ) -> &Arc<crate::sandboxing::cleanup_census::SandboxCleanupCensus> {
+        self.unified_exec_manager.sandbox_cleanup_census()
+    }
+
     #[expect(
         clippy::expect_used,
         reason = "poisoned grants must not authorize discovery"

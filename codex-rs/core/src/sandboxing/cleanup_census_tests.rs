@@ -658,3 +658,60 @@ fn remote_unknown_stream_cancellation_cannot_be_relabelled_as_local_absence() {
     );
     assert!(totals.has_unproven());
 }
+
+#[tokio::test]
+async fn cancelled_stream_open_cannot_erase_launch_debt() {
+    use futures::FutureExt;
+    let census = Arc::new(SandboxCleanupCensus::default());
+    let receipts = PendingStreamReceipts::new(Arc::clone(&census), true);
+    let mut opening = Box::pin(receipts.open(futures::future::pending));
+    assert!(opening.as_mut().now_or_never().is_none());
+    drop(opening);
+    drop(receipts);
+    assert_eq!(
+        (census.totals().operations, census.totals().missing_receipt),
+        (1, 1)
+    );
+}
+
+#[tokio::test]
+async fn completed_stream_open_transfers_debt_without_double_recording() {
+    let census = Arc::new(SandboxCleanupCensus::default());
+    let receipts = PendingStreamReceipts::new(Arc::clone(&census), true);
+    assert!(
+        receipts
+            .open(|| async {
+                ReadStreamOutcome::from_open(
+                    Err(std::io::Error::other("open failed")),
+                    Some(receipt(SandboxCleanupState::Complete, true)),
+                    SandboxLaunch::Launched,
+                )
+            })
+            .await
+            .is_err()
+    );
+    assert_eq!(census.totals().operations, 0);
+    receipts.settle(STREAM_RECEIPT_SETTLE_GRACE).await;
+    drop(receipts);
+    assert_eq!(
+        (census.totals().operations, census.totals().complete),
+        (1, 1)
+    );
+}
+
+#[tokio::test]
+async fn stream_open_guard_precedes_backend_future_construction() {
+    use futures::FutureExt;
+    let census = Arc::new(SandboxCleanupCensus::default());
+    let receipts = PendingStreamReceipts::new(Arc::clone(&census), true);
+    let result =
+        std::panic::AssertUnwindSafe(receipts.open(|| -> std::future::Ready<ReadStreamOutcome> {
+            panic!("backend refused before returning its future");
+        }))
+        .catch_unwind()
+        .await;
+    assert!(result.is_err());
+    drop(receipts);
+    let totals = census.totals();
+    assert_eq!((totals.operations, totals.missing_receipt), (1, 1));
+}

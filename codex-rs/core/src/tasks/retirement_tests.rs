@@ -29,7 +29,7 @@ async fn settled_join_replays_after_deadline_without_reobserving() {
         .completion
         .clone();
     assert!(completion.await);
-    handle.detach();
+    drop(handle.detach());
     let deadline = Instant::now();
     tokio::time::advance(Duration::from_secs(1)).await;
     assert_eq!(
@@ -50,7 +50,7 @@ async fn many_completed_tasks_retain_only_the_latest_join() {
             state.entries[0].completion.clone()
         };
         assert!(completion.await);
-        handle.detach();
+        drop(handle.detach());
     }
     assert_eq!(
         registry
@@ -85,9 +85,11 @@ async fn dropping_active_capability_aborts_but_does_not_discard_join() {
 #[tokio::test]
 async fn detached_active_handle_still_has_an_observable_join() {
     let registry = TaskJoinRegistry::default();
-    registry
-        .register(tokio::spawn(std::future::pending::<()>()))
-        .detach();
+    drop(
+        registry
+            .register(tokio::spawn(std::future::pending::<()>()))
+            .detach(),
+    );
     assert_eq!(
         registry
             .shutdown_until(Instant::now() + Duration::from_secs(1))
@@ -126,7 +128,7 @@ async fn completed_join_compaction_keeps_failure_sticky() {
     while !handle.abort.is_finished() {
         tokio::task::yield_now().await;
     }
-    handle.detach();
+    drop(handle.detach());
     let next = registry.register(tokio::spawn(std::future::pending::<()>()));
     assert_eq!(registry.state.lock().expect("state").entries.len(), 1);
     assert_eq!(
@@ -145,7 +147,7 @@ async fn detached_observer_joins_before_reporting_completion() {
     let handle = registry.register(tokio::spawn(async move {
         let _ = receive.await;
     }));
-    let mut observer = handle.detach();
+    let mut observer = drop(handle.detach());
     assert!(
         tokio::time::timeout(Duration::from_millis(1), &mut observer)
             .await

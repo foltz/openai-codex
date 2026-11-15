@@ -58,6 +58,7 @@ impl TaskAbortHandle {
         self.abort.is_finished()
     }
 
+    #[cfg(test)]
     pub(crate) async fn wait(&self) -> bool {
         match &self.completion {
             Some(completion) => completion.clone().await,

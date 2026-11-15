@@ -13718,3 +13718,82 @@ async fn rejected_mcp_refresh_then_corrected_user_config_blocks_ordinary_replace
         "rejection must not permit same-name ordinary-auth replacement in this session"
     );
 }
+
+#[tokio::test]
+async fn task_retirement_closes_empty_reservation_and_refuses_late_start() {
+    let (session, context) = make_session_and_context().await;
+    let session = Arc::new(session);
+    *session.active_turn.lock().await = Some(ActiveTurn::default());
+    session.close_task_admission().await;
+    session.close_task_admission().await;
+    assert!(
+        session
+            .task_admission_closed
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
+    assert!(session.active_turn.lock().await.is_none());
+    session
+        .start_task(
+            Arc::new(context),
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: false,
+            },
+        )
+        .await;
+    assert!(
+        session.active_turn.lock().await.is_none(),
+        "closed admission must not publish a task"
+    );
+    assert_eq!(
+        session
+            .task_joins
+            .shutdown_until(tokio::time::Instant::now())
+            .await,
+        crate::tasks::TaskJoinOutcome::Complete { panicked: false }
+    );
+}
+
+#[tokio::test]
+async fn task_retirement_preserves_active_task_until_abort_and_original_join() {
+    let (session, context) = make_session_and_context().await;
+    let session = Arc::new(session);
+    session
+        .start_task(
+            Arc::new(context),
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: false,
+            },
+        )
+        .await;
+    assert!(
+        session
+            .active_turn
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|turn| turn.task.is_some())
+    );
+    session.close_task_admission().await;
+    assert!(
+        session
+            .active_turn
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|turn| turn.task.is_some()),
+        "closing admission must retain the active task for ordered abort"
+    );
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+    assert_eq!(
+        session
+            .task_joins
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await,
+        crate::tasks::TaskJoinOutcome::Complete { panicked: false }
+    );
+    assert!(session.active_turn.lock().await.is_none());
+}

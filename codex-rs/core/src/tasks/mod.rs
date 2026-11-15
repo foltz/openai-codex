@@ -780,7 +780,7 @@ impl Session {
                 }
             }
             let task = active_turn.task.take()?;
-            task.handle.detach();
+            drop(task.handle.detach());
             active_turn.finishing = Some(finishing);
             (
                 Arc::clone(&active_turn.turn_state),

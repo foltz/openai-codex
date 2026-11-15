@@ -245,12 +245,20 @@ where
     }
 }
 
+// A retained context may be reused; an old prepared snapshot must not publish
+// through a different host preparation even when the textual turn ID matches.
+struct PreparedGoalTurn {
+    accounting: GoalTurnPreparation,
+    resources: Arc<TurnPreparationAccess>,
+}
+
 impl<C> TurnLifecycleContributor for GoalExtension<C>
 where
     C: Send + Sync + 'static,
 {
     fn on_turn_start<'a>(&'a self, input: TurnStartInput<'a>) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
+            input.turn_store.remove::<PreparedGoalTurn>();
             let Some(runtime) = goal_runtime_handle(input.thread_store) else {
                 return;
             };
@@ -284,7 +292,10 @@ where
                 input.collaboration_mode.mode,
                 codex_protocol::config_types::ModeKind::Plan
             ) {
-                input.turn_store.insert(prepared);
+                input.turn_store.insert(PreparedGoalTurn {
+                    accounting: prepared,
+                    resources,
+                });
                 return;
             }
             let Ok(goal) = self
@@ -293,7 +304,10 @@ where
                 .get_thread_goal(runtime.thread_id())
                 .await
             else {
-                input.turn_store.insert(prepared);
+                input.turn_store.insert(PreparedGoalTurn {
+                    accounting: prepared,
+                    resources,
+                });
                 return;
             };
             if let Some(goal) = goal
@@ -305,7 +319,10 @@ where
             {
                 prepared.activate_goal(goal.goal_id, &accounting);
             }
-            input.turn_store.insert(prepared);
+            input.turn_store.insert(PreparedGoalTurn {
+                accounting: prepared,
+                resources,
+            });
         })
     }
 
@@ -313,12 +330,18 @@ where
         let Some(runtime) = goal_runtime_handle(input.thread_store) else {
             return;
         };
-        let Some(prepared) = input.turn_store.remove::<GoalTurnPreparation>() else {
+        let Some(prepared) = input.turn_store.remove::<PreparedGoalTurn>() else {
             return;
         };
+        let Some(current) = input.turn_store.get::<TurnPreparationAccess>() else {
+            return;
+        };
+        if !Arc::ptr_eq(&prepared.resources, &current) {
+            return;
+        }
         runtime
             .accounting_state()
-            .commit_prepared_turn(input.turn_id, &prepared);
+            .commit_prepared_turn(input.turn_id, &prepared.accounting);
     }
 
     fn on_item_completed<'a>(

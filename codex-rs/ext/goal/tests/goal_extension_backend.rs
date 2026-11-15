@@ -2352,3 +2352,76 @@ async fn actual_goal_preparation_permit_releases_on_drop_and_commit_with_retaine
     drop(following);
     Ok(())
 }
+
+#[tokio::test]
+async fn retained_goal_snapshot_cannot_commit_through_a_new_preparation_with_the_same_id()
+-> anyhow::Result<()> {
+    let runtime = test_runtime().await?;
+    let thread_id = test_thread_id()?;
+    seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+    runtime
+        .thread_goals()
+        .replace_thread_goal(
+            thread_id,
+            "goal",
+            codex_state::ThreadGoalStatus::Active,
+            None,
+        )
+        .await?;
+    let harness = GoalExtensionHarness::new(Arc::clone(&runtime), thread_id).await?;
+    let abandoned = harness
+        .prepare_turn("reused", ModeKind::Default, &TokenUsage::default())
+        .await;
+    let retained = Arc::clone(&abandoned.store);
+    drop(abandoned);
+    let different = TurnPreparationOwner::new("reused");
+    retained.insert(different.access());
+    for contributor in harness.registry.turn_lifecycle_contributors() {
+        contributor.on_turn_committed(TurnCommittedInput {
+            turn_id: "reused",
+            session_store: &harness.session_store,
+            thread_store: &harness.thread_store,
+            turn_store: &retained,
+        });
+    }
+    harness
+        .record_token_usage("reused", &input_token_usage(41))
+        .await;
+    harness
+        .runtime_handle()
+        .prepare_external_goal_mutation()
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(
+        0,
+        runtime
+            .thread_goals()
+            .get_thread_goal(thread_id)
+            .await?
+            .expect("goal")
+            .tokens_used
+    );
+    drop(different);
+    let accepted = harness
+        .prepare_turn("reused", ModeKind::Default, &TokenUsage::default())
+        .await;
+    harness.commit_turn(&accepted);
+    harness
+        .record_token_usage("reused", &input_token_usage(9))
+        .await;
+    harness
+        .runtime_handle()
+        .prepare_external_goal_mutation()
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(
+        9,
+        runtime
+            .thread_goals()
+            .get_thread_goal(thread_id)
+            .await?
+            .expect("goal")
+            .tokens_used
+    );
+    Ok(())
+}

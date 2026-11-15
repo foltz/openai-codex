@@ -953,7 +953,15 @@ async fn pool_keeps_late_release_join_when_the_chat_and_its_slot_are_dropped() {
     let mut peer = LeasePeer::new();
     let (first, _) = peer.chat().await;
     let (other, _) = peer.chat().await;
+    let ConnectionSharing::Shared(first_lease) = &first.connection_sharing else {
+        panic!("expected shared lease");
+    };
+    let weak_slot = Arc::downgrade(&first_lease.slot);
     drop(first);
+    assert!(
+        weak_slot.upgrade().is_none(),
+        "the ordinary chat slot must be gone"
+    );
     let release = peer.next("codex/connection/release").await;
     tokio::time::advance(LEASE_REQUEST_TIMEOUT).await;
     tokio::task::yield_now().await;

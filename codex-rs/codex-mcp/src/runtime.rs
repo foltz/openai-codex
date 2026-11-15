@@ -1066,6 +1066,8 @@ pub struct McpRuntimeContext {
     ready_environments: HashMap<String, Arc<Environment>>,
     local_process_cwd: PathBuf,
     local_http_client: Arc<dyn HttpClient>,
+    canonical_thread_id: Option<String>,
+    control_endpoint: Option<String>,
 }
 
 /// Applies the local HTTP headers helper configured for an MCP server.
@@ -1115,7 +1117,34 @@ impl McpRuntimeContext {
             ready_environments: HashMap::new(),
             local_process_cwd,
             local_http_client,
+            canonical_thread_id: None,
+            control_endpoint: None,
         }
+    }
+
+    /// Supplies the owning session's canonical identity; threadless callers
+    /// deliberately retain None. The value is never initialize metadata.
+    pub fn with_canonical_thread_id(mut self, thread_id: String) -> Self {
+        self.canonical_thread_id = Some(thread_id);
+        self
+    }
+
+    /// Supplies only the hosting listener's endpoint. Isolated callers keep None.
+    pub fn with_control_endpoint(mut self, endpoint: Option<String>) -> Self {
+        self.control_endpoint = endpoint;
+        self
+    }
+
+    pub(crate) fn connection_bindings(
+        &self,
+        config: &codex_config::McpServerConfig,
+    ) -> crate::connection_handshake::ConnectionBindings {
+        crate::connection_handshake::ConnectionBindings::new(
+            config.thread_identity_eligible,
+            self.canonical_thread_id.clone(),
+            config.control_endpoint_eligible,
+            self.control_endpoint.clone(),
+        )
     }
 
     /// Uses this process's pool for compatible local stdio servers using MCP 2026-07-28.
@@ -1246,6 +1275,8 @@ mod tests {
             required: false,
             startup_readiness: Default::default(),
             supports_parallel_tool_calls: false,
+            thread_identity_eligible: false,
+            control_endpoint_eligible: false,
             tool_input_schema_max_bytes: None,
             omit_tools_from: None,
             disabled_reason: None,

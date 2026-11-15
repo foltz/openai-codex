@@ -45,6 +45,10 @@ impl ConnectionBindings {
         }
     }
 
+    pub(crate) fn requires_binding_gate(&self) -> bool {
+        self.canonical_thread_id.is_some() || self.control_endpoint.is_some()
+    }
+
     fn requests(&self, direct_peer_info: &ServerPeerInfo) -> Vec<(&'static str, Value)> {
         let mut requests = Vec::new();
         if let Some(thread_id) = &self.canonical_thread_id

@@ -756,6 +756,8 @@ async fn run_code_mode_turn_with_rmcp_config(
                 required: false,
                 startup_readiness: Default::default(),
                 supports_parallel_tool_calls: false,
+                thread_identity_eligible: false,
+                control_endpoint_eligible: false,
                 tool_input_schema_max_bytes: None,
                 omit_tools_from: None,
                 disabled_reason: None,

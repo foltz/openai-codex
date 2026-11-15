@@ -42,6 +42,8 @@ fn server(url: &str) -> McpServerConfig {
         required: true,
         startup_readiness: Default::default(),
         supports_parallel_tool_calls: true,
+        thread_identity_eligible: false,
+        control_endpoint_eligible: false,
         tool_input_schema_max_bytes: None,
         omit_tools_from: None,
         disabled_reason: None,

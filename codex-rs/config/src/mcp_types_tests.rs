@@ -642,6 +642,8 @@ fn deserialize_ignores_unknown_server_fields() {
             required: false,
             startup_readiness: Default::default(),
             supports_parallel_tool_calls: false,
+            thread_identity_eligible: false,
+            control_endpoint_eligible: false,
             tool_input_schema_max_bytes: None,
             omit_tools_from: None,
             disabled_reason: None,
@@ -740,4 +742,30 @@ fn deserialize_rejects_inline_bearer_token_field() {
         err.to_string().contains("bearer_token is not supported"),
         "unexpected error: {err}"
     );
+}
+
+#[test]
+fn connection_disclosure_is_default_off_and_round_trips_only_explicit_opt_in() {
+    let ordinary: McpServerConfig =
+        serde_json::from_value(serde_json::json!({"command": "fixture"})).unwrap();
+    assert!(!ordinary.thread_identity_eligible);
+    assert!(!ordinary.control_endpoint_eligible);
+    let encoded = serde_json::to_value(&ordinary).unwrap();
+    assert!(encoded.get("thread_identity_eligible").is_none());
+    assert!(encoded.get("control_endpoint_eligible").is_none());
+
+    let opted_in: McpServerConfig = serde_json::from_value(serde_json::json!({
+        "command": "fixture", "thread_identity_eligible": true, "control_endpoint_eligible": true,
+    }))
+    .unwrap();
+    assert!(opted_in.thread_identity_eligible);
+    assert!(opted_in.control_endpoint_eligible);
+    let serialized = toml::to_string(&opted_in).unwrap();
+    let decoded: McpServerConfig = toml::from_str(&serialized).unwrap();
+    assert_eq!(decoded, opted_in);
+    for key in ["thread_identity_eligible", "control_endpoint_eligible"] {
+        let mut value = serde_json::json!({"command": "fixture"});
+        value[key] = serde_json::json!("true");
+        assert!(serde_json::from_value::<McpServerConfig>(value).is_err());
+    }
 }

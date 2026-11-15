@@ -1524,15 +1524,20 @@ async fn permanent_edge_clamps_unpublished_custody_and_refuses_late_birth() {
 
 #[tokio::test]
 async fn real_constructor_cancelled_before_publication_is_drained_after_close() {
-    real_account_constructor_case(false).await;
+    real_account_constructor_case(false, false).await;
 }
 
 #[tokio::test]
 async fn explicit_constructor_operation_does_not_rediscover_an_ended_request() {
-    real_account_constructor_case(true).await;
+    real_account_constructor_case(true, false).await;
 }
 
-async fn real_account_constructor_case(explicit: bool) {
+#[tokio::test]
+async fn real_initial_mcp_original_keeps_account_work_after_constructor_observer_drop() {
+    real_account_constructor_case(false, true).await;
+}
+
+async fn real_account_constructor_case(explicit: bool, hold_mcp: bool) {
     use crate::config::ConfigBuilder;
     use crate::thread_manager::StartThreadOptions;
     use crate::thread_manager::ThreadManager;
@@ -1615,6 +1620,11 @@ async fn real_account_constructor_case(explicit: bool) {
         .await
         .unwrap();
     config.ephemeral = true;
+    let mut held_mcp = if hold_mcp {
+        Some(HeldRequiredMcp::install(&mut config).await)
+    } else {
+        None
+    };
     let mut manager = ThreadManager::with_models_provider_and_home_for_tests(
         codex_login::CodexAuth::from_api_key("dummy"),
         config.model_provider.clone(),
@@ -1622,6 +1632,7 @@ async fn real_account_constructor_case(explicit: bool) {
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
     );
     let (release, receiver) = oneshot::channel();
+    let mut instruction_release = Some(release);
     let provider = Arc::new(HeldInstructions {
         entered: AtomicUsize::new(0),
         entry: tokio::sync::Notify::new(),
@@ -1655,11 +1666,27 @@ async fn real_account_constructor_case(explicit: bool) {
     .await
     .expect("constructor reaches held instructions");
     assert_eq!(provider.entered.load(Ordering::SeqCst), 1);
+    assert_eq!(host.operations.load(Ordering::SeqCst), 2);
+    if let Some(mcp) = &held_mcp {
+        instruction_release
+            .take()
+            .unwrap()
+            .send(())
+            .expect("advance actual constructor into MCP startup");
+        reach_held_initialize(observer.as_mut(), mcp).await;
+        assert_eq!(mcp.initialize_attempts(), 1);
+        // Constructor and initial-publication input each retain one operation;
+        // eager driver and actual original each own one further descendant.
+        assert_eq!(host.operations.load(Ordering::SeqCst), 4);
+    }
     // Observer departure is a cancellation request consumed by the retained
     // constructor; the registry still owns and records its completion.
     drop(observer);
     host.request_alive.store(false, Ordering::SeqCst);
-    assert_eq!(host.operations.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        host.operations.load(Ordering::SeqCst),
+        if hold_mcp { 4 } else { 2 }
+    );
     assert!(manager.list_thread_ids().await.is_empty());
     // Account progress must finish counted construction without initiating
     // thread shutdown, which only happens after account adoption.
@@ -1676,10 +1703,20 @@ async fn real_account_constructor_case(explicit: bool) {
     .await
     .expect("abandoned constructor completes before retirement");
     assert_eq!(host.operations.load(Ordering::SeqCst), 0);
-    assert!(
-        release.send(()).is_err(),
-        "the constructor dropped its held start when it consumed cancellation"
-    );
+    if let Some(release) = instruction_release {
+        assert!(
+            release.send(()).is_err(),
+            "the original constructor dropped held instructions on cancellation"
+        );
+    }
+    if let Some(mcp) = &mut held_mcp {
+        assert_eq!(
+            mcp.initialize_attempts(),
+            1,
+            "account drain does not retry initialize"
+        );
+        mcp.release();
+    }
     let startup = first_startup(&manager);
     assert!(
         manager

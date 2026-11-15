@@ -267,7 +267,9 @@ pub(crate) mod inject;
 mod reasoning_effort;
 mod submission;
 pub(crate) use reasoning_effort::RequestEffortUsage;
+pub(crate) use submission::IdleAdmissionError;
 pub(crate) use submission::Submission;
+pub(crate) use submission::SubmissionSender;
 mod input_queue;
 mod mcp;
 mod mcp_prewarm;
@@ -300,7 +302,9 @@ use self::code_mode_warning::unsupported_code_mode_warning;
 pub(crate) use self::environment::ThreadEnvironmentDefaults;
 #[cfg(test)]
 use self::handlers::submission_dispatch_span;
+#[cfg(test)]
 use self::handlers::submission_loop;
+use self::handlers::submission_loop_with_dispatch;
 pub(crate) use self::input_queue::InputQueueActivity;
 pub(crate) use self::input_queue::TurnInput;
 pub(crate) use self::input_queue::TurnInputQueue;
@@ -455,13 +459,64 @@ pub(crate) enum NetworkApprovalTurn {
 /// completion future observes that shutdown.
 #[derive(Clone)]
 pub(crate) struct SessionIo {
-    pub(crate) tx_sub: Sender<Submission>,
+    pub(crate) tx_sub: SubmissionSender,
     pub(crate) rx_event: Receiver<Event>,
     // Last known status of the agent.
     pub(crate) agent_status: watch::Receiver<AgentStatus>,
     // Shared future for the background submission loop completion so multiple
     // callers can wait for shutdown.
     pub(crate) session_loop_termination: SessionLoopTermination,
+}
+
+/// Submission and exact loop control only; never retains event-consumer capabilities.
+#[derive(Clone)]
+pub(crate) struct SessionRetirementIo {
+    pub(crate) tx_sub: SubmissionSender,
+    pub(crate) session_loop_termination: SessionLoopTermination,
+}
+
+impl SessionRetirementIo {
+    pub(crate) async fn submit_shutdown(&self) -> CodexResult<()> {
+        self.tx_sub
+            .send_shutdown(Submission {
+                id: new_submission_id(),
+                op: Op::Shutdown,
+                root_turn_id: None,
+                trace: current_span_w3c_trace_context(),
+                parent_turn_id: None,
+                residency_guard: None,
+                turn_extension_init: None,
+                message_delivery: None,
+            })
+            .await
+            .map_err(|_| CodexErr::InternalAgentDied)?;
+        Ok(())
+    }
+    pub(crate) async fn shutdown_and_wait(&self) -> CodexResult<()> {
+        let session_loop_termination = self.session_loop_termination.clone();
+        match self.submit_shutdown().await {
+            Ok(_) => {}
+            Err(err) if matches!(err.details(), CodexErrorDetails::InternalAgentDied) => {}
+            Err(err) => return Err(err),
+        }
+        match session_loop_termination.await {
+            SessionLoopOutcome::Normal => {
+                if self.session_loop_termination.cleanup_owner.is_none()
+                    || self.session_loop_termination.cleanup_completed()
+                        == Some(retirement::CleanupExecution::Finished {
+                            persistence_failed: false,
+                        })
+                {
+                    Ok(())
+                } else {
+                    Err(CodexErr::InternalAgentDied)
+                }
+            }
+            SessionLoopOutcome::Cancelled | SessionLoopOutcome::Panicked => {
+                Err(CodexErr::InternalAgentDied)
+            }
+        }
+    }
 }
 
 /// Observed original task outcome, not a receipt for all Session resources.
@@ -780,6 +835,7 @@ impl Session {
             windows_sandbox_proxy_settings_mode,
         } = args;
         let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
+        let tx_sub = SubmissionSender::from(tx_sub);
         let (tx_event, rx_event) = async_channel::unbounded();
 
         let isolation = thread_extension_init
@@ -1169,13 +1225,19 @@ impl Session {
         let tree_teardown = startup
             .as_ref()
             .and_then(|startup| startup.session_teardown(thread_id));
+        let submissions = tx_sub.dispatch_control();
         let session_for_loop = Arc::clone(&session);
         let cleanup_owner = session.cleanup_owner();
         let loop_cleanup_owner = Arc::clone(&cleanup_owner);
         let session_loop_handle = tokio::spawn(Box::pin(storage_originator.scope(async move {
-            submission_loop(session_for_loop, configured_config, rx_sub)
-                .instrument(info_span!("session_loop", thread_id = %thread_id))
-                .await;
+            submission_loop_with_dispatch(
+                session_for_loop,
+                configured_config,
+                rx_sub,
+                Some(submissions),
+            )
+            .instrument(info_span!("session_loop", thread_id = %thread_id))
+            .await;
             if let Some(tree_teardown) = tree_teardown {
                 tree_teardown.complete();
             }
@@ -1184,7 +1246,7 @@ impl Session {
         let mut termination = session_loop_termination_from_handle(session_loop_handle);
         termination.cleanup_owner = Some(cleanup_owner);
         let io = SessionIo {
-            tx_sub,
+            tx_sub: tx_sub.into(),
             rx_event,
             agent_status: agent_status_rx,
             session_loop_termination: termination,
@@ -1316,30 +1378,15 @@ impl SessionIo {
         reply_rx.await.unwrap_or(Err(CodexErr::InternalAgentDied))
     }
 
+    pub(crate) fn retirement_io(&self) -> SessionRetirementIo {
+        SessionRetirementIo {
+            tx_sub: self.tx_sub.clone(),
+            session_loop_termination: self.session_loop_termination.clone(),
+        }
+    }
+
     pub(crate) async fn shutdown_and_wait(&self) -> CodexResult<()> {
-        let session_loop_termination = self.session_loop_termination.clone();
-        match self.submit(Op::Shutdown).await {
-            Ok(_) => {}
-            Err(err) if matches!(err.details(), CodexErrorDetails::InternalAgentDied) => {}
-            Err(err) => return Err(err),
-        }
-        match session_loop_termination.await {
-            SessionLoopOutcome::Normal => {
-                if self.session_loop_termination.cleanup_owner.is_none()
-                    || self.session_loop_termination.cleanup_completed()
-                        == Some(retirement::CleanupExecution::Finished {
-                            persistence_failed: false,
-                        })
-                {
-                    Ok(())
-                } else {
-                    Err(CodexErr::InternalAgentDied)
-                }
-            }
-            SessionLoopOutcome::Cancelled | SessionLoopOutcome::Panicked => {
-                Err(CodexErr::InternalAgentDied)
-            }
-        }
+        self.retirement_io().shutdown_and_wait().await
     }
 
     pub(crate) async fn next_event(&self) -> CodexResult<Event> {

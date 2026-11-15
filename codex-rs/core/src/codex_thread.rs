@@ -92,6 +92,14 @@ use uuid::Uuid;
 
 use codex_rollout::state_db::StateDbHandle;
 
+mod retirement;
+pub use retirement::ThreadCleanupOutcome;
+pub use retirement::ThreadLoopOutcome;
+pub use retirement::ThreadRetirement;
+pub use retirement::ThreadRetirementError;
+pub use retirement::ThreadRetirementReport;
+pub use retirement::ThreadShutdownOutcome;
+
 static LIVE_THREADS: Gauge = Gauge::new("core.threads.live");
 
 #[derive(Clone, Debug)]
@@ -206,6 +214,7 @@ pub struct CodexThread {
     startup_metadata: ThreadStartupMetadata,
     rollout_path: Option<PathBuf>,
     out_of_band_elicitations: Mutex<OutOfBandElicitations>,
+    retirement: std::sync::Mutex<Option<ThreadRetirement>>,
     _diagnostics_guard: GaugeGuard,
 }
 
@@ -241,6 +250,7 @@ impl CodexThread {
             startup_metadata,
             rollout_path,
             out_of_band_elicitations: Mutex::new(OutOfBandElicitations::default()),
+            retirement: std::sync::Mutex::new(None),
             _diagnostics_guard: LIVE_THREADS.track(),
         }
     }

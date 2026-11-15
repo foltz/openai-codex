@@ -56,7 +56,7 @@ async fn io_with_original(handle: JoinHandle<()>) -> SessionIo {
     drop(rx_sub);
     let (_tx_event, rx_event) = async_channel::unbounded();
     SessionIo {
-        tx_sub,
+        tx_sub: tx_sub.into(),
         rx_event,
         agent_status: watch::channel(AgentStatus::PendingInit).1,
         session_loop_termination: session_loop_termination_from_handle(handle),

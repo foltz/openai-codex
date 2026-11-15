@@ -595,10 +595,20 @@ pub async fn review(
     }
 }
 
+#[cfg(test)]
 pub(super) async fn submission_loop(
     sess: Arc<Session>,
     config: Arc<Config>,
     rx_sub: Receiver<Submission>,
+) {
+    submission_loop_with_dispatch(sess, config, rx_sub, None).await;
+}
+
+pub(super) async fn submission_loop_with_dispatch(
+    sess: Arc<Session>,
+    config: Arc<Config>,
+    rx_sub: Receiver<Submission>,
+    submissions: Option<super::submission::SubmissionDispatch>,
 ) {
     // Session shutdown and tree shutdown both use the existing teardown handler.
     let mut shutdown_received = false;
@@ -656,6 +666,7 @@ pub(super) async fn submission_loop(
                 continue;
             }
         };
+        let _dispatch = submissions.as_ref().map(|submissions| submissions.begin());
         debug!(
             thread_id = %sess.thread_id(),
             submission_id = %sub.id,

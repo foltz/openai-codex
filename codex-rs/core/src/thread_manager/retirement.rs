@@ -291,6 +291,19 @@ pub(super) struct ConstructionDrain {
 }
 
 impl ThreadConstructions {
+    #[cfg(test)]
+    pub(in crate::thread_manager) fn retains_without_compaction(
+        &self,
+        thread: &Arc<CodexThread>,
+    ) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .published
+            .iter()
+            .any(|owned| Arc::ptr_eq(owned, thread))
+    }
+
     /// Latch the host's shutdown-edge deadline (only tightens) and return the
     /// published population to bind now. Synchronous: one short std mutex.
     pub(super) fn latch_shutdown_deadline(&self, deadline: Instant) -> Vec<Arc<CodexThread>> {

@@ -107,10 +107,15 @@ impl ThreadManagerState {
             runtime
                 .registry
                 .save_evicted_environments(thread_id, environments);
-            let removed = threads.remove(&thread_id).is_some();
+            let removed = threads.remove(&thread_id);
+            let was_removed = removed.is_some();
             runtime.residency.remove(thread_id);
+            drop(threads);
+            // The eviction transaction already observed this exact loop and cleanup.
+            // Compact outside the registry/residency ordering lock, never by ID alone.
+            manager.release_removed_thread(removed.as_ref());
             teardown.complete();
-            Ok(if removed {
+            Ok(if was_removed {
                 ThreadEvictionOutcome::Evicted
             } else {
                 ThreadEvictionOutcome::NotCurrent

@@ -1715,6 +1715,11 @@ impl ThreadManager {
         Box::pin(self.state.spawn_thread(request)).await
     }
 
+    #[cfg(test)]
+    pub(crate) fn population_retains_without_compaction(&self, thread: &Arc<CodexThread>) -> bool {
+        self.constructions.retains_without_compaction(thread)
+    }
+
     /// Removes the thread from the manager's internal map, though the thread is stored
     /// as `Arc<CodexThread>`, it is possible that other references to it exist elsewhere.
     /// Returns the thread if the thread was found and removed.
@@ -2317,6 +2322,11 @@ impl ThreadManagerState {
                 message_delivery,
             )
             .await
+    }
+
+    /// Invoke after releasing any lookup guard: positive proof alone releases population.
+    pub(crate) fn release_removed_thread(&self, removed: Option<&Arc<CodexThread>>) {
+        self.constructions.release_removed(removed);
     }
 
     /// Remove lookup only; positive cleanup evidence controls retained population release.

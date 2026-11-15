@@ -104,6 +104,10 @@ async fn residency_slot_reservation_unloads_oldest_idle_v2_agent() {
         },
         Ok(_) => panic!("expected evicted thread to be missing"),
     }
+    assert!(
+        !manager.population_retains_without_compaction(&first.thread),
+        "real eviction compacts its exact positively retired runtime without a later manager call"
+    );
     let retained = first
         .thread
         .session

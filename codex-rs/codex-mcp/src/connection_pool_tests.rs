@@ -1403,6 +1403,7 @@ async fn assert_event_pool_retired(pool: &McpConnectionPool) {
     let workers = pool
         .observe_workers_until(tokio::time::Instant::now() + Duration::from_secs(1))
         .await;
+    assert!(workers.counts[1].joined > 0);
     assert_eq!(workers.counts[1].pending, 0);
     assert_eq!(workers.counts[1].panicked + workers.counts[1].cancelled, 0);
     let report = pool
@@ -1458,7 +1459,6 @@ async fn borrowed_event_stream_keeps_ordinary_lease_until_cancellation_finishes(
     );
     result.unwrap();
     drop(other);
-    peer.next("codex/connection/release").await.reply(json!({}));
     assert_event_pool_retired(&peer.pool).await;
 }
 
@@ -1486,7 +1486,6 @@ async fn borrowed_event_completion_releases_only_its_holder() {
     assert!(!other.client.is_closed().await);
     drop(stream);
     drop(other);
-    peer.next("codex/connection/release").await.reply(json!({}));
     assert_event_pool_retired(&peer.pool).await;
 }
 
@@ -1504,7 +1503,6 @@ async fn independent_event_stream_keeps_its_transport_until_drop() {
     drop(stream);
     let cancel = event_frame(&mut frames, "notifications/cancelled").await;
     assert_eq!(cancel.message["params"]["requestId"], request.message["id"]);
-    request.reply(json!({}));
     assert_event_pool_retired(&pool).await;
     assert!(client.is_closed().await);
 }
@@ -1526,10 +1524,9 @@ async fn independent_event_completion_is_retained_and_physically_closed() {
 async fn event_stream_drop_outside_runtime_keeps_original_cleanup_join() {
     let pool = McpConnectionPool::default();
     let (stream, mut frames, client) = private_event_stream(&pool).await;
-    let request = event_frame(&mut frames, "events/stream").await;
+    let _request = event_frame(&mut frames, "events/stream").await;
     std::thread::spawn(move || drop(stream)).join().unwrap();
     event_frame(&mut frames, "notifications/cancelled").await;
-    request.reply(json!({}));
     assert_event_pool_retired(&pool).await;
     assert!(client.is_closed().await);
 }
@@ -1612,6 +1609,5 @@ async fn event_binding_refuses_foreign_transport_without_closing_it() {
     );
     result.unwrap();
     drop(foreign);
-    peer.next("codex/connection/release").await.reply(json!({}));
     assert_event_pool_retired(&peer.pool).await;
 }

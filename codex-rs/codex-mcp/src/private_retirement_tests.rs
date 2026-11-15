@@ -422,7 +422,7 @@ async fn private_adapter_retains_cancelled_caller_and_late_transport() {
         .expect("real private factory entered")
         .forget();
     caller.abort();
-    assert!(caller.await.unwrap_err().is_cancelled());
+    assert!(matches!(caller.await, Err(error) if error.is_cancelled()));
     let pending = control.shutdown_until(Instant::now()).await;
     assert!(!pending.is_complete());
     assert_eq!(pending.connections.len(), 1);

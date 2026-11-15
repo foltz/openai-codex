@@ -149,7 +149,7 @@ mod plugin_config;
 pub(crate) mod private_retirement;
 mod resource_client;
 mod resource_origin;
-mod rmcp_client;
+pub(crate) mod rmcp_client;
 pub(crate) mod runtime;
 mod sandbox_executable;
 mod sandbox_metadata;

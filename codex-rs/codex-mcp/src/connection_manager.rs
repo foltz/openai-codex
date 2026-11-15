@@ -332,6 +332,7 @@ pub(crate) struct PreviousMcpConnections<'a> {
 
 /// A published view over a set of running MCP server connections.
 pub(crate) struct McpConnectionSet {
+    pub(crate) retirement: crate::McpRuntimeRetirement,
     pub(crate) workers: crate::McpWorkerOwner,
     config: Option<Arc<crate::McpConfig>>,
     network_policy_metadata: Option<Arc<dyn NetworkPolicyMetadataProvider>>,
@@ -349,6 +350,11 @@ pub(crate) struct McpConnectionSet {
 }
 
 impl McpConnectionSet {
+    pub(crate) fn with_retirement_owner(mut self, retirement: crate::McpRuntimeRetirement) -> Self {
+        self.retirement = retirement;
+        self
+    }
+
     pub(crate) fn with_worker_owner(mut self, workers: crate::McpWorkerOwner) -> Self {
         self.workers = workers;
         self
@@ -388,6 +394,7 @@ impl McpConnectionSet {
             elicitation_reviewer,
             elicitation_lifecycle,
         } = input;
+        let retirement = runtime_context.retirement.clone().unwrap_or_default();
         let workers = runtime_context.workers.clone();
         let event_pool = runtime_context.connection_pool.clone().unwrap_or_default();
         let store_mode = config.mcp_oauth_credentials_store_mode;
@@ -1111,6 +1118,7 @@ impl McpConnectionSet {
             }
         }
         let manager = Self {
+            retirement,
             workers: workers.clone(),
             config: Some(config),
             network_policy_metadata,
@@ -1206,6 +1214,7 @@ impl McpConnectionSet {
 
     pub fn empty(prefix_mcp_tool_names: bool) -> Self {
         Self {
+            retirement: crate::McpRuntimeRetirement::default(),
             workers: crate::McpWorkerOwner::default(),
             config: None,
             network_policy_metadata: None,

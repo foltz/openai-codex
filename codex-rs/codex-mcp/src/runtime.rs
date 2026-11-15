@@ -126,6 +126,7 @@ pub struct McpRuntimeInput {
 /// Publication replaces the latest state atomically. Existing bindings retain
 /// their exact connections and configuration for as long as they are needed.
 pub struct McpRuntime {
+    retirement: crate::McpRuntimeRetirement,
     workers: crate::McpWorkerOwner,
     current: ArcSwap<PublishedMcpRuntime>,
     // This mutex is held only through synchronous publication, never network I/O or call drain.
@@ -283,12 +284,25 @@ impl McpRuntime {
     /// This is useful while constructing a thread that must publish a stable
     /// runtime handle before its full MCP inputs are available.
     pub fn empty(prefix_mcp_tool_names: bool) -> Self {
+        Self::empty_in_retirement(
+            prefix_mcp_tool_names,
+            crate::McpRuntimeRetirement::default(),
+        )
+    }
+
+    pub fn empty_in_retirement(
+        prefix_mcp_tool_names: bool,
+        retirement: crate::McpRuntimeRetirement,
+    ) -> Self {
         let workers = crate::McpWorkerOwner::default();
         Self {
+            retirement: retirement.clone(),
             workers: workers.clone(),
             current: ArcSwap::from_pointee(PublishedMcpRuntime {
                 connections: Arc::new(
-                    McpConnectionSet::empty(prefix_mcp_tool_names).with_worker_owner(workers),
+                    McpConnectionSet::empty(prefix_mcp_tool_names)
+                        .with_worker_owner(workers)
+                        .with_retirement_owner(retirement),
                 ),
                 config: None,
                 auth: None,
@@ -409,7 +423,11 @@ impl McpRuntime {
     }
 
     async fn publish(&self, mut input: McpRuntimeInput, reuse_previous: bool) {
+        if self.retirement.is_closed() {
+            return;
+        }
         input.runtime_context.workers = self.workers.clone();
+        input.runtime_context.retirement = Some(self.retirement.clone());
         // Also cover callers which replace the runtime without Core's dirty-state machinery.
         self.invalidate_apps_tool_refresh();
         let current = self.current.load_full();
@@ -1042,7 +1060,12 @@ impl McpRuntime {
         self.workers.clone()
     }
 
+    pub fn retirement_owner(&self) -> crate::McpRuntimeRetirement {
+        self.retirement.clone()
+    }
+
     pub async fn shutdown(&self) {
+        self.retirement.close_registration();
         self.elicitation_router.close().await;
         let superseded = std::mem::take(
             &mut *self
@@ -1077,6 +1100,7 @@ impl McpRuntime {
 /// environment registry, captured thread selections, and the host-local cwd used by MCP processes.
 #[derive(Clone)]
 pub struct McpRuntimeContext {
+    pub(crate) retirement: Option<crate::McpRuntimeRetirement>,
     pub(crate) workers: crate::McpWorkerOwner,
     pub(crate) connection_pool: Option<McpConnectionPool>,
     environment_manager: Arc<EnvironmentManager>,
@@ -1123,12 +1147,18 @@ pub fn apply_http_headers_helper(
 }
 
 impl McpRuntimeContext {
+    pub(crate) fn without_retirement_owner(mut self) -> Self {
+        self.retirement = None;
+        self
+    }
+
     pub fn new(environment_manager: Arc<EnvironmentManager>, local_process_cwd: PathBuf) -> Self {
         let local_http_client = Arc::new(
             RouteAwareHttpClient::new(environment_manager.http_client_factory().clone())
                 .with_tls_backend_fallback(),
         );
         Self {
+            retirement: Some(crate::McpRuntimeRetirement::default()),
             workers: crate::McpWorkerOwner::default(),
             connection_pool: None,
             environment_manager,

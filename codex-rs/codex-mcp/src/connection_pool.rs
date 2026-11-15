@@ -8,6 +8,8 @@ mod event_lease;
 pub(crate) use event_lease::EventConnectionLease;
 mod physical;
 mod slot_retirement;
+pub use slot_retirement::SlotReleaseOutcome;
+pub use slot_retirement::SlotReleaseSnapshot;
 mod worker_joins;
 
 use physical::PhysicalOwner;
@@ -497,6 +499,7 @@ impl McpConnectionPool {
                     server_lease: OnceLock::new(),
                     workers: Arc::clone(&self.workers),
                 });
+                lease.release_receipt.bind(&lease);
                 *state = SlotState::Acquired(Arc::downgrade(&lease.entry));
                 (lease, role)
             };

@@ -364,6 +364,7 @@ impl ManagedClientStartup {
             .startup_timeout_sec
             .unwrap_or(DEFAULT_STARTUP_TIMEOUT);
         let cancel_token_for_fut = cancel_token;
+        let runtime_context = runtime_context.without_retirement_owner();
         let startup = async move {
             let workers = runtime_context.workers.clone();
             let connection_bindings = runtime_context.connection_bindings(server.config());
@@ -582,6 +583,25 @@ impl AsyncManagedClient {
             pool_catalog.clone()
         };
         let private_retirement = PrivateClientRetirement::default();
+        let reserved_slot = connection_pool
+            .as_ref()
+            .map(|_| Arc::new(ConnectionSlot::default()));
+        if let Some(owner) = &runtime_context.retirement
+            && owner
+                .register_connection(
+                    private_retirement.clone(),
+                    reserved_slot.clone(),
+                    cancel_token.clone(),
+                )
+                .is_err()
+        {
+            private_retirement.close_registration();
+            if let Some(slot) = &reserved_slot {
+                slot.close_acquisition();
+            }
+            cancel_token.cancel();
+            startup_complete.store(true, Ordering::Release);
+        }
         let startup = Arc::new(ManagedClientStartup {
             private_retirement: private_retirement.clone(),
             ema_auth,
@@ -608,7 +628,7 @@ impl AsyncManagedClient {
             server_capabilities: Arc::clone(&server_capabilities),
         });
         let (client, connection_slot) = if let Some((pool, key)) = connection_pool {
-            let slot = Arc::new(ConnectionSlot::default());
+            let slot = reserved_slot.expect("pooled startup reserves its slot before construction");
             let connection_slot = Arc::clone(&slot);
             let startup = Arc::clone(&startup);
             let cancel_token = cancel_token.clone();

@@ -165,6 +165,10 @@ impl PrivateClientRetirement {
         self.registry.close_registration();
     }
 
+    pub(crate) fn fence_construction(&self) {
+        self.registry.fence_registration();
+    }
+
     /// Observe the retained exact population; incomplete results retain custody.
     pub async fn shutdown_until(&self, deadline: Instant) -> PrivateTerminationReport {
         self.registry.shutdown_until(deadline).await
@@ -252,8 +256,8 @@ impl PrivateRetirementRegistry {
         }
     }
 
-    pub(crate) fn close_registration(&self) {
-        let state = {
+    fn fence_registration(&self) {
+        {
             let mut state = self
                 .state
                 .lock()
@@ -272,9 +276,18 @@ impl PrivateRetirementRegistry {
             for owner in &state.connections {
                 owner.lower.close_registration();
             }
-            state.connections.clone()
-        };
-        for owner in state {
+        }
+    }
+
+    pub(crate) fn close_registration(&self) {
+        self.fence_registration();
+        let owners = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .connections
+            .clone();
+        for owner in owners {
             owner.cancellation.cancel();
         }
     }

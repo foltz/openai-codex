@@ -1,7 +1,10 @@
 //! Exact per-slot release receipts, without another ordinary lease owner.
 
+use super::ConnectionLease;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::sync::Weak;
 
 use codex_rmcp_client::PhysicalRetirementReport;
 use tokio::time::Instant;
@@ -12,7 +15,7 @@ use super::SlotState;
 use super::physical::PhysicalOwner;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum SlotReleaseOutcome {
+pub enum SlotReleaseOutcome {
     AwaitingOrdinaryRelease,
     ReleaseWorkerRunning,
     ReleasedWithoutServerLease,
@@ -23,7 +26,7 @@ pub(crate) enum SlotReleaseOutcome {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct SlotReleaseSnapshot {
+pub struct SlotReleaseSnapshot {
     pub registered_at_start: u64,
     pub registered_at_end: u64,
     pub acquisition_closed: bool,
@@ -36,7 +39,7 @@ pub(crate) struct SlotReleaseSnapshot {
 impl SlotReleaseSnapshot {
     /// This slot's logical obligations only. A successful non-final release
     /// explicitly does not assert that another chat's physical transport ended.
-    pub(crate) fn is_released(&self) -> bool {
+    pub fn is_released(&self) -> bool {
         self.acquisition_closed
             && !self.poisoned
             && !self.workers.poisoned
@@ -61,12 +64,19 @@ impl SlotReleaseSnapshot {
 }
 
 pub(super) struct ReleaseReceipt {
+    lease: OnceLock<Weak<ConnectionLease>>,
     id: u64,
     physical: Arc<PhysicalOwner>,
     outcome: Mutex<SlotReleaseOutcome>,
 }
 
 impl ReleaseReceipt {
+    pub(super) fn bind(&self, lease: &Arc<ConnectionLease>) {
+        assert!(
+            self.lease.set(Arc::downgrade(lease)).is_ok(),
+            "release authority is bound once"
+        );
+    }
     pub(super) fn record(&self, outcome: SlotReleaseOutcome) {
         *self
             .outcome
@@ -93,6 +103,7 @@ impl ReleaseReceipts {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let receipt = Arc::new(ReleaseReceipt {
+            lease: OnceLock::new(),
             id: records.len() as u64,
             physical,
             outcome: Mutex::new(SlotReleaseOutcome::AwaitingOrdinaryRelease),
@@ -103,6 +114,23 @@ impl ReleaseReceipts {
 }
 
 impl ConnectionSlot {
+    /// Call only after all runtime acquisition/lower gates are fenced. These
+    /// weak upgrades name this slot's exact authorities, not other chat leases.
+    pub(crate) fn release_closed_acquisitions(&self) {
+        self.close_acquisition();
+        let records = self
+            .release_receipts
+            .records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        for record in records {
+            if let Some(lease) = record.lease.get().and_then(Weak::upgrade) {
+                let _ = lease.release();
+            }
+        }
+    }
+
     /// Close only this slot's acquisition gate. Unlike supersession retire(),
     /// this does not evict the still-shared entry from the process reuse pool.
     pub(crate) fn close_acquisition(&self) {

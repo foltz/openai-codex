@@ -112,6 +112,7 @@ impl McpConnectionSet {
             network_policy_metadata: None,
             servers: HashMap::new(),
             workers: crate::McpWorkerOwner::default(),
+            retirement: crate::McpRuntimeRetirement::default(),
             event_stream_connection: None,
             event_pool: Default::default(),
             disabled_servers: Vec::new(),

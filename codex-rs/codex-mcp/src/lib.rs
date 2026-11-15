@@ -164,3 +164,12 @@ pub use worker_joins::McpWorkerKind;
 pub use worker_joins::McpWorkerOwner;
 pub use worker_joins::McpWorkerSnapshot;
 mod worker_joins;
+
+mod runtime_retirement;
+pub use connection_pool::SlotReleaseOutcome;
+pub use connection_pool::SlotReleaseSnapshot;
+pub use private_retirement::PrivateTaskOutcome;
+pub use private_retirement::PrivateTerminationReport;
+pub use runtime_retirement::McpRuntimeRetirement;
+pub use runtime_retirement::RuntimeConnectionReport;
+pub use runtime_retirement::RuntimeConnectionResult;

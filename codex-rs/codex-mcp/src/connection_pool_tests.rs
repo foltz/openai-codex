@@ -1857,3 +1857,78 @@ async fn closed_slot_refuses_late_factory_before_allocating_a_release_record() {
         0
     );
 }
+
+#[tokio::test]
+async fn external_runtime_connection_owner_releases_only_its_exact_chat_lease() {
+    let mut peer = LeasePeer::new();
+    let (first, _) = peer.chat().await;
+    let (other, _) = peer.chat().await;
+    let ConnectionSharing::Shared(lease) = &first.connection_sharing else {
+        panic!("shared lease");
+    };
+    let root = crate::McpRuntimeRetirement::default();
+    root.register_connection(
+        Default::default(),
+        Some(Arc::clone(&lease.slot)),
+        CancellationToken::new(),
+    )
+    .unwrap();
+    root.close_registration();
+    peer.next("codex/connection/release").await.reply(json!({}));
+    let report = root
+        .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await;
+    assert!(report.are_connections_released(), "{report:?}");
+    assert!(
+        report.connections[0]
+            .shared
+            .as_ref()
+            .unwrap()
+            .physical
+            .is_empty()
+    );
+    let (result, ()) = tokio::join!(
+        other.call_tool("test".into(), None, |_| Ok(None), None),
+        async {
+            peer.next("tools/call").await.reply(json!({"content": []}));
+        }
+    );
+    result.unwrap();
+    drop(other);
+    assert_event_pool_retired(&peer.pool).await;
+    assert!(
+        first.client.is_closed().await,
+        "the retained census must not prevent actual final-owner shutdown"
+    );
+}
+
+#[tokio::test]
+async fn retained_runtime_census_does_not_keep_an_ordinary_chat_lease_alive() {
+    let mut peer = LeasePeer::new();
+    let (first, _) = peer.chat().await;
+    let (other, _) = peer.chat().await;
+    let ConnectionSharing::Shared(lease) = &first.connection_sharing else {
+        panic!("shared lease");
+    };
+    let weak = Arc::downgrade(lease);
+    let root = crate::McpRuntimeRetirement::default();
+    root.register_connection(
+        Default::default(),
+        Some(Arc::clone(&lease.slot)),
+        CancellationToken::new(),
+    )
+    .unwrap();
+    drop(first);
+    assert!(
+        weak.upgrade().is_none(),
+        "the external census stores only weak release authority"
+    );
+    peer.next("codex/connection/release").await.reply(json!({}));
+    let report = root
+        .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await;
+    assert!(report.are_connections_released());
+    assert!(!other.client.is_closed().await);
+    drop(other);
+    assert_event_pool_retired(&peer.pool).await;
+}

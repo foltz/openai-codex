@@ -1714,6 +1714,19 @@ async fn joined_release_worker_with_server_error_is_not_positive_release() {
     result.unwrap();
     drop(other);
     assert_event_pool_retired(&peer.pool).await;
+    let recovered = slot
+        .retire_release_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await;
+    assert_eq!(
+        recovered.outcomes, report.outcomes,
+        "the server refusal stays visible"
+    );
+    assert!(
+        recovered.is_released(),
+        "positive final physical proof may discharge the failed logical release: {recovered:?}"
+    );
+    assert_eq!(recovered.physical.len(), 1);
+    assert!(!recovered.physical[0].1.attempts.is_empty());
 }
 
 #[tokio::test]

@@ -50,7 +50,8 @@ impl SlotReleaseSnapshot {
             && self.outcomes.iter().all(|(id, outcome)| match outcome {
                 SlotReleaseOutcome::ReleasedWithoutServerLease
                 | SlotReleaseOutcome::ServerLeaseAcknowledged => true,
-                SlotReleaseOutcome::RequiresPhysicalProof => self
+                SlotReleaseOutcome::RequiresPhysicalProof
+                | SlotReleaseOutcome::ServerReleaseFailed(_) => self
                     .physical
                     .iter()
                     .any(|(observed, report)| observed == id && report.is_complete()),
@@ -130,8 +131,11 @@ impl ConnectionSlot {
         let workers = self.release_workers.observe_until(deadline).await;
         let mut physical = Vec::new();
         for record in &records {
-            if record.snapshot() == SlotReleaseOutcome::RequiresPhysicalProof
-                && record.physical.released()
+            if matches!(
+                record.snapshot(),
+                SlotReleaseOutcome::RequiresPhysicalProof
+                    | SlotReleaseOutcome::ServerReleaseFailed(_)
+            ) && record.physical.released()
             {
                 physical.push((
                     record.id,

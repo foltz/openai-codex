@@ -179,6 +179,11 @@ impl Drop for RuntimeGenerationPermit {
 }
 
 impl McpRuntimeRetirement {
+    /// Identity of the exact retained root, without exposing its mutable state.
+    pub fn same_scope(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+
     pub(crate) fn register_ema(&self, owner: Arc<crate::ema_retirement::EmaRetirementOwner>) {
         let mut state = self
             .state

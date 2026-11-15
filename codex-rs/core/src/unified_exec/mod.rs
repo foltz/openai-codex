@@ -165,6 +165,14 @@ pub(crate) struct UnifiedExecProcessManager {
 }
 
 impl UnifiedExecProcessManager {
+    pub(crate) fn with_sandbox_cleanup_scope(
+        mut self,
+        scope: codex_sandboxing::CleanupDeadlineScope,
+    ) -> Self {
+        self.sandbox_cleanup_scope = scope;
+        self
+    }
+
     pub(crate) fn with_sandbox_cleanup_census(
         mut self,
         census: Arc<crate::sandboxing::cleanup_census::SandboxCleanupCensus>,

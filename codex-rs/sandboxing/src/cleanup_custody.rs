@@ -49,6 +49,10 @@ pub struct CleanupDeadlineScope {
 }
 
 impl CleanupDeadlineScope {
+    pub fn same_scope(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

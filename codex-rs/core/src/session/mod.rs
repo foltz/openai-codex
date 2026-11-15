@@ -288,6 +288,7 @@ mod rollout_reconstruction;
 pub(crate) mod session;
 pub(crate) mod startup_custody;
 pub(crate) mod startup_prewarm;
+mod startup_resources;
 mod step_activation;
 pub(crate) mod step_context;
 pub(crate) mod step_settings;
@@ -748,8 +749,56 @@ impl Session {
     pub(crate) fn spawn(
         args: SessionSpawnArgs,
     ) -> BoxFuture<'static, CodexResult<(Arc<Self>, SessionIo)>> {
+        Self::spawn_with_custody(args, None)
+    }
+
+    pub(crate) fn spawn_with_custody(
+        args: SessionSpawnArgs,
+        custody: Option<Arc<startup_custody::SessionStartupCustody>>,
+    ) -> BoxFuture<'static, CodexResult<(Arc<Self>, SessionIo)>> {
+        let startup_stop = args.startup.as_ref().map(|startup| startup.stop.clone());
+        if custody.is_some() && args.startup.is_none() {
+            return Box::pin(async {
+                Err(CodexErr::Fatal(
+                    "retained startup owner is unavailable".to_string(),
+                ))
+            });
+        }
+        if let (Some(custody), Some(startup)) = (&custody, &args.startup) {
+            if let Some(existing) = startup.custody.get() {
+                if !Arc::ptr_eq(existing, custody) {
+                    return Box::pin(async {
+                        Err(CodexErr::Fatal(
+                            "startup custody identity mismatch".to_string(),
+                        ))
+                    });
+                }
+            } else if startup.custody.set(Arc::clone(custody)).is_err() {
+                return Box::pin(async {
+                    Err(CodexErr::Fatal(
+                        "startup custody installation raced".to_string(),
+                    ))
+                });
+            }
+        }
         let tree_shutdown = args.agent_control.runtime().shutdown.clone();
         Box::pin(async move {
+            let retained_resources = custody
+                .as_ref()
+                .map(|custody| custody.begin_resources())
+                .transpose()
+                .map_err(|_| {
+                    CodexErr::Fatal(
+                        "constructor resources already owned or unavailable".to_string(),
+                    )
+                })?;
+            // Declared before the initialization future so its drop follows
+            // initialization drop, including cancellation before Session birth.
+            let (resources, _resource_guard) = match retained_resources {
+                Some((resources, guard)) => (Some(resources), Some(guard)),
+                None => (None, None),
+            };
+
             let parent_trace = match args.parent_trace {
                 Some(trace) => {
                     if codex_otel::context_from_w3c_trace_context(&trace).is_some() {
@@ -765,20 +814,31 @@ impl Session {
             if let Some(trace) = parent_trace.as_ref() {
                 let _ = set_parent_from_w3c_trace_context(&thread_spawn_span, trace);
             }
-            let spawn = Self::spawn_internal(SessionSpawnArgs {
-                parent_trace,
-                ..args
-            })
+            let spawn = Self::spawn_internal(
+                SessionSpawnArgs {
+                    parent_trace,
+                    ..args
+                },
+                custody,
+                resources,
+            )
             .instrument(thread_spawn_span);
             tokio::select! {
                 biased;
                 _ = tree_shutdown.cancelled() => Err(CodexErr::TurnAborted),
+                _ = async {
+                    match startup_stop { Some(stop) => stop.cancelled().await, None => std::future::pending().await }
+                } => Err(CodexErr::TurnAborted),
                 result = spawn => result,
             }
         })
     }
 
-    async fn spawn_internal(args: SessionSpawnArgs) -> CodexResult<(Arc<Self>, SessionIo)> {
+    async fn spawn_internal(
+        args: SessionSpawnArgs,
+        custody: Option<Arc<startup_custody::SessionStartupCustody>>,
+        resources: Option<Arc<startup_resources::StartupResources>>,
+    ) -> CodexResult<(Arc<Self>, SessionIo)> {
         args.config
             .config_layer_stack
             .ensure_config_server_applied()?;
@@ -1203,6 +1263,8 @@ impl Session {
             multi_agent_version,
             git_enrichment_policy,
             windows_sandbox_proxy_settings_mode,
+            custody.as_deref(),
+            resources.as_deref(),
         ))
         .await
         .map_err(|e| {
@@ -1256,6 +1318,9 @@ impl Session {
         if let Some(startup) = startup {
             let _ = startup.io.set(io.clone());
             startup.persistence.lock().await.commit();
+        }
+        if let Some(custody) = custody {
+            custody.attach_io(io.retirement_io());
         }
         // A required MCP server must not block startup waiting for form input.
         if enable_full_access_form_input {

@@ -7111,8 +7111,31 @@ async fn load_latest_config_for_session(session: &Session) -> Config {
 async fn make_session_with_config_and_rx(
     mutator: impl FnOnce(&mut Config),
 ) -> anyhow::Result<(Arc<Session>, async_channel::Receiver<Event>)> {
+    make_session_with_custody_and_rx(mutator, None).await
+}
+
+pub(super) async fn make_session_with_custody_and_rx(
+    mutator: impl FnOnce(&mut Config),
+    custody: Option<Arc<super::startup_custody::SessionStartupCustody>>,
+) -> anyhow::Result<(Arc<Session>, async_channel::Receiver<Event>)> {
+    let retained_resources = custody
+        .as_ref()
+        .map(|custody| custody.begin_resources())
+        .transpose()
+        .map_err(|_| anyhow::anyhow!("test constructor custody unavailable"))?;
+    let (resources, _resource_guard) = match retained_resources {
+        Some((resources, guard)) => (Some(resources), Some(guard)),
+        None => (None, None),
+    };
     let codex_home = tempfile::tempdir().expect("create temp dir");
-    let mut config = build_test_config(codex_home.path()).await;
+    let home_path = codex_home.path().to_path_buf();
+    let _unretained_home = if let Some(custody) = &custody {
+        custody.retain_owner(Box::new(codex_home));
+        None
+    } else {
+        Some(codex_home)
+    };
+    let mut config = build_test_config(&home_path).await;
     mutator(&mut config);
     let config = Arc::new(config);
     let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
@@ -7240,6 +7263,8 @@ async fn make_session_with_config_and_rx(
         Some(config.multi_agent_version_from_features()),
         GitEnrichmentPolicy::Fresh,
         codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
+        custody.as_deref(),
+        resources.as_deref(),
     )
     .await?;
 
@@ -7388,6 +7413,8 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         Some(config.multi_agent_version_from_features()),
         GitEnrichmentPolicy::Fresh,
         codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
+        /*startup_custody*/ None,
+        /*startup_resources*/ None,
     )
     .await?;
 

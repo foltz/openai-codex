@@ -17,6 +17,7 @@ use codex_protocol::protocol::Op;
 use codex_thread_store::LiveThreadInitGuard;
 use futures::future::BoxFuture;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 use super::SessionIo;
 use super::session::Session;
@@ -24,7 +25,10 @@ use super::session::Session;
 #[derive(Default)]
 pub(crate) struct SessionStartup {
     teardown: StdMutex<Option<AgentTreeTeardownGuard>>,
-    pub(crate) persistence: Mutex<LiveThreadInitGuard>,
+    // Cancellation must be consumed inside the retained constructor before cleanup.
+    pub(crate) stop: CancellationToken,
+    pub(crate) persistence: Arc<Mutex<LiveThreadInitGuard>>,
+    pub(crate) custody: OnceLock<Arc<super::startup_custody::SessionStartupCustody>>,
     pub(crate) session: OnceLock<Arc<Session>>,
     pub(crate) io: OnceLock<SessionIo>,
 }
@@ -56,6 +60,12 @@ impl SessionStartup {
         Some(teardown.clone_for_teardown("session_loop", Some(thread_id)))
     }
 
+    /// Hand a failed manager-owned start's membership to its registry
+    /// custody. The custody completes it only after its cleanup is terminal.
+    pub(crate) fn take_teardown(&self) -> Option<AgentTreeTeardownGuard> {
+        self.lock_teardown().take()
+    }
+
     pub(crate) fn release_membership(&self) {
         if let Some(teardown) = self.lock_teardown().take() {
             teardown.complete();
@@ -63,6 +73,73 @@ impl SessionStartup {
     }
 
     pub(crate) async fn cleanup(&self) {
+        drop(self.cleanup_with_owner(Box::new(())).await);
+    }
+
+    /// Synchronous disposition for a cancelled start dropped where no Tokio
+    /// runtime can drive `cleanup`. This polls nothing and starts no work, so
+    /// it never progresses cleanup outside its bound. Ownership is never
+    /// discarded silently: the membership records a sticky failure first.
+    /// A registry custody, if present, then adopts the membership, so its
+    /// existing drain or reset reports and settles it. Otherwise the
+    /// uncompleted guard is dropped, which also records `GuardAbandoned`.
+    pub(crate) fn abandon_without_runtime(&self) {
+        let Some(mut teardown) = self.lock_teardown().take() else {
+            return;
+        };
+        if let Some(session) = self.session.get() {
+            teardown.set_thread_id(session.thread_id);
+        }
+        teardown.record_shutdown_failure("session_startup_guard", "dropped_without_runtime");
+        tracing::warn!("cancelled session startup dropped without a Tokio runtime");
+        match self.custody.get() {
+            Some(custody) => custody.adopt_teardown(teardown),
+            None => drop(teardown),
+        }
+    }
+
+    /// Lifetime cleanup for a caller-supplied startup. `owner` is the caller's
+    /// background-work token. It is handed back unless proven registry/custody
+    /// expiry leaves an unpublished start without a complete receipt; then the
+    /// custody retains it with the membership for the manager drain or reset.
+    pub(crate) async fn cleanup_with_owner(&self, owner: Box<dyn Send>) -> Option<Box<dyn Send>> {
+        if let Some(custody) = self.custody.get() {
+            custody.latch_registry_expiry();
+        }
+        if let Some(custody) = self.custody.get()
+            && !custody.is_empty()
+            && let Some(deadline) = custody.elapsed_deadline()
+        {
+            let mut teardown = self.lock_teardown().take();
+            if let Some(teardown) = teardown.as_mut()
+                && let Some(session) = self.session.get()
+            {
+                teardown.set_thread_id(session.thread_id);
+            }
+            // Expiry is proven: inspect only. An elapsed bound starts no new
+            // cleanup and replays an existing receipt or a sticky TimedOut.
+            let receipt = custody.shutdown_until(deadline).await;
+            if receipt.is_complete() {
+                if let Some(teardown) = teardown {
+                    teardown.complete();
+                }
+                return Some(owner);
+            }
+            if let Some(teardown) = teardown {
+                custody.adopt_teardown(teardown);
+            }
+            custody.retain_owner(owner);
+            tracing::warn!(
+                ?receipt,
+                "expired managed startup retained for manager drain or reset"
+            );
+            return None;
+        }
+        self.cleanup_unexpired().await;
+        Some(owner)
+    }
+
+    async fn cleanup_unexpired(&self) {
         let mut teardown = self.lock_teardown().take();
         if let Some(teardown) = teardown.as_mut()
             && let Some(session) = self.session.get()
@@ -83,6 +160,21 @@ impl SessionStartup {
                 }
                 tracing::warn!("failed to stop cancelled session init: {error}");
             }
+        } else if let Some(custody) = self.custody.get() {
+            if let Some(session) = self.session.get() {
+                session
+                    .failed_initialization_persistence
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            // The constructor is terminal. Its retained owner joins acquisition,
+            // cleans any partial session, and records disposal once for both
+            // this lifetime task and a later manager drain.
+            if !custody.shutdown_legacy().await {
+                if let Some(teardown) = teardown.as_ref() {
+                    teardown.record_shutdown_failure("startup_custody", "cleanup_incomplete");
+                }
+                tracing::warn!("managed startup cleanup incomplete");
+            }
         } else {
             if let Some(session) = self.session.get() {
                 let cleanup = session.cleanup_owner().observe(Arc::clone(session)).await;
@@ -97,13 +189,8 @@ impl SessionStartup {
                             "cleanup_incomplete",
                         );
                     }
-                    tracing::warn!(?cleanup, "cancelled pre-loop Session cleanup incomplete");
+                    tracing::warn!(?cleanup, "managed startup runtime cleanup incomplete");
                 }
-                // The session loop never started, so it cannot close the trace itself.
-                session
-                    .services
-                    .rollout_thread_trace
-                    .record_ended(codex_rollout_trace::RolloutStatus::Aborted);
             }
             let mut persistence = std::mem::take(&mut *self.persistence.lock().await);
             if let Err(error) = persistence.discard().await {
@@ -118,6 +205,14 @@ impl SessionStartup {
                 );
             }
         }
+        if self.io.get().is_none()
+            && let Some(session) = self.session.get()
+        {
+            session
+                .services
+                .rollout_thread_trace
+                .record_ended(codex_rollout_trace::RolloutStatus::Aborted);
+        }
         if let Some(teardown) = teardown {
             teardown.complete();
         }
@@ -127,12 +222,17 @@ impl SessionStartup {
 /// Cleans up a cancelled session start before releasing its agent-tree membership.
 pub(crate) struct SessionStartupGuard {
     startup: Option<Arc<SessionStartup>>,
+    /// The runtime that admitted this start. Captured at construction so that
+    /// a drop on a runtime-less thread (for example the last `ThreadManager`
+    /// owner released on a std thread) still hands cleanup to a driver.
+    runtime: Option<tokio::runtime::Handle>,
 }
 
 impl SessionStartupGuard {
     pub(crate) fn new(startup: Arc<SessionStartup>) -> Self {
         Self {
             startup: Some(startup),
+            runtime: tokio::runtime::Handle::try_current().ok(),
         }
     }
 
@@ -154,8 +254,43 @@ impl Drop for SessionStartupGuard {
         let Some(startup) = self.startup.take() else {
             return;
         };
-        drop(tokio::spawn(async move {
+        // `tokio::spawn` panics without a runtime, and a panic here during an
+        // unwind aborts the process. Cleanup ownership goes to the current
+        // runtime, or else the runtime captured at construction. If that
+        // runtime has shut down, it drops the task unpolled, and the sentinel
+        // records the abandonment and hands membership to the registry
+        // custody. Either way, cleanup is driven or reported, never lost.
+        let Some(runtime) = tokio::runtime::Handle::try_current()
+            .ok()
+            .or_else(|| self.runtime.take())
+        else {
+            startup.abandon_without_runtime();
+            return;
+        };
+        let sentinel = AbandonUnlessCleaned(Some(Arc::clone(&startup)));
+        drop(runtime.spawn(async move {
             startup.cleanup().await;
+            sentinel.disarm();
         }));
+    }
+}
+
+/// Reports a startup whose cleanup task was dropped before it finished: for
+/// example, one spawned onto a runtime that had already shut down. If cleanup
+/// had already taken the membership, the guard it dropped recorded the failure
+/// itself, and this is a no-op.
+struct AbandonUnlessCleaned(Option<Arc<SessionStartup>>);
+
+impl AbandonUnlessCleaned {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for AbandonUnlessCleaned {
+    fn drop(&mut self) {
+        if let Some(startup) = self.0.take() {
+            startup.abandon_without_runtime();
+        }
     }
 }

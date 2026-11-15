@@ -946,7 +946,19 @@ impl Session {
         multi_agent_version: Option<MultiAgentVersion>,
         git_enrichment_policy: GitEnrichmentPolicy,
         windows_sandbox_proxy_settings_mode: codex_sandboxing::WindowsSandboxProxySettingsMode,
+        startup_custody: Option<&super::startup_custody::SessionStartupCustody>,
+        startup_resources: Option<&super::startup_resources::StartupResources>,
     ) -> anyhow::Result<Arc<Self>> {
+        match (startup_custody, startup_resources) {
+            (Some(custody), Some(resources)) if custody.owns_resources(resources) => {}
+            (None, None) => {}
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "constructor resource custody identity mismatch"
+                ));
+            }
+        }
+
         debug!(
             "Configuring session: model={}; provider={:?}",
             session_configuration
@@ -1216,8 +1228,20 @@ impl Session {
             } else {
                 let mut local_guard = LiveThreadInitGuard::default();
                 let mut resume_context = None;
-                let mut managed_guard = match &startup {
-                    Some(startup) => Some(startup.persistence.lock().await),
+                let retained_guard = match (startup_custody, &startup) {
+                    (Some(custody), startup) => {
+                        let guard = startup.as_ref().map_or_else(
+                            || Arc::new(Mutex::new(LiveThreadInitGuard::default())),
+                            |startup| Arc::clone(&startup.persistence),
+                        );
+                        custody.retain_persistence_guard(thread_id, Arc::clone(&guard));
+                        Some(guard)
+                    }
+                    (None, Some(startup)) => Some(Arc::clone(&startup.persistence)),
+                    (None, None) => None,
+                };
+                let mut managed_guard = match &retained_guard {
+                    Some(guard) => Some(guard.lock().await),
                     None => None,
                 };
                 let guard = managed_guard.as_deref_mut().unwrap_or(&mut local_guard);
@@ -1319,6 +1343,11 @@ impl Session {
                         live_thread
                     }
                 };
+                drop(managed_guard);
+                #[cfg(test)]
+                if let Some(custody) = startup_custody {
+                    custody.wait_after_persistence_for_test().await;
+                }
                 Ok((Some(live_thread), local_guard, resume_context))
             }
         }
@@ -1649,8 +1678,9 @@ impl Session {
             let resolved_environments = turn_environments
                 .resolve_snapshot(configured_environments)
                 .await;
-            let sandbox_cleanup_census = Arc::new(
-                crate::sandboxing::cleanup_census::SandboxCleanupCensus::default(),
+            let sandbox_cleanup_census = startup_resources.map_or_else(
+                || Arc::new(crate::sandboxing::cleanup_census::SandboxCleanupCensus::default()),
+                super::startup_resources::StartupResources::census,
             );
             let agents_md_manager = Arc::new(
                 AgentsMdManager::new(instructions)
@@ -1795,9 +1825,11 @@ impl Session {
             }
 
             // Hooks and extensions share one stable thread-owned MCP runtime handle.
-            let mcp_runtime = Arc::new(McpRuntime::empty(
-                mcp_projection.config.prefix_mcp_tool_names,
-            ));
+            let mcp_runtime = match startup_resources {
+                Some(resources) => resources.create_mcp_runtime(mcp_projection.config.prefix_mcp_tool_names)
+                    .map_err(|_| anyhow::anyhow!("startup MCP resource admission is closed"))?,
+                None => Arc::new(McpRuntime::empty(mcp_projection.config.prefix_mcp_tool_names)),
+            };
             let hooks_config = build_hooks_config(
                 &config,
                 plugins_manager.as_ref(),
@@ -2012,7 +2044,11 @@ impl Session {
                 unified_exec_manager: UnifiedExecProcessManager::new(
                     config.background_terminal_max_timeout,
                 )
-                .with_sandbox_cleanup_census(sandbox_cleanup_census),
+                .with_sandbox_cleanup_census(sandbox_cleanup_census)
+                .with_sandbox_cleanup_scope(startup_resources.map_or_else(
+                    codex_sandboxing::CleanupDeadlineScope::new,
+                    super::startup_resources::StartupResources::cleanup_scope,
+                )),
                 elicitations: crate::elicitation::ElicitationService::new(),
                 analytics_events_client,
                 hooks: arc_swap::ArcSwap::from_pointee(hooks),
@@ -2135,6 +2171,15 @@ impl Session {
             });
             if let Some(startup) = &startup {
                 startup.set_session(Arc::clone(&sess));
+            }
+            if let Some(custody) = startup_custody {
+                if !custody.retain(&sess) {
+                    return Err(anyhow::anyhow!("startup resource or persistence custody mismatch"));
+                }
+                sess.failed_initialization_persistence.store(true, std::sync::atomic::Ordering::Release);
+                live_thread_init.commit();
+                #[cfg(test)]
+                custody.wait_after_retain_for_test().await;
             }
             if let Some(err) = startup_error {
                 if startup.is_none() {

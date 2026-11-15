@@ -404,3 +404,170 @@ async fn retained_pre_loop_session_uses_its_actual_common_cleanup_owner() {
     assert!(custody.is_empty());
     assert_eq!(custody.shutdown_until(Instant::now()).await, result);
 }
+
+#[tokio::test]
+async fn early_resources_block_disposal_until_constructor_scope_ends() {
+    let (mut session, _) = crate::session::tests::make_session_and_context().await;
+    crate::session::tests::open_thread_persistence(&mut session).await;
+    let writer = session.live_thread().unwrap().clone();
+    let custody = SessionStartupCustody::default();
+    let (_resources, scope) = custody.begin_resources().unwrap();
+    custody.retain_persistence(session.thread_id, writer.clone());
+    assert_eq!(
+        custody
+            .shutdown_until(Instant::now() + std::time::Duration::from_secs(3))
+            .await,
+        StartupCleanup::Refused(ThreadRetirementError::AuthorityUnavailable)
+    );
+    assert!(
+        custody
+            .state
+            .lock()
+            .unwrap()
+            .persistence
+            .as_ref()
+            .unwrap()
+            .disposal
+            .is_none()
+    );
+    writer.flush().await.unwrap();
+    drop(scope);
+    assert!(
+        custody
+            .shutdown_until(Instant::now() + std::time::Duration::from_secs(3))
+            .await
+            .is_complete()
+    );
+    assert!(writer.discard().await.is_err());
+    assert!(custody.is_empty());
+}
+
+#[tokio::test]
+async fn early_census_debt_cannot_be_relabelled_as_an_empty_constructor() {
+    let custody = SessionStartupCustody::default();
+    let (resources, scope) = custody.begin_resources().unwrap();
+    resources.census().record(true, None);
+    drop(scope);
+    let first = custody
+        .shutdown_until(Instant::now() + std::time::Duration::from_secs(3))
+        .await;
+    assert_eq!(
+        first,
+        StartupCleanup::BeforeLoop(CleanupExecution::SandboxCleanupUnproven { timed_out: false })
+    );
+    assert!(!custody.is_empty());
+    assert_eq!(custody.shutdown_until(Instant::now()).await, first);
+}
+
+#[tokio::test]
+async fn real_session_constructor_transfers_exact_early_resource_owners() {
+    let custody = Arc::new(SessionStartupCustody::default());
+    let (session, _events) = Box::pin(crate::session::tests::make_session_with_custody_and_rx(
+        |config| config.ephemeral = true,
+        Some(Arc::clone(&custody)),
+    ))
+    .await
+    .unwrap();
+    {
+        let state = custody.state.lock().unwrap();
+        assert!(Arc::ptr_eq(
+            &state.session.as_ref().unwrap().session,
+            &session
+        ));
+        assert!(state.resources.as_ref().unwrap().finished());
+    }
+    assert!(
+        session
+            .failed_initialization_persistence
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
+    assert!(
+        custody
+            .shutdown_until(Instant::now() + std::time::Duration::from_secs(10))
+            .await
+            .is_complete()
+    );
+    assert!(custody.is_empty());
+}
+
+#[tokio::test]
+async fn cancelled_real_constructor_retains_and_discards_its_actual_writer() {
+    let custody = Arc::new(SessionStartupCustody::default());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    custody.pause_after_retain_for_test(Arc::clone(&entered), release);
+    let owner = Arc::clone(&custody);
+    let constructor = tokio::spawn(Box::pin(async move {
+        crate::session::tests::make_session_with_custody_and_rx(
+            |config| config.ephemeral = false,
+            Some(owner),
+        )
+        .await
+    }));
+    entered.notified().await;
+    assert_eq!(
+        custody
+            .shutdown_until(Instant::now() + std::time::Duration::from_secs(3))
+            .await,
+        StartupCleanup::Refused(ThreadRetirementError::AuthorityUnavailable)
+    );
+    constructor.abort();
+    match constructor.await {
+        Err(error) => assert!(error.is_cancelled()),
+        Ok(_) => panic!("constructor completed before cancellation"),
+    }
+    let session = Arc::clone(
+        &custody
+            .state
+            .lock()
+            .unwrap()
+            .session
+            .as_ref()
+            .unwrap()
+            .session,
+    );
+    assert!(session.live_thread().is_some());
+    assert!(
+        session
+            .failed_initialization_persistence
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
+    let result = custody
+        .shutdown_until(Instant::now() + std::time::Duration::from_secs(10))
+        .await;
+    assert!(result.is_complete(), "{result:?}");
+    assert!(
+        session
+            .services
+            .thread_store
+            .flush_thread(session.thread_id)
+            .await
+            .is_err(),
+        "actual backend writer was disposed"
+    );
+    assert!(custody.is_empty());
+}
+
+#[tokio::test]
+async fn unrelated_resource_identity_refuses_session_transfer_without_losing_custody() {
+    let (session, _) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let custody = SessionStartupCustody::default();
+    let (_resources, scope) = custody.begin_resources().unwrap();
+    assert!(!custody.retain(&session));
+    assert!(custody.begin_resources().is_err());
+    assert!(!custody.is_empty());
+    drop(scope);
+    assert!(
+        custody
+            .shutdown_until(Instant::now() + std::time::Duration::from_secs(3))
+            .await
+            .is_complete()
+    );
+    assert_eq!(
+        session.cleanup_owner().observe(session.clone()).await,
+        CleanupExecution::Finished {
+            persistence_failed: false
+        }
+    );
+}

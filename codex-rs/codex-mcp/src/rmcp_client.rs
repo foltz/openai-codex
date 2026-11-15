@@ -688,7 +688,9 @@ impl AsyncManagedClient {
             elicitation_requests,
             codex_apps_tools_cache_context: codex_apps_tools_cache_context.clone(),
             tool_catalog_cache_context,
-            runtime_context,
+            // The containing root was registered above. A lazy factory must
+            // never retain that same root through its worker/private aliases.
+            runtime_context: runtime_context.without_retirement_owner(),
             resolved_environment,
             runtime_auth_provider,
             client_elicitation_capability,

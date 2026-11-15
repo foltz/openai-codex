@@ -1,4 +1,5 @@
 use super::*;
+use crate::server::EffectiveMcpServer;
 use crate::{McpAttemptAccess, McpAttemptRefused, McpAttemptRequirement, McpAttemptWork};
 use pretty_assertions::assert_eq;
 use std::sync::atomic::AtomicUsize;
@@ -129,7 +130,7 @@ async fn wait_for_publication_work_to_finish(live: &AtomicUsize) {
 async fn unpublished_eager_driver_releases_staged_original_without_starting_transport() {
     let live = Arc::new(AtomicUsize::new(1));
     let input = publication_input(Some(Box::new(PublicationWork(Arc::clone(&live)))));
-    let (publish, gate) = McpPublicationGate::pending();
+    let (publish, gate) = McpPublicationGate::pending_for_test();
     let set = McpConnectionSet::new(
         None,
         None,
@@ -229,7 +230,7 @@ async fn publication_reuse_cannot_cross_attempt_requirement() {
         let previous =
             tests::manager_with_reusable_ready_server(&config, &input.runtime_context, Vec::new())
                 .await;
-        let (publish, gate) = McpPublicationGate::pending();
+        let (publish, gate) = McpPublicationGate::pending_for_test();
         let set = McpConnectionSet::new(
             None,
             None,

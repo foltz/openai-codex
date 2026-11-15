@@ -297,6 +297,11 @@ pub(crate) struct McpPublicationGate {
 }
 
 impl McpPublicationGate {
+    #[cfg(test)]
+    pub(crate) fn pending_for_test() -> (watch::Sender<bool>, Self) {
+        Self::pending()
+    }
+
     fn pending() -> (watch::Sender<bool>, Self) {
         let (publish, published) = watch::channel(false);
         (

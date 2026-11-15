@@ -928,7 +928,8 @@ mod tests {
             Vec::new(),
             codex_protocol::openai_models::ToolMode::CodeMode,
             names,
-            None,
+            /*exec_definitions*/ None,
+            /*tool_namespaces_info*/ None,
             &[],
         );
         (tool_search_handler(infos), router)

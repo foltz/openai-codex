@@ -1521,3 +1521,200 @@ async fn permanent_edge_clamps_unpublished_custody_and_refuses_late_birth() {
     );
     drop(observer);
 }
+
+#[tokio::test]
+async fn real_constructor_cancelled_before_publication_is_drained_after_close() {
+    real_account_constructor_case(false).await;
+}
+
+#[tokio::test]
+async fn explicit_constructor_operation_does_not_rediscover_an_ended_request() {
+    real_account_constructor_case(true).await;
+}
+
+async fn real_account_constructor_case(explicit: bool) {
+    use crate::config::ConfigBuilder;
+    use crate::thread_manager::StartThreadOptions;
+    use crate::thread_manager::ThreadManager;
+    #[derive(Debug, Default)]
+    struct RequestHost {
+        request_alive: std::sync::atomic::AtomicBool,
+        operations: AtomicUsize,
+        released: tokio::sync::Notify,
+    }
+    #[derive(Debug)]
+    struct ConstructionWork(Arc<RequestHost>);
+    impl Drop for ConstructionWork {
+        fn drop(&mut self) {
+            self.0.operations.fetch_sub(1, Ordering::SeqCst);
+            self.0.released.notify_one();
+        }
+    }
+    impl codex_extension_api::HostOperationWork for ConstructionWork {
+        fn derive_operation(
+            &self,
+        ) -> Result<
+            Box<dyn codex_extension_api::HostOperationWork>,
+            codex_extension_api::TurnWorkRefused,
+        > {
+            // Existing work may derive descendants after the request ends.
+            self.0.operations.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(Self(Arc::clone(&self.0))))
+        }
+        fn derive_turn_work(
+            &self,
+            _: &codex_extension_api::ExtensionData,
+            _: codex_extension_api::ExtensionFuture<'static, ()>,
+        ) -> Result<
+            Box<dyn codex_protocol::host_turn_work::HostTurnWork>,
+            codex_extension_api::TurnWorkRefused,
+        > {
+            Err(codex_extension_api::TurnWorkRefused::Unavailable)
+        }
+    }
+    #[derive(Debug)]
+    struct ConstructionAdmission(Arc<RequestHost>);
+    impl codex_extension_api::TurnStartAdmission for ConstructionAdmission {
+        fn admit_turn_start(&self) -> Option<Box<dyn Send>> {
+            Some(Box::new(()))
+        }
+        fn derive_request_operation_work(
+            &self,
+        ) -> Result<
+            Option<Box<dyn codex_extension_api::HostOperationWork>>,
+            codex_extension_api::TurnWorkRefused,
+        > {
+            if !self.0.request_alive.load(Ordering::SeqCst) {
+                return Err(codex_extension_api::TurnWorkRefused::Unavailable);
+            }
+            self.0.operations.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(Box::new(ConstructionWork(Arc::clone(&self.0)))))
+        }
+    }
+    struct HeldInstructions {
+        entered: AtomicUsize,
+        entry: tokio::sync::Notify,
+        receiver: Mutex<Option<oneshot::Receiver<()>>>,
+    }
+    impl codex_extension_api::UserInstructionsProvider for HeldInstructions {
+        fn load_user_instructions(&self) -> codex_extension_api::LoadInstructionsFuture<'_> {
+            let receiver = self.receiver.lock().unwrap().take().expect("one load");
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            self.entry.notify_one();
+            Box::pin(async move {
+                receiver.await.expect("release instructions");
+                codex_extension_api::LoadedUserInstructions::default()
+            })
+        }
+    }
+    let home = tempfile::tempdir().unwrap();
+    let mut config = ConfigBuilder::default()
+        .codex_home(home.path().to_path_buf())
+        .fallback_cwd(Some(home.path().to_path_buf()))
+        .build()
+        .await
+        .unwrap();
+    config.ephemeral = true;
+    let mut manager = ThreadManager::with_models_provider_and_home_for_tests(
+        codex_login::CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let (release, receiver) = oneshot::channel();
+    let provider = Arc::new(HeldInstructions {
+        entered: AtomicUsize::new(0),
+        entry: tokio::sync::Notify::new(),
+        receiver: Mutex::new(Some(receiver)),
+    });
+    Arc::get_mut(&mut manager.state)
+        .expect("builders retain unique State")
+        .user_instructions_provider = provider.clone();
+    let host = Arc::new(RequestHost::default());
+    host.request_alive.store(true, Ordering::SeqCst);
+    let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
+    extensions.turn_start_admission(Arc::new(ConstructionAdmission(Arc::clone(&host))));
+    Arc::get_mut(&mut manager.state).unwrap().extensions = Arc::new(extensions.build());
+    let mut options = StartThreadOptions::new(config.clone(), None);
+    if explicit {
+        // A delegated operation must not rediscover an already-ended request.
+        host.request_alive.store(false, Ordering::SeqCst);
+        host.operations.store(1, Ordering::SeqCst);
+        options.account_work = Some(Box::new(ConstructionWork(Arc::clone(&host))));
+    }
+    let mut observer = Box::pin(manager.start_thread(options));
+    // Startup now has asynchronous work before loading instruction providers.
+    // Drive the real constructor to the held boundary rather than assuming
+    // that its first poll reaches it.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::select! {
+            _ = provider.entry.notified() => {}
+            _ = observer.as_mut() => panic!("constructor returned before instructions were released"),
+        }
+    })
+    .await
+    .expect("constructor reaches held instructions");
+    assert_eq!(provider.entered.load(Ordering::SeqCst), 1);
+    // Observer departure is a cancellation request consumed by the retained
+    // constructor; the registry still owns and records its completion.
+    drop(observer);
+    host.request_alive.store(false, Ordering::SeqCst);
+    assert_eq!(host.operations.load(Ordering::SeqCst), 2);
+    assert!(manager.list_thread_ids().await.is_empty());
+    // Account progress must finish counted construction without initiating
+    // thread shutdown, which only happens after account adoption.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let progress = manager.drive_admitted_constructions();
+        tokio::pin!(progress);
+        while host.operations.load(Ordering::SeqCst) != 0 {
+            tokio::select! {
+                _ = host.released.notified() => {},
+                _ = &mut progress => panic!("progress observer stopped"),
+            }
+        }
+    })
+    .await
+    .expect("abandoned constructor completes before retirement");
+    assert_eq!(host.operations.load(Ordering::SeqCst), 0);
+    assert!(
+        release.send(()).is_err(),
+        "the constructor dropped its held start when it consumed cancellation"
+    );
+    let startup = first_startup(&manager);
+    assert!(
+        manager
+            .shutdown_unpublished_constructions_bounded(Duration::from_secs(20))
+            .await
+    );
+    assert!(
+        startup.is_empty(),
+        "reset retires the runtime outside the lookup map"
+    );
+    manager.constructions.close();
+    assert!(
+        manager
+            .start_thread(StartThreadOptions::new(
+                config, /*control_endpoint*/ None
+            ))
+            .await
+            .is_err()
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let report = manager.constructions.drain_until(deadline).await;
+    assert_eq!(
+        report,
+        ConstructionDrain {
+            finished: true,
+            panicked: false,
+            unavailable: false,
+            unpublished: 0,
+            sessions: vec![],
+        }
+    );
+    assert!(
+        manager.list_thread_ids().await.is_empty(),
+        "cancelled caller must not publish a successor"
+    );
+    assert_eq!(manager.constructions.drain_until(deadline).await, report);
+    assert_eq!(provider.entered.load(Ordering::SeqCst), 1);
+}

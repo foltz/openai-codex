@@ -275,6 +275,8 @@ mod mcp;
 mod mcp_prewarm;
 mod mcp_refresh;
 mod mcp_runtime;
+mod mcp_work;
+pub(crate) use mcp_work::McpOperationWork;
 mod model_catalog_settings;
 pub(crate) mod multi_agents;
 mod plugin_selection;
@@ -614,6 +616,8 @@ impl From<CompactedHistoryMetadata> for CompactedHistoryInstallation<'_> {
 }
 
 pub(crate) struct SessionSpawnArgs {
+    pub(crate) host_admission: Option<Arc<dyn codex_extension_api::TurnStartAdmission>>,
+    pub(crate) initial_mcp_work: Option<Box<dyn codex_mcp::McpAttemptWork>>,
     pub(crate) control_endpoint: Option<String>,
     pub(crate) attached_thread: bool,
     pub(crate) startup: Option<Arc<startup::SessionStartup>>,
@@ -844,6 +848,8 @@ impl Session {
             .ensure_config_server_applied()?;
         args.config.validate_windows_mxc_requirement()?;
         let SessionSpawnArgs {
+            host_admission,
+            initial_mcp_work,
             control_endpoint,
             attached_thread,
             startup,
@@ -1247,6 +1253,8 @@ impl Session {
             mcp_manager.clone(),
             code_mode_session_provider,
             extensions,
+            host_admission,
+            initial_mcp_work,
             thread_extension_init,
             client_mcp_extensions,
             agent_control,

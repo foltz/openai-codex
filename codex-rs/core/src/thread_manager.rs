@@ -376,6 +376,9 @@ pub enum PromptCacheKey {
 
 pub struct StartThreadOptions {
     pub config: Config,
+    /// Finite construction custody supplied by a parent operation. Consumed by
+    /// the retained constructor, never stored on an idle session.
+    pub account_work: Option<Box<dyn codex_extension_api::HostOperationWork>>,
     /// Hosting listener custody, supplied explicitly by the host; never loaded
     /// from history, configuration or a parent thread.
     pub control_endpoint: Option<String>,
@@ -476,6 +479,7 @@ impl StartThreadOptions {
     pub fn new(config: Config, control_endpoint: Option<String>) -> Self {
         Self {
             config,
+            account_work: None,
             control_endpoint,
             prompt_cache_key: PromptCacheKey::default(),
             thread_instructions_provider: None,
@@ -2636,9 +2640,40 @@ impl ThreadManagerState {
     }
 
     /// Spawn a new thread under a retained original constructor and publication fence.
-    async fn spawn_thread(self: &Arc<Self>, request: ThreadSpawnRequest) -> CodexResult<NewThread> {
+    async fn spawn_thread(
+        self: &Arc<Self>,
+        mut request: ThreadSpawnRequest,
+    ) -> CodexResult<NewThread> {
+        // Capture in the original request before handing the original constructor
+        // to the registry; later pollers must not rediscover ambient authority.
+        let account_work = match request.options.account_work.take() {
+            Some(work) => Some(work),
+            None => match self.extensions.host_admission() {
+                Some(host) => host.derive_request_operation_work().map_err(|_| {
+                    CodexErr::Fatal(
+                        "request account work cannot admit thread construction".to_owned(),
+                    )
+                })?,
+                None => None,
+            },
+        };
+        let initial_mcp_work = account_work
+            .as_deref()
+            .map(|work| {
+                work.derive_operation()
+                    .map(|work| {
+                        Box::new(crate::session::McpOperationWork(work))
+                            as Box<dyn codex_mcp::McpAttemptWork>
+                    })
+                    .map_err(|_| {
+                        CodexErr::Fatal(
+                            "construction account work cannot admit MCP startup".to_owned(),
+                        )
+                    })
+            })
+            .transpose()?;
         let state = Arc::clone(self);
-        self.constructions.register(None, move |custody, publication| async move {
+        self.constructions.register(account_work, move |custody, publication| async move {
             let mut request = request;
         let runtime = request.agent_control.runtime().clone();
         let membership = runtime.admit_start()?;
@@ -2671,7 +2706,7 @@ impl ThreadManagerState {
                 }
             });
             let result = {
-                let start = state.spawn_thread_owned_boxed(request, Arc::clone(&custody), publication);
+                let start = state.spawn_thread_owned_boxed(request, Arc::clone(&custody), publication, initial_mcp_work);
                 tokio::select! {
                     biased;
                     _ = stopped => Err(CodexErr::TurnAborted),
@@ -2714,8 +2749,9 @@ impl ThreadManagerState {
         request: ThreadSpawnRequest,
         custody: Arc<crate::session::startup_custody::SessionStartupCustody>,
         publication: retirement::ConstructionPublication,
+        initial_mcp_work: Option<Box<dyn codex_mcp::McpAttemptWork>>,
     ) -> std::pin::Pin<Box<impl std::future::Future<Output = CodexResult<NewThread>> + '_>> {
-        Box::pin(self.spawn_thread_owned(request, custody, publication))
+        Box::pin(self.spawn_thread_owned(request, custody, publication, initial_mcp_work))
     }
 
     async fn spawn_thread_owned(
@@ -2723,6 +2759,7 @@ impl ThreadManagerState {
         mut request: ThreadSpawnRequest,
         custody: Arc<crate::session::startup_custody::SessionStartupCustody>,
         publication: retirement::ConstructionPublication,
+        initial_mcp_work: Option<Box<dyn codex_mcp::McpAttemptWork>>,
     ) -> CodexResult<NewThread> {
         let cancellation = request
             .options
@@ -2771,6 +2808,7 @@ impl ThreadManagerState {
         };
         let StartThreadOptions {
             mut config,
+            account_work: _, // Already consumed by retained constructor custody.
             control_endpoint,
             prompt_cache_key,
             thread_instructions_provider,
@@ -3116,6 +3154,8 @@ impl ThreadManagerState {
         };
         let spawn_result = Session::spawn_with_custody(
             SessionSpawnArgs {
+                host_admission: self.extensions.host_admission(),
+                initial_mcp_work,
                 control_endpoint,
                 attached_thread,
                 startup,

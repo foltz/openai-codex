@@ -1330,6 +1330,8 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
     let mut thread_extension_init = codex_extension_api::ExtensionDataInit::default();
     thread_extension_init.insert(codex_extension_api::SessionIsolation::Isolated);
     let (session, io) = Session::spawn(SessionSpawnArgs {
+        host_admission: None,
+        initial_mcp_work: None,
         control_endpoint: Some("unix:///must-not-reach-isolated-mcp".to_string()),
         attached_thread: false,
         startup: None,

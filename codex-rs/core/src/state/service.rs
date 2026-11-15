@@ -79,6 +79,9 @@ pub(crate) struct SessionServices {
     pub(crate) plugins_manager: Arc<PluginsManager>,
     pub(crate) mcp_manager: Arc<McpManager>,
     pub(crate) extensions: Arc<ExtensionRegistry<crate::config::Config>>,
+    /// Account-work policy is distinct from agent execution-capacity admission.
+    /// Retain the original host even when ordinary contributors are isolated.
+    pub(crate) host_admission: Option<Arc<dyn codex_extension_api::TurnStartAdmission>>,
     pub(crate) session_extension_data: ExtensionData,
     pub(crate) thread_extension_data: ExtensionData,
     /// MCP extensions fixed when this session is created.

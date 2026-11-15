@@ -930,6 +930,8 @@ impl Session {
         mcp_manager: Arc<McpManager>,
         code_mode_session_provider: Arc<dyn codex_code_mode::CodeModeSessionProvider>,
         extensions: Arc<codex_extension_api::ExtensionRegistry<crate::config::Config>>,
+        host_admission: Option<Arc<dyn codex_extension_api::TurnStartAdmission>>,
+        initial_mcp_work: Option<Box<dyn codex_mcp::McpAttemptWork>>,
         mut thread_extension_init: ExtensionDataInit,
         client_mcp_extensions: ClientMcpExtensions,
         agent_control: AgentControlInit,
@@ -2087,6 +2089,7 @@ impl Session {
                 plugins_manager: Arc::clone(&plugins_manager),
                 mcp_manager: Arc::clone(&mcp_manager),
                 extensions: Arc::clone(&extensions),
+                host_admission,
                 // TODO(jif): extract session to share between sub-agents
                 session_extension_data,
                 thread_extension_data,
@@ -2276,8 +2279,10 @@ impl Session {
                 latest_auth,
                 mcp_projection,
                 &resolved_environments,
+                codex_mcp::McpAttemptAccess::from_work(initial_mcp_work.as_deref()),
             ))
             .await?;
+            drop(initial_mcp_work);
             sess.start_mcp_prewarm_worker(mcp_prewarm_rx, mcp_auth_changes);
             sess.follow_inherited_environment_configurations(
                 &inherited_environments,

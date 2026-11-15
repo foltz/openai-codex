@@ -107,6 +107,7 @@ impl Session {
         auth: Option<CodexAuth>,
         mcp_projection: McpRuntimeProjection,
         resolved_environments: &TurnEnvironmentSnapshot,
+        access: codex_mcp::McpAttemptAccess<'_>,
     ) -> anyhow::Result<()> {
         let config = self.build_per_turn_config(
             session_configuration,
@@ -123,19 +124,23 @@ impl Session {
             local_process_cwd,
             disabled_plugin_ids: session_configuration.disabled_plugin_ids.clone(),
         };
-        self.publish_mcp_runtime(
+        self.publish_mcp_runtime_with_authority(
             &desired,
             mcp_projection,
             /*ready_selected_capability_roots*/ &[],
             Some(self.mcp_elicitation_reviewer()),
+            access,
         )
         .instrument(info_span!(
             "session_init.mcp_manager_init",
             otel.name = "session_init.mcp_manager_init",
         ))
-        .await;
+        .await?;
 
-        self.services.mcp_runtime.validate_required_servers().await
+        self.services
+            .mcp_runtime
+            .validate_required_servers_with_authority(access)
+            .await
     }
 
     /// Adds effective executor-owned configuration from this exact thread snapshot.
@@ -283,6 +288,29 @@ impl Session {
         ready_selected_capability_roots: &[SelectedCapabilityRoot],
         elicitation_reviewer: Option<ElicitationReviewerHandle>,
     ) {
+        self.publish_mcp_runtime_with_authority(
+            desired,
+            mcp_projection,
+            ready_selected_capability_roots,
+            elicitation_reviewer,
+            codex_mcp::McpAttemptAccess::Unscoped,
+        )
+        .await
+        .expect("unscoped publication cannot derive work");
+    }
+
+    pub(super) async fn publish_mcp_runtime_with_authority(
+        &self,
+        desired: &McpDesiredState,
+        mcp_projection: McpRuntimeProjection,
+        ready_selected_capability_roots: &[SelectedCapabilityRoot],
+        elicitation_reviewer: Option<ElicitationReviewerHandle>,
+        access: codex_mcp::McpAttemptAccess<'_>,
+    ) -> anyhow::Result<()> {
+        let startup_work = match access {
+            codex_mcp::McpAttemptAccess::Unscoped => None,
+            codex_mcp::McpAttemptAccess::Admitted(work) => Some(work.derive_attempt()?),
+        };
         let mcp_projection = self
             .project_selected_environment_mcp_servers(
                 &desired.config,
@@ -291,16 +319,18 @@ impl Session {
             )
             .await;
         let selected_plugins = mcp_projection.selected_plugins.clone();
-        let input = self.build_mcp_runtime_input(
+        let mut input = self.build_mcp_runtime_input(
             desired,
             mcp_projection,
             ready_selected_capability_roots,
             elicitation_reviewer,
         );
+        input.startup_work = startup_work;
         AuthStorageOriginator::from_client_name(&desired.originator)
             .scope(self.services.mcp_runtime.replace(input))
             .await;
         self.services.thread_extension_data.insert(selected_plugins);
+        Ok(())
     }
 
     pub(super) fn build_mcp_runtime_input(

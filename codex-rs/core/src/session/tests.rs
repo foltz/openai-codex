@@ -13866,3 +13866,76 @@ async fn startup_auxiliary_original_join_observes_body_destruction() {
         "join must observe original body destruction"
     );
 }
+
+#[tokio::test]
+async fn task_replacement_reports_refusal_when_closure_wins_during_abort() {
+    struct AbortGate {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    impl SessionTask for AbortGate {
+        fn kind(&self) -> TaskKind {
+            TaskKind::Regular
+        }
+        fn span_name(&self) -> &'static str {
+            "session_task.abort_gate_fixture"
+        }
+        async fn run(
+            self: Arc<Self>,
+            _session: Arc<Session>,
+            _ctx: Arc<TurnContext>,
+            _input: Vec<TurnInput>,
+            _cancel: CancellationToken,
+        ) -> SessionTaskResult {
+            std::future::pending().await
+        }
+        async fn abort(&self, _session: Arc<Session>, _ctx: Arc<TurnContext>) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+    }
+    let (session, context) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let context = Arc::new(context);
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    assert!(
+        session
+            .start_task(
+                Arc::clone(&context),
+                Vec::new(),
+                AbortGate {
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                }
+            )
+            .await
+    );
+    let replacing = tokio::spawn({
+        let session = Arc::clone(&session);
+        async move {
+            session
+                .try_spawn_task(context, Vec::new(), CompletingTask)
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("replacement reached original task abort");
+    session.close_task_admission().await;
+    release.notify_one();
+    assert!(
+        !tokio::time::timeout(Duration::from_secs(5), replacing)
+            .await
+            .expect("replacement returns")
+            .expect("replacement joins")
+    );
+    assert!(session.active_turn.lock().await.is_none());
+    assert_eq!(
+        session
+            .task_joins
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await,
+        crate::tasks::TaskJoinOutcome::Complete { panicked: false }
+    );
+}

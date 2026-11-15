@@ -282,6 +282,14 @@ pub(super) async fn handle(
             .try_for_each(AdditionalContextEntry::validate)
             .map_err(|message| CodexErr::InvalidRequest(message.to_owned()))?;
     }
+    if session
+        .task_admission_closed
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Ok(TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::ServerDraining,
+        });
+    }
     let result = match mode {
         TurnInputMode::StartOrSteer => start_or_steer(session, request, submission_id).await,
         TurnInputMode::StartIfIdle => {
@@ -501,9 +509,14 @@ async fn start_or_steer(
                     .await,
                 );
             }
-            session
-                .spawn_task(Arc::clone(&turn_context), task_input, RegularTask::new())
-                .await;
+            if !session
+                .try_spawn_task(Arc::clone(&turn_context), task_input, RegularTask::new())
+                .await
+            {
+                return Ok(TurnInputSubmission::NotSubmitted {
+                    reason: NotSubmittedReason::ServerDraining,
+                });
+            }
             Ok(TurnInputSubmission::Started {
                 turn_id: submission_id,
                 root_turn_id: turn_context.root_turn_id(),
@@ -537,6 +550,14 @@ async fn start_if_idle(
         responsesapi_client_metadata,
         ..
     } = request;
+    if session
+        .task_admission_closed
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Ok(TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::ServerDraining,
+        });
+    }
     if session.input_queue.has_trigger_turn_mailbox_items().await {
         return Ok(TurnInputSubmission::NotSubmitted {
             reason: NotSubmittedReason::PendingTriggerTurn,
@@ -680,9 +701,14 @@ async fn start_if_idle(
             }
         }
     }
-    session
+    if !session
         .start_task(Arc::clone(&turn_context), task_input, RegularTask::new())
-        .await;
+        .await
+    {
+        return Ok(TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::ServerDraining,
+        });
+    }
     Ok(TurnInputSubmission::Started {
         turn_id: submission_id,
         root_turn_id: turn_context.root_turn_id(),

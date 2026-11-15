@@ -298,9 +298,24 @@ impl Session {
         input: Vec<TurnInput>,
         task: T,
     ) {
+        let _ = self.try_spawn_task(turn_context, input, task).await;
+    }
+
+    pub(crate) async fn try_spawn_task<T: SessionTask>(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        input: Vec<TurnInput>,
+        task: T,
+    ) -> bool {
+        if self
+            .task_admission_closed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return false;
+        }
         self.abort_all_tasks(TurnAbortReason::Replaced).await;
         self.clear_connector_selection().await;
-        self.start_task(turn_context, input, task).await;
+        self.start_task(turn_context, input, task).await
     }
 
     #[expect(
@@ -312,7 +327,7 @@ impl Session {
         turn_context: Arc<TurnContext>,
         input: Vec<TurnInput>,
         task: T,
-    ) {
+    ) -> bool {
         // Replace the cache; in-flight acquisitions retain their previous Arc.
         self.services
             .thread_extension_data
@@ -360,7 +375,7 @@ impl Session {
                 .load(std::sync::atomic::Ordering::Acquire)
                 || self.outcome_handoffs_closed()
             {
-                return;
+                return false;
             }
             let turn = active.get_or_insert_with(ActiveTurn::default);
             debug_assert!(turn.task.is_none());
@@ -383,12 +398,12 @@ impl Session {
             .task_admission_closed
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            return;
+            return false;
         }
         // Shutdown closes registration before taking this same lock to abort active work.
         let outcome_handoff = if let Some(reporting) = &self.outcome_reporting {
             if reporting.handoffs.is_closed() {
-                return;
+                return false;
             }
             Some(reporting.handoffs.token())
         } else {
@@ -521,6 +536,7 @@ impl Session {
             _timer: timer,
         };
         turn.task = Some(running_task);
+        true
     }
 
     /// Returns whether an extension has marked this thread as durably asleep.

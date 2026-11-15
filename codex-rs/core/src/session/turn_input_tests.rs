@@ -1239,3 +1239,52 @@ async fn scored_prompt_keeps_its_submission_item_id() {
     assert_eq!(ui_ids.len(), 3);
     session.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }
+
+#[tokio::test]
+async fn closed_task_admission_never_reports_a_started_submission() {
+    let (session, _) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let settings = session.thread_settings_snapshot().await;
+    session.close_task_admission().await;
+    for mode in [TurnInputMode::StartOrSteer, TurnInputMode::StartIfIdle] {
+        let result = handle(
+            &session,
+            TurnInputRequest::new(SubmittedTurnInput::ResponseItem(user_message(
+                "closed task gate",
+            ))),
+            mode,
+            "closed-task-gate".to_string(),
+        )
+        .await
+        .expect("typed refusal");
+        assert_eq!(
+            result,
+            TurnInputSubmission::NotSubmitted {
+                reason: NotSubmittedReason::ServerDraining
+            }
+        );
+    }
+    let recovery = handle_recovery(
+        &session,
+        ThreadSettingsOverrides::default(),
+        TurnStartOptions::default(),
+        "closed-recovery".to_string(),
+    )
+    .await
+    .expect("recovery refusal");
+    assert_eq!(
+        recovery,
+        TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::ServerDraining
+        }
+    );
+    assert_eq!(session.thread_settings_snapshot().await, settings);
+    assert!(session.active_turn.lock().await.is_none());
+    assert_eq!(
+        session
+            .task_joins
+            .shutdown_until(tokio::time::Instant::now())
+            .await,
+        crate::tasks::TaskJoinOutcome::Complete { panicked: false }
+    );
+}

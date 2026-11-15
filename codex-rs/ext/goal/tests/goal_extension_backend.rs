@@ -2264,6 +2264,7 @@ async fn staged_goal_preparation_respects_persisted_set_before_runtime_effects_a
                     token_budget: GoalTokenBudgetUpdate::Keep,
                     max_goal_token_budget: None,
                 },
+                std::future::ready(Ok(())),
             )
             .await?;
         // Deliberately commit before the separate runtime-effects phase.
@@ -2299,7 +2300,7 @@ async fn staged_goal_preparation_respects_persisted_set_before_runtime_effects_a
         assert!(
             harness
                 .goal_service
-                .clear_thread_goal(runtime.as_ref(), thread_id)
+                .clear_thread_goal(runtime.as_ref(), thread_id, std::future::ready(Ok(())))
                 .await?
         );
         harness.commit_turn(&staged);

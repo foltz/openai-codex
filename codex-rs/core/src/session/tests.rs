@@ -1,4 +1,7 @@
 use crate::McpRefreshReason;
+#[path = "turn_commit_tests.rs"]
+mod turn_commit_tests;
+
 use crate::agent::LocalAgentControl;
 use codex_protocol::ContextWindowId;
 #[path = "compaction_replay_tests.rs"]

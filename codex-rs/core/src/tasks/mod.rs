@@ -654,8 +654,9 @@ impl Session {
             .register_publication(running_task.commit_ready.clone());
         turn.task = Some(running_task);
         drop(active);
-        // The publication barrier also orders a concurrent abort. The Goal019
-        // committed-effect callback is a separate pending contributor port.
+        // Exact assignment is irrevocable; publish outside active_turn. Run,
+        // abort and replacement wait for this publication before proceeding.
+        self.emit_turn_committed_lifecycle(turn_context.as_ref());
         commit_cancel_guard.disarm();
         drop(commit_guard);
         true

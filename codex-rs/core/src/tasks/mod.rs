@@ -1,6 +1,9 @@
 mod admission;
 mod compact;
 mod lifecycle;
+mod preparation;
+pub(crate) use preparation::MailboxPreparation;
+pub(crate) use preparation::MailboxPreparationSlot;
 mod regular;
 mod retirement;
 mod review;
@@ -78,6 +81,11 @@ pub(crate) use user_shell::UserShellCommandTask;
 pub(crate) use user_shell::execute_user_shell_command;
 
 pub(crate) const GRACEFULL_INTERRUPTION_TIMEOUT_MS: u64 = 100;
+enum TaskReservation {
+    New,
+    Existing(Arc<Mutex<TurnState>>),
+}
+
 const TASK_COMPACT_METRIC: &str = "codex.task.compact";
 pub(crate) static ACTIVE_TURNS: Gauge = Gauge::new("core.turns.active");
 
@@ -279,6 +287,7 @@ where
 
 impl Session {
     pub(crate) async fn close_task_admission(&self) {
+        let _ = self.input_queue.preparation.cancel_for_replacement();
         let reservation = {
             let mut active = self.active_turn.lock().await;
             self.task_admission_closed
@@ -313,21 +322,115 @@ impl Session {
         {
             return false;
         }
+        let _ = self.input_queue.preparation.cancel_for_replacement();
         self.abort_all_tasks(TurnAbortReason::Replaced).await;
         self.clear_connector_selection().await;
         self.start_task(turn_context, input, task).await
     }
 
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "record the started turn atomically with task registration"
-    )]
     pub(crate) async fn start_task<T: SessionTask>(
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
         input: Vec<TurnInput>,
         task: T,
     ) -> bool {
+        let mailbox = self.input_queue.reserve_mailbox();
+        self.start_task_with_mailbox(turn_context, input, task, mailbox, TaskReservation::New)
+            .await
+    }
+
+    pub(crate) async fn start_reserved_task<T: SessionTask>(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        input: Vec<TurnInput>,
+        task: T,
+        turn_state: Arc<Mutex<TurnState>>,
+    ) -> bool {
+        let mailbox = self.input_queue.reserve_mailbox();
+        self.start_task_with_mailbox(
+            turn_context,
+            input,
+            task,
+            mailbox,
+            TaskReservation::Existing(turn_state),
+        )
+        .await
+    }
+
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "mailbox, metadata and installation commit share exact final admission"
+    )]
+    async fn start_task_with_mailbox<T: SessionTask>(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        input: Vec<TurnInput>,
+        task: T,
+        mailbox: crate::session::MailboxReservation,
+        reservation: TaskReservation,
+    ) -> bool {
+        let mut replacement = None;
+        // Restore mail before waking replacement waiters, including cancelled waits.
+        let mut mailbox = mailbox;
+        let turn_state = loop {
+            let mut active = self.active_turn.lock().await;
+            if self
+                .task_admission_closed
+                .load(std::sync::atomic::Ordering::Acquire)
+                || self.outcome_handoffs_closed()
+            {
+                return false;
+            }
+            if self.input_queue.mailbox_eviction_fenced() {
+                drop(active);
+                drop(mailbox);
+                if let TaskReservation::Existing(expected) = &reservation {
+                    self.clear_task_reservation(expected).await;
+                }
+                self.input_queue.completion_wake.notify_one();
+                return false;
+            }
+            if active.as_ref().is_some_and(|turn| turn.task.is_some()) {
+                return false;
+            }
+            if let Some(ready) = self.input_queue.preparation.pending_publication() {
+                drop(active);
+                ready.cancelled().await;
+                continue;
+            }
+            match &reservation {
+                TaskReservation::New => {
+                    let completed = if replacement.is_some() {
+                        self.input_queue.preparation.cancel_for_replacement()
+                    } else {
+                        let (guard, completed) = self
+                            .input_queue
+                            .preparation
+                            .begin_replacement(&self.input_queue.completion_wake);
+                        replacement = Some(guard);
+                        completed
+                    };
+                    if let Some(completed) = completed {
+                        drop(active);
+                        completed.cancelled().await;
+                        continue;
+                    }
+                    let turn = ActiveTurn::default();
+                    let turn_state = Arc::clone(&turn.turn_state);
+                    *active = Some(turn);
+                    break turn_state;
+                }
+                TaskReservation::Existing(expected) => {
+                    if !active
+                        .as_ref()
+                        .is_some_and(|turn| Arc::ptr_eq(&turn.turn_state, expected))
+                    {
+                        return false;
+                    }
+                    break Arc::clone(expected);
+                }
+            }
+        };
         // Direct task callers must refuse an already-closed session before
         // replacing caches or beginning async plugin preparation. The locked
         // checks below still handle closure racing with preparation.
@@ -376,25 +479,8 @@ impl Session {
         let cancellation_token = CancellationToken::new();
         let done = Arc::new(Notify::new());
 
-        let (pending_items, _) = self.input_queue.drain_mailbox_input_items().await;
-        let turn_state = {
-            let mut active = self.active_turn.lock().await;
-            if self
-                .task_admission_closed
-                .load(std::sync::atomic::Ordering::Acquire)
-                || self.outcome_handoffs_closed()
-            {
-                return false;
-            }
-            let turn = active.get_or_insert_with(ActiveTurn::default);
-            debug_assert!(turn.task.is_none());
-            turn.finishing = None;
-            Arc::clone(&turn.turn_state)
-        };
+        mailbox.append(self.input_queue.reserve_mailbox());
         turn_state.lock().await.token_usage_at_turn_start = token_usage_at_turn_start.clone();
-        self.input_queue
-            .extend_pending_input_for_turn_state(turn_state.as_ref(), pending_items)
-            .await;
         self.emit_turn_start_lifecycle(
             turn_context.as_ref(),
             Some(&token_usage_at_turn_start),
@@ -406,26 +492,39 @@ impl Session {
         if self
             .task_admission_closed
             .load(std::sync::atomic::Ordering::Acquire)
+            || self.outcome_handoffs_closed()
         {
+            drop(active);
+            drop(mailbox);
+            if self.clear_task_reservation(&turn_state).await {
+                self.input_queue.completion_wake.notify_one();
+            }
             return false;
         }
-        // Shutdown closes registration before taking this same lock to abort active work.
-        let outcome_handoff = if let Some(reporting) = &self.outcome_reporting {
-            if reporting.handoffs.is_closed() {
-                return false;
-            }
-            Some(reporting.handoffs.token())
-        } else {
-            None
+        let outcome_handoff = self
+            .outcome_reporting
+            .as_ref()
+            .map(|reporting| reporting.handoffs.token());
+        let Some(turn) = active
+            .as_mut()
+            .filter(|turn| turn.task.is_none() && Arc::ptr_eq(&turn.turn_state, &turn_state))
+        else {
+            return false;
         };
-        let turn = active.get_or_insert_with(ActiveTurn::default);
-        debug_assert!(turn.task.is_none());
-        // Record lineage only when the task starts: settings changes can invalidate a reservation.
-        self.record_started_turn(
+        // Acquire both destination locks before consuming. No await separates
+        // this final commit from installing its exact task.
+        self.commit_started_turn(
             &turn_context.sub_id,
+            &turn.turn_state,
+            mailbox,
             (task_kind == TaskKind::Regular).then(|| turn_context.attribution()),
         )
         .await;
+        let commit_ready = CancellationToken::new();
+        let commit_guard = commit_ready.clone().drop_guard();
+        // Drop order cancels execution before opening readiness on unwind.
+        let commit_cancel_guard = cancellation_token.clone().drop_guard();
+        let ready_for_run = commit_ready.clone();
         let host_admission = self.host_turn_admission();
         let (agent_execution_guard, task_input, pending_initial_input) = match &host_admission {
             Some(_) => (None, Vec::new(), Some(input)),
@@ -463,6 +562,11 @@ impl Session {
         );
         let storage_originator = AuthStorageOriginator::from_client_name(&turn_context.originator);
         let task_future = async move {
+            ready_for_run.cancelled().await;
+            if task_cancellation_token.is_cancelled() {
+                done_clone.notify_waiters();
+                return;
+            }
             let ctx_for_finish = Arc::clone(&ctx);
             let mut task_result = async {
                 let input = match host_admission {
@@ -532,6 +636,7 @@ impl Session {
             .start_timer(TURN_E2E_DURATION_METRIC, &[])
             .ok();
         let running_task = RunningTask {
+            commit_ready,
             done,
             handle: self.task_joins.register(handle),
             kind: task_kind,
@@ -544,7 +649,15 @@ impl Session {
             _diagnostics_guard: ACTIVE_TURNS.track(),
             _timer: timer,
         };
+        self.input_queue
+            .preparation
+            .register_publication(running_task.commit_ready.clone());
         turn.task = Some(running_task);
+        drop(active);
+        // The publication barrier also orders a concurrent abort. The Goal019
+        // committed-effect callback is a separate pending contributor port.
+        commit_cancel_guard.disarm();
+        drop(commit_guard);
         true
     }
 
@@ -583,105 +696,112 @@ impl Session {
         if !self.input_queue.has_pending_mailbox_items().await {
             return;
         }
-
-        let Some((turn_state, previous_options)) = self.reserve_pending_work_turn().await else {
+        let Some((turn_state, previous_options, mut mailbox, preparation)) =
+            self.reserve_pending_work_turn().await
+        else {
             return;
         };
-
-        let helper_admission = HelperTurnAdmission::capture(self);
-        self.services
-            .models_manager
-            .refresh_after_auth_change(self.get_config().await.http_client_factory())
-            .await;
-        let session_configuration = if self.enabled(Feature::WakeOnAgentMessages) {
-            let Some(configuration) = self.pending_work_turn_configuration(&turn_state).await
-            else {
-                return;
-            };
-            Some(configuration)
-        } else {
-            if self
-                .active_turn
-                .lock()
-                .await
-                .as_ref()
-                .is_none_or(|turn| !Arc::ptr_eq(&turn.turn_state, &turn_state))
-            {
-                return;
+        // Keep the private batch intact through discovery, settings and every
+        // lock wait. The losing future restores it before replacement completes.
+        let prepare = async {
+            let helper_admission = HelperTurnAdmission::capture(self);
+            self.services
+                .models_manager
+                .refresh_after_auth_change(self.get_config().await.http_client_factory())
+                .await;
+            if self.active_turn.lock().await.as_ref().is_none_or(|turn| {
+                turn.task.is_some() || !Arc::ptr_eq(&turn.turn_state, &turn_state)
+            }) {
+                return false;
             }
-            None
-        };
-        let (input, mut start_options) =
-            self.input_queue.get_pending_input(&self.active_turn).await;
-        let triggered = input.iter().any(
-            |item| matches!(item, TurnInput::InterAgentCommunication(mail) if mail.trigger_turn),
-        );
-        if !triggered {
-            // Queue-only wakes retain the previous turn context without selecting a new task.
-            start_options = previous_options;
-            start_options.cyber_access_program = self
-                .reference_context_item()
-                .await
-                .and_then(|context| context.cyber_access_program);
-        }
-        let options = NewTurnContextOptions {
-            direct_only_tool_namespaces: start_options.direct_only_tool_namespaces,
-            final_output_json_schema: start_options.final_output_json_schema,
-            prompt_cache_ttl: start_options.prompt_cache_ttl,
-            cyber_access_program: start_options.cyber_access_program,
-            helper_admission: triggered.then_some(helper_admission).flatten(),
-        };
-        let turn_context = match session_configuration {
-            Some(configuration) => {
-                self.new_turn_with_configuration(sub_id, configuration, options)
+            mailbox.append(self.input_queue.reserve_mailbox());
+            let (mut start_options, initiating_agent_path) = mailbox.start_metadata();
+            let triggered = initiating_agent_path.is_some();
+            let session_configuration = if self.enabled(Feature::WakeOnAgentMessages) {
+                let Some(configuration) = self
+                    .pending_work_turn_configuration(&turn_state, triggered)
                     .await
+                else {
+                    return false;
+                };
+                Some(configuration)
+            } else {
+                None
+            };
+            if !triggered {
+                start_options = previous_options;
+                start_options.cyber_access_program = self
+                    .reference_context_item()
+                    .await
+                    .and_then(|context| context.cyber_access_program);
             }
-            None => self.new_turn_with_default_settings(sub_id, options).await,
-        };
-        if let Some(trigger) = start_options.turn_trigger {
-            turn_context.turn_metadata_state.set_turn_trigger(trigger);
-        }
-        if let Some(id) = start_options.parent_turn_id {
-            if let Some(initiating_agent_path) = input
-                .iter()
-                .find_map(|item| {
-                    let TurnInput::InterAgentCommunication(communication) = item else {
-                        return None;
-                    };
-                    communication
-                        .trigger_turn
-                        .then(|| communication.author.clone())
-                })
-                .or(start_options.initiating_agent_path)
-            {
-                turn_context
-                    .turn_metadata_state
-                    .set_initiating_agent_path(initiating_agent_path);
+            let options = NewTurnContextOptions {
+                direct_only_tool_namespaces: start_options.direct_only_tool_namespaces,
+                final_output_json_schema: start_options.final_output_json_schema,
+                prompt_cache_ttl: start_options.prompt_cache_ttl,
+                cyber_access_program: start_options.cyber_access_program,
+                helper_admission: triggered.then_some(helper_admission).flatten(),
+            };
+            let turn_context = match session_configuration {
+                Some(configuration) => {
+                    self.new_turn_with_configuration(sub_id, configuration, options)
+                        .await
+                }
+                None => self.new_turn_with_default_settings(sub_id, options).await,
+            };
+            if let Some(trigger) = start_options.turn_trigger {
+                turn_context.turn_metadata_state.set_turn_trigger(trigger);
             }
-            turn_context.turn_metadata_state.set_parent_turn_id(id);
-        }
-        if let Some(id) = start_options.root_turn_id {
-            turn_context.turn_metadata_state.set_root_turn_id(id);
-        }
-        self.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
-            .await;
-        // Task completion must still save this mail if pre-turn compaction fails.
-        self.input_queue
-            .extend_pending_input_for_turn_state(turn_state.as_ref(), input)
-            .await;
-        // Context construction can outlive an interrupt or replacement. Do not let
-        // start_task recreate a turn whose reservation is no longer ours.
-        if self
-            .active_turn
-            .lock()
+            if let Some(id) = start_options.parent_turn_id {
+                if let Some(path) = initiating_agent_path.or(start_options.initiating_agent_path) {
+                    turn_context
+                        .turn_metadata_state
+                        .set_initiating_agent_path(path);
+                }
+                turn_context.turn_metadata_state.set_parent_turn_id(id);
+            }
+            if let Some(id) = start_options.root_turn_id {
+                turn_context.turn_metadata_state.set_root_turn_id(id);
+            }
+            self.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
+                .await;
+            self.start_task_with_mailbox(
+                turn_context,
+                Vec::new(),
+                RegularTask::new(),
+                mailbox,
+                TaskReservation::Existing(Arc::clone(&turn_state)),
+            )
             .await
-            .as_ref()
-            .is_none_or(|turn| !Arc::ptr_eq(&turn.turn_state, &turn_state))
-        {
-            return;
+        };
+        let started = tokio::select! {
+            biased;
+            _ = preparation.cancelled() => false,
+            started = prepare => started,
+        };
+        if !started {
+            let cleared = self.clear_task_reservation(&turn_state).await;
+            if (cleared || preparation.was_replaced())
+                && !self
+                    .task_admission_closed
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
+                self.input_queue.completion_wake.notify_one();
+            }
         }
-        self.start_task(turn_context, Vec::new(), RegularTask::new())
-            .await;
+    }
+
+    async fn clear_task_reservation(&self, expected: &Arc<Mutex<TurnState>>) -> bool {
+        let mut active = self.active_turn.lock().await;
+        if active
+            .as_ref()
+            .is_some_and(|turn| turn.task.is_none() && Arc::ptr_eq(&turn.turn_state, expected))
+        {
+            active.take();
+            true
+        } else {
+            false
+        }
     }
 
     pub async fn abort_all_tasks(self: &Arc<Self>, reason: TurnAbortReason) {
@@ -710,7 +830,7 @@ impl Session {
             self.input_queue.clear_pending(&active_turn).await;
         }
         if reason == TurnAbortReason::Interrupted && aborted_turn {
-            self.maybe_start_turn_for_pending_work().await;
+            self.input_queue.completion_wake.notify_one();
         }
     }
 
@@ -762,7 +882,7 @@ impl Session {
         self.input_queue.clear_pending(&active_turn).await;
 
         if reason == TurnAbortReason::Interrupted {
-            self.maybe_start_turn_for_pending_work().await;
+            self.input_queue.completion_wake.notify_one();
         }
     }
 
@@ -1060,7 +1180,7 @@ impl Session {
             warn!("failed to flush rollout after emitting terminal turn event: {err}");
         }
         if cleared_active_turn {
-            self.maybe_start_turn_for_pending_work().await;
+            self.input_queue.completion_wake.notify_one();
         }
         None
     }
@@ -1108,15 +1228,20 @@ impl Session {
         turn_state: &Mutex<TurnState>,
         error: Option<ErrorEvent>,
     ) {
+        let done = task.done.notified();
+        tokio::pin!(done);
+        done.as_mut().enable();
+        let already_cancelled = task.cancellation_token.is_cancelled();
+        task.cancellation_token.cancel();
+        task.commit_ready.cancelled().await;
         let sub_id = task.turn_context.sub_id.clone();
-        if task.cancellation_token.is_cancelled() {
+        if already_cancelled {
             self.emit_turn_abort_lifecycle(reason, task.turn_context.extension_data.as_ref())
                 .await;
             return;
         }
 
         trace!(task_kind = ?task.kind, sub_id, "aborting running task");
-        task.cancellation_token.cancel();
         if reason == TurnAbortReason::Interrupted
             && task
                 .turn_context
@@ -1135,7 +1260,7 @@ impl Session {
         let session_task = task.task;
 
         select! {
-            _ = task.done.notified() => {
+            _ = &mut done => {
             },
             _ = tokio::time::sleep(Duration::from_millis(GRACEFULL_INTERRUPTION_TIMEOUT_MS)) => {
                 warn!("task {sub_id} didn't complete gracefully after {}ms", GRACEFULL_INTERRUPTION_TIMEOUT_MS);
@@ -1239,3 +1364,6 @@ impl Session {
 #[cfg(test)]
 #[path = "mod_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod mailbox_commit_tests;

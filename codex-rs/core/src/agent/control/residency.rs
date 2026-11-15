@@ -53,6 +53,16 @@ impl ThreadManagerState {
         if !is_resident_candidate(&thread) || !is_unloadable(&thread).await {
             return Ok(ThreadEvictionOutcome::Busy);
         }
+        let mut mailbox_fence = {
+            let active = thread.session.active_turn.lock().await;
+            if active.is_some() || thread.session.input_queue.preparation.is_busy() {
+                return Ok(ThreadEvictionOutcome::Busy);
+            }
+            let Some(fence) = thread.session.input_queue.try_fence_mailbox_for_eviction() else {
+                return Ok(ThreadEvictionOutcome::Busy);
+            };
+            fence
+        };
         let manager = Arc::clone(self);
         let teardown = membership
             .clone()
@@ -109,6 +119,7 @@ impl ThreadManagerState {
                 .save_evicted_environments(thread_id, environments);
             let removed = threads.remove(&thread_id);
             let was_removed = removed.is_some();
+            mailbox_fence.commit();
             runtime.residency.remove(thread_id);
             drop(threads);
             // The eviction transaction already observed this exact loop and cleanup.

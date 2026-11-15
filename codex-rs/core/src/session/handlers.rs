@@ -621,10 +621,15 @@ pub(super) async fn submission_loop_with_dispatch(
     if let Some(updates) = &mut mailbox {
         updates.mark_changed();
     }
+    let mut mailbox_start: Option<futures::future::BoxFuture<'static, ()>> = None;
     loop {
+        if rx_sub.is_closed() && rx_sub.is_empty() {
+            break;
+        }
         let sub = tokio::select! {
             biased;
             _ = sess.services.local_agent_runtime.shutdown.cancelled() => {
+                drop(mailbox_start.take());
                 shutdown_received = shutdown(&sess, super::new_submission_id()).await;
                 break;
             }
@@ -667,7 +672,7 @@ pub(super) async fn submission_loop_with_dispatch(
                         if sess.features.enabled(Feature::WakeOnAgentMessages)
                             || sess.has_outstanding_durable_sleep()
                         {
-                            sess.maybe_start_turn_for_pending_work().await;
+                            sess.input_queue.completion_wake.notify_one();
                         }
                     }
                     Ok(false) => {}
@@ -675,7 +680,27 @@ pub(super) async fn submission_loop_with_dispatch(
                 }
                 continue;
             }
+            _ = sess.input_queue.completion_wake.notified(), if mailbox_start.is_none() => {
+                let work = match submissions.as_ref().map(|control| control.begin_work()) {
+                    Some(Some(work)) => Some(work),
+                    Some(None) => continue,
+                    None => None,
+                };
+                let session = Arc::clone(&sess);
+                mailbox_start = Some(Box::pin(async move {
+                    let _work = work;
+                    session.maybe_start_turn_for_pending_work().await;
+                }));
+                continue;
+            }
+            _ = async { mailbox_start.as_mut().expect("guarded mailbox start").await }, if mailbox_start.is_some() => {
+                mailbox_start = None;
+                continue;
+            }
         };
+        if matches!(&sub.op, Op::Shutdown) {
+            drop(mailbox_start.take());
+        }
         let _dispatch = submissions.as_ref().map(|submissions| submissions.begin());
         debug!(
             thread_id = %sess.thread_id(),
@@ -687,7 +712,7 @@ pub(super) async fn submission_loop_with_dispatch(
             "Submission"
         );
         let dispatch_span = submission_dispatch_span(&sub);
-        let should_exit = async {
+        let dispatch = async {
             match sub.op {
                 Op::Interrupt => {
                     interrupt(&sess).await;
@@ -981,14 +1006,25 @@ pub(super) async fn submission_loop_with_dispatch(
                 _ => false, // Ignore unknown ops; enum is non_exhaustive to allow extensions.
             }
         }
-        .instrument(dispatch_span)
-        .await;
+        .instrument(dispatch_span);
+        tokio::pin!(dispatch);
+        // Progress the retained preparation alongside control dispatch. It
+        // owns no submission sender; cancellation drops it before cleanup.
+        let should_exit = loop {
+            tokio::select! {
+                result = &mut dispatch => break result,
+                _ = async { mailbox_start.as_mut().expect("guarded mailbox start").await }, if mailbox_start.is_some() => {
+                    mailbox_start = None;
+                }
+            }
+        };
         drop(sub.residency_guard);
         if should_exit {
             shutdown_received = true;
             break;
         }
     }
+    drop(mailbox_start);
     // If the submission loop exits because the channel closed without an
     // explicit shutdown op, still run session teardown.
     if !shutdown_received {

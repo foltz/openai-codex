@@ -594,9 +594,9 @@ async fn start_if_idle(
         });
     }
 
-    let turn_state = {
+    let (turn_state, _registration) = {
         let mut active_turn = session.active_turn.lock().await;
-        if active_turn.is_some() {
+        if active_turn.is_some() || session.input_queue.preparation.is_busy() {
             return Ok(TurnInputSubmission::NotSubmitted {
                 reason: NotSubmittedReason::NotIdle,
             });
@@ -609,12 +609,15 @@ async fn start_if_idle(
             });
         }
         let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
-        Arc::clone(&active_turn.turn_state)
+        (
+            Arc::clone(&active_turn.turn_state),
+            session.input_queue.preparation.register(),
+        )
     };
 
     if session.input_queue.has_trigger_turn_mailbox_items().await {
         session.clear_reserved_idle_turn(&turn_state).await;
-        session.maybe_start_turn_for_pending_work().await;
+        session.input_queue.completion_wake.notify_one();
         return Ok(TurnInputSubmission::NotSubmitted {
             reason: NotSubmittedReason::PendingTriggerTurn,
         });
@@ -702,7 +705,12 @@ async fn start_if_idle(
         }
     }
     if !session
-        .start_task(Arc::clone(&turn_context), task_input, RegularTask::new())
+        .start_reserved_task(
+            Arc::clone(&turn_context),
+            task_input,
+            RegularTask::new(),
+            turn_state,
+        )
         .await
     {
         return Ok(TurnInputSubmission::NotSubmitted {
@@ -832,15 +840,53 @@ impl Session {
         }
     }
 
+    /// Final admission holds active_turn. Destination locks precede synchronous
+    /// consumption and metadata, with no suspension before task installation.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "ordered state and destination locks protect final task commit"
+    )]
+    pub(crate) async fn commit_started_turn(
+        &self,
+        turn_id: &str,
+        turn_state: &tokio::sync::Mutex<TurnState>,
+        mailbox: super::MailboxReservation,
+        attribution: Option<codex_history::TurnAttribution>,
+    ) {
+        let mut state = self.state.lock().await;
+        self.input_queue
+            .commit_mailbox_for_turn_state(turn_state, mailbox, turn_id)
+            .await;
+        state.last_started_turn_id = Some(turn_id.to_owned());
+        if let Some(attribution) = attribution {
+            state.turn_attribution = Some(attribution);
+        }
+    }
+
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "The admission lock keeps the previous turn stable while capturing its attribution."
     )]
     pub(crate) async fn reserve_pending_work_turn(
         &self,
-    ) -> Option<(Arc<tokio::sync::Mutex<TurnState>>, TurnStartOptions)> {
+    ) -> Option<(
+        Arc<tokio::sync::Mutex<TurnState>>,
+        TurnStartOptions,
+        super::MailboxReservation,
+        crate::tasks::MailboxPreparation,
+    )> {
         let mut active_turn = self.active_turn.lock().await;
-        if active_turn.is_some() || self.outcome_handoffs_closed() {
+        if active_turn.is_some()
+            || self.outcome_handoffs_closed()
+            || self
+                .task_admission_closed
+                .load(std::sync::atomic::Ordering::Acquire)
+            || self.input_queue.mailbox_eviction_fenced()
+            || self
+                .input_queue
+                .preparation
+                .defer_if_busy(&self.input_queue.completion_wake)
+        {
             return None;
         }
         let has_trigger_turn = self.input_queue.has_trigger_turn_mailbox_items().await;
@@ -850,7 +896,11 @@ impl Session {
         {
             return None;
         }
-        let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
+        let mailbox = self.input_queue.reserve_mailbox();
+        if mailbox.is_empty() {
+            return None;
+        }
+        let has_trigger_turn = mailbox.start_metadata().1.is_some();
         let previous_options = if has_trigger_turn {
             Default::default()
         } else {
@@ -862,7 +912,13 @@ impl Session {
                 .map(codex_history::TurnAttribution::start_options)
                 .unwrap_or_default()
         };
-        Some((Arc::clone(&active_turn.turn_state), previous_options))
+        let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
+        Some((
+            Arc::clone(&active_turn.turn_state),
+            previous_options,
+            mailbox,
+            self.input_queue.preparation.register(),
+        ))
     }
 
     /// Revalidates a reserved wake and selects its settings before any mail is consumed.
@@ -873,6 +929,7 @@ impl Session {
     pub(crate) async fn pending_work_turn_configuration(
         &self,
         turn_state: &Arc<tokio::sync::Mutex<TurnState>>,
+        has_trigger_turn: bool,
     ) -> Option<SessionConfiguration> {
         // Discovery can outlive an interrupt or a settings update. Keep cancellation
         // atomic with admission so newly arriving mail can retry a rejected wake.
@@ -883,7 +940,6 @@ impl Session {
         {
             return None;
         }
-        let has_trigger_turn = self.input_queue.has_trigger_turn_mailbox_items().await;
         let state = self.state.lock().await;
         let configuration = &state.session_configuration;
         if !has_trigger_turn

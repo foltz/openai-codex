@@ -272,6 +272,7 @@ pub(crate) use submission::Submission;
 pub(crate) use submission::SubmissionSender;
 mod input_queue;
 mod mailbox;
+pub(crate) use mailbox::MailboxReservation;
 mod mcp;
 mod mcp_prewarm;
 mod mcp_refresh;
@@ -308,7 +309,7 @@ pub(crate) use self::environment::ThreadEnvironmentDefaults;
 #[cfg(test)]
 use self::handlers::submission_dispatch_span;
 #[cfg(test)]
-use self::handlers::submission_loop;
+pub(crate) use self::handlers::submission_loop;
 use self::handlers::submission_loop_with_dispatch;
 pub(crate) use self::input_queue::InputQueueActivity;
 pub(crate) use self::input_queue::TurnInput;

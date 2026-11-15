@@ -127,6 +127,8 @@ pub(crate) struct TurnInputQueue {
 pub(crate) struct InputQueue {
     activity_tx: watch::Sender<InputQueueActivity>,
     mailbox: super::mailbox::Mailbox,
+    pub(crate) completion_wake: Arc<tokio::sync::Notify>,
+    pub(crate) preparation: crate::tasks::MailboxPreparationSlot,
 }
 
 impl InputQueue {
@@ -135,6 +137,8 @@ impl InputQueue {
         Self {
             mailbox: super::mailbox::Mailbox::new(activity_tx.clone()),
             activity_tx,
+            completion_wake: Arc::new(tokio::sync::Notify::new()),
+            preparation: crate::tasks::MailboxPreparationSlot::default(),
         }
     }
 
@@ -233,6 +237,18 @@ impl InputQueue {
         self.mailbox.drain_unaccounted()
     }
 
+    pub(crate) fn try_fence_mailbox_for_eviction(
+        &self,
+    ) -> Option<super::mailbox::MailboxEvictionFence> {
+        self.mailbox
+            .try_fence_eviction()
+            .map(|fence| fence.with_wake(Arc::clone(&self.completion_wake)))
+    }
+
+    pub(crate) fn mailbox_eviction_fenced(&self) -> bool {
+        self.mailbox.eviction_fenced()
+    }
+
     /// Accounted consumers must retain this private batch through final task
     /// admission. Dropping it restores full message records in enqueue order.
     pub(crate) fn reserve_mailbox(&self) -> super::mailbox::MailboxReservation {
@@ -252,6 +268,7 @@ impl InputQueue {
         turn_state.pending_input.items.extend(items);
     }
 
+    #[cfg(test)]
     pub(crate) async fn drain_mailbox_input_items(&self) -> (Vec<TurnInput>, TurnStartOptions) {
         let pending_mails = self.drain_mailbox().await;
         // A later follow-up supersedes the earlier choice, including an omitted choice.
@@ -422,6 +439,7 @@ impl InputQueue {
     pub(crate) async fn get_pending_input(
         &self,
         active_turn: &Mutex<Option<ActiveTurn>>,
+        turn_id: &str,
     ) -> (Vec<TurnInput>, TurnStartOptions) {
         let (pending_input, accepts_mailbox_delivery) = {
             let mut active = active_turn.lock().await;
@@ -443,7 +461,7 @@ impl InputQueue {
         if !accepts_mailbox_delivery {
             return (pending_input, TurnStartOptions::default());
         }
-        let (mailbox_items, start_options) = self.drain_mailbox_input_items().await;
+        let (mailbox_items, start_options) = self.mailbox.reserve().into_input(turn_id);
         if pending_input.is_empty() {
             (mailbox_items, start_options)
         } else {

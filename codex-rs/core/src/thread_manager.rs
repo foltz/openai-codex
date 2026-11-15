@@ -1,5 +1,9 @@
+const OWNED_STARTUP_CLEANUP_BUDGET: Duration = Duration::from_secs(30);
+
+mod account_work;
 mod managed;
 mod model_catalog;
+mod retirement;
 mod shared_instructions;
 mod shutdown;
 
@@ -7,10 +11,14 @@ pub use shutdown::AgentTreeShutdown;
 pub use shutdown::AgentTreeShutdownFailure;
 pub use shutdown::AgentTreeShutdownFailureReason;
 pub use shutdown::AgentTreeShutdownReport;
+pub use shutdown::ThreadManagerRetirement;
+pub use shutdown::ThreadManagerRetirementError;
+pub use shutdown::ThreadManagerRetirementReport;
 pub(crate) use shutdown::thread_store_error_kind;
 
 use crate::CodexAppsToolsCache;
 use crate::CodexThreadSettingsOverrides;
+use crate::ThreadRetirementError;
 use crate::agent::AgentStatus;
 use crate::agent::LocalAgentControl;
 use crate::agent::api::AgentControl;
@@ -250,6 +258,30 @@ impl From<usize> for ForkSnapshot {
     }
 }
 
+/// Census of a synchronous shutdown-deadline binding.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ShutdownDeadlineBinding {
+    /// Runtimes whose cleanup is now bound to the deadline.
+    pub bound: usize,
+    /// Runtimes whose cleanup had already started in Legacy (unbounded) mode:
+    /// refused, never claimed bound. A runtime already terminal with positive
+    /// proof (clean receipt, proven sandbox cleanup, loop joined `Normal`) is
+    /// not counted.
+    pub legacy_cleanup_started: usize,
+    /// Runtimes whose cleanup authority was unavailable.
+    pub unavailable: usize,
+    /// The lookup map was write-locked; the published registry (a superset of
+    /// every non-terminal map entry) was used alone.
+    pub lookup_contended: bool,
+}
+
+impl ShutdownDeadlineBinding {
+    /// True only when every reachable runtime was actually bound.
+    pub fn is_complete(&self) -> bool {
+        self.legacy_cleanup_started == 0 && self.unavailable == 0
+    }
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ThreadShutdownReport {
     pub completed: Vec<ThreadId>,
@@ -313,6 +345,8 @@ pub enum McpRefreshReason {
 /// them in memory.
 pub struct ThreadManager {
     state: Arc<ThreadManagerState>,
+    constructions: retirement::ThreadConstructions,
+    shutdown: std::sync::Mutex<Option<ThreadManagerRetirement>>,
     _test_codex_home_guard: Option<TempCodexHomeGuard>,
 }
 
@@ -584,6 +618,7 @@ pub(crate) struct ResumeThreadWithHistoryOptions {
 /// `Arc` reference that can be downgraded to by `LocalAgentControl` while preventing every single
 /// function to require an `Arc<&Self>`.
 pub(crate) struct ThreadManagerState {
+    constructions: retirement::ConstructionTicket,
     // Eviction updates this registry and residency together, locking the registry first.
     pub(crate) threads: Arc<RwLock<HashMap<ThreadId, Arc<CodexThread>>>>,
     shared_thread_instructions: shared_instructions::SharedThreadInstructionsProviders,
@@ -688,8 +723,10 @@ impl ThreadManager {
             } else {
                 Arc::new(DisabledCodeModeSessionProvider)
             };
+        let constructions = retirement::ThreadConstructions::default();
         Self {
             state: Arc::new(ThreadManagerState {
+                constructions: constructions.ticket(),
                 threads: Arc::new(RwLock::new(HashMap::new())),
                 shared_thread_instructions: Default::default(),
                 thread_created_tx,
@@ -718,6 +755,8 @@ impl ThreadManager {
                 ops_log: should_use_test_thread_manager_behavior()
                     .then(|| Arc::new(std::sync::Mutex::new(Vec::new()))),
             }),
+            constructions,
+            shutdown: Default::default(),
             _test_codex_home_guard: None,
         }
     }
@@ -900,8 +939,10 @@ impl ThreadManager {
             state_db.clone(),
         ));
         let agent_graph_store = local_agent_graph_store_from_state_db(state_db.as_ref());
+        let constructions = retirement::ThreadConstructions::default();
         Self {
             state: Arc::new(ThreadManagerState {
+                constructions: constructions.ticket(),
                 runtime_auth,
                 threads: Arc::new(RwLock::new(HashMap::new())),
                 shared_thread_instructions: Default::default(),
@@ -943,6 +984,8 @@ impl ThreadManager {
                 ops_log: should_use_test_thread_manager_behavior()
                     .then(|| Arc::new(std::sync::Mutex::new(Vec::new()))),
             }),
+            constructions,
+            shutdown: Default::default(),
             _test_codex_home_guard: None,
         }
     }
@@ -1685,18 +1728,24 @@ impl ThreadManager {
         &self,
         thread_id: &ThreadId,
     ) -> CodexResult<Option<Arc<CodexThread>>> {
-        let mut threads = self.state.threads.write().await;
-        if threads
-            .get(thread_id)
-            .is_some_and(|thread| thread.session_source.is_internal())
-        {
-            return Err(CodexErr::InvalidRequest(
-                "live internal threads can only be removed by their owner".to_owned(),
-            ));
-        }
-        Ok(threads.remove(thread_id).inspect(|thread| {
+        let removed = {
+            let mut threads = self.state.threads.write().await;
+            if threads
+                .get(thread_id)
+                .is_some_and(|thread| thread.session_source.is_internal())
+            {
+                return Err(CodexErr::InvalidRequest(
+                    "live internal threads can only be removed by their owner".to_owned(),
+                ));
+            }
+            threads.remove(thread_id)
+        };
+        // Lookup guard released: compaction may run runtime destructors.
+        if let Some(thread) = &removed {
             thread.session.services.mcp_runtime.revoke_ema();
-        }))
+        }
+        self.state.constructions.release_removed(removed.as_ref());
+        Ok(removed)
     }
 
     /// Removes a thread only if `thread_id` still maps to `expected`.
@@ -1708,57 +1757,154 @@ impl ThreadManager {
         thread_id: &ThreadId,
         expected: &Arc<CodexThread>,
     ) -> Option<Arc<CodexThread>> {
-        let mut threads = self.state.threads.write().await;
-        if threads
-            .get(thread_id)
-            .is_some_and(|thread| Arc::ptr_eq(thread, expected))
-        {
-            threads.remove(thread_id).inspect(|thread| {
-                thread.session.services.mcp_runtime.revoke_ema();
-            })
-        } else {
-            None
+        let removed = {
+            let mut threads = self.state.threads.write().await;
+            if threads
+                .get(thread_id)
+                .is_some_and(|thread| Arc::ptr_eq(thread, expected))
+            {
+                threads.remove(thread_id)
+            } else {
+                None
+            }
+        };
+        // Compaction is by Arc identity: a same-id replacement left in the
+        // lookup (or still uncleaned) is never released by this call.
+        if let Some(thread) = &removed {
+            thread.session.services.mcp_runtime.revoke_ema();
         }
+        self.state.constructions.release_removed(removed.as_ref());
+        removed
     }
 
-    /// Tries to shut down all tracked threads concurrently within the provided timeout.
-    /// Threads that complete shutdown are removed from the manager; incomplete shutdowns
-    /// remain tracked so callers can retry or inspect them later.
+    /// Removes only the exact runtime observed by a KCF retirement transaction.
+    pub async fn remove_thread_if_same(
+        &self,
+        thread_id: &ThreadId,
+        expected: &Arc<CodexThread>,
+    ) -> Option<Arc<CodexThread>> {
+        self.remove_thread_if_matches(thread_id, expected).await
+    }
+
+    /// Synchronous shutdown-deadline binding for the permanent host/manager
+    /// shutdown edge (the standalone host's first edge, and the permanent
+    /// `begin_shutdown`): no
+    /// async lock and no task. The population is the published registry (it
+    /// holds every non-terminal runtime, under a short std mutex), plus a
+    /// best-effort `try_read` of the lookup map; a contended map never makes
+    /// this wait. The deadline is also latched in the registry, so a runtime
+    /// published later is bound at publication and its cleanup can never start
+    /// in Legacy (unbounded) mode. A runtime whose cleanup already started in
+    /// Legacy mode is refused and counted, never claimed bound, unless it is
+    /// already terminal with positive proof (clean Legacy receipt or
+    /// reconciliation, proven sandbox cleanup, loop joined `Normal`): such a
+    /// runtime is neither bound nor counted.
+    pub fn bind_shutdown_deadlines_now(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> ShutdownDeadlineBinding {
+        let mut threads = self.constructions.latch_shutdown_deadline(deadline);
+        let lookup_contended = match self.state.threads.try_read() {
+            Ok(map) => {
+                for thread in map.values() {
+                    if !threads.iter().any(|known| Arc::ptr_eq(known, thread)) {
+                        threads.push(Arc::clone(thread));
+                    }
+                }
+                false
+            }
+            Err(_) => true,
+        };
+        let mut binding = ShutdownDeadlineBinding {
+            lookup_contended,
+            ..ShutdownDeadlineBinding::default()
+        };
+        for thread in threads {
+            // The permanent host/manager shutdown edge: an in-flight Legacy cleanup is
+            // refused (counted) and clamped live to this deadline.
+            match thread.bind_shutdown_edge_deadline(deadline) {
+                Ok(_) => binding.bound += 1,
+                // Already terminal: a refused Legacy cleanup whose existing
+                // strict positive proof is complete (clean receipt or
+                // reconciliation, proven sandbox cleanup, and this exact loop
+                // joined Normal) has nothing left to bind. The proof is
+                // consumed as recorded; nothing is bound retroactively. A
+                // lookup entry not yet removed after such a cleanup is not
+                // unbound work.
+                Err(ThreadRetirementError::LegacyCleanupStarted)
+                    if thread.observed_terminal_cleanup()
+                        == Some(crate::session::SessionLoopOutcome::Normal) => {}
+                Err(ThreadRetirementError::LegacyCleanupStarted) => {
+                    binding.legacy_cleanup_started += 1;
+                }
+                Err(_) => binding.unavailable += 1,
+            }
+        }
+        binding
+    }
+
+    /// Tries to shut down all tracked runtimes concurrently within the provided timeout.
+    /// Includes runtimes removed from lookup while their cleanup remains unproven.
+    /// Positive shutdown removes only the exact runtime from lookup; incomplete
+    /// cleanup stays owned by the retained population for subsequent observation.
     pub async fn shutdown_all_threads_bounded(&self, timeout: Duration) -> ThreadShutdownReport {
-        let threads = {
+        let mut threads = {
             let threads = self.state.threads.read().await;
             threads
                 .iter()
                 .map(|(thread_id, thread)| (*thread_id, Arc::clone(thread)))
                 .collect::<Vec<_>>()
         };
+        // Resume and managed lifetime teardown can remove a lookup entry before
+        // resource cleanup succeeds. Reset must still observe that exact runtime.
+        // A replacement may share its thread ID, so deduplicate by Arc identity.
+        for thread in self.constructions.published() {
+            if !threads
+                .iter()
+                .any(|(_, tracked)| Arc::ptr_eq(tracked, &thread))
+            {
+                threads.push((thread.session.thread_id(), thread));
+            }
+        }
 
+        // Bind each runtime before its Shutdown submission: session cleanup is
+        // then deadline-bound and never polled past this caller's bound. This
+        // leaves construction admission open, so reusable callers (managed
+        // reset) keep a working manager; only `begin_shutdown` closes it.
+        let deadline = tokio::time::Instant::now() + timeout;
         let mut shutdowns = threads
             .into_iter()
             .map(|(thread_id, thread)| async move {
-                let outcome = match tokio::time::timeout(timeout, thread.shutdown_and_wait()).await
-                {
-                    Ok(Ok(())) => ShutdownOutcome::Complete,
-                    Ok(Err(_)) => ShutdownOutcome::SubmitFailed,
-                    Err(_) => ShutdownOutcome::TimedOut,
-                };
-                (thread_id, outcome)
+                // A refusal means unbound legacy cleanup already started; it
+                // keeps its historical classification below.
+                let _ = thread.bind_shutdown_deadline(deadline);
+                let outcome =
+                    match tokio::time::timeout_at(deadline, thread.shutdown_and_wait()).await {
+                        // Deadline-bound cleanup that expired ends the loop without
+                        // a receipt; that is TimedOut, never Complete.
+                        Ok(Ok(()))
+                            if tokio::time::Instant::now() >= deadline
+                                && thread.observed_terminal_cleanup().is_none() =>
+                        {
+                            ShutdownOutcome::TimedOut
+                        }
+                        Ok(Ok(())) => ShutdownOutcome::Complete,
+                        Ok(Err(_)) => ShutdownOutcome::SubmitFailed,
+                        Err(_) => ShutdownOutcome::TimedOut,
+                    };
+                (thread_id, thread, outcome)
             })
             .collect::<FuturesUnordered<_>>();
         let mut report = ThreadShutdownReport::default();
 
-        while let Some((thread_id, outcome)) = shutdowns.next().await {
+        while let Some((thread_id, thread, outcome)) = shutdowns.next().await {
             match outcome {
-                ShutdownOutcome::Complete => report.completed.push(thread_id),
+                ShutdownOutcome::Complete => {
+                    self.remove_thread_if_same(&thread_id, &thread).await;
+                    report.completed.push(thread_id);
+                }
                 ShutdownOutcome::SubmitFailed => report.submit_failed.push(thread_id),
                 ShutdownOutcome::TimedOut => report.timed_out.push(thread_id),
-            }
-        }
-
-        let mut tracked_threads = self.state.threads.write().await;
-        for thread_id in &report.completed {
-            if let Some(thread) = tracked_threads.remove(thread_id) {
-                thread.session.services.mcp_runtime.revoke_ema();
             }
         }
 
@@ -1949,6 +2095,31 @@ impl ThreadManager {
         request.fork_persistence = fork_persistence;
         request.inherited_instructions = Some(instructions);
         Box::pin(self.state.spawn_thread(request)).await
+    }
+
+    /// Bounds host work that waits on manager-owned background tasks by this
+    /// manager's latched retirement deadline: `None` once that deadline has
+    /// elapsed (starts still unreceipted then stay in manager custody). With
+    /// no deadline latched this is exactly `work`. Holds no strong reference
+    /// to the manager or its construction registry.
+    pub fn until_retirement_deadline<F>(
+        &self,
+        work: F,
+    ) -> impl std::future::Future<Output = Option<F::Output>> + Send + 'static
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send,
+    {
+        let ticket = self.constructions.ticket();
+        async move {
+            // Expiry first: once the manager deadline has elapsed, `work` is
+            // never polled, so no new cleanup starts after expiry.
+            tokio::select! {
+                biased;
+                _ = ticket.expiry(/*local*/ None) => None,
+                output = work => Some(output),
+            }
+        }
     }
 
     pub(crate) fn agent_control(&self) -> LocalAgentControl {
@@ -2148,15 +2319,14 @@ impl ThreadManagerState {
             .await
     }
 
-    /// Remove a thread from the manager by ID, returning it when present.
+    /// Remove lookup only; positive cleanup evidence controls retained population release.
     pub(crate) async fn remove_thread(&self, thread_id: &ThreadId) -> Option<Arc<CodexThread>> {
-        self.threads
-            .write()
-            .await
-            .remove(thread_id)
-            .inspect(|thread| {
-                thread.session.services.mcp_runtime.revoke_ema();
-            })
+        let removed = self.threads.write().await.remove(thread_id);
+        if let Some(thread) = &removed {
+            thread.session.services.mcp_runtime.revoke_ema();
+        }
+        self.constructions.release_removed(removed.as_ref());
+        removed
     }
 
     pub(crate) async fn effective_multi_agent_version_for_spawn(
@@ -2311,7 +2481,7 @@ impl ThreadManagerState {
     /// Start a newly spawned agent. Both history modes use the same options captured
     /// from the spawning turn; only history ownership and persistence differ.
     pub(crate) async fn spawn_child_thread(
-        &self,
+        self: &Arc<Self>,
         mut options: StartThreadOptions,
         agent_control: LocalAgentControl,
         parent_thread_id: Option<ThreadId>,
@@ -2334,7 +2504,7 @@ impl ThreadManagerState {
 
     /// Starts a host-reserved child using inheritance captured from this manager's parent.
     pub(crate) async fn spawn_host_child_thread(
-        &self,
+        self: &Arc<Self>,
         options: StartThreadOptions,
         agent_control: AgentControlInit,
         parent_thread_id: ThreadId,
@@ -2372,7 +2542,7 @@ impl ThreadManagerState {
     }
 
     pub(crate) async fn resume_thread_with_history_with_source(
-        &self,
+        self: &Arc<Self>,
         options: ResumeThreadWithHistoryOptions,
     ) -> CodexResult<NewThread> {
         let ResumeThreadWithHistoryOptions {
@@ -2455,19 +2625,11 @@ impl ThreadManagerState {
             .unwrap_or_default()
     }
 
-    /// Spawn a new thread with optional history and register it with the manager.
-    async fn spawn_thread(&self, mut request: ThreadSpawnRequest) -> CodexResult<NewThread> {
-        let cancellation = request
-            .options
-            .config
-            .config_layer_stack
-            .mcp_ema_cancellation()
-            .for_startup();
-        request.options.config.config_layer_stack = request
-            .options
-            .config
-            .config_layer_stack
-            .with_mcp_ema_cancellation(cancellation);
+    /// Spawn a new thread under a retained original constructor and publication fence.
+    async fn spawn_thread(self: &Arc<Self>, request: ThreadSpawnRequest) -> CodexResult<NewThread> {
+        let state = Arc::clone(self);
+        self.constructions.register(None, move |custody, publication| async move {
+            let mut request = request;
         let runtime = request.agent_control.runtime().clone();
         let membership = runtime.admit_start()?;
         let owns_startup = request.startup.is_none();
@@ -2479,6 +2641,90 @@ impl ThreadManagerState {
         startup_state.hold_membership(membership);
         let startup_guard =
             owns_startup.then(|| SessionStartupGuard::new(Arc::clone(&startup_state)));
+            if let Some(existing) = startup_state.custody.get() {
+                if !Arc::ptr_eq(existing, &custody) {
+                    return Err(CodexErr::Fatal("startup custody identity mismatch".to_owned()));
+                }
+            } else if startup_state.custody.set(Arc::clone(&custody)).is_err() {
+                return Err(CodexErr::Fatal("startup custody installation raced".to_owned()));
+            }
+            let stop = startup_state.stop.clone();
+            let observer_cancelled = publication.observer_cancellation();
+            let cleanup_clock = publication.clone();
+            let expiry_refused = publication.expiry_cancellation();
+            let stopped = cleanup_clock.unless_published(stop.cancelled());
+            let abandoned = cleanup_clock.unless_published(observer_cancelled.cancelled());
+            let expired = cleanup_clock.unless_published(async {
+                tokio::select! {
+                    _ = expiry_refused.cancelled() => {}
+                    _ = cleanup_clock.expiry(None) => {}
+                }
+            });
+            let result = {
+                let start = state.spawn_thread_owned_boxed(request, Arc::clone(&custody), publication);
+                tokio::select! {
+                    biased;
+                    _ = stopped => Err(CodexErr::TurnAborted),
+                    _ = abandoned, if owns_startup => {
+                        stop.cancel();
+                        Err(CodexErr::TurnAborted)
+                    }
+                    _ = expired => {
+                        cleanup_clock.refuse_unpublished();
+                        let now = tokio::time::Instant::now();
+                        custody.tighten_deadline(cleanup_clock.registry_deadline().map_or(now, |bound| bound.min(now)));
+                        Err(CodexErr::TurnAborted)
+                    }
+                    result = start => result,
+                }
+            };
+            match &result {
+                Ok(_) => {
+                    startup_state.release_membership();
+                    if let Some(startup_guard) = startup_guard { startup_guard.disarm(); }
+                }
+                Err(_) => {
+                    if let Some(startup_guard) = startup_guard {
+                        startup_guard.disarm();
+                        if let Some(teardown) = startup_state.take_teardown() { custody.adopt_teardown(teardown); }
+                        let cleanup = cleanup_clock.clamped_cleanup(&custody, OWNED_STARTUP_CLEANUP_BUDGET).await;
+                        if !cleanup.is_some_and(crate::session::startup_custody::StartupCleanup::is_complete) {
+                            warn!(?cleanup, "managed startup cleanup incomplete; custody retained");
+                        }
+                    }
+                }
+            }
+            result
+        })?.await
+    }
+
+    /// Keep the large constructor frame on the heap before registry polling.
+    fn spawn_thread_owned_boxed(
+        &self,
+        request: ThreadSpawnRequest,
+        custody: Arc<crate::session::startup_custody::SessionStartupCustody>,
+        publication: retirement::ConstructionPublication,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = CodexResult<NewThread>> + '_>> {
+        Box::pin(self.spawn_thread_owned(request, custody, publication))
+    }
+
+    async fn spawn_thread_owned(
+        &self,
+        mut request: ThreadSpawnRequest,
+        custody: Arc<crate::session::startup_custody::SessionStartupCustody>,
+        publication: retirement::ConstructionPublication,
+    ) -> CodexResult<NewThread> {
+        let cancellation = request
+            .options
+            .config
+            .config_layer_stack
+            .mcp_ema_cancellation()
+            .for_startup();
+        request.options.config.config_layer_stack = request
+            .options
+            .config
+            .config_layer_stack
+            .with_mcp_ema_cancellation(cancellation);
         let ThreadSpawnRequest {
             ready_notification,
             startup,
@@ -2616,18 +2862,16 @@ impl ThreadManagerState {
                     }
                     let session_configured =
                         thread.startup_metadata().to_session_configured_event();
-                    startup_state.release_membership();
-                    if let Some(startup_guard) = startup_guard {
-                        startup_guard.disarm();
-                    }
                     return Ok(NewThread {
                         thread_id: resumed.conversation_id,
                         session_configured,
                         thread,
                     });
                 }
-                threads.remove(&resumed.conversation_id);
+                let removed = threads.remove(&resumed.conversation_id);
                 thread.session.services.mcp_runtime.revoke_ema();
+                drop(threads);
+                self.constructions.release_removed(removed.as_ref());
             }
         }
         let supplied_thread_instructions =
@@ -2850,9 +3094,6 @@ impl ThreadManagerState {
         let models_manager = tokio::select! {
             biased;
             _ = agent_control.runtime().shutdown.cancelled() => {
-                if let Some(startup_guard) = startup_guard {
-                    startup_guard.cleanup().await;
-                }
                 return Err(CodexErr::TurnAborted);
             }
             manager = self.models_for_thread(
@@ -2863,81 +3104,81 @@ impl ThreadManagerState {
                 &session_source,
             ) => manager,
         };
-        let spawn_result = Session::spawn(SessionSpawnArgs {
-            control_endpoint,
-            attached_thread,
-            startup,
-            config,
-            prompt_cache_key,
-            allow_provider_model_fallback,
-            instructions: startup_context.instructions,
-            installation_id: self.installation_id.clone(),
-            auth_manager,
-            runtime_auth,
-            models_manager,
-            git_root_discovery: Arc::clone(&self.git_root_discovery),
-            environment_manager: Arc::clone(&self.environment_manager),
-            skills_service: Arc::clone(&self.skills_service),
-            plugins_manager,
-            mcp_manager,
-            code_mode_session_provider: Arc::clone(&self.code_mode_session_provider),
-            extensions,
-            conversation_history: initial_history,
-            resume_preparation,
-            history_initialization: startup_context.history_initialization,
-            disabled_plugin_ids,
-            requested_history_mode: history_mode,
-            fork_persistence,
-            // Keep only the manager registration internal. The session and its saved
-            // history retain Guardian's existing identity for metadata, filtering and resume.
-            session_source: match session_source {
-                SessionSource::Internal(InternalSessionSource::Guardian) => {
-                    SessionSource::SubAgent(SubAgentSource::Other(
-                        crate::guardian::GUARDIAN_REVIEWER_NAME.to_owned(),
-                    ))
-                }
-                source => source,
+        let spawn_result = Session::spawn_with_custody(
+            SessionSpawnArgs {
+                control_endpoint,
+                attached_thread,
+                startup,
+                config,
+                prompt_cache_key,
+                allow_provider_model_fallback,
+                instructions: startup_context.instructions,
+                installation_id: self.installation_id.clone(),
+                auth_manager,
+                runtime_auth,
+                models_manager,
+                git_root_discovery: Arc::clone(&self.git_root_discovery),
+                environment_manager: Arc::clone(&self.environment_manager),
+                skills_service: Arc::clone(&self.skills_service),
+                plugins_manager,
+                mcp_manager,
+                code_mode_session_provider: Arc::clone(&self.code_mode_session_provider),
+                extensions,
+                conversation_history: initial_history,
+                resume_preparation,
+                history_initialization: startup_context.history_initialization,
+                disabled_plugin_ids,
+                requested_history_mode: history_mode,
+                fork_persistence,
+                // Keep only the manager registration internal. The session and its saved
+                // history retain Guardian's existing identity for metadata, filtering and resume.
+                session_source: match session_source {
+                    SessionSource::Internal(InternalSessionSource::Guardian) => {
+                        SessionSource::SubAgent(SubAgentSource::Other(
+                            crate::guardian::GUARDIAN_REVIEWER_NAME.to_owned(),
+                        ))
+                    }
+                    source => source,
+                },
+                forked_from_thread_id,
+                parent_thread_id,
+                thread_source,
+                originator: startup_context.originator,
+                agent_control,
+                dynamic_tools,
+                metrics_service_name,
+                inherited_environments,
+                inherited_exec_policy: startup_context.exec_policy,
+                parent_rollout_thread_trace: startup_context.parent_rollout_thread_trace,
+                user_shell_override,
+                parent_trace,
+                environment_requests,
+                thread_extension_init,
+                turn_extension_init,
+                client_mcp_extensions,
+                reserved_thread_id,
+                analytics_events_client,
+                image_store: Arc::clone(&self.image_store),
+                thread_store: Arc::clone(&self.thread_store),
+                attestation_provider: self.attestation_provider.clone(),
+                external_time_provider: self.external_time_provider.clone(),
+                inherited_multi_agent_version: startup_context.multi_agent_version,
+                git_enrichment_policy: if matches!(
+                    &tracked_session_source,
+                    SessionSource::Internal(InternalSessionSource::Guardian)
+                ) {
+                    GitEnrichmentPolicy::Skip
+                } else {
+                    GitEnrichmentPolicy::Fresh
+                },
+                windows_sandbox_proxy_settings_mode,
             },
-            forked_from_thread_id,
-            parent_thread_id,
-            thread_source,
-            originator: startup_context.originator,
-            agent_control,
-            dynamic_tools,
-            metrics_service_name,
-            inherited_environments,
-            inherited_exec_policy: startup_context.exec_policy,
-            parent_rollout_thread_trace: startup_context.parent_rollout_thread_trace,
-            user_shell_override,
-            parent_trace,
-            environment_requests,
-            thread_extension_init,
-            turn_extension_init,
-            client_mcp_extensions,
-            reserved_thread_id,
-            analytics_events_client,
-            image_store: Arc::clone(&self.image_store),
-            thread_store: Arc::clone(&self.thread_store),
-            attestation_provider: self.attestation_provider.clone(),
-            external_time_provider: self.external_time_provider.clone(),
-            inherited_multi_agent_version: startup_context.multi_agent_version,
-            git_enrichment_policy: if matches!(
-                &tracked_session_source,
-                SessionSource::Internal(InternalSessionSource::Guardian)
-            ) {
-                GitEnrichmentPolicy::Skip
-            } else {
-                GitEnrichmentPolicy::Fresh
-            },
-            windows_sandbox_proxy_settings_mode,
-        })
+            Some(Arc::clone(&custody)),
+        )
         .await;
         let (session, io) = match spawn_result {
             Ok(spawned) => spawned,
             Err(error) => {
-                if let Some(startup_guard) = startup_guard {
-                    startup_guard.cleanup().await;
-                }
                 return Err(error);
             }
         };
@@ -2957,17 +3198,17 @@ impl ThreadManagerState {
             }
         }
         let finalize_result = self
-            .finalize_thread_spawn(session, io, tracked_session_source)
+            .finalize_thread_spawn(session, io, tracked_session_source, publication.clone())
             .await;
         let (new_thread, tier_acceptance) = match finalize_result {
             Ok(registered) => registered,
             Err(error) => {
-                if let Some(startup_guard) = startup_guard {
-                    startup_guard.cleanup().await;
-                }
                 return Err(error);
             }
         };
+        #[cfg(test)]
+        publication.wait_after_publish_for_test().await;
+        custody.published();
         if matches!(ready_notification, ThreadReadyNotification::Emit) {
             new_thread.thread.emit_thread_ready_lifecycle().await;
         }
@@ -2984,10 +3225,6 @@ impl ThreadManagerState {
         if is_resumed_thread {
             new_thread.thread.emit_thread_resume_lifecycle().await;
         }
-        startup_state.release_membership();
-        if let Some(startup_guard) = startup_guard {
-            startup_guard.disarm();
-        }
         // Cancelling this wait must leave the registered runtime and the host handoff intact.
         if let Some(accepted) = tier_acceptance {
             let _ = accepted.await;
@@ -3000,6 +3237,7 @@ impl ThreadManagerState {
         session: Arc<Session>,
         io: SessionIo,
         session_source: SessionSource,
+        publication: retirement::ConstructionPublication,
     ) -> CodexResult<(NewThread, Option<ServiceTierAcceptance>)> {
         let thread_id = session.thread_id();
         let event = io.next_event().await?;
@@ -3032,27 +3270,36 @@ impl ThreadManagerState {
             };
             let mut threads = self.threads.write().await;
             if let std::collections::hash_map::Entry::Vacant(e) = threads.entry(thread_id) {
-                ema_cancellation.publish();
-                let thread = Arc::new(CodexThread::new(
-                    Arc::clone(&session),
-                    io,
-                    ThreadStartupMetadata::from(&session_configured),
-                    session_configured.rollout_path.clone(),
-                    session_source,
-                ));
-                e.insert(thread.clone());
-                let tier_acceptance = pending_service_tier.and_then(|(mut state, update)| {
-                    state.service_tier_acceptance =
-                        crate::agent::host::propagate_config_update(&session, update);
-                    state.shared_service_tier_pending = false;
-                    state.service_tier_acceptance.clone()
+                return publication.publish(|| {
+                    let thread = Arc::new(CodexThread::new(
+                        Arc::clone(&session),
+                        io,
+                        ThreadStartupMetadata::from(&session_configured),
+                        session_configured.rollout_path.clone(),
+                        session_source,
+                    ));
+                    self.constructions.publish_thread(Arc::clone(&thread), || {
+                        // Clear unpublished disposition before any visible runtime.
+                        session
+                            .failed_initialization_persistence
+                            .store(false, std::sync::atomic::Ordering::Release);
+                        ema_cancellation.publish();
+                        e.insert(thread.clone());
+                        let tier_acceptance =
+                            pending_service_tier.and_then(|(mut state, update)| {
+                                state.service_tier_acceptance =
+                                    crate::agent::host::propagate_config_update(&session, update);
+                                state.shared_service_tier_pending = false;
+                                state.service_tier_acceptance.clone()
+                            });
+                        let new_thread = NewThread {
+                            thread_id,
+                            thread,
+                            session_configured,
+                        };
+                        (new_thread, tier_acceptance)
+                    })
                 });
-                let new_thread = NewThread {
-                    thread_id,
-                    thread,
-                    session_configured,
-                };
-                return Ok((new_thread, tier_acceptance));
             }
         }
 

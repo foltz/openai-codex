@@ -202,6 +202,11 @@ impl<C: Sync> ExtensionRegistry<C> {
         }
     }
 
+    /// Finite operation admission remains attached even for isolated contributors.
+    pub fn host_admission(&self) -> Option<Arc<dyn crate::TurnStartAdmission>> {
+        self.turn_start_admission.clone()
+    }
+
     /// Acquires the host's turn-start permit, or an empty permit for ungated hosts.
     /// A missing permit rejects the start before Core consumes pending input.
     pub fn admit_turn_start(&self) -> Option<Box<dyn Send>> {

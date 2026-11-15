@@ -4906,7 +4906,7 @@ fn success_flag_true_with_no_error_and_content_used() {
     assert_eq!(expected, got);
 }
 
-async fn open_thread_persistence(session: &mut Session) -> PathBuf {
+pub(super) async fn open_thread_persistence(session: &mut Session) -> PathBuf {
     let config = session.get_config().await;
     let live_thread = LiveThread::create(
         Arc::clone(&session.services.thread_store),

@@ -104,6 +104,19 @@ impl LiveThreadInitGuard {
         };
         live_thread.discard().await
     }
+
+    /// Disposal for an externally retained cleanup transaction. The caller must
+    /// retain this guard and the original future until a terminal receipt.
+    /// On failure or cancellation, retain the actual writer handle in the guard.
+    pub async fn discard_with_result(&mut self) -> ThreadStoreResult<()> {
+        self.finish_acquisition().await?;
+        let Some(live_thread) = self.live_thread.as_ref() else {
+            return Ok(());
+        };
+        live_thread.discard().await?;
+        self.live_thread = None;
+        Ok(())
+    }
 }
 
 impl Drop for LiveThreadInitGuard {

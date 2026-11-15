@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use crate::worker_joins::McpAbortOnDrop;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -33,7 +34,6 @@ use codex_rmcp_client::StreamableHttpRedirectMode;
 use codex_rmcp_client::stored_oauth_credential_snapshot;
 use futures::future::BoxFuture;
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::AbortOnDropHandle;
 
 use crate::EffectiveMcpServer;
 use crate::McpConfig;
@@ -61,11 +61,12 @@ pub(crate) struct EmaAuth {
     pub(crate) manager: Arc<AuthManager>,
     pub(crate) account: CodexAuth,
     pub(crate) authority: EmaRequestAuthority,
-    _revocation: AbortOnDropHandle<()>,
+    _revocation: McpAbortOnDrop,
 }
 
 impl EmaAuth {
     pub(crate) fn new(
+        workers: &crate::McpWorkerOwner,
         config: Arc<McpConfig>,
         auth: Option<&CodexAuth>,
         auth_manager: Option<&Arc<AuthManager>>,
@@ -92,26 +93,30 @@ impl EmaAuth {
         })
         .with_policy(policy.clone());
         authority.check_new_request()?;
-        let revocation = tokio::spawn(async move {
-            tokio::select! {
-                biased;
-                () = cancellation.cancelled() => {}
-                () = async {
-                    match policy {
-                        Some(policy) => policy.invalidated().await,
-                        None => std::future::pending().await,
-                    }
-                } => {}
-                () = async {
-                    while changes.changed().await.is_ok() {
-                        if changes.borrow().login_generation != login_generation {
-                            break;
+        let revocation = workers.spawn_abort_on_drop(
+            &tokio::runtime::Handle::current(),
+            crate::McpWorkerKind::EmaRevocation,
+            async move {
+                tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => {}
+                    () = async {
+                        match policy {
+                            Some(policy) => policy.invalidated().await,
+                            None => std::future::pending().await,
                         }
-                    }
-                } => {}
-            }
-            cancellation.cancel();
-        });
+                    } => {}
+                    () = async {
+                        while changes.changed().await.is_ok() {
+                            if changes.borrow().login_generation != login_generation {
+                                break;
+                            }
+                        }
+                    } => {}
+                }
+                cancellation.cancel();
+            },
+        );
         Ok(Arc::new(Self {
             scope,
             config,
@@ -120,7 +125,7 @@ impl EmaAuth {
                 .context("enterprise MCP requires an account owner")?
                 .clone(),
             authority,
-            _revocation: AbortOnDropHandle::new(revocation),
+            _revocation: revocation,
         }))
     }
 

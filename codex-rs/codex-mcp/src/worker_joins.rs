@@ -21,6 +21,8 @@ pub enum McpWorkerKind {
     AuthNotification,
     ConnectionShutdown,
     RuntimeShutdown,
+    EagerStartup,
+    EmaRevocation,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -90,6 +92,8 @@ impl Default for State {
                 McpWorkerKind::AuthNotification,
                 McpWorkerKind::ConnectionShutdown,
                 McpWorkerKind::RuntimeShutdown,
+                McpWorkerKind::EagerStartup,
+                McpWorkerKind::EmaRevocation,
             ]
             .into_iter()
             .map(McpWorkerCounts::empty)
@@ -108,6 +112,8 @@ fn index(kind: McpWorkerKind) -> usize {
         McpWorkerKind::AuthNotification => 4,
         McpWorkerKind::ConnectionShutdown => 5,
         McpWorkerKind::RuntimeShutdown => 6,
+        McpWorkerKind::EagerStartup => 7,
+        McpWorkerKind::EmaRevocation => 8,
     }
 }
 
@@ -148,7 +154,56 @@ impl Drop for McpAbortOnDrop {
     }
 }
 
+struct EagerAbortGroup(Vec<AbortHandle>);
+
+impl Drop for EagerAbortGroup {
+    fn drop(&mut self) {
+        for abort in &self.0 {
+            abort.abort();
+        }
+    }
+}
+
 impl McpWorkerOwner {
+    /// Like the previous JoinSet batch, failure or caller cancellation aborts
+    /// siblings. Every child's original join stays observable after that abort.
+    /// Payloads travel through a separate channel: the ledger must not become
+    /// an extra ordinary owner of completed managed clients.
+    pub(crate) async fn join_eager_batch<T: Send + 'static>(
+        &self,
+        bodies: impl IntoIterator<Item = impl Future<Output = T> + Send + 'static>,
+    ) -> Result<Vec<T>, String> {
+        use futures::StreamExt;
+        let mut aborts = EagerAbortGroup(Vec::new());
+        let mut pending = futures::stream::FuturesUnordered::new();
+        for body in bodies {
+            let (send, receive) = tokio::sync::oneshot::channel();
+            let (completion, abort) = self.spawn_tracked(
+                &Handle::current(),
+                McpWorkerKind::EagerStartup,
+                async move {
+                    let _ = send.send(body.await);
+                },
+            );
+            aborts.0.push(abort);
+            pending.push(async move {
+                let value = receive.await;
+                match (value, completion.await) {
+                    (Ok(value), WorkerExit::Joined) => Ok(value),
+                    (_, outcome) => Err(format!(
+                        "eager startup worker result unavailable: {outcome:?}"
+                    )),
+                }
+            });
+        }
+        let mut outputs = Vec::new();
+        while let Some(result) = pending.next().await {
+            outputs.push(result?);
+        }
+        aborts.0.clear();
+        Ok(outputs)
+    }
+
     pub(crate) fn spawn_result<T: Clone + Send + Sync + 'static>(
         &self,
         runtime: &Handle,

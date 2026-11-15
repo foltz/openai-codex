@@ -199,6 +199,8 @@ async fn all_worker_families_retain_distinct_counts_without_cancelling_siblings(
         McpWorkerKind::AuthNotification,
         McpWorkerKind::ConnectionShutdown,
         McpWorkerKind::RuntimeShutdown,
+        McpWorkerKind::EagerStartup,
+        McpWorkerKind::EmaRevocation,
     ];
     for kind in kinds {
         let release = Arc::clone(&release);
@@ -207,14 +209,14 @@ async fn all_worker_families_retain_distinct_counts_without_cancelling_siblings(
         }));
     }
     let pending = owner.observe_until(Instant::now()).await;
-    assert_eq!(pending.registered_at_start, 7);
+    assert_eq!(pending.registered_at_start, 9);
     assert!(
         pending
             .counts
             .iter()
             .all(|c| c.pending == 1 && c.joined + c.panicked + c.cancelled == 0)
     );
-    release.add_permits(7);
+    release.add_permits(9);
     let done = owner
         .observe_until(Instant::now() + Duration::from_secs(1))
         .await;
@@ -245,4 +247,121 @@ async fn actual_empty_runtime_shutdown_retains_both_shutdown_workers() {
             .iter()
             .all(|c| c.pending + c.panicked + c.cancelled == 0)
     );
+}
+
+#[tokio::test]
+async fn eager_batch_caller_cancellation_aborts_and_retains_both_original_joins() {
+    let owner = McpWorkerOwner::default();
+    let entered = Arc::new(Semaphore::new(0));
+    let resource = Arc::new(());
+    let weak = Arc::downgrade(&resource);
+    let mut bodies = Vec::new();
+    for _ in 0..2 {
+        let entered = Arc::clone(&entered);
+        let resource = Arc::clone(&resource);
+        bodies.push(
+            async move {
+                let _resource = resource;
+                entered.add_permits(1);
+                std::future::pending::<()>().await;
+            }
+            .boxed(),
+        );
+    }
+    drop(resource);
+    let caller_owner = owner.clone();
+    let caller = tokio::spawn(async move { caller_owner.join_eager_batch(bodies).await });
+    entered.acquire_many(2).await.unwrap().forget();
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    let report = owner
+        .observe_until(Instant::now() + Duration::from_secs(1))
+        .await;
+    let eager = count(&report, McpWorkerKind::EagerStartup);
+    assert_eq!(eager.cancelled, 2);
+    assert_eq!(eager.joined + eager.panicked + eager.pending, 0);
+    assert!(weak.upgrade().is_none());
+}
+
+#[tokio::test]
+async fn eager_child_panic_aborts_sibling_and_keeps_both_outcomes() {
+    let owner = McpWorkerOwner::default();
+    let entered = Arc::new(Notify::new());
+    let observed = Arc::clone(&entered);
+    let panic_now = Arc::new(Notify::new());
+    let fail = Arc::clone(&panic_now);
+    let bodies = vec![
+        async move {
+            observed.notify_one();
+            std::future::pending::<()>().await;
+        }
+        .boxed(),
+        async move {
+            fail.notified().await;
+            panic!("injected eager child panic");
+        }
+        .boxed(),
+    ];
+    let caller_owner = owner.clone();
+    let caller = tokio::spawn(async move { caller_owner.join_eager_batch(bodies).await });
+    entered.notified().await;
+    panic_now.notify_one();
+    let result = caller.await.unwrap();
+    assert!(matches!(result, Err(ref error) if error.contains("Panicked")));
+    let report = owner
+        .observe_until(Instant::now() + Duration::from_secs(1))
+        .await;
+    let eager = count(&report, McpWorkerKind::EagerStartup);
+    assert_eq!(eager.panicked, 1);
+    assert_eq!(eager.cancelled, 1);
+    assert_eq!(eager.joined + eager.pending, 0);
+}
+
+#[tokio::test]
+async fn eager_results_do_not_remain_as_ordinary_holders_in_the_join_ledger() {
+    let owner = McpWorkerOwner::default();
+    let resource = Arc::new(());
+    let weak = Arc::downgrade(&resource);
+    let result = owner
+        .join_eager_batch(vec![async move { resource }.boxed()])
+        .await
+        .unwrap();
+    assert!(weak.upgrade().is_some());
+    drop(result);
+    // No extra spawn, observation or compaction is needed to release outputs.
+    assert!(weak.upgrade().is_none());
+    let report = owner
+        .observe_until(Instant::now() + Duration::from_secs(1))
+        .await;
+    assert_eq!(count(&report, McpWorkerKind::EagerStartup).joined, 1);
+}
+
+#[tokio::test]
+async fn ema_abort_guard_follows_final_ordinary_owner_and_retains_original_join() {
+    let owner = McpWorkerOwner::default();
+    let entered = Arc::new(Notify::new());
+    let seen = Arc::clone(&entered);
+    let resource = Arc::new(());
+    let weak = Arc::downgrade(&resource);
+    let guard = Arc::new(owner.spawn_abort_on_drop(
+        &Handle::current(),
+        McpWorkerKind::EmaRevocation,
+        async move {
+            let _resource = resource;
+            seen.notify_one();
+            std::future::pending::<()>().await;
+        },
+    ));
+    entered.notified().await;
+    let other = Arc::clone(&guard);
+    drop(guard);
+    let held = owner.observe_until(Instant::now()).await;
+    assert_eq!(count(&held, McpWorkerKind::EmaRevocation).pending, 1);
+    assert!(weak.upgrade().is_some());
+    drop(other);
+    let report = owner
+        .observe_until(Instant::now() + Duration::from_secs(1))
+        .await;
+    assert_eq!(count(&report, McpWorkerKind::EmaRevocation).cancelled, 1);
+    assert!(weak.upgrade().is_none());
 }

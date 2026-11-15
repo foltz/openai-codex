@@ -423,6 +423,7 @@ impl McpRuntime {
             self.ema_auth
                 .get_or_init(|| {
                     crate::ema_auth::EmaAuth::new(
+                        &self.workers,
                         Arc::clone(&input.config),
                         input.auth.as_ref(),
                         input.auth_manager.as_ref(),

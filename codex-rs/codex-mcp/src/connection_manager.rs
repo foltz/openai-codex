@@ -91,7 +91,6 @@ use codex_rmcp_client::determine_streamable_http_auth_status_from_credentials;
 use futures::FutureExt;
 use futures::future::join_all;
 use tokio::sync::watch;
-use tokio::task::JoinSet;
 use tracing::warn;
 
 static LIVE_CONNECTIONS: Gauge = Gauge::new("mcp.connections.live");
@@ -1159,7 +1158,10 @@ impl McpConnectionSet {
                         },
                     ));
                 }
-                let outcomes = JoinSet::from_iter(eager_workers).join_all().await;
+                let outcomes = deferred_owner
+                    .join_eager_batch(eager_workers)
+                    .await
+                    .expect("MCP eager startup worker failed");
                 if let Some(tx_event) = tx_event {
                     let mut summary = McpStartupCompleteEvent {
                         ready: reused_ready,

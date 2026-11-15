@@ -13728,6 +13728,11 @@ async fn task_retirement_closes_empty_reservation_and_refuses_late_start() {
     let (session, context) = make_session_and_context().await;
     let session = Arc::new(session);
     *session.active_turn.lock().await = Some(ActiveTurn::default());
+    let store = &session.services.thread_extension_data;
+    store.insert(codex_exec_server::ExecutorCapabilityDiscoveryV2Cache::default());
+    let original_cache = store
+        .get::<codex_exec_server::ExecutorCapabilityDiscoveryV2Cache>()
+        .expect("discovery cache before closure");
     session.close_task_admission().await;
     session.close_task_admission().await;
     assert!(
@@ -13736,16 +13741,25 @@ async fn task_retirement_closes_empty_reservation_and_refuses_late_start() {
             .load(std::sync::atomic::Ordering::Acquire)
     );
     assert!(session.active_turn.lock().await.is_none());
-    session
-        .start_task(
-            Arc::new(context),
-            Vec::new(),
-            NeverEndingTask {
-                kind: TaskKind::Regular,
-                listen_to_cancellation_token: false,
-            },
-        )
-        .await;
+    assert!(
+        !session
+            .start_task(
+                Arc::new(context),
+                Vec::new(),
+                NeverEndingTask {
+                    kind: TaskKind::Regular,
+                    listen_to_cancellation_token: false,
+                },
+            )
+            .await
+    );
+    let after_cache = store
+        .get::<codex_exec_server::ExecutorCapabilityDiscoveryV2Cache>()
+        .expect("discovery cache after refused start");
+    assert!(
+        Arc::ptr_eq(&original_cache, &after_cache),
+        "closed admission must refuse before replacing the active discovery cache"
+    );
     assert!(
         session.active_turn.lock().await.is_none(),
         "closed admission must not publish a task"

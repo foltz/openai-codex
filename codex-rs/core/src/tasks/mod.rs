@@ -328,6 +328,15 @@ impl Session {
         input: Vec<TurnInput>,
         task: T,
     ) -> bool {
+        // Direct task callers must refuse an already-closed session before
+        // replacing caches or beginning async plugin preparation. The locked
+        // checks below still handle closure racing with preparation.
+        if self
+            .task_admission_closed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return false;
+        }
         // Replace the cache; in-flight acquisitions retain their previous Arc.
         self.services
             .thread_extension_data

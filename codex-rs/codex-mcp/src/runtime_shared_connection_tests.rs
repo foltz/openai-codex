@@ -208,7 +208,12 @@ async fn actual_runtime_publication_uses_one_generation_and_refuses_after_closur
     assert_eq!(first.generations_admitted, 1);
     assert_eq!(first.generations_settled, 1);
     assert_eq!(first.generations_published, 1);
+    let catalogue_generation = *runtime.catalog_publication.lock().unwrap();
     runtime.replace(input()).await;
+    assert_eq!(
+        *runtime.catalog_publication.lock().unwrap(),
+        catalogue_generation
+    );
     assert!(Arc::ptr_eq(&runtime.current.load_full(), &published));
     let second = external.shutdown_until(tokio::time::Instant::now()).await;
     assert_eq!(second, first);

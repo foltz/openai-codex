@@ -341,3 +341,23 @@ async fn generation_permit_is_weak_and_does_not_keep_its_census_alive() {
     );
     drop(permit);
 }
+
+#[tokio::test]
+async fn closed_generation_skips_synchronous_preparation_effects() {
+    let root = McpRuntimeRetirement::default();
+    let permit = root.admit_generation().unwrap();
+    root.close_registration();
+    let effects = AtomicUsize::new(0);
+    assert!(
+        permit
+            .with_open_gate(|| effects.fetch_add(1, Ordering::SeqCst))
+            .is_none()
+    );
+    assert_eq!(effects.load(Ordering::SeqCst), 0);
+    drop(permit);
+    assert!(
+        root.shutdown_until(Instant::now())
+            .await
+            .are_connections_released()
+    );
+}

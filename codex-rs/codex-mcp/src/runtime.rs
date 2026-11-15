@@ -428,11 +428,12 @@ impl McpRuntime {
         };
         input.runtime_context.workers = self.workers.clone();
         input.runtime_context.retirement = Some(self.retirement.clone());
-        // Also cover callers which replace the runtime without Core's dirty-state machinery.
-        self.invalidate_apps_tool_refresh();
-        let current = self.current.load_full();
-        let retain_ema = current.config.is_some();
-        let Some(ema_auth) = generation.with_open_gate(|| {
+        let Some((current, retain_ema, ema_auth)) = generation.with_open_gate(|| {
+            // Cover direct callers too, but never invalidate a catalogue after
+            // closure has won this generation's preparation gate.
+            self.invalidate_apps_tool_refresh();
+            let current = self.current.load_full();
+            let retain_ema = current.config.is_some();
             let ema_auth = (input.config.xaa_enabled
                 && input.mcp_servers.values().any(|server| {
                     server.config().enabled
@@ -454,7 +455,7 @@ impl McpRuntime {
             if !reuse_previous {
                 current.connections.retire_shared_connections();
             }
-            ema_auth
+            (current, retain_ema, ema_auth)
         }) else {
             return;
         };

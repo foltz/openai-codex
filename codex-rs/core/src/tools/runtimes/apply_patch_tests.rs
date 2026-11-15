@@ -445,6 +445,7 @@ async fn direct_and_intercepted_patch_verification_record_separate_cleanup() {
         target.display()
     );
     let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
     let turn = Arc::new(turn);
     let cancel = tokio_util::sync::CancellationToken::new();
     let step = session.capture_step_context(turn, &cancel).await.unwrap();

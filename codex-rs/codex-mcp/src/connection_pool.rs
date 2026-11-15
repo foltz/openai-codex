@@ -4,6 +4,13 @@
 //! Request continuations use the calling chat's elicitation authority. Legacy connections and
 //! servers that request input during startup remain private.
 
+mod worker_joins;
+
+pub use worker_joins::PoolWorkerCounts;
+use worker_joins::PoolWorkerJoins;
+pub use worker_joins::PoolWorkerKind;
+pub use worker_joins::PoolWorkerSnapshot;
+
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -75,6 +82,8 @@ impl ServerLease {
 #[derive(Clone, Default)]
 pub struct McpConnectionPool {
     entries: Arc<Mutex<Vec<Weak<Entry>>>>,
+    // Process-owned custody independent of ordinary chat/client ownership.
+    workers: Arc<PoolWorkerJoins>,
 }
 
 #[derive(Clone)]
@@ -196,6 +205,7 @@ pub(crate) struct ConnectionLease {
     cancellation: CancellationToken,
     slot: Arc<ConnectionSlot>,
     server_lease: OnceLock<ServerLease>,
+    workers: Arc<PoolWorkerJoins>,
 }
 
 /// Tracks an acquisition without retaining its lease, including before startup completes.
@@ -203,6 +213,7 @@ pub(crate) struct ConnectionLease {
 pub(crate) struct ConnectionSlot {
     state: Mutex<SlotState>,
     shutdown_tasks: OnceLock<TaskTracker>,
+    release_workers: PoolWorkerJoins,
 }
 
 #[derive(Default)]
@@ -255,6 +266,15 @@ impl ConnectionSharing {
 }
 
 impl McpConnectionPool {
+    /// Observe a snapshot of original pool-worker joins without cancelling work.
+    /// This does not close admission or prove physical transport retirement.
+    pub async fn observe_workers_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> PoolWorkerSnapshot {
+        self.workers.observe_until(deadline).await
+    }
+
     pub(crate) async fn connect(
         &self,
         slot: Arc<ConnectionSlot>,
@@ -377,7 +397,14 @@ impl McpConnectionPool {
                     let client =
                         start(startup_cancellation.clone(), Some(sharing_declined.clone()));
                     // Startup belongs to the connection, including if its first chat is cancelled.
-                    tokio::spawn(client.clone());
+                    let startup = client.clone();
+                    drop(self.workers.spawn(
+                        &tokio::runtime::Handle::current(),
+                        PoolWorkerKind::Startup,
+                        async move {
+                            let _ = startup.await;
+                        },
+                    ));
                     let owner = Arc::new(LeaseOwners);
                     let entry = Arc::new(Entry {
                         runtime: tokio::runtime::Handle::current(),
@@ -399,6 +426,7 @@ impl McpConnectionPool {
                     cancellation: lease_cancellation,
                     slot: Arc::clone(slot),
                     server_lease: OnceLock::new(),
+                    workers: Arc::clone(&self.workers),
                 });
                 *state = SlotState::Acquired(Arc::downgrade(&lease.entry));
                 (lease, role)
@@ -484,28 +512,35 @@ impl ConnectionLease {
         // The chat must be able to await its final release even when cancellation drops the lease.
         let tasks = self.slot.shutdown_tasks.get_or_init(TaskTracker::new);
         let completion = tasks.token();
-        self.entry.runtime.spawn(async move {
-            match (entry.client.clone().await, server_lease) {
-                (Ok(client), None) => client.client.shutdown().await,
-                (Ok(client), Some(lease)) => {
-                    let release = lease
-                        .release(&client.client, &entry)
-                        .or_cancel(&entry.cancellation);
-                    tokio::pin!(release);
-                    if tokio::time::timeout(LEASE_REQUEST_TIMEOUT, &mut release)
-                        .await
-                        .is_err()
-                    {
-                        // Let the chat unload. A late open reply or cancellation write
-                        // must still precede release while other chats own the connection.
-                        entry.remove_from_pool();
-                        drop(completion);
-                        let _ = release.await;
+        let worker = self
+            .workers
+            .spawn(&self.entry.runtime, PoolWorkerKind::Release, async move {
+                match (entry.client.clone().await, server_lease) {
+                    (Ok(client), None) => client.client.shutdown().await,
+                    (Ok(client), Some(lease)) => {
+                        let release = lease
+                            .release(&client.client, &entry)
+                            .or_cancel(&entry.cancellation);
+                        tokio::pin!(release);
+                        if tokio::time::timeout(LEASE_REQUEST_TIMEOUT, &mut release)
+                            .await
+                            .is_err()
+                        {
+                            // Let the chat unload. A late open reply or cancellation write
+                            // must still precede release while other chats own the connection.
+                            entry.remove_from_pool();
+                            drop(completion);
+                            let _ = release.await;
+                        }
                     }
+                    (Err(error), _) => error.wait_for_shutdown().await,
                 }
-                (Err(error), _) => error.wait_for_shutdown().await,
-            }
-        });
+            });
+        // The owner lock spans both registrations: a repeated release cannot
+        // observe owner=None before this exact worker is retained locally too.
+        self.slot
+            .release_workers
+            .retain(PoolWorkerKind::Release, worker);
         Some(&self.slot)
     }
 }

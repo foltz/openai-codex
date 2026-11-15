@@ -856,3 +856,195 @@ async fn negotiation_requires_the_stateless_protocol_and_detaches_startup_callba
         assert_eq!(response.action, expected_action);
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn late_release_keeps_its_original_join_after_chat_unload_and_observer_cancellation() {
+    let mut peer = LeasePeer::new();
+    let (first, first_id) = peer.chat().await;
+    let (other, other_id) = peer.chat().await;
+    let ConnectionSharing::Shared(lease) = &first.connection_sharing else {
+        panic!("expected shared lease");
+    };
+    let slot = lease.release().expect("first release owns worker");
+    let release = peer.next("codex/connection/release").await;
+    assert_eq!(release.message["params"]["leaseId"], first_id);
+    // Do not acknowledge release yet. Preserve upstream's prompt chat-unload
+    // behavior while retaining the distinct worker join through the late tail.
+    tokio::time::advance(LEASE_REQUEST_TIMEOUT).await;
+    tokio::time::timeout(Duration::from_secs(1), slot.wait_for_shutdown())
+        .await
+        .expect("chat unload does not wait for a late release reply");
+    assert!(
+        lease.release().is_none(),
+        "a repeated release cannot create another worker"
+    );
+    let mut observer = Box::pin(
+        slot.release_workers
+            .observe_until(tokio::time::Instant::now() + Duration::from_secs(10)),
+    );
+    assert!(futures::poll!(observer.as_mut()).is_pending());
+    // Cancel only the observer, not the global/per-slot original-join custody.
+    drop(observer);
+    let pending = slot
+        .release_workers
+        .observe_until(tokio::time::Instant::now())
+        .await;
+    assert_eq!(pending.registered_at_start, 1);
+    assert_eq!(pending.counts[1].pending, 1);
+    assert_eq!(pending.counts[1].joined, 0);
+
+    let (result, ()) = tokio::join!(
+        other.call_tool("test".into(), None, |_| Ok(None), None),
+        async {
+            let request = peer.next("tools/call").await;
+            assert_eq!(request.message["params"]["_meta"][LEASE_META_KEY], other_id);
+            request.reply(json!({"content": []}));
+        }
+    );
+    result.unwrap();
+    assert!(!other.client.is_closed().await);
+    release.reply(json!({}));
+    let settled = slot
+        .release_workers
+        .observe_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await;
+    assert_eq!(settled.counts[1].joined, 1);
+    assert_eq!(settled.counts[1].pending, 0);
+    assert_eq!(settled.counts[1].panicked, 0);
+    assert_eq!(settled.counts[1].cancelled, 0);
+    assert!(!settled.poisoned);
+    // Settled observation replays even when the next observer has no budget.
+    assert_eq!(
+        slot.release_workers
+            .observe_until(tokio::time::Instant::now())
+            .await,
+        settled
+    );
+    let global = peer
+        .pool
+        .observe_workers_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await;
+    assert_eq!(global.registered_at_start, 2);
+    assert_eq!(global.registered_at_end, 2);
+    assert_eq!(global.counts[0].joined, 1);
+    assert_eq!(global.counts[1].joined, 1);
+    assert!(
+        !other.client.is_closed().await,
+        "join observation does not shut down another holder"
+    );
+    let ConnectionSharing::Shared(last) = &other.connection_sharing else {
+        panic!("expected final shared lease");
+    };
+    last.release()
+        .expect("final owner release")
+        .wait_for_shutdown()
+        .await;
+    let final_workers = peer
+        .pool
+        .observe_workers_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await;
+    assert_eq!(final_workers.counts[1].joined, 2);
+    assert_eq!(final_workers.counts[1].pending, 0);
+    assert!(other.client.is_closed().await);
+}
+
+#[tokio::test(start_paused = true)]
+async fn pool_keeps_late_release_join_when_the_chat_and_its_slot_are_dropped() {
+    let mut peer = LeasePeer::new();
+    let (first, _) = peer.chat().await;
+    let (other, _) = peer.chat().await;
+    drop(first);
+    let release = peer.next("codex/connection/release").await;
+    tokio::time::advance(LEASE_REQUEST_TIMEOUT).await;
+    tokio::task::yield_now().await;
+    let pending = peer
+        .pool
+        .observe_workers_until(tokio::time::Instant::now())
+        .await;
+    assert_eq!(pending.registered_at_start, 2);
+    assert_eq!(pending.counts[1].pending, 1);
+    release.reply(json!({}));
+    let settled = peer
+        .pool
+        .observe_workers_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await;
+    assert_eq!(settled.counts[0].joined, 1);
+    assert_eq!(settled.counts[1].joined, 1);
+    assert_eq!(settled.counts[1].pending, 0);
+    assert!(!other.client.is_closed().await);
+    let ConnectionSharing::Shared(last) = &other.connection_sharing else {
+        panic!("expected final shared lease");
+    };
+    last.release()
+        .expect("final owner release")
+        .wait_for_shutdown()
+        .await;
+    let final_workers = peer
+        .pool
+        .observe_workers_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await;
+    assert_eq!(final_workers.counts[1].joined, 2);
+    assert_eq!(final_workers.counts[1].pending, 0);
+    assert!(other.client.is_closed().await);
+}
+
+#[tokio::test]
+async fn worker_join_failure_stays_visible_after_later_pool_work_is_compacted() {
+    let pool = McpConnectionPool::default();
+    drop(pool.workers.spawn(
+        &tokio::runtime::Handle::current(),
+        PoolWorkerKind::Release,
+        async {
+            panic!("injected pool release worker failure");
+        },
+    ));
+    let failed = pool
+        .observe_workers_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await;
+    assert_eq!(failed.counts[1].joined, 0);
+    assert_eq!(failed.counts[1].panicked, 1);
+    drop(pool.workers.spawn(
+        &tokio::runtime::Handle::current(),
+        PoolWorkerKind::Release,
+        async {},
+    ));
+    let later = pool
+        .observe_workers_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await;
+    assert_eq!(later.registered_at_start, 2);
+    assert_eq!(later.counts[1].joined, 1);
+    assert_eq!(later.counts[1].panicked, 1);
+    assert_eq!(later.counts[1].pending, 0);
+}
+
+#[tokio::test]
+async fn expired_worker_observer_does_not_poll_an_unobserved_join_or_lose_it() {
+    let pool = McpConnectionPool::default();
+    let finished_body = Arc::new(Notify::new());
+    let signal = Arc::clone(&finished_body);
+    drop(pool.workers.spawn(
+        &tokio::runtime::Handle::current(),
+        PoolWorkerKind::Release,
+        async move {
+            signal.notify_one();
+        },
+    ));
+    tokio::time::timeout(Duration::from_secs(1), finished_body.notified())
+        .await
+        .expect("worker ran");
+    let expired = pool
+        .observe_workers_until(tokio::time::Instant::now())
+        .await;
+    assert_eq!(expired.counts[1].joined, 0);
+    assert_eq!(expired.counts[1].pending, 1);
+    let settled = pool
+        .observe_workers_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await;
+    assert_eq!(settled.counts[1].joined, 1);
+    assert_eq!(settled.counts[1].pending, 0);
+    assert_eq!(
+        pool.observe_workers_until(tokio::time::Instant::now())
+            .await,
+        settled
+    );
+}

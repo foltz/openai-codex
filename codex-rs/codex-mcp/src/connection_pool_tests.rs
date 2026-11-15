@@ -2007,7 +2007,7 @@ async fn pooled_auth_watcher_survives_creator_release_and_stops_on_final_transpo
     let initial = peer.next("notifications/codex/authChanged").await;
     assert_eq!(
         initial.message["params"],
-        json!({"_meta": {}, "generation": 0, "ownerGeneration": 0})
+        json!({"generation": 0, "ownerGeneration": 0})
     );
     peer.next("codex/connection/open").await.reply(json!({}));
     let first = attached.await.unwrap().unwrap();
@@ -2056,7 +2056,7 @@ async fn pooled_auth_watcher_survives_creator_release_and_stops_on_final_transpo
     let update = peer.next("notifications/codex/authChanged").await;
     assert_eq!(
         update.message["params"],
-        json!({"_meta": {}, "generation": 1, "ownerGeneration": 0})
+        json!({"generation": 1, "ownerGeneration": 0})
     );
     let (result, ()) = tokio::join!(
         other.call_tool("test".into(), None, |_| Ok(None), None),

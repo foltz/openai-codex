@@ -15,6 +15,10 @@ use crate::RemoveOptions;
 use crate::WalkOptions;
 use crate::WalkOutcome;
 use crate::WriteFileOptions;
+use crate::{
+    ExecutorFileSystemOutcomeFuture, ExecutorFileSystemReadStreamFuture, FileSystemOutcome,
+    ReadStreamOutcome,
+};
 use bytes::Bytes;
 use codex_utils_path_uri::PathUri;
 use futures::stream::BoxStream;
@@ -105,6 +109,115 @@ pub trait EnvironmentAccess: Send + Sync {
         destination_path: &'a PathUri,
         options: CopyOptions,
     ) -> ExecutorFileSystemFuture<'a, ()>;
+    // Default implementations preserve compatibility without fabricating proof.
+    fn canonicalize_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, PathUri> {
+        Box::pin(async move { FileSystemOutcome::without_receipt(self.canonicalize(path).await) })
+    }
+
+    fn read_file_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+        options: ReadFileOptions,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, Vec<u8>> {
+        Box::pin(
+            async move { FileSystemOutcome::without_receipt(self.read_file(path, options).await) },
+        )
+    }
+
+    fn read_file_stream_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+    ) -> ExecutorFileSystemReadStreamFuture<'a> {
+        Box::pin(async move {
+            ReadStreamOutcome::from_open(
+                self.read_file_stream(path).await,
+                None,
+                crate::SandboxLaunch::Unknown,
+            )
+        })
+    }
+
+    fn write_file_stream_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+        contents: BoxStream<'a, FileSystemResult<Bytes>>,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, u64> {
+        Box::pin(async move {
+            FileSystemOutcome::without_receipt(self.write_file_stream(path, contents).await)
+        })
+    }
+
+    fn write_file_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+        contents: Vec<u8>,
+        options: WriteFileOptions,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, ()> {
+        Box::pin(async move {
+            FileSystemOutcome::without_receipt(self.write_file(path, contents, options).await)
+        })
+    }
+
+    fn create_directory_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+        options: CreateDirectoryOptions,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, ()> {
+        Box::pin(async move {
+            FileSystemOutcome::without_receipt(self.create_directory(path, options).await)
+        })
+    }
+
+    fn get_metadata_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+        options: GetMetadataOptions,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, FileMetadata> {
+        Box::pin(async move {
+            FileSystemOutcome::without_receipt(self.get_metadata(path, options).await)
+        })
+    }
+
+    fn read_directory_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, Vec<ReadDirectoryEntry>> {
+        Box::pin(async move { FileSystemOutcome::without_receipt(self.read_directory(path).await) })
+    }
+
+    fn walk_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+        options: WalkOptions,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, WalkOutcome> {
+        Box::pin(async move { FileSystemOutcome::without_receipt(self.walk(path, options).await) })
+    }
+
+    fn remove_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+        options: RemoveOptions,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, ()> {
+        Box::pin(
+            async move { FileSystemOutcome::without_receipt(self.remove(path, options).await) },
+        )
+    }
+
+    fn copy_with_receipt<'a>(
+        &'a self,
+        source_path: &'a PathUri,
+        destination_path: &'a PathUri,
+        options: CopyOptions,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, ()> {
+        Box::pin(async move {
+            FileSystemOutcome::without_receipt(
+                self.copy(source_path, destination_path, options).await,
+            )
+        })
+    }
 }
 
 /// Convenience operations available to every implementation of [`EnvironmentAccess`].
@@ -327,6 +440,112 @@ impl EnvironmentAccess for FileSystemEnvironmentAccessor<'_> {
         options: CopyOptions,
     ) -> ExecutorFileSystemFuture<'a, ()> {
         self.file_system.copy(
+            source_path,
+            destination_path,
+            options,
+            self.key.sandbox.as_deref(),
+        )
+    }
+
+    fn canonicalize_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, PathUri> {
+        self.file_system
+            .canonicalize_with_receipt(path, self.key.sandbox.as_deref())
+    }
+
+    fn read_file_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+        options: ReadFileOptions,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, Vec<u8>> {
+        self.file_system
+            .read_file_with_receipt(path, options, self.key.sandbox.as_deref())
+    }
+
+    fn read_file_stream_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+    ) -> ExecutorFileSystemReadStreamFuture<'a> {
+        self.file_system
+            .read_file_stream_with_receipt(path, self.key.sandbox.as_deref())
+    }
+
+    fn write_file_stream_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+        contents: BoxStream<'a, FileSystemResult<Bytes>>,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, u64> {
+        self.file_system
+            .write_file_stream_with_receipt(path, contents, self.key.sandbox.as_deref())
+    }
+
+    fn write_file_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+        contents: Vec<u8>,
+        options: WriteFileOptions,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, ()> {
+        self.file_system.write_file_with_receipt(
+            path,
+            contents,
+            options,
+            self.key.sandbox.as_deref(),
+        )
+    }
+
+    fn create_directory_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+        options: CreateDirectoryOptions,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, ()> {
+        self.file_system
+            .create_directory_with_receipt(path, options, self.key.sandbox.as_deref())
+    }
+
+    fn get_metadata_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+        options: GetMetadataOptions,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, FileMetadata> {
+        self.file_system
+            .get_metadata_with_receipt(path, options, self.key.sandbox.as_deref())
+    }
+
+    fn read_directory_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, Vec<ReadDirectoryEntry>> {
+        self.file_system
+            .read_directory_with_receipt(path, self.key.sandbox.as_deref())
+    }
+
+    fn walk_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+        options: WalkOptions,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, WalkOutcome> {
+        self.file_system
+            .walk_with_receipt(path, options, self.key.sandbox.as_deref())
+    }
+
+    fn remove_with_receipt<'a>(
+        &'a self,
+        path: &'a PathUri,
+        options: RemoveOptions,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, ()> {
+        self.file_system
+            .remove_with_receipt(path, options, self.key.sandbox.as_deref())
+    }
+
+    fn copy_with_receipt<'a>(
+        &'a self,
+        source_path: &'a PathUri,
+        destination_path: &'a PathUri,
+        options: CopyOptions,
+    ) -> ExecutorFileSystemOutcomeFuture<'a, ()> {
+        self.file_system.copy_with_receipt(
             source_path,
             destination_path,
             options,

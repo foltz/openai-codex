@@ -12,12 +12,15 @@ bytes = { workspace = true }
 codex-protocol = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
 codex-utils-path-uri = { workspace = true }
-futures = { workspace = true }
+futures = { workspace = true, features = ["alloc"] }
 serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["rt", "sync"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { workspace = true, features = ["fs"] }
+
+[dev-dependencies]
+futures = { workspace = true, features = ["executor"] }
 
 [lib]
 test = false

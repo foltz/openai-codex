@@ -304,13 +304,17 @@ async fn manager_incomplete_report_keeps_failed_start_custody_after_future_retur
 }
 
 /// Cancelling an admitted constructor before Session birth must still finish
-/// it, and must prove that no unpublished session exists to clean up.
+/// it and positively settle its actual early scope without inventing Session/MCP birth.
 #[tokio::test]
 async fn manager_shutdown_completes_cancelled_admitted_constructor_without_a_session() {
-    struct HeldInstructions(Mutex<Option<tokio::sync::oneshot::Receiver<()>>>);
+    struct HeldInstructions {
+        held: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        entered: Arc<tokio::sync::Notify>,
+    }
     impl codex_extension_api::UserInstructionsProvider for HeldInstructions {
         fn load_user_instructions(&self) -> codex_extension_api::LoadInstructionsFuture<'_> {
-            let held = self.0.lock().unwrap().take().unwrap();
+            let held = self.held.lock().unwrap().take().unwrap();
+            self.entered.notify_one();
             Box::pin(async move {
                 held.await.unwrap();
                 codex_extension_api::LoadedUserInstructions::default()
@@ -319,11 +323,28 @@ async fn manager_shutdown_completes_cancelled_admitted_constructor_without_a_ses
     }
     let (_home, mut manager, config) = manager().await;
     let (release, held) = tokio::sync::oneshot::channel();
+    let entered = Arc::new(tokio::sync::Notify::new());
     Arc::get_mut(&mut manager.state)
         .unwrap()
-        .user_instructions_provider = Arc::new(HeldInstructions(Mutex::new(Some(held))));
+        .user_instructions_provider = Arc::new(HeldInstructions {
+        held: Mutex::new(Some(held)),
+        entered: Arc::clone(&entered),
+    });
     let mut constructor = Box::pin(manager.start_thread(StartThreadOptions::new(config, None)));
-    assert!(futures::poll!(constructor.as_mut()).is_pending());
+    tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::select! {
+            _ = entered.notified() => {},
+            _ = constructor.as_mut() => panic!("constructor escaped held instructions"),
+        }
+    })
+    .await
+    .expect("real constructor reaches held instruction refresh");
+    let startup = Arc::clone(&manager.constructions.state.lock().unwrap().constructions[0].startup);
+    assert_eq!(
+        startup.constructor_stage_for_test(),
+        Some((false, false, false)),
+        "early resource scope exists, but Session/MCP runtime have not been born"
+    );
     let deadline = Instant::now() + Duration::from_secs(20);
     let ticket = manager.begin_shutdown(deadline).unwrap();
     let mut observer = Box::pin(ticket.wait());
@@ -333,7 +354,7 @@ async fn manager_shutdown_completes_cancelled_admitted_constructor_without_a_ses
     // the constructor's departing observer now requests cancellation even
     // though admission is closed, so the drain delivers the start to its
     // cancellation arm before the released instructions are consumed and no
-    // Session is born. It used to assert one completed session receipt.
+    // Session is born. The actual early scope still requires its positive receipt.
     drop(observer);
     drop(constructor);
     release.send(()).unwrap();
@@ -343,9 +364,18 @@ async fn manager_shutdown_completes_cancelled_admitted_constructor_without_a_ses
     assert_eq!(report.constructors.unpublished, 0);
     assert_eq!(
         report.constructors.sessions,
-        Vec::new(),
-        "cancelled before Session birth: no unpublished session to clean"
+        vec![crate::session::startup_custody::StartupCleanup::BeforeLoop(
+            crate::session::retirement::CleanupExecution::Finished {
+                persistence_failed: false
+            }
+        )],
+        "cancelled before Session birth: the actual early scope was positively cleaned"
     );
+    assert_eq!(
+        startup.constructor_stage_for_test(),
+        Some((false, false, true))
+    );
+    assert!(startup.is_empty());
     assert!(
         report.runtimes.is_empty(),
         "post-close publication is forbidden"

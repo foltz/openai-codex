@@ -63,6 +63,11 @@ impl StartupResources {
         (resources, guard)
     }
 
+    #[cfg(test)]
+    pub(super) fn runtime_created_for_test(&self) -> bool {
+        self.state.lock().unwrap().root.is_some()
+    }
+
     pub(super) fn finished(&self) -> bool {
         self.state.lock().is_ok_and(|state| state.finished)
     }

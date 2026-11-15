@@ -522,6 +522,20 @@ impl SessionStartupCustody {
     }
 
     #[cfg(test)]
+    pub(crate) fn constructor_stage_for_test(&self) -> Option<(bool, bool, bool)> {
+        let state = self.state.lock().unwrap();
+        let resources = state
+            .resources
+            .as_ref()
+            .or(state.completed_resources.as_ref())?;
+        Some((
+            state.session.is_some(),
+            resources.runtime_created_for_test(),
+            resources.finished(),
+        ))
+    }
+
+    #[cfg(test)]
     pub(crate) fn retained_for_test(&self) -> (bool, usize, bool) {
         let state = self
             .state

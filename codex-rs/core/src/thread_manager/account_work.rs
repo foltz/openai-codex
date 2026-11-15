@@ -40,9 +40,19 @@ impl ThreadManager {
 
 /// A request-scope observation, including an explicit absence. Private to the
 /// manager: a spawned task must not repeat an ambient lookup for captured None.
-pub(super) struct CapturedConstructionWork(
-    pub(super) Option<Box<dyn codex_extension_api::HostOperationWork>>,
+pub(crate) struct CapturedConstructionWork(
+    pub(crate) Option<Box<dyn codex_extension_api::HostOperationWork>>,
 );
+
+impl CapturedConstructionWork {
+    pub(crate) fn derive(&self) -> Result<Self, codex_extension_api::TurnWorkRefused> {
+        self.0
+            .as_deref()
+            .map(|work| work.derive_operation())
+            .transpose()
+            .map(Self)
+    }
+}
 
 impl super::ThreadManagerState {
     pub(super) fn capture_construction_work(

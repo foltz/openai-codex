@@ -25,6 +25,7 @@ use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use std::sync::Arc;
 
 /// Child creation options; omitted overrides retain native MAv2 inheritance and role rules.
 pub struct ThreadCreateRequest {
@@ -95,7 +96,7 @@ pub enum ThreadSpawnError {
 }
 
 pub(crate) async fn spawn(
-    session: &Session,
+    session: &Arc<Session>,
     step_context: &StepContext,
     call_id: &str,
     request: ThreadSpawnRequest,
@@ -122,7 +123,7 @@ pub(crate) async fn spawn(
 
 /// Prepare the native child settings without choosing its coordination backend.
 pub(crate) async fn prepare(
-    session: &Session,
+    session: &Arc<Session>,
     step_context: &StepContext,
     call_id: &str,
     request: ThreadCreateRequest,
@@ -196,6 +197,7 @@ pub(crate) async fn prepare(
             config,
             source: spawn_source,
             options: SpawnAgentOptions {
+                parent_authority: Some(crate::ParentTurnAuthority::capture(&session, &turn.sub_id)),
                 fork_parent_spawn_call_id: fork_mode.as_ref().map(|_| call_id.to_string()),
                 fork_mode,
                 parent_thread_id: Some(session.thread_id),

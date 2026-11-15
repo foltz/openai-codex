@@ -1,6 +1,7 @@
 const OWNED_STARTUP_CLEANUP_BUDGET: Duration = Duration::from_secs(30);
 
 mod account_work;
+pub(crate) use account_work::CapturedConstructionWork;
 mod managed;
 mod model_catalog;
 mod retirement;
@@ -607,6 +608,7 @@ fn effective_originator_value(
 }
 
 pub(crate) struct ResumeThreadWithHistoryOptions {
+    pub(crate) captured_account_work: Option<CapturedConstructionWork>,
     pub(crate) config: Config,
     pub(crate) prompt_cache_key: Option<PromptCacheKey>,
     pub(crate) initial_history: InitialHistory,
@@ -2510,6 +2512,7 @@ impl ThreadManagerState {
         agent_control: LocalAgentControl,
         parent_thread_id: Option<ThreadId>,
         inherited_exec_policy: Option<Arc<crate::exec_policy::ExecPolicyManager>>,
+        captured_account_work: Option<CapturedConstructionWork>,
     ) -> CodexResult<NewThread> {
         (options.client_mcp_extensions, options.prompt_cache_key) =
             self.inherited_child_settings(parent_thread_id).await;
@@ -2517,6 +2520,7 @@ impl ThreadManagerState {
         let (auth_manager, runtime_auth) = self.inherited_child_auth(parent_thread_id).await;
         let mut request = ThreadSpawnRequest::new(options, auth_manager, agent_control);
         request.inherited_runtime_auth = Some(runtime_auth);
+        request.captured_account_work = captured_account_work;
         request.parent_thread_id = parent_thread_id;
         request.inherited_exec_policy = inherited_exec_policy;
         if forked {
@@ -2533,6 +2537,7 @@ impl ThreadManagerState {
         agent_control: AgentControlInit,
         parent_thread_id: ThreadId,
         inheritance: crate::agent::host::PreparedChildInheritance,
+        captured_account_work: Option<CapturedConstructionWork>,
     ) -> CodexResult<NewThread> {
         options.reserved_thread_id.ok_or_else(|| {
             CodexErr::InvalidRequest("prepared child startup requires a reserved thread ID".into())
@@ -2540,6 +2545,7 @@ impl ThreadManagerState {
         let (auth_manager, runtime_auth) = self.inherited_child_auth(Some(parent_thread_id)).await;
         let mut request = ThreadSpawnRequest::new(options, auth_manager, agent_control);
         request.inherited_runtime_auth = Some(runtime_auth);
+        request.captured_account_work = captured_account_work;
         request.ready_notification = ThreadReadyNotification::Defer;
         request.parent_thread_id = Some(parent_thread_id);
         let history_initialization = match &request.options.initial_history {
@@ -2570,6 +2576,7 @@ impl ThreadManagerState {
         options: ResumeThreadWithHistoryOptions,
     ) -> CodexResult<NewThread> {
         let ResumeThreadWithHistoryOptions {
+            captured_account_work,
             config,
             prompt_cache_key,
             initial_history,
@@ -2607,6 +2614,7 @@ impl ThreadManagerState {
         request.inherited_environments = inherited_environments;
         request.inherited_instructions = inherited_instructions;
         request.inherited_exec_policy = inherited_exec_policy;
+        request.captured_account_work = captured_account_work;
         Box::pin(self.spawn_thread(request)).await
     }
 

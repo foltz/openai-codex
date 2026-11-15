@@ -240,6 +240,7 @@ impl LocalAgentControl {
         mut config: Config,
         thread_id: ThreadId,
         parent: Option<Arc<CodexThread>>,
+        parent_authority: Option<&crate::ParentTurnAuthority>,
     ) -> CodexResult<Option<tokio::sync::OwnedRwLockReadGuard<()>>> {
         let membership = self.runtime.admit_start()?;
         let state = self.runtime.upgrade()?;
@@ -337,6 +338,12 @@ impl LocalAgentControl {
                 return self.runtime.pin_v2_residency(&thread).await;
             }
         }
+        // Warm recipients need no constructor authority. A cold load does,
+        // even when the eventual message only queues mail.
+        let captured_account_work =
+            crate::ParentTurnAuthority::capture_construction(parent_authority).map_err(|_| {
+                CodexErr::Fatal("parent account work cannot admit agent construction".to_owned())
+            })?;
         let parent = if let Some(parent) = parent {
             let turn = parent
                 .session
@@ -573,6 +580,7 @@ impl LocalAgentControl {
 
         match state
             .resume_thread_with_history_with_source(ResumeThreadWithHistoryOptions {
+                captured_account_work,
                 config,
                 prompt_cache_key,
                 initial_history,
@@ -637,6 +645,13 @@ impl LocalAgentControl {
         let membership = self.runtime.admit_start()?;
         let spawn_started_at = Instant::now();
         let state = self.runtime.upgrade()?;
+        let captured_account_work =
+            crate::ParentTurnAuthority::capture_construction(options.parent_authority.as_ref())
+                .map_err(|_| {
+                    CodexErr::Fatal(
+                        "parent account work cannot admit agent construction".to_owned(),
+                    )
+                })?;
         // Resolve the parent before inheriting settings or copying attachments.
         // Recovering it later from history only repairs the child's metadata.
         let parent_thread_id = session_source
@@ -856,6 +871,7 @@ impl LocalAgentControl {
                 self.clone(),
                 parent_thread_id,
                 inherited_exec_policy,
+                captured_account_work,
             )
             .await
             .map_err(|err| err.with_agent_context(AgentErrorContext::ChildStartup))?;
@@ -988,13 +1004,22 @@ impl LocalAgentControl {
         config: Config,
         thread_id: ThreadId,
         session_source: SessionSource,
+        parent_authority: Option<&crate::ParentTurnAuthority>,
     ) -> CodexResult<ThreadId> {
+        let account_work = crate::ParentTurnAuthority::capture_construction(parent_authority)
+            .map_err(|_| {
+                CodexErr::Fatal("parent account work cannot admit agent construction".to_owned())
+            })?;
         let _membership = self.runtime.admit_start()?;
         let root_depth = thread_spawn_depth(&session_source).unwrap_or(0);
-        let (resumed_thread_id, resumed_multi_agent_version) = Box::pin(
-            self.resume_single_agent_from_rollout(config.clone(), thread_id, session_source),
-        )
-        .await?;
+        let (resumed_thread_id, resumed_multi_agent_version) =
+            Box::pin(self.resume_single_agent_from_rollout(
+                config.clone(),
+                thread_id,
+                session_source,
+                account_work.as_ref(),
+            ))
+            .await?;
         let state = self.runtime.upgrade()?;
         if config.multi_agent_version_from_features() == MultiAgentVersion::V2
             || resumed_multi_agent_version == MultiAgentVersion::V2
@@ -1040,6 +1065,7 @@ impl LocalAgentControl {
                         config.clone(),
                         child_thread_id,
                         child_session_source,
+                        account_work.as_ref(),
                     ))
                     .await
                     {
@@ -1064,7 +1090,14 @@ impl LocalAgentControl {
         config: Config,
         thread_id: ThreadId,
         session_source: SessionSource,
+        account_work: Option<&crate::thread_manager::CapturedConstructionWork>,
     ) -> CodexResult<(ThreadId, MultiAgentVersion)> {
+        let captured_account_work = account_work
+            .map(crate::thread_manager::CapturedConstructionWork::derive)
+            .transpose()
+            .map_err(|_| {
+                CodexErr::Fatal("account work cannot admit resumed agent construction".to_owned())
+            })?;
         let state = self.runtime.upgrade()?;
         let stored_thread = state
             .read_stored_thread(ReadThreadParams {
@@ -1132,6 +1165,7 @@ impl LocalAgentControl {
 
         let resumed_thread = state
             .resume_thread_with_history_with_source(ResumeThreadWithHistoryOptions {
+                captured_account_work,
                 config: config.clone(),
                 prompt_cache_key: None,
                 initial_history,

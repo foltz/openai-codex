@@ -187,7 +187,12 @@ async fn interrupted_v2_agent_is_lost_after_residency_eviction() {
     mark_thread_completed(second.thread.as_ref()).await;
 
     let err = control
-        .ensure_v2_agent_loaded(config, first.thread_id, /*parent*/ None)
+        .ensure_v2_agent_loaded(
+            config,
+            first.thread_id,
+            /*parent*/ None,
+            /*parent_authority*/ None,
+        )
         .await
         .expect_err("evicted interrupted agent should stay lost");
     match err.details() {
@@ -227,6 +232,7 @@ async fn spawn_v2_subagent(
             control.clone(),
             Some(parent_thread_id),
             /*inherited_exec_policy*/ None,
+            /*captured_account_work*/ None,
         )
         .await
         .expect("spawn v2 subagent")

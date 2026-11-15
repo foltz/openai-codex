@@ -2003,3 +2003,122 @@ async fn managed_constructor_missing_required_request_refuses_before_task_birth(
 async fn managed_constructor_exhausted_request_refuses_before_task_birth() {
     managed_account_refusal_case(true).await;
 }
+
+#[tokio::test]
+async fn agent_constructor_retains_exact_parent_work_across_held_mcp_and_caller_loss() {
+    use crate::agent::api::{AgentControl, AgentInput, SpawnRequest};
+    use crate::agent::types::SpawnAgentOptions;
+    let (_home, manager, mut config) = expiry_manager(/*ephemeral*/ true).await;
+    let mut mcp = HeldRequiredMcp::install(&mut config).await;
+    let (parent, gate) = crate::agent::turn_authority::tests::parent().await;
+    let authority = crate::ParentTurnAuthority::capture(&parent, "live-parent");
+    let control = manager.agent_control();
+    // The real LocalAgentControl path reaches the actual retained constructor
+    // before any initial input can be submitted to the child.
+    let mut start = Box::pin(async {
+        match control
+            .spawn(SpawnRequest {
+                caller: parent.thread_id,
+                config,
+                input: AgentInput::UserInput(Vec::new()),
+                source: codex_protocol::protocol::SessionSource::Exec,
+                options: SpawnAgentOptions {
+                    parent_authority: Some(authority),
+                    ..Default::default()
+                },
+            })
+            .await
+        {
+            Ok(_) => panic!("child cannot publish before held initialize"),
+            Err(error) => Err(error),
+        }
+    });
+    reach_held_initialize(start.as_mut(), &mcp).await;
+    assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(gate.live.load(Ordering::SeqCst), 4);
+    gate.active.store(false, Ordering::SeqCst);
+    drop(start);
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        manager.drive_admitted_constructions(),
+    )
+    .await
+    .expect("agent original drains");
+    assert_eq!(gate.live.load(Ordering::SeqCst), 0);
+    assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
+    assert!(manager.state.threads.read().await.is_empty());
+    assert_eq!(mcp.initialize_attempts(), 1);
+    mcp.release();
+}
+
+#[tokio::test]
+async fn expired_parent_refuses_real_agent_constructor_before_mcp_or_publication() {
+    use crate::agent::api::{AgentControl, AgentInput, SpawnRequest};
+    use crate::agent::types::SpawnAgentOptions;
+    let (_home, manager, mut config) = expiry_manager(/*ephemeral*/ true).await;
+    let mcp = HeldRequiredMcp::install(&mut config).await;
+    let (parent, gate) = crate::agent::turn_authority::tests::parent().await;
+    gate.active.store(false, Ordering::SeqCst);
+    let error = manager
+        .agent_control()
+        .spawn(SpawnRequest {
+            caller: parent.thread_id,
+            config,
+            input: AgentInput::UserInput(Vec::new()),
+            source: codex_protocol::protocol::SessionSource::Exec,
+            options: SpawnAgentOptions {
+                parent_authority: Some(crate::ParentTurnAuthority::capture(&parent, "live-parent")),
+                ..Default::default()
+            },
+        })
+        .await
+        .err()
+        .expect("expired parent refuses");
+    assert!(
+        error
+            .to_string()
+            .contains("parent account work cannot admit agent construction")
+    );
+    assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(gate.live.load(Ordering::SeqCst), 0);
+    assert_eq!(mcp.initialize_attempts(), 0);
+    assert!(manager.state.threads.read().await.is_empty());
+}
+
+#[tokio::test]
+async fn explicit_empty_parent_capture_never_falls_back_to_required_manager_request() {
+    use crate::agent::api::{AgentControl, AgentInput, SpawnRequest};
+    use crate::agent::types::SpawnAgentOptions;
+    let (_home, mut manager, config) = expiry_manager(/*ephemeral*/ true).await;
+    let (mut parent, _) = crate::session::tests::make_session_and_context().await;
+    parent.services.host_admission = None;
+    let parent = Arc::new(parent);
+    let (_policy_parent, required_gate) = crate::agent::turn_authority::tests::parent().await;
+    let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
+    extensions.turn_start_admission(required_gate.clone());
+    Arc::get_mut(&mut manager.state).unwrap().extensions = Arc::new(extensions.build());
+    let error = manager
+        .agent_control()
+        .spawn(SpawnRequest {
+            caller: parent.thread_id,
+            config,
+            input: AgentInput::UserInput(Vec::new()),
+            source: codex_protocol::protocol::SessionSource::Exec,
+            options: SpawnAgentOptions {
+                parent_authority: Some(crate::ParentTurnAuthority::capture(&parent, "ungated")),
+                ..Default::default()
+            },
+        })
+        .await
+        .err()
+        .expect("empty parent work cannot satisfy required manager policy");
+    assert!(
+        error
+            .to_string()
+            .contains("thread construction requires account work")
+    );
+    // A request lookup on this gate panics, so this also detects rediscovery.
+    assert_eq!(required_gate.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(required_gate.live.load(Ordering::SeqCst), 0);
+    assert!(manager.state.threads.read().await.is_empty());
+}

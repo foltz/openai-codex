@@ -816,6 +816,7 @@ async fn thread_id_generator_applies_to_roots_children_and_forks() {
                 agent_role: None,
             }),
             SpawnAgentOptions {
+                parent_authority: None,
                 parent_thread_id: Some(root.thread_id),
                 ..Default::default()
             },
@@ -994,6 +995,7 @@ async fn child_session_inherits_resumed_parent_auth(host_child: bool) {
                     originator: parent.thread.session.originator().await,
                     attachment_source: None,
                 },
+                /*captured_account_work*/ None,
             )
             .await
     } else {
@@ -1004,6 +1006,7 @@ async fn child_session_inherits_resumed_parent_auth(host_child: bool) {
                 control,
                 Some(parent.thread_id),
                 /*inherited_exec_policy*/ None,
+                /*captured_account_work*/ None,
             )
             .await
     }
@@ -3620,6 +3623,7 @@ async fn new_uses_active_provider_for_model_refresh(with_cache: bool) {
                     .control(started.thread.session.session_id()),
                 Some(started.thread_id),
                 /*inherited_exec_policy*/ None,
+                /*captured_account_work*/ None,
             )
             .await
             .expect("spawn child with the parent's provider headers");

@@ -771,6 +771,7 @@ async fn spawn_failure_context_survives_manager_and_fork_errors() {
                 "worker".to_string(),
             ))),
             SpawnAgentOptions {
+                parent_authority: None,
                 fork_mode: Some(SpawnAgentForkMode::FullHistory),
                 ..Default::default()
             },
@@ -951,7 +952,12 @@ async fn resume_agent_errors_when_manager_dropped() {
     let control = LocalAgentControl::default();
     let (_home, config) = test_config().await;
     let err = control
-        .resume_agent_from_rollout(config, ThreadId::new(), SessionSource::Exec)
+        .resume_agent_from_rollout(
+            config,
+            ThreadId::new(),
+            SessionSource::Exec,
+            /*parent_authority*/ None,
+        )
         .await
         .expect_err("resume_agent should fail without a manager");
     assert_eq!(
@@ -1179,6 +1185,7 @@ async fn cancelled_v2_send_finishes_reload_registration() {
     sender_config.approvals_reviewer = ApprovalsReviewer::AutoReview;
     sender_config.requested_approvals_reviewer = Some(ApprovalsReviewer::AutoReview);
     let followup_request = |message: &str| SendRequest {
+        parent_authority: None,
         caller: parent_id,
         target: AgentTarget::Id(child_id),
         resume_config: sender_config.clone(),
@@ -1294,6 +1301,7 @@ async fn spawn_v2_reload_test_child(
             text_input("hello child"),
             source,
             SpawnAgentOptions {
+                parent_authority: None,
                 parent_thread_id: Some(parent.session.thread_id),
                 ..Default::default()
             },
@@ -1430,7 +1438,12 @@ async fn check_v2_agent_reload(route: V2ReloadRoute) {
     let mut parent_turn = parent_thread.session.new_default_turn().await;
     let residency_pin = match route {
         V2ReloadRoute::Sender => control
-            .ensure_v2_agent_loaded(sender_config, spawned_agent.thread_id, /*parent*/ None)
+            .ensure_v2_agent_loaded(
+                sender_config,
+                spawned_agent.thread_id,
+                /*parent*/ None,
+                /*parent_authority*/ None,
+            )
             .await
             .expect("known v2 agent should reload"),
         V2ReloadRoute::NestedParent => {
@@ -1657,6 +1670,7 @@ async fn resume_agent_from_rollout_does_not_reopen_v2_descendants() {
             harness.config.clone(),
             parent_thread_id,
             SessionSource::Exec,
+            /*parent_authority*/ None,
         )
         .await
         .expect("v2 root resume should succeed");
@@ -1847,6 +1861,7 @@ async fn cold_resume_with_thread_instructions_preserves_lazy_v2_child_inheritanc
             .services
             .agent_control
             .send(crate::SendRequest {
+                parent_authority: None,
                 caller: parent_thread_id,
                 target: crate::AgentTarget::Id(target_thread_id),
                 resume_config: crate::agent::child_config::build_agent_resume_config(&turn)
@@ -1996,6 +2011,7 @@ async fn v2_reload_preserves_shared_instructions_after_root_unloads(
         .services
         .agent_control
         .send(crate::SendRequest {
+            parent_authority: None,
             caller: sender_id,
             target: crate::AgentTarget::Id(target_id),
             resume_config: crate::agent::child_config::build_agent_resume_config(&sender_turn)
@@ -2178,6 +2194,7 @@ async fn v2_spawn_resolves_reported_effort_without_changing_child_selection(
             },
             source,
             options: SpawnAgentOptions {
+                parent_authority: None,
                 parent_thread_id: Some(parent_id),
                 ..Default::default()
             },
@@ -2368,6 +2385,7 @@ async fn spawn_agent_disabled_plugins_follow_parent_unless_overridden(
         .spawn_anonymous_child(
             parent.thread_id,
             SpawnAgentOptions {
+                parent_authority: None,
                 fork_parent_spawn_call_id: fork_mode
                     .as_ref()
                     .map(|_| parent_spawn_call_id.to_string()),
@@ -2496,6 +2514,7 @@ async fn spawn_agent_fork_from_paginated_parent_uses_model_context_prefix(
         .spawn_anonymous_child(
             parent_thread_id,
             SpawnAgentOptions {
+                parent_authority: None,
                 // The source identifies the parent in both cases. Fork startup must
                 // resolve it before inheriting client MCP settings, not just for metadata.
                 parent_thread_id: include_parent_in_options.then_some(parent_thread_id),
@@ -2656,6 +2675,7 @@ async fn spawn_agent_without_fork_from_paginated_parent_stays_fresh_and_paginate
         .spawn_anonymous_child(
             parent_thread_id,
             SpawnAgentOptions {
+                parent_authority: None,
                 parent_thread_id: Some(parent_thread_id),
                 ..Default::default()
             },
@@ -2778,6 +2798,7 @@ async fn spawn_agent_fork_sanitizes_inherited_compaction_metadata() {
         .spawn_anonymous_child(
             parent_thread_id,
             SpawnAgentOptions {
+                parent_authority: None,
                 fork_parent_spawn_call_id: Some(parent_spawn_call_id),
                 fork_mode: Some(SpawnAgentForkMode::FullHistory),
                 ..Default::default()
@@ -3083,6 +3104,7 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
                 agent_role: None,
             }),
             SpawnAgentOptions {
+                parent_authority: None,
                 fork_parent_spawn_call_id: Some(parent_spawn_call_id.clone()),
                 fork_mode: Some(SpawnAgentForkMode::FullHistory),
                 ..Default::default()
@@ -3239,6 +3261,7 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
                 agent_role: None,
             }),
             SpawnAgentOptions {
+                parent_authority: None,
                 fork_parent_spawn_call_id: Some(parent_spawn_call_id.clone()),
                 fork_mode: Some(SpawnAgentForkMode::FullHistory),
                 ..Default::default()
@@ -3495,6 +3518,7 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history(marke
                 agent_role: None,
             }),
             SpawnAgentOptions {
+                parent_authority: None,
                 fork_parent_spawn_call_id: Some(parent_spawn_call_id),
                 fork_mode: Some(SpawnAgentForkMode::FullHistory),
                 multi_agent_v2_usage_hints: Some(ResolvedMultiAgentV2UsageHints {
@@ -3721,6 +3745,7 @@ async fn spawn_agent_full_fork_restores_instructions_after_compaction_discards_p
                 agent_role: None,
             }),
             SpawnAgentOptions {
+                parent_authority: None,
                 fork_parent_spawn_call_id: Some(parent_spawn_call_id),
                 fork_mode: Some(SpawnAgentForkMode::FullHistory),
                 ..Default::default()
@@ -3983,6 +4008,7 @@ async fn spawn_agent_full_fork_legacy_compaction_rebuilds_child_instructions_onc
                     agent_role: None,
                 }),
                 SpawnAgentOptions {
+                    parent_authority: None,
                     fork_parent_spawn_call_id: Some(parent_spawn_call_id.to_string()),
                     fork_mode: Some(SpawnAgentForkMode::FullHistory),
                     ..Default::default()
@@ -4249,6 +4275,7 @@ async fn spawn_agent_fork_flushes_parent_rollout_before_loading_history() {
                 agent_role: None,
             }),
             SpawnAgentOptions {
+                parent_authority: None,
                 fork_parent_spawn_call_id: Some(parent_spawn_call_id.clone()),
                 fork_mode: Some(SpawnAgentForkMode::FullHistory),
                 ..Default::default()
@@ -4462,7 +4489,12 @@ async fn resume_agent_respects_max_threads_limit() {
         .expect("spawn_agent should succeed for active slot");
 
     let err = control
-        .resume_agent_from_rollout(config, resumable_id, SessionSource::Exec)
+        .resume_agent_from_rollout(
+            config,
+            resumable_id,
+            SessionSource::Exec,
+            /*parent_authority*/ None,
+        )
         .await
         .expect_err("resume should respect max threads");
     let CodexErrorDetails::AgentLimitReached {
@@ -4496,7 +4528,12 @@ async fn resume_agent_releases_slot_after_resume_failure() {
     let control = manager.agent_control();
 
     let _ = control
-        .resume_agent_from_rollout(config.clone(), ThreadId::new(), SessionSource::Exec)
+        .resume_agent_from_rollout(
+            config.clone(),
+            ThreadId::new(),
+            SessionSource::Exec,
+            /*parent_authority*/ None,
+        )
         .await
         .expect_err("resume should fail for missing rollout path");
 
@@ -4920,6 +4957,7 @@ async fn spawn_thread_subagents_persist_parent_originator_across_new_and_full_fo
                 agent_role: Some("explorer".to_string()),
             }),
             SpawnAgentOptions {
+                parent_authority: None,
                 fork_parent_spawn_call_id: Some("spawn-call-full-history".to_string()),
                 fork_mode: Some(SpawnAgentForkMode::FullHistory),
                 ..Default::default()
@@ -5152,6 +5190,7 @@ async fn resume_thread_subagent_restores_stored_metadata() {
                 agent_nickname: None,
                 agent_role: None,
             }),
+            /*parent_authority*/ None,
         )
         .await
         .expect("resume should succeed");
@@ -5254,7 +5293,12 @@ async fn resume_agent_from_rollout_reads_archived_rollout_path() {
 
     let resumed_thread_id = harness
         .control
-        .resume_agent_from_rollout(harness.config.clone(), child_thread_id, SessionSource::Exec)
+        .resume_agent_from_rollout(
+            harness.config.clone(),
+            child_thread_id,
+            SessionSource::Exec,
+            /*parent_authority*/ None,
+        )
         .await
         .expect("resume should find archived rollout");
     assert_eq!(resumed_thread_id, child_thread_id);
@@ -5276,6 +5320,7 @@ async fn resume_agent_from_paginated_rollout_loads_model_context(disabled_plugin
         .spawn_anonymous_child(
             parent_thread_id,
             SpawnAgentOptions {
+                parent_authority: None,
                 parent_thread_id: Some(parent_thread_id),
                 disabled_plugin_ids: Some(disabled_plugin_ids.clone()),
                 ..Default::default()
@@ -5309,7 +5354,12 @@ async fn resume_agent_from_paginated_rollout_loads_model_context(disabled_plugin
 
     let resumed_thread_id = harness
         .control
-        .resume_agent_from_rollout(harness.config.clone(), child_thread_id, SessionSource::Exec)
+        .resume_agent_from_rollout(
+            harness.config.clone(),
+            child_thread_id,
+            SessionSource::Exec,
+            /*parent_authority*/ None,
+        )
         .await
         .expect("resume should load paginated model context");
     assert_eq!(resumed_thread_id, child_thread_id);
@@ -5780,6 +5830,7 @@ async fn resume_agent_from_rollout_does_not_reopen_closed_descendants() {
             harness.config.clone(),
             parent_thread_id,
             SessionSource::Exec,
+            /*parent_authority*/ None,
         )
         .await
         .expect("single-thread resume should succeed");
@@ -5876,6 +5927,7 @@ async fn resume_closed_child_reopens_open_descendants() {
                 agent_nickname: None,
                 agent_role: None,
             }),
+            /*parent_authority*/ None,
         )
         .await
         .expect("child resume should succeed");
@@ -5968,6 +6020,7 @@ async fn resume_agent_from_rollout_reopens_open_descendants_after_manager_shutdo
             harness.config.clone(),
             parent_thread_id,
             SessionSource::Exec,
+            /*parent_authority*/ None,
         )
         .await
         .expect("tree resume should succeed");
@@ -6081,6 +6134,7 @@ async fn resume_agent_from_rollout_uses_edge_data_when_descendant_metadata_sourc
             harness.config.clone(),
             parent_thread_id,
             SessionSource::Exec,
+            /*parent_authority*/ None,
         )
         .await
         .expect("tree resume should succeed");
@@ -6196,6 +6250,7 @@ async fn resume_agent_from_rollout_skips_descendants_when_parent_resume_fails() 
             harness.config.clone(),
             parent_thread_id,
             SessionSource::Exec,
+            /*parent_authority*/ None,
         )
         .await
         .expect("root resume should succeed");
@@ -6218,4 +6273,96 @@ async fn resume_agent_from_rollout_skips_descendants_when_parent_resume_fails() 
         .shutdown_agent_tree(parent_thread_id)
         .await
         .expect("tree shutdown after partial subtree resume should succeed");
+}
+
+#[tokio::test]
+async fn warm_v2_lookup_needs_no_parent_work_but_cold_reload_requires_exact_live_turn() {
+    use std::sync::atomic::Ordering;
+    let (home, mut config) = test_config().await;
+    config.features.enable(Feature::MultiAgentV2).unwrap();
+    config.features.enable(Feature::Sqlite).unwrap();
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (_, root) = harness.start_paginated_thread().await;
+    let control = root
+        .session
+        .services
+        .local_agent_runtime
+        .control(root.session.session_id());
+    let child =
+        spawn_v2_reload_test_child(&control, harness.config.clone(), &root, "account-worker").await;
+    let (parent, gate) = crate::agent::turn_authority::tests::parent().await;
+    let authority = crate::ParentTurnAuthority::capture(&parent, "live-parent");
+    gate.active.store(false, Ordering::SeqCst);
+    let pin = control
+        .ensure_v2_agent_loaded(
+            harness.config.clone(),
+            child.thread_id,
+            None,
+            Some(&authority),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        gate.calls.load(Ordering::SeqCst),
+        0,
+        "a loaded recipient requires no constructor"
+    );
+    assert_eq!(gate.live.load(Ordering::SeqCst), 0);
+    drop(pin);
+    let loaded = harness.manager.get_thread(child.thread_id).await.unwrap();
+    loaded
+        .inject_response_items(vec![assistant_message(
+            "persisted child",
+            Some(MessagePhase::FinalAnswer),
+        )])
+        .await
+        .unwrap();
+    loaded.shutdown_and_wait().await.unwrap();
+    assert!(
+        harness
+            .manager
+            .remove_thread(&child.thread_id)
+            .await
+            .is_some()
+    );
+    let error = control
+        .ensure_v2_agent_loaded(
+            harness.config.clone(),
+            child.thread_id,
+            None,
+            Some(&authority),
+        )
+        .await
+        .err()
+        .expect("cold reload cannot use an ended parent turn");
+    assert!(
+        error
+            .to_string()
+            .contains("parent account work cannot admit agent construction")
+    );
+    assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(gate.live.load(Ordering::SeqCst), 0);
+    assert!(harness.manager.get_thread(child.thread_id).await.is_err());
+    gate.active.store(true, Ordering::SeqCst);
+    let pin = control
+        .ensure_v2_agent_loaded(
+            harness.config.clone(),
+            child.thread_id,
+            None,
+            Some(&authority),
+        )
+        .await
+        .unwrap();
+    assert_eq!(gate.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        gate.live.load(Ordering::SeqCst),
+        0,
+        "idle reloaded runtime retains no construction work"
+    );
+    let reloaded = harness.manager.get_thread(child.thread_id).await.unwrap();
+    assert!(!Arc::ptr_eq(&loaded.session, &reloaded.session));
+    assert_eq!(reloaded.session.thread_id, child.thread_id);
+    drop(pin);
+    reloaded.shutdown_and_wait().await.unwrap();
+    root.shutdown_and_wait().await.unwrap();
 }

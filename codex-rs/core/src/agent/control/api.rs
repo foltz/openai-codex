@@ -100,6 +100,7 @@ impl AgentControl for LocalAgentControl {
     fn send(&self, request: SendRequest) -> BoxFuture<'_, Result<DeliveryReceipt>> {
         Box::pin(async move {
             let SendRequest {
+                parent_authority,
                 caller,
                 target,
                 resume_config,
@@ -111,8 +112,13 @@ impl AgentControl for LocalAgentControl {
                 AgentInput::UserInput(input) => {
                     let receiver = self.get_agent_metadata(target);
                     let _residency_pin = if receiver.is_some() {
-                        self.ensure_v2_agent_loaded(resume_config, target, /*parent*/ None)
-                            .await?
+                        self.ensure_v2_agent_loaded(
+                            resume_config,
+                            target,
+                            /*parent*/ None,
+                            parent_authority.as_ref(),
+                        )
+                        .await?
                     } else {
                         None
                     };
@@ -146,8 +152,13 @@ impl AgentControl for LocalAgentControl {
                         || (self.runtime.upgrade()?.get_thread(target).await.is_err()
                             && self.runtime.registry.evicted_environments(target).is_none())
                     {
-                        self.ensure_v2_agent_loaded(resume_config, target, /*parent*/ None)
-                            .await?
+                        self.ensure_v2_agent_loaded(
+                            resume_config,
+                            target,
+                            /*parent*/ None,
+                            parent_authority.as_ref(),
+                        )
+                        .await?
                     } else {
                         None
                     };
@@ -190,7 +201,7 @@ impl AgentControl for LocalAgentControl {
         Box::pin(async move {
             let parent = self.runtime.upgrade()?.get_thread(parent).await?;
             let config = parent.session.get_config().await.as_ref().clone();
-            self.ensure_v2_agent_loaded(config, child, Some(parent))
+            self.ensure_v2_agent_loaded(config, child, Some(parent), /*parent_authority*/ None)
                 .await
                 .map(drop)
         })

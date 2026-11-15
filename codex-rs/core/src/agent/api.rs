@@ -216,6 +216,7 @@ pub struct SpawnRequest {
 }
 
 pub struct SendRequest {
+    pub parent_authority: Option<crate::ParentTurnAuthority>,
     pub caller: ThreadId,
     pub target: AgentTarget,
     /// Captured caller settings used if the recipient must be restored.

@@ -98,6 +98,7 @@ async fn spawn_child(
             text(),
             source,
             SpawnAgentOptions {
+                parent_authority: None,
                 parent_thread_id: Some(parent_id),
                 parent_turn_id: Some(spawning_turn.sub_id.clone()),
                 cyber_access_program: spawning_turn.cyber_access_program,

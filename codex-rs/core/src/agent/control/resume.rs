@@ -16,12 +16,19 @@ impl LocalAgentControl {
         config: Config,
         thread_id: ThreadId,
         source: SessionSource,
+        parent_authority: Option<&crate::ParentTurnAuthority>,
     ) -> CodexResult<(LiveAgent, ThreadConfigSnapshot)> {
         let manager = self.runtime.upgrade()?;
         let thread = match manager.get_thread(thread_id).await {
             Ok(thread) => thread,
             Err(err) if matches!(err.details(), CodexErrorDetails::ThreadNotFound(_)) => {
-                Box::pin(self.resume_agent_from_rollout(config, thread_id, source)).await?;
+                Box::pin(self.resume_agent_from_rollout(
+                    config,
+                    thread_id,
+                    source,
+                    parent_authority,
+                ))
+                .await?;
                 manager.get_thread(thread_id).await?
             }
             Err(err) => return Err(err),

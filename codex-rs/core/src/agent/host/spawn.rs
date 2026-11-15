@@ -104,6 +104,11 @@ pub(super) async fn create_spawn(
     task_name: AgentPath,
     reservation: HostThreadSpawnReservation,
 ) -> std::result::Result<ThreadSpawnResult, ThreadSpawnError> {
+    let captured_account_work =
+        crate::ParentTurnAuthority::capture_construction(request.options.parent_authority.as_ref())
+            .map_err(|_| {
+                CodexErr::Fatal("parent account work cannot admit agent construction".to_owned())
+            })?;
     let (mut options, inheritance, client_metadata) =
         Box::pin(prepare_spawn_inputs(parent, request)).await?;
     let caller = parent.session.thread_id;
@@ -147,6 +152,7 @@ pub(super) async fn create_spawn(
             },
             caller,
             inheritance,
+            captured_account_work,
         )
         .await
         .map_err(|error| error.with_agent_context(AgentErrorContext::ChildStartup))?;

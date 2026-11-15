@@ -25,6 +25,8 @@ pub enum SpawnAgentForkMode {
 
 #[derive(Clone, Debug, Default)]
 pub struct SpawnAgentOptions {
+    /// Exact parent provenance; tracing IDs are not account authority.
+    pub parent_authority: Option<crate::ParentTurnAuthority>,
     pub fork_parent_spawn_call_id: Option<String>,
     pub fork_mode: Option<SpawnAgentForkMode>,
     pub parent_thread_id: Option<ThreadId>,

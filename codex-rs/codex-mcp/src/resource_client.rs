@@ -170,6 +170,9 @@ impl McpEventStream {
         match self.custody.take() {
             Some(EventStreamCustody::Private(lease)) => lease.release_after(async move {
                 before_close.await;
+                if let Some(client) = &client {
+                    client.shutdown().await;
+                }
                 drop(client);
             }),
             Some(EventStreamCustody::Borrowed(managed)) => {

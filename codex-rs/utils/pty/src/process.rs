@@ -123,6 +123,53 @@ pub struct ProcessHandle {
     // Optional resize hook for driver-backed sessions that proxy PTY control to
     // another backend instead of owning local PTY handles.
     resizer: StdMutex<Option<ResizeFn>>,
+    pid: Option<u32>,
+    launcher_pin: StdMutex<Option<ProcessPin>>,
+}
+
+/// An opaque pin on a spawned child, taken right after spawning and before
+/// any task can reap it, so its exit can be observed later without racing
+/// reaping or pid reuse. On Linux it holds a pidfd (CLOEXEC); it is empty when
+/// the pidfd could not be opened and on other platforms.
+#[derive(Debug)]
+pub struct ProcessPin {
+    #[cfg(target_os = "linux")]
+    pidfd: Option<std::os::fd::OwnedFd>,
+}
+
+impl ProcessPin {
+    /// Pins `pid`, which must be this process's unreaped child.
+    pub(crate) fn for_child(pid: Option<u32>) -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::FromRawFd;
+
+            let pidfd = pid
+                .and_then(|pid| libc::pid_t::try_from(pid).ok())
+                .and_then(|pid| {
+                    // SAFETY: pidfd_open takes a pid and flags and returns a
+                    // new descriptor (always close-on-exec) or -1.
+                    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+                    let fd = std::os::fd::RawFd::try_from(fd)
+                        .ok()
+                        .filter(|fd| *fd >= 0)?;
+                    // SAFETY: the kernel returned a new descriptor we now own.
+                    Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+                });
+            Self { pidfd }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = pid;
+            Self {}
+        }
+    }
+
+    /// The child's pidfd, if it could be opened before the child was reaped.
+    #[cfg(target_os = "linux")]
+    pub fn into_pidfd(self) -> Option<std::os::fd::OwnedFd> {
+        self.pidfd
+    }
 }
 
 impl fmt::Debug for ProcessHandle {
@@ -156,7 +203,33 @@ impl ProcessHandle {
             exit_code,
             _pty_handles: StdMutex::new(pty_handles),
             resizer: StdMutex::new(resizer),
+            pid: None,
+            launcher_pin: StdMutex::new(None),
         }
+    }
+
+    /// Records the directly spawned child: its pid and the pin taken right
+    /// after spawning, before the wait task could reap it.
+    pub(crate) fn with_child(mut self, pid: Option<u32>, pin: ProcessPin) -> Self {
+        self.pid = pid;
+        self.launcher_pin = StdMutex::new(Some(pin));
+        self
+    }
+
+    /// Takes the pin on the spawned child (once). `Some` for locally spawned
+    /// children, `None` for driver-backed sessions or once taken.
+    pub fn take_launcher_pin(&self) -> Option<ProcessPin> {
+        self.launcher_pin
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    /// Informational pid of the directly spawned child; it may already have
+    /// exited. Never use this number as post-reap process identity. Cleanup
+    /// authority uses take_launcher_pin instead. None for driver-backed sessions.
+    pub fn pid(&self) -> Option<u32> {
+        self.pid
     }
 
     pub fn stdout_reader(&self) -> Option<AbortHandle> {

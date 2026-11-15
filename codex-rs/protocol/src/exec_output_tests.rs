@@ -75,3 +75,76 @@ fn decode_shell_output(bytes: &[u8]) -> String {
     .from_utf8_lossy()
     .text
 }
+
+#[test]
+fn sandbox_cleanup_summary_roundtrips_only_typed_counts_and_join_evidence() {
+    use super::{SandboxCleanupState, SandboxCleanupSummary};
+    for (state, wire) in [
+        (SandboxCleanupState::Complete, "complete"),
+        (SandboxCleanupState::Incomplete, "incomplete"),
+        (SandboxCleanupState::TimedOut, "timed_out"),
+        (SandboxCleanupState::Unreported, "unreported"),
+    ] {
+        let summary = SandboxCleanupSummary {
+            state,
+            reaped: 1,
+            preserved_unproven: 2,
+            host_owned: 3,
+            handed_off: 4,
+            timed_out: 5,
+            joined: false,
+        };
+        let value = serde_json::to_value(summary).unwrap();
+        assert_eq!(value["state"], serde_json::json!(wire));
+        assert_eq!(value["joined"], serde_json::json!(false));
+        let actual: std::collections::BTreeSet<_> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let expected = [
+            "state",
+            "reaped",
+            "preservedUnproven",
+            "hostOwned",
+            "handedOff",
+            "timedOut",
+            "joined",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            serde_json::from_value::<SandboxCleanupSummary>(value).unwrap(),
+            summary
+        );
+    }
+}
+
+#[test]
+fn sandbox_cleanup_summary_never_defaults_missing_join_or_invalid_state() {
+    use super::SandboxCleanupSummary;
+    let value = serde_json::json!({"state":"complete", "reaped":0, "preservedUnproven":0, "hostOwned":0, "handedOff":0, "timedOut":0, "joined":false});
+    let mut missing = value.clone();
+    missing.as_object_mut().unwrap().remove("joined");
+    assert!(serde_json::from_value::<SandboxCleanupSummary>(missing).is_err());
+    for state in [
+        serde_json::json!("unknown"),
+        serde_json::json!(true),
+        serde_json::Value::Null,
+    ] {
+        let mut invalid = value.clone();
+        invalid["state"] = state;
+        assert!(serde_json::from_value::<SandboxCleanupSummary>(invalid).is_err());
+    }
+    for count in [
+        serde_json::json!(-1),
+        serde_json::json!(false),
+        serde_json::json!(4294967296u64),
+    ] {
+        let mut invalid = value.clone();
+        invalid["reaped"] = count;
+        assert!(serde_json::from_value::<SandboxCleanupSummary>(invalid).is_err());
+    }
+}

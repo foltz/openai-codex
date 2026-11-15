@@ -27,6 +27,7 @@ use tokio::task::JoinHandle;
 
 use crate::process::ChildTerminator;
 use crate::process::ProcessHandle;
+use crate::process::ProcessPin;
 use crate::process::ProcessSignal;
 use crate::process::SpawnedProcess;
 use crate::process::exit_code_from_status;
@@ -180,6 +181,8 @@ async fn spawn_process_with_stdin_mode(
         };
     #[cfg(not(target_os = "linux"))]
     let mut child = command.spawn()?;
+    let child_pid = child.id();
+    let launcher_pin = ProcessPin::for_child(child_pid);
     #[cfg(windows)]
     let windows_terminator = {
         // Accept the small race: a descendant created between spawn and
@@ -291,7 +294,8 @@ async fn spawn_process_with_stdin_mode(
         exit_code,
         /*pty_handles*/ None,
         /*resizer*/ None,
-    );
+    )
+    .with_child(child_pid, launcher_pin);
 
     Ok(SpawnedProcess {
         session: handle,

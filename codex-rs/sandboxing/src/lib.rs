@@ -1,3 +1,10 @@
+pub mod cleanup_custody;
+#[cfg(target_os = "linux")]
+mod linux_cleanup_custody;
+pub use cleanup_custody::CleanupDeadlineScope;
+pub use cleanup_custody::CleanupDeadlineSink;
+pub use cleanup_custody::SandboxCleanupCustody;
+pub use cleanup_custody::SandboxCleanupTightener;
 #[cfg(target_os = "linux")]
 mod bwrap;
 mod denial;

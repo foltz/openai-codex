@@ -10,7 +10,10 @@ use chardetng::EncodingDetector;
 use encoding_rs::Encoding;
 use encoding_rs::IBM866;
 use encoding_rs::WINDOWS_1252;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
+use ts_rs::TS;
 
 #[derive(Debug, Clone)]
 pub struct StreamOutput<T: Clone> {
@@ -57,6 +60,44 @@ impl Default for ExecToolCallOutput {
             timed_out: false,
         }
     }
+}
+
+/// Final state of a sandbox launch's cleanup, as observed by its owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxCleanupState {
+    /// Every target the launch installed was removed (or was never codex's).
+    Complete,
+    /// Some target was preserved because its removal could not be proven
+    /// safe; it stays recorded for a later exact-owner recovery.
+    Incomplete,
+    /// The cleanup deadline (not the command timeout) passed first. Sticky:
+    /// never relabelled, even if a later recovery removes the targets.
+    TimedOut,
+    /// The launcher ended without reporting (it failed before cleanup).
+    Unreported,
+}
+
+/// Owner-facing summary of one sandbox launch's cleanup. It carries only
+/// the state and per-category counts; paths, kernel handles and process
+/// tokens stay internal to the launcher's registry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxCleanupSummary {
+    pub state: SandboxCleanupState,
+    /// Targets this launch installed and removed (or found already gone).
+    pub reaped: u32,
+    /// Targets preserved as unproven (incomplete or still pending).
+    pub preserved_unproven: u32,
+    /// Targets that were never codex's and were left untouched.
+    pub host_owned: u32,
+    /// Targets still held by another live launch, which releases them.
+    pub handed_off: u32,
+    /// Targets retained because the cleanup deadline passed.
+    pub timed_out: u32,
+    /// Every cleanup helper of the launch was observed to exit before the
+    /// owner's deadline.
+    pub joined: bool,
 }
 
 /// Attempts to convert arbitrary bytes to UTF-8 with best-effort encoding detection.

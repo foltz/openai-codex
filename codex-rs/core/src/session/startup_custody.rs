@@ -186,7 +186,18 @@ impl SessionStartupCustody {
         {
             return Err(());
         }
+        // A registry can bind this cell before the constructor's first poll.
+        // Reject expired birth, and transfer an unexpired bound before effects.
+        if state
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(());
+        }
         let (resources, guard) = super::startup_resources::StartupResources::begin();
+        if let Some(deadline) = state.deadline {
+            resources.bind_deadline(deadline).map_err(|_| ())?;
+        }
         state.resources = Some(Arc::clone(&resources));
         Ok((resources, guard))
     }

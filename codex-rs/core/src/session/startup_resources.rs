@@ -29,7 +29,7 @@ struct State {
     completion: Option<Shared<BoxFuture<'static, CleanupExecution>>>,
 }
 
-pub(super) struct StartupResources {
+pub(crate) struct StartupResources {
     census: Arc<SandboxCleanupCensus>,
     scope: codex_sandboxing::CleanupDeadlineScope,
     state: Mutex<State>,

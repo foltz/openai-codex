@@ -571,3 +571,31 @@ async fn unrelated_resource_identity_refuses_session_transfer_without_losing_cus
         }
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn prebound_constructor_inherits_the_original_cell_deadline() {
+    let custody = SessionStartupCustody::default();
+    let deadline = Instant::now() + std::time::Duration::from_secs(2);
+    custody.tighten_deadline(deadline);
+    let (resources, scope) = custody.begin_resources().unwrap();
+    tokio::time::advance(std::time::Duration::from_secs(2)).await;
+    assert!(resources.create_mcp_runtime(false).is_err());
+    drop(scope);
+    assert_eq!(
+        resources
+            .observe_until(deadline + std::time::Duration::from_secs(30))
+            .await
+            .unwrap(),
+        CleanupExecution::TimedOut
+    );
+    assert!(!custody.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn expired_cell_refuses_constructor_birth_without_resource_effects() {
+    let custody = SessionStartupCustody::default();
+    custody.tighten_deadline(Instant::now());
+    assert!(custody.begin_resources().is_err());
+    assert!(custody.state.lock().unwrap().resources.is_none());
+    assert!(custody.is_empty());
+}

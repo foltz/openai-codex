@@ -1398,6 +1398,7 @@ impl McpConnectionSet {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn wait_for_server_startup(&self, server_name: &str) -> bool {
         self.wait_for_server_startup_with_authority(server_name, crate::McpAttemptAccess::Unscoped)
             .await
@@ -1478,6 +1479,7 @@ impl McpConnectionSet {
             .is_selected_plugin_mcp_server(server_name)
     }
 
+    #[cfg(test)]
     pub async fn wait_for_server_ready(&self, server_name: &str, timeout: Duration) -> bool {
         self.wait_for_server_ready_with_authority(
             server_name,
@@ -1532,6 +1534,7 @@ impl McpConnectionSet {
 
     /// Invoke the tool indicated by the (server, tool) pair.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub async fn call_tool(
         &self,
         server: &str,

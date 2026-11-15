@@ -193,11 +193,13 @@ impl McpConnectionSet {
     }
 
     /// Returns all tools with model-visible names normalized.
+    #[cfg(test)]
     pub async fn list_all_tools(&self) -> Vec<ToolInfo> {
         Box::pin(self.list_tools_with_errors(|_| true)).await.0
     }
 
     #[instrument(level = "trace", skip_all, fields(mcp_server_count = self.servers.len()))]
+    #[cfg(test)]
     pub(crate) async fn list_tools_with_errors(
         &self,
         include_server: impl Fn(&str) -> bool,

@@ -894,6 +894,7 @@ impl AsyncManagedClient {
         });
     }
 
+    #[cfg(test)]
     pub(crate) async fn reconnect_failed_startup(&self) {
         self.reconnect_failed_startup_with_authority(McpAttemptAccess::Unscoped)
             .await;

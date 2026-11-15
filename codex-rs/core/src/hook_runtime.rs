@@ -66,6 +66,7 @@ use crate::event_mapping::is_contextual_user_message_content;
 use crate::event_mapping::user_input_parts;
 use crate::guardian::GuardianReviewContext;
 use crate::hook_environment_executor::with_environment_hooks;
+use crate::hook_environment_executor::with_only_environment_hooks;
 use crate::hook_environment_executor::with_tool_environment_hooks;
 use crate::session::TurnInput;
 use crate::session::session::Session;
@@ -133,6 +134,48 @@ pub(crate) async fn run_pending_session_start_hooks(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
 ) -> bool {
+    while let Some(mut outcome) = sess.take_eager_session_start_hook_outcome().await {
+        // Local handlers ran before the first prompt. Environment handlers need
+        // the turn's admitted executor/network authority, without replaying local
+        // handlers. Preserve upstream's started batch then completed batch.
+        let mut request = codex_hooks::SessionStartRequest {
+            session_id: sess.session_id().into(),
+            #[allow(deprecated)]
+            cwd: turn_context.cwd.clone(),
+            transcript_path: None,
+            model: turn_context.model_info().slug.clone(),
+            permission_mode: hook_permission_mode(turn_context.approval_policy()),
+            target: StartHookTarget::SessionStart { source: outcome.source },
+        };
+        let hooks = with_only_environment_hooks(
+            sess, turn_context, &turn_context.initial_environments.refresh_readiness(),
+        );
+        let preview_runs = hooks.preview_session_start(&request);
+        let has_environment_hooks = !preview_runs.is_empty();
+        outcome.preview_runs.extend(preview_runs);
+        emit_hook_started_events(sess, turn_context, outcome.preview_runs).await;
+        if has_environment_hooks {
+            request.transcript_path = sess.hook_transcript_path().await;
+            let environment = hooks.run_session_start(request, Some(turn_context.sub_id.clone())).await;
+            outcome.hook_events.extend(environment.hook_events);
+            outcome.additional_contexts.extend(environment.additional_contexts);
+            // A local stop must not skip matching required environment hooks.
+            outcome.should_stop |= environment.should_stop;
+        }
+        let hook_events = outcome
+            .hook_events
+            .into_iter()
+            .map(|mut event| {
+                event.turn_id.get_or_insert_with(|| turn_context.sub_id.clone());
+                event
+            })
+            .collect();
+        emit_hook_completed_events(sess, turn_context, hook_events).await;
+        record_additional_contexts(sess, turn_context, outcome.additional_contexts).await;
+        if outcome.should_stop {
+            return true;
+        }
+    }
     while let Some(session_start_source) = sess.take_pending_session_start_source().await {
         // Spawned subagents can start fresh or fork their parent's history, so both
         // sources dispatch SubagentStart. Internal/system subagents skip start hooks.
@@ -186,6 +229,49 @@ pub(crate) async fn run_pending_session_start_hooks(
     }
 
     false
+}
+
+/// Dispatches a user session's start hook when it becomes addressable.
+/// Turn-scoped output and lifecycle events remain queued until the first turn.
+/// Subagents retain their existing turn-scoped SubagentStart mapping.
+#[instrument(level = "trace", skip_all)]
+pub(crate) async fn run_pending_session_start_hooks_eager(sess: &Arc<Session>) -> bool {
+    let config_snapshot = sess.thread_config_snapshot().await;
+    if matches!(&config_snapshot.session_source, SessionSource::SubAgent(_)) {
+        return false;
+    }
+    let Some(source) = sess.take_pending_session_start_source().await else {
+        return false;
+    };
+    let config = sess.get_config().await;
+    let mut request = codex_hooks::SessionStartRequest {
+        session_id: sess.session_id().into(),
+        #[allow(deprecated)]
+        cwd: config.cwd.clone(),
+        transcript_path: None,
+        model: config_snapshot.model,
+        permission_mode: hook_permission_mode(config_snapshot.approval_policy),
+        target: StartHookTarget::SessionStart { source },
+    };
+    let hooks = sess.hooks();
+    let preview_runs = hooks.preview_session_start(&request);
+    if preview_runs.is_empty() {
+        // Preserve the source for environment-owned hooks discovered at a turn,
+        // without materializing an otherwise empty local rollout.
+        sess.queue_eager_session_start_hook_outcome(source, Vec::new(), Vec::new(), false, Vec::new()).await;
+        return true;
+    }
+    request.transcript_path = sess.hook_transcript_path().await;
+    let outcome = hooks.run_session_start(request, None).await;
+    sess.queue_eager_session_start_hook_outcome(
+        source,
+        preview_runs,
+        outcome.hook_events,
+        outcome.should_stop,
+        outcome.additional_contexts,
+    )
+    .await;
+    true
 }
 
 /// Runs matching `PreToolUse` hooks before a tool executes.

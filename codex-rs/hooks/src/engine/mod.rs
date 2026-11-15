@@ -172,6 +172,10 @@ pub(crate) struct HandlerRunResult {
 }
 
 impl ConfiguredHandler {
+    pub(crate) fn is_environment_scoped(&self) -> bool {
+        matches!(self.source_path, HandlerSourcePath::Environment { .. })
+    }
+
     /// Internal memory work runs policy and executor hooks, not user or project hooks.
     pub(crate) fn runs_for_memory_consolidation(&self) -> bool {
         matches!(self.source_path, HandlerSourcePath::ExecutorScoped { .. })

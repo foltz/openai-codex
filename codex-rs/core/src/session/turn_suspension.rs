@@ -1,4 +1,6 @@
 use super::handlers;
+use super::retirement::CleanupExecution;
+use super::retirement::CleanupMode;
 use super::session::Session;
 use crate::state::TaskKind;
 use codex_protocol::error::CodexErr;
@@ -102,13 +104,19 @@ pub(super) async fn suspend_turn_and_shutdown(
     // Stop all producers before flushing their final history and closing its writer.
     // If either persistence step fails, do not report success: the current worker
     // retains ownership until worker-failure recovery can take responsibility.
-    handlers::shutdown_session_runtime(session).await;
-    live_thread.flush().await.map_err(|error| {
-        CodexErr::Fatal(format!("flush after root turn suspension failed: {error}"))
-    })?;
-    live_thread.shutdown().await.map_err(|error| {
-        CodexErr::Fatal(format!("close suspended root turn writer failed: {error}"))
-    })?;
+    let cleanup = session
+        .cleanup_owner()
+        .observe_suspension(Arc::clone(session))
+        .await;
+    if cleanup
+        != (CleanupExecution::Finished {
+            persistence_failed: false,
+        })
+    {
+        return Err(CodexErr::Fatal(format!(
+            "cleanup after root turn suspension failed: {cleanup:?}"
+        )));
+    }
     recorded?;
     // Announce completion only after extension cleanup and writer closure so a
     // replacement worker cannot write the same thread concurrently.
@@ -119,4 +127,30 @@ pub(super) async fn suspend_turn_and_shutdown(
         })
         .await;
     Ok(SuspendTurnOutcome::Suspended { turn_id })
+}
+
+/// Executed only by the retained cleanup owner, never as a second teardown.
+pub(super) async fn cleanup_suspended_session(session: &Arc<Session>) -> CleanupExecution {
+    // Preserve suspension's stricter ordering and stop-on-failure policy:
+    // stop producers, flush their final history, then close the writer.
+    // Even with a bound observer, suspension must join producers *inside* this
+    // sequence before persistence. The owner's parallel deadline-bound join
+    // alone does not establish that ordering. Keep the preexisting legacy join.
+    if let Some(failure) = handlers::shutdown_session_runtime(session, CleanupMode::Legacy).await {
+        return failure;
+    }
+    let result: anyhow::Result<()> = async {
+        let live_thread = session.live_thread_for_persistence("close a suspended root turn")?;
+        live_thread.flush().await?;
+        live_thread.shutdown().await?;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = &result {
+        warn!(thread_id = %session.thread_id, %error, "suspended root turn persistence cleanup failed");
+    }
+    CleanupExecution::Finished {
+        persistence_failed: result.is_err(),
+    }
+    .with_sandbox_cleanup_census(session.services.sandbox_cleanup_census().totals())
 }

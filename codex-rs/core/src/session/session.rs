@@ -113,6 +113,9 @@ pub(crate) struct Session {
     pub(crate) realtime_history: Option<Mutex<crate::realtime_history::RealtimeHistoryState>>,
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
     pub(crate) task_joins: crate::tasks::TaskJoinRegistry,
+    pub(super) cleanup_owner:
+        std::sync::Mutex<std::sync::Weak<super::retirement::SessionCleanupOwner>>,
+    pub(crate) failed_initialization_persistence: std::sync::atomic::AtomicBool,
     pub(crate) task_admission_closed: std::sync::atomic::AtomicBool,
     pub(crate) async_hook_results: async_channel::Receiver<HookCompletedEvent>,
     pub(crate) input_queue: InputQueue,
@@ -2115,6 +2118,8 @@ impl Session {
                 .then(|| Mutex::new(Default::default())),
                 active_turn: Mutex::new(None),
                 task_joins: Default::default(),
+                cleanup_owner: Default::default(),
+                failed_initialization_persistence: std::sync::atomic::AtomicBool::new(false),
                 task_admission_closed: Default::default(),
                 async_hook_results,
                 input_queue: InputQueue::with_controller(
@@ -2133,7 +2138,11 @@ impl Session {
             }
             if let Some(err) = startup_error {
                 if startup.is_none() {
-                    super::handlers::shutdown_session_runtime(&sess).await;
+                    let cleanup = sess.cleanup_owner().observe(Arc::clone(&sess)).await;
+                    if cleanup != (super::retirement::CleanupExecution::Finished { persistence_failed: false }) {
+                        warn!(?cleanup, "failed Session startup cleanup incomplete");
+                    }
+                    sess.services.rollout_thread_trace.record_ended(codex_rollout_trace::RolloutStatus::Aborted);
                 }
                 return Err(err.into());
             }

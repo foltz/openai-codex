@@ -278,6 +278,7 @@ pub(crate) mod multi_agents;
 mod plugin_selection;
 mod realtime_history;
 mod retained_context;
+pub(crate) mod retirement;
 mod review;
 mod rollout_budget;
 mod rollout_reconstruction;
@@ -476,11 +477,16 @@ pub(crate) enum SessionLoopOutcome {
 pub(crate) struct SessionLoopTermination {
     completion: Shared<BoxFuture<'static, SessionLoopOutcome>>,
     abort: Option<tokio::task::AbortHandle>,
+    cleanup_owner: Option<Arc<retirement::SessionCleanupOwner>>,
 }
 
 impl SessionLoopTermination {
     pub(crate) fn observed(&self) -> Option<SessionLoopOutcome> {
         self.completion.clone().now_or_never()
+    }
+
+    pub(crate) fn cleanup_completed(&self) -> Option<retirement::CleanupExecution> {
+        self.cleanup_owner.as_ref()?.completed()
     }
 
     pub(crate) fn request_abort(&self) {
@@ -1164,6 +1170,8 @@ impl Session {
             .as_ref()
             .and_then(|startup| startup.session_teardown(thread_id));
         let session_for_loop = Arc::clone(&session);
+        let cleanup_owner = session.cleanup_owner();
+        let loop_cleanup_owner = Arc::clone(&cleanup_owner);
         let session_loop_handle = tokio::spawn(Box::pin(storage_originator.scope(async move {
             submission_loop(session_for_loop, configured_config, rx_sub)
                 .instrument(info_span!("session_loop", thread_id = %thread_id))
@@ -1171,12 +1179,15 @@ impl Session {
             if let Some(tree_teardown) = tree_teardown {
                 tree_teardown.complete();
             }
+            drop(loop_cleanup_owner);
         })));
+        let mut termination = session_loop_termination_from_handle(session_loop_handle);
+        termination.cleanup_owner = Some(cleanup_owner);
         let io = SessionIo {
             tx_sub,
             rx_event,
             agent_status: agent_status_rx,
-            session_loop_termination: session_loop_termination_from_handle(session_loop_handle),
+            session_loop_termination: termination,
         };
 
         if let Some(startup) = startup {
@@ -1313,7 +1324,18 @@ impl SessionIo {
             Err(err) => return Err(err),
         }
         match session_loop_termination.await {
-            SessionLoopOutcome::Normal => Ok(()),
+            SessionLoopOutcome::Normal => {
+                if self.session_loop_termination.cleanup_owner.is_none()
+                    || self.session_loop_termination.cleanup_completed()
+                        == Some(retirement::CleanupExecution::Finished {
+                            persistence_failed: false,
+                        })
+                {
+                    Ok(())
+                } else {
+                    Err(CodexErr::InternalAgentDied)
+                }
+            }
             SessionLoopOutcome::Cancelled | SessionLoopOutcome::Panicked => {
                 Err(CodexErr::InternalAgentDied)
             }
@@ -1390,6 +1412,7 @@ pub(crate) fn completed_session_loop_termination() -> SessionLoopTermination {
             .boxed()
             .shared(),
         abort: None,
+        cleanup_owner: None,
     }
 }
 
@@ -1409,6 +1432,7 @@ pub(crate) fn session_loop_termination_from_handle(
     SessionLoopTermination {
         completion,
         abort: Some(abort),
+        cleanup_owner: None,
     }
 }
 

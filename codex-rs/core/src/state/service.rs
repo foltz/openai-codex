@@ -108,6 +108,10 @@ pub(crate) struct SessionServices {
 }
 
 impl SessionServices {
+    pub(crate) fn sandbox_cleanup_scope(&self) -> &codex_sandboxing::CleanupDeadlineScope {
+        self.unified_exec_manager.sandbox_cleanup_scope()
+    }
+
     pub(crate) fn sandbox_cleanup_census(
         &self,
     ) -> &Arc<crate::sandboxing::cleanup_census::SandboxCleanupCensus> {

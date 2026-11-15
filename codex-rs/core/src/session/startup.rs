@@ -85,7 +85,20 @@ impl SessionStartup {
             }
         } else {
             if let Some(session) = self.session.get() {
-                super::handlers::shutdown_session_runtime(session).await;
+                let cleanup = session.cleanup_owner().observe(Arc::clone(session)).await;
+                if cleanup
+                    != (super::retirement::CleanupExecution::Finished {
+                        persistence_failed: false,
+                    })
+                {
+                    if let Some(teardown) = teardown.as_ref() {
+                        teardown.record_shutdown_failure(
+                            "session_runtime_cleanup",
+                            "cleanup_incomplete",
+                        );
+                    }
+                    tracing::warn!(?cleanup, "cancelled pre-loop Session cleanup incomplete");
+                }
                 // The session loop never started, so it cannot close the trace itself.
                 session
                     .services

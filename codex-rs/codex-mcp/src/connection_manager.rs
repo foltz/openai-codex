@@ -331,12 +331,13 @@ impl McpServerView {
         &self,
         server_name: &str,
         tool_plugin_context: &ToolPluginContext,
+        access: crate::McpAttemptAccess<'_>,
     ) -> Result<(Vec<ToolInfo>, Option<Arc<serde_json::Value>>), StartupOutcomeError> {
         let (tools, meta) = if let Some(client) = self.connection.client.ready_client() {
             self.refresh_notified_catalog(server_name, &client).await;
             client.listed_catalog().await
         } else {
-            self.connection.client.listed_catalog().await?
+            self.connection.client.listed_catalog(access).await?
         };
         let tools = filter_tools(tools, &self.tool_filter);
         let tools = if self.connection.client.is_codex_apps_mcp_server {
@@ -1403,11 +1404,24 @@ impl McpConnectionSet {
     }
 
     pub(crate) async fn wait_for_server_startup(&self, server_name: &str) -> bool {
+        self.wait_for_server_startup_with_authority(server_name, crate::McpAttemptAccess::Unscoped)
+            .await
+    }
+
+    pub(crate) async fn wait_for_server_startup_with_authority(
+        &self,
+        server_name: &str,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> bool {
         let Some(view) = self.servers.get(server_name) else {
             return false;
         };
         view.connection.client.ready_transport().is_some()
-            || view.connection.client_for_call().await.is_ok()
+            || view
+                .connection
+                .client_for_call_with_authority(access)
+                .await
+                .is_ok()
     }
 
     /// Release this manager's clients, terminating shared stdio servers after their final release.
@@ -1470,11 +1484,25 @@ impl McpConnectionSet {
     }
 
     pub async fn wait_for_server_ready(&self, server_name: &str, timeout: Duration) -> bool {
+        self.wait_for_server_ready_with_authority(
+            server_name,
+            timeout,
+            crate::McpAttemptAccess::Unscoped,
+        )
+        .await
+    }
+
+    pub async fn wait_for_server_ready_with_authority(
+        &self,
+        server_name: &str,
+        timeout: Duration,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> bool {
         let Some(view) = self.servers.get(server_name) else {
             return false;
         };
 
-        match tokio::time::timeout(timeout, view.connection.client()).await {
+        match tokio::time::timeout(timeout, view.connection.client_with_authority(access)).await {
             Ok(Ok(_)) => true,
             Ok(Err(_)) | Err(_) => false,
         }
@@ -1515,15 +1543,40 @@ impl McpConnectionSet {
         tool: &str,
         environment_id: Option<&str>,
         arguments: Option<serde_json::Value>,
+        meta: Option<serde_json::Value>,
+        requested_timeout: Option<Duration>,
+        wait_for_server: bool,
+    ) -> Result<CallToolResult> {
+        self.call_tool_with_authority(
+            server,
+            tool,
+            environment_id,
+            arguments,
+            meta,
+            requested_timeout,
+            wait_for_server,
+            crate::McpAttemptAccess::Unscoped,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn call_tool_with_authority(
+        &self,
+        server: &str,
+        tool: &str,
+        environment_id: Option<&str>,
+        arguments: Option<serde_json::Value>,
         mut meta: Option<serde_json::Value>,
         requested_timeout: Option<Duration>,
         wait_for_server: bool,
+        access: crate::McpAttemptAccess<'_>,
     ) -> Result<CallToolResult> {
         self.validate_tool_call(server, tool, environment_id)?;
         let view = &self.servers[server];
         let client = if wait_for_server {
             view.connection
-                .client()
+                .client_with_authority(access)
                 .await
                 .context("failed to get client")?
         } else {
@@ -1597,6 +1650,18 @@ impl McpConnectionSet {
         &self,
         include_server: impl Fn(&str) -> bool,
     ) -> HashMap<String, McpServerInfo> {
+        self.list_available_server_infos_with_authority(
+            include_server,
+            crate::McpAttemptAccess::Unscoped,
+        )
+        .await
+    }
+
+    pub(crate) async fn list_available_server_infos_with_authority(
+        &self,
+        include_server: impl Fn(&str) -> bool,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> HashMap<String, McpServerInfo> {
         let mut server_infos = HashMap::new();
         for (server_name, view) in self.servers.iter().filter(|(name, _)| include_server(name)) {
             let client = &view.connection.client;
@@ -1606,7 +1671,7 @@ impl McpConnectionSet {
                 server_infos.insert(server_name.clone(), server_info);
                 continue;
             }
-            match view.connection.client().await {
+            match view.connection.client_with_authority(access).await {
                 Ok(managed_client) => {
                     server_infos.insert(server_name.clone(), managed_client.server_info);
                 }

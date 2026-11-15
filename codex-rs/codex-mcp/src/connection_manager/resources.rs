@@ -47,6 +47,15 @@ impl McpConnectionSet {
         &self,
         include_server: impl Fn(&str) -> bool,
     ) -> HashMap<String, Vec<Resource>> {
+        self.list_all_resources_with_authority(include_server, crate::McpAttemptAccess::Unscoped)
+            .await
+    }
+
+    pub async fn list_all_resources_with_authority(
+        &self,
+        include_server: impl Fn(&str) -> bool,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> HashMap<String, Vec<Resource>> {
         let mut join_set = JoinSet::new();
         for (server_name, view) in self
             .servers
@@ -54,7 +63,7 @@ impl McpConnectionSet {
             .filter(|(server_name, _)| include_server(server_name))
         {
             let server_name = server_name.clone();
-            let Ok(client) = view.connection.client().await else {
+            let Ok(client) = view.connection.client_with_authority(access).await else {
                 continue;
             };
             let timeout = view.tool_timeout;
@@ -94,12 +103,24 @@ impl McpConnectionSet {
         &self,
         include_server: impl Fn(&str) -> bool,
     ) -> HashMap<String, Vec<ResourceTemplate>> {
+        self.list_all_resource_templates_with_authority(
+            include_server,
+            crate::McpAttemptAccess::Unscoped,
+        )
+        .await
+    }
+
+    pub async fn list_all_resource_templates_with_authority(
+        &self,
+        include_server: impl Fn(&str) -> bool,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> HashMap<String, Vec<ResourceTemplate>> {
         let mut join_set = JoinSet::new();
         for (server_name, view) in self.servers.iter().filter(|(server_name, _)| {
             include_server(server_name) && !self.skips_resource_template_listing(server_name)
         }) {
             let server_name = server_name.clone();
-            let Ok(client) = view.connection.client().await else {
+            let Ok(client) = view.connection.client_with_authority(access).await else {
                 continue;
             };
             let timeout = view.tool_timeout;
@@ -141,7 +162,17 @@ impl McpConnectionSet {
         server: &str,
         params: Option<PaginatedRequestParams>,
     ) -> Result<ListResourcesResult> {
-        let (managed, timeout) = self.client_by_name(server).await?;
+        self.list_resources_with_authority(server, params, crate::McpAttemptAccess::Unscoped)
+            .await
+    }
+
+    pub async fn list_resources_with_authority(
+        &self,
+        server: &str,
+        params: Option<PaginatedRequestParams>,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Result<ListResourcesResult> {
+        let (managed, timeout) = self.client_by_name_with_authority(server, access).await?;
         managed
             .list_resources(params, timeout)
             .await
@@ -153,7 +184,21 @@ impl McpConnectionSet {
         server: &str,
         params: Option<PaginatedRequestParams>,
     ) -> Result<ListResourceTemplatesResult> {
-        let (managed, timeout) = self.client_by_name(server).await?;
+        self.list_resource_templates_with_authority(
+            server,
+            params,
+            crate::McpAttemptAccess::Unscoped,
+        )
+        .await
+    }
+
+    pub async fn list_resource_templates_with_authority(
+        &self,
+        server: &str,
+        params: Option<PaginatedRequestParams>,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Result<ListResourceTemplatesResult> {
+        let (managed, timeout) = self.client_by_name_with_authority(server, access).await?;
         managed
             .list_resource_templates(params, timeout)
             .await
@@ -179,7 +224,17 @@ impl McpConnectionSet {
         server: &str,
         params: ReadResourceRequestParams,
     ) -> Result<ReadResourceResult> {
-        let (managed, timeout) = self.client_by_name(server).await?;
+        self.read_resource_with_authority(server, params, crate::McpAttemptAccess::Unscoped)
+            .await
+    }
+
+    pub async fn read_resource_with_authority(
+        &self,
+        server: &str,
+        params: ReadResourceRequestParams,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Result<ReadResourceResult> {
+        let (managed, timeout) = self.client_by_name_with_authority(server, access).await?;
         let uri = params.uri.clone();
         managed
             .read_resource(params, timeout)
@@ -215,13 +270,22 @@ impl McpConnectionSet {
         &self,
         name: &str,
     ) -> Result<(ManagedClient, Option<Duration>)> {
+        self.client_by_name_with_authority(name, crate::McpAttemptAccess::Unscoped)
+            .await
+    }
+
+    pub(crate) async fn client_by_name_with_authority(
+        &self,
+        name: &str,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Result<(ManagedClient, Option<Duration>)> {
         let view = self
             .servers
             .get(name)
             .ok_or_else(|| anyhow!("unknown MCP server '{name}'"))?;
         let client = view
             .connection
-            .client()
+            .client_with_authority(access)
             .await
             .context("failed to get client")?;
         Ok((client, view.tool_timeout))
@@ -237,6 +301,22 @@ impl McpServerConnection {
         timeout: Option<Duration>,
         request: impl AsyncFnOnce(Arc<RmcpClient>, Option<Duration>) -> Result<ServerResult>,
     ) -> Result<ServerResult> {
+        self.with_early_apps_client_with_authority(
+            runtime,
+            timeout,
+            request,
+            crate::McpAttemptAccess::Unscoped,
+        )
+        .await
+    }
+
+    pub(crate) async fn with_early_apps_client_with_authority(
+        self: &Arc<Self>,
+        runtime: &McpRuntime,
+        timeout: Option<Duration>,
+        request: impl AsyncFnOnce(Arc<RmcpClient>, Option<Duration>) -> Result<ServerResult>,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Result<ServerResult> {
         let auth = runtime.auth_cache_key_for_server(CODEX_APPS_MCP_SERVER_NAME);
         let key = runtime
             .resource_cache_key(CODEX_APPS_MCP_SERVER_NAME)
@@ -245,11 +325,11 @@ impl McpServerConnection {
             key.connection.ptr_eq(&Arc::downgrade(self)),
             "Apps connection was replaced"
         );
-        let client = self.initialized_apps_client().await?;
+        let client = self.initialized_apps_client_with_authority(access).await?;
         let response = tokio::select! {
             biased;
             _ = self.client.cancel_token.cancelled() => anyhow::bail!("Apps startup cancelled"),
-            Err(error) = self.client.client.observe(crate::McpAttemptAccess::Unscoped) => return Err(error.into()),
+            Err(error) = self.client.client.observe(access) => return Err(error.into()),
             response = request(client, timeout) => response?,
         };
         anyhow::ensure!(
@@ -261,6 +341,14 @@ impl McpServerConnection {
     }
 
     pub(super) async fn initialized_apps_client(&self) -> Result<Arc<RmcpClient>> {
+        self.initialized_apps_client_with_authority(crate::McpAttemptAccess::Unscoped)
+            .await
+    }
+
+    pub(super) async fn initialized_apps_client_with_authority(
+        &self,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Result<Arc<RmcpClient>> {
         let mut initialized = self
             .initialized_apps
             .clone()
@@ -275,7 +363,7 @@ impl McpServerConnection {
         let acquire = async {
             tokio::select! {
                 biased;
-                ready = self.client.client.observe(crate::McpAttemptAccess::Unscoped) => Ok(ready?.client),
+                ready = self.client.client.observe(access) => Ok(ready?.client),
                 Some(client) = initialized_transport => Ok(client),
             }
         };

@@ -249,7 +249,23 @@ impl ResourceOrigin {
         &self,
         binding: &McpBinding,
         thread_id: ThreadId,
+        params: ReadResourceRequestParams,
+    ) -> anyhow::Result<ReadResourceResult> {
+        self.read_with_authority(
+            binding,
+            thread_id,
+            params,
+            crate::McpAttemptAccess::Unscoped,
+        )
+        .await
+    }
+
+    pub(crate) async fn read_with_authority(
+        &self,
+        binding: &McpBinding,
+        thread_id: ThreadId,
         mut params: ReadResourceRequestParams,
+        access: crate::McpAttemptAccess<'_>,
     ) -> anyhow::Result<ReadResourceResult> {
         if self.uri != params.uri {
             anyhow::bail!("originating MCP tool call does not match the requested resource");
@@ -309,7 +325,7 @@ impl ResourceOrigin {
             }),
         );
         binding
-            .read_resource(CODEX_APPS_MCP_SERVER_NAME, params)
+            .read_resource_with_authority(CODEX_APPS_MCP_SERVER_NAME, params, access)
             .await
     }
 }

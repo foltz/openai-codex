@@ -121,10 +121,22 @@ impl McpBinding {
         server: &str,
         params: Option<PaginatedRequestParams>,
     ) -> Result<ListResourcesResult> {
+        self.list_resources_with_authority(server, params, crate::McpAttemptAccess::Unscoped)
+            .await
+    }
+
+    pub async fn list_resources_with_authority(
+        &self,
+        server: &str,
+        params: Option<PaginatedRequestParams>,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Result<ListResourcesResult> {
         if self.clients.client(server).is_some() {
             self.clients.list_resources(server, params).await
         } else {
-            self.connections.list_resources(server, params).await
+            self.connections
+                .list_resources_with_authority(server, params, access)
+                .await
         }
     }
 
@@ -140,6 +152,20 @@ impl McpBinding {
         server: &str,
         params: Option<PaginatedRequestParams>,
     ) -> Result<ListResourceTemplatesResult> {
+        self.list_resource_templates_with_authority(
+            server,
+            params,
+            crate::McpAttemptAccess::Unscoped,
+        )
+        .await
+    }
+
+    pub async fn list_resource_templates_with_authority(
+        &self,
+        server: &str,
+        params: Option<PaginatedRequestParams>,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Result<ListResourceTemplatesResult> {
         if self.connections.skips_resource_template_listing(server) {
             return Ok(ListResourceTemplatesResult::with_all_items(Vec::new()));
         }
@@ -147,7 +173,7 @@ impl McpBinding {
             self.clients.list_resource_templates(server, params).await
         } else {
             self.connections
-                .list_resource_templates(server, params)
+                .list_resource_templates_with_authority(server, params, access)
                 .await
         }
     }
@@ -168,10 +194,22 @@ impl McpBinding {
         server: &str,
         params: ReadResourceRequestParams,
     ) -> Result<ReadResourceResult> {
+        self.read_resource_with_authority(server, params, crate::McpAttemptAccess::Unscoped)
+            .await
+    }
+
+    pub async fn read_resource_with_authority(
+        &self,
+        server: &str,
+        params: ReadResourceRequestParams,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Result<ReadResourceResult> {
         if self.clients.client(server).is_some() {
             self.clients.read_resource(server, params).await
         } else {
-            self.connections.read_resource(server, params).await
+            self.connections
+                .read_resource_with_authority(server, params, access)
+                .await
         }
     }
 }

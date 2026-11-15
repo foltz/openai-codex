@@ -202,13 +202,43 @@ impl McpConnectionSet {
         &self,
         include_server: impl Fn(&str) -> bool,
     ) -> (Vec<ToolInfo>, HashMap<String, String>) {
-        let (tools, errors, _) = self.list_catalogs_with_errors(include_server).await;
+        self.list_tools_with_errors_with_authority(
+            include_server,
+            crate::McpAttemptAccess::Unscoped,
+        )
+        .await
+    }
+
+    pub(crate) async fn list_tools_with_errors_with_authority(
+        &self,
+        include_server: impl Fn(&str) -> bool,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> (Vec<ToolInfo>, HashMap<String, String>) {
+        let (tools, errors, _) = self
+            .list_catalogs_with_errors_with_authority(include_server, access)
+            .await;
         (tools, errors)
     }
 
     pub(crate) async fn list_catalogs_with_errors(
         &self,
         include_server: impl Fn(&str) -> bool,
+    ) -> (
+        Vec<ToolInfo>,
+        HashMap<String, String>,
+        HashMap<String, Arc<serde_json::Value>>,
+    ) {
+        self.list_catalogs_with_errors_with_authority(
+            include_server,
+            crate::McpAttemptAccess::Unscoped,
+        )
+        .await
+    }
+
+    pub(crate) async fn list_catalogs_with_errors_with_authority(
+        &self,
+        include_server: impl Fn(&str) -> bool,
+        access: crate::McpAttemptAccess<'_>,
     ) -> (
         Vec<ToolInfo>,
         HashMap<String, String>,
@@ -224,7 +254,10 @@ impl McpConnectionSet {
                 .iter()
                 .filter(|(name, _)| include_server(name))
                 .map(|(server_name, view)| async move {
-                    view.connection.client.reconnect_failed_startup().await;
+                    view.connection
+                        .client
+                        .reconnect_failed_startup_with_authority(access)
+                        .await;
                     let has_cached_tools = view.connection.client.has_cached_tools();
                     let startup_complete = view
                         .connection
@@ -232,7 +265,7 @@ impl McpConnectionSet {
                         .startup_complete
                         .load(Ordering::Acquire);
                     let server_tools = view
-                        .listed_catalog(server_name, &self.tool_plugin_context)
+                        .listed_catalog(server_name, &self.tool_plugin_context, access)
                         .instrument(trace_span!(
                             "list_tools_for_server",
                             server_name = %server_name,
@@ -299,6 +332,24 @@ impl McpConnectionSet {
         required_servers: &[String],
         required_plugins: &HashSet<String>,
     ) -> McpBinding {
+        self.capture_binding_with_metadata_with_authority(
+            config,
+            plugins_available,
+            required_servers,
+            required_plugins,
+            crate::McpAttemptAccess::Unscoped,
+        )
+        .await
+    }
+
+    pub(crate) async fn capture_binding_with_metadata_with_authority(
+        self: &Arc<Self>,
+        config: Arc<crate::McpConfig>,
+        plugins_available: bool,
+        required_servers: &[String],
+        required_plugins: &HashSet<String>,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> McpBinding {
         let mut listed_tools = Vec::new();
         let mut clients = HashMap::new();
         let catalog_log_enabled = tracing::enabled!(
@@ -348,7 +399,7 @@ impl McpConnectionSet {
                             optional_mcp_startup_grace,
                         );
                     }
-                    let _ = view.connection.client().await;
+                    let _ = view.connection.client_with_authority(access).await;
                 } else if !must_wait_for_startup {
                     let optional_startup_deadline = if view.connection.startup_is_dormant() {
                         tokio::time::Instant::now() + optional_mcp_startup_grace
@@ -369,7 +420,7 @@ impl McpConnectionSet {
                             )
                         })
                         .unwrap_or(optional_startup_deadline);
-                    if tokio::time::timeout_at(startup_deadline, view.connection.client())
+                    if tokio::time::timeout_at(startup_deadline, view.connection.client_with_authority(access))
                         .await
                         .is_err()
                     {
@@ -377,7 +428,7 @@ impl McpConnectionSet {
                     }
                     return (server_name, view, cached_tools);
                 }
-                let _ = view.connection.client().await;
+                let _ = view.connection.client_with_authority(access).await;
                 return (server_name, view, cached_tools);
             }
             (server_name, view, None)
@@ -391,7 +442,7 @@ impl McpConnectionSet {
                 .load(Ordering::Acquire);
             // A transient Apps startup failure must not remove functions already discovered
             // by the model. Keep retrying even when the cached catalog supplies this step.
-            view.connection.client.reconnect_failed_startup().await;
+            view.connection.client.reconnect_failed_startup_with_authority(access).await;
             let accepts_cached_catalog = view.startup_readiness == McpStartupReadiness::Catalog
                 || (view.connection.client.is_codex_apps_mcp_server
                     && !view.connection.client.cancel_token.is_cancelled());
@@ -413,7 +464,7 @@ impl McpConnectionSet {
                 {
                     return None;
                 }
-                let Ok(mut client) = view.connection.client().await else {
+                let Ok(mut client) = view.connection.client_with_authority(access).await else {
                     trace!(server_name = %server_name, "omitting MCP server without an exact ready client");
                     return None;
                 };
@@ -579,6 +630,20 @@ impl McpConnectionSet {
         config: Arc<crate::McpConfig>,
         advertised_tool: &ToolInfo,
     ) -> Result<PreparedMcpCall> {
+        self.prepare_call_for_tool_with_authority(
+            config,
+            advertised_tool,
+            crate::McpAttemptAccess::Unscoped,
+        )
+        .await
+    }
+
+    pub(crate) async fn prepare_call_for_tool_with_authority(
+        self: &Arc<Self>,
+        config: Arc<crate::McpConfig>,
+        advertised_tool: &ToolInfo,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Result<PreparedMcpCall> {
         let server_name = &advertised_tool.server_name;
         let unavailable = || advertised_tool.unavailable_to_model_error();
         let view = self.servers.get(server_name).ok_or_else(unavailable)?;
@@ -588,7 +653,7 @@ impl McpConnectionSet {
         // Recovery belongs to readiness, before the caller acquires the tool execution lock.
         let mut client = view
             .connection
-            .client()
+            .client_with_authority(access)
             .await
             .with_context(|| format!("Could not start MCP server `{server_name}`"))?;
         client.tool_timeout = view.tool_timeout;
@@ -665,12 +730,29 @@ impl McpConnectionSet {
         config: &crate::McpConfig,
         validate: impl FnOnce() -> Option<G>,
     ) -> Result<Option<CodexAppsToolSnapshot>> {
+        self.refresh_codex_apps_client_catalog_with_authority(
+            config,
+            validate,
+            crate::McpAttemptAccess::Unscoped,
+        )
+        .await
+    }
+
+    pub(crate) async fn refresh_codex_apps_client_catalog_with_authority<G>(
+        &self,
+        config: &crate::McpConfig,
+        validate: impl FnOnce() -> Option<G>,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Result<Option<CodexAppsToolSnapshot>> {
         let refresh_start = Instant::now();
         let view = self
             .servers
             .get(CODEX_APPS_MCP_SERVER_NAME)
             .ok_or_else(|| anyhow!("unknown MCP server '{CODEX_APPS_MCP_SERVER_NAME}'"))?;
-        let Some((tools, _)) = self.refresh_codex_apps_tool_catalog(validate).await? else {
+        let Some((tools, _)) = self
+            .refresh_codex_apps_tool_catalog(validate, access)
+            .await?
+        else {
             return Ok(None);
         };
         let server_has_permission = config
@@ -701,13 +783,23 @@ impl McpConnectionSet {
 
     /// Refreshes Apps tools and returns the prepared shared-cache winner for discovery.
     pub async fn refresh_codex_apps_tools_for_discovery(&self) -> Result<Vec<ToolInfo>> {
+        self.refresh_codex_apps_tools_for_discovery_with_authority(
+            crate::McpAttemptAccess::Unscoped,
+        )
+        .await
+    }
+
+    pub async fn refresh_codex_apps_tools_for_discovery_with_authority(
+        &self,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Result<Vec<ToolInfo>> {
         let refresh_start = Instant::now();
         let view = self
             .servers
             .get(CODEX_APPS_MCP_SERVER_NAME)
             .ok_or_else(|| anyhow!("unknown MCP server '{CODEX_APPS_MCP_SERVER_NAME}'"))?;
         let (_, tools) = self
-            .refresh_codex_apps_tool_catalog(|| Some(()))
+            .refresh_codex_apps_tool_catalog(|| Some(()), access)
             .await?
             .context("Apps discovery refresh skipped publication")?;
         let tools = prepare_codex_apps_tools_for_model(
@@ -753,6 +845,7 @@ impl McpConnectionSet {
     async fn refresh_codex_apps_tool_catalog<G>(
         &self,
         validate: impl FnOnce() -> Option<G>,
+        access: crate::McpAttemptAccess<'_>,
     ) -> Result<Option<(Vec<ToolInfo>, Vec<ToolInfo>)>> {
         let view = self
             .servers
@@ -760,7 +853,7 @@ impl McpConnectionSet {
             .ok_or_else(|| anyhow!("unknown MCP server '{CODEX_APPS_MCP_SERVER_NAME}'"))?;
         let managed_client = view
             .connection
-            .client()
+            .client_with_authority(access)
             .await
             .context("failed to get client")?;
         let Some((tools, list_start)) = managed_client

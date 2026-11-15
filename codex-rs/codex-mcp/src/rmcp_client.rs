@@ -994,13 +994,14 @@ impl AsyncManagedClient {
 
     pub(crate) async fn listed_catalog(
         &self,
+        access: crate::McpAttemptAccess<'_>,
     ) -> Result<(Vec<ToolInfo>, Option<Arc<serde_json::Value>>), StartupOutcomeError> {
         if !self.startup_complete.load(Ordering::Acquire)
             && let Some(catalog) = self.cached_catalog()
         {
             Ok(catalog)
         } else {
-            match self.client().await {
+            match self.client_with_authority(access).await {
                 Ok(client) => Ok(client.listed_catalog().await),
                 Err(error) if self.is_codex_apps_mcp_server => self.cached_catalog().ok_or(error),
                 Err(error) => Err(error),

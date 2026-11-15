@@ -1185,7 +1185,8 @@ async fn cancelled_pool_constructor_retains_its_late_transport_owner() {
         settled
             .connections
             .iter()
-            .all(|(_, report)| !report.attempts.is_empty() && report.is_complete())
+            .all(|(_, report)| !report.attempts.is_empty() && report.is_complete()),
+        "late transport retirement: {settled:?}"
     );
     let workers = pool
         .observe_workers_until(tokio::time::Instant::now() + Duration::from_secs(1))

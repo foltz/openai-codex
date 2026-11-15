@@ -270,10 +270,9 @@ impl SessionStartupCustody {
 
     /// Called synchronously at Session birth, before startup can await or fail.
     pub(super) fn retain(&self, session: &Arc<Session>) -> bool {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
         if state
             .persistence
             .as_ref()

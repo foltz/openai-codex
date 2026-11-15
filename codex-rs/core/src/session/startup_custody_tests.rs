@@ -157,6 +157,10 @@ async fn pre_session_transfer_is_atomic_and_poison_is_fail_closed() {
         panic!("poison startup custody");
     }));
     assert!(!poisoned.is_empty());
+    assert!(
+        !poisoned.retain(&session),
+        "poison cannot authorize a transfer"
+    );
     assert_eq!(
         poisoned
             .shutdown_until(Instant::now() + std::time::Duration::from_secs(3))
@@ -372,4 +376,31 @@ async fn mismatched_session_transfer_preserves_the_unpublished_persistence() {
         .await;
     assert!(result.is_complete());
     assert!(guard.lock().await.as_ref().is_none());
+}
+
+#[tokio::test]
+async fn retained_pre_loop_session_uses_its_actual_common_cleanup_owner() {
+    let (session, _) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let owner = session.cleanup_owner();
+    let custody = SessionStartupCustody::default();
+    assert!(custody.retain(&session));
+    assert!(!custody.is_empty());
+    let result = custody
+        .shutdown_until(Instant::now() + std::time::Duration::from_secs(3))
+        .await;
+    assert_eq!(
+        result,
+        StartupCleanup::BeforeLoop(CleanupExecution::Finished {
+            persistence_failed: false
+        })
+    );
+    assert_eq!(
+        owner.completed(),
+        Some(CleanupExecution::Finished {
+            persistence_failed: false
+        })
+    );
+    assert!(custody.is_empty());
+    assert_eq!(custody.shutdown_until(Instant::now()).await, result);
 }

@@ -77,7 +77,7 @@ mod remote_control_cmd;
 mod sandbox_setup;
 mod sandbox_uninstall;
 mod state_db_recovery;
-#[cfg(not(windows))]
+#[cfg(all(not(windows), test))]
 mod wsl_paths;
 
 use crate::mcp_cmd::McpCli;

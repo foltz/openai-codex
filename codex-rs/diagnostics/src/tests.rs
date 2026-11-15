@@ -56,3 +56,24 @@ fn snapshot_includes_process_memory_and_registers_gauges_once() {
     #[cfg(not(target_os = "macos"))]
     assert_eq!(diagnostics.process.physical_footprint_bytes, None);
 }
+
+#[test]
+fn explicit_registration_preserves_zero_and_tracked_values() {
+    static ZERO_GAUGE: Gauge = Gauge::new("diagnostics.tests.initial_zero");
+    let value = || {
+        snapshot()
+            .gauges
+            .into_iter()
+            .filter(|gauge| gauge.name == "diagnostics.tests.initial_zero")
+            .map(|gauge| gauge.value)
+            .collect::<Vec<_>>()
+    };
+    ZERO_GAUGE.register();
+    ZERO_GAUGE.register();
+    assert_eq!(value(), vec![0]);
+    let guard = ZERO_GAUGE.track();
+    ZERO_GAUGE.register();
+    assert_eq!(value(), vec![1]);
+    drop(guard);
+    assert_eq!(value(), vec![0]);
+}

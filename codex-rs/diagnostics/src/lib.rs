@@ -43,7 +43,9 @@ impl Gauge {
         GaugeGuard { gauge: self }
     }
 
-    fn register(&'static self) {
+    /// Registers a zero-valued gauge before its first measured event.
+    /// Repeated registration does not reset the current value.
+    pub fn register(&'static self) {
         self.registered.call_once(|| {
             GAUGES
                 .lock()

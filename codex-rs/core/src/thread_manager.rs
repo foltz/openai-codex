@@ -645,6 +645,8 @@ impl ThreadManager {
         attestation_provider: Option<Arc<dyn AttestationProvider>>,
         external_time_provider: Option<Arc<dyn TimeProvider>>,
     ) -> Self {
+        // Lifecycle owners need an explicit zero before the first turn exists.
+        crate::tasks::ACTIVE_TURNS.register();
         let StartupModels {
             credentials: auth_manager,
             runtime_auth,

@@ -49,6 +49,7 @@ use crate::mcp::CODEX_APPS_MCP_SERVER_NAME;
 use crate::mcp::ToolPluginContext;
 use crate::openai_docs_source_attribution::maybe_with_openai_docs_source_attribution;
 use crate::pagination::collect_paginated_with_limit;
+use crate::private_retirement::PrivateClientRetirement;
 use crate::runtime::McpRuntimeContext;
 use crate::runtime::emit_duration;
 use crate::server::EffectiveMcpServer;
@@ -272,6 +273,7 @@ fn codex_apps_reconnect_backoff(consecutive_failures: u32) -> Duration {
 
 #[derive(Clone)]
 struct ManagedClientStartup {
+    private_retirement: PrivateClientRetirement,
     ema_auth: Option<Result<crate::ema_auth::EmaConnectionAuth, StartupOutcomeError>>,
     originator: AuthStorageOriginator,
     server_name: String,
@@ -302,11 +304,10 @@ impl ManagedClientStartup {
         sharing_declined: Option<CancellationToken>,
         publish_apps: Option<watch::Sender<Option<std::sync::Weak<RmcpClient>>>>,
     ) -> ManagedClientFuture {
-        self.start_in_retirement(
-            sharing_declined,
-            publish_apps,
-            RmcpClientRetirement::default(),
-        )
+        self.private_retirement
+            .track_startup(self.cancel_token.clone(), |retirement| {
+                self.start_in_retirement(sharing_declined, publish_apps, retirement)
+            })
     }
 
     fn start_in_retirement(
@@ -321,6 +322,7 @@ impl ManagedClientStartup {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         let Self {
+            private_retirement: _,
             ema_auth,
             originator,
             server_name,
@@ -478,6 +480,7 @@ impl ManagedClientStartup {
 
 #[derive(Clone)]
 pub(crate) struct AsyncManagedClient {
+    pub(crate) private_retirement: PrivateClientRetirement,
     pub(crate) ema_authority: Option<codex_rmcp_client::EmaRequestAuthority>,
     pub(crate) client: ManagedClientFuture,
     pub(crate) is_codex_apps_mcp_server: bool,
@@ -557,7 +560,9 @@ impl AsyncManagedClient {
         } else {
             pool_catalog.clone()
         };
+        let private_retirement = PrivateClientRetirement::default();
         let startup = Arc::new(ManagedClientStartup {
+            private_retirement: private_retirement.clone(),
             ema_auth,
             originator: AuthStorageOriginator::current(),
             server_name,
@@ -645,6 +650,7 @@ impl AsyncManagedClient {
             )
         });
         Self {
+            private_retirement,
             client,
             ema_authority,
             is_codex_apps_mcp_server,
@@ -728,14 +734,14 @@ impl AsyncManagedClient {
     }
 
     pub(crate) async fn shutdown(&self) {
+        self.private_retirement.close_registration();
         self.cancel_token.cancel();
         match self.client().await {
             Ok(client) => match &client.connection_sharing {
                 ConnectionSharing::Owned(lease) | ConnectionSharing::Shared(lease) => {
                     if let Some(slot) = lease.release() {
-                        return slot.wait_for_shutdown().await;
-                    }
-                    if matches!(&client.connection_sharing, ConnectionSharing::Owned(_)) {
+                        slot.wait_for_shutdown().await;
+                    } else if matches!(&client.connection_sharing, ConnectionSharing::Owned(_)) {
                         // Waiters from startup may still hold leases even though sharing was declined.
                         client.client.shutdown().await;
                     }
@@ -753,6 +759,15 @@ impl AsyncManagedClient {
         if let Some(slot) = &self.connection_slot {
             slot.wait_for_shutdown().await;
         }
+        // Retain incomplete physical evidence for the external owner to retry.
+        // This compatibility API still returns unit; runtime typed reports are
+        // integrated separately and must not infer success from this return.
+        let _ = self
+            .private_retirement
+            .shutdown_within_latched(
+                TokioInstant::now() + codex_rmcp_client::DEFAULT_RETIREMENT_TIMEOUT,
+            )
+            .await;
     }
 
     pub(crate) fn has_cached_tools(&self) -> bool {

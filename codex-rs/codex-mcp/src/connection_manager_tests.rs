@@ -614,6 +614,7 @@ async fn prepared_call_timeout_includes_trusted_access_lookup() {
 
 pub(crate) async fn create_ready_async_managed_client(tools: Vec<ToolInfo>) -> AsyncManagedClient {
     AsyncManagedClient {
+        private_retirement: Default::default(),
         ema_authority: None,
         client: futures::future::ready::<Result<ManagedClient, StartupOutcomeError>>(Ok(
             create_test_managed_client(tools).await,
@@ -821,6 +822,7 @@ fn create_gated_async_managed_client(
 
     (
         AsyncManagedClient {
+            private_retirement: Default::default(),
             ema_authority: None,
             client,
             is_codex_apps_mcp_server: false,
@@ -894,6 +896,7 @@ pub(crate) async fn create_test_manager_with_ready_apps_client(
     manager.insert_test_client(
         CODEX_APPS_MCP_SERVER_NAME.to_string(),
         AsyncManagedClient {
+            private_retirement: Default::default(),
             ema_authority: None,
             client: futures::future::ready::<Result<ManagedClient, StartupOutcomeError>>(Ok(
                 managed_client,
@@ -954,6 +957,7 @@ fn create_test_manager_with_failed_apps_startup(
     manager.insert_test_client(
         CODEX_APPS_MCP_SERVER_NAME.to_string(),
         AsyncManagedClient {
+            private_retirement: Default::default(),
             ema_authority: None,
             client,
             is_codex_apps_mcp_server: true,
@@ -2467,6 +2471,7 @@ async fn list_all_tools_uses_shared_codex_apps_cache_while_client_is_pending() {
     manager.insert_test_client(
         CODEX_APPS_MCP_SERVER_NAME.to_string(),
         AsyncManagedClient {
+            private_retirement: Default::default(),
             ema_authority: None,
             client: pending_client,
             is_codex_apps_mcp_server: true,
@@ -2541,6 +2546,7 @@ async fn capture_binding_preserves_ready_client_catalog_and_shares_prepared_meta
     manager.insert_test_client(
         CODEX_APPS_MCP_SERVER_NAME.to_string(),
         AsyncManagedClient {
+            private_retirement: Default::default(),
             ema_authority: None,
             client: futures::future::ready(Ok(ready_client)).boxed().shared(),
             is_codex_apps_mcp_server: true,
@@ -2949,6 +2955,7 @@ async fn list_available_server_infos_uses_cache_while_client_is_pending() {
     manager.insert_test_client(
         CODEX_APPS_MCP_SERVER_NAME.to_string(),
         AsyncManagedClient {
+            private_retirement: Default::default(),
             ema_authority: None,
             client: pending_client,
             is_codex_apps_mcp_server: true,
@@ -3048,6 +3055,7 @@ async fn capture_binding_exposes_cached_tools_before_startup() {
     manager.insert_test_client(
         CODEX_APPS_MCP_SERVER_NAME.to_string(),
         AsyncManagedClient {
+            private_retirement: Default::default(),
             ema_authority: None,
             client: pending_client,
             is_codex_apps_mcp_server: true,
@@ -3150,6 +3158,7 @@ async fn capture_binding_skips_pending_optional_servers_after_configured_shared_
         manager.insert_test_client(
             server_name.to_string(),
             AsyncManagedClient {
+                private_retirement: Default::default(),
                 ema_authority: None,
                 client: futures::future::pending::<Result<ManagedClient, StartupOutcomeError>>()
                     .boxed()
@@ -3406,6 +3415,7 @@ async fn capture_binding_shares_optional_startup_grace_across_connection_sets() 
         manager.insert_test_client(
             "pending",
             AsyncManagedClient {
+                private_retirement: Default::default(),
                 ema_authority: None,
                 client: futures::future::pending::<Result<ManagedClient, StartupOutcomeError>>()
                     .boxed()
@@ -4099,6 +4109,7 @@ async fn list_all_tools_blocks_while_client_is_pending_without_cached_tools() {
     manager.insert_test_client(
         CODEX_APPS_MCP_SERVER_NAME.to_string(),
         AsyncManagedClient {
+            private_retirement: Default::default(),
             ema_authority: None,
             client: pending_client,
             is_codex_apps_mcp_server: true,
@@ -4159,6 +4170,7 @@ async fn shutdown_cancels_pending_tool_listing() {
     manager.insert_test_client(
         CODEX_APPS_MCP_SERVER_NAME.to_string(),
         AsyncManagedClient {
+            private_retirement: Default::default(),
             ema_authority: None,
             client: pending_client,
             is_codex_apps_mcp_server: true,
@@ -4208,6 +4220,7 @@ async fn shutdown_continues_after_caller_is_aborted() {
     manager.insert_test_client(
         CODEX_APPS_MCP_SERVER_NAME.to_string(),
         AsyncManagedClient {
+            private_retirement: Default::default(),
             ema_authority: None,
             client: blocking_client,
             is_codex_apps_mcp_server: true,
@@ -4263,6 +4276,7 @@ async fn list_all_tools_does_not_block_when_shared_codex_apps_cache_is_empty() {
     manager.insert_test_client(
         CODEX_APPS_MCP_SERVER_NAME.to_string(),
         AsyncManagedClient {
+            private_retirement: Default::default(),
             ema_authority: None,
             client: pending_client,
             is_codex_apps_mcp_server: true,
@@ -4320,6 +4334,7 @@ async fn list_all_tools_uses_shared_codex_apps_cache_when_client_startup_fails()
     manager.insert_test_client(
         CODEX_APPS_MCP_SERVER_NAME.to_string(),
         AsyncManagedClient {
+            private_retirement: Default::default(),
             ema_authority: None,
             client: failed_client,
             is_codex_apps_mcp_server: true,
@@ -6018,6 +6033,7 @@ async fn reconciliation_reuses_connection_without_relisting_regular_tools() -> a
             connection: Arc::new(McpServerConnection {
                 identity: Some(reusable_server_identity("docs", &config, &runtime_context)),
                 client: AsyncManagedClient {
+                    private_retirement: Default::default(),
                     ema_authority: None,
                     client: futures::future::ready(Ok(managed_client)).boxed().shared(),
                     is_codex_apps_mcp_server: false,
@@ -6858,6 +6874,7 @@ async fn reconciliation_replaces_closed_connections() -> anyhow::Result<()> {
     view.connection = Arc::new(McpServerConnection {
         identity: Some(reusable_server_identity("docs", &config, &runtime_context)),
         client: AsyncManagedClient {
+            private_retirement: Default::default(),
             ema_authority: None,
             client: futures::future::ready(Ok(connected_client))
                 .boxed()

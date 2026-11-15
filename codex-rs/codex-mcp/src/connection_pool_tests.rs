@@ -870,6 +870,7 @@ async fn late_release_keeps_its_original_join_after_chat_unload_and_observer_can
         panic!("expected shared lease");
     };
     let slot = lease.release().expect("first release owns worker");
+    slot.close_acquisition();
     let release = peer.next("codex/connection/release").await;
     assert_eq!(release.message["params"]["leaseId"], first_id);
     // Do not acknowledge release yet. Preserve upstream's prompt chat-unload
@@ -896,6 +897,15 @@ async fn late_release_keeps_its_original_join_after_chat_unload_and_observer_can
     assert_eq!(pending.registered_at_start, 1);
     assert_eq!(pending.counts[1].pending, 1);
     assert_eq!(pending.counts[1].joined, 0);
+    let logical = slot.retire_release_until(tokio::time::Instant::now()).await;
+    assert!(
+        !logical.is_released(),
+        "prompt unload is not a server release reply"
+    );
+    assert_eq!(
+        logical.outcomes,
+        vec![(0, slot_retirement::SlotReleaseOutcome::ReleaseWorkerRunning)]
+    );
 
     let (result, ()) = tokio::join!(
         other.call_tool("test".into(), None, |_| Ok(None), None),
@@ -917,6 +927,19 @@ async fn late_release_keeps_its_original_join_after_chat_unload_and_observer_can
     assert_eq!(settled.counts[1].panicked, 0);
     assert_eq!(settled.counts[1].cancelled, 0);
     assert!(!settled.poisoned);
+    let logical = slot.retire_release_until(tokio::time::Instant::now()).await;
+    assert!(logical.is_released());
+    assert_eq!(
+        logical.outcomes,
+        vec![(
+            0,
+            slot_retirement::SlotReleaseOutcome::ServerLeaseAcknowledged
+        )]
+    );
+    assert!(
+        logical.physical.is_empty(),
+        "non-final release is not physical shutdown"
+    );
     // Settled observation replays even when the next observer has no budget.
     assert_eq!(
         slot.release_workers
@@ -1610,4 +1633,209 @@ async fn event_binding_refuses_foreign_transport_without_closing_it() {
     result.unwrap();
     drop(foreign);
     assert_event_pool_retired(&peer.pool).await;
+}
+
+#[tokio::test]
+async fn closed_slot_gate_is_not_release_and_does_not_evict_another_chat() {
+    let mut peer = LeasePeer::new();
+    let (first, _) = peer.chat().await;
+    let ConnectionSharing::Shared(lease) = &first.connection_sharing else {
+        panic!("shared lease");
+    };
+    let slot = Arc::clone(&lease.slot);
+    slot.close_acquisition();
+    let held = slot.retire_release_until(tokio::time::Instant::now()).await;
+    assert!(!held.is_released());
+    assert_eq!(
+        held.outcomes,
+        vec![(
+            0,
+            slot_retirement::SlotReleaseOutcome::AwaitingOrdinaryRelease
+        )]
+    );
+    let (other, _) = peer.chat().await;
+    let population = peer
+        .pool
+        .retire_released_until(tokio::time::Instant::now())
+        .await;
+    assert_eq!(
+        population.registered_at_start, 1,
+        "closing a slot must keep the shared process eligible for reuse"
+    );
+    lease.release().unwrap();
+    peer.next("codex/connection/release").await.reply(json!({}));
+    let released = slot
+        .retire_release_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await;
+    assert!(released.is_released(), "{released:?}");
+    assert!(released.physical.is_empty());
+    let (result, ()) = tokio::join!(
+        other.call_tool("test".into(), None, |_| Ok(None), None),
+        async {
+            peer.next("tools/call").await.reply(json!({"content": []}));
+        }
+    );
+    result.unwrap();
+    drop(other);
+    assert_event_pool_retired(&peer.pool).await;
+}
+
+#[tokio::test]
+async fn joined_release_worker_with_server_error_is_not_positive_release() {
+    let mut peer = LeasePeer::new();
+    let (first, _) = peer.chat().await;
+    let (other, _) = peer.chat().await;
+    let ConnectionSharing::Shared(lease) = &first.connection_sharing else {
+        panic!("shared lease");
+    };
+    let slot = Arc::clone(&lease.slot);
+    slot.close_acquisition();
+    lease.release().unwrap();
+    let release = peer.next("codex/connection/release").await;
+    release
+        .replies
+        .send(json!({"jsonrpc": "2.0", "id": release.message["id"],
+        "error": {"code": -32603, "message": "injected lease release refusal"}}))
+        .unwrap();
+    let report = slot
+        .retire_release_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await;
+    assert_eq!(report.workers.counts[1].joined, 1);
+    assert!(!report.is_released());
+    assert!(
+        matches!(&report.outcomes[..], [(0, slot_retirement::SlotReleaseOutcome::ServerReleaseFailed(error))] if error.contains("injected lease release refusal"))
+    );
+    let (result, ()) = tokio::join!(
+        other.call_tool("test".into(), None, |_| Ok(None), None),
+        async {
+            peer.next("tools/call").await.reply(json!({"content": []}));
+        }
+    );
+    result.unwrap();
+    drop(other);
+    assert_event_pool_retired(&peer.pool).await;
+}
+
+#[tokio::test]
+async fn final_slot_release_requires_actual_physical_proof_and_replays_it() {
+    let mut peer = LeasePeer::new();
+    let (managed, _) = peer.chat().await;
+    let ConnectionSharing::Shared(lease) = &managed.connection_sharing else {
+        panic!("shared lease");
+    };
+    let slot = Arc::clone(&lease.slot);
+    slot.close_acquisition();
+    lease.release().unwrap();
+    let report = slot
+        .retire_release_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await;
+    assert_eq!(
+        report.outcomes,
+        vec![(
+            0,
+            slot_retirement::SlotReleaseOutcome::RequiresPhysicalProof
+        )]
+    );
+    assert_eq!(report.physical.len(), 1);
+    assert!(!report.physical[0].1.attempts.is_empty());
+    assert!(report.is_released(), "{report:?}");
+    assert!(managed.client.is_closed().await);
+    assert!(lease.release().is_none());
+    assert_eq!(
+        slot.retire_release_until(tokio::time::Instant::now()).await,
+        report
+    );
+}
+
+#[tokio::test]
+async fn nonfinal_connection_without_remote_lease_has_explicit_logical_receipt() {
+    let pool = McpConnectionPool::default();
+    let ready = Arc::<Notify>::default();
+    ready.notify_one();
+    let launch = startup(
+        ConnectionSharing::Negotiated,
+        Arc::default(),
+        Arc::default(),
+        ready,
+        TestServer::default(),
+    );
+    let first_slot = Arc::new(ConnectionSlot::default());
+    let first = pool
+        .connect(
+            Arc::clone(&first_slot),
+            key(&context(), &config()),
+            Arc::default(),
+            None,
+            CancellationToken::new(),
+            &launch,
+        )
+        .await
+        .unwrap();
+    let other = pool
+        .connect(
+            Arc::default(),
+            key(&context(), &config()),
+            Arc::default(),
+            None,
+            CancellationToken::new(),
+            &launch,
+        )
+        .await
+        .unwrap();
+    let ConnectionSharing::Shared(lease) = &first.connection_sharing else {
+        panic!("shared lease");
+    };
+    assert!(lease.server_lease.get().is_none());
+    first_slot.close_acquisition();
+    assert!(
+        lease.release().is_none(),
+        "no remote protocol worker exists for this non-final holder"
+    );
+    let report = first_slot
+        .retire_release_until(tokio::time::Instant::now())
+        .await;
+    assert_eq!(
+        report.outcomes,
+        vec![(
+            0,
+            slot_retirement::SlotReleaseOutcome::ReleasedWithoutServerLease
+        )]
+    );
+    assert_eq!(report.workers.registered_at_end, 0);
+    assert!(report.physical.is_empty());
+    assert!(report.is_released());
+    other
+        .call_tool("test".into(), None, |_| Ok(None), None)
+        .await
+        .unwrap();
+    drop(other);
+    assert_event_pool_retired(&pool).await;
+}
+
+#[tokio::test]
+async fn closed_slot_refuses_late_factory_before_allocating_a_release_record() {
+    let pool = McpConnectionPool::default();
+    let slot = Arc::new(ConnectionSlot::default());
+    slot.close_acquisition();
+    let result = pool
+        .connect(
+            Arc::clone(&slot),
+            key(&context(), &config()),
+            Arc::default(),
+            None,
+            CancellationToken::new(),
+            |_, _, _| panic!("closed slot must refuse before factory invocation"),
+        )
+        .await;
+    assert!(matches!(result, Err(StartupOutcomeError::Cancelled)));
+    let report = slot.retire_release_until(tokio::time::Instant::now()).await;
+    assert_eq!(report.registered_at_start + report.registered_at_end, 0);
+    assert!(report.outcomes.is_empty());
+    assert!(report.is_released());
+    assert_eq!(
+        pool.retire_released_until(tokio::time::Instant::now())
+            .await
+            .registered_at_end,
+        0
+    );
 }

@@ -7,6 +7,7 @@
 mod event_lease;
 pub(crate) use event_lease::EventConnectionLease;
 mod physical;
+mod slot_retirement;
 mod worker_joins;
 
 use physical::PhysicalOwner;
@@ -66,10 +67,10 @@ pub(crate) struct ServerLease {
 }
 
 impl ServerLease {
-    async fn release(self, client: &RmcpClient, entry: &Arc<Entry>) {
-        if self.opened.await.is_err() {
-            return;
-        }
+    async fn release(self, client: &RmcpClient, entry: &Arc<Entry>) -> Result<(), String> {
+        self.opened
+            .await
+            .map_err(|error| format!("server lease open failed: {error}"))?;
         // MCP cancellation has no acknowledgement. The server owns any handler still
         // winding down after it receives these cancellation writes and then release.
         self.requests.cancel_and_wait().await;
@@ -82,7 +83,9 @@ impl ServerLease {
         {
             entry.remove_from_pool();
             tracing::warn!(%error, "failed to release a server-side MCP lease");
+            return Err(error.to_string());
         }
+        Ok(())
     }
 }
 
@@ -226,6 +229,7 @@ pub(crate) struct ConnectionLease {
     slot: Arc<ConnectionSlot>,
     server_lease: OnceLock<ServerLease>,
     workers: Arc<PoolWorkerJoins>,
+    release_receipt: Arc<slot_retirement::ReleaseReceipt>,
 }
 
 /// Tracks an acquisition without retaining its lease, including before startup completes.
@@ -234,6 +238,7 @@ pub(crate) struct ConnectionSlot {
     state: Mutex<SlotState>,
     shutdown_tasks: OnceLock<TaskTracker>,
     release_workers: PoolWorkerJoins,
+    release_receipts: slot_retirement::ReleaseReceipts,
 }
 
 #[derive(Default)]
@@ -482,7 +487,9 @@ impl McpConnectionPool {
                     entries.push(Arc::downgrade(&entry));
                     (entry, owner, AcquisitionRole::Creator)
                 };
+                let release_receipt = slot.release_receipts.reserve(Arc::clone(&entry.physical));
                 let lease = Arc::new(ConnectionLease {
+                    release_receipt,
                     entry,
                     owner: Mutex::new(Some(owner)),
                     cancellation: lease_cancellation,
@@ -563,13 +570,20 @@ impl ConnectionLease {
             .owner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let server_lease = if Arc::into_inner(owner.take()?).is_some() {
+        let ordinary = owner.take()?;
+        let receipt = Arc::clone(&self.release_receipt);
+        let server_lease = if Arc::into_inner(ordinary).is_some() {
             self.entry.cancellation.cancel();
             self.entry.remove_from_pool();
             None
         } else {
-            Some(self.server_lease.get()?.clone())
+            let Some(lease) = self.server_lease.get() else {
+                receipt.record(slot_retirement::SlotReleaseOutcome::ReleasedWithoutServerLease);
+                return None;
+            };
+            Some(lease.clone())
         };
+        receipt.record(slot_retirement::SlotReleaseOutcome::ReleaseWorkerRunning);
         let entry = Arc::clone(&self.entry);
         // The chat must be able to await its final release even when cancellation drops the lease.
         let tasks = self.slot.shutdown_tasks.get_or_init(TaskTracker::new);
@@ -577,25 +591,38 @@ impl ConnectionLease {
         let worker = self
             .workers
             .spawn(&self.entry.runtime, PoolWorkerKind::Release, async move {
-                match (entry.client.clone().await, server_lease) {
+                let outcome = match (entry.client.clone().await, server_lease) {
                     (Ok(client), _) if !entry.physical.accepts(&client.client) => {
                         // Preserve the mismatch receipt; do not stop a foreign holder.
+                        slot_retirement::SlotReleaseOutcome::ForeignRegistry
                     }
-                    (Ok(client), None) => client.client.shutdown().await,
+                    (Ok(client), None) => {
+                        client.client.shutdown().await;
+                        slot_retirement::SlotReleaseOutcome::RequiresPhysicalProof
+                    }
                     (Ok(client), Some(lease)) => {
                         let release = lease
                             .release(&client.client, &entry)
                             .or_cancel(&entry.cancellation);
                         tokio::pin!(release);
-                        if tokio::time::timeout(LEASE_REQUEST_TIMEOUT, &mut release)
-                            .await
-                            .is_err()
-                        {
-                            // Let the chat unload. A late open reply or cancellation write
-                            // must still precede release while other chats own the connection.
-                            entry.remove_from_pool();
-                            drop(completion);
-                            let _ = release.await;
+                        let result =
+                            match tokio::time::timeout(LEASE_REQUEST_TIMEOUT, &mut release).await {
+                                Ok(result) => result,
+                                Err(_) => {
+                                    // Prompt unload stays separate from the original late reply.
+                                    entry.remove_from_pool();
+                                    drop(completion);
+                                    release.await
+                                }
+                            };
+                        match result {
+                            Ok(Ok(())) => {
+                                slot_retirement::SlotReleaseOutcome::ServerLeaseAcknowledged
+                            }
+                            Ok(Err(error)) => {
+                                slot_retirement::SlotReleaseOutcome::ServerReleaseFailed(error)
+                            }
+                            Err(_) => slot_retirement::SlotReleaseOutcome::RequiresPhysicalProof,
                         }
                     }
                     (Err(error), _) => {
@@ -610,8 +637,10 @@ impl ConnectionLease {
                                 )
                                 .await;
                         }
+                        slot_retirement::SlotReleaseOutcome::RequiresPhysicalProof
                     }
-                }
+                };
+                receipt.record(outcome);
             });
         // The owner lock spans both registrations: a repeated release cannot
         // observe owner=None before this exact worker is retained locally too.

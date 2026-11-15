@@ -24,11 +24,13 @@ use crate::EffectiveMcpServer;
 use crate::McpEventStream;
 use crate::McpProtocolMode;
 use crate::McpRuntimeContext;
+use crate::resource_client::EventStreamCustody;
 use crate::rmcp_client::DEFAULT_STARTUP_TIMEOUT;
-use crate::rmcp_client::make_rmcp_client;
+use crate::rmcp_client::make_rmcp_client_in_retirement;
 use crate::rmcp_client::mcp_initialize_request_params;
 
 pub(crate) struct EventStreamConnectionSettings {
+    pub event_pool: crate::McpConnectionPool,
     pub server: EffectiveMcpServer,
     pub store_mode: OAuthCredentialsStoreMode,
     pub keyring_backend_kind: AuthKeyringBackendKind,
@@ -78,7 +80,8 @@ impl McpEventStreamOpener {
 
                 let startup_timeout = connection.server.config().startup_timeout_sec
                     .unwrap_or(DEFAULT_STARTUP_TIMEOUT);
-                let client = Arc::new(tokio::time::timeout(startup_timeout, make_rmcp_client(
+                let lease = connection.event_pool.reserve_event_connection();
+                let client = Arc::new(tokio::time::timeout(startup_timeout, make_rmcp_client_in_retirement(
                     /*ema_auth*/ None,
                     CODEX_APPS_MCP_SERVER_NAME,
                     connection.server.clone(),
@@ -89,7 +92,11 @@ impl McpEventStreamOpener {
                     connection.resolved_environment.clone(),
                     connection.auth_provider.clone(),
                     connection.protocol_mode,
+                    lease.retirement(),
                 )).await??);
+                if !lease.bind(&client) {
+                    bail!("event MCP factory returned a client outside its retained retirement owner");
+                }
                 client.initialize(
                     mcp_initialize_request_params(
                         ElicitationCapability::default(),
@@ -106,6 +113,8 @@ impl McpEventStreamOpener {
                 ).await?;
                 McpEventStream::open(
                     client,
+                    EventStreamCustody::Private(lease),
+                    connection.event_pool.clone(),
                     self.cancellation_receiver.clone(),
                     event_name,
                     arguments,

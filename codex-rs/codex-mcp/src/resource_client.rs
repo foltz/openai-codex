@@ -80,9 +80,16 @@ pub struct McpEventNotification {
     pub params: Option<Value>,
 }
 
+pub(crate) enum EventStreamCustody {
+    Private(crate::connection_pool::EventConnectionLease),
+    Borrowed(crate::rmcp_client::ManagedClient),
+}
+
 /// Owns an MCP event subscription and cancels its request when dropped.
 pub struct McpEventStream {
     request: Option<CancellableEventStreamRequest>,
+    custody: Option<EventStreamCustody>,
+    release_pool: crate::McpConnectionPool,
     runtime_handle: Handle,
     client: Option<Arc<RmcpClient>>,
     cancel_event_streams_on_server_removal: watch::Receiver<()>,
@@ -91,6 +98,8 @@ pub struct McpEventStream {
 impl McpEventStream {
     pub(crate) async fn open(
         client: Arc<RmcpClient>,
+        custody: EventStreamCustody,
+        release_pool: crate::McpConnectionPool,
         cancel_event_streams_on_server_removal: watch::Receiver<()>,
         event_name: &str,
         arguments: &Value,
@@ -106,6 +115,8 @@ impl McpEventStream {
             .context("events/stream request failed")?;
         Ok(Self {
             request: Some(request),
+            custody: Some(custody),
+            release_pool,
             runtime_handle: Handle::current(),
             client: Some(client),
             cancel_event_streams_on_server_removal,
@@ -138,7 +149,7 @@ impl McpEventStream {
             }
             response = &mut request.handle.rx => {
                 self.request = None;
-                self.client = None;
+                self.release_with(std::future::ready(()));
 
                 match response {
                     Ok(Ok(_))
@@ -151,6 +162,32 @@ impl McpEventStream {
         }
     }
 
+    fn release_with(
+        &mut self,
+        before_close: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        let client = self.client.take();
+        match self.custody.take() {
+            Some(EventStreamCustody::Private(lease)) => lease.release_after(async move {
+                before_close.await;
+                drop(client);
+            }),
+            Some(EventStreamCustody::Borrowed(managed)) => {
+                self.release_pool
+                    .spawn_event_release(&self.runtime_handle, async move {
+                        before_close.await;
+                        drop(client);
+                        // Retain the original ordinary lease through request cancellation.
+                        // Dropping it releases only this stream's holder.
+                        drop(managed);
+                    });
+            }
+            None => {
+                drop(client);
+            }
+        }
+    }
+
     fn cancel(&mut self) {
         if let Some(CancellableEventStreamRequest {
             handle,
@@ -158,15 +195,15 @@ impl McpEventStream {
         }) = self.request.take()
         {
             drop(notifications);
-            let client = self.client.take();
-            self.runtime_handle.spawn(async move {
+            self.release_with(async move {
                 let _ = tokio::time::timeout(
                     Duration::from_secs(30),
                     handle.cancel(Some("event subscription closed".to_string())),
                 )
                 .await;
-                drop(client);
             });
+        } else {
+            self.release_with(std::future::ready(()));
         }
     }
 }
@@ -400,7 +437,9 @@ impl McpResourceClient {
             .client_by_name(CODEX_APPS_MCP_SERVER_NAME)
             .await?;
         McpEventStream::open(
-            managed.client,
+            Arc::clone(&managed.client),
+            EventStreamCustody::Borrowed(managed),
+            connections.event_pool.clone(),
             cancel_event_streams_on_server_removal,
             event_name,
             arguments,

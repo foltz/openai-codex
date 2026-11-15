@@ -1482,35 +1482,6 @@ struct StartServerTaskParams {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn make_rmcp_client(
-    ema_auth: Option<Result<crate::ema_auth::EmaConnectionAuth, StartupOutcomeError>>,
-    server_name: &str,
-    server: EffectiveMcpServer,
-    store_mode: OAuthCredentialsStoreMode,
-    keyring_backend_kind: AuthKeyringBackendKind,
-    oauth_refresh_mode: McpOAuthRefreshMode,
-    runtime_context: McpRuntimeContext,
-    resolved_environment: std::result::Result<Option<Arc<Environment>>, String>,
-    runtime_auth_provider: Option<McpAuthProvider>,
-    protocol_mode: McpProtocolMode,
-) -> Result<RmcpClient, StartupOutcomeError> {
-    make_rmcp_client_in_retirement(
-        ema_auth,
-        server_name,
-        server,
-        store_mode,
-        keyring_backend_kind,
-        oauth_refresh_mode,
-        runtime_context,
-        resolved_environment,
-        runtime_auth_provider,
-        protocol_mode,
-        RmcpClientRetirement::default(),
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
 #[instrument(name = "make_rmcp_client", level = "trace", skip_all, fields(server_name = %server_name))]
 pub(crate) async fn make_rmcp_client_in_retirement(
     ema_auth: Option<Result<crate::ema_auth::EmaConnectionAuth, StartupOutcomeError>>,

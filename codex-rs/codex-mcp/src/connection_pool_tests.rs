@@ -1352,3 +1352,266 @@ async fn released_pool_owner_is_retained_until_its_factory_settles() {
     assert!(after.constructing_connections.is_empty());
     assert!(after.foreign_connections.is_empty());
 }
+
+async fn private_event_stream(
+    pool: &McpConnectionPool,
+) -> (
+    crate::McpEventStream,
+    mpsc::UnboundedReceiver<LeaseFrame>,
+    Arc<RmcpClient>,
+) {
+    let (tx, frames) = mpsc::unbounded_channel();
+    let lease = pool.reserve_event_connection();
+    let ready = Arc::<Notify>::default();
+    ready.notify_one();
+    let launch = startup(
+        ConnectionSharing::Private,
+        Arc::default(),
+        Arc::default(),
+        ready,
+        LeaseTransport(tx),
+    );
+    let managed = launch(CancellationToken::new(), None, Some(lease.retirement()))
+        .await
+        .unwrap();
+    assert!(lease.bind(&managed.client));
+    let client = Arc::clone(&managed.client);
+    let stream = crate::McpEventStream::open(
+        Arc::clone(&client),
+        crate::resource_client::EventStreamCustody::Private(lease),
+        pool.clone(),
+        tokio::sync::watch::channel(()).1,
+        "test",
+        &json!({}),
+        None,
+    )
+    .await
+    .unwrap();
+    (stream, frames, client)
+}
+
+async fn event_frame(frames: &mut mpsc::UnboundedReceiver<LeaseFrame>, method: &str) -> LeaseFrame {
+    let frame = tokio::time::timeout(Duration::from_secs(1), frames.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(frame.message["method"], method);
+    frame
+}
+
+async fn assert_event_pool_retired(pool: &McpConnectionPool) {
+    let workers = pool
+        .observe_workers_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await;
+    assert_eq!(workers.counts[1].pending, 0);
+    assert_eq!(workers.counts[1].panicked + workers.counts[1].cancelled, 0);
+    let report = pool
+        .retire_released_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await;
+    assert!(report.held_connections.is_empty());
+    assert!(report.foreign_connections.is_empty());
+    assert!(report.constructing_connections.is_empty());
+    assert_eq!(report.retired_before + report.connections.len() as u64, 1);
+    assert!(
+        report
+            .connections
+            .iter()
+            .all(|(_, physical)| physical.is_complete())
+    );
+}
+
+#[tokio::test]
+async fn borrowed_event_stream_keeps_ordinary_lease_until_cancellation_finishes() {
+    let mut peer = LeasePeer::new();
+    let (other, _) = peer.chat().await;
+    let (managed, id) = peer.chat().await;
+    let stream = crate::McpEventStream::open(
+        Arc::clone(&managed.client),
+        crate::resource_client::EventStreamCustody::Borrowed(managed),
+        peer.pool.clone(),
+        tokio::sync::watch::channel(()).1,
+        "test",
+        &json!({}),
+        None,
+    )
+    .await
+    .unwrap();
+    let request = peer.next("events/stream").await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), peer.frames.recv())
+            .await
+            .is_err(),
+        "opening a stream must not drop its ordinary lease"
+    );
+    drop(stream);
+    let cancel = peer.next("notifications/cancelled").await;
+    assert_eq!(cancel.message["params"]["requestId"], request.message["id"]);
+    request.reply(json!({}));
+    let release = peer.next("codex/connection/release").await;
+    assert_eq!(release.message["params"]["leaseId"], id);
+    release.reply(json!({}));
+    let (result, ()) = tokio::join!(
+        other.call_tool("test".into(), None, |_| Ok(None), None),
+        async {
+            peer.next("tools/call").await.reply(json!({"content": []}));
+        }
+    );
+    result.unwrap();
+    drop(other);
+    peer.next("codex/connection/release").await.reply(json!({}));
+    assert_event_pool_retired(&peer.pool).await;
+}
+
+#[tokio::test]
+async fn borrowed_event_completion_releases_only_its_holder() {
+    let mut peer = LeasePeer::new();
+    let (other, _) = peer.chat().await;
+    let (managed, id) = peer.chat().await;
+    let mut stream = crate::McpEventStream::open(
+        Arc::clone(&managed.client),
+        crate::resource_client::EventStreamCustody::Borrowed(managed),
+        peer.pool.clone(),
+        tokio::sync::watch::channel(()).1,
+        "test",
+        &json!({}),
+        None,
+    )
+    .await
+    .unwrap();
+    peer.next("events/stream").await.reply(json!({}));
+    assert!(stream.recv().await.unwrap().is_none());
+    let release = peer.next("codex/connection/release").await;
+    assert_eq!(release.message["params"]["leaseId"], id);
+    release.reply(json!({}));
+    assert!(!other.client.is_closed().await);
+    drop(stream);
+    drop(other);
+    peer.next("codex/connection/release").await.reply(json!({}));
+    assert_event_pool_retired(&peer.pool).await;
+}
+
+#[tokio::test]
+async fn independent_event_stream_keeps_its_transport_until_drop() {
+    let pool = McpConnectionPool::default();
+    let (stream, mut frames, client) = private_event_stream(&pool).await;
+    let request = event_frame(&mut frames, "events/stream").await;
+    let held = pool
+        .retire_released_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await;
+    assert_eq!(held.held_connections, vec![0]);
+    assert!(held.connections.is_empty());
+    assert!(!client.is_closed().await);
+    drop(stream);
+    let cancel = event_frame(&mut frames, "notifications/cancelled").await;
+    assert_eq!(cancel.message["params"]["requestId"], request.message["id"]);
+    request.reply(json!({}));
+    assert_event_pool_retired(&pool).await;
+    assert!(client.is_closed().await);
+}
+
+#[tokio::test]
+async fn independent_event_completion_is_retained_and_physically_closed() {
+    let pool = McpConnectionPool::default();
+    let (mut stream, mut frames, client) = private_event_stream(&pool).await;
+    event_frame(&mut frames, "events/stream")
+        .await
+        .reply(json!({}));
+    assert!(stream.recv().await.unwrap().is_none());
+    assert_event_pool_retired(&pool).await;
+    assert!(client.is_closed().await);
+    drop(stream);
+}
+
+#[tokio::test]
+async fn event_stream_drop_outside_runtime_keeps_original_cleanup_join() {
+    let pool = McpConnectionPool::default();
+    let (stream, mut frames, client) = private_event_stream(&pool).await;
+    let request = event_frame(&mut frames, "events/stream").await;
+    std::thread::spawn(move || drop(stream)).join().unwrap();
+    event_frame(&mut frames, "notifications/cancelled").await;
+    request.reply(json!({}));
+    assert_event_pool_retired(&pool).await;
+    assert!(client.is_closed().await);
+}
+
+#[tokio::test]
+async fn event_release_original_join_survives_observer_cancellation() {
+    let pool = McpConnectionPool::default();
+    let lease = pool.reserve_event_connection();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let seen = Arc::clone(&entered);
+    let resume = Arc::clone(&release);
+    lease.release_after(async move {
+        seen.notify_one();
+        resume.notified().await;
+    });
+    entered.notified().await;
+    let observer_pool = pool.clone();
+    let observer = tokio::spawn(async move {
+        observer_pool
+            .observe_workers_until(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+    });
+    observer.abort();
+    assert!(observer.await.unwrap_err().is_cancelled());
+    let pending = pool
+        .observe_workers_until(tokio::time::Instant::now())
+        .await;
+    assert_eq!(pending.counts[1].pending, 1);
+    release.notify_one();
+    assert_event_pool_retired(&pool).await;
+}
+
+#[tokio::test]
+async fn event_constructor_cancellation_keeps_late_physical_custody() {
+    let pool = McpConnectionPool::default();
+    let lease = pool.reserve_event_connection();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let factory = Arc::new(DelayedPoolTransport {
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+        server: TestServer::default(),
+    });
+    let mut constructing = Box::pin(RmcpClient::new_in_process_client_in_retirement(
+        factory,
+        lease.retirement(),
+    ));
+    tokio::select! { _ = entered.notified() => {}, _ = &mut constructing => panic!("factory must remain gated") }
+    drop(lease);
+    drop(constructing);
+    let pending = pool
+        .retire_released_until(tokio::time::Instant::now())
+        .await;
+    assert_eq!(pending.retired_before, 0);
+    assert_eq!(pending.connections.len(), 1);
+    assert!(!pending.connections[0].1.is_complete());
+    release.notify_one();
+    assert_event_pool_retired(&pool).await;
+}
+
+#[tokio::test]
+async fn event_binding_refuses_foreign_transport_without_closing_it() {
+    let mut peer = LeasePeer::new();
+    let (foreign, _) = peer.chat().await;
+    let pool = McpConnectionPool::default();
+    let lease = pool.reserve_event_connection();
+    assert!(!lease.bind(&foreign.client));
+    drop(lease);
+    let report = pool
+        .retire_released_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await;
+    assert_eq!(report.foreign_connections, vec![0]);
+    assert_eq!(report.retired_before, 0);
+    let (result, ()) = tokio::join!(
+        foreign.call_tool("test".into(), None, |_| Ok(None), None),
+        async {
+            peer.next("tools/call").await.reply(json!({"content": []}));
+        }
+    );
+    result.unwrap();
+    drop(foreign);
+    peer.next("codex/connection/release").await.reply(json!({}));
+    assert_event_pool_retired(&peer.pool).await;
+}

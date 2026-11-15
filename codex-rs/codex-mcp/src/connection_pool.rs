@@ -4,6 +4,8 @@
 //! Request continuations use the calling chat's elicitation authority. Legacy connections and
 //! servers that request input during startup remain private.
 
+mod event_lease;
+pub(crate) use event_lease::EventConnectionLease;
 mod physical;
 mod worker_joins;
 
@@ -84,7 +86,7 @@ impl ServerLease {
     }
 }
 
-/// Process-owned registry for compatible local stdio servers using MCP 2026-07-28.
+/// Process-owned custody for pooled stdio connections and independent event clients.
 #[derive(Clone, Default)]
 pub struct McpConnectionPool {
     entries: Arc<Mutex<Vec<Weak<Entry>>>>,

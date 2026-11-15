@@ -337,6 +337,7 @@ pub(crate) struct McpConnectionSet {
     network_policy_metadata: Option<Arc<dyn NetworkPolicyMetadataProvider>>,
     servers: HashMap<String, McpServerView>,
     pub(crate) event_stream_connection: Option<Arc<EventStreamConnectionSettings>>,
+    pub(crate) event_pool: crate::McpConnectionPool,
     disabled_servers: Vec<String>,
     required_servers: Vec<String>,
     optional_startup_deadline: OnceLock<tokio::time::Instant>,
@@ -382,6 +383,7 @@ impl McpConnectionSet {
             elicitation_reviewer,
             elicitation_lifecycle,
         } = input;
+        let event_pool = runtime_context.connection_pool.clone().unwrap_or_default();
         let store_mode = config.mcp_oauth_credentials_store_mode;
         let keyring_backend_kind = config.auth_keyring_backend_kind;
         let oauth_refresh_mode = config.oauth_refresh_mode;
@@ -620,6 +622,7 @@ impl McpConnectionSet {
             };
             if is_host_owned_codex_apps {
                 event_stream_connection = Some(Arc::new(EventStreamConnectionSettings {
+                    event_pool: event_pool.clone(),
                     server: server.clone(),
                     store_mode,
                     keyring_backend_kind,
@@ -1106,6 +1109,7 @@ impl McpConnectionSet {
             network_policy_metadata,
             servers,
             event_stream_connection,
+            event_pool,
             disabled_servers,
             required_servers,
             optional_startup_deadline: OnceLock::new(),
@@ -1183,6 +1187,7 @@ impl McpConnectionSet {
             network_policy_metadata: None,
             servers: HashMap::new(),
             event_stream_connection: None,
+            event_pool: Default::default(),
             disabled_servers: Vec::new(),
             required_servers: Vec::new(),
             optional_startup_deadline: OnceLock::new(),

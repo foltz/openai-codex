@@ -112,6 +112,7 @@ impl McpConnectionSet {
             network_policy_metadata: None,
             servers: HashMap::new(),
             event_stream_connection: None,
+            event_pool: Default::default(),
             disabled_servers: Vec::new(),
             required_servers: Vec::new(),
             optional_startup_deadline: OnceLock::new(),

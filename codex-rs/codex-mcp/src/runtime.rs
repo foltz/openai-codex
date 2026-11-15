@@ -524,6 +524,12 @@ impl McpRuntime {
         }) else {
             return;
         };
+        // The generation gate above has been released: avoid recursively
+        // locking the containing census. A closure that won in between revokes
+        // this exact already-created authority at registration.
+        if let Some(Ok(auth)) = &ema_auth {
+            self.retirement.register_ema(Arc::clone(&auth.retirement));
+        }
         let (publish, publication_gate) = McpPublicationGate::pending();
         let config = Arc::clone(&input.config);
         let auth = input.auth.clone();

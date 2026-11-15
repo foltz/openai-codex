@@ -64,6 +64,7 @@ pub struct RuntimeWorkerDrainReport {
     pub runtime_shutdowns: u64,
     pub runtime_shutdowns_joined: u64,
     pub workers: Vec<crate::McpWorkerSnapshot>,
+    pub ema: Vec<crate::RuntimeEmaDrainResult>,
     pub poisoned: bool,
 }
 
@@ -74,6 +75,10 @@ impl RuntimeWorkerDrainReport {
             && self.runtime_shutdowns > 0
             && self.runtime_shutdowns_joined == self.runtime_shutdowns
             && !self.workers.is_empty()
+            && self
+                .ema
+                .iter()
+                .all(|ema| ema.revoked && ema.outcome == crate::RuntimeEmaOutcome::Quiesced)
             && self.workers.iter().all(|worker| {
                 worker.startup_admission_closed
                     && worker.all_admission_closed
@@ -113,6 +118,7 @@ struct State {
     connections: Vec<Arc<ConnectionOwner>>,
     workers: Vec<crate::McpWorkerOwner>,
     shutdowns: Vec<Arc<crate::runtime::RuntimeShutdown>>,
+    ema: Vec<Arc<crate::ema_retirement::EmaRetirementOwner>>,
 }
 
 /// Retain before asynchronous connection construction or cleanup can be dropped.
@@ -173,6 +179,23 @@ impl Drop for RuntimeGenerationPermit {
 }
 
 impl McpRuntimeRetirement {
+    pub(crate) fn register_ema(&self, owner: Arc<crate::ema_retirement::EmaRetirementOwner>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.closed || self.state.is_poisoned() {
+            owner.revoke();
+        }
+        if !state
+            .ema
+            .iter()
+            .any(|existing| Arc::ptr_eq(existing, &owner))
+        {
+            state.ema.push(owner);
+        }
+    }
+
     pub(crate) fn register_shutdown(&self, shutdown: Arc<crate::runtime::RuntimeShutdown>) {
         let mut state = self
             .state
@@ -265,7 +288,7 @@ impl McpRuntimeRetirement {
     }
 
     pub fn close_registration(&self) {
-        let records = {
+        let (records, ema) = {
             let mut state = self
                 .state
                 .lock()
@@ -282,8 +305,11 @@ impl McpRuntimeRetirement {
                     slot.close_acquisition();
                 }
             }
-            state.connections.clone()
+            (state.connections.clone(), state.ema.clone())
         };
+        for owner in ema {
+            owner.revoke();
+        }
         for record in records {
             record.private.close_registration();
             record.cancellation.cancel();
@@ -297,7 +323,7 @@ impl McpRuntimeRetirement {
     /// original observer was dropped. All waits share the supplied deadline.
     pub async fn drain_workers_until(&self, deadline: Instant) -> RuntimeWorkerDrainReport {
         self.close_registration();
-        let (shutdowns, workers) = {
+        let (shutdowns, workers, initial_ema) = {
             let state = self
                 .state
                 .lock()
@@ -309,12 +335,37 @@ impl McpRuntimeRetirement {
                     .map(|owner| owner.start())
                     .collect::<Vec<_>>(),
                 state.workers.clone(),
+                state.ema.clone(),
             )
         };
         let observe =
             futures::future::join_all(workers.iter().map(|worker| worker.observe_until(deadline)));
-        let (connections, observed) = tokio::join!(self.shutdown_until(deadline), observe);
-        let workers = if connections.are_connections_released() {
+        let observe_ema = futures::future::join_all(
+            initial_ema
+                .iter()
+                .enumerate()
+                .map(|(id, owner)| owner.observe_until(id as u64, deadline)),
+        );
+        let (connections, observed, _) =
+            tokio::join!(self.shutdown_until(deadline), observe, observe_ema);
+        // Admitted constructors may register their already-created authority
+        // after closure. Settlement precedes this final population read.
+        let ema = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ema
+            .clone();
+        let ema = futures::future::join_all(
+            ema.iter()
+                .enumerate()
+                .map(|(id, owner)| owner.observe_until(id as u64, deadline)),
+        )
+        .await;
+        let ema_quiesced = ema
+            .iter()
+            .all(|owner| owner.revoked && owner.outcome == crate::RuntimeEmaOutcome::Quiesced);
+        let workers = if connections.are_connections_released() && ema_quiesced {
             futures::future::join_all(
                 workers
                     .iter()
@@ -338,6 +389,7 @@ impl McpRuntimeRetirement {
             runtime_shutdowns: shutdowns.len() as u64,
             runtime_shutdowns_joined,
             workers,
+            ema,
             poisoned: self.state.is_poisoned(),
         }
     }

@@ -175,3 +175,7 @@ pub use runtime_retirement::RuntimeConnectionReport;
 pub use runtime_retirement::RuntimeConnectionResult;
 
 pub use runtime_retirement::RuntimeWorkerDrainReport;
+
+mod ema_retirement;
+pub use ema_retirement::RuntimeEmaDrainResult;
+pub use ema_retirement::RuntimeEmaOutcome;

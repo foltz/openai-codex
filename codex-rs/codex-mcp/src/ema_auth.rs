@@ -61,6 +61,7 @@ pub(crate) struct EmaAuth {
     pub(crate) manager: Arc<AuthManager>,
     pub(crate) account: CodexAuth,
     pub(crate) authority: EmaRequestAuthority,
+    pub(crate) retirement: Arc<crate::ema_retirement::EmaRetirementOwner>,
     _revocation: McpAbortOnDrop,
 }
 
@@ -119,6 +120,7 @@ impl EmaAuth {
                 },
             )
             .map_err(|()| anyhow::anyhow!("MCP worker startup admission closed"))?;
+        let retirement = crate::ema_retirement::EmaRetirementOwner::new(authority.clone());
         Ok(Arc::new(Self {
             scope,
             config,
@@ -127,6 +129,7 @@ impl EmaAuth {
                 .context("enterprise MCP requires an account owner")?
                 .clone(),
             authority,
+            retirement,
             _revocation: revocation,
         }))
     }

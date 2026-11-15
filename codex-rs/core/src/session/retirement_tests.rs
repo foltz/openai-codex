@@ -979,9 +979,9 @@ async fn exact_thread_gone_loop_preserves_legacy_classification_without_syntheti
         let thread = exact_thread_fixture(mode).await;
         thread.io.session_loop_termination.clone().await;
         let legacy = thread.io.shutdown_and_wait().await;
-        assert_eq!(
-            legacy.is_ok(),
-            ordinary == crate::ThreadShutdownOutcome::Complete
+        assert!(
+            legacy.is_err(),
+            "a bare normal join is not a recorded cleanup receipt"
         );
         let ticket = thread
             .begin_retirement(Instant::now() + Duration::from_secs(3))
@@ -995,6 +995,11 @@ async fn exact_thread_gone_loop_preserves_legacy_classification_without_syntheti
                     persistence_failed: false
                 },
             }
+        );
+        assert_eq!(
+            thread.io.shutdown_and_wait().await.is_ok(),
+            ordinary == crate::ThreadShutdownOutcome::Complete,
+            "normal join requires the now-recorded original cleanup receipt",
         );
         while let Ok(event) = thread.io.rx_event.try_recv() {
             assert!(!matches!(
@@ -1305,6 +1310,25 @@ async fn late_resource_release_keeps_the_timed_out_retirement_report() {
         session.services.extensions = Arc::new(builder.build());
     })
     .await;
+    // Isolate a late common receipt: parallel MCP/task evidence must already
+    // be settled, rather than assuming that starting a drain observed it.
+    // These are real original owners, not injected success labels.
+    let prepared = thread
+        .session
+        .services
+        .mcp_runtime
+        .retirement_owner()
+        .drain_workers_until(Instant::now() + Duration::from_secs(10))
+        .await;
+    assert!(prepared.are_recorded_workers_drained());
+    assert!(matches!(
+        thread
+            .session
+            .task_joins
+            .shutdown_until(Instant::now() + Duration::from_secs(10))
+            .await,
+        crate::tasks::TaskJoinOutcome::Complete { panicked: false }
+    ));
     let deadline = Instant::now() + Duration::from_secs(2);
     let ticket = thread.begin_retirement(deadline).expect("ticket");
     let observer = ticket.clone();

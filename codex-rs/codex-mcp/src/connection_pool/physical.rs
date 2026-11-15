@@ -19,6 +19,7 @@ pub struct PoolPhysicalSnapshot {
     pub connections: Vec<(u64, PhysicalRetirementReport)>,
     pub held_connections: Vec<u64>,
     pub foreign_connections: Vec<u64>,
+    pub constructing_connections: Vec<u64>,
     pub poisoned: bool,
 }
 
@@ -28,7 +29,13 @@ pub(super) struct PhysicalOwner {
     released: AtomicBool,
     // Keep unexpected lower custody visible, without cancelling a possibly
     // foreign/shared connection for which this pool has no release authority.
-    foreign: Mutex<Vec<RmcpClientRetirement>>,
+    binding: Mutex<BindingState>,
+}
+
+#[derive(Default)]
+struct BindingState {
+    settled: bool,
+    foreign: Vec<RmcpClientRetirement>,
 }
 
 impl PhysicalOwner {
@@ -46,26 +53,39 @@ impl PhysicalOwner {
         if self.lower.downgrade().same_registry(&lower.downgrade()) {
             return true;
         }
-        let mut foreign = self
-            .foreign
+        let mut binding = self
+            .binding
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !foreign
+        if !binding
+            .foreign
             .iter()
             .any(|entry| entry.downgrade().same_registry(&lower.downgrade()))
         {
-            foreign.push(lower);
+            binding.foreign.push(lower);
         }
         false
     }
 
-    fn has_foreign(&self) -> bool {
-        self.foreign.is_poisoned()
-            || !self
-                .foreign
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_empty()
+    pub(super) fn settle_startup(&self, client: Option<&RmcpClient>) {
+        if let Some(client) = client {
+            self.accepts(client);
+        }
+        self.binding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .settled = true;
+    }
+
+    fn binding_state(&self) -> (bool, bool) {
+        let binding = self
+            .binding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            binding.settled,
+            self.binding.is_poisoned() || !binding.foreign.is_empty(),
+        )
     }
 }
 
@@ -80,9 +100,8 @@ impl State {
     fn compact(&mut self) {
         let retired = &mut self.retired;
         self.owners.retain(|owner| {
-            if owner.released()
-                && !owner.has_foreign()
-                && owner.lower.retirement_proof().is_proven()
+            let (settled, foreign) = owner.binding_state();
+            if owner.released() && settled && !foreign && owner.lower.retirement_proof().is_proven()
             {
                 *retired += 1;
                 false
@@ -109,7 +128,7 @@ impl PoolPhysicalOwners {
             id: state.registered,
             lower: RmcpClientRetirement::default(),
             released: AtomicBool::new(false),
-            foreign: Mutex::new(Vec::new()),
+            binding: Mutex::new(BindingState::default()),
         });
         state.registered += 1;
         state.owners.push(Arc::clone(&owner));
@@ -127,10 +146,15 @@ impl PoolPhysicalOwners {
         };
         let mut held_connections = Vec::new();
         let mut foreign_connections = Vec::new();
+        let mut constructing_connections = Vec::new();
         let mut released = Vec::new();
         for owner in owners {
-            if owner.has_foreign() {
+            let (settled, foreign) = owner.binding_state();
+            if foreign {
                 foreign_connections.push(owner.id);
+            }
+            if !settled {
+                constructing_connections.push(owner.id);
             }
             if owner.released() {
                 released.push(owner);
@@ -156,6 +180,7 @@ impl PoolPhysicalOwners {
             connections,
             held_connections,
             foreign_connections,
+            constructing_connections,
             poisoned: self.state.is_poisoned(),
         }
     }

@@ -1254,3 +1254,94 @@ async fn pool_refuses_foreign_retirement_owner_without_closing_that_clients_tran
         .await;
     assert!(foreign.client.is_closed().await);
 }
+
+#[derive(Clone)]
+struct ObservedPoolTransport(Arc<AtomicBool>);
+
+impl InProcessTransportFactory for ObservedPoolTransport {
+    fn open(&self) -> BoxFuture<'static, std::io::Result<tokio::io::DuplexStream>> {
+        self.0.store(true, Ordering::Release);
+        TestServer::default().open()
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn released_pool_owner_is_retained_until_its_factory_settles() {
+    let pool = McpConnectionPool::default();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let opened = Arc::new(AtomicBool::new(false));
+    let launch = {
+        let entered = Arc::clone(&entered);
+        let release = Arc::clone(&release);
+        let opened = Arc::clone(&opened);
+        move |_, _, retirement: Option<RmcpClientRetirement>| {
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            let opened = Arc::clone(&opened);
+            async move {
+                entered.notify_one();
+                release.notified().await;
+                let result = RmcpClient::new_in_process_client_in_retirement(
+                    Arc::new(ObservedPoolTransport(Arc::clone(&opened))),
+                    retirement.expect("pooled owner supplied before factory"),
+                )
+                .await;
+                match result {
+                    Err(error) => assert!(error.to_string().contains("registration is closed")),
+                    Ok(client) => {
+                        client.shutdown().await;
+                        panic!("closed owner must fence a late constructor");
+                    }
+                }
+                assert!(!opened.load(Ordering::Acquire));
+                Err(StartupOutcomeError::Cancelled)
+            }
+            .boxed()
+            .shared()
+        }
+    };
+    let mut connecting = Box::pin(pool.connect(
+        Arc::default(),
+        key(&context(), &config()),
+        Arc::default(),
+        None,
+        CancellationToken::new(),
+        launch,
+    ));
+    tokio::select! {
+        _ = entered.notified() => {}
+        _ = &mut connecting => panic!("factory must wait before construction"),
+    }
+    drop(connecting);
+    let before = pool
+        .retire_released_until(tokio::time::Instant::now())
+        .await;
+    assert_eq!(before.retired_before, 0);
+    assert_eq!(before.constructing_connections, vec![0]);
+    assert_eq!(before.connections.len(), 1);
+    assert!(before.connections[0].1.is_complete());
+    assert!(before.connections[0].1.attempts.is_empty());
+    let repeated = pool
+        .retire_released_until(tokio::time::Instant::now())
+        .await;
+    assert_eq!(
+        repeated.retired_before, 0,
+        "empty lower proof must not compact a running factory"
+    );
+    assert_eq!(repeated.constructing_connections, vec![0]);
+    release.notify_one();
+    let workers = pool
+        .observe_workers_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await;
+    assert_eq!(workers.counts[0].joined, 1);
+    assert_eq!(workers.counts[1].joined, 1);
+    assert!(!opened.load(Ordering::Acquire));
+    let after = pool
+        .retire_released_until(tokio::time::Instant::now())
+        .await;
+    assert_eq!(after.retired_before, 1);
+    assert!(after.connections.is_empty());
+    assert!(after.constructing_connections.is_empty());
+    assert!(after.foreign_connections.is_empty());
+}

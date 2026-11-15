@@ -127,6 +127,7 @@ pub use trace_context::McpRequestTrace;
 pub use user_verification::UserVerificationReason;
 
 // Physical receipts remain separate from serving or runtime qualification.
+pub use retirement::DEFAULT_RETIREMENT_TIMEOUT;
 pub use retirement::PhysicalRetirementOutcome;
 pub use retirement::PhysicalRetirementReport;
 pub use retirement::RegistrationClosed;

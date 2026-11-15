@@ -452,11 +452,15 @@ impl McpConnectionPool {
                     );
                     // Startup belongs to the connection, including if its first chat is cancelled.
                     let startup = client.clone();
+                    let startup_owner = Arc::clone(&physical);
                     drop(self.workers.spawn(
                         &tokio::runtime::Handle::current(),
                         PoolWorkerKind::Startup,
                         async move {
-                            let _ = startup.await;
+                            let result = startup.await;
+                            startup_owner.settle_startup(
+                                result.as_ref().ok().map(|client| client.client.as_ref()),
+                            );
                         },
                     ));
                     let entry = Arc::new(Entry {

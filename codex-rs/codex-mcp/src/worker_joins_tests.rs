@@ -95,6 +95,10 @@ async fn panic_and_abort_outcomes_survive_later_compaction() {
         .await;
     assert_eq!(count(&first, McpWorkerKind::Reconnect).panicked, 1);
     assert_eq!(count(&first, McpWorkerKind::AuthNotification).cancelled, 1);
+    assert_eq!(
+        count(&first, McpWorkerKind::AuthNotification).requested_cancelled,
+        1
+    );
     drop(owner.spawn(&Handle::current(), McpWorkerKind::Reconnect, async {}));
     let later = owner
         .observe_until(Instant::now() + Duration::from_secs(1))
@@ -279,6 +283,7 @@ async fn eager_batch_caller_cancellation_aborts_and_retains_both_original_joins(
         .await;
     let eager = count(&report, McpWorkerKind::EagerStartup);
     assert_eq!(eager.cancelled, 2);
+    assert_eq!(eager.requested_cancelled, 2);
     assert_eq!(eager.joined + eager.panicked + eager.pending, 0);
     assert!(weak.upgrade().is_none());
 }
@@ -314,6 +319,7 @@ async fn eager_child_panic_aborts_sibling_and_keeps_both_outcomes() {
     let eager = count(&report, McpWorkerKind::EagerStartup);
     assert_eq!(eager.panicked, 1);
     assert_eq!(eager.cancelled, 1);
+    assert_eq!(eager.requested_cancelled, 1);
     assert_eq!(eager.joined + eager.pending, 0);
 }
 
@@ -364,4 +370,90 @@ async fn ema_abort_guard_follows_final_ordinary_owner_and_retains_original_join(
         .await;
     assert_eq!(count(&report, McpWorkerKind::EmaRevocation).cancelled, 1);
     assert!(weak.upgrade().is_none());
+}
+
+#[tokio::test]
+async fn stop_request_is_not_completion_and_survives_dropped_observer() {
+    let owner = McpWorkerOwner::default();
+    let guard = owner.spawn_abort_on_drop(
+        &Handle::current(),
+        McpWorkerKind::AuthNotification,
+        std::future::pending(),
+    );
+    guard.stop();
+    let unobserved = owner.observe_until(Instant::now()).await;
+    let unobserved = count(&unobserved, McpWorkerKind::AuthNotification);
+    assert_eq!(unobserved.pending, 1);
+    assert_eq!(unobserved.cancelled + unobserved.requested_cancelled, 0);
+    let observing = owner.clone();
+    let observer = tokio::spawn(async move {
+        observing
+            .observe_until(Instant::now() + Duration::from_secs(1))
+            .await
+    });
+    observer.abort();
+    assert!(observer.await.unwrap_err().is_cancelled());
+    let settled = owner
+        .observe_until(Instant::now() + Duration::from_secs(1))
+        .await;
+    let settled = count(&settled, McpWorkerKind::AuthNotification);
+    assert_eq!(settled.cancelled, 1);
+    assert_eq!(settled.requested_cancelled, 1);
+    drop(guard);
+    let replay = owner.observe_until(Instant::now()).await;
+    assert_eq!(count(&replay, McpWorkerKind::AuthNotification), settled);
+}
+
+#[tokio::test]
+async fn late_guard_drop_does_not_reclassify_unrequested_cancellation() {
+    let owner = McpWorkerOwner::default();
+    let guard = owner.spawn_abort_on_drop(
+        &Handle::current(),
+        McpWorkerKind::EmaRevocation,
+        std::future::pending(),
+    );
+    // Simulate cancellation outside the retained stop authority.
+    guard.abort.handle.abort();
+    let first = owner
+        .observe_until(Instant::now() + Duration::from_secs(1))
+        .await;
+    let first = count(&first, McpWorkerKind::EmaRevocation);
+    assert_eq!(first.cancelled, 1);
+    assert_eq!(first.requested_cancelled, 0);
+    guard.stop();
+    drop(guard);
+    drop(owner.spawn(&Handle::current(), McpWorkerKind::Reconnect, async {}));
+    let replay = owner
+        .observe_until(Instant::now() + Duration::from_secs(1))
+        .await;
+    assert_eq!(count(&replay, McpWorkerKind::EmaRevocation), first);
+}
+
+#[tokio::test]
+async fn stop_requests_do_not_relabel_natural_exit_or_panic() {
+    let owner = McpWorkerOwner::default();
+    let natural =
+        owner.spawn_abort_on_drop(&Handle::current(), McpWorkerKind::AuthNotification, async {
+        });
+    let panicked =
+        owner.spawn_abort_on_drop(&Handle::current(), McpWorkerKind::EmaRevocation, async {
+            panic!("injected watcher panic");
+        });
+    let first = owner
+        .observe_until(Instant::now() + Duration::from_secs(1))
+        .await;
+    assert_eq!(count(&first, McpWorkerKind::AuthNotification).joined, 1);
+    assert_eq!(count(&first, McpWorkerKind::EmaRevocation).panicked, 1);
+    natural.stop();
+    panicked.stop();
+    drop(natural);
+    drop(panicked);
+    let replay = owner.observe_until(Instant::now()).await;
+    assert_eq!(replay.counts, first.counts);
+    assert!(
+        replay
+            .counts
+            .iter()
+            .all(|c| c.cancelled + c.requested_cancelled == 0)
+    );
 }

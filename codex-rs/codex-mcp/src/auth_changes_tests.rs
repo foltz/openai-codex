@@ -119,6 +119,7 @@ async fn auth_notifications_require_opt_in_and_follow_client_lifetime() -> Resul
         .find(|count| count.kind == crate::McpWorkerKind::AuthNotification)
         .unwrap();
     assert_eq!(watcher.cancelled, 1);
+    assert_eq!(watcher.requested_cancelled, 1);
     assert_eq!(watcher.pending + watcher.panicked + watcher.joined, 0);
     client.shutdown().await;
     Ok(())
@@ -176,6 +177,7 @@ async fn explicit_private_shutdown_stops_its_watcher_even_with_retained_client_b
         .find(|c| c.kind == crate::McpWorkerKind::AuthNotification)
         .unwrap();
     assert_eq!(watcher.cancelled, 1);
+    assert_eq!(watcher.requested_cancelled, 1);
     assert_eq!(watcher.pending + watcher.joined + watcher.panicked, 0);
     assert_eq!(
         pool.observe_background_workers_until(tokio::time::Instant::now())

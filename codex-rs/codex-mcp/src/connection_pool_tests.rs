@@ -2082,6 +2082,7 @@ async fn pooled_auth_watcher_survives_creator_release_and_stops_on_final_transpo
         .find(|c| c.kind == crate::McpWorkerKind::AuthNotification)
         .unwrap();
     assert_eq!(watcher.cancelled, 1);
+    assert_eq!(watcher.requested_cancelled, 1);
     assert_eq!(watcher.pending + watcher.panicked + watcher.joined, 0);
     assert!(
         first._auth_change_notifications.is_some(),

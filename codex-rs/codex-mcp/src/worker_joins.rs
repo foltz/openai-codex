@@ -4,6 +4,7 @@
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::task::AbortHandle;
 
 use futures::FutureExt;
@@ -29,7 +30,7 @@ pub enum McpWorkerKind {
 pub(crate) enum WorkerExit {
     Joined,
     Panicked,
-    Cancelled,
+    Cancelled { stop_requested: bool },
 }
 
 pub(crate) type Completion = Shared<BoxFuture<'static, WorkerExit>>;
@@ -41,6 +42,9 @@ pub struct McpWorkerCounts {
     pub joined: u64,
     pub panicked: u64,
     pub cancelled: u64,
+    /// Subset of cancelled with an explicit stop request before observed exit.
+    /// This is not a causal assertion or positive physical-retirement proof.
+    pub requested_cancelled: u64,
     pub pending: u64,
 }
 
@@ -51,6 +55,7 @@ impl McpWorkerCounts {
             joined: 0,
             panicked: 0,
             cancelled: 0,
+            requested_cancelled: 0,
             pending: 0,
         }
     }
@@ -59,7 +64,10 @@ impl McpWorkerCounts {
         match exit {
             WorkerExit::Joined => self.joined += 1,
             WorkerExit::Panicked => self.panicked += 1,
-            WorkerExit::Cancelled => self.cancelled += 1,
+            WorkerExit::Cancelled { stop_requested } => {
+                self.cancelled += 1;
+                self.requested_cancelled += u64::from(stop_requested);
+            }
         }
     }
 }
@@ -145,27 +153,44 @@ pub struct McpWorkerOwner {
 /// Preserve managed auth's final-owner abort semantics while the ledger owns
 /// and observes the original JoinHandle, including its cancellation outcome.
 pub(crate) struct McpAbortOnDrop {
-    abort: AbortHandle,
+    abort: TrackedAbort,
 }
 
 impl McpAbortOnDrop {
     pub(crate) fn stop(&self) {
-        self.abort.abort();
+        self.abort.stop();
     }
 }
 
 impl Drop for McpAbortOnDrop {
     fn drop(&mut self) {
-        self.abort.abort();
+        self.stop();
     }
 }
 
-struct EagerAbortGroup(Vec<AbortHandle>);
+struct TrackedAbort {
+    handle: AbortHandle,
+    requested: Arc<AtomicBool>,
+}
+
+impl TrackedAbort {
+    fn stop(&self) {
+        // Never reclassify an already finished task because its last guard was
+        // dropped late. Record intent before requesting Tokio cancellation;
+        // only the original JoinHandle can establish the actual exit outcome.
+        if !self.handle.is_finished() {
+            self.requested.store(true, Ordering::SeqCst);
+            self.handle.abort();
+        }
+    }
+}
+
+struct EagerAbortGroup(Vec<TrackedAbort>);
 
 impl Drop for EagerAbortGroup {
     fn drop(&mut self) {
         for abort in &self.0 {
-            abort.abort();
+            abort.stop();
         }
     }
 }
@@ -229,7 +254,9 @@ impl McpWorkerOwner {
                     if error.is_panic() {
                         WorkerExit::Panicked
                     } else {
-                        WorkerExit::Cancelled
+                        WorkerExit::Cancelled {
+                            stop_requested: false,
+                        }
                     },
                     error.to_string(),
                 )),
@@ -277,19 +304,25 @@ impl McpWorkerOwner {
         runtime: &Handle,
         kind: McpWorkerKind,
         body: impl Future<Output = ()> + Send + 'static,
-    ) -> (Completion, AbortHandle) {
+    ) -> (Completion, TrackedAbort) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.compact(true);
         let handle = runtime.spawn(body);
-        let abort = handle.abort_handle();
+        let requested = Arc::new(AtomicBool::new(false));
+        let abort = TrackedAbort {
+            handle: handle.abort_handle(),
+            requested: Arc::clone(&requested),
+        };
         let completion = async move {
             match handle.await {
                 Ok(()) => WorkerExit::Joined,
                 Err(error) if error.is_panic() => WorkerExit::Panicked,
-                Err(_) => WorkerExit::Cancelled,
+                Err(_) => WorkerExit::Cancelled {
+                    stop_requested: requested.load(Ordering::SeqCst),
+                },
             }
         }
         .boxed()

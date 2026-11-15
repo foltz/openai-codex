@@ -62,12 +62,13 @@ async fn already_created_ema_owner_registering_after_closure_is_immediately_revo
     assert_eq!(report.ema[0].outcome, RuntimeEmaOutcome::Quiesced);
 }
 
+#[derive(Clone)]
 struct CachedSource {
     endpoint: Url,
-    renewals: AtomicUsize,
+    renewals: Arc<AtomicUsize>,
 }
 
-impl EmaTokenSource for Arc<CachedSource> {
+impl EmaTokenSource for CachedSource {
     fn endpoint(&self) -> &Url {
         &self.endpoint
     }
@@ -104,13 +105,13 @@ async fn suspended_actual_ema_response_keeps_external_drain_incomplete_until_rel
     let authority = EmaRequestAuthority::default();
     root.register_ema(EmaRetirementOwner::new(authority.clone()));
     let calls = Arc::new(AtomicUsize::new(0));
-    let source = Arc::new(CachedSource {
+    let source = CachedSource {
         endpoint: Url::parse("https://ema.invalid/mcp").unwrap(),
-        renewals: AtomicUsize::new(0),
-    });
+        renewals: Arc::new(AtomicUsize::new(0)),
+    };
     let client = EmaAuthenticatedHttpClient::new(
         Arc::new(SuspendedHttp(Arc::clone(&calls))),
-        Arc::clone(&source),
+        source.clone(),
         EmaAccessToken {
             access_token: "fixture-only-token".into(),
             expires_in: Some(Duration::from_secs(300)),

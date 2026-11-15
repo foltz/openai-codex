@@ -1073,6 +1073,7 @@ impl MessageProcessor {
             ClientRequest::ThreadSample { .. }
             | ClientRequest::ThreadGuardianReview { .. }
             | ClientRequest::TurnStart { .. }
+            | ClientRequest::TurnStartIfIdle { .. }
             | ClientRequest::TurnSteer { .. }
             | ClientRequest::ReviewStart { .. }
             | ClientRequest::ThreadCompactStart { .. }
@@ -1751,6 +1752,16 @@ impl MessageProcessor {
             ClientRequest::TurnStart { params, .. } => {
                 self.turn_processor
                     .turn_start(
+                        request_id.clone(),
+                        params,
+                        app_server_client_name.clone(),
+                        client_version.clone(),
+                    )
+                    .await
+            }
+            ClientRequest::TurnStartIfIdle { params, .. } => {
+                self.turn_processor
+                    .turn_start_if_idle(
                         request_id.clone(),
                         params,
                         app_server_client_name.clone(),

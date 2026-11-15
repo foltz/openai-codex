@@ -1116,6 +1116,14 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::TurnStartResponse,
     },
+    #[experimental("turn/startIfIdle")]
+    /// Submit input only if Core atomically observes the target thread idle.
+    TurnStartIfIdle => "turn/startIfIdle" {
+        params: v2::TurnStartIfIdleParams,
+        inspect_params: true,
+        serialization: thread_id(params.thread_id),
+        response: v2::TurnStartIfIdleResponse,
+    },
     #[experimental("turn/settings/update")]
     TurnSettingsUpdate => "turn/settings/update" {
         params: v2::TurnSettingsUpdateParams,

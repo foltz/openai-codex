@@ -81,3 +81,25 @@ fn debug_test_user_config_file_overrides_loader_path() {
 
 #[path = "stderr_logging_tests.rs"]
 mod stderr_logging_tests;
+
+#[cfg(unix)]
+#[test]
+fn hosting_control_endpoint_requires_an_absolute_unix_listener() {
+    use super::AppServerTransport;
+    use super::mcp_control_endpoint_uri;
+
+    assert_eq!(mcp_control_endpoint_uri(&AppServerTransport::Stdio), None);
+    assert_eq!(mcp_control_endpoint_uri(&AppServerTransport::Off), None);
+    assert_eq!(
+        mcp_control_endpoint_uri(&AppServerTransport::UnixSocket {
+            socket_path: "relative.sock".into()
+        }),
+        None
+    );
+    assert_eq!(
+        mcp_control_endpoint_uri(&AppServerTransport::UnixSocket {
+            socket_path: "/tmp/host socket?#.sock".into()
+        }),
+        Some("unix:///tmp/host%20socket%3F%23.sock".to_string())
+    );
+}

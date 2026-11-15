@@ -75,7 +75,9 @@ pub async fn build_prompt_input(
         /*external_time_provider*/ None,
     );
     let thread = thread_manager
-        .start_thread(StartThreadOptions::new(config))
+        .start_thread(StartThreadOptions::new(
+            config, /*control_endpoint*/ None,
+        ))
         .await?;
 
     let output = build_prompt_input_from_session(&thread.thread.session, input).await;

@@ -172,7 +172,7 @@ async fn native_spawn_captures_the_saved_choice(
         .expect("unshared manager")
         .extensions = Arc::new(extensions.build());
 
-    let mut start_options = StartThreadOptions::new(config.clone());
+    let mut start_options = StartThreadOptions::new(config.clone(), /*control_endpoint*/ None);
     let thread_store = &manager.state.thread_store;
     if let Some(enabled) = pending {
         let thread_id = manager.reserve_thread_id();

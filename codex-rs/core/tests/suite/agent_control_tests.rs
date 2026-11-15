@@ -364,7 +364,7 @@ async fn host_threads_preserve_lineage_settings_and_resume_routing() -> anyhow::
                 agent_nickname: None,
                 agent_role: None,
             })),
-            ..StartThreadOptions::new(child_config.clone())
+            ..StartThreadOptions::new(child_config.clone(), /*control_endpoint*/ None)
         })
         .await?;
     assert_eq!(
@@ -464,7 +464,7 @@ async fn host_threads_preserve_lineage_settings_and_resume_routing() -> anyhow::
             .start_thread(StartThreadOptions {
                 reserved_thread_id: Some(reserved_thread_id),
                 environments: Some(vec![test.executor_environment().request()]),
-                ..StartThreadOptions::new(child_config.clone())
+                ..StartThreadOptions::new(child_config.clone(), /*control_endpoint*/ None)
             })
             .await;
         let error = rejected
@@ -524,7 +524,7 @@ async fn host_factory_follows_thread_lifecycle() -> anyhow::Result<()> {
     let manager = &test.thread_manager;
     let options = || StartThreadOptions {
         environments: Some(vec![test.executor_environment().request()]),
-        ..StartThreadOptions::new(test.config.clone())
+        ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
     };
     let internal = manager
         .spawn_internal_session(
@@ -604,7 +604,7 @@ async fn fresh_hosted_child_persists_inherited_session_id(
         history_mode: Some(history_mode),
         session_source: Some(SessionSource::Custom("host".to_string())),
         environments: Some(vec![root.executor_environment().request()]),
-        ..StartThreadOptions::new(root.config.clone())
+        ..StartThreadOptions::new(root.config.clone(), /*control_endpoint*/ None)
     };
     let mut child_options = options();
     child_options

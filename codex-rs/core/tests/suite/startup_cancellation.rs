@@ -88,7 +88,7 @@ async fn cancelled_resume_releases_writer_while_mcp_startup_is_pending() -> Resu
                 .map(TurnEnvironmentSelection::into_request)
                 .collect(),
         ),
-        ..StartThreadOptions::new(test.config.clone())
+        ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
     };
 
     barrier.block_next.store(true, Ordering::SeqCst);
@@ -163,7 +163,7 @@ async fn failed_resume_releases_writer_before_returning() -> Result<()> {
                 .map(TurnEnvironmentSelection::into_request)
                 .collect(),
         ),
-        ..StartThreadOptions::new(config.clone())
+        ..StartThreadOptions::new(config.clone(), /*control_endpoint*/ None)
     };
 
     assert!(

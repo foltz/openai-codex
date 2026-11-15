@@ -1197,7 +1197,10 @@ async fn code_mode_excludes_mcp_servers_using_their_configured_identity() -> Res
                             },
                         )],
                     })],
-                    ..StartThreadOptions::new(base_test.config.clone())
+                    ..StartThreadOptions::new(
+                        base_test.config.clone(),
+                        /*control_endpoint*/ None,
+                    )
                 })
                 .await?;
             let mut test = base_test;
@@ -8303,7 +8306,7 @@ async fn code_mode_uses_the_first_dynamic_tool_for_a_normalized_name() -> Result
                     })
                 })
                 .collect(),
-                ..StartThreadOptions::new(base_test.config.clone())
+                ..StartThreadOptions::new(base_test.config.clone(), /*control_endpoint*/ None)
             })
             .await?;
         let mut test = base_test;
@@ -8563,7 +8566,7 @@ async fn code_mode_renders_local_refs_in_outbound_exec_description() -> Result<(
                 }),
                 defer_loading: false,
             })],
-            ..StartThreadOptions::new(base_test.config.clone())
+            ..StartThreadOptions::new(base_test.config.clone(), /*control_endpoint*/ None)
         })
         .await?;
     let mut test = base_test;
@@ -8655,7 +8658,7 @@ async fn code_mode_search_normalizes_and_calls_deferred_dynamic_tools(
                     )],
                 }),
             ],
-            ..StartThreadOptions::new(base_test.config.clone())
+            ..StartThreadOptions::new(base_test.config.clone(), /*control_endpoint*/ None)
         })
         .await?;
     let mut test = base_test;
@@ -8861,7 +8864,7 @@ async fn code_mode_excludes_configured_nested_tool_namespaces() -> Result<()> {
                     },
                 )],
             })],
-            ..StartThreadOptions::new(base_test.config.clone())
+            ..StartThreadOptions::new(base_test.config.clone(), /*control_endpoint*/ None)
         })
         .await?;
     let mut test = base_test;

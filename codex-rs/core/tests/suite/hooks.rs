@@ -1541,7 +1541,7 @@ async fn session_end_skips_subagents() -> Result<()> {
             .start_thread(StartThreadOptions {
                 session_source: Some(SessionSource::SubAgent(source)),
                 environments: Some(Vec::new()),
-                ..StartThreadOptions::new(test.config.clone())
+                ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
             })
             .await?;
 
@@ -1662,7 +1662,7 @@ print(json.dumps({"hookSpecificOutput": {
         .thread_manager
         .fork_legacy_thread(
             ForkSnapshot::TruncateBeforeNthUserMessage(1),
-            StartThreadOptions::new(test.config.clone()),
+            StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None),
             test.codex.rollout_path().expect("parent rollout path"),
         )
         .await?
@@ -1725,6 +1725,7 @@ async fn explicit_history_runs_resume_session_start_hook() -> Result<()> {
             test.thread_manager.auth_manager(),
             /*parent_trace*/ None,
             ClientMcpExtensions::default(),
+            /*control_endpoint*/ None,
         )
         .await?
         .thread;
@@ -6357,7 +6358,7 @@ async fn memory_consolidation_skips_user_model_request_hooks() -> Result<()> {
             session_source: Some(SessionSource::Internal(
                 InternalSessionSource::MemoryConsolidation,
             )),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?;
     test.codex = thread.thread;

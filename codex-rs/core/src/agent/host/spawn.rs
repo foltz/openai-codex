@@ -78,7 +78,7 @@ async fn prepare_spawn_inputs(
             .services
             .model_client
             .prompt_cache_key_policy(),
-        ..StartThreadOptions::new(config)
+        ..StartThreadOptions::new(config, /*control_endpoint*/ None)
     };
     thread_options
         .thread_extension_init

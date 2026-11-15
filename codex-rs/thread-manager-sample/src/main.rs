@@ -171,7 +171,9 @@ async fn run_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
     let NewThread {
         thread_id, thread, ..
     } = thread_manager
-        .start_thread(StartThreadOptions::new(config))
+        .start_thread(StartThreadOptions::new(
+            config, /*control_endpoint*/ None,
+        ))
         .await
         .context("start Codex thread")?;
 

@@ -744,7 +744,7 @@ impl LocalAgentControl {
                 .map(TurnEnvironmentSnapshot::inheritable_requests),
             inherited_environments,
             disabled_plugin_ids,
-            ..StartThreadOptions::new(config.clone())
+            ..StartThreadOptions::new(config.clone(), /*control_endpoint*/ None)
         };
         if let Some(parent_id) = session_source
             .as_ref()

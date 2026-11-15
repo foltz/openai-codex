@@ -108,7 +108,7 @@ async fn check_connection_events_for_active_selection(scheduler_idle: Arc<Notify
     remote.environment_id = remote_id.to_string();
     let options = || StartThreadOptions {
         environments: Some(vec![primary.clone(), remote.clone()]),
-        ..StartThreadOptions::new(test.config.clone())
+        ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
     };
     let control = test.thread_manager.start_thread(options()).await?.thread;
     let thread = test.thread_manager.start_thread(options()).await?.thread;
@@ -237,7 +237,7 @@ async fn current_turn_environment_selections_follow_active_updates(with_roots: b
         .start_thread(StartThreadOptions {
             environments: Some(vec![selection.into_request()]),
             thread_extension_init,
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?
         .thread;

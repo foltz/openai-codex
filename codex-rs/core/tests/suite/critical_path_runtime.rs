@@ -169,7 +169,7 @@ async fn critical_path_follows_runtime_admission(
     let mut options = StartThreadOptions {
         session_source: Some(session_source),
         environments: Some(vec![test.executor_environment().request()]),
-        ..StartThreadOptions::new(test.config.clone())
+        ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
     };
     if matches!(source, CaptureSource::Guardian) {
         // Guardian inherits neither host extensions nor an unrestricted tool policy.

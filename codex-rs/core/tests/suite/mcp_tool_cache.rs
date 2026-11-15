@@ -173,7 +173,10 @@ async fn mcp_calls_stay_bound_to_each_thread() -> anyhow::Result<()> {
         ..
     } = fixture
         .thread_manager
-        .start_thread(StartThreadOptions::new(second_config))
+        .start_thread(StartThreadOptions::new(
+            second_config,
+            /*control_endpoint*/ None,
+        ))
         .await?;
 
     wait_for_mcp_server(&fixture.codex, SERVER_NAME).await?;
@@ -377,7 +380,7 @@ pub(super) async fn apps_requests_during_peer_discovery(
                     agent_nickname: None,
                     agent_role: None,
                 })),
-                ..StartThreadOptions::new(test.config.clone())
+                ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
             })
             .await?;
         assert_eq!(waiting_startup.initialize_attempts(), 1);
@@ -410,7 +413,7 @@ pub(super) async fn apps_requests_during_peer_discovery(
             .set(std::collections::HashMap::new())?;
         let NewThread { thread: peer, .. } = test
             .thread_manager
-            .start_thread(StartThreadOptions::new(peer_config))
+            .start_thread(StartThreadOptions::new(peer_config, /*control_endpoint*/ None))
             .await?;
         wait_for_mcp_server(&peer, CODEX_APPS_MCP_SERVER_NAME).await?;
         // The non-refreshing client-local API never exposes a shared provider.
@@ -549,7 +552,7 @@ async fn cached_http_mcp_starts_lazily_for_subagents(
                 agent_nickname: None,
                 agent_role: None,
             })),
-            ..StartThreadOptions::new(subagent_config)
+            ..StartThreadOptions::new(subagent_config, /*control_endpoint*/ None)
         })
         .await?;
     if with_headers_helper {
@@ -688,7 +691,10 @@ pub(super) async fn cached_stdio_first_use_scenario() -> anyhow::Result<Vec<Valu
 
     let control = fixture
         .thread_manager
-        .start_thread(StartThreadOptions::new(fixture.config.clone()))
+        .start_thread(StartThreadOptions::new(
+            fixture.config.clone(),
+            /*control_endpoint*/ None,
+        ))
         .await?
         .thread;
     wait_for_mcp_server(&control, SERVER_NAME).await?;
@@ -710,7 +716,10 @@ pub(super) async fn cached_stdio_first_use_scenario() -> anyhow::Result<Vec<Valu
         ..
     } = fixture
         .thread_manager
-        .start_thread(StartThreadOptions::new(required_config))
+        .start_thread(StartThreadOptions::new(
+            required_config,
+            /*control_endpoint*/ None,
+        ))
         .await?;
     let required_pid = wait_for_new_pid(fs.as_ref(), &pid_file, Some(&control_pid)).await?;
     wait_for_mcp_server(&required_thread, SERVER_NAME).await?;
@@ -739,7 +748,9 @@ pub(super) async fn cached_stdio_first_use_scenario() -> anyhow::Result<Vec<Valu
         ..
     } = fixture
         .thread_manager
-        .start_thread(StartThreadOptions::new(treatment))
+        .start_thread(StartThreadOptions::new(
+            treatment, /*control_endpoint*/ None,
+        ))
         .await?;
     second_thread.submit(Op::Interrupt).await?;
 
@@ -931,7 +942,7 @@ pub(super) async fn cached_stdio_first_use_scenario() -> anyhow::Result<Vec<Valu
             session_source: Some(SessionSource::SubAgent(SubAgentSource::Other(
                 "filtered-cached-startup".to_string(),
             ))),
-            ..StartThreadOptions::new(filtered_config)
+            ..StartThreadOptions::new(filtered_config, /*control_endpoint*/ None)
         })
         .await?;
     let filtered_response = mount_sse_once(
@@ -993,7 +1004,7 @@ pub(super) async fn cached_stdio_first_use_scenario() -> anyhow::Result<Vec<Valu
             session_source: Some(SessionSource::SubAgent(SubAgentSource::Other(
                 "interrupted-cached-startup".to_string(),
             ))),
-            ..StartThreadOptions::new(fixture.config.clone())
+            ..StartThreadOptions::new(fixture.config.clone(), /*control_endpoint*/ None)
         })
         .await?;
     mount_sse_once(
@@ -1157,7 +1168,7 @@ async fn cached_stdio_negotiates_sharing_on_first_use() -> anyhow::Result<()> {
             session_source: Some(SessionSource::SubAgent(SubAgentSource::Other(
                 "cached-sharing".to_string(),
             ))),
-            ..StartThreadOptions::new(config)
+            ..StartThreadOptions::new(config, /*control_endpoint*/ None)
         })
     };
     let first = start_child(config.clone()).await?.thread;

@@ -141,7 +141,7 @@ impl PreparedGuardianContext {
             ),
             inherited_environments: Some(self.context.environments().clone()),
             client_mcp_extensions: self.parent.services.client_mcp_extensions.clone(),
-            ..crate::StartThreadOptions::new(config)
+            ..crate::StartThreadOptions::new(config, /*control_endpoint*/ None)
         };
         (options, state)
     }

@@ -115,6 +115,7 @@ async fn local_thread_history_mode_survives_restart(
             initial.thread_manager.auth_manager(),
             /*parent_trace*/ None,
             ClientMcpExtensions::default(),
+            /*control_endpoint*/ None,
         )
         .await?;
     assert_eq!(

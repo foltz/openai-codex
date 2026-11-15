@@ -510,6 +510,7 @@ impl From<CompactedHistoryMetadata> for CompactedHistoryInstallation<'_> {
 }
 
 pub(crate) struct SessionSpawnArgs {
+    pub(crate) control_endpoint: Option<String>,
     pub(crate) attached_thread: bool,
     pub(crate) startup: Option<Arc<startup::SessionStartup>>,
     pub(crate) config: Config,
@@ -680,6 +681,7 @@ impl Session {
             .ensure_config_server_applied()?;
         args.config.validate_windows_mxc_requirement()?;
         let SessionSpawnArgs {
+            control_endpoint,
             attached_thread,
             startup,
             config,
@@ -1058,6 +1060,7 @@ impl Session {
             startup.clone(),
             session_configuration,
             attached_thread,
+            control_endpoint,
             prompt_cache_key,
             &environment_selections,
             config.clone(),

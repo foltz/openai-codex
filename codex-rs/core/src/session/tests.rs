@@ -4299,7 +4299,10 @@ async fn fork_startup_context_then_first_turn_diff_snapshot() -> anyhow::Result<
         .thread_manager
         .fork_legacy_thread(
             usize::MAX,
-            core_test_support::test_codex::StartThreadOptions::new(fork_config.clone()),
+            core_test_support::test_codex::StartThreadOptions::new(
+                fork_config.clone(),
+                /*control_endpoint*/ None,
+            ),
             rollout_path,
         )
         .await?;
@@ -6987,6 +6990,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
     };
 
     let session = Session {
+        control_endpoint: None,
         thread_id,
         item_id_generator,
         agent_runtime: crate::agent::host::AgentRuntimeServices::Controller,
@@ -7186,6 +7190,7 @@ async fn make_session_with_config_and_rx(
         /*startup*/ None,
         session_configuration,
         /*attached_thread*/ false,
+        /*control_endpoint*/ None,
         PromptCacheKey::default(),
         &default_environments,
         Arc::clone(&config),
@@ -7326,6 +7331,7 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         /*startup*/ None,
         session_configuration,
         /*attached_thread*/ false,
+        /*control_endpoint*/ None,
         PromptCacheKey::default(),
         &default_environments,
         Arc::clone(&config),
@@ -9331,6 +9337,7 @@ where
     };
 
     let session = Arc::new(Session {
+        control_endpoint: None,
         thread_id,
         item_id_generator,
         agent_runtime: crate::agent::host::AgentRuntimeServices::Controller,

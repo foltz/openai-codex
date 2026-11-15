@@ -603,7 +603,7 @@ approvals_reviewer = "user"
     let mut options = StartThreadOptions {
         session_source: Some(session_source),
         environments: Some(vec![test.executor_environment().request()]),
-        ..StartThreadOptions::new(test.config.clone())
+        ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
     };
     if restrict_root_capabilities {
         options

@@ -97,7 +97,7 @@ async fn interrupt_completes_cancelled_dynamic_call(hook: Option<HookEventName>)
                 input_schema: json!({"type": "object"}),
                 defer_loading: false,
             })],
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?
         .thread;
@@ -193,7 +193,7 @@ async fn terminated_cell_persists_failure_and_excludes_late_reply_from_context()
                 defer_loading: false,
             })],
             history_mode: Some(ThreadHistoryMode::Paginated),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?
         .thread;

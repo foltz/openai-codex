@@ -806,13 +806,16 @@ async fn tree_shutdown_waits_for_children_without_affecting_other_roots() -> Res
             root_id,
             StartThreadOptions {
                 session_source: Some(SessionSource::Internal(InternalSessionSource::Guardian)),
-                ..StartThreadOptions::new(test.config.clone())
+                ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
             },
         )
         .await?;
     let other = test
         .thread_manager
-        .start_thread(StartThreadOptions::new(test.config.clone()))
+        .start_thread(StartThreadOptions::new(
+            test.config.clone(),
+            /*control_endpoint*/ None,
+        ))
         .await?;
 
     assert!(test.codex.wait_until_terminated().now_or_never().is_none());
@@ -828,7 +831,7 @@ async fn tree_shutdown_waits_for_children_without_affecting_other_roots() -> Res
             root_id,
             StartThreadOptions {
                 session_source: Some(SessionSource::Internal(InternalSessionSource::Guardian)),
-                ..StartThreadOptions::new(test.config.clone())
+                ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
             },
         )
         .await
@@ -908,7 +911,7 @@ async fn tree_shutdown_cancels_admitted_session_startup() -> Result<()> {
         root_id,
         StartThreadOptions {
             session_source: Some(SessionSource::Internal(InternalSessionSource::Guardian)),
-            ..StartThreadOptions::new(config)
+            ..StartThreadOptions::new(config, /*control_endpoint*/ None)
         },
     ));
 

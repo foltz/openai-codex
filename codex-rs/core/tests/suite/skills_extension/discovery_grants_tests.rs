@@ -324,7 +324,7 @@ async fn executor_discovery_uses_current_environment_grants(
                 || matches!(discovery, Discovery::StandaloneExecutorV1WithDisabledId))
             .then(|| vec!["approved-root".to_string()]),
             thread_extension_init,
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?
         .thread;

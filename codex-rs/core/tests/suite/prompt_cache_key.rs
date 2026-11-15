@@ -260,7 +260,7 @@ async fn ephemeral_fork_shares_cache_routing_but_keeps_session_identity() -> Res
                         .map(TurnEnvironmentSelection::into_request)
                         .collect(),
                 ),
-                ..StartThreadOptions::new(config)
+                ..StartThreadOptions::new(config, /*control_endpoint*/ None)
             },
             test.codex.rollout_path().expect("parent rollout"),
         )

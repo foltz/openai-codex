@@ -31,7 +31,7 @@ async fn code_mode_dynamic_tool_calls_pending_together_resolve_in_reverse_order(
                 }),
                 defer_loading: false,
             })],
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?;
     test.codex = new_thread.thread;

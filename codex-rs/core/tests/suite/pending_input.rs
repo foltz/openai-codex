@@ -818,7 +818,7 @@ async fn plugin_wait_wakes_on_turn_input(
                 input_schema: json!({"type": "object", "properties": {}}),
                 defer_loading: false,
             })],
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?
         .thread;
@@ -1909,7 +1909,7 @@ async fn steers_during_tool_drain_preserve_tool_output_and_each_input() {
                 input_schema: json!({"type": "object", "properties": {}}),
                 defer_loading: false,
             })],
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await
         .expect("start thread with dynamic tool")
@@ -2033,7 +2033,7 @@ async fn steers_yield_exec_and_wait_without_stopping_the_cell(instant_interrupt:
                 input_schema: json!({"type": "object", "properties": {}}),
                 defer_loading: false,
             })],
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await
         .expect("start thread with dynamic tool")
@@ -2337,7 +2337,7 @@ async fn input_preempts_response_and_yields_running_code_mode_call() {
                 input_schema: json!({"type": "object", "properties": {}}),
                 defer_loading: false,
             })],
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await
         .expect("start thread with dynamic tool")

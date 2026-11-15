@@ -1646,7 +1646,7 @@ async fn astra_omits_disabled_executor_and_plugin_skills_from_model_context(
                 }
                 ExecutorPluginDisablement::ConfigRefresh => None,
             },
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?
         .thread;
@@ -1806,7 +1806,7 @@ async fn child_completion_wakes_parent_after_final_answer() -> Result<()> {
                 defer_loading: false,
             })],
             environments: Some(vec![test.executor_environment().request()]),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?;
     test.codex = root.thread;
@@ -2649,7 +2649,7 @@ async fn astra_continues_after_input_yields_a_code_mode_cell() -> Result<()> {
                 input_schema: json!({"type": "object", "properties": {}}),
                 defer_loading: false,
             })],
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?
         .thread;
@@ -3413,7 +3413,8 @@ async fn attached_side_chat_preserves_model_context_on_cold_resume() -> Result<(
         SideConversationPolicy::Attached
             .instructions(options.config.developer_instructions.as_deref()),
     );
-    let mut resume_options = StartThreadOptions::new(options.config.clone());
+    let mut resume_options =
+        StartThreadOptions::new(options.config.clone(), /*control_endpoint*/ None);
     resume_options.environments = options.environments.clone();
     let child = test
         .thread_manager

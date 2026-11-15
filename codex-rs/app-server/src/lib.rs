@@ -534,6 +534,7 @@ pub async fn run_main_with_transport_options(
     };
     #[cfg(target_os = "windows")]
     let _registered_core = codex_windows_sandbox::registered_core_requested();
+    let control_endpoint = mcp_control_endpoint_uri(&transport);
     let managed_daemon = matches!(&transport, AppServerTransport::UnixSocket { .. })
         && runtime_options.managed_daemon;
     #[cfg(unix)]
@@ -1028,6 +1029,7 @@ pub async fn run_main_with_transport_options(
         let outbound_control_tx = outbound_control_tx;
         let (startup_warnings_tx, mut startup_warnings_rx) = mpsc::unbounded_channel();
         let mut processor = MessageProcessor::new(MessageProcessorArgs {
+            control_endpoint,
             cloud_skill_provider,
             outgoing: outgoing_message_sender,
             analytics_events_client,
@@ -1596,6 +1598,21 @@ fn analytics_rpc_transport(transport: &AppServerTransport) -> AppServerRpcTransp
         | AppServerTransport::WebSocket { .. }
         | AppServerTransport::Off => AppServerRpcTransport::Websocket,
     }
+}
+
+/// Derive disclosure only from the actual hosting absolute Unix listener.
+/// Other transports and relative paths provide no endpoint authority.
+fn mcp_control_endpoint_uri(transport: &AppServerTransport) -> Option<String> {
+    let AppServerTransport::UnixSocket { socket_path } = transport else {
+        return None;
+    };
+    if !socket_path.is_absolute() {
+        return None;
+    }
+    let path = socket_path.to_str()?;
+    let mut endpoint = url::Url::parse("unix:///").ok()?;
+    endpoint.set_path(path);
+    Some(endpoint.to_string())
 }
 
 #[cfg(test)]

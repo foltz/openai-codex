@@ -2098,7 +2098,10 @@ async fn prefers_apikey_when_config_prefers_apikey_even_with_chatgpt_tokens() {
         /*external_time_provider*/ None,
     );
     let NewThread { thread: codex, .. } = thread_manager
-        .start_thread(StartThreadOptions::new(config.clone()))
+        .start_thread(StartThreadOptions::new(
+            config.clone(),
+            /*control_endpoint*/ None,
+        ))
         .await
         .expect("create new conversation");
 

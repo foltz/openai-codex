@@ -126,7 +126,7 @@ async fn thread_projection_preserves_executor_order_and_unavailable_selections()
                 .thread_manager
                 .start_thread(StartThreadOptions {
                     environments: Some(requests),
-                    ..StartThreadOptions::new(test.config.clone())
+                    ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
                 })
                 .await?;
             thread.thread.current_mcp_config_and_runtime_context().await;
@@ -171,7 +171,7 @@ async fn model_step_plugin_projection_preserves_selected_environments() -> Resul
         .thread_manager
         .start_thread(StartThreadOptions {
             environments: Some(vec![selection.clone().into_request()]),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?
         .thread;

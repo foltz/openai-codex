@@ -129,7 +129,7 @@ async fn recovery_without_a_snapshot_keeps_each_threads_originator() -> Result<(
                         .map(TurnEnvironmentSelection::into_request)
                         .collect(),
                 ),
-                ..StartThreadOptions::new(config.clone())
+                ..StartThreadOptions::new(config.clone(), /*control_endpoint*/ None)
             })
             .await?
             .thread;

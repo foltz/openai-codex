@@ -72,6 +72,7 @@ pub(crate) struct AgentOutcomeReporting {
 ///
 /// A session has at most 1 running task at a time, and can be interrupted by user input.
 pub(crate) struct Session {
+    pub(super) control_endpoint: Option<String>,
     pub(crate) thread_id: ThreadId,
     pub(crate) item_id_generator: ItemIdGenerator,
     pub(crate) agent_runtime: AgentRuntimeServices,
@@ -900,6 +901,7 @@ impl Session {
         startup: Option<Arc<super::startup::SessionStartup>>,
         mut session_configuration: SessionConfiguration,
         attached_thread: bool,
+        control_endpoint: Option<String>,
         prompt_cache_key: PromptCacheKey,
         environment_selections: &[TurnEnvironmentSelection],
         config: Arc<Config>,
@@ -2067,6 +2069,11 @@ impl Session {
             };
             let (mcp_prewarm_tx, mcp_prewarm_rx) = async_channel::bounded(1);
             let sess = Arc::new(Session {
+                control_endpoint: if isolation == codex_extension_api::SessionIsolation::Isolated {
+                    None
+                } else {
+                    control_endpoint
+                },
                 thread_id,
                 item_id_generator,
                 agent_runtime,

@@ -944,7 +944,10 @@ async fn remote_compact_v2_budgets_persisted_file_audio_atomically(
         .thread_manager
         .start_thread(StartThreadOptions {
             initial_history: InitialHistory::Forked(initial_history),
-            ..StartThreadOptions::new(harness.test().config.clone())
+            ..StartThreadOptions::new(
+                harness.test().config.clone(),
+                /*control_endpoint*/ None,
+            )
         })
         .await?
         .thread;
@@ -1076,7 +1079,10 @@ async fn remote_compact_v2_reuses_compaction_trigger_for_followups() -> Result<(
         .thread_manager
         .start_thread(StartThreadOptions {
             initial_history: InitialHistory::Forked(initial_history),
-            ..StartThreadOptions::new(harness.test().config.clone())
+            ..StartThreadOptions::new(
+                harness.test().config.clone(),
+                /*control_endpoint*/ None,
+            )
         })
         .await?
         .thread;

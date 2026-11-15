@@ -504,6 +504,7 @@ fn validate_dynamic_tools(tools: &[DynamicToolSpec]) -> Result<(), String> {
 
 #[derive(Clone)]
 pub(crate) struct ThreadRequestProcessor {
+    pub(super) control_endpoint: Option<String>,
     pub(super) auth_manager: Arc<AuthManager>,
     pub(crate) thread_manager: Arc<ThreadManager>,
     pub(super) outgoing: Arc<OutgoingMessageSender>,
@@ -563,6 +564,7 @@ impl ThreadRequestProcessor {
         turn_cost_worker: Option<crate::turn_cost_worker::TurnCostWorkerHandle>,
         initial_config_warnings: Vec<ConfigWarningNotification>,
         sample_responses: Arc<crate::thread_sample::SampleResponseRegistry>,
+        control_endpoint: Option<String>,
     ) -> Self {
         Self {
             auth_manager,
@@ -584,6 +586,7 @@ impl ThreadRequestProcessor {
             skills_watcher,
             turn_cost_worker,
             initial_config_warnings: Arc::new(initial_config_warnings),
+            control_endpoint,
         }
     }
 
@@ -1362,6 +1365,7 @@ impl ThreadRequestProcessor {
         let config_manager = self.config_manager.clone();
         let thread_store = Arc::clone(&self.thread_store);
         let initial_config_warnings = Arc::clone(&self.initial_config_warnings);
+        let control_endpoint = self.control_endpoint.clone();
         let outgoing = Arc::clone(&listener_task_context.outgoing);
         let error_request_id = request_id.clone();
         let thread_start_task = async move {
@@ -1388,6 +1392,7 @@ impl ThreadRequestProcessor {
                 experimental_raw_events,
                 request_trace,
                 initial_config_warnings,
+                control_endpoint,
             )
             .await
             {
@@ -1470,6 +1475,7 @@ impl ThreadRequestProcessor {
         experimental_raw_events: bool,
         request_trace: Option<W3cTraceContext>,
         initial_config_warnings: Arc<Vec<ConfigWarningNotification>>,
+        control_endpoint: Option<String>,
     ) -> Result<(), JSONRPCErrorError> {
         let thread_start_started_at = std::time::Instant::now();
         let requested_cwd = typesafe_overrides.cwd.clone();
@@ -1602,7 +1608,7 @@ impl ThreadRequestProcessor {
         if !selected_capability_roots.is_empty() {
             thread_extension_init.insert(selected_capability_roots);
         }
-        let mut start_options = StartThreadOptions::new(config);
+        let mut start_options = StartThreadOptions::new(config, control_endpoint);
         let reserved_thread_id = if start_options.config.ephemeral {
             None
         } else {
@@ -2521,6 +2527,7 @@ impl ThreadRequestProcessor {
                 self.auth_manager.clone(),
                 self.request_trace_context(request_id).await,
                 client_mcp_extensions,
+                self.control_endpoint.clone(),
             )
             .await
             .map_err(|err| internal_error(format!("error reloading thread after revert: {err}")))?;
@@ -4382,7 +4389,7 @@ impl ThreadRequestProcessor {
                     ThreadResumeTarget::DaemonRecovery(_) => None,
                 },
                 client_mcp_extensions,
-                ..StartThreadOptions::new(config)
+                ..StartThreadOptions::new(config, self.control_endpoint.clone())
             })
             .await
         {
@@ -5665,7 +5672,7 @@ impl ThreadRequestProcessor {
                 .map_err(|err| config_load_error(&err))?;
             StartThreadOptions {
                 client_mcp_extensions,
-                ..StartThreadOptions::new(config)
+                ..StartThreadOptions::new(config, self.control_endpoint.clone())
             }
         };
         let goals_enabled = options.config.features.enabled(Feature::Goals);

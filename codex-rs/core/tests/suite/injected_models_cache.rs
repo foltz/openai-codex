@@ -361,7 +361,9 @@ async fn threads_follow_provider_changes_and_preserve_host_cache_policy(
         .disable(codex_features::Feature::RuntimeAgentInstances)?;
     let sibling = test
         .thread_manager
-        .start_thread(StartThreadOptions::new(disabled))
+        .start_thread(StartThreadOptions::new(
+            disabled, /*control_endpoint*/ None,
+        ))
         .await?;
     assert_eq!(sibling.session_configured.model, model);
     let second_host = responses::start_mock_server().await;
@@ -387,7 +389,9 @@ async fn threads_follow_provider_changes_and_preserve_host_cache_policy(
         Some(format!("{}/second-models", second_host.uri()).into());
     let changed_thread = test
         .thread_manager
-        .start_thread(StartThreadOptions::new(changed))
+        .start_thread(StartThreadOptions::new(
+            changed, /*control_endpoint*/ None,
+        ))
         .await?;
     assert_eq!(changed_thread.session_configured.model, second_model);
     if use_cache {

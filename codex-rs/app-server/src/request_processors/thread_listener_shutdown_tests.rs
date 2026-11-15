@@ -93,6 +93,7 @@ async fn listener_shutdown_releases_runtime_and_preserves_other_subscribers(
         /*turn_cost_worker*/ None,
         Vec::new(),
         Arc::new(SampleResponseRegistry::default()),
+        /*control_endpoint*/ None,
     );
     let connection_id = ConnectionId(1);
     let disconnecting_connection_id = ConnectionId(2);

@@ -116,6 +116,7 @@ async fn resumed_plugin_install_uses_the_threads_account(mode: RuntimeAuthMode) 
                 replacement,
                 /*parent_trace*/ None,
                 ClientMcpExtensions::default(),
+                /*control_endpoint*/ None,
             )
             .await?;
         resumed

@@ -1678,7 +1678,7 @@ async fn opted_in_executor_provider_skips_host_discovery_but_injects_discovered_
             history_mode: Some(codex_protocol::protocol::ThreadHistoryMode::Legacy),
             environments: Some(vec![environment.clone().into_request()]),
             thread_extension_init,
-            ..StartThreadOptions::new(executor_config)
+            ..StartThreadOptions::new(executor_config, /*control_endpoint*/ None)
         })
         .await?;
     let executor_skill_path = environment
@@ -2138,7 +2138,7 @@ async fn executor_skill_tool_reads_references_under_current_permissions(
         .start_thread(StartThreadOptions {
             environments: Some(vec![selection.into_request()]),
             thread_extension_init,
-            ..StartThreadOptions::new(config)
+            ..StartThreadOptions::new(config, /*control_endpoint*/ None)
         })
         .await?;
     let requested_permissions = RequestPermissionProfile {
@@ -3684,7 +3684,7 @@ async fn production_turn_keeps_rebalanced_catalogs_stable_after_compaction_and_r
         .start_thread(StartThreadOptions {
             environments: Some(vec![pending_selection.clone().into_request()]),
             thread_extension_init: thread_extension_init.clone(),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?;
     let response = responses::mount_sse_sequence(
@@ -3806,7 +3806,7 @@ async fn production_turn_keeps_rebalanced_catalogs_stable_after_compaction_and_r
             }),
             environments: Some(vec![pending_selection.clone().into_request()]),
             thread_extension_init,
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?;
     resumed

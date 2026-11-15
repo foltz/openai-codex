@@ -38,7 +38,10 @@ async fn residency_slot_reservation_unloads_oldest_idle_v2_agent() {
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
     );
     let root = manager
-        .start_thread(StartThreadOptions::new(config.clone()))
+        .start_thread(StartThreadOptions::new(
+            config.clone(),
+            /*control_endpoint*/ None,
+        ))
         .await
         .expect("start root thread");
     let control = manager.agent_control();
@@ -131,7 +134,10 @@ async fn interrupted_v2_agent_is_lost_after_residency_eviction() {
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
     );
     let root = manager
-        .start_thread(StartThreadOptions::new(config.clone()))
+        .start_thread(StartThreadOptions::new(
+            config.clone(),
+            /*control_endpoint*/ None,
+        ))
         .await
         .expect("start root thread");
     let control = manager.agent_control();
@@ -210,7 +216,9 @@ async fn spawn_v2_subagent(
                     label.to_string(),
                 ))),
                 thread_source: Some(ThreadSource::Subagent),
-                ..crate::thread_manager::StartThreadOptions::new(config)
+                ..crate::thread_manager::StartThreadOptions::new(
+                    config, /*control_endpoint*/ None,
+                )
             },
             control.clone(),
             Some(parent_thread_id),

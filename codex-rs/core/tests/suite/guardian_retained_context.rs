@@ -241,6 +241,7 @@ async fn resume(test: &TestCodex, thread: &CodexThread) -> Result<Arc<CodexThrea
             test.thread_manager.auth_manager(),
             /*parent_trace*/ None,
             ClientMcpExtensions::default(),
+            /*control_endpoint*/ None,
         )
         .await?
         .thread)
@@ -796,7 +797,8 @@ async fn inherited_instruction_authorization_after_cold_resume(restricted: bool)
     let server = start_mock_server().await;
     let test = test_codex().build_with_auto_env(&server).await?;
     let options = |initial_history| {
-        let mut options = StartThreadOptions::new(test.config.clone());
+        let mut options =
+            StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None);
         options.initial_history = initial_history;
         options.session_source = Some(SessionSource::Custom("host".into()));
         if restricted {
@@ -982,7 +984,10 @@ async fn standalone_fork_retains_inherited_user_instructions(
             .await?;
         test.thread_manager
             .fork_prepared_thread(
-                codex_core::StartThreadOptions::new(test.config.clone()),
+                codex_core::StartThreadOptions::new(
+                    test.config.clone(),
+                    /*control_endpoint*/ None,
+                ),
                 prepared,
             )
             .await?
@@ -990,7 +995,10 @@ async fn standalone_fork_retains_inherited_user_instructions(
         test.thread_manager
             .fork_thread_from_history(
                 ForkSnapshot::Interrupted,
-                codex_core::StartThreadOptions::new(test.config.clone()),
+                codex_core::StartThreadOptions::new(
+                    test.config.clone(),
+                    /*control_endpoint*/ None,
+                ),
                 InitialHistory::Resumed(ResumedHistory {
                     history_revision: None,
                     conversation_id: worker.startup_metadata().thread_id,

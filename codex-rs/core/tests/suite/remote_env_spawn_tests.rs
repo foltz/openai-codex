@@ -90,7 +90,7 @@ pub(crate) async fn pending_subagent_scenario(
         .thread_manager
         .start_thread(StartThreadOptions {
             environments: Some(vec![pending.clone().into_request()]),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?;
     let root_id = root.thread_id.to_string();

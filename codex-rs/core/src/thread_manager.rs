@@ -342,6 +342,9 @@ pub enum PromptCacheKey {
 
 pub struct StartThreadOptions {
     pub config: Config,
+    /// Hosting listener custody, supplied explicitly by the host; never loaded
+    /// from history, configuration or a parent thread.
+    pub control_endpoint: Option<String>,
     /// Request-body cache key policy for this thread and its children. Hosts must reapply it on cold resume.
     pub prompt_cache_key: PromptCacheKey,
     /// Host-owned provider for this root thread's additional instructions.
@@ -436,9 +439,10 @@ impl StartThreadOptions {
         });
     }
 
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: Config, control_endpoint: Option<String>) -> Self {
         Self {
             config,
+            control_endpoint,
             prompt_cache_key: PromptCacheKey::default(),
             thread_instructions_provider: None,
             allow_provider_model_fallback: false,
@@ -1553,6 +1557,7 @@ impl ThreadManager {
             auth_manager,
             parent_trace,
             client_mcp_extensions,
+            /*control_endpoint*/ None,
         ))
         .await
     }
@@ -1599,6 +1604,7 @@ impl ThreadManager {
         auth_manager: Arc<AuthManager>,
         parent_trace: Option<W3cTraceContext>,
         client_mcp_extensions: ClientMcpExtensions,
+        control_endpoint: Option<String>,
     ) -> CodexResult<NewThread> {
         let agent_control = self.agent_control_for_config(&config);
         let (session_source, thread_source) = initial_history
@@ -1610,7 +1616,7 @@ impl ThreadManager {
             thread_source,
             parent_trace,
             client_mcp_extensions,
-            ..StartThreadOptions::new(config)
+            ..StartThreadOptions::new(config, control_endpoint)
         };
         Box::pin(self.state.spawn_thread(ThreadSpawnRequest::new(
             options,
@@ -1629,7 +1635,7 @@ impl ThreadManager {
         let agent_control = self.agent_control_for_config(&config);
         let options = StartThreadOptions {
             client_mcp_extensions,
-            ..StartThreadOptions::new(config)
+            ..StartThreadOptions::new(config, /*control_endpoint*/ None)
         };
         let mut request =
             ThreadSpawnRequest::new(options, Arc::clone(&self.state.auth_manager), agent_control);
@@ -1657,7 +1663,7 @@ impl ThreadManager {
             session_source: Some(session_source),
             thread_source,
             client_mcp_extensions,
-            ..StartThreadOptions::new(config)
+            ..StartThreadOptions::new(config, /*control_endpoint*/ None)
         };
         let mut request = ThreadSpawnRequest::new(options, auth_manager, agent_control);
         request.user_shell_override = Some(user_shell_override);
@@ -1786,7 +1792,7 @@ impl ThreadManager {
                 disabled_plugin_ids: Some(settings.disabled_plugin_ids),
                 thread_extension_init,
                 turn_extension_init: settings.turn_extension_init,
-                ..StartThreadOptions::new(config)
+                ..StartThreadOptions::new(config, /*control_endpoint*/ None)
             },
             CodexThreadSettingsOverrides {
                 collaboration_mode: Some(settings.collaboration_mode),
@@ -2397,7 +2403,7 @@ impl ThreadManagerState {
                     .collect()
             }),
             client_mcp_extensions,
-            ..StartThreadOptions::new(config)
+            ..StartThreadOptions::new(config, /*control_endpoint*/ None)
         };
         let mut request =
             ThreadSpawnRequest::new(options, Arc::clone(&self.auth_manager), agent_control);
@@ -2507,6 +2513,7 @@ impl ThreadManagerState {
         };
         let StartThreadOptions {
             mut config,
+            control_endpoint,
             prompt_cache_key,
             thread_instructions_provider,
             allow_provider_model_fallback,
@@ -2855,6 +2862,7 @@ impl ThreadManagerState {
             ) => manager,
         };
         let spawn_result = Session::spawn(SessionSpawnArgs {
+            control_endpoint,
             attached_thread,
             startup,
             config,

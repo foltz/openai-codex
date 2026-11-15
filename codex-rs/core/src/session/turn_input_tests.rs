@@ -1358,11 +1358,9 @@ async fn idle_preparation_cancellation_drops_original_before_replacement_or_shut
         "queue-only mail survives abandoned idle preparation".into(),
         false,
     );
-    session.input_queue.enqueue_mailbox_with_work(
-        message.into(),
-        Default::default(),
-        Some(Box::new(IdlePreparationMailWork(Arc::clone(&work)))),
-    );
+    session
+        .input_queue
+        .enqueue_mailbox_with_work(message.into(), Default::default(), None);
     let old_session = Arc::clone(&session);
     let old = tokio::spawn(async move {
         handle(
@@ -1378,6 +1376,20 @@ async fn idle_preparation_cancellation_drops_original_before_replacement_or_shut
         .expect("actual idle request reaches the held contributor");
     assert!(!session.input_queue.has_pending_mailbox_items().await);
     assert!(work.lock().unwrap().is_empty());
+    // Counted work belongs to trigger mail, which arrives only after the idle
+    // request passed trigger admission and privately reserved the queue-only mail.
+    let trigger = InterAgentCommunication::new(
+        AgentPath::root(),
+        AgentPath::try_from("/root/worker").unwrap(),
+        Vec::new(),
+        "counted trigger arrives during preparation".into(),
+        true,
+    );
+    session.input_queue.enqueue_mailbox_with_work(
+        trigger.into(),
+        Default::default(),
+        Some(Box::new(IdlePreparationMailWork(Arc::clone(&work)))),
+    );
     let replacement = if closing {
         session.close_task_admission().await;
         None

@@ -373,7 +373,18 @@ pub(super) async fn shutdown_session_runtime(sess: &Arc<Session>) {
         );
         warn!("failed to shutdown code mode session: {err}");
     }
-    sess.stop_mcp_prewarm_worker().await;
+    let prewarm = sess.stop_mcp_prewarm_worker().await;
+    if prewarm != SessionLoopOutcome::Normal {
+        sess.services.local_agent_runtime.record_shutdown_failure(
+            AgentTreeShutdownFailure::operation_failed(
+                "session_shutdown",
+                "mcp_prewarm",
+                Some(sess.thread_id),
+                "prewarm_join_failed",
+            ),
+        );
+        warn!(?prewarm, "MCP prewarm worker stopped unexpectedly");
+    }
     {
         let _refresh = sess.mcp_refresh.acquire().await;
         sess.mcp_refresh.close();

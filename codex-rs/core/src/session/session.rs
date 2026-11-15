@@ -107,7 +107,8 @@ pub(crate) struct Session {
     pub(super) mcp_elicitation_lifecycle_handle: OnceLock<codex_mcp::ElicitationLifecycle>,
     pub(super) mcp_prewarm_tx: async_channel::Sender<()>,
     pub(super) mcp_prewarm_shutdown: CancellationToken,
-    pub(super) mcp_prewarm_task: std::sync::Mutex<Option<JoinHandle<()>>>,
+    // Retain the exact original join independently of a cancelled stop observer.
+    pub(super) mcp_prewarm_task: std::sync::Mutex<Option<SessionLoopTermination>>,
     pub(crate) conversation: Arc<RealtimeConversationManager>,
     pub(crate) realtime_history: Option<Mutex<crate::realtime_history::RealtimeHistoryState>>,
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,

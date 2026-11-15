@@ -394,9 +394,9 @@ use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::DeprecationNoticeEvent;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ExecApprovalRequestEvent;
 use codex_protocol::protocol::HookCompletedEvent;
 use codex_protocol::protocol::HookRunSummary;
-use codex_protocol::protocol::ExecApprovalRequestEvent;
 use codex_protocol::protocol::ModelRerouteEvent;
 use codex_protocol::protocol::ModelRerouteReason;
 use codex_protocol::protocol::ModelVerification;
@@ -463,7 +463,46 @@ pub(crate) struct SessionIo {
     pub(crate) session_loop_termination: SessionLoopTermination,
 }
 
-pub(crate) type SessionLoopTermination = Shared<BoxFuture<'static, ()>>;
+/// Observed original task outcome, not a receipt for all Session resources.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SessionLoopOutcome {
+    Normal,
+    Cancelled,
+    Panicked,
+}
+
+/// Every observer shares the original join. Abort is a request, never proof.
+#[derive(Clone)]
+pub(crate) struct SessionLoopTermination {
+    completion: Shared<BoxFuture<'static, SessionLoopOutcome>>,
+    abort: Option<tokio::task::AbortHandle>,
+}
+
+impl SessionLoopTermination {
+    pub(crate) fn observed(&self) -> Option<SessionLoopOutcome> {
+        self.completion.clone().now_or_never()
+    }
+
+    pub(crate) fn request_abort(&self) {
+        if let Some(abort) = &self.abort {
+            abort.abort();
+        }
+    }
+}
+
+impl std::future::Future for SessionLoopTermination {
+    type Output = SessionLoopOutcome;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.completion).poll(cx)
+    }
+}
+
+#[cfg(test)]
+mod original_join_tests;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GitEnrichmentPolicy {
@@ -1273,8 +1312,12 @@ impl SessionIo {
             Err(err) if matches!(err.details(), CodexErrorDetails::InternalAgentDied) => {}
             Err(err) => return Err(err),
         }
-        session_loop_termination.await;
-        Ok(())
+        match session_loop_termination.await {
+            SessionLoopOutcome::Normal => Ok(()),
+            SessionLoopOutcome::Cancelled | SessionLoopOutcome::Panicked => {
+                Err(CodexErr::InternalAgentDied)
+            }
+        }
     }
 
     pub(crate) async fn next_event(&self) -> CodexResult<Event> {
@@ -1342,17 +1385,31 @@ fn session_permission_profile_state_from_config(
 
 #[cfg(test)]
 pub(crate) fn completed_session_loop_termination() -> SessionLoopTermination {
-    futures::future::ready(()).boxed().shared()
+    SessionLoopTermination {
+        completion: futures::future::ready(SessionLoopOutcome::Normal)
+            .boxed()
+            .shared(),
+        abort: None,
+    }
 }
 
 pub(crate) fn session_loop_termination_from_handle(
     handle: JoinHandle<()>,
 ) -> SessionLoopTermination {
-    async move {
-        let _ = handle.await;
+    let abort = handle.abort_handle();
+    let completion = async move {
+        match handle.await {
+            Ok(()) => SessionLoopOutcome::Normal,
+            Err(error) if error.is_cancelled() => SessionLoopOutcome::Cancelled,
+            Err(_) => SessionLoopOutcome::Panicked,
+        }
     }
     .boxed()
-    .shared()
+    .shared();
+    SessionLoopTermination {
+        completion,
+        abort: Some(abort),
+    }
 }
 
 async fn thread_title_from_thread_store(

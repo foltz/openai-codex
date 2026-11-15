@@ -1,3 +1,5 @@
+mod attempt_work;
+pub use attempt_work::{McpAttemptAccess, McpAttemptRefused, McpAttemptRequirement, McpAttemptWork};
 pub use binding::McpBinding;
 pub use binding::McpPermissionSource;
 pub use binding::PreparedMcpCall;

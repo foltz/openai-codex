@@ -57,7 +57,7 @@ async fn forced_refresh_replaces_pending_connection_without_interrupting_other_c
     assert!(futures::poll!(&mut other).is_pending());
     started.notified().await;
     let mut owner = create_ready_async_managed_client(Vec::new()).await;
-    owner.client = first;
+    owner.client = first.into();
     owner.connection_slot = Some(slot);
     let mut connections = McpConnectionSet::empty(/*prefix_mcp_tool_names*/ true);
     connections.insert_test_client("test_server", owner);
@@ -166,7 +166,7 @@ async fn forced_refresh_replaces_pending_connection_without_interrupting_other_c
         .unwrap();
     let transport = Arc::clone(&other.client);
     let mut other_owner = create_ready_async_managed_client(Vec::new()).await;
-    other_owner.client = futures::future::ready(Ok(other)).boxed().shared();
+    other_owner.client = (futures::future::ready(Ok(other)).boxed().shared()).into();
     other_owner.shutdown().await;
     assert!(transport.is_closed().await);
     drop(binding);

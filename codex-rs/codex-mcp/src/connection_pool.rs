@@ -104,6 +104,7 @@ pub struct McpConnectionPool {
 #[derive(Clone)]
 pub(crate) struct ConnectionKey {
     pub(crate) server_name: String,
+    pub(crate) attempt_requirement: crate::McpAttemptRequirement,
     pub(crate) identity: McpServerConnectionIdentity,
     pub(crate) account: ConnectorRuntimeContextKey,
     pub(crate) auth_state: Option<(Arc<AuthManager>, AuthChangeState)>,
@@ -114,6 +115,7 @@ pub(crate) struct ConnectionKey {
 impl PartialEq for ConnectionKey {
     fn eq(&self, other: &Self) -> bool {
         self.server_name == other.server_name
+            && self.attempt_requirement == other.attempt_requirement
             && self.identity == other.identity
             && self.account == other.account
             && self.startup_timeout == other.startup_timeout

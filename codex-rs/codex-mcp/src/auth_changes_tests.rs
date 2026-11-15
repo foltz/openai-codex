@@ -169,7 +169,7 @@ async fn explicit_private_shutdown_stops_its_watcher_even_with_retained_client_b
     let retained = managed.clone();
     let mut async_client =
         crate::connection_manager::tests::create_ready_async_managed_client(Vec::new()).await;
-    async_client.client = futures::future::ready(Ok(managed)).boxed().shared();
+    async_client.client = (futures::future::ready(Ok(managed)).boxed().shared()).into();
     async_client.shutdown().await;
     timeout(SEND_TIMEOUT, changes.closed()).await?;
     assert!(retained._auth_change_notifications.is_some());

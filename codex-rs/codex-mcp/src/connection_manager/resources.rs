@@ -249,7 +249,7 @@ impl McpServerConnection {
         let response = tokio::select! {
             biased;
             _ = self.client.cancel_token.cancelled() => anyhow::bail!("Apps startup cancelled"),
-            Err(error) = self.client.client.clone() => return Err(error.into()),
+            Err(error) = self.client.client.observe(crate::McpAttemptAccess::Unscoped) => return Err(error.into()),
             response = request(client, timeout) => response?,
         };
         anyhow::ensure!(
@@ -275,7 +275,7 @@ impl McpServerConnection {
         let acquire = async {
             tokio::select! {
                 biased;
-                ready = self.client.client.clone() => Ok(ready?.client),
+                ready = self.client.client.observe(crate::McpAttemptAccess::Unscoped) => Ok(ready?.client),
                 Some(client) = initialized_transport => Ok(client),
             }
         };

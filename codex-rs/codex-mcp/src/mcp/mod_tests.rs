@@ -167,7 +167,7 @@ async fn status_snapshot_only_downgrades_oauth_and_ema_authentication_failures()
     ] {
         let mut client = create_ready_async_managed_client(Vec::new()).await;
         if let Some(error) = startup_error {
-            client.client = futures::future::ready(Err(error)).boxed().shared();
+            client.client = (futures::future::ready(Err(error)).boxed().shared()).into();
         }
         manager.insert_test_client(name, client);
         auth_status_entries.insert(

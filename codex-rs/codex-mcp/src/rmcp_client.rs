@@ -11,6 +11,12 @@
 
 #[path = "rmcp_client/managed_client.rs"]
 mod managed_client;
+#[path = "rmcp_client/startup_work.rs"]
+mod startup_work;
+use crate::{McpAttemptAccess, McpAttemptRequirement};
+pub(crate) use startup_work::ClientStartup;
+pub(crate) use startup_work::physical_continuation;
+
 #[path = "rmcp_client/status.rs"]
 mod status;
 
@@ -156,20 +162,55 @@ struct CodexAppsStartupStatusContext {
 
 pub(crate) struct CodexAppsStartupReconnect {
     workers: crate::McpWorkerOwner,
-    factory: Arc<dyn Fn() -> ManagedClientFuture + Send + Sync>,
+    requirement: McpAttemptRequirement,
+    factory:
+        Arc<dyn Fn(Option<Box<dyn crate::McpAttemptWork>>) -> ManagedClientFuture + Send + Sync>,
     state: StdMutex<CodexAppsStartupReconnectState>,
     startup_status_context: Option<CodexAppsStartupStatusContext>,
 }
 
 impl CodexAppsStartupReconnect {
+    #[cfg(test)]
     pub(crate) fn new(
         factory: Arc<dyn Fn() -> ManagedClientFuture + Send + Sync>,
         workers: crate::McpWorkerOwner,
     ) -> Self {
+        Self::with_requirement(factory, workers, McpAttemptRequirement::Ungated)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_requirement(
+        factory: Arc<dyn Fn() -> ManagedClientFuture + Send + Sync>,
+        workers: crate::McpWorkerOwner,
+        requirement: McpAttemptRequirement,
+    ) -> Self {
+        Self::with_work_factory(
+            Arc::new(move |work| {
+                let original = factory();
+                async move {
+                    let _work = work;
+                    original.await
+                }
+                .boxed()
+                .shared()
+            }),
+            workers,
+            requirement,
+        )
+    }
+
+    fn with_work_factory(
+        factory: Arc<
+            dyn Fn(Option<Box<dyn crate::McpAttemptWork>>) -> ManagedClientFuture + Send + Sync,
+        >,
+        workers: crate::McpWorkerOwner,
+        requirement: McpAttemptRequirement,
+    ) -> Self {
         Self {
             workers,
+            requirement,
             factory,
-            state: StdMutex::new(CodexAppsStartupReconnectState::default()),
+            state: StdMutex::default(),
             startup_status_context: None,
         }
     }
@@ -196,7 +237,15 @@ impl CodexAppsStartupReconnect {
             .clone()
     }
 
+    #[cfg(test)]
     pub(crate) fn reconnect_in_background(self: &Arc<Self>) -> Option<ManagedClientFuture> {
+        self.reconnect_with_authority(McpAttemptAccess::Unscoped)
+    }
+
+    pub(crate) fn reconnect_with_authority(
+        self: &Arc<Self>,
+        access: McpAttemptAccess<'_>,
+    ) -> Option<ManagedClientFuture> {
         let mut state = self
             .state
             .lock()
@@ -212,6 +261,9 @@ impl CodexAppsStartupReconnect {
             return None;
         }
 
+        // Derive before constructing/spawning any new attempt. Refusal is not
+        // a transport error and must not advance reconnect backoff.
+        let work = self.requirement.derive(access).ok()?;
         let reconnect = Arc::clone(self);
         let (send, receive) = tokio::sync::oneshot::channel();
         // Callers observe the result channel only. They cannot independently
@@ -223,7 +275,9 @@ impl CodexAppsStartupReconnect {
             &tokio::runtime::Handle::current(),
             crate::McpWorkerKind::Reconnect,
             async move {
-                let result = (reconnect.factory)().await;
+                // The factory transfers custody into the actual private original,
+                // so cancellation of this worker cannot release it prematurely.
+                let result = (reconnect.factory)(work).await;
                 let startup_status_context = reconnect.startup_status_context.clone();
                 let recovered = {
                     let mut state = reconnect
@@ -312,14 +366,31 @@ struct ManagedClientStartup {
 }
 
 impl ManagedClientStartup {
-    fn start(
+    fn start_with_work(
         &self,
         sharing_declined: Option<CancellationToken>,
         publish_apps: Option<watch::Sender<Option<std::sync::Weak<RmcpClient>>>>,
+        work: Option<Box<dyn crate::McpAttemptWork>>,
+    ) -> ManagedClientFuture {
+        self.start_with_custody(sharing_declined, publish_apps, work.map(Arc::new))
+    }
+
+    fn start_with_custody(
+        &self,
+        sharing_declined: Option<CancellationToken>,
+        publish_apps: Option<watch::Sender<Option<std::sync::Weak<RmcpClient>>>>,
+        work: Option<Arc<Box<dyn crate::McpAttemptWork>>>,
     ) -> ManagedClientFuture {
         self.private_retirement
             .track_startup(self.cancel_token.clone(), |retirement| {
-                self.start_in_retirement(sharing_declined, publish_apps, retirement)
+                let original = self.start_in_retirement(sharing_declined, publish_apps, retirement);
+                // This exact future is the alias retained by private retirement.
+                async move {
+                    let _work = work;
+                    original.await
+                }
+                .boxed()
+                .shared()
             })
     }
 
@@ -505,7 +576,7 @@ impl ManagedClientStartup {
 pub(crate) struct AsyncManagedClient {
     pub(crate) private_retirement: PrivateClientRetirement,
     pub(crate) ema_authority: Option<codex_rmcp_client::EmaRequestAuthority>,
-    pub(crate) client: ManagedClientFuture,
+    pub(crate) client: ClientStartup,
     pub(crate) is_codex_apps_mcp_server: bool,
     pub(crate) cached_server_info: Option<McpServerInfo>,
     /// Retained after initialization even if subsequent tool discovery fails.
@@ -547,6 +618,7 @@ impl AsyncManagedClient {
         catalog_item_limit: usize,
         connection_pool: Option<(crate::McpConnectionPool, ConnectionKey)>,
         publish_apps: Option<watch::Sender<Option<std::sync::Weak<RmcpClient>>>>,
+        attempt_requirement: McpAttemptRequirement,
     ) -> Self {
         let is_codex_apps_mcp_server = server_name == CODEX_APPS_MCP_SERVER_NAME;
         let reconnect_server_name = server_name.clone();
@@ -628,69 +700,102 @@ impl AsyncManagedClient {
             startup_complete: Arc::clone(&startup_complete),
             server_capabilities: Arc::clone(&server_capabilities),
         });
-        let (client, connection_slot) = if let Some((pool, key)) = connection_pool {
+        let (client, connection_slot) = if let Some((pool, mut key)) = connection_pool {
+            key.attempt_requirement = attempt_requirement;
             let slot = reserved_slot.expect("pooled startup reserves its slot before construction");
             let connection_slot = Arc::clone(&slot);
             let startup = Arc::clone(&startup);
             let cancel_token = cancel_token.clone();
             let startup_complete = Arc::clone(&startup_complete);
             let server_capabilities = Arc::clone(&server_capabilities);
-            let client = async move {
-                let outcome = pool
-                    .connect(
-                        slot,
-                        key,
-                        server_capabilities,
-                        pool_catalog,
-                        cancel_token,
-                        |cancellation, sharing_declined, retirement| {
-                            let mut shared_startup = (*startup).clone();
-                            shared_startup.cancel_token = cancellation;
-                            match retirement {
-                                Some(retirement) => {
-                                    shared_startup.runtime_context =
-                                        shared_startup.runtime_context.for_pooled_connection(&pool);
-                                    shared_startup.start_in_retirement(
-                                        sharing_declined,
-                                        /*publish_apps*/ None,
-                                        retirement,
+            let client = ClientStartup::new_with_work(
+                move |work| {
+                    // One admitted invocation, jointly owned by its original continuations.
+                    // These Arc clones are not new admissions or reusable-factory authority.
+                    let work = work.map(Arc::new);
+                    async move {
+                        let outcome = pool
+                            .connect(
+                                slot,
+                                key,
+                                server_capabilities,
+                                pool_catalog,
+                                cancel_token,
+                                |cancellation, sharing_declined, retirement| {
+                                    physical_continuation(
+                                        attempt_requirement,
+                                        work.clone(),
+                                        |physical_work| {
+                                            let mut physical = (*startup).clone();
+                                            physical.cancel_token = cancellation;
+                                            match retirement {
+                                                Some(retirement) => {
+                                                    physical.runtime_context = physical
+                                                        .runtime_context
+                                                        .for_pooled_connection(&pool);
+                                                    let original = physical.start_in_retirement(
+                                                        sharing_declined,
+                                                        None,
+                                                        retirement,
+                                                    );
+                                                    async move {
+                                                        let _work = physical_work;
+                                                        original.await
+                                                    }
+                                                    .boxed()
+                                                    .shared()
+                                                }
+                                                None => physical.start_with_custody(
+                                                    sharing_declined,
+                                                    None,
+                                                    physical_work,
+                                                ),
+                                            }
+                                        },
                                     )
+                                },
+                            )
+                            .await
+                            .map(|mut client| {
+                                if matches!(client.connection_sharing, ConnectionSharing::Shared(_))
+                                {
+                                    client.shared_elicitation =
+                                        Some(Arc::new(startup.elicitation_requests.make_sender(
+                                            startup.server_name.clone(),
+                                            startup.tx_event.clone(),
+                                            &startup.client_mcp_extensions,
+                                        )));
                                 }
-                                None => shared_startup
-                                    .start(sharing_declined, /*publish_apps*/ None),
-                            }
-                        },
-                    )
-                    .await
-                    .map(|mut client| {
-                        if matches!(client.connection_sharing, ConnectionSharing::Shared(_)) {
-                            client.shared_elicitation =
-                                Some(Arc::new(startup.elicitation_requests.make_sender(
-                                    startup.server_name.clone(),
-                                    startup.tx_event.clone(),
-                                    &startup.client_mcp_extensions,
-                                )));
-                        }
-                        client
-                    });
-                startup_complete.store(true, Ordering::Release);
-                outcome
-            }
-            .boxed()
-            .shared();
+                                client
+                            });
+                        startup_complete.store(true, Ordering::Release);
+                        outcome
+                    }
+                    .boxed()
+                    .shared()
+                },
+                attempt_requirement,
+            );
             (client, Some(connection_slot))
         } else {
-            (startup.start(/*sharing_declined*/ None, publish_apps), None)
+            let private = Arc::clone(&startup);
+            (
+                ClientStartup::new_with_work(
+                    move |work| private.start_with_work(None, publish_apps, work),
+                    attempt_requirement,
+                ),
+                None,
+            )
         };
+
         let startup_reconnect = is_codex_apps_mcp_server.then(|| {
             let workers = startup.runtime_context.workers.clone();
             let startup = Arc::clone(&startup);
             Arc::new(
-                CodexAppsStartupReconnect::new(
-                    Arc::new(move || {
-                        startup.start(/*sharing_declined*/ None, /*publish_apps*/ None)
-                    }),
+                CodexAppsStartupReconnect::with_work_factory(
+                    Arc::new(move |work| startup.start_with_work(None, None, work)),
                     workers,
+                    attempt_requirement,
                 )
                 .with_startup_status_context(
                     startup_submit_id,
@@ -716,6 +821,13 @@ impl AsyncManagedClient {
     }
 
     pub(crate) async fn client(&self) -> Result<ManagedClient, StartupOutcomeError> {
+        self.client_with_authority(McpAttemptAccess::Unscoped).await
+    }
+
+    pub(crate) async fn client_with_authority(
+        &self,
+        access: McpAttemptAccess<'_>,
+    ) -> Result<ManagedClient, StartupOutcomeError> {
         if let Some(client) = self
             .startup_reconnect
             .as_ref()
@@ -723,7 +835,14 @@ impl AsyncManagedClient {
         {
             return Ok(client);
         }
-        self.client.clone().await
+        if self.cancel_token.is_cancelled() && !self.startup_complete.load(Ordering::Acquire) {
+            self.client.cancel_unstarted();
+        }
+        let result = self.client.observe(access).await;
+        if matches!(&result, Err(StartupOutcomeError::Cancelled)) {
+            self.startup_complete.store(true, Ordering::Release);
+        }
+        result
     }
 
     /// Returns the current ready client, including its tool catalog and metadata,
@@ -759,19 +878,29 @@ impl AsyncManagedClient {
         let error = error.clone();
         let client = self.client.clone();
         let startup_complete = Arc::clone(&self.startup_complete);
-        self.client = async move {
-            if let Err(stop_error) = shutdown.await {
-                warn!("cannot restart MCP server after failed cleanup: {stop_error}");
-                startup_complete.store(true, Ordering::Release);
-                return Err(error);
+        self.client = client.map_completion(move |client| {
+            async move {
+                if let Err(stop_error) = shutdown.await {
+                    warn!("cannot restart MCP server after failed cleanup: {stop_error}");
+                    startup_complete.store(true, Ordering::Release);
+                    return Err(error);
+                }
+                client.await
             }
-            client.await
-        }
-        .boxed()
-        .shared();
+            .boxed()
+            .shared()
+        });
     }
 
     pub(crate) async fn reconnect_failed_startup(&self) {
+        self.reconnect_failed_startup_with_authority(McpAttemptAccess::Unscoped)
+            .await;
+    }
+
+    pub(crate) async fn reconnect_failed_startup_with_authority(
+        &self,
+        access: McpAttemptAccess<'_>,
+    ) {
         let Some(startup_reconnect) = self.startup_reconnect.as_ref() else {
             return;
         };
@@ -779,13 +908,14 @@ impl AsyncManagedClient {
             return;
         }
         if matches!(self.client().await, Err(StartupOutcomeError::Failed { .. })) {
-            let _ = startup_reconnect.reconnect_in_background();
+            let _ = startup_reconnect.reconnect_with_authority(access);
         }
     }
 
     pub(crate) async fn shutdown(&self) {
         self.private_retirement.close_registration();
         self.cancel_token.cancel();
+        self.client.cancel_unstarted();
         match self.client().await {
             Ok(client) => match &client.connection_sharing {
                 ConnectionSharing::Owned(lease) | ConnectionSharing::Shared(lease) => {
@@ -881,6 +1011,9 @@ impl AsyncManagedClient {
 pub(crate) enum StartupOutcomeError {
     #[error("MCP startup cancelled")]
     Cancelled,
+    /// Admission refusal performed no attempt; keep it retryable, not memoized failure.
+    #[error(transparent)]
+    Refused(crate::McpAttemptRefused),
     // We can't store the original error here because anyhow::Error doesn't implement
     // `Clone`.
     #[error("MCP startup failed: {error}")]
@@ -906,7 +1039,7 @@ impl StartupOutcomeError {
 
     pub(crate) fn is_authentication_required(&self) -> bool {
         match self {
-            Self::Cancelled => false,
+            Self::Cancelled | Self::Refused(_) => false,
             Self::Failed {
                 error,
                 is_authentication_required,

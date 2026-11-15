@@ -128,32 +128,32 @@ impl McpServerConnection {
         let fallback = Arc::new(OnceLock::new());
         let selected = Arc::clone(&fallback);
         let cancellation = replacement.cancel_token.clone();
-        replacement.client = replacement
-            .client
-            .clone()
-            .then(move |outcome| async move {
-                let Err(error @ StartupOutcomeError::Failed { .. }) = &outcome else {
-                    return outcome;
-                };
-                if error.is_authentication_required() {
-                    return outcome;
-                }
-                error.wait_for_shutdown().await;
-                let Some(client) = previous.client.ready_client() else {
-                    return outcome;
-                };
-                if client.client.is_closed().await {
-                    return outcome;
-                }
-                if cancellation.is_cancelled() || previous.client.cancel_token.is_cancelled() {
-                    return Err(StartupOutcomeError::Cancelled);
-                }
-                // The connection owns the startup token and the capabilities for this transport.
-                selected.get_or_init(|| previous);
-                Ok(client)
-            })
-            .boxed()
-            .shared();
+        replacement.client = replacement.client.clone().map_completion(move |original| {
+            original
+                .then(move |outcome| async move {
+                    let Err(error @ StartupOutcomeError::Failed { .. }) = &outcome else {
+                        return outcome;
+                    };
+                    if error.is_authentication_required() {
+                        return outcome;
+                    }
+                    error.wait_for_shutdown().await;
+                    let Some(client) = previous.client.ready_client() else {
+                        return outcome;
+                    };
+                    if client.client.is_closed().await {
+                        return outcome;
+                    }
+                    if cancellation.is_cancelled() || previous.client.cancel_token.is_cancelled() {
+                        return Err(StartupOutcomeError::Cancelled);
+                    }
+                    // The connection owns the startup token and the capabilities for this transport.
+                    selected.get_or_init(|| previous);
+                    Ok(client)
+                })
+                .boxed()
+                .shared()
+        });
         fallback
     }
 
@@ -195,23 +195,46 @@ impl McpServerConnection {
     }
 
     pub(crate) async fn client(&self) -> Result<ManagedClient, StartupOutcomeError> {
+        self.client_with_authority(crate::McpAttemptAccess::Unscoped)
+            .await
+    }
+
+    pub(crate) async fn client_with_authority(
+        &self,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Result<ManagedClient, StartupOutcomeError> {
+        if self.client.cancel_token.is_cancelled()
+            && !self.client.startup_complete.load(Ordering::Acquire)
+        {
+            self.client.client.cancel_unstarted();
+        }
+        // Admission must precede waking a driver which may run on another task.
+        self.client.client.admit(access)?;
         if let Some(startup_trigger) = &self.startup_trigger {
             startup_trigger.send_replace(true);
         }
-        self.client.client().await
+        self.client.client_with_authority(access).await
     }
 
     async fn client_for_call(&self) -> Result<ManagedClient, StartupOutcomeError> {
-        let result = self.client().await;
+        self.client_for_call_with_authority(crate::McpAttemptAccess::Unscoped)
+            .await
+    }
+
+    async fn client_for_call_with_authority(
+        &self,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Result<ManagedClient, StartupOutcomeError> {
+        let result = self.client_with_authority(access).await;
         if matches!(result, Err(StartupOutcomeError::Failed { .. }))
             && !self.client.cancel_token.is_cancelled()
             && let Some(reconnect) = &self.client.startup_reconnect
         {
-            if let Some(attempt) = reconnect.reconnect_in_background() {
+            if let Some(attempt) = reconnect.reconnect_with_authority(access) {
                 return attempt.await;
             }
             // Recovery may have finished between reading the client and joining it.
-            return self.client().await;
+            return self.client_with_authority(access).await;
         }
         result
     }
@@ -914,6 +937,7 @@ impl McpConnectionSet {
                     ConnectionKey {
                         server_name: server_name.clone(),
                         identity: connection_identity.clone(),
+                        attempt_requirement: crate::McpAttemptRequirement::Ungated,
                         account: codex_apps_tools_cache_key.clone(),
                         auth_state: auth_manager.as_ref().map(|manager| {
                             (
@@ -965,6 +989,7 @@ impl McpConnectionSet {
                 catalog_item_limit,
                 connection_pool,
                 publish_apps,
+                crate::McpAttemptRequirement::Ungated,
             );
             // A forced reconnect must also wait for the previously published helper to exit.
             if let Some(previous) = existing_ema.and_then(|set| set.servers.get(&server_name)) {
@@ -1535,3 +1560,7 @@ impl McpConnectionSet {
 #[cfg(test)]
 #[path = "connection_manager_tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(test)]
+#[path = "connection_manager/startup_admission_tests.rs"]
+mod startup_admission_tests;

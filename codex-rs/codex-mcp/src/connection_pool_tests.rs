@@ -150,6 +150,7 @@ impl InProcessTransportFactory for TestServer {
 
 pub(crate) fn key(context: &McpRuntimeContext, config: &McpServerConfig) -> ConnectionKey {
     ConnectionKey {
+        attempt_requirement: crate::McpAttemptRequirement::Ungated,
         server_name: "test_server".to_string(),
         identity: reusable_server_identity("test_server", config, context),
         account: ConnectorRuntimeContextKey::personal(
@@ -569,7 +570,7 @@ async fn shared_startup_survives_first_chat_cancellation_and_rejects_released_bi
         permits = server.started_listings.acquire_many(2) => permits.unwrap().forget(),
     }
     let mut owned = create_ready_async_managed_client(Vec::new()).await;
-    owned.client = futures::future::ready(Ok(client.clone())).boxed().shared();
+    owned.client = (futures::future::ready(Ok(client.clone())).boxed().shared()).into();
     owned.shutdown().await;
     let (resources, templates) = waiting.await;
     assert!(resources.is_err());
@@ -602,7 +603,7 @@ async fn shared_startup_survives_first_chat_cancellation_and_rejects_released_bi
         )
         .await
         .unwrap();
-    owned.client = futures::future::ready(Ok(other)).boxed().shared();
+    owned.client = (futures::future::ready(Ok(other)).boxed().shared()).into();
     owned.shutdown().await;
 }
 
@@ -709,7 +710,7 @@ async fn callback_during_startup_releases_waiting_chats_without_sharing_authorit
         .await
         .unwrap();
     let mut owner = create_ready_async_managed_client(Vec::new()).await;
-    owner.client = futures::future::ready(Ok(first.clone())).boxed().shared();
+    owner.client = (futures::future::ready(Ok(first.clone())).boxed().shared()).into();
     tokio::time::timeout(Duration::from_secs(10), owner.shutdown())
         .await
         .expect("private owner shutdown must not wait for the joining chat");
@@ -2144,4 +2145,133 @@ async fn pooled_worker_context_preserves_connection_identity_and_external_proces
             .joined,
         1
     );
+}
+
+#[test]
+fn account_required_and_ungated_clients_cannot_share_a_pool_key() {
+    let context = context();
+    let first = key(&context, &config());
+    let mut required = first.clone();
+    required.attempt_requirement = crate::McpAttemptRequirement::Required;
+    assert!(first != required);
+    assert!(required == required.clone());
+}
+
+#[tokio::test]
+async fn physical_continuation_keeps_admitted_account_work_after_chat_cancellation() {
+    use crate::{McpAttemptAccess, McpAttemptRefused, McpAttemptRequirement, McpAttemptWork};
+    struct Work(Arc<AtomicUsize>, Arc<AtomicBool>);
+    impl McpAttemptWork for Work {
+        fn derive_attempt(&self) -> Result<Box<dyn McpAttemptWork>, McpAttemptRefused> {
+            if self.1.load(Ordering::SeqCst) {
+                return Err(McpAttemptRefused);
+            }
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(Self(Arc::clone(&self.0), Arc::clone(&self.1))))
+        }
+    }
+    impl Drop for Work {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    let live = Arc::new(AtomicUsize::new(1));
+    let refused = Arc::new(AtomicBool::new(false));
+    let work = Work(Arc::clone(&live), Arc::clone(&refused));
+    let pool = McpConnectionPool::default();
+    let mut identity = key(&context(), &config());
+    identity.attempt_requirement = McpAttemptRequirement::Required;
+    let slot = Arc::new(ConnectionSlot::default());
+    let cancellation = CancellationToken::new();
+    let cancel = cancellation.clone();
+    let entered = Arc::new(Notify::new());
+    let entry = Arc::clone(&entered);
+    let (finish, receive) = tokio::sync::oneshot::channel();
+    let held = Arc::new(Mutex::new(Some(receive)));
+    let pool_for_start = pool.clone();
+    let startup = crate::rmcp_client::ClientStartup::new_with_work(
+        move |work| {
+            let work = work.map(Arc::new);
+            async move {
+                pool_for_start
+                    .connect(slot, identity, Arc::default(), None, cancel, |_, _, _| {
+                        crate::rmcp_client::physical_continuation(
+                            McpAttemptRequirement::Required,
+                            work.clone(),
+                            |physical_work| {
+                                let held =
+                                    held.lock().unwrap().take().expect("one physical factory");
+                                let entry = Arc::clone(&entry);
+                                async move {
+                                    let _work = physical_work;
+                                    entry.notify_one();
+                                    held.await.expect("finish actual pool worker");
+                                    Err(StartupOutcomeError::Cancelled)
+                                }
+                                .boxed()
+                                .shared()
+                            },
+                        )
+                    })
+                    .await
+            }
+            .boxed()
+            .shared()
+        },
+        McpAttemptRequirement::Required,
+    );
+    // No pool acquisition/worker may be constructed by an unscoped observer.
+    assert!(matches!(
+        startup.observe(McpAttemptAccess::Unscoped).await,
+        Err(StartupOutcomeError::Refused(_))
+    ));
+    assert_eq!(
+        pool.observe_workers_until(tokio::time::Instant::now())
+            .await
+            .registered_at_end,
+        0
+    );
+    startup.admit(McpAttemptAccess::Admitted(&work)).unwrap();
+    refused.store(true, Ordering::SeqCst); // No fresh admission during this original invocation.
+    let mut chat = Box::pin(startup.observe(McpAttemptAccess::Unscoped));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::select! {
+            _ = entered.notified() => {},
+            _ = chat.as_mut() => panic!("chat returned before physical start"),
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        live.load(Ordering::SeqCst),
+        2,
+        "caller plus the admitted invocation jointly held by its original continuations"
+    );
+    cancellation.cancel();
+    assert!(matches!(chat.await, Err(StartupOutcomeError::Cancelled)));
+    assert_eq!(
+        live.load(Ordering::SeqCst),
+        2,
+        "the counted invocation outlives its cancelled chat observer"
+    );
+    let pending = pool
+        .observe_workers_until(tokio::time::Instant::now())
+        .await;
+    assert!(
+        pending
+            .counts
+            .iter()
+            .any(|row| row.kind == PoolWorkerKind::Startup && row.pending == 1)
+    );
+    finish.send(()).unwrap();
+    let joined = pool
+        .observe_workers_until(tokio::time::Instant::now() + Duration::from_secs(3))
+        .await;
+    assert!(
+        joined
+            .counts
+            .iter()
+            .any(|row| row.kind == PoolWorkerKind::Startup && row.joined == 1 && row.pending == 0)
+    );
+    assert_eq!(live.load(Ordering::SeqCst), 1);
 }

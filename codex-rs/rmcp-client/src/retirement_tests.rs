@@ -761,7 +761,6 @@ async fn expired_latched_deadline_is_retained_and_drives_zero_cleanup() {
     assert!(!registry.retirement_proof().is_proven());
 }
 
-
 #[tokio::test]
 async fn direct_service_wait_requests_cancellation_and_observes_exact_close() {
     let transport = controlled_transport(false);
@@ -770,10 +769,15 @@ async fn direct_service_wait_requests_cancellation_and_observes_exact_close() {
     let (transport, receipt) = AcknowledgedTransport::new(transport);
     let service = ManagedRunningService::new(serve_directly((), transport, None), receipt);
     assert_eq!(
-        service.wait_until(Instant::now() + Duration::from_secs(5)).await,
+        service
+            .wait_until(Instant::now() + Duration::from_secs(5))
+            .await,
         Ok(LogicalCloseAck),
     );
     assert_eq!(closes.load(Ordering::SeqCst), 1);
-    assert_eq!(service.wait_until(Instant::now()).await, Ok(LogicalCloseAck));
+    assert_eq!(
+        service.wait_until(Instant::now()).await,
+        Ok(LogicalCloseAck)
+    );
     assert_eq!(closes.load(Ordering::SeqCst), 1);
 }

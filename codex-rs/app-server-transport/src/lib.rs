@@ -20,6 +20,7 @@ pub use outgoing_message::OutgoingResponse;
 pub use outgoing_message::QueuedOutgoingMessage;
 pub use transport::AppServerStartupLock;
 pub use transport::AppServerTransport;
+pub use transport::PeerExecutableIdentity;
 pub use transport::AppServerTransportParseError;
 pub use transport::CHANNEL_CAPACITY;
 pub use transport::ConnectionOrigin;

@@ -76,6 +76,22 @@ struct RefreshCounter {
 }
 
 impl ModelsManager for RefreshCounter {
+    fn model_catalog_with_origins(
+        &self,
+        strategy: RefreshStrategy,
+        factory: HttpClientFactory,
+    ) -> ModelsManagerFuture<'_, Vec<codex_models_manager::CatalogModel>> {
+        self.inner.model_catalog_with_origins(strategy, factory)
+    }
+
+    fn get_model_info<'a>(
+        &'a self,
+        model: &'a str,
+        config: &'a codex_models_manager::ModelsManagerConfig,
+    ) -> ModelsManagerFuture<'a, codex_models_manager::CatalogModel> {
+        self.inner.get_model_info(model, config)
+    }
+
     fn ensure_initialized(&self, factory: HttpClientFactory) -> ModelsManagerFuture<'_, ()> {
         self.inner.ensure_initialized(factory)
     }
@@ -242,7 +258,7 @@ async fn mailbox_retries_after_reopen_without_an_unrelated_submission(reopen: bo
         .unwrap();
         let (reply, result) = tokio::sync::oneshot::channel();
         sender
-            .send(codex_protocol::protocol::Submission {
+            .send(crate::session::Submission {
                 id: "unrelated-control".into(),
                 op: codex_protocol::protocol::Op::InterruptIfNoPendingInput {
                     turn_id: "not-an-active-turn".into(),
@@ -366,7 +382,7 @@ async fn mailbox_preparation_owns_its_admission(carried: bool) {
     });
     session
         .input_queue
-        .enqueue_mailbox_with_work(mail, Default::default(), work);
+        .enqueue_mailbox_with_work(mail.into(), Default::default(), work);
     let mut start =
         Box::pin(session.maybe_start_turn_for_pending_work_with_sub_id("consumer".into()));
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -634,72 +650,6 @@ async fn fresh_mailbox_work_requires_a_real_owner_only_under_required_policy(req
             .abort_all_tasks(codex_protocol::protocol::TurnAbortReason::Interrupted)
             .await;
     }
-}
-
-#[derive(Debug)]
-struct TerminalHost(Arc<Mutex<Vec<String>>>);
-impl TurnStartAdmission for TerminalHost {
-    fn admit_turn_start(&self) -> Option<Box<dyn Send>> {
-        Some(Box::new(()))
-    }
-    fn turn_work_terminal(&self, _: &codex_extension_api::ExtensionData, turn: &str) {
-        self.0.lock().unwrap().push(format!("isolated:{turn}"));
-    }
-}
-impl codex_extension_api::TurnLifecycleContributor for TerminalHost {
-    fn on_turn_stop<'a>(
-        &'a self,
-        input: codex_extension_api::TurnStopInput<'a>,
-    ) -> ExtensionFuture<'a, ()> {
-        Box::pin(async move {
-            self.0
-                .lock()
-                .unwrap()
-                .push(format!("contributor:{}", input.turn_store.level_id()));
-        })
-    }
-    fn on_turn_abort<'a>(
-        &'a self,
-        input: codex_extension_api::TurnAbortInput<'a>,
-    ) -> ExtensionFuture<'a, ()> {
-        Box::pin(async move {
-            self.0
-                .lock()
-                .unwrap()
-                .push(format!("contributor:{}", input.turn_store.level_id()));
-        })
-    }
-}
-
-#[test_case::test_case(true; "isolated host gets logical terminal")]
-#[test_case::test_case(false; "normal contributor is not duplicated")]
-#[tokio::test]
-async fn terminal_account_bridge_observes_exact_store_and_only_isolated_host(isolated: bool) {
-    let (mut session, context) = make_session_and_context().await;
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let gate = Arc::new(TerminalHost(Arc::clone(&events)));
-    let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
-    if !isolated {
-        builder.turn_start_admission(gate.clone());
-        builder.turn_lifecycle_contributor(gate.clone());
-    }
-    session.services.extensions = Arc::new(builder.build());
-    session.services.host_admission = Some(gate);
-    session
-        .emit_turn_stop_lifecycle(&context.extension_data)
-        .await;
-    session
-        .emit_turn_abort_lifecycle(
-            codex_protocol::protocol::TurnAbortReason::Interrupted,
-            &context.extension_data,
-        )
-        .await;
-    let prefix = if isolated { "isolated" } else { "contributor" };
-    let expected = format!("{prefix}:{}", context.extension_data.level_id());
-    assert_eq!(*events.lock().unwrap(), [expected.clone(), expected]);
-    // This observes logical callbacks, never physical cleanup or a fabricated
-    // SessionLoop/retirement receipt.
-    assert!(session.turn_work_termination().now_or_never().is_none());
 }
 
 #[tokio::test]

@@ -147,7 +147,7 @@ async fn detached_observer_joins_before_reporting_completion() {
     let handle = registry.register(tokio::spawn(async move {
         let _ = receive.await;
     }));
-    let mut observer = drop(handle.detach());
+    let mut observer = handle.detach();
     assert!(
         tokio::time::timeout(Duration::from_millis(1), &mut observer)
             .await

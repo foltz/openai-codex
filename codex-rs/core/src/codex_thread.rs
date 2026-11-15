@@ -409,6 +409,17 @@ impl CodexThread {
         self.io.session_loop_termination.clone().await;
     }
 
+    /// Observe this exact original loop without retaining CodexThread or consuming its result.
+    /// Termination includes panic/cancellation and does not certify resource cleanup.
+    pub fn termination_receipt(
+        &self,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static + use<> {
+        let termination = self.io.session_loop_termination.clone();
+        async move {
+            termination.await;
+        }
+    }
+
     pub(crate) async fn emit_subagent_session_started(
         &self,
         client_metadata: AppServerClientMetadata,

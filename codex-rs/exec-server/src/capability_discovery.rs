@@ -58,7 +58,11 @@ pub async fn discover_capability_roots(
         .buffered(MAX_CONCURRENT_ROOTS)
         .collect()
         .await;
-    Ok(CapabilityRootsDiscoverResponse { roots })
+    Ok(CapabilityRootsDiscoverResponse {
+        roots,
+        sandbox_cleanup: None,
+        no_sandbox_launch: false,
+    })
 }
 
 pub(crate) async fn discover_root(

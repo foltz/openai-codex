@@ -1,3 +1,6 @@
+use codex_exec_server_protocol::{
+    SandboxCleanupSummary, no_sandbox_launch_from_error, sandbox_cleanup_from_error,
+};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::future::Future;
@@ -985,6 +988,41 @@ impl ExecServerClient {
             },
         )
         .await
+    }
+
+    /// Calls a filesystem method and keeps the executor's sandbox cleanup
+    /// receipt and "no launch" mark from a JSON-RPC error's `data`; successful
+    /// responses carry them in their own fields. The error itself is unchanged.
+    pub(crate) async fn call_fs_with_error_receipt<P, T>(
+        &self,
+        method: &str,
+        params: &P,
+    ) -> (
+        Result<T, ExecServerError>,
+        Option<SandboxCleanupSummary>,
+        bool,
+    )
+    where
+        P: serde::Serialize,
+        T: serde::de::DeserializeOwned,
+    {
+        let rpc_client = match self.rpc_client().await {
+            Ok(rpc_client) => rpc_client,
+            Err(error) => return (Err(error), None, false),
+        };
+        let result = rpc_client.call(method, params).await;
+        let (sandbox_cleanup, no_sandbox_launch) = match &result {
+            Err(RpcCallError::Server(error)) => (
+                sandbox_cleanup_from_error(error),
+                no_sandbox_launch_from_error(error),
+            ),
+            _ => (None, false),
+        };
+        (
+            self.map_rpc_call_result(result),
+            sandbox_cleanup,
+            no_sandbox_launch,
+        )
     }
 
     pub async fn fs_read_file(
@@ -2001,6 +2039,130 @@ async fn handle_server_notification(
 
 #[cfg(test)]
 mod tests {
+    async fn scripted_client(
+        respond: impl Fn(codex_exec_server_protocol::JSONRPCRequest) -> JSONRPCMessage + Send + 'static,
+    ) -> (ExecServerClient, tokio::task::JoinHandle<()>) {
+        let (client_stdin, server_reader) = duplex(1 << 20);
+        let (mut server_writer, client_stdout) = duplex(1 << 20);
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_reader).lines();
+            let initialize = read_jsonrpc_line(&mut lines).await;
+            let request = match initialize {
+                JSONRPCMessage::Request(request) if request.method == INITIALIZE_METHOD => request,
+                other => panic!("expected initialize request, got {other:?}"),
+            };
+            write_jsonrpc_line(
+                &mut server_writer,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: request.id,
+                    result: serde_json::to_value(InitializeResponse {
+                        session_id: "session-1".to_string(),
+                        environment_info: None,
+                    })
+                    .expect("initialize response should serialize"),
+                }),
+            )
+            .await;
+            match read_jsonrpc_line(&mut lines).await {
+                JSONRPCMessage::Notification(notification)
+                    if notification.method == INITIALIZED_METHOD => {}
+                other => panic!("expected initialized notification, got {other:?}"),
+            }
+            while let Ok(Some(line)) = lines.next_line().await {
+                let message = serde_json::from_str(&line).expect("json-rpc line should parse");
+                if let JSONRPCMessage::Request(request) = message {
+                    write_jsonrpc_line(&mut server_writer, respond(request)).await;
+                }
+            }
+        });
+        let client = ExecServerClient::connect(
+            JsonRpcConnection::from_stdio(
+                client_stdout,
+                client_stdin,
+                "test-exec-server-client".to_string(),
+            ),
+            ExecServerClientConnectOptions::default(),
+        )
+        .await
+        .expect("client should connect");
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn fs_error_keeps_cleanup_receipt_from_error_data() {
+        let receipt = crate::protocol::SandboxCleanupSummary {
+            state: crate::protocol::SandboxCleanupState::Complete,
+            reaped: 2,
+            preserved_unproven: 0,
+            host_owned: 0,
+            handed_off: 0,
+            timed_out: 0,
+            joined: true,
+        };
+        let (client, server) = scripted_client(move |request| {
+            JSONRPCMessage::Error(codex_exec_server_protocol::JSONRPCError {
+                id: request.id,
+                error: crate::protocol::attach_sandbox_cleanup_to_error(
+                    codex_exec_server_protocol::JSONRPCErrorError {
+                        code: -32004,
+                        data: None,
+                        message: "missing".to_string(),
+                    },
+                    Some(receipt),
+                ),
+            })
+        })
+        .await;
+
+        let (result, sandbox_cleanup, no_sandbox_launch) = client
+            .call_fs_with_error_receipt::<_, crate::protocol::FsReadFileResponse>(
+                crate::protocol::FS_READ_FILE_METHOD,
+                &crate::protocol::WireFsReadFileParams::from(crate::protocol::FsReadFileParams {
+                    path: PathUri::from_host_native_path(std::env::temp_dir())
+                        .expect("temp dir URI"),
+                    follow_symlinks: None,
+                    sandbox: None,
+                }),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ExecServerError::Server { code: -32004, .. })
+        ));
+        assert_eq!((sandbox_cleanup, no_sandbox_launch), (Some(receipt), false));
+        drop(client);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn fs_decode_errors_cannot_invent_cleanup() {
+        let (client, server) = scripted_client(|request| {
+            assert_eq!(request.method, crate::protocol::FS_READ_FILE_METHOD);
+            JSONRPCMessage::Response(JSONRPCResponse {
+                id: request.id,
+                result: serde_json::json!({"dataBase64": 123,
+                    "sandboxCleanup": {"state": "complete"}, "noSandboxLaunch": true}),
+            })
+        })
+        .await;
+        let (result, cleanup, no_launch) = client
+            .call_fs_with_error_receipt::<_, crate::protocol::FsReadFileResponse>(
+                crate::protocol::FS_READ_FILE_METHOD,
+                &crate::protocol::WireFsReadFileParams::from(crate::protocol::FsReadFileParams {
+                    path: PathUri::from_host_native_path(std::env::temp_dir()).expect("temp URI"),
+                    follow_symlinks: None,
+                    sandbox: None,
+                }),
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(cleanup, None);
+        assert!(!no_launch);
+        drop(client);
+        server.abort();
+    }
+
     use codex_exec_server_protocol::JSONRPCMessage;
     use codex_exec_server_protocol::JSONRPCNotification;
     use codex_exec_server_protocol::JSONRPCResponse;

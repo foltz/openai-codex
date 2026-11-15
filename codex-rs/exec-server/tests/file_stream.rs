@@ -842,3 +842,27 @@ fn read_only_sandbox(path: std::path::PathBuf) -> codex_exec_server::FileSystemS
     );
     FileSystemSandboxContext::from_permission_profile(permissions, cwd)
 }
+
+#[tokio::test]
+async fn streaming_replacement_receipt_preserves_bytes_and_positive_no_launch() -> Result<()> {
+    let server = exec_server().await?;
+    let local = Environment::create_for_tests(None)?.get_filesystem();
+    let remote = connect_file_system(server.websocket_url())?;
+    let tmp = TempDir::new()?;
+    let target = tmp.path().join("receipt.bin");
+    let path = PathUri::from_host_native_path(&target)?;
+    for filesystem in [&local, &remote] {
+        let bytes = futures::stream::iter([Ok(bytes::Bytes::from_static(b"receipt"))]).boxed();
+        let outcome = filesystem
+            .write_file_stream_with_receipt(&path, bytes, None)
+            .await;
+        assert_eq!(outcome.result?, 7);
+        assert_eq!(
+            outcome.launch,
+            codex_file_system::SandboxLaunch::NotLaunched
+        );
+        assert_eq!(outcome.sandbox_cleanup, None);
+        assert_eq!(std::fs::read(&target)?, b"receipt");
+    }
+    Ok(())
+}

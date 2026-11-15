@@ -308,6 +308,8 @@ pub(crate) async fn run_direct_request(
                 .await
                 .map_err(map_fs_error)?;
             Ok(FsHelperPayload::ReadFile(FsReadFileResponse {
+                sandbox_cleanup: None,
+                no_sandbox_launch: false,
                 data_base64: STANDARD.encode(data),
             }))
         }
@@ -328,7 +330,10 @@ pub(crate) async fn run_direct_request(
                 )
                 .await
                 .map_err(map_fs_error)?;
-            Ok(FsHelperPayload::WriteFile(FsWriteFileResponse {}))
+            Ok(FsHelperPayload::WriteFile(FsWriteFileResponse {
+                sandbox_cleanup: None,
+                no_sandbox_launch: false,
+            }))
         }
         FsHelperRequest::CreateDirectory(params) => {
             file_system
@@ -343,7 +348,10 @@ pub(crate) async fn run_direct_request(
                 .await
                 .map_err(map_fs_error)?;
             Ok(FsHelperPayload::CreateDirectory(
-                FsCreateDirectoryResponse {},
+                FsCreateDirectoryResponse {
+                    sandbox_cleanup: None,
+                    no_sandbox_launch: false,
+                },
             ))
         }
         FsHelperRequest::GetMetadata(params) => {
@@ -358,6 +366,8 @@ pub(crate) async fn run_direct_request(
                 .await
                 .map_err(map_fs_error)?;
             Ok(FsHelperPayload::GetMetadata(FsGetMetadataResponse {
+                sandbox_cleanup: None,
+                no_sandbox_launch: false,
                 is_directory: metadata.is_directory,
                 is_file: metadata.is_file,
                 is_symlink: metadata.is_symlink,
@@ -372,6 +382,8 @@ pub(crate) async fn run_direct_request(
                 .await
                 .map_err(map_fs_error)?;
             Ok(FsHelperPayload::Canonicalize(FsCanonicalizeResponse {
+                sandbox_cleanup: None,
+                no_sandbox_launch: false,
                 path,
             }))
         }
@@ -388,6 +400,8 @@ pub(crate) async fn run_direct_request(
                 })
                 .collect();
             Ok(FsHelperPayload::ReadDirectory(FsReadDirectoryResponse {
+                sandbox_cleanup: None,
+                no_sandbox_launch: false,
                 entries,
             }))
         }
@@ -396,7 +410,7 @@ pub(crate) async fn run_direct_request(
                 .walk(&params.path, params.options, /*sandbox*/ None)
                 .await
                 .map_err(map_fs_error)?;
-            Ok(FsHelperPayload::Walk(outcome))
+            Ok(FsHelperPayload::Walk(outcome.into()))
         }
         FsHelperRequest::Remove(params) => {
             file_system
@@ -411,7 +425,10 @@ pub(crate) async fn run_direct_request(
                 )
                 .await
                 .map_err(map_fs_error)?;
-            Ok(FsHelperPayload::Remove(FsRemoveResponse {}))
+            Ok(FsHelperPayload::Remove(FsRemoveResponse {
+                sandbox_cleanup: None,
+                no_sandbox_launch: false,
+            }))
         }
         FsHelperRequest::Copy(params) => {
             file_system
@@ -425,7 +442,10 @@ pub(crate) async fn run_direct_request(
                 )
                 .await
                 .map_err(map_fs_error)?;
-            Ok(FsHelperPayload::Copy(FsCopyResponse {}))
+            Ok(FsHelperPayload::Copy(FsCopyResponse {
+                sandbox_cleanup: None,
+                no_sandbox_launch: false,
+            }))
         }
     }
 }
@@ -485,7 +505,11 @@ mod tests {
             assert!(request_path.starts_with("file:"));
 
             let response = serde_json::to_value(FsHelperResponse::Ok(
-                FsHelperPayload::Canonicalize(FsCanonicalizeResponse { path }),
+                FsHelperPayload::Canonicalize(FsCanonicalizeResponse {
+                    sandbox_cleanup: None,
+                    no_sandbox_launch: false,
+                    path,
+                }),
             ))?;
             assert_eq!(
                 response,

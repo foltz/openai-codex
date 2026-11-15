@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use codex_file_system::FileSystemOutcome;
 use codex_utils_path_uri::PathUri;
 use tokio::io;
 use uuid::Uuid;
@@ -7,13 +8,15 @@ use super::map_remote_error;
 use crate::ExecServerClient;
 use crate::FILE_READ_CHUNK_SIZE;
 use crate::FileSystemReadStream;
-use crate::FileSystemResult;
 use crate::FileSystemSandboxContext;
+use crate::protocol::FS_OPEN_METHOD;
 use crate::protocol::FS_READ_BLOCK_METHOD;
 use crate::protocol::FsCloseParams;
 use crate::protocol::FsOpenMode;
 use crate::protocol::FsOpenParams;
+use crate::protocol::FsOpenResponse;
 use crate::protocol::FsReadBlockParams;
+use crate::protocol::WireFsOpenParams;
 
 struct FileReadRegistration {
     client: ExecServerClient,
@@ -22,28 +25,51 @@ struct FileReadRegistration {
     active: bool,
 }
 
+/// Opens a remote read stream. The executor's `fs/open` runs its sandboxed
+/// open helper to completion (the helper exits and its launch's cleanup is
+/// collected) before it answers, so the receipt returned here is terminal for
+/// that launch; no launch stays alive while the stream is read.
 pub(super) async fn open(
     client: ExecServerClient,
     path: PathUri,
     sandbox: Option<&FileSystemSandboxContext>,
-) -> FileSystemResult<FileSystemReadStream> {
+) -> FileSystemOutcome<FileSystemReadStream> {
     let registration = FileReadRegistration {
         client,
         handle_id: Uuid::new_v4().simple().to_string(),
         runtime: tokio::runtime::Handle::try_current().ok(),
         active: true,
     };
-    registration
+    let sandbox_requested = sandbox.is_some();
+    let (opened, error_receipt, error_no_launch) = registration
         .client
-        .fs_open(FsOpenParams {
-            handle_id: registration.handle_id.clone(),
-            path,
-            mode: FsOpenMode::Read,
-            sandbox: sandbox.cloned(),
-        })
-        .await
-        .map_err(map_remote_error)?;
-    Ok(FileSystemReadStream::new(futures::stream::try_unfold(
+        .call_fs_with_error_receipt::<_, FsOpenResponse>(
+            FS_OPEN_METHOD,
+            &WireFsOpenParams::from(FsOpenParams {
+                handle_id: registration.handle_id.clone(),
+                path,
+                mode: FsOpenMode::Read,
+                sandbox: sandbox.cloned(),
+            }),
+        )
+        .await;
+    let (result, sandbox_cleanup, no_sandbox_launch) = match opened {
+        Ok(response) => (
+            Ok(read_stream(registration)),
+            response.sandbox_cleanup,
+            response.no_sandbox_launch,
+        ),
+        Err(error) => (Err(map_remote_error(error)), error_receipt, error_no_launch),
+    };
+    FileSystemOutcome {
+        result,
+        sandbox_cleanup,
+        launch: super::launch_evidence(sandbox_requested, sandbox_cleanup, no_sandbox_launch),
+    }
+}
+
+fn read_stream(registration: FileReadRegistration) -> FileSystemReadStream {
+    FileSystemReadStream::new(futures::stream::try_unfold(
         Some((registration, 0_u64)),
         |state| async move {
             let Some((mut registration, offset)) = state else {
@@ -100,7 +126,7 @@ pub(super) async fn open(
             })?;
             Ok(Some((chunk, Some((registration, next_offset)))))
         },
-    )))
+    ))
 }
 
 impl Drop for FileReadRegistration {

@@ -1,3 +1,4 @@
+pub use codex_protocol::exec_output::{SandboxCleanupState, SandboxCleanupSummary};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -624,6 +625,13 @@ pub struct WireFsReadFileParams {
 #[serde(rename_all = "camelCase")]
 pub struct FsReadFileResponse {
     pub data_base64: String,
+
+    /// Executor-owned cleanup proof. Missing from older peers remains unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_cleanup: Option<SandboxCleanupSummary>,
+    /// Positive absence; false/omitted with no receipt never implies cleanup.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_sandbox_launch: bool,
 }
 
 /// Defaults preserve read-only opens for legacy callers.
@@ -662,6 +670,13 @@ pub struct WireFsOpenParams {
 #[serde(rename_all = "camelCase")]
 pub struct FsOpenResponse {
     pub handle_id: String,
+
+    /// Executor-owned cleanup proof. Missing from older peers remains unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_cleanup: Option<SandboxCleanupSummary>,
+    /// Positive absence; false/omitted with no receipt never implies cleanup.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_sandbox_launch: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -726,7 +741,14 @@ pub struct WireFsWriteFileParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct FsWriteFileResponse {}
+pub struct FsWriteFileResponse {
+    /// Executor-owned cleanup proof. Missing from older peers remains unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_cleanup: Option<SandboxCleanupSummary>,
+    /// Positive absence; false/omitted with no receipt never implies cleanup.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_sandbox_launch: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -751,7 +773,14 @@ pub struct WireFsCreateDirectoryParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct FsCreateDirectoryResponse {}
+pub struct FsCreateDirectoryResponse {
+    /// Executor-owned cleanup proof. Missing from older peers remains unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_cleanup: Option<SandboxCleanupSummary>,
+    /// Positive absence; false/omitted with no receipt never implies cleanup.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_sandbox_launch: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -802,6 +831,13 @@ pub struct FsGetMetadataResponse {
     pub size: u64,
     pub created_at_ms: i64,
     pub modified_at_ms: i64,
+
+    /// Executor-owned cleanup proof. Missing from older peers remains unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_cleanup: Option<SandboxCleanupSummary>,
+    /// Positive absence; false/omitted with no receipt never implies cleanup.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_sandbox_launch: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -823,6 +859,13 @@ pub struct WireFsCanonicalizeParams {
 #[serde(rename_all = "camelCase")]
 pub struct FsCanonicalizeResponse {
     pub path: PathUri,
+
+    /// Executor-owned cleanup proof. Missing from older peers remains unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_cleanup: Option<SandboxCleanupSummary>,
+    /// Positive absence; false/omitted with no receipt never implies cleanup.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_sandbox_launch: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -852,6 +895,13 @@ pub struct FsReadDirectoryEntry {
 #[serde(rename_all = "camelCase")]
 pub struct FsReadDirectoryResponse {
     pub entries: Vec<FsReadDirectoryEntry>,
+
+    /// Executor-owned cleanup proof. Missing from older peers remains unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_cleanup: Option<SandboxCleanupSummary>,
+    /// Positive absence; false/omitted with no receipt never implies cleanup.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_sandbox_launch: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -871,7 +921,34 @@ pub struct WireFsWalkParams {
     sandbox: Option<WireFileSystemSandboxContext>,
 }
 
-pub type FsWalkResponse = WalkOutcome;
+/// `fs/walk` result: the walk outcome's fields at the top level (the legacy
+/// shape) plus the executor's sandbox cleanup receipt.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsWalkResponse {
+    #[serde(flatten)]
+    pub outcome: WalkOutcome,
+    /// Cleanup outcome of the sandboxed helper launch(es) that served this
+    /// walk, collected by the executor. Omitted when none ran and by older
+    /// executors; older clients ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_cleanup: Option<SandboxCleanupSummary>,
+    /// True when the executor positively ran no Linux sandbox launcher for
+    /// this request (so no `sandboxCleanup` is owed). Absent or false with no
+    /// `sandboxCleanup` means unknown: unproven.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_sandbox_launch: bool,
+}
+
+impl From<WalkOutcome> for FsWalkResponse {
+    fn from(outcome: WalkOutcome) -> Self {
+        Self {
+            outcome,
+            sandbox_cleanup: None,
+            no_sandbox_launch: false,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -898,7 +975,14 @@ pub struct WireFsRemoveParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct FsRemoveResponse {}
+pub struct FsRemoveResponse {
+    /// Executor-owned cleanup proof. Missing from older peers remains unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_cleanup: Option<SandboxCleanupSummary>,
+    /// Positive absence; false/omitted with no receipt never implies cleanup.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_sandbox_launch: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -921,7 +1005,14 @@ pub struct WireFsCopyParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct FsCopyResponse {}
+pub struct FsCopyResponse {
+    /// Executor-owned cleanup proof. Missing from older peers remains unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_cleanup: Option<SandboxCleanupSummary>,
+    /// Positive absence; false/omitted with no receipt never implies cleanup.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_sandbox_launch: bool,
+}
 
 /// Roots to inspect for plugin and skill capability manifests.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1033,6 +1124,13 @@ impl WireCapabilityRootsDiscoverParams {
 #[serde(rename_all = "camelCase")]
 pub struct CapabilityRootsDiscoverResponse {
     pub roots: Vec<CapabilityRootDiscovery>,
+
+    /// Executor-owned cleanup proof. Missing from older peers remains unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_cleanup: Option<SandboxCleanupSummary>,
+    /// Positive absence; false/omitted with no receipt never implies cleanup.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_sandbox_launch: bool,
 }
 
 /// UTF-8 capability contents materialized by the exec-server.
@@ -1266,6 +1364,82 @@ pub struct ExecClosedNotification {
     pub seq: u64,
 }
 
+/// Key of the executor's sandbox cleanup receipt inside a JSON-RPC error's
+/// `data` object, set when a sandboxed helper ran for the failed request. The
+/// failure and the cleanup state stay distinct: a failed request may carry a
+/// `complete` receipt.
+pub const SANDBOX_CLEANUP_ERROR_DATA_KEY: &str = "sandboxCleanup";
+
+/// Attaches a cleanup receipt to an error's `data` object (creating it when
+/// absent). A non-object `data` is left untouched rather than replaced.
+pub fn attach_sandbox_cleanup_to_error(
+    mut error: JSONRPCErrorError,
+    sandbox_cleanup: Option<SandboxCleanupSummary>,
+) -> JSONRPCErrorError {
+    let Some(sandbox_cleanup) = sandbox_cleanup else {
+        return error;
+    };
+    let Ok(value) = serde_json::to_value(sandbox_cleanup) else {
+        return error;
+    };
+    match &mut error.data {
+        None => {
+            let mut data = serde_json::Map::new();
+            data.insert(SANDBOX_CLEANUP_ERROR_DATA_KEY.to_string(), value);
+            error.data = Some(serde_json::Value::Object(data));
+        }
+        Some(serde_json::Value::Object(data)) => {
+            data.insert(SANDBOX_CLEANUP_ERROR_DATA_KEY.to_string(), value);
+        }
+        Some(_) => {}
+    }
+    error
+}
+
+/// Key marking, inside a JSON-RPC error's `data` object, that the executor
+/// positively ran no Linux sandbox launcher for the failed request.
+pub const NO_SANDBOX_LAUNCH_ERROR_DATA_KEY: &str = "noSandboxLaunch";
+
+/// Marks an error as served without any Linux sandbox launch (creating
+/// `data` when absent). A non-object `data` is left untouched, which keeps
+/// the request's launch evidence unknown.
+pub fn mark_no_sandbox_launch_in_error(mut error: JSONRPCErrorError) -> JSONRPCErrorError {
+    match &mut error.data {
+        None => {
+            let mut data = serde_json::Map::new();
+            data.insert(
+                NO_SANDBOX_LAUNCH_ERROR_DATA_KEY.to_string(),
+                serde_json::Value::Bool(true),
+            );
+            error.data = Some(serde_json::Value::Object(data));
+        }
+        Some(serde_json::Value::Object(data)) => {
+            data.insert(
+                NO_SANDBOX_LAUNCH_ERROR_DATA_KEY.to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
+        Some(_) => {}
+    }
+    error
+}
+
+/// Whether an executor marked the error as served without a sandbox launch.
+pub fn no_sandbox_launch_from_error(error: &JSONRPCErrorError) -> bool {
+    error
+        .data
+        .as_ref()
+        .and_then(|data| data.get(NO_SANDBOX_LAUNCH_ERROR_DATA_KEY))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Reads the cleanup receipt from an error's `data`, if an executor set one.
+pub fn sandbox_cleanup_from_error(error: &JSONRPCErrorError) -> Option<SandboxCleanupSummary> {
+    let value = error.data.as_ref()?.get(SANDBOX_CLEANUP_ERROR_DATA_KEY)?;
+    serde_json::from_value(value.clone()).ok()
+}
+
 mod base64_bytes {
     use super::BASE64_STANDARD;
     use base64::Engine as _;
@@ -1295,6 +1469,211 @@ mod base64_bytes {
 
 #[cfg(test)]
 mod tests {
+    use super::{SandboxCleanupState, SandboxCleanupSummary};
+    fn timed_out_cleanup_summary() -> SandboxCleanupSummary {
+        SandboxCleanupSummary {
+            state: SandboxCleanupState::TimedOut,
+            reaped: 1,
+            preserved_unproven: 0,
+            host_owned: 2,
+            handed_off: 0,
+            timed_out: 3,
+            joined: false,
+        }
+    }
+    #[test]
+    fn fs_responses_carry_optional_sandbox_cleanup() {
+        let read = super::FsReadFileResponse {
+            data_base64: "b2s=".to_string(),
+            sandbox_cleanup: Some(timed_out_cleanup_summary()),
+            no_sandbox_launch: false,
+        };
+        let value = serde_json::to_value(&read).expect("serialize read file response");
+        assert_eq!(
+            value["sandboxCleanup"]["state"],
+            serde_json::json!("timed_out")
+        );
+        assert_eq!(
+            serde_json::from_value::<super::FsReadFileResponse>(value)
+                .expect("deserialize read file response"),
+            read
+        );
+
+        // Legacy executors send `{}`; responses without a receipt stay `{}`.
+        let legacy: super::FsWriteFileResponse =
+            serde_json::from_value(serde_json::json!({})).expect("legacy write file response");
+        assert_eq!(
+            (
+                legacy.sandbox_cleanup,
+                serde_json::to_value(&legacy).expect("serialize write file response"),
+            ),
+            (None, serde_json::json!({}))
+        );
+    }
+
+    #[test]
+    fn walk_response_keeps_legacy_shape_and_adds_optional_cleanup() {
+        let legacy = serde_json::json!({
+            "entries": [],
+            "errors": [],
+            "truncated": true,
+        });
+        let response: super::FsWalkResponse =
+            serde_json::from_value(legacy.clone()).expect("legacy walk response");
+        assert_eq!(
+            (
+                response.outcome.truncated,
+                response.sandbox_cleanup,
+                serde_json::to_value(&response).expect("serialize walk response"),
+            ),
+            (true, None, legacy)
+        );
+
+        let with_receipt = super::FsWalkResponse {
+            sandbox_cleanup: Some(timed_out_cleanup_summary()),
+            ..response
+        };
+        let value = serde_json::to_value(&with_receipt).expect("serialize walk response");
+        assert_eq!(
+            (
+                value["truncated"].clone(),
+                value["sandboxCleanup"]["state"].clone()
+            ),
+            (serde_json::json!(true), serde_json::json!("timed_out"))
+        );
+        assert_eq!(
+            serde_json::from_value::<super::FsWalkResponse>(value)
+                .expect("deserialize walk response"),
+            with_receipt
+        );
+    }
+
+    #[test]
+    fn error_data_carries_cleanup_receipt_without_replacing_other_data() {
+        let error = super::attach_sandbox_cleanup_to_error(
+            crate::JSONRPCErrorError {
+                code: -32004,
+                data: None,
+                message: "not found".to_string(),
+            },
+            Some(timed_out_cleanup_summary()),
+        );
+        assert_eq!(
+            super::sandbox_cleanup_from_error(&error),
+            Some(timed_out_cleanup_summary())
+        );
+        let encoded = serde_json::to_value(&error).expect("serialize error");
+        assert_eq!(
+            encoded["data"]["sandboxCleanup"]["state"],
+            serde_json::json!("timed_out")
+        );
+
+        let with_other_data = super::attach_sandbox_cleanup_to_error(
+            crate::JSONRPCErrorError {
+                code: -32603,
+                data: Some(serde_json::json!({ "detail": "kept" })),
+                message: "failed".to_string(),
+            },
+            Some(timed_out_cleanup_summary()),
+        );
+        assert_eq!(
+            with_other_data
+                .data
+                .as_ref()
+                .map(|data| data["detail"].clone()),
+            Some(serde_json::json!("kept"))
+        );
+
+        let without_receipt = super::attach_sandbox_cleanup_to_error(
+            crate::JSONRPCErrorError {
+                code: -32603,
+                data: None,
+                message: "failed".to_string(),
+            },
+            /*sandbox_cleanup*/ None,
+        );
+        assert_eq!(
+            (
+                without_receipt.data.clone(),
+                super::sandbox_cleanup_from_error(&without_receipt)
+            ),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn no_sandbox_launch_is_distinct_from_a_missing_receipt() {
+        let unknown: super::FsRemoveResponse =
+            serde_json::from_value(serde_json::json!({})).expect("legacy remove response");
+        let not_launched = super::FsRemoveResponse {
+            sandbox_cleanup: None,
+            no_sandbox_launch: true,
+        };
+        assert_eq!(
+            (
+                unknown.no_sandbox_launch,
+                serde_json::to_value(&unknown).expect("serialize legacy"),
+                serde_json::to_value(&not_launched).expect("serialize not launched"),
+            ),
+            (
+                false,
+                serde_json::json!({}),
+                serde_json::json!({ "noSandboxLaunch": true }),
+            )
+        );
+
+        let error = super::mark_no_sandbox_launch_in_error(crate::JSONRPCErrorError {
+            code: -32004,
+            data: None,
+            message: "missing".to_string(),
+        });
+        assert_eq!(
+            (
+                super::no_sandbox_launch_from_error(&error),
+                super::sandbox_cleanup_from_error(&error),
+            ),
+            (true, None)
+        );
+        assert!(!super::no_sandbox_launch_from_error(
+            &crate::JSONRPCErrorError {
+                code: -32004,
+                data: None,
+                message: "missing".to_string(),
+            }
+        ));
+    }
+
+    #[test]
+    fn receipt_error_helpers_preserve_non_object_data_and_refuse_malformed_proof() {
+        for data in [
+            serde_json::json!("opaque"),
+            serde_json::json!([1]),
+            serde_json::Value::Null,
+        ] {
+            let error =
+                super::mark_no_sandbox_launch_in_error(super::attach_sandbox_cleanup_to_error(
+                    crate::JSONRPCErrorError {
+                        code: -32004,
+                        message: "failure".to_string(),
+                        data: Some(data.clone()),
+                    },
+                    Some(timed_out_cleanup_summary()),
+                ));
+            assert_eq!(error.data, Some(data));
+            assert!(!super::no_sandbox_launch_from_error(&error));
+            assert_eq!(super::sandbox_cleanup_from_error(&error), None);
+        }
+        let error = crate::JSONRPCErrorError {
+            code: -32004,
+            message: "failure".to_string(),
+            data: Some(
+                serde_json::json!({"sandboxCleanup": {"state": "complete"}, "noSandboxLaunch": "true"}),
+            ),
+        };
+        assert_eq!(super::sandbox_cleanup_from_error(&error), None);
+        assert!(!super::no_sandbox_launch_from_error(&error));
+    }
+
     use super::CapabilityRootDiscoverRequest;
     use super::WireExecParams;
     #[test]

@@ -3,6 +3,11 @@ use std::io;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use codex_exec_server_protocol::JSONRPCErrorError;
+use codex_exec_server_protocol::SandboxCleanupSummary;
+use codex_exec_server_protocol::attach_sandbox_cleanup_to_error;
+use codex_exec_server_protocol::mark_no_sandbox_launch_in_error;
+use codex_file_system::FileSystemOutcome;
+use codex_file_system::SandboxLaunch;
 
 use crate::CapabilityRootsDiscoverParams;
 use crate::CapabilityRootsDiscoverResponse;
@@ -15,6 +20,7 @@ use crate::ReadFileOptions;
 use crate::RemoveOptions;
 use crate::WriteFileOptions;
 use crate::file_handle::FileHandleManager;
+use crate::fs_sandbox::with_fs_helper_cleanup_receipt;
 use crate::local_file_system::LocalFileSystem;
 use crate::protocol::FS_READ_DIRECTORY_METHOD;
 use crate::protocol::FS_WRITE_FILE_METHOD;
@@ -76,6 +82,25 @@ impl FileSystemHandler {
         &self,
         params: CapabilityRootsDiscoverParams,
     ) -> Result<CapabilityRootsDiscoverResponse, JSONRPCErrorError> {
+        // Discovery reads through sandboxed helpers (batched or per root), which
+        // are launches this executor owns: report their merged cleanup.
+        let (result, sandbox_cleanup, launch) =
+            with_fs_helper_cleanup_receipt(self.discover_capability_roots_inner(params)).await;
+        match result {
+            // Never forward a receipt or launch claim from the helper's output.
+            Ok(response) => Ok(CapabilityRootsDiscoverResponse {
+                sandbox_cleanup,
+                no_sandbox_launch: launch == SandboxLaunch::NotLaunched,
+                ..response
+            }),
+            Err(error) => Err(attach_receipt_to_error(error, sandbox_cleanup, launch)),
+        }
+    }
+
+    async fn discover_capability_roots_inner(
+        &self,
+        params: CapabilityRootsDiscoverParams,
+    ) -> Result<CapabilityRootsDiscoverResponse, JSONRPCErrorError> {
         let sandbox = params
             .roots
             .first()
@@ -124,16 +149,22 @@ impl FileSystemHandler {
         params: FsOpenParams,
     ) -> Result<FsOpenResponse, JSONRPCErrorError> {
         validate_file_handle_id(&params.handle_id)?;
-        let handle_id = self
-            .file_handles
-            .open(
+        let (handle_id, sandbox_cleanup, launch) = with_fs_helper_cleanup_receipt(
+            self.file_handles.open(
                 params.handle_id,
                 self.file_system
                     .open_file(&params.path, params.mode, params.sandbox.as_ref()),
-            )
-            .await
-            .map_err(map_fs_error)?;
-        Ok(FsOpenResponse { handle_id })
+            ),
+        )
+        .await;
+        let handle_id = handle_id.map_err(|error| {
+            attach_receipt_to_error(map_fs_error(error), sandbox_cleanup, launch)
+        })?;
+        Ok(FsOpenResponse {
+            handle_id,
+            sandbox_cleanup,
+            no_sandbox_launch: launch == SandboxLaunch::NotLaunched,
+        })
     }
 
     pub(crate) async fn read_block(
@@ -177,19 +208,21 @@ impl FileSystemHandler {
         &self,
         params: FsReadFileParams,
     ) -> Result<FsReadFileResponse, JSONRPCErrorError> {
-        let bytes = self
-            .file_system
-            .read_file(
-                &params.path,
-                ReadFileOptions {
-                    follow_symlinks: params.follow_symlinks.unwrap_or(true),
-                },
-                params.sandbox.as_ref(),
-            )
-            .await
-            .map_err(map_fs_error)?;
+        let (bytes, sandbox_cleanup, no_sandbox_launch) = fs_outcome(
+            self.file_system
+                .read_file_with_receipt(
+                    &params.path,
+                    ReadFileOptions {
+                        follow_symlinks: params.follow_symlinks.unwrap_or(true),
+                    },
+                    params.sandbox.as_ref(),
+                )
+                .await,
+        )?;
         Ok(FsReadFileResponse {
             data_base64: STANDARD.encode(bytes),
+            sandbox_cleanup,
+            no_sandbox_launch,
         })
     }
 
@@ -202,18 +235,22 @@ impl FileSystemHandler {
                 "{FS_WRITE_FILE_METHOD} requires valid base64 dataBase64: {err}"
             ))
         })?;
-        self.file_system
-            .write_file(
-                &params.path,
-                bytes,
-                WriteFileOptions {
-                    follow_symlinks: params.follow_symlinks.unwrap_or(true),
-                },
-                params.sandbox.as_ref(),
-            )
-            .await
-            .map_err(map_fs_error)?;
-        Ok(FsWriteFileResponse {})
+        let ((), sandbox_cleanup, no_sandbox_launch) = fs_outcome(
+            self.file_system
+                .write_file_with_receipt(
+                    &params.path,
+                    bytes,
+                    WriteFileOptions {
+                        follow_symlinks: params.follow_symlinks.unwrap_or(true),
+                    },
+                    params.sandbox.as_ref(),
+                )
+                .await,
+        )?;
+        Ok(FsWriteFileResponse {
+            sandbox_cleanup,
+            no_sandbox_launch,
+        })
     }
 
     pub(crate) async fn create_directory(
@@ -221,35 +258,39 @@ impl FileSystemHandler {
         params: FsCreateDirectoryParams,
     ) -> Result<FsCreateDirectoryResponse, JSONRPCErrorError> {
         let recursive = params.recursive.unwrap_or(true);
-        self.file_system
-            .create_directory(
-                &params.path,
-                CreateDirectoryOptions {
-                    recursive,
-                    follow_symlinks: params.follow_symlinks.unwrap_or(true),
-                },
-                params.sandbox.as_ref(),
-            )
-            .await
-            .map_err(map_fs_error)?;
-        Ok(FsCreateDirectoryResponse {})
+        let ((), sandbox_cleanup, no_sandbox_launch) = fs_outcome(
+            self.file_system
+                .create_directory_with_receipt(
+                    &params.path,
+                    CreateDirectoryOptions {
+                        recursive,
+                        follow_symlinks: params.follow_symlinks.unwrap_or(true),
+                    },
+                    params.sandbox.as_ref(),
+                )
+                .await,
+        )?;
+        Ok(FsCreateDirectoryResponse {
+            sandbox_cleanup,
+            no_sandbox_launch,
+        })
     }
 
     pub(crate) async fn get_metadata(
         &self,
         params: FsGetMetadataParams,
     ) -> Result<FsGetMetadataResponse, JSONRPCErrorError> {
-        let metadata = self
-            .file_system
-            .get_metadata(
-                &params.path,
-                GetMetadataOptions {
-                    follow_symlinks: params.follow_symlinks.unwrap_or(true),
-                },
-                params.sandbox.as_ref(),
-            )
-            .await
-            .map_err(map_fs_error)?;
+        let (metadata, sandbox_cleanup, no_sandbox_launch) = fs_outcome(
+            self.file_system
+                .get_metadata_with_receipt(
+                    &params.path,
+                    GetMetadataOptions {
+                        follow_symlinks: params.follow_symlinks.unwrap_or(true),
+                    },
+                    params.sandbox.as_ref(),
+                )
+                .await,
+        )?;
         Ok(FsGetMetadataResponse {
             is_directory: metadata.is_directory,
             is_file: metadata.is_file,
@@ -257,6 +298,8 @@ impl FileSystemHandler {
             size: metadata.size,
             created_at_ms: metadata.created_at_ms,
             modified_at_ms: metadata.modified_at_ms,
+            sandbox_cleanup,
+            no_sandbox_launch,
         })
     }
 
@@ -264,28 +307,40 @@ impl FileSystemHandler {
         &self,
         params: FsCanonicalizeParams,
     ) -> Result<FsCanonicalizeResponse, JSONRPCErrorError> {
-        let path = self
-            .file_system
-            .canonicalize(&params.path, params.sandbox.as_ref())
-            .await
-            .map_err(map_fs_error)?;
-        Ok(FsCanonicalizeResponse { path })
+        let (path, sandbox_cleanup, no_sandbox_launch) = fs_outcome(
+            self.file_system
+                .canonicalize_with_receipt(&params.path, params.sandbox.as_ref())
+                .await,
+        )?;
+        Ok(FsCanonicalizeResponse {
+            path,
+            sandbox_cleanup,
+            no_sandbox_launch,
+        })
     }
 
     pub(crate) async fn read_directory(
         &self,
         params: FsReadDirectoryParams,
     ) -> Result<FsReadDirectoryResponse, JSONRPCErrorError> {
-        let entries = self
-            .file_system
-            .read_directory(&params.path, params.sandbox.as_ref())
-            .await
-            .map_err(map_fs_error)?;
+        let (entries, sandbox_cleanup, no_sandbox_launch) = fs_outcome(
+            self.file_system
+                .read_directory_with_receipt(&params.path, params.sandbox.as_ref())
+                .await,
+        )?;
         let entry_count = entries.len();
         if entry_count > MAX_READ_DIRECTORY_ENTRIES {
-            return Err(internal_error(format!(
-                "{FS_READ_DIRECTORY_METHOD} returned {entry_count} entries; limit is {MAX_READ_DIRECTORY_ENTRIES}"
-            )));
+            let error = attach_sandbox_cleanup_to_error(
+                internal_error(format!(
+                    "{FS_READ_DIRECTORY_METHOD} returned {entry_count} entries; limit is {MAX_READ_DIRECTORY_ENTRIES}"
+                )),
+                sandbox_cleanup,
+            );
+            return Err(if no_sandbox_launch {
+                mark_no_sandbox_launch_in_error(error)
+            } else {
+                error
+            });
         }
         let entries = entries
             .into_iter()
@@ -295,17 +350,27 @@ impl FileSystemHandler {
                 is_file: entry.is_file,
             })
             .collect();
-        Ok(FsReadDirectoryResponse { entries })
+        Ok(FsReadDirectoryResponse {
+            entries,
+            sandbox_cleanup,
+            no_sandbox_launch,
+        })
     }
 
     pub(crate) async fn walk(
         &self,
         params: FsWalkParams,
     ) -> Result<FsWalkResponse, JSONRPCErrorError> {
-        self.file_system
-            .walk(&params.path, params.options, params.sandbox.as_ref())
-            .await
-            .map_err(map_fs_error)
+        let (outcome, sandbox_cleanup, no_sandbox_launch) = fs_outcome(
+            self.file_system
+                .walk_with_receipt(&params.path, params.options, params.sandbox.as_ref())
+                .await,
+        )?;
+        Ok(FsWalkResponse {
+            outcome,
+            sandbox_cleanup,
+            no_sandbox_launch,
+        })
     }
 
     pub(crate) async fn remove(
@@ -314,37 +379,80 @@ impl FileSystemHandler {
     ) -> Result<FsRemoveResponse, JSONRPCErrorError> {
         let recursive = params.recursive.unwrap_or(true);
         let force = params.force.unwrap_or(true);
-        self.file_system
-            .remove(
-                &params.path,
-                RemoveOptions {
-                    recursive,
-                    force,
-                    follow_symlinks: params.follow_symlinks.unwrap_or(true),
-                },
-                params.sandbox.as_ref(),
-            )
-            .await
-            .map_err(map_fs_error)?;
-        Ok(FsRemoveResponse {})
+        let ((), sandbox_cleanup, no_sandbox_launch) = fs_outcome(
+            self.file_system
+                .remove_with_receipt(
+                    &params.path,
+                    RemoveOptions {
+                        recursive,
+                        force,
+                        follow_symlinks: params.follow_symlinks.unwrap_or(true),
+                    },
+                    params.sandbox.as_ref(),
+                )
+                .await,
+        )?;
+        Ok(FsRemoveResponse {
+            sandbox_cleanup,
+            no_sandbox_launch,
+        })
     }
 
     pub(crate) async fn copy(
         &self,
         params: FsCopyParams,
     ) -> Result<FsCopyResponse, JSONRPCErrorError> {
-        self.file_system
-            .copy(
-                &params.source_path,
-                &params.destination_path,
-                CopyOptions {
-                    recursive: params.recursive,
-                },
-                params.sandbox.as_ref(),
-            )
-            .await
-            .map_err(map_fs_error)?;
-        Ok(FsCopyResponse {})
+        let ((), sandbox_cleanup, no_sandbox_launch) = fs_outcome(
+            self.file_system
+                .copy_with_receipt(
+                    &params.source_path,
+                    &params.destination_path,
+                    CopyOptions {
+                        recursive: params.recursive,
+                    },
+                    params.sandbox.as_ref(),
+                )
+                .await,
+        )?;
+        Ok(FsCopyResponse {
+            sandbox_cleanup,
+            no_sandbox_launch,
+        })
+    }
+}
+
+/// Splits a filesystem outcome for the wire: the cleanup receipt and the
+/// positive "no launch" evidence go in the response, or in the error's `data`
+/// when the operation failed. The failure and the cleanup state stay distinct.
+fn fs_outcome<T>(
+    outcome: FileSystemOutcome<T>,
+) -> Result<(T, Option<SandboxCleanupSummary>, bool), JSONRPCErrorError> {
+    let FileSystemOutcome {
+        result,
+        sandbox_cleanup,
+        launch,
+    } = outcome;
+    match result {
+        Ok(value) => Ok((value, sandbox_cleanup, launch == SandboxLaunch::NotLaunched)),
+        Err(error) => Err(attach_receipt_to_error(
+            map_fs_error(error),
+            sandbox_cleanup,
+            launch,
+        )),
+    }
+}
+
+/// Puts a failed request's receipt and launch evidence in the error's data.
+fn attach_receipt_to_error(
+    error: JSONRPCErrorError,
+    sandbox_cleanup: Option<SandboxCleanupSummary>,
+    launch: SandboxLaunch,
+) -> JSONRPCErrorError {
+    let error = attach_sandbox_cleanup_to_error(error, sandbox_cleanup);
+    if launch == SandboxLaunch::NotLaunched {
+        mark_no_sandbox_launch_in_error(error)
+    } else {
+        error
     }
 }
 
@@ -378,6 +486,41 @@ mod tests {
     use crate::FileSystemSandboxContext;
     use crate::protocol::FsReadFileParams;
     use crate::protocol::FsWriteFileParams;
+
+    /// A failed sandboxed operation still reports its launches' cleanup, in the
+    /// error's data; the failure itself is unchanged.
+    #[test]
+    fn failed_operation_reports_cleanup_receipt_in_error_data() {
+        let receipt = SandboxCleanupSummary {
+            state: codex_exec_server_protocol::SandboxCleanupState::Complete,
+            reaped: 1,
+            preserved_unproven: 0,
+            host_owned: 0,
+            handed_off: 0,
+            timed_out: 0,
+            joined: true,
+        };
+
+        let error = fs_outcome::<()>(FileSystemOutcome {
+            result: Err(io::Error::new(io::ErrorKind::NotFound, "gone")),
+            sandbox_cleanup: Some(receipt),
+            launch: SandboxLaunch::Launched,
+        })
+        .expect_err("the operation failed");
+
+        assert_eq!(
+            (
+                error.code,
+                error.message.clone(),
+                codex_exec_server_protocol::sandbox_cleanup_from_error(&error)
+            ),
+            (
+                not_found("gone".to_string()).code,
+                "gone".to_string(),
+                Some(receipt)
+            )
+        );
+    }
 
     #[tokio::test]
     async fn no_platform_sandbox_policies_do_not_require_configured_sandbox_helper() {
@@ -439,7 +582,16 @@ mod tests {
                 .await
                 .expect("read file");
 
-            assert_eq!(response.data_base64, STANDARD.encode("ok"));
+            // No helper (and so no sandbox launcher) ran: no receipt is owed,
+            // and the response says so positively.
+            assert_eq!(
+                (
+                    response.data_base64,
+                    response.sandbox_cleanup,
+                    response.no_sandbox_launch
+                ),
+                (STANDARD.encode("ok"), None, true)
+            );
         }
     }
 }

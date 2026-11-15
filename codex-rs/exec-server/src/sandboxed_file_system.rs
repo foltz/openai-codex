@@ -293,7 +293,7 @@ impl SandboxedFileSystem {
             .await?
             .expect_walk()
             .map_err(map_sandbox_error)?;
-        Ok(response)
+        Ok(response.outcome)
     }
 
     async fn remove(

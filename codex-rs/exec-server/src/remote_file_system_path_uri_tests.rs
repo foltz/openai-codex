@@ -185,10 +185,21 @@ async fn remote_full_disk_reads_preserve_executor_permission_path_validation() {
             // Policy cwd is caller-supplied; only the operation path must be native to succeed.
             PathUri::parse(permission_path).expect("deliberately mismatched policy cwd"),
         );
-        file_system
-            .read_file(&path, Default::default(), Some(&sandbox))
-            .await
-            .expect("remote read");
+        let outcome = file_system
+            .read_file_with_receipt(&path, Default::default(), Some(&sandbox))
+            .await;
+        outcome.result.expect("remote read");
+        // The legacy response carries no receipt. Evidence follows the actual
+        // normalized request, not the policy originally handed to the adapter.
+        assert_eq!(outcome.sandbox_cleanup, None);
+        assert_eq!(
+            outcome.launch,
+            if retain_sandbox {
+                SandboxLaunch::Unknown
+            } else {
+                SandboxLaunch::NotLaunched
+            }
+        );
         expected_params.push(FsReadFileParams {
             path,
             follow_symlinks: None,
@@ -433,6 +444,8 @@ async fn remote_file_system_can_read_after_checkout_removal_with_legacy_helper_l
             JSONRPCMessage::Response(JSONRPCResponse {
                 id: request.id,
                 result: serde_json::to_value(FsReadFileResponse {
+                    sandbox_cleanup: None,
+                    no_sandbox_launch: false,
                     data_base64: STANDARD.encode(output.stdout),
                 })
                 .expect("read response"),
@@ -847,6 +860,8 @@ async fn record_read_file_params(
                 JSONRPCMessage::Response(JSONRPCResponse {
                     id: request.id,
                     result: serde_json::to_value(FsReadFileResponse {
+                        sandbox_cleanup: None,
+                        no_sandbox_launch: false,
                         data_base64: String::new(),
                     })
                     .expect("fs/readFile response should serialize"),
@@ -870,6 +885,8 @@ enum MetadataResponse {
 
 fn metadata_response(size: u64) -> FsGetMetadataResponse {
     FsGetMetadataResponse {
+        sandbox_cleanup: None,
+        no_sandbox_launch: false,
         is_directory: false,
         is_file: true,
         is_symlink: false,

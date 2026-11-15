@@ -1760,6 +1760,13 @@ async fn real_account_constructor_case(explicit: bool, hold_mcp: bool) {
         startup.is_empty(),
         "reset retires the runtime outside the lookup map"
     );
+    // Check only the original construction before making a separate late
+    // start request. That new request may consult the now-closed host itself.
+    assert_eq!(
+        host.request_derivations.load(Ordering::SeqCst),
+        usize::from(!explicit),
+        "retained construction must not rediscover request authority"
+    );
     manager.constructions.close();
     assert!(
         manager
@@ -1792,8 +1799,8 @@ async fn real_account_constructor_case(explicit: bool, hold_mcp: bool) {
     assert_eq!(manager.constructions.drain_until(deadline).await, report);
     assert_eq!(provider.entered.load(Ordering::SeqCst), 1);
     assert_eq!(
-        host.request_derivations.load(Ordering::SeqCst),
-        usize::from(!explicit),
-        "retained construction must not rediscover request authority"
+        host.operations.load(Ordering::SeqCst),
+        0,
+        "late refusal acquires no work or new constructor"
     );
 }

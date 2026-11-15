@@ -110,3 +110,33 @@ async fn server_diagnostics_requires_experimental_capability() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn server_diagnostics_reports_idle_before_any_thread_or_turn() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+    for _ in 0..2 {
+        let diagnostics: ServerDiagnosticsResponse = app_server
+            .request(|request_id| ClientRequest::ServerDiagnostics {
+                request_id,
+                params: ServerDiagnosticsParams::default(),
+            })
+            .await?;
+        let active_turns = diagnostics
+            .gauges
+            .into_iter()
+            .filter(|gauge| gauge.name == "core.turns.active")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            active_turns,
+            vec![ServerDiagnosticsGauge {
+                name: "core.turns.active".to_string(),
+                value: 0,
+            }]
+        );
+    }
+    Ok(())
+}

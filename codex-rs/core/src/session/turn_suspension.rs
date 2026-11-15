@@ -69,9 +69,9 @@ pub(super) async fn suspend_turn_and_shutdown(
     )
     .await
     {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            warn!(thread_id = %session.thread_id, %error, "suspended turn task exited abnormally");
+        Ok(true) => {}
+        Ok(false) => {
+            warn!(thread_id = %session.thread_id, "suspended turn task panicked; retained in task registry");
         }
         Err(_) => {
             warn!(

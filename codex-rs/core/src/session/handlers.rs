@@ -313,6 +313,7 @@ pub async fn set_thread_memory_mode(sess: &Arc<Session>, sub_id: String, mode: T
 }
 
 pub(super) async fn shutdown_session_runtime(sess: &Arc<Session>) {
+    sess.close_task_admission().await;
     if let Some(reporting) = &sess.outcome_reporting {
         reporting.handoffs.close();
     }
@@ -327,6 +328,24 @@ pub(super) async fn shutdown_session_runtime(sess: &Arc<Session>) {
     }
     let _ = sess.conversation.shutdown().await;
     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+    let task_result = sess
+        .task_joins
+        .shutdown_until(tokio::time::Instant::now() + std::time::Duration::from_secs(30))
+        .await;
+    if !matches!(
+        task_result,
+        crate::tasks::TaskJoinOutcome::Complete { panicked: false }
+    ) {
+        sess.services.local_agent_runtime.record_shutdown_failure(
+            AgentTreeShutdownFailure::operation_failed(
+                "session_shutdown",
+                "task_joins",
+                Some(sess.thread_id),
+                "task_join_failed",
+            ),
+        );
+        warn!(?task_result, "session task joins did not settle cleanly");
+    }
     if let Some(reporting) = &sess.outcome_reporting {
         reporting.handoffs.wait().await;
     }

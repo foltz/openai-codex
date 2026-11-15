@@ -111,6 +111,8 @@ pub(crate) struct Session {
     pub(crate) conversation: Arc<RealtimeConversationManager>,
     pub(crate) realtime_history: Option<Mutex<crate::realtime_history::RealtimeHistoryState>>,
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
+    pub(crate) task_joins: crate::tasks::TaskJoinRegistry,
+    pub(crate) task_admission_closed: std::sync::atomic::AtomicBool,
     pub(crate) async_hook_results: async_channel::Receiver<HookCompletedEvent>,
     pub(crate) input_queue: InputQueue,
     pub(crate) services: SessionServices,
@@ -2104,6 +2106,8 @@ impl Session {
                     && services.live_thread.is_some())
                 .then(|| Mutex::new(Default::default())),
                 active_turn: Mutex::new(None),
+                task_joins: Default::default(),
+                task_admission_closed: Default::default(),
                 async_hook_results,
                 input_queue: InputQueue::with_controller(
                     thread_id,

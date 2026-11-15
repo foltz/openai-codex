@@ -1,5 +1,6 @@
 //! Turn-scoped state, input waiters, and active turn metadata.
 
+use crate::tasks::TaskAbortHandle;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex as SyncMutex;
@@ -8,7 +9,6 @@ use std::sync::Weak;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::AbortOnDropHandle;
 use tokio_util::task::task_tracker::TaskTrackerToken;
 
 use codex_diagnostics::GaugeGuard;
@@ -84,7 +84,7 @@ pub(crate) struct RunningTask {
     pub(crate) kind: TaskKind,
     pub(crate) task: Arc<dyn AnySessionTask>,
     pub(crate) cancellation_token: CancellationToken,
-    pub(crate) handle: AbortOnDropHandle<()>,
+    pub(crate) handle: TaskAbortHandle,
     pub(crate) turn_context: Arc<TurnContext>,
     pub(crate) _agent_execution_guard: Option<AgentExecutionGuard>,
     /// Follows the task into whichever finalizer claims its terminal event.

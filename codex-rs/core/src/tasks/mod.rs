@@ -2,6 +2,7 @@ mod admission;
 mod compact;
 mod lifecycle;
 mod regular;
+mod retirement;
 mod review;
 mod user_shell;
 
@@ -14,11 +15,13 @@ use codex_diagnostics::Gauge;
 use codex_exec_server::ExecutorCapabilityDiscoveryV2Cache;
 use codex_extension_api::ThreadIdleCause;
 use futures::future::BoxFuture;
+pub(crate) use retirement::TaskAbortHandle;
+pub(crate) use retirement::TaskJoinOutcome;
+pub(crate) use retirement::TaskJoinRegistry;
 use tokio::select;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
 use tracing::Span;
 use tracing::field;
@@ -275,6 +278,20 @@ where
 }
 
 impl Session {
+    pub(crate) async fn close_task_admission(&self) {
+        let reservation = {
+            let mut active = self.active_turn.lock().await;
+            self.task_admission_closed
+                .store(true, std::sync::atomic::Ordering::Release);
+            if active.as_ref().is_some_and(|turn| turn.task.is_none()) {
+                active.take()
+            } else {
+                None
+            }
+        };
+        drop(reservation);
+    }
+
     pub async fn spawn_task<T: SessionTask>(
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
@@ -338,7 +355,11 @@ impl Session {
         let (pending_items, _) = self.input_queue.drain_mailbox_input_items().await;
         let turn_state = {
             let mut active = self.active_turn.lock().await;
-            if self.outcome_handoffs_closed() {
+            if self
+                .task_admission_closed
+                .load(std::sync::atomic::Ordering::Acquire)
+                || self.outcome_handoffs_closed()
+            {
                 return;
             }
             let turn = active.get_or_insert_with(ActiveTurn::default);
@@ -358,6 +379,12 @@ impl Session {
         .await;
 
         let mut active = self.active_turn.lock().await;
+        if self
+            .task_admission_closed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
         // Shutdown closes registration before taking this same lock to abort active work.
         let outcome_handoff = if let Some(reporting) = &self.outcome_reporting {
             if reporting.handoffs.is_closed() {
@@ -482,7 +509,7 @@ impl Session {
             .ok();
         let running_task = RunningTask {
             done,
-            handle: AbortOnDropHandle::new(handle),
+            handle: self.task_joins.register(handle),
             kind: task_kind,
             task,
             cancellation_token,

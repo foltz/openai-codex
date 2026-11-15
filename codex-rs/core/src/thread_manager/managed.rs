@@ -25,7 +25,7 @@ impl ThreadManager {
     /// Resumed threads are excluded because they can refer to another owner's live runtime.
     pub async fn start_thread_until(
         self: &Arc<Self>,
-        options: StartThreadOptions,
+        mut options: StartThreadOptions,
         until: impl Future<Output = ()> + Send + 'static,
         tasks: &TaskTracker,
     ) -> CodexResult<NewThread> {
@@ -47,6 +47,9 @@ impl ThreadManager {
                 "owned thread startup requires explicit session isolation".to_owned(),
             ));
         }
+        // Observe the caller's request before task creation. Preserve an empty
+        // observation too: the spawned lifetime has no inherited request scope.
+        let captured_account_work = self.state.capture_construction_work(&mut options)?;
         let task = tasks.token();
         let manager = Arc::clone(self);
         let state = Arc::downgrade(&self.state);
@@ -64,6 +67,7 @@ impl ThreadManager {
                     options,
                     /*forked_from_thread_id*/ None,
                     Some(Arc::clone(&startup)),
+                    Some(captured_account_work),
                 );
                 tokio::pin!(start);
                 tokio::select! {

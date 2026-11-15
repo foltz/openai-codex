@@ -531,6 +531,7 @@ struct PreparedChildOrigin {
 }
 
 struct ThreadSpawnRequest {
+    captured_account_work: Option<account_work::CapturedConstructionWork>,
     ready_notification: ThreadReadyNotification,
     startup: Option<Arc<crate::session::startup::SessionStartup>>,
     options: StartThreadOptions,
@@ -555,6 +556,7 @@ impl ThreadSpawnRequest {
         agent_control: impl Into<AgentControlInit>,
     ) -> Self {
         Self {
+            captured_account_work: None,
             ready_notification: ThreadReadyNotification::Emit,
             startup: None,
             options,
@@ -1434,6 +1436,7 @@ impl ThreadManager {
     pub async fn start_thread(&self, options: StartThreadOptions) -> CodexResult<NewThread> {
         Box::pin(self.start_thread_inner(
             options, /*forked_from_thread_id*/ None, /*startup*/ None,
+            /*captured_account_work*/ None,
         ))
         .await
     }
@@ -1509,6 +1512,7 @@ impl ThreadManager {
         mut options: StartThreadOptions,
         forked_from_thread_id: Option<ThreadId>,
         startup: Option<Arc<crate::session::startup::SessionStartup>>,
+        captured_account_work: Option<account_work::CapturedConstructionWork>,
     ) -> CodexResult<NewThread> {
         let (session_source, thread_source) = options.effective_sources(&self.state.session_source);
         options.session_source = Some(session_source);
@@ -1541,6 +1545,7 @@ impl ThreadManager {
             request
         };
         request.startup = startup;
+        request.captured_account_work = captured_account_work;
         Box::pin(self.state.spawn_thread(request)).await
     }
 
@@ -1580,8 +1585,13 @@ impl ThreadManager {
                 inherited_multi_agent_version,
             ),
         );
-        self.start_thread_inner(options, Some(forked_from_thread_id), /*startup*/ None)
-            .await
+        self.start_thread_inner(
+            options,
+            Some(forked_from_thread_id),
+            /*startup*/ None,
+            /*captured_account_work*/ None,
+        )
+        .await
     }
 
     /// Resume a legacy thread by reading its full rollout history.
@@ -2646,17 +2656,11 @@ impl ThreadManagerState {
     ) -> CodexResult<NewThread> {
         // Capture in the original request before handing the original constructor
         // to the registry; later pollers must not rediscover ambient authority.
-        let account_work = match request.options.account_work.take() {
-            Some(work) => Some(work),
-            None => match self.extensions.host_admission() {
-                Some(host) => host.derive_request_operation_work().map_err(|_| {
-                    CodexErr::Fatal(
-                        "request account work cannot admit thread construction".to_owned(),
-                    )
-                })?,
-                None => None,
-            },
+        let captured = match request.captured_account_work.take() {
+            Some(captured) => self.require_construction_work(captured)?,
+            None => self.capture_construction_work(&mut request.options)?,
         };
+        let account_work = captured.0;
         let initial_mcp_work = account_work
             .as_deref()
             .map(|work| {
@@ -2773,6 +2777,7 @@ impl ThreadManagerState {
             .config_layer_stack
             .with_mcp_ema_cancellation(cancellation);
         let ThreadSpawnRequest {
+            captured_account_work: _, // Consumed before the retained handoff.
             ready_notification,
             startup,
             options,

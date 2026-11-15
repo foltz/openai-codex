@@ -1804,3 +1804,202 @@ async fn real_account_constructor_case(explicit: bool, hold_mcp: bool) {
         "late refusal acquires no work or new constructor"
     );
 }
+
+tokio::task_local! {
+    static MANAGED_REQUEST_SCOPE: ();
+}
+
+#[derive(Debug)]
+struct ManagedRequestHost {
+    required: bool,
+    produce_work: bool,
+    refuse: bool,
+    lookups: AtomicUsize,
+    operations: AtomicUsize,
+}
+
+#[derive(Debug)]
+struct ManagedRequestWork(Arc<ManagedRequestHost>);
+
+impl Drop for ManagedRequestWork {
+    fn drop(&mut self) {
+        self.0.operations.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl codex_extension_api::HostOperationWork for ManagedRequestWork {
+    fn derive_operation(
+        &self,
+    ) -> Result<Box<dyn codex_extension_api::HostOperationWork>, codex_extension_api::TurnWorkRefused>
+    {
+        self.0.operations.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(Self(Arc::clone(&self.0))))
+    }
+
+    fn derive_turn_work(
+        &self,
+        _: &codex_extension_api::ExtensionData,
+        _: codex_extension_api::ExtensionFuture<'static, ()>,
+    ) -> Result<
+        Box<dyn codex_protocol::host_turn_work::HostTurnWork>,
+        codex_extension_api::TurnWorkRefused,
+    > {
+        Err(codex_extension_api::TurnWorkRefused::Unavailable)
+    }
+}
+
+#[derive(Debug)]
+struct ManagedRequestAdmission(Arc<ManagedRequestHost>);
+
+impl codex_extension_api::TurnStartAdmission for ManagedRequestAdmission {
+    fn admit_turn_start(&self) -> Option<Box<dyn Send>> {
+        Some(Box::new(()))
+    }
+
+    fn requires_account_work(&self) -> bool {
+        self.0.required
+    }
+
+    fn admit_operation_work(
+        &self,
+    ) -> Result<
+        Option<Box<dyn codex_extension_api::HostOperationWork>>,
+        codex_extension_api::TurnWorkRefused,
+    > {
+        panic!("managed constructor must not acquire fresh account admission")
+    }
+
+    fn derive_request_operation_work(
+        &self,
+    ) -> Result<
+        Option<Box<dyn codex_extension_api::HostOperationWork>>,
+        codex_extension_api::TurnWorkRefused,
+    > {
+        self.0.lookups.fetch_add(1, Ordering::SeqCst);
+        if self.0.refuse {
+            return Err(codex_extension_api::TurnWorkRefused::Unavailable);
+        }
+        if MANAGED_REQUEST_SCOPE.try_with(|_| ()).is_err() || !self.0.produce_work {
+            return Ok(None);
+        }
+        self.0.operations.fetch_add(1, Ordering::SeqCst);
+        Ok(Some(Box::new(ManagedRequestWork(Arc::clone(&self.0)))))
+    }
+}
+
+async fn managed_account_capture_case(explicit: bool, required: bool) {
+    use crate::thread_manager::StartThreadOptions;
+    let (_home, mut manager, mut config) = expiry_manager(/*ephemeral*/ true).await;
+    let mut mcp = HeldRequiredMcp::install(&mut config).await;
+    let host = Arc::new(ManagedRequestHost {
+        required,
+        produce_work: required,
+        refuse: false,
+        lookups: AtomicUsize::new(0),
+        operations: AtomicUsize::new(0),
+    });
+    let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
+    extensions.turn_start_admission(Arc::new(ManagedRequestAdmission(Arc::clone(&host))));
+    Arc::get_mut(&mut manager.state).unwrap().extensions = Arc::new(extensions.build());
+    let manager = Arc::new(manager);
+    let mut options = StartThreadOptions::new(config, None);
+    options
+        .thread_extension_init
+        .insert(codex_extension_api::SessionIsolation::Isolated);
+    if explicit {
+        host.operations.store(1, Ordering::SeqCst);
+        options.account_work = Some(Box::new(ManagedRequestWork(Arc::clone(&host))));
+    }
+    let tasks = tokio_util::task::TaskTracker::new();
+    let mut start = Box::pin(manager.start_thread_until(options, std::future::pending(), &tasks));
+    if explicit {
+        assert!(futures::poll!(start.as_mut()).is_pending());
+    } else {
+        MANAGED_REQUEST_SCOPE
+            .scope((), async {
+                assert!(futures::poll!(start.as_mut()).is_pending());
+            })
+            .await;
+    }
+    // The original caller's task-local scope has ended before the spawned task
+    // can run on this current-thread runtime.
+    assert!(MANAGED_REQUEST_SCOPE.try_with(|_| ()).is_err());
+    assert_eq!(host.lookups.load(Ordering::SeqCst), usize::from(!explicit));
+    reach_held_initialize(start.as_mut(), &mcp).await;
+    assert_eq!(
+        host.operations.load(Ordering::SeqCst),
+        if required { 4 } else { 0 }
+    );
+    assert_eq!(host.lookups.load(Ordering::SeqCst), usize::from(!explicit));
+    drop(start);
+    tasks.close();
+    tokio::time::timeout(Duration::from_secs(20), tasks.wait())
+        .await
+        .expect("managed original drains");
+    assert_eq!(host.operations.load(Ordering::SeqCst), 0);
+    assert_eq!(host.lookups.load(Ordering::SeqCst), usize::from(!explicit));
+    assert!(manager.state.threads.read().await.is_empty());
+    assert_eq!(mcp.initialize_attempts(), 1);
+    mcp.release();
+}
+
+#[tokio::test]
+async fn managed_constructor_captures_task_local_request_before_spawn() {
+    managed_account_capture_case(false, true).await;
+}
+
+#[tokio::test]
+async fn managed_constructor_uses_explicit_operation_without_request_lookup() {
+    managed_account_capture_case(true, true).await;
+}
+
+#[tokio::test]
+async fn managed_constructor_preserves_ungated_empty_capture_without_rediscovery() {
+    managed_account_capture_case(false, false).await;
+}
+
+async fn managed_account_refusal_case(refuse: bool) {
+    use crate::thread_manager::StartThreadOptions;
+    let (_home, mut manager, config) = expiry_manager(/*ephemeral*/ true).await;
+    let host = Arc::new(ManagedRequestHost {
+        required: true,
+        produce_work: true,
+        refuse,
+        lookups: AtomicUsize::new(0),
+        operations: AtomicUsize::new(0),
+    });
+    let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
+    extensions.turn_start_admission(Arc::new(ManagedRequestAdmission(Arc::clone(&host))));
+    Arc::get_mut(&mut manager.state).unwrap().extensions = Arc::new(extensions.build());
+    let manager = Arc::new(manager);
+    let mut options = StartThreadOptions::new(config, None);
+    options
+        .thread_extension_init
+        .insert(codex_extension_api::SessionIsolation::Isolated);
+    let tasks = tokio_util::task::TaskTracker::new();
+    let result = manager
+        .start_thread_until(options, std::future::pending(), &tasks)
+        .await;
+    let error = result
+        .err()
+        .expect("missing/exhausted request refuses before task birth");
+    assert!(error.to_string().contains(if refuse {
+        "request account work cannot admit thread construction"
+    } else {
+        "thread construction requires account work"
+    }));
+    assert_eq!(host.lookups.load(Ordering::SeqCst), 1);
+    assert_eq!(host.operations.load(Ordering::SeqCst), 0);
+    assert!(tasks.is_empty());
+    assert!(manager.state.threads.read().await.is_empty());
+}
+
+#[tokio::test]
+async fn managed_constructor_missing_required_request_refuses_before_task_birth() {
+    managed_account_refusal_case(false).await;
+}
+
+#[tokio::test]
+async fn managed_constructor_exhausted_request_refuses_before_task_birth() {
+    managed_account_refusal_case(true).await;
+}

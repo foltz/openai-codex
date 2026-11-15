@@ -358,7 +358,10 @@ mod tests {
             )
             .await?;
         let thread = thread_manager
-            .start_thread(codex_core::StartThreadOptions::new(thread_config))
+            .start_thread(codex_core::StartThreadOptions::new(
+                thread_config,
+                /*control_endpoint*/ None,
+            ))
             .await?
             .thread;
         std::fs::write(
@@ -419,7 +422,10 @@ enabled = false
         );
         // Prediction forks inherit a published config and may outlive their parent.
         let parent = thread_manager
-            .start_thread(codex_core::StartThreadOptions::new(pending_startup.clone()))
+            .start_thread(codex_core::StartThreadOptions::new(
+                pending_startup.clone(),
+                /*control_endpoint*/ None,
+            ))
             .await?;
         let (inherited_fork, _) = thread_manager
             .fork_options_from_parent(parent.thread_id)
@@ -578,10 +584,15 @@ enabled = false
             )
         });
         thread_manager
-            .start_thread(codex_core::StartThreadOptions::new(good_config))
+            .start_thread(codex_core::StartThreadOptions::new(
+                good_config,
+                /*control_endpoint*/ None,
+            ))
             .await?;
         thread_manager
-            .start_thread(codex_core::StartThreadOptions::new(bad_config))
+            .start_thread(codex_core::StartThreadOptions::new(
+                bad_config, /*control_endpoint*/ None,
+            ))
             .await?;
 
         let loader = Arc::new(CountingThreadConfigLoader {

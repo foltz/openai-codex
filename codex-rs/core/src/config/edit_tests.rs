@@ -1091,6 +1091,8 @@ fn blocking_replace_mcp_servers_round_trips() {
             required: false,
             startup_readiness: Default::default(),
             supports_parallel_tool_calls: true,
+            thread_identity_eligible: false,
+            control_endpoint_eligible: false,
             tool_input_schema_max_bytes: None,
             omit_tools_from: None,
             disabled_reason: None,
@@ -1126,6 +1128,8 @@ fn blocking_replace_mcp_servers_round_trips() {
             required: false,
             startup_readiness: Default::default(),
             supports_parallel_tool_calls: false,
+            thread_identity_eligible: false,
+            control_endpoint_eligible: false,
             tool_input_schema_max_bytes: None,
             omit_tools_from: None,
             disabled_reason: None,
@@ -1222,6 +1226,8 @@ fn blocking_replace_mcp_servers_serializes_tool_approval_overrides(output_token_
             required: false,
             startup_readiness: Default::default(),
             supports_parallel_tool_calls: false,
+            thread_identity_eligible: false,
+            control_endpoint_eligible: false,
             tool_input_schema_max_bytes: None,
             omit_tools_from: None,
             disabled_reason: None,
@@ -1300,6 +1306,8 @@ foo = { command = "cmd" }
             required: false,
             startup_readiness: Default::default(),
             supports_parallel_tool_calls: false,
+            thread_identity_eligible: false,
+            control_endpoint_eligible: false,
             tool_input_schema_max_bytes: None,
             omit_tools_from: None,
             disabled_reason: None,
@@ -1354,6 +1362,8 @@ foo = { command = "cmd" } # keep me
             required: false,
             startup_readiness: Default::default(),
             supports_parallel_tool_calls: false,
+            thread_identity_eligible: false,
+            control_endpoint_eligible: false,
             tool_input_schema_max_bytes: None,
             omit_tools_from: None,
             disabled_reason: None,
@@ -1407,6 +1417,8 @@ foo = { command = "cmd", args = ["--flag"] } # keep me
             required: false,
             startup_readiness: Default::default(),
             supports_parallel_tool_calls: false,
+            thread_identity_eligible: false,
+            control_endpoint_eligible: false,
             tool_input_schema_max_bytes: None,
             omit_tools_from: None,
             disabled_reason: None,
@@ -1461,6 +1473,8 @@ foo = { command = "cmd" }
             required: false,
             startup_readiness: Default::default(),
             supports_parallel_tool_calls: false,
+            thread_identity_eligible: false,
+            control_endpoint_eligible: false,
             tool_input_schema_max_bytes: None,
             omit_tools_from: None,
             disabled_reason: None,
@@ -1708,4 +1722,37 @@ fn replace_mcp_servers_blocking_clears_table_when_empty() {
 
     let contents = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
     assert!(!contents.contains("mcp_servers"));
+}
+
+#[test]
+fn blocking_replace_mcp_servers_preserves_explicit_disclosure_eligibility() {
+    let tmp = tempdir().expect("tmpdir");
+    let opted_in: McpServerConfig = serde_json::from_value(serde_json::json!({
+        "command": "fixture", "thread_identity_eligible": true, "control_endpoint_eligible": true,
+    }))
+    .expect("eligible server");
+    let ordinary: McpServerConfig =
+        serde_json::from_value(serde_json::json!({"command": "fixture"})).unwrap();
+    let servers = BTreeMap::from([
+        ("eligible".to_string(), opted_in.clone()),
+        ("ordinary".to_string(), ordinary),
+    ]);
+    apply_blocking(tmp.path(), &[ConfigEdit::ReplaceMcpServers(servers)]).expect("persist");
+    let raw = std::fs::read_to_string(tmp.path().join(CONFIG_TOML_FILE)).expect("read config");
+    let document: toml::Value = toml::from_str(&raw).expect("parse config");
+    let eligible: McpServerConfig = document["mcp_servers"]["eligible"]
+        .clone()
+        .try_into()
+        .unwrap();
+    assert_eq!(eligible, opted_in);
+    assert!(
+        document["mcp_servers"]["ordinary"]
+            .get("thread_identity_eligible")
+            .is_none()
+    );
+    assert!(
+        document["mcp_servers"]["ordinary"]
+            .get("control_endpoint_eligible")
+            .is_none()
+    );
 }

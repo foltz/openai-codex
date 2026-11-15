@@ -2436,7 +2436,7 @@ async fn local_stdio_server_uses_runtime_fallback_cwd_when_config_omits_cwd() ->
             .thread_manager
             .start_thread(StartThreadOptions {
                 environments: Some(environments),
-                ..StartThreadOptions::new(fixture.config.clone())
+                ..StartThreadOptions::new(fixture.config.clone(), /*control_endpoint*/ None)
             })
             .await?;
         fixture.codex = started.thread;

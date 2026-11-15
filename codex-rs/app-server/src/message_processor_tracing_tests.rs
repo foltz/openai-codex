@@ -264,6 +264,7 @@ pub(super) async fn build_test_processor(
         analytics_events_client.clone(),
     ));
     let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
+        control_endpoint: None,
         cloud_skill_provider: None,
         outgoing,
         analytics_events_client,

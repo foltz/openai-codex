@@ -77,7 +77,9 @@ async fn prepare_child_retains_loaded_exec_policy_requirements_after_mcp_refresh
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
     );
     let parent = manager
-        .start_thread(StartThreadOptions::new(config))
+        .start_thread(StartThreadOptions::new(
+            config, /*control_endpoint*/ None,
+        ))
         .await?
         .thread;
     let startup = parent.config().await;
@@ -162,7 +164,7 @@ async fn same_manager_creation_retains_step_executor_and_shares_exec_policy() ->
     let parent = manager
         .start_thread(StartThreadOptions {
             environments: Some(requests),
-            ..StartThreadOptions::new(config)
+            ..StartThreadOptions::new(config, /*control_endpoint*/ None)
         })
         .await?
         .thread;

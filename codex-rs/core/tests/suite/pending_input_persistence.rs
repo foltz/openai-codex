@@ -686,6 +686,7 @@ async fn local_preparation_is_durable_before_first_input_and_survives_restart(
             initial.thread_manager.auth_manager(),
             /*parent_trace*/ None,
             ClientMcpExtensions::default(),
+            /*control_endpoint*/ None,
         )
         .await?;
     assert!(!Arc::ptr_eq(&initial.codex, &resumed.thread));

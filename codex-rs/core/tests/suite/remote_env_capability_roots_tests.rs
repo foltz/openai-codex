@@ -123,7 +123,7 @@ async fn selected_capability_roots_survive_environment_reselection(
             environments: Some(vec![selection.clone().into_request()]),
             initial_history,
             thread_extension_init,
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?
         .thread;
@@ -231,7 +231,7 @@ async fn stale_roots_do_not_connect_unselected_executors(
         .start_thread(StartThreadOptions {
             environments: Some(vec![selection.clone().into_request()]),
             thread_extension_init,
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?
         .thread;

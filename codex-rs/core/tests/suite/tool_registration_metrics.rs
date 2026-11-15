@@ -109,7 +109,7 @@ async fn sampling_records_tool_registrations_once_across_stream_retry() -> Resul
                 })
                 .collect(),
         })],
-        ..StartThreadOptions::new(test.config.clone())
+        ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
     };
     options.thread_extension_init.insert(metrics.clone());
     let thread = test.thread_manager.start_thread(options).await?.thread;

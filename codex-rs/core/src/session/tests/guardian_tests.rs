@@ -1330,6 +1330,7 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
     let mut thread_extension_init = codex_extension_api::ExtensionDataInit::default();
     thread_extension_init.insert(codex_extension_api::SessionIsolation::Isolated);
     let (session, io) = Session::spawn(SessionSpawnArgs {
+        control_endpoint: Some("unix:///must-not-reach-isolated-mcp".to_string()),
         attached_thread: false,
         startup: None,
         config,
@@ -1385,6 +1386,10 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
     })
     .await
     .expect("spawn guardian subagent");
+    assert!(
+        session.control_endpoint.is_none(),
+        "isolated startup must discard host endpoint custody"
+    );
 
     assert_eq!(
         session

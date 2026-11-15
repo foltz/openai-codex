@@ -55,7 +55,7 @@ async fn idle_eviction_preserves_worker_context_for_followup() -> Result<()> {
                 defer_loading: false,
             })],
             environments: Some(Vec::new()),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?;
     test.codex = root.thread;

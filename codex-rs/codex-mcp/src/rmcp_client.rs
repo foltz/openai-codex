@@ -337,6 +337,7 @@ impl ManagedClientStartup {
             .unwrap_or(DEFAULT_STARTUP_TIMEOUT);
         let cancel_token_for_fut = cancel_token;
         let startup = async move {
+            let connection_bindings = runtime_context.connection_bindings(server.config());
             let tool_catalog_fetch_ticket = tool_catalog_cache_context
                 .as_ref()
                 .map(McpToolCatalogCacheContext::begin_fetch);
@@ -364,9 +365,16 @@ impl ManagedClientStartup {
                 )
                 .await
                 {
-                    Ok(result) => Arc::new(
-                        result?.with_read_only_tools(server.requires_read_only_mcp_tools()),
-                    ),
+                    Ok(result) => {
+                        let mut client =
+                            result?.with_read_only_tools(server.requires_read_only_mcp_tools());
+                        if connection_bindings.requires_binding_gate() {
+                            client = client.with_post_reconnect_hook(
+                                connection_bindings.reconnect_hook(Some(startup_timeout)),
+                            );
+                        }
+                        Arc::new(client)
+                    }
                     Err(_) => {
                         return Err(StartupOutcomeError::from(anyhow!(
                             "MCP client startup timed out after {startup_timeout:?}"
@@ -380,6 +388,7 @@ impl ManagedClientStartup {
                     server_name.clone(),
                     client,
                     StartServerTaskParams {
+                        connection_bindings,
                         sharing_declined,
                         publish_apps,
                         is_codex_apps_mcp_server,
@@ -1126,6 +1135,7 @@ async fn start_server_task(
     params: StartServerTaskParams,
 ) -> Result<ManagedClient, StartupOutcomeError> {
     let StartServerTaskParams {
+        connection_bindings,
         sharing_declined,
         publish_apps,
         is_codex_apps_mcp_server,
@@ -1183,6 +1193,15 @@ async fn start_server_task(
         &initialize_result,
     );
     let initialize_result = initialize_result.map_err(StartupOutcomeError::from)?;
+    // Use this physical connection's direct peer information, never a cached
+    // discovery entry. No provider/auth-change/cache operation precedes this.
+    if let Err(error) = connection_bindings
+        .bind_initial(&client, &initialize_result, startup_timeout)
+        .await
+    {
+        client.shutdown().await;
+        return Err(StartupOutcomeError::from(error));
+    }
     if client.protocol_mode() == McpProtocolMode::DiscoverLocalStdio
         && !initialize_result.protocol_version.has_initialize()
         && let Some(context) = tool_catalog_cache_context.take()
@@ -1407,6 +1426,7 @@ fn mcp_server_info_from_implementation(
 }
 
 struct StartServerTaskParams {
+    connection_bindings: crate::connection_handshake::ConnectionBindings,
     publish_apps: Option<watch::Sender<Option<std::sync::Weak<RmcpClient>>>>,
     sharing_declined: Option<CancellationToken>,
     server_capabilities: Arc<StdMutex<Option<serde_json::Value>>>,

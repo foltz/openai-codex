@@ -299,7 +299,7 @@ async fn environment_requires_loadable_managed_hooks_at_startup_and_readiness() 
     let start = |selection: TurnEnvironmentSelection| {
         test.thread_manager.start_thread(StartThreadOptions {
             environments: Some(vec![selection.into_request()]),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
     };
     let assert_invalid_matcher = |error: String| {

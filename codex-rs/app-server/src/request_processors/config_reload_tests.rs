@@ -38,7 +38,9 @@ async fn reloads_accept_a_provider_supplied_by_thread_overrides() -> anyhow::Res
         ),
     );
     let thread = threads
-        .start_thread(codex_core::StartThreadOptions::new(initial))
+        .start_thread(codex_core::StartThreadOptions::new(
+            initial, /*control_endpoint*/ None,
+        ))
         .await?
         .thread;
 
@@ -108,7 +110,9 @@ async fn user_reload_promotes_plugin_and_feature_requirements_without_server_cha
     );
     let original_servers = initial.mcp_servers.get().clone();
     let thread = threads
-        .start_thread(codex_core::StartThreadOptions::new(initial))
+        .start_thread(codex_core::StartThreadOptions::new(
+            initial, /*control_endpoint*/ None,
+        ))
         .await?
         .thread;
     std::fs::write(
@@ -197,7 +201,9 @@ async fn mcp_refresh_rejects_superseded_app_server_policy(
         Arc::new(EnvironmentManager::default_for_tests()),
     );
     let thread = threads
-        .start_thread(codex_core::StartThreadOptions::new(initial))
+        .start_thread(codex_core::StartThreadOptions::new(
+            initial, /*control_endpoint*/ None,
+        ))
         .await?
         .thread;
     let current = thread.config().await;

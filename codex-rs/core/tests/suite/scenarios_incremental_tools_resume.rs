@@ -339,7 +339,7 @@ async fn exec_tools_follow_current_settings_across_history() -> Result<()> {
         .thread_manager
         .fork_legacy_thread(
             ForkSnapshot::Interrupted,
-            StartThreadOptions::new(fork_config),
+            StartThreadOptions::new(fork_config, /*control_endpoint*/ None),
             returned
                 .codex
                 .rollout_path()

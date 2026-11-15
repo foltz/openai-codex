@@ -32,6 +32,7 @@ mod program_resolver;
 mod protocol_mode;
 mod request_cancellation;
 mod request_input;
+mod retirement;
 mod rmcp_client;
 mod service_error;
 mod startup_error;
@@ -107,6 +108,8 @@ pub use rmcp_client::CancellableEventStreamRequest;
 pub use rmcp_client::Elicitation;
 pub use rmcp_client::ElicitationResponse;
 pub use rmcp_client::ListToolsWithConnectorIdResult;
+pub use rmcp_client::PostReconnectHook;
+pub use rmcp_client::ReconnectContext;
 pub use rmcp_client::RmcpClient;
 pub use rmcp_client::SendElicitation;
 pub use rmcp_client::StreamableHttpBearerToken;
@@ -122,3 +125,11 @@ pub use stdio_server_launcher::StdioServerLauncher;
 pub use tool_list_changes::ToolListRevision;
 pub use trace_context::McpRequestTrace;
 pub use user_verification::UserVerificationReason;
+
+// Physical receipts remain separate from serving or runtime qualification.
+pub use retirement::PhysicalRetirementOutcome;
+pub use retirement::PhysicalRetirementReport;
+pub use retirement::RegistrationClosed;
+pub use retirement::RetirementProof;
+pub use retirement::RmcpClientRetirement;
+pub use retirement::WeakRmcpClientRetirement;

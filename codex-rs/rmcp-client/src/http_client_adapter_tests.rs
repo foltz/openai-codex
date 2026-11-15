@@ -609,3 +609,16 @@ async fn automatic_event_stream_reconnect_refreshes_request_auth() -> anyhow::Re
     client.shutdown().await;
     Ok(())
 }
+
+#[test]
+fn delete_status_distinguishes_absence_local_release_and_failure() {
+    use rmcp::transport::streamable_http_client::StreamableHttpError;
+    for status in [200, 202, 204] {
+        super::delete_session_result(status).expect("successful DELETE");
+    }
+    assert!(matches!(super::delete_session_result(404), Err(StreamableHttpError::SessionExpired)));
+    assert!(matches!(super::delete_session_result(405), Err(StreamableHttpError::ServerDoesNotSupportDeleteSession)));
+    for status in [301, 401, 403, 408, 500] {
+        assert!(matches!(super::delete_session_result(status), Err(StreamableHttpError::UnexpectedServerResponse(_))));
+    }
+}

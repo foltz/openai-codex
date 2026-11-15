@@ -12,6 +12,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+VENDORED_RUST_ROOTS = (Path("codex-rs/vendor/rust-sdk"),)
 
 
 @dataclass(frozen=True)
@@ -58,7 +59,12 @@ def rust_formatter_group(*, check: bool) -> FormatterGroup:
     rust_files = sorted(
         os.path.relpath(REPO_ROOT / os.fsdecode(encoded_path), rust_workspace)
         for encoded_path in repository_files
-        if encoded_path and (REPO_ROOT / os.fsdecode(encoded_path)).is_file()
+        if encoded_path
+        and (REPO_ROOT / os.fsdecode(encoded_path)).is_file()
+        and not any(
+            Path(os.fsdecode(encoded_path)).is_relative_to(root)
+            for root in VENDORED_RUST_ROOTS
+        )
     )
     # Git supplies every source file, including files Cargo cannot discover.
     # Do not recursively format child modules again or include ignored files.

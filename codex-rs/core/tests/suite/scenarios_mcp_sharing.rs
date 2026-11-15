@@ -121,6 +121,7 @@ async fn exercise_mcp_sharing(resume_with_replacement_auth: bool) -> Result<Stri
                 ),
                 /*parent_trace*/ None,
                 ClientMcpExtensions::default(),
+                /*control_endpoint*/ None,
             )
             .await?;
         test.codex = resumed.thread;

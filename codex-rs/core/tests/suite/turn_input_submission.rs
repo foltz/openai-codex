@@ -128,7 +128,7 @@ async fn turn_extension_data_is_captured_for_automatic_turns() -> anyhow::Result
         .start_thread(StartThreadOptions {
             turn_extension_init: initial,
             environments: Some(vec![test.executor_environment().request()]),
-            ..StartThreadOptions::new(config)
+            ..StartThreadOptions::new(config, /*control_endpoint*/ None)
         })
         .await?
         .thread;

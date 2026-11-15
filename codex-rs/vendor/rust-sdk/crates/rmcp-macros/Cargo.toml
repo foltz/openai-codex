@@ -1,0 +1,28 @@
+
+
+[package]
+name = "rmcp-macros"
+license = "Apache-2.0"
+version = "3.5.1"
+edition = "2024"
+rust-version = "1.88"
+repository = "https://github.com/modelcontextprotocol/rust-sdk/"
+homepage = "https://github.com/modelcontextprotocol/rust-sdk"
+readme = "../../README.md"
+description = "Rust SDK for Model Context Protocol macros library"
+documentation = "https://docs.rs/rmcp-macros"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = {version = "3", features = ["full"]}
+quote = "1"
+proc-macro2 = "1"
+serde_json = "1.0"
+darling = { version = "0.24" }
+
+[features]
+local = []
+
+[dev-dependencies]

@@ -3621,6 +3621,7 @@ async fn conversation_startup_context_current_thread_selects_many_turns_by_budge
             auth_manager_from_auth(CodexAuth::from_api_key("dummy")),
             /*parent_trace*/ None,
             ClientMcpExtensions::default(),
+            /*control_endpoint*/ None,
         )
         .await?;
     let codex = resumed_thread.thread;

@@ -313,7 +313,7 @@ async fn model_switches_refresh_the_window_base_across_compaction_and_restart() 
         .thread_manager
         .fork_legacy_thread(
             ForkSnapshot::Interrupted,
-            StartThreadOptions::new(fork_config),
+            StartThreadOptions::new(fork_config, /*control_endpoint*/ None),
             test.codex.rollout_path().expect("rollout path"),
         )
         .await?;

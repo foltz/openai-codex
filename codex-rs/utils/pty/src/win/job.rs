@@ -52,19 +52,7 @@ pub struct JobObject {
     // A mutex makes the state check, Job Object API call, and state update
     // atomic with respect to concurrent preserve and terminate requests.
     preserve_descendants: Mutex<bool>,
-}
-
-// A failed restart must still stop any remaining members.
-struct TerminateOnDrop<'a>(Option<&'a JobObject>);
-
-impl Drop for TerminateOnDrop<'_> {
-    fn drop(&mut self) {
-        if let Some(job) = self.0
-            && let Err(error) = job.terminate()
-        {
-            log::warn!("Failed to terminate Windows job after an interrupted restart: {error}");
-        }
-    }
+    retirement_members: Mutex<HashMap<usize, ProcessHandle>>,
 }
 
 impl JobObject {
@@ -84,6 +72,7 @@ impl JobObject {
         Ok(Self {
             handle,
             preserve_descendants: Mutex::new(false),
+            retirement_members: Mutex::new(HashMap::new()),
         })
     }
 
@@ -279,27 +268,55 @@ impl JobObject {
 
     /// Stops a root from [`Self::assign_and_resume_process`] and the remaining members of its job.
     pub fn terminate_and_wait(&self, root: &ProcessHandle, grace: Duration) -> io::Result<()> {
-        let mut cleanup = TerminateOnDrop(Some(self));
+        // Keep captured handles across failed waits. Do not bulk-terminate on
+        // error: that can erase job membership before uncaptured handles signal.
+        // This owner retains the job (and its kill-on-close protection) for retry.
+        let mut stopped = self
+            .retirement_members
+            .lock()
+            .map_err(|_| io::Error::other("job retirement lock poisoned"))?;
         let deadline = Instant::now() + grace;
-        Self::request_stop(root)?;
-        Self::wait_for_exit(root, deadline)?;
-        // TerminateJobObject can empty the job list before members release their handles.
-        // Stop by process handle, then rescan for children born during the previous pass.
+        let result = (|| {
+            Self::request_stop(root)?;
+            Self::wait_for_exit(root, deadline)?;
+            let mut list = vec![0usize; 16];
+            loop {
+                if Instant::now() >= deadline {
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+                // A subset (including an empty list) is not proof while any
+                // captured process handle remains unsignaled.
+                for member in stopped.values() {
+                    Self::request_stop(member)?;
+                    Self::wait_for_exit(member, deadline)?;
+                }
+                let pids = self.member_ids(&mut list)?;
+                if pids.iter().all(|pid| stopped.contains_key(pid)) {
+                    self.terminate()?;
+                    return Ok(());
+                }
+                self.stop_listed_members(&mut stopped, false)?;
+            }
+        })();
+        if result.is_err() {
+            // Bound error cleanup to one final scan. Retain newly captured
+            // stragglers for the next observer instead of hiding them with a
+            // bulk job termination. Higher-level retirement must re-drive this.
+            let _ = self.stop_listed_members(&mut stopped, true);
+        }
+        result
+    }
+
+    fn stop_listed_members(
+        &self,
+        stopped: &mut HashMap<usize, ProcessHandle>,
+        best_effort: bool,
+    ) -> io::Result<()> {
         let mut list = vec![0usize; 16];
-        let mut stopped = HashMap::new();
-        loop {
-            if Instant::now() >= deadline {
-                return Err(io::ErrorKind::TimedOut.into());
-            }
-            let pids = self.member_ids(&mut list)?;
-            if pids.iter().all(|pid| stopped.contains_key(pid)) {
-                self.terminate()?;
-                cleanup.0 = None;
-                return Ok(());
-            }
-            for &pid in pids {
-                if stopped.contains_key(&pid) {
-                    continue;
+        for &pid in self.member_ids(&mut list)? {
+            let result = (|| {
+                if let Some(member) = stopped.get(&pid) {
+                    return Self::request_stop(member);
                 }
                 let member = match Self::open_process(
                     pid as u32,
@@ -307,11 +324,12 @@ impl JobObject {
                 ) {
                     Ok(member) => member,
                     Err(error) if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) => {
-                        continue;
+                        return Ok(());
                     }
                     Err(error) => return Err(error),
                 };
-                // A listed PID can be reused before OpenProcess. Only signal confirmed job members.
+                // A PID from the list may already have been reused. Confirm
+                // membership before signalling this retained native handle.
                 let mut in_job = 0;
                 if unsafe {
                     IsProcessInJob(
@@ -324,14 +342,16 @@ impl JobObject {
                     return Err(io::Error::last_os_error());
                 }
                 if in_job != 0 {
-                    Self::request_stop(&member)?;
                     stopped.insert(pid, member);
+                    Self::request_stop(&stopped[&pid])?;
                 }
-            }
-            for member in stopped.values() {
-                Self::wait_for_exit(member, deadline)?;
+                Ok(())
+            })();
+            if !best_effort {
+                result?;
             }
         }
+        Ok(())
     }
 
     fn member_ids<'a>(&self, list: &'a mut Vec<usize>) -> io::Result<&'a [usize]> {

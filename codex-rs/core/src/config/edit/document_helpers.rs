@@ -123,6 +123,12 @@ fn serialize_mcp_server_table(config: &McpServerConfig) -> anyhow::Result<TomlTa
     if config.supports_parallel_tool_calls {
         entry["supports_parallel_tool_calls"] = value(true);
     }
+    if config.thread_identity_eligible {
+        entry["thread_identity_eligible"] = value(true);
+    }
+    if config.control_endpoint_eligible {
+        entry["control_endpoint_eligible"] = value(true);
+    }
     if let Some(budget) = config.tool_input_schema_max_bytes {
         entry["tool_input_schema_max_bytes"] = value(i64::try_from(budget.get())?);
     }

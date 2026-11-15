@@ -384,7 +384,7 @@ async fn exercise_harness(server_uri: String) -> Result<()> {
             .thread_manager
             .start_thread(StartThreadOptions {
                 metrics_service_name: Some("codex_work_cca".into()),
-                ..StartThreadOptions::new(catalog_config)
+                ..StartThreadOptions::new(catalog_config, /*control_endpoint*/ None)
             })
             .await?;
         assert_eq!(
@@ -404,7 +404,10 @@ async fn exercise_harness(server_uri: String) -> Result<()> {
     }
     let parent = test
         .thread_manager
-        .start_thread(StartThreadOptions::new(enabled.clone()))
+        .start_thread(StartThreadOptions::new(
+            enabled.clone(),
+            /*control_endpoint*/ None,
+        ))
         .await?;
     turn(&parent.thread, "parent-dual").await?;
     exercise_provider_destinations(&parent.thread, &enabled).await?;
@@ -431,7 +434,7 @@ async fn exercise_harness(server_uri: String) -> Result<()> {
                     agent_nickname: None,
                     agent_role: None,
                 })),
-                ..StartThreadOptions::new(child_config.clone())
+                ..StartThreadOptions::new(child_config.clone(), /*control_endpoint*/ None)
             },
             prepared,
         )
@@ -454,7 +457,10 @@ async fn exercise_harness(server_uri: String) -> Result<()> {
 
     let disabled = test
         .thread_manager
-        .start_thread(StartThreadOptions::new(test.config.clone()))
+        .start_thread(StartThreadOptions::new(
+            test.config.clone(),
+            /*control_endpoint*/ None,
+        ))
         .await?;
     turn(&disabled.thread, "thread-disabled").await?;
     // A third-party OpenAI-compatible endpoint still uses its existing provider authentication.
@@ -462,7 +468,9 @@ async fn exercise_harness(server_uri: String) -> Result<()> {
     enabled.chatgpt_base_url = "https://custom.example.test/backend-api".to_string();
     let third_party = test
         .thread_manager
-        .start_thread(StartThreadOptions::new(enabled))
+        .start_thread(StartThreadOptions::new(
+            enabled, /*control_endpoint*/ None,
+        ))
         .await?;
     turn(&third_party.thread, "third-party").await?;
 
@@ -505,6 +513,7 @@ async fn exercise_harness(server_uri: String) -> Result<()> {
             Arc::clone(&replacement),
             /*parent_trace*/ None,
             ClientMcpExtensions::default(),
+            /*control_endpoint*/ None,
         )
         .await?;
     assert_eq!(
@@ -532,6 +541,7 @@ async fn exercise_harness(server_uri: String) -> Result<()> {
             replacement,
             /*parent_trace*/ None,
             ClientMcpExtensions::default(),
+            /*control_endpoint*/ None,
         )
         .await?;
     turn(&resumed.thread, "replacement-root").await?;
@@ -543,7 +553,7 @@ async fn exercise_harness(server_uri: String) -> Result<()> {
                 session_source: Some(SessionSource::Internal(
                     InternalSessionSource::MemoryConsolidation,
                 )),
-                ..StartThreadOptions::new(resumed_config)
+                ..StartThreadOptions::new(resumed_config, /*control_endpoint*/ None)
             },
         )
         .await?;
@@ -940,7 +950,10 @@ async fn exercise_mcp_uploads() -> Result<()> {
     assertion_only.runtime_auth_mode = RuntimeAuthMode::AssertionOnly;
     let assertion_thread = test
         .thread_manager
-        .start_thread(StartThreadOptions::new(assertion_only))
+        .start_thread(StartThreadOptions::new(
+            assertion_only,
+            /*control_endpoint*/ None,
+        ))
         .await?;
     let thread_id = assertion_thread.thread_id;
     test.codex = assertion_thread.thread;
@@ -982,6 +995,7 @@ async fn exercise_mcp_uploads() -> Result<()> {
             auth,
             /*parent_trace*/ None,
             ClientMcpExtensions::default(),
+            /*control_endpoint*/ None,
         )
         .await?;
     test.codex = resumed.thread;

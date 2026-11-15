@@ -1037,7 +1037,9 @@ client_id = "mcp-client"
             Arc::new(EnvironmentManager::default_for_tests()),
         );
         let thread = thread_manager
-            .start_thread(codex_core::StartThreadOptions::new(initial))
+            .start_thread(codex_core::StartThreadOptions::new(
+                initial, /*control_endpoint*/ None,
+            ))
             .await?
             .thread;
         assert!(thread.config().await.mcp_servers.get()["enterprise"].enabled);

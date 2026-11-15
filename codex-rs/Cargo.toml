@@ -1,4 +1,5 @@
 [workspace]
+exclude = ["vendor/rust-sdk"]
 members = [
     "aws-auth",
     "analytics",
@@ -694,3 +695,8 @@ v8 = { git = "https://github.com/openai-oss-forks/rusty_v8.git", rev = "90a65f88
 
 [patch."ssh://git@github.com/openai-oss-forks/tungstenite-rs.git"]
 tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "bc589d684755a8c02da0fc7e58d0861cbfc306f1" }
+
+# KCF cleanup correction at the exact 0.169 SDK pin; keep the dependency rev above.
+[patch."https://github.com/modelcontextprotocol/rust-sdk"]
+rmcp = { path = "vendor/rust-sdk/crates/rmcp" }
+rmcp-macros = { path = "vendor/rust-sdk/crates/rmcp-macros" }

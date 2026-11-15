@@ -874,7 +874,7 @@ async fn direct_metadata_limit_respects_provider_support(
         .thread_manager
         .fork_legacy_thread(
             ForkSnapshot::Interrupted,
-            StartThreadOptions::new(test.config.clone()),
+            StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None),
             rollout_path.clone(),
         )
         .await?;

@@ -161,7 +161,7 @@ pub(super) async fn mcp_server_elicitation_scenario(
     };
     let mut options = StartThreadOptions {
         environments: Some(vec![test.executor_environment().request()]),
-        ..StartThreadOptions::new(config)
+        ..StartThreadOptions::new(config, /*control_endpoint*/ None)
     };
     options.session_source = Some(match caller {
         Caller::Root => SessionSource::Exec,

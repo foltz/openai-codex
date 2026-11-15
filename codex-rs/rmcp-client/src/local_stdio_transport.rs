@@ -146,6 +146,12 @@ enum StdioTransport {
 }
 
 impl LocalStdioTransport {
+    /// End the handshake's discovery observation even when a retirement receipt
+    /// retains the underlying transport rather than dropping its pipes yet.
+    pub(super) fn finish_discovery(&mut self) {
+        self.discovery.take();
+    }
+
     pub(super) fn new(
         stdio: LocalStdio,
         program_name: String,

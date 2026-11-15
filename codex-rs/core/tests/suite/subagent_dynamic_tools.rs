@@ -131,7 +131,7 @@ async fn fresh_v2_subagent_can_call_parent_dynamic_tool_when_enabled() -> Result
         .start_thread(StartThreadOptions {
             dynamic_tools: vec![DynamicToolSpec::Function(tool.clone())],
             environments: Some(vec![test.executor_environment().request()]),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?;
     test.codex = root.thread;

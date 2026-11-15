@@ -260,6 +260,7 @@ impl ConnectionSessionState {
 }
 
 pub(crate) struct MessageProcessorArgs {
+    pub(crate) control_endpoint: Option<String>,
     pub(crate) cloud_skill_provider: Option<Arc<dyn codex_skills_extension::SkillProvider>>,
     pub(crate) outgoing: Arc<OutgoingMessageSender>,
     pub(crate) analytics_events_client: AnalyticsEventsClient,
@@ -291,6 +292,7 @@ impl MessageProcessor {
     /// `Sender` so handlers can enqueue messages to be written to stdout.
     pub(crate) fn new(args: MessageProcessorArgs) -> Self {
         let MessageProcessorArgs {
+            control_endpoint,
             cloud_skill_provider,
             outgoing,
             analytics_events_client,
@@ -526,6 +528,7 @@ impl MessageProcessor {
             outgoing.clone(),
             config_manager.clone(),
             account_processor.clone(),
+            control_endpoint.clone(),
         );
         let plugin_processor = PluginRequestProcessor::new(
             auth_manager.clone(),
@@ -577,6 +580,7 @@ impl MessageProcessor {
             turn_cost_worker.as_ref().map(TurnCostWorker::handle),
             config_warnings.clone(),
             sample_responses,
+            control_endpoint,
         );
         let turn_processor = TurnRequestProcessor::new(
             Arc::clone(&thread_manager),

@@ -454,3 +454,28 @@ async fn streamable_http_non_session_failure_does_not_trigger_recovery() -> anyh
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn session_recovery_retirement_census_includes_both_physical_services() -> anyhow::Result<()>
+{
+    let (_server, base_url) = spawn_streamable_http_server().await?;
+    let client = create_client(&base_url).await?;
+    assert_eq!(
+        call_echo_tool(&client, "warmup").await?,
+        expected_echo_result("warmup")
+    );
+    arm_session_post_failure(&base_url, 404, 1, &[]).await?;
+    assert_eq!(
+        call_echo_tool(&client, "recovered").await?,
+        expected_echo_result("recovered")
+    );
+    let report = client
+        .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(5))
+        .await;
+    assert_eq!(report.attempts.len(), 2);
+    assert!(
+        report.is_complete(),
+        "old and new HTTP services both need exact close receipts: {report:?}"
+    );
+    Ok(())
+}

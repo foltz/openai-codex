@@ -998,7 +998,7 @@ impl TestCodexBuilder {
                     history_mode: self.history_mode,
                     client_mcp_extensions: client_mcp_extensions(),
                     environments: environment_requests,
-                    ..StartThreadOptions::new(config.clone())
+                    ..StartThreadOptions::new(config.clone(), /*control_endpoint*/ None)
                 }))
                 .await?
             }
@@ -1126,7 +1126,7 @@ impl TestCodex {
                     .map(TurnEnvironmentSelection::into_request)
                     .collect(),
             ),
-            ..StartThreadOptions::new(self.config.clone())
+            ..StartThreadOptions::new(self.config.clone(), /*control_endpoint*/ None)
         }
     }
 

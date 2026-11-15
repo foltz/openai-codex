@@ -258,6 +258,14 @@ pub struct McpServerConfig {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub supports_parallel_tool_calls: bool,
 
+    /// Opt in to capability-gated, connection-scoped canonical thread binding.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub thread_identity_eligible: bool,
+
+    /// Opt in to capability-gated disclosure of the hosting control endpoint.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub control_endpoint_eligible: bool,
+
     /// UTF-8 byte threshold for compacting each ordinary MCP tool input schema. Defaults to 5,000 bytes.
     /// Code Mode also uses an explicitly configured limit when rendering each tool's input type.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -437,6 +445,10 @@ pub struct RawMcpServerConfig {
     pub startup_readiness: Option<McpStartupReadiness>,
     #[serde(default)]
     pub supports_parallel_tool_calls: Option<bool>,
+    #[serde(default)]
+    pub thread_identity_eligible: Option<bool>,
+    #[serde(default)]
+    pub control_endpoint_eligible: Option<bool>,
     /// UTF-8 byte threshold for compacting each ordinary MCP tool input schema. Defaults to 5,000 bytes.
     /// Code Mode also uses an explicitly configured limit when rendering each tool's input type.
     /// Larger limits preserve more parameter descriptions.
@@ -489,6 +501,8 @@ impl TryFrom<RawMcpServerConfig> for McpServerConfig {
             required,
             startup_readiness,
             supports_parallel_tool_calls,
+            thread_identity_eligible,
+            control_endpoint_eligible,
             tool_input_schema_max_bytes,
             omit_tools_from,
             default_tools_approval_mode,
@@ -624,6 +638,8 @@ impl TryFrom<RawMcpServerConfig> for McpServerConfig {
             required: required.unwrap_or_default(),
             startup_readiness: startup_readiness.unwrap_or_default(),
             supports_parallel_tool_calls: supports_parallel_tool_calls.unwrap_or_default(),
+            thread_identity_eligible: thread_identity_eligible.unwrap_or_default(),
+            control_endpoint_eligible: control_endpoint_eligible.unwrap_or_default(),
             tool_input_schema_max_bytes,
             omit_tools_from,
             disabled_reason: None,

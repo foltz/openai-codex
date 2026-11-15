@@ -23,14 +23,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(unix)]
 use std::sync::Mutex;
-use std::sync::OnceLock;
-use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 #[cfg(unix)]
 use std::thread::sleep;
-#[cfg(unix)]
-use std::thread::spawn;
 use std::time::Duration;
 
 use crate::local_stdio_io;
@@ -42,6 +38,7 @@ use codex_exec_server::ExecBackend;
 use codex_exec_server::ExecEnvPolicy;
 use codex_exec_server::ExecParams;
 use codex_exec_server::ExecProcess;
+use codex_exec_server::ExecProcessEvent;
 use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
 use codex_utils_path_uri::LegacyAppPathString;
 use codex_utils_path_uri::PathUri;
@@ -53,6 +50,8 @@ use codex_utils_pty::DescriptorPolicy;
 use codex_utils_pty::ProcessMode;
 #[cfg(unix)]
 use codex_utils_pty::process_group::kill_process_group;
+#[cfg(unix)]
+use codex_utils_pty::process_group::process_group_exists;
 #[cfg(unix)]
 use codex_utils_pty::process_group::terminate_process_group;
 #[cfg(unix)]
@@ -128,49 +127,139 @@ impl StdioProcessRegistration {
 
 type DiscoveryCleanupResult = Shared<BoxFuture<'static, Result<(), Arc<io::Error>>>>;
 
+/// One retained cleanup operation, shared by restart, shutdown and later observers.
+/// Its owned process outlives the public handle, including when a bounded wait is cancelled.
 struct DiscoveryCleanup {
-    process: Weak<StdioServerProcessHandle>,
-    result: OnceLock<DiscoveryCleanupResult>,
+    process: Arc<StdioServerProcessOwner>,
+    state: Mutex<DiscoveryCleanupState>,
+    observed: AtomicBool,
+}
+
+#[derive(Default)]
+struct DiscoveryCleanupState {
+    reason: Option<StdioTermination>,
+    operation: Option<DiscoveryCleanupResult>,
 }
 
 impl DiscoveryCleanup {
-    fn start(&self, runtime: &Handle, reason: StdioTermination) -> &DiscoveryCleanupResult {
-        self.result.get_or_init(|| {
-            let process = self.process.upgrade();
-            // The owner waits for this worker on shutdown. Its grace periods must also advance
-            // when the caller leaves a current-thread runtime idle.
-            runtime
-                .spawn_blocking(move || {
-                    process
-                        .ok_or_else(|| io::Error::other("discovery process already released"))?
-                        .terminate_discovery(reason)
-                })
-                .map(|joined| match joined {
-                    Ok(result) => result.map_err(Arc::new),
-                    Err(error) => Err(Arc::new(io::Error::other(error))),
-                })
-                .boxed()
-                .shared()
-        })
+    fn is_started(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .operation
+            .is_some()
+    }
+
+    fn start(&self, runtime: &Handle, reason: StdioTermination) -> DiscoveryCleanupResult {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Reset failures and install the next attempt under the same lock. All
+        // concurrent retry observers join that attempt; successful steps stay cached.
+        if let Some(operation) = &state.operation
+            && !matches!(operation.peek(), Some(Err(_)))
+        {
+            return operation.clone();
+        }
+        let reason = *state.reason.get_or_insert(reason);
+        let process = Arc::clone(&self.process);
+        // Submit local cleanup immediately, including on an idle current-thread runtime.
+        let task = match &process.kind {
+            StdioServerProcessKind::Local(_) => {
+                runtime.spawn_blocking(move || process.terminate_local(reason))
+            }
+            StdioServerProcessKind::Executor(_) => {
+                runtime.spawn(async move { process.terminate_executor().await })
+            }
+        };
+        let operation = task
+            .map(|joined| match joined {
+                Ok(result) => result.map_err(Arc::new),
+                Err(error) => Err(Arc::new(io::Error::other(error))),
+            })
+            .boxed()
+            .shared();
+        state.operation = Some(operation.clone());
+        operation
+    }
+
+    async fn wait_until(&self, reason: StdioTermination, deadline: Instant) -> io::Result<()> {
+        if self.observed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "MCP process retirement deadline expired",
+            ));
+        }
+        let operation = self.start(&Handle::try_current().map_err(io::Error::other)?, reason);
+        tokio::time::timeout_at(deadline, operation)
+            .await
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "MCP process retirement timed out")
+            })?
+            .map_err(|error| io::Error::new(error.kind(), error))?;
+        self.observe_until(deadline).await?;
+        self.observed.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    async fn observe_until(&self, deadline: Instant) -> io::Result<()> {
+        #[cfg(unix)]
+        self.observe_group_until(deadline, process_group_exists)
+            .await?;
+        #[cfg(not(unix))]
+        let _ = deadline;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    async fn observe_group_until(
+        &self,
+        deadline: Instant,
+        mut exists: impl FnMut(u32) -> io::Result<bool>,
+    ) -> io::Result<()> {
+        if let StdioServerProcessKind::Local(Some(LocalProcessTerminator::DiscoveryLeader {
+            leader,
+        })) = &self.process.kind
+        {
+            let pid = leader
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pid;
+            while exists(pid)? {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "MCP process group exit was not observed",
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        Ok(())
     }
 }
 
 #[derive(Clone)]
 pub(super) struct StdioProcessRef {
-    process: Weak<StdioServerProcessHandle>,
-    discovery_cleanup: Option<Arc<DiscoveryCleanup>>,
+    cleanup: Arc<DiscoveryCleanup>,
 }
 
 impl StdioProcessRef {
     pub(super) async fn terminate(&self, reason: StdioTermination) -> io::Result<()> {
-        if let Some(cleanup) = &self.discovery_cleanup {
-            let result = cleanup.start(&Handle::current(), reason);
-            return result.clone().await.map_err(io::Error::other);
-        }
-        if let Some(process) = self.process.upgrade() {
-            process.terminate().await?;
-        }
-        Ok(())
+        self.terminate_until(reason, Instant::now() + PROCESS_RETIREMENT_TIMEOUT)
+            .await
+    }
+
+    pub(super) async fn terminate_until(
+        &self,
+        reason: StdioTermination,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        self.cleanup.wait_until(reason, deadline).await
     }
 }
 
@@ -184,6 +273,7 @@ pub struct StdioServerTransport {
     process: Arc<StdioServerProcessHandle>,
     discovery_cleanup: Option<Arc<DiscoveryCleanup>>,
     protocol_mode: McpProtocolMode,
+    restart_on_drop: bool,
 }
 
 enum StdioServerTransportInner {
@@ -233,16 +323,30 @@ impl Drop for StdioServerTransport {
         // A client or handshake still holding this result may retry after the SDK drops a
         // failed transport. Otherwise the process handle runs its ordinary shutdown on drop.
         if let Some(cleanup) = &self.discovery_cleanup
-            && Arc::strong_count(cleanup) > 1
-            && !self.process.terminated.load(Ordering::Acquire)
+            // The transport and its handle each hold one intrinsic reference.
+            && Arc::strong_count(cleanup) > 2
+            && !cleanup.is_started()
             && let Ok(runtime) = Handle::try_current()
         {
-            cleanup.start(&runtime, StdioTermination::Restart);
+            drop(cleanup.start(
+                &runtime,
+                if self.restart_on_drop {
+                    StdioTermination::Restart
+                } else {
+                    StdioTermination::Shutdown
+                },
+            ));
         }
     }
 }
 
 impl StdioServerTransport {
+    pub(super) fn finish_discovery(&mut self) {
+        if let StdioServerTransportInner::Local(local) = &mut self.inner {
+            local.finish_discovery();
+        }
+    }
+
     pub(super) fn protocol_mode(&self) -> McpProtocolMode {
         self.protocol_mode
     }
@@ -260,8 +364,7 @@ impl StdioServerTransport {
 
     pub(super) fn process_ref(&self) -> StdioProcessRef {
         StdioProcessRef {
-            process: Arc::downgrade(&self.process),
-            discovery_cleanup: self.discovery_cleanup.clone(),
+            cleanup: Arc::clone(&self.process.cleanup),
         }
     }
 
@@ -361,47 +464,28 @@ const RESTART_DRAIN_GRACE_PERIOD: Duration = Duration::from_millis(250);
 // Keep queued stderr diagnostics before closing the reader, even when an
 // escaped descendant prevents the pipe from reaching EOF.
 const STDERR_READER_DRAIN_GRACE_PERIOD: Duration = Duration::from_millis(250);
+const PROCESS_RETIREMENT_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[cfg(unix)]
 enum LocalProcessTerminator {
-    ProcessGroup(u32),
     // The SDK may drop the failed transport before the caller can decide whether to restart it.
-    DiscoveryLeader {
-        leader: Mutex<Option<Box<Child>>>,
-        runtime: Handle,
-    },
+    DiscoveryLeader { leader: Mutex<UnixGroupCleanup> },
 }
 
 #[cfg(unix)]
-#[derive(Clone)]
-struct KillDiscoveryGroupOnDrop(Arc<Mutex<Option<Box<Child>>>>);
-
-#[cfg(unix)]
-impl KillDiscoveryGroupOnDrop {
-    fn new(child: Box<Child>) -> Self {
-        Self(Arc::new(Mutex::new(Some(child))))
-    }
-
-    fn kill(&self) -> io::Result<()> {
-        // Runtime teardown must wait for a timer that has already started sending the signal.
-        let mut leader = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(child) = leader.as_ref()
-            && let Some(pid) = child.id()
-        {
-            kill_process_group_and_warn(pid)?;
-        }
-        leader.take();
-        Ok(())
-    }
+struct UnixGroupCleanup {
+    pid: u32,
+    child: Option<Box<Child>>,
+    term_sent: bool,
+    released: bool,
 }
 
 #[cfg(unix)]
-impl Drop for KillDiscoveryGroupOnDrop {
+impl Drop for UnixGroupCleanup {
     fn drop(&mut self) {
-        let _ = self.kill();
+        if self.child.is_some() {
+            let _ = kill_process_group_and_warn(self.pid);
+        }
     }
 }
 
@@ -424,11 +508,14 @@ enum LocalProcessTerminator {
 struct LocalProcessTerminator;
 
 pub(crate) struct StdioServerProcessHandle {
+    cleanup: Arc<DiscoveryCleanup>,
+}
+
+struct StdioServerProcessOwner {
     program_name: String,
     kind: StdioServerProcessKind,
-    terminated: AtomicBool,
-    // An escaped descendant can keep stderr open after the MCP server exits.
     stderr_reader: Option<watch::Sender<()>>,
+    executor_termination_accepted: AtomicBool,
 }
 
 enum StdioServerProcessKind {
@@ -545,7 +632,7 @@ impl LocalStdioServerLauncher {
         let terminator = match job {
             Some((job, root)) => Some(LocalProcessTerminator::Job {
                 job,
-                discovery_root: discovery_owned.then_some(root),
+                discovery_root: Some(root),
             }),
             None => process_id.and_then(|process_id| {
                 match codex_utils_pty::JobObject::open_process_handle(process_id) {
@@ -560,15 +647,14 @@ impl LocalStdioServerLauncher {
         #[cfg(unix)]
         let (transport, terminator) = {
             let mut transport = transport;
-            let terminator = process_id.map(|pid| {
-                if discovery_owned {
-                    LocalProcessTerminator::DiscoveryLeader {
-                        leader: Mutex::new(transport.take_child()),
-                        runtime: Handle::current(),
-                    }
-                } else {
-                    LocalProcessTerminator::ProcessGroup(pid)
-                }
+            let terminator = process_id.map(|pid| LocalProcessTerminator::DiscoveryLeader {
+                // Every local group keeps its leader until the last destructive signal.
+                leader: Mutex::new(UnixGroupCleanup {
+                    pid,
+                    child: transport.take_child(),
+                    term_sent: false,
+                    released: false,
+                }),
             });
             (transport, terminator)
         };
@@ -612,17 +698,13 @@ impl LocalStdioServerLauncher {
             stop_tx
         });
         let process = StdioServerProcessHandle::local(program_name, terminator, stderr_reader);
-        let discovery_cleanup = discovery_owned.then(|| {
-            Arc::new(DiscoveryCleanup {
-                process: Arc::downgrade(&process),
-                result: OnceLock::new(),
-            })
-        });
+        let discovery_cleanup = Some(Arc::clone(&process.cleanup));
         let transport = StdioServerTransport {
             inner: StdioServerTransportInner::Local(transport),
             process,
             discovery_cleanup,
             protocol_mode,
+            restart_on_drop: discovery_owned,
         };
         if let Some(mut slot) = slot {
             slot.process = transport.process_ref();
@@ -635,83 +717,39 @@ impl LocalStdioServerLauncher {
 impl LocalProcessTerminator {
     #[cfg(unix)]
     fn terminate_discovery(&self, reason: StdioTermination) -> io::Result<()> {
-        let Self::DiscoveryLeader { leader, .. } = self else {
-            return Err(io::Error::other("missing Unix MCP discovery leader"));
-        };
-        let child = leader
+        let Self::DiscoveryLeader { leader, .. } = self;
+        // Hold the stage lock through the last signal and child release. A
+        // retry can never signal a group whose identity reservation was released.
+        let mut stage = leader
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-            .ok_or_else(|| io::Error::other("Unix MCP discovery leader already released"))?;
-        let pid = child
-            .id()
-            .ok_or_else(|| io::Error::other("missing Unix MCP discovery leader PID"))?;
-        let cleanup = KillDiscoveryGroupOnDrop::new(child);
-        // A failed transport closed stdin. Let the helper release its endpoint before TERM,
-        // and reserve its PID through the last group signal.
-        let term_grace = match reason {
-            StdioTermination::Restart => {
-                sleep(RESTART_DRAIN_GRACE_PERIOD);
-                RESTART_DRAIN_GRACE_PERIOD
-            }
-            StdioTermination::Shutdown => PROCESS_GROUP_TERM_GRACE_PERIOD,
-        };
-        if terminate_process_group(pid)? {
-            // A wrapper may exit before a child handling SIGTERM has released its own endpoint.
-            wait_for_process_group_exit(pid, term_grace);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if stage.released {
+            return Ok(());
         }
-        cleanup.kill()?;
-        wait_for_process_group_exit(pid, Duration::from_secs(1));
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    fn terminate(&self) {
-        let (process_group_id, discovery) = match self {
-            Self::ProcessGroup(pid) => (*pid, None),
-            Self::DiscoveryLeader { leader, runtime } => {
-                let Some(leader) = leader
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take()
-                else {
-                    return;
-                };
-                let Some(pid) = leader.id() else {
-                    return;
-                };
-                (pid, Some((runtime, leader)))
-            }
-        };
-        let should_escalate = match terminate_process_group(process_group_id) {
-            Ok(exists) => exists,
-            Err(error) => {
-                warn!("Failed to terminate MCP process group {process_group_id}: {error}");
-                false
-            }
-        };
-        if should_escalate {
-            let discovery = discovery.map(|(runtime, leader)| {
-                let on_timeout = KillDiscoveryGroupOnDrop::new(leader);
-                let on_runtime_exit = on_timeout.clone();
-                let (finished, wait) = oneshot::channel::<()>();
-                std::mem::drop(runtime.spawn(async move {
-                    let _ = wait.await;
-                    drop(on_runtime_exit);
-                }));
-                (on_timeout, finished)
-            });
-            // A caller can leave a current-thread runtime idle for the entire grace period.
-            spawn(move || {
-                sleep(PROCESS_GROUP_TERM_GRACE_PERIOD);
-                if let Some((on_timeout, finished)) = discovery {
-                    drop(on_timeout);
-                    drop(finished);
-                } else {
-                    let _ = kill_process_group_and_warn(process_group_id);
+        if stage.child.is_none() {
+            return Err(io::Error::other("missing Unix MCP discovery leader"));
+        }
+        let pid = stage.pid;
+        if !stage.term_sent {
+            let grace = match reason {
+                StdioTermination::Restart => {
+                    sleep(RESTART_DRAIN_GRACE_PERIOD);
+                    RESTART_DRAIN_GRACE_PERIOD
                 }
-            });
+                StdioTermination::Shutdown => PROCESS_GROUP_TERM_GRACE_PERIOD,
+            };
+            let present = terminate_process_group(pid)?;
+            stage.term_sent = true;
+            if present {
+                wait_for_process_group_exit(pid, grace);
+            }
         }
+        kill_process_group_and_warn(pid)?;
+        stage.released = true;
+        stage.child.take();
+        // Absence is observed separately under each caller's fresh deadline.
+
+        Ok(())
     }
 
     #[cfg(windows)]
@@ -721,22 +759,14 @@ impl LocalProcessTerminator {
                 job,
                 discovery_root: Some(root),
             } => job.terminate_and_wait(root, Duration::from_secs(1)),
-            _ => Err(io::Error::other(
-                "cannot restart an uncontained Windows MCP server",
-            )),
-        }
-    }
-
-    #[cfg(windows)]
-    fn terminate(&self) {
-        let result = match self {
-            Self::Job { job, .. } => job.terminate(),
-            Self::Process(process_handle) => {
-                codex_utils_pty::JobObject::terminate_process_handle(process_handle)
+            Self::Process(handle) => {
+                codex_utils_pty::JobObject::terminate_process_handle(handle)?;
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "MCP process lacks job-level terminal evidence",
+                ))
             }
-        };
-        if let Err(error) = result {
-            warn!("Failed to terminate Windows MCP process: {error}");
+            _ => Err(io::Error::other("missing Windows MCP job root")),
         }
     }
 
@@ -744,9 +774,6 @@ impl LocalProcessTerminator {
     fn terminate_discovery(&self, _reason: StdioTermination) -> io::Result<()> {
         Err(io::Error::other("MCP stdio restart is unsupported"))
     }
-
-    #[cfg(not(any(unix, windows)))]
-    fn terminate(&self) {}
 }
 
 impl StdioServerProcessHandle {
@@ -755,102 +782,118 @@ impl StdioServerProcessHandle {
         terminator: Option<LocalProcessTerminator>,
         stderr_reader: Option<watch::Sender<()>>,
     ) -> Arc<Self> {
-        Arc::new(Self {
+        Self::new_owner(StdioServerProcessOwner {
             program_name,
             kind: StdioServerProcessKind::Local(terminator),
-            terminated: AtomicBool::new(false),
             stderr_reader,
+            executor_termination_accepted: AtomicBool::new(false),
         })
     }
 
     pub(crate) fn executor(program_name: String, process: Arc<dyn ExecProcess>) -> Arc<Self> {
-        Arc::new(Self {
+        Self::new_owner(StdioServerProcessOwner {
             program_name,
             kind: StdioServerProcessKind::Executor(process),
-            terminated: AtomicBool::new(false),
             stderr_reader: None,
+            executor_termination_accepted: AtomicBool::new(false),
         })
     }
 
-    fn begin_termination(&self) -> bool {
-        if self.terminated.swap(true, Ordering::AcqRel) {
-            return false;
-        }
-        if let Some(stderr_reader) = &self.stderr_reader {
-            stderr_reader.send_replace(());
-        }
-        true
-    }
-
-    fn terminate_discovery(&self, reason: StdioTermination) -> io::Result<()> {
-        if !self.begin_termination() {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "MCP stdio server is already shutting down",
-            ));
-        }
-        let StdioServerProcessKind::Local(Some(terminator)) = &self.kind else {
-            return Err(io::Error::other("missing local MCP discovery process"));
-        };
-        // Stop an uncontained replacement, but don't permit a retry on it.
-        terminator
-            .terminate_discovery(reason)
-            .inspect_err(|_| terminator.terminate())
+    fn new_owner(process: StdioServerProcessOwner) -> Arc<Self> {
+        Arc::new(Self {
+            cleanup: Arc::new(DiscoveryCleanup {
+                process: Arc::new(process),
+                state: Mutex::new(DiscoveryCleanupState::default()),
+                observed: AtomicBool::new(false),
+            }),
+        })
     }
 
     pub(crate) async fn terminate(&self) -> io::Result<()> {
-        if !self.begin_termination() {
-            return Ok(());
+        self.terminate_until(Instant::now() + PROCESS_RETIREMENT_TIMEOUT)
+            .await
+    }
+
+    pub(crate) async fn terminate_until(&self, deadline: Instant) -> io::Result<()> {
+        self.cleanup
+            .wait_until(StdioTermination::Shutdown, deadline)
+            .await
+    }
+}
+
+impl StdioServerProcessOwner {
+    fn stop_stderr(&self) {
+        if let Some(stderr_reader) = &self.stderr_reader {
+            stderr_reader.send_replace(());
         }
-        match &self.kind {
+    }
+
+    fn terminate_local(&self, reason: StdioTermination) -> io::Result<()> {
+        let result = match &self.kind {
             StdioServerProcessKind::Local(Some(terminator)) => {
-                terminator.terminate();
-                Ok(())
+                terminator.terminate_discovery(reason)
             }
-            StdioServerProcessKind::Local(None) => Ok(()),
+            _ => Err(io::Error::other("missing MCP process-group terminal owner")),
+        };
+        self.stop_stderr();
+        result
+    }
+
+    async fn terminate_executor(&self) -> io::Result<()> {
+        let result = match &self.kind {
             StdioServerProcessKind::Executor(process) => {
-                process.terminate().await.map_err(|error| {
-                    self.terminated.store(false, Ordering::Release);
-                    io::Error::other(error)
-                })
+                let mut events = process.subscribe_events();
+                if !self.executor_termination_accepted.load(Ordering::Acquire) {
+                    process.terminate().await.map_err(io::Error::other)?;
+                    self.executor_termination_accepted
+                        .store(true, Ordering::Release);
+                }
+                loop {
+                    match events.recv().await {
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            events = process.subscribe_events();
+                            tokio::task::yield_now().await;
+                        }
+                        event => {
+                            if executor_event_proves_close(event)? {
+                                break Ok(());
+                            }
+                        }
+                    }
+                }
             }
+            _ => Err(io::Error::other("missing executor process owner")),
+        };
+        self.stop_stderr();
+        result
+    }
+}
+
+fn executor_event_proves_close(
+    event: Result<ExecProcessEvent, tokio::sync::broadcast::error::RecvError>,
+) -> io::Result<bool> {
+    match event {
+        Ok(ExecProcessEvent::Closed { .. }) => Ok(true),
+        Ok(ExecProcessEvent::Exited { .. } | ExecProcessEvent::Output(_)) => Ok(false),
+        Ok(ExecProcessEvent::Failed(message)) => {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, message))
         }
+        Err(error) => Err(io::Error::other(error)),
     }
 }
 
 impl Drop for StdioServerProcessHandle {
     fn drop(&mut self) {
-        if self.terminated.swap(true, Ordering::AcqRel) {
-            return;
-        }
-
-        match &self.kind {
-            StdioServerProcessKind::Local(Some(terminator)) => {
-                terminator.terminate();
+        if !self.cleanup.is_started() {
+            if let Ok(runtime) = Handle::try_current() {
+                drop(self.cleanup.start(&runtime, StdioTermination::Shutdown));
+            } else {
+                // Retained StdioProcessRefs can drive this owner on a later runtime.
+                warn!(
+                    "MCP process cleanup remains unproven ({}): no Tokio runtime",
+                    self.cleanup.process.program_name
+                );
             }
-            StdioServerProcessKind::Local(None) => {}
-            StdioServerProcessKind::Executor(process) => {
-                let process = Arc::clone(process);
-                let program_name = self.program_name.clone();
-                let Ok(handle) = Handle::try_current() else {
-                    warn!(
-                        "Could not schedule remote MCP server process termination on drop ({}): no Tokio runtime is available",
-                        self.program_name
-                    );
-                    return;
-                };
-
-                std::mem::drop(handle.spawn(async move {
-                    if let Err(error) = process.terminate().await {
-                        warn!(
-                            "Failed to terminate remote MCP server process on drop ({program_name}): {error}"
-                        );
-                    }
-                }));
-            }
-        }
-        if let Some(stderr_reader) = &self.stderr_reader {
-            stderr_reader.send_replace(());
         }
     }
 }
@@ -958,6 +1001,7 @@ impl ExecutorStdioServerLauncher {
             process,
             discovery_cleanup: None,
             protocol_mode,
+            restart_on_drop: false,
         })
     }
 
@@ -1074,6 +1118,373 @@ mod tests {
             }
             Ok(())
         })
+    }
+
+    #[test]
+    fn executor_terminal_evidence_rejects_exit_failure_and_lost_events() {
+        assert!(
+            executor_event_proves_close(Ok(ExecProcessEvent::Closed { seq: 2 })).expect("closed")
+        );
+        assert!(
+            !executor_event_proves_close(Ok(ExecProcessEvent::Exited {
+                seq: 1,
+                exit_code: 0,
+                sandbox_denied: None
+            }))
+            .expect("exit is not closed")
+        );
+        assert!(executor_event_proves_close(Ok(ExecProcessEvent::Failed("lost".into()))).is_err());
+        assert!(
+            executor_event_proves_close(Err(tokio::sync::broadcast::error::RecvError::Closed))
+                .is_err()
+        );
+        assert!(
+            executor_event_proves_close(Err(tokio::sync::broadcast::error::RecvError::Lagged(1)))
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_process_owner_never_claims_retirement_on_repeat() {
+        let process = StdioServerProcessHandle::local("missing".into(), None, None);
+        let observed = StdioProcessRef {
+            cleanup: Arc::clone(&process.cleanup),
+        };
+        assert!(
+            observed
+                .terminate(StdioTermination::Shutdown)
+                .await
+                .is_err()
+        );
+        drop(process);
+        assert!(
+            observed
+                .terminate(StdioTermination::Shutdown)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_process_deadline_starts_no_cleanup() {
+        let process = StdioServerProcessHandle::local("missing".into(), None, None);
+        let error = process
+            .terminate_until(Instant::now())
+            .await
+            .expect_err("expired deadline");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(!process.cleanup.is_started());
+    }
+
+    #[test]
+    fn no_runtime_drop_retains_unstarted_custody_for_later_observer() {
+        let process = StdioServerProcessHandle::local("missing".into(), None, None);
+        let observed = StdioProcessRef {
+            cleanup: Arc::clone(&process.cleanup),
+        };
+        drop(process);
+        assert!(!observed.cleanup.is_started());
+        let runtime = tokio::runtime::Runtime::new().expect("fixture runtime");
+        assert!(
+            runtime
+                .block_on(observed.terminate(StdioTermination::Shutdown))
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_cleanup_progresses_while_current_thread_runtime_is_idle() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let ready = root.path().join("ready");
+        let script = format!(
+            "trap '' TERM; echo ready > '{}'; while :; do sleep 1; done",
+            ready.display()
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let (observed, pid) = runtime.block_on(async {
+            let command = StdioServerCommand::new(
+                "/bin/sh".into(),
+                vec!["-c".into(), script.into()],
+                None,
+                vec![],
+                None,
+                McpProtocolMode::Legacy,
+            );
+            let transport =
+                LocalStdioServerLauncher::launch_server(command, root.path().to_owned())?;
+            let observed = transport.process_ref();
+            let pid = match &observed.cleanup.process.kind {
+                StdioServerProcessKind::Local(Some(LocalProcessTerminator::DiscoveryLeader {
+                    leader,
+                })) => leader.lock().expect("leader").pid,
+                _ => panic!("owned local group"),
+            };
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !ready.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await?;
+            drop(transport); // Starts the same once-only blocking cleanup.
+            Ok::<_, anyhow::Error>((observed, pid))
+        })?;
+        // Do not drive the runtime: a detached async prelude would stall here.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while process_group_exists(pid)? && std::time::Instant::now() < deadline {
+            sleep(Duration::from_millis(10));
+        }
+        let absent_while_idle = !process_group_exists(pid)?;
+        // Always drive/observe cleanup before asserting, including the regression path.
+        runtime.block_on(observed.terminate_until(
+            StdioTermination::Shutdown,
+            Instant::now() + Duration::from_secs(5),
+        ))?;
+        assert!(
+            absent_while_idle,
+            "blocking cleanup must finish while the current-thread runtime is idle"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ordinary_group_retirement_retains_leader_and_retries_one_operation()
+    -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let ready = root.path().join("ready");
+        let script = format!(
+            "trap '' TERM; echo ready > '{}'; while :; do sleep 1; done",
+            ready.display()
+        );
+        let command = StdioServerCommand::new(
+            "/bin/sh".into(),
+            vec!["-c".into(), script.into()],
+            None,
+            vec![],
+            None,
+            McpProtocolMode::Legacy,
+        );
+        let transport = LocalStdioServerLauncher::launch_server(command, root.path().to_owned())?;
+        let observed = transport.process_ref();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        // Keep the transport alive: cleanup itself must own and stop the group.
+        let (short, eventual) = tokio::join!(
+            observed.terminate_until(
+                StdioTermination::Shutdown,
+                Instant::now() + Duration::from_millis(20)
+            ),
+            observed.terminate_until(
+                StdioTermination::Shutdown,
+                Instant::now() + Duration::from_secs(5)
+            ),
+        );
+        assert_eq!(
+            short
+                .expect_err("TERM-ignoring group exceeds short wait")
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        eventual?;
+        drop(transport);
+        observed
+            .terminate_until(
+                StdioTermination::Restart,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    struct FailFirstTermination {
+        inner: Arc<dyn ExecProcess>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(unix)]
+    impl ExecProcess for FailFirstTermination {
+        fn process_id(&self) -> &codex_exec_server::ProcessId {
+            self.inner.process_id()
+        }
+        fn subscribe_wake(&self) -> watch::Receiver<u64> {
+            self.inner.subscribe_wake()
+        }
+        fn subscribe_events(&self) -> codex_exec_server::ExecProcessEventReceiver {
+            self.inner.subscribe_events()
+        }
+        fn read(
+            &self,
+            after: Option<u64>,
+            max: Option<usize>,
+            wait: Option<u64>,
+        ) -> codex_exec_server::ExecProcessFuture<'_, codex_exec_server::ReadResponse> {
+            self.inner.read(after, max, wait)
+        }
+        fn write(
+            &self,
+            chunk: Vec<u8>,
+        ) -> codex_exec_server::ExecProcessFuture<'_, codex_exec_server::WriteResponse> {
+            self.inner.write(chunk)
+        }
+        fn signal(
+            &self,
+            signal: codex_exec_server::ProcessSignal,
+        ) -> codex_exec_server::ExecProcessFuture<'_, ()> {
+            self.inner.signal(signal)
+        }
+        fn terminate(&self) -> codex_exec_server::ExecProcessFuture<'_, ()> {
+            if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                Box::pin(async {
+                    Err(codex_exec_server::ExecServerError::Protocol(
+                        "injected termination failure".into(),
+                    ))
+                })
+            } else {
+                self.inner.terminate()
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn executor_failed_rpc_retries_then_caches_positive_close() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let command = StdioServerCommand::new(
+            "/bin/sleep".into(),
+            vec!["10".into()],
+            None,
+            vec![],
+            Some(root.path().to_string_lossy().into_owned()),
+            McpProtocolMode::Legacy,
+        );
+        let transport = ExecutorStdioServerLauncher::launch_server(
+            command,
+            codex_exec_server::Environment::default_for_tests().get_exec_backend(),
+        )
+        .await?;
+        let original = transport.process_ref();
+        let StdioServerProcessKind::Executor(inner) = &original.cleanup.process.kind else {
+            panic!("executor owner");
+        };
+        let process = Arc::new(FailFirstTermination {
+            inner: Arc::clone(inner),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let owner = StdioServerProcessHandle::executor("retry fixture".into(), process.clone());
+        assert!(owner.terminate().await.is_err());
+        let (first, second) = tokio::join!(owner.terminate(), owner.terminate());
+        first?;
+        second?;
+        assert_eq!(process.calls.load(Ordering::Acquire), 2);
+        owner.terminate_until(Instant::now()).await?;
+        assert_eq!(process.calls.load(Ordering::Acquire), 2);
+        drop(transport);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn released_group_reobserves_after_timeout_without_repeating_signals()
+    -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let command = StdioServerCommand::new(
+            "/bin/sleep".into(),
+            vec!["10".into()],
+            None,
+            vec![],
+            None,
+            McpProtocolMode::Legacy,
+        );
+        let transport = LocalStdioServerLauncher::launch_server(command, root.path().to_owned())?;
+        let observed = transport.process_ref();
+        let cleanup = &observed.cleanup;
+        let operation = cleanup.start(&Handle::current(), StdioTermination::Restart);
+        operation.clone().await.map_err(io::Error::other)?;
+        // Inject only delayed absence evidence; never invent positive exit evidence.
+        assert_eq!(
+            cleanup
+                .observe_group_until(Instant::now() + Duration::from_millis(20), |_| Ok(true))
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        observed
+            .terminate_until(
+                StdioTermination::Restart,
+                Instant::now() + Duration::from_secs(3),
+            )
+            .await?;
+        let same_operation = cleanup.start(&Handle::current(), StdioTermination::Shutdown);
+        assert!(operation.ptr_eq(&same_operation));
+        assert!(cleanup.observed.load(Ordering::Acquire));
+        observed
+            .terminate_until(StdioTermination::Shutdown, Instant::now())
+            .await?;
+        drop(transport);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_held_stage_concurrent_retries_join_one_operation() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let command = StdioServerCommand::new(
+            "/bin/sleep".into(),
+            vec!["10".into()],
+            None,
+            vec![],
+            None,
+            McpProtocolMode::Legacy,
+        );
+        let transport = LocalStdioServerLauncher::launch_server(command, root.path().to_owned())?;
+        let observed = transport.process_ref();
+        let cleanup = &observed.cleanup;
+        let StdioServerProcessKind::Local(Some(LocalProcessTerminator::DiscoveryLeader { leader })) =
+            &cleanup.process.kind
+        else {
+            panic!("local group");
+        };
+        // Retain the fixture's reservation outside the stage to force a safe,
+        // pre-signal error, then restore it before simultaneous retry admission.
+        let child = leader.lock().unwrap().child.take();
+        let failed = cleanup.start(&Handle::current(), StdioTermination::Restart);
+        assert!(failed.clone().await.is_err());
+        leader.lock().unwrap().child = child;
+        let runtime = Handle::current();
+        let barrier = std::sync::Barrier::new(2);
+        let (first, second) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                barrier.wait();
+                cleanup.start(&runtime, StdioTermination::Restart)
+            });
+            let second = scope.spawn(|| {
+                barrier.wait();
+                cleanup.start(&runtime, StdioTermination::Shutdown)
+            });
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        assert!(!failed.ptr_eq(&first));
+        assert!(first.ptr_eq(&second));
+        first.await.map_err(io::Error::other)?;
+        observed
+            .terminate_until(
+                StdioTermination::Shutdown,
+                Instant::now() + Duration::from_secs(3),
+            )
+            .await?;
+        assert!(leader.lock().unwrap().released);
+        assert!(leader.lock().unwrap().child.is_none());
+        drop(transport);
+        Ok(())
     }
 
     #[test]

@@ -150,7 +150,7 @@ async fn steer_joins_existing_turn_without_extending_sampling(
                 input_schema: serde_json::json!({"type": "object", "properties": {}}),
                 defer_loading: false,
             })],
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?;
     let thread_id = thread.thread_id.to_string();

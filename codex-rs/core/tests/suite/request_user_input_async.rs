@@ -83,7 +83,7 @@ async fn async_question_registration_respects_user_input_setting(
     };
     let mut options = StartThreadOptions {
         session_source: Some(session_source),
-        ..StartThreadOptions::new(test.config.clone())
+        ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
     };
     if matches!(thread_kind, ThreadKind::HostRestricted) {
         options
@@ -174,7 +174,7 @@ async fn persistent_async_message_guidance_follows_tool_availability(
         .thread_manager
         .start_thread(StartThreadOptions {
             session_source: Some(session_source),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?
         .thread;
@@ -253,7 +253,7 @@ async fn freeform_async_message_requires_root_and_catalog_or_feature_opt_in(
         .thread_manager
         .start_thread(StartThreadOptions {
             session_source: Some(session_source),
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?
         .thread;

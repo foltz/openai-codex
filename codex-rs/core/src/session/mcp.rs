@@ -175,6 +175,8 @@ impl Session {
             self.services.turn_environments.environment_manager(),
             local_process_cwd,
         )
+        .with_canonical_thread_id(self.thread_id.to_string())
+        .with_control_endpoint(self.control_endpoint.clone())
         .with_connection_pool(self.services.mcp_manager.connection_pool())
         .with_selected_environments(
             environments.all_selections().into(),

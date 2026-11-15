@@ -82,7 +82,7 @@ async fn abort_lifecycle_finishes_before_terminal_event(
                 input_schema: serde_json::json!({"type": "object", "properties": {}}),
                 defer_loading: false,
             })],
-            ..StartThreadOptions::new(test.config.clone())
+            ..StartThreadOptions::new(test.config.clone(), /*control_endpoint*/ None)
         })
         .await?
         .thread;

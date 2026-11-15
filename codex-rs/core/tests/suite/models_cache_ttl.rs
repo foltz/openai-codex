@@ -201,7 +201,7 @@ async fn guardian_reused_reviewer_avoids_stale_catalog_lookup(with_cache: bool) 
                 test.session_configured.session_id.into(),
                 StartThreadOptions {
                     session_source: Some(SessionSource::Internal(InternalSessionSource::Guardian)),
-                    ..StartThreadOptions::new(config)
+                    ..StartThreadOptions::new(config, /*control_endpoint*/ None)
                 },
                 Vec::new(),
             )

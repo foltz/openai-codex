@@ -19,6 +19,7 @@ const MCP_THREAD_ID_META_KEY: &str = "threadId";
 
 #[derive(Clone)]
 pub(crate) struct McpRequestProcessor {
+    control_endpoint: Option<String>,
     pub(super) auth_manager: Arc<AuthManager>,
     thread_manager: Arc<ThreadManager>,
     pub(super) outgoing: Arc<OutgoingMessageSender>,
@@ -35,6 +36,7 @@ impl McpRequestProcessor {
         outgoing: Arc<OutgoingMessageSender>,
         config_manager: ConfigManager,
         account_processor: Arc<AccountRequestProcessor>,
+        control_endpoint: Option<String>,
     ) -> Self {
         Self {
             auth_manager,
@@ -42,6 +44,7 @@ impl McpRequestProcessor {
             outgoing,
             config_manager,
             account_processor,
+            control_endpoint,
             thread_state_manager,
         }
     }
@@ -160,7 +163,8 @@ impl McpRequestProcessor {
                 let runtime_context = McpRuntimeContext::new(
                     self.thread_manager.environment_manager(),
                     config.cwd.to_path_buf(),
-                );
+                )
+                .with_control_endpoint(self.control_endpoint.clone());
                 (mcp_config, runtime_context)
             }
         };
@@ -448,7 +452,8 @@ impl McpRequestProcessor {
                     McpRuntimeContext::new(
                         self.thread_manager.environment_manager(),
                         config.cwd.to_path_buf(),
-                    ),
+                    )
+                    .with_control_endpoint(self.control_endpoint.clone()),
                 ),
             };
             let mut snapshot = collect_mcp_server_status_snapshot_with_detail(
@@ -727,7 +732,8 @@ impl McpRequestProcessor {
         // environment. Use config cwd only as the local stdio fallback; named
         // environment stdio MCPs must declare their own absolute cwd.
         let runtime_context =
-            McpRuntimeContext::new(Arc::clone(&environment_manager), config.cwd.to_path_buf());
+            McpRuntimeContext::new(Arc::clone(&environment_manager), config.cwd.to_path_buf())
+                .with_control_endpoint(self.control_endpoint.clone());
         let response_request_id = request_id.clone();
 
         let task = async move {

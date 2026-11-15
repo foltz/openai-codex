@@ -41,6 +41,11 @@ use crate::responses_metadata::subagent_metadata_kind;
 use crate::thread_manager;
 use crate::unified_exec;
 
+/// Close the real final-admission gate while an integration contributor is paused.
+pub async fn close_task_admission(thread: &crate::CodexThread) {
+    thread.session.close_task_admission().await;
+}
+
 /// Supply fixed model metadata to tests without implementing a provider.
 pub fn fixed_model_catalog(
     manager: SharedModelsManager,

@@ -213,3 +213,131 @@ async fn empty_runtime_exposes_external_connection_owner_before_shutdown() {
     assert!(report.are_connections_released());
     assert_eq!(report.registered_at_end, 0);
 }
+
+#[tokio::test]
+async fn admitted_generation_prevents_empty_success_and_cannot_publish_after_close() {
+    let root = McpRuntimeRetirement::default();
+    let permit = root.admit_generation().unwrap();
+    let pending = root.shutdown_until(Instant::now()).await;
+    assert!(!pending.are_connections_released());
+    assert!(pending.connections.is_empty());
+    assert_eq!(pending.constructing_generations, vec![0]);
+    assert_eq!(pending.generations_admitted, 1);
+    let published = AtomicUsize::new(0);
+    assert!(
+        permit
+            .publish_if_open(|| published.fetch_add(1, Ordering::SeqCst))
+            .is_none()
+    );
+    assert_eq!(published.load(Ordering::SeqCst), 0);
+    assert!(root.admit_generation().is_err());
+    drop(permit);
+    let settled = root.shutdown_until(Instant::now()).await;
+    assert!(settled.are_connections_released());
+    assert_eq!(settled.generations_settled, 1);
+    assert_eq!(settled.generations_published, 0);
+}
+
+#[tokio::test]
+async fn cancelled_constructor_settles_its_original_generation_reservation() {
+    let root = McpRuntimeRetirement::default();
+    let caller_root = root.clone();
+    let entered = Arc::new(Semaphore::new(0));
+    let ready = Arc::clone(&entered);
+    let caller = tokio::spawn(async move {
+        let _permit = caller_root.admit_generation().unwrap();
+        ready.add_permits(1);
+        std::future::pending::<()>().await;
+    });
+    entered.acquire().await.unwrap().forget();
+    assert!(
+        !root
+            .shutdown_until(Instant::now())
+            .await
+            .are_connections_released()
+    );
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    let report = root
+        .shutdown_until(Instant::now() + Duration::from_secs(1))
+        .await;
+    assert!(report.are_connections_released());
+    assert!(report.constructing_generations.is_empty());
+    assert_eq!(report.generations_admitted, report.generations_settled);
+}
+
+#[tokio::test]
+async fn publication_commit_is_linearized_with_closure_and_runs_once() {
+    let root = McpRuntimeRetirement::default();
+    let permit = root.admit_generation().unwrap();
+    let (entered, inside) = std::sync::mpsc::channel();
+    let (release, resume) = std::sync::mpsc::channel();
+    let (attempted, trying) = std::sync::mpsc::channel();
+    let (closed, done) = std::sync::mpsc::channel();
+    let published = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&published);
+    let publisher = std::thread::spawn(move || {
+        assert!(
+            permit
+                .publish_if_open(|| {
+                    entered.send(()).unwrap();
+                    resume.recv_timeout(Duration::from_secs(1)).unwrap();
+                    count.fetch_add(1, Ordering::SeqCst);
+                })
+                .is_some()
+        );
+        assert!(
+            permit
+                .publish_if_open(|| panic!("a generation commits at most once"))
+                .is_none()
+        );
+    });
+    inside.recv_timeout(Duration::from_secs(1)).unwrap();
+    let closing_root = root.clone();
+    let closer = std::thread::spawn(move || {
+        attempted.send(()).unwrap();
+        closing_root.close_registration();
+        closed.send(()).unwrap();
+    });
+    trying.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(done.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty));
+    release.send(()).unwrap();
+    publisher.join().unwrap();
+    closer.join().unwrap();
+    done.recv_timeout(Duration::from_secs(1)).unwrap();
+    let report = root.shutdown_until(Instant::now()).await;
+    assert!(report.are_connections_released());
+    assert_eq!(published.load(Ordering::SeqCst), 1);
+    assert_eq!(report.generations_published, 1);
+}
+
+#[tokio::test]
+async fn cancelled_generation_observer_does_not_settle_the_constructor() {
+    let root = McpRuntimeRetirement::default();
+    let permit = root.admit_generation().unwrap();
+    let mut observation = Box::pin(root.shutdown_until(Instant::now() + Duration::from_secs(1)));
+    assert!(futures::poll!(&mut observation).is_pending());
+    drop(observation);
+    let pending = root.shutdown_until(Instant::now()).await;
+    assert_eq!(pending.constructing_generations, vec![0]);
+    assert!(!pending.are_connections_released());
+    drop(permit);
+    let done = root.shutdown_until(Instant::now()).await;
+    assert!(done.are_connections_released());
+    assert_eq!(done.generations_settled, 1);
+}
+
+#[tokio::test]
+async fn generation_permit_is_weak_and_does_not_keep_its_census_alive() {
+    let root = McpRuntimeRetirement::default();
+    let weak = Arc::downgrade(&root.state);
+    let permit = root.admit_generation().unwrap();
+    drop(root);
+    assert!(weak.upgrade().is_none());
+    assert!(
+        permit
+            .publish_if_open(|| panic!("lost census must refuse publication"))
+            .is_none()
+    );
+    drop(permit);
+}

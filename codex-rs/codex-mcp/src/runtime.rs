@@ -423,41 +423,46 @@ impl McpRuntime {
     }
 
     async fn publish(&self, mut input: McpRuntimeInput, reuse_previous: bool) {
-        if self.retirement.is_closed() {
+        let Ok(generation) = self.retirement.admit_generation() else {
             return;
-        }
+        };
         input.runtime_context.workers = self.workers.clone();
         input.runtime_context.retirement = Some(self.retirement.clone());
         // Also cover callers which replace the runtime without Core's dirty-state machinery.
         self.invalidate_apps_tool_refresh();
         let current = self.current.load_full();
         let retain_ema = current.config.is_some();
-        let ema_auth = (input.config.xaa_enabled
-            && input.mcp_servers.values().any(|server| {
-                server.config().enabled
-                    && matches!(server.config().auth, codex_config::McpServerAuth::EmaAuth)
-            }))
-        .then(|| {
-            self.ema_auth
-                .get_or_init(|| {
-                    crate::ema_auth::EmaAuth::new(
-                        &self.workers,
-                        Arc::clone(&input.config),
-                        input.auth.as_ref(),
-                        input.auth_manager.as_ref(),
-                    )
-                    .map_err(Into::into)
-                })
-                .clone()
-        });
+        let Some(ema_auth) = generation.with_open_gate(|| {
+            let ema_auth = (input.config.xaa_enabled
+                && input.mcp_servers.values().any(|server| {
+                    server.config().enabled
+                        && matches!(server.config().auth, codex_config::McpServerAuth::EmaAuth)
+                }))
+            .then(|| {
+                self.ema_auth
+                    .get_or_init(|| {
+                        crate::ema_auth::EmaAuth::new(
+                            &self.workers,
+                            Arc::clone(&input.config),
+                            input.auth.as_ref(),
+                            input.auth_manager.as_ref(),
+                        )
+                        .map_err(Into::into)
+                    })
+                    .clone()
+            });
+            if !reuse_previous {
+                current.connections.retire_shared_connections();
+            }
+            ema_auth
+        }) else {
+            return;
+        };
         let (publish, publication_gate) = McpPublicationGate::pending();
         let config = Arc::clone(&input.config);
         let auth = input.auth.clone();
         let auth_manager = input.auth_manager.clone();
         let auth_token = auth.as_ref().and_then(|auth| auth.get_token().ok());
-        if !reuse_previous {
-            current.connections.retire_shared_connections();
-        }
         let auth_matches = current.auth_matches(auth.as_ref());
         let auth_owner = AuthOwner::capture(auth.as_ref(), auth_manager.as_deref());
         let same_owner = match (current.auth_owner, auth_owner) {
@@ -505,47 +510,49 @@ impl McpRuntime {
                         .source()
                         .is_host_owned_apps(CODEX_APPS_MCP_SERVER_NAME, registration.config())
                 });
-        let mut cancellation = self
-            .event_stream_cancellation
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        {
-            let mut superseded = self
-                .superseded_connections
+        let _ = generation.publish_if_open(|| {
+            let mut cancellation = self
+                .event_stream_cancellation
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            superseded.retain(|connections| connections.strong_count() > 0);
-            superseded.push(Arc::downgrade(&current.connections));
-        }
-        let publication = self
-            .catalog_publication
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.current.store(Arc::new(PublishedMcpRuntime {
-            connections,
-            config: Some(config),
-            auth,
-            auth_token,
-            auth_manager,
-            auth_owner,
-            auth_generation,
-            plugins_available,
-            ready_selected_capability_roots,
-            environment_selections,
-            ready_environments,
-            cached_binding: Mutex::new(None),
-        }));
-        drop(publication);
-        let _ = publish.send(true);
-        cancellation.event_server_available = hosted_event_server_retained;
-        if !hosted_event_server_retained {
-            cancellation
-                .cancel_event_streams_on_server_removal
-                .send_replace(());
-            if let Some(retained) = &cancellation.retained_subscription_cancellation {
-                retained.send_replace(());
+            {
+                let mut superseded = self
+                    .superseded_connections
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                superseded.retain(|connections| connections.strong_count() > 0);
+                superseded.push(Arc::downgrade(&current.connections));
             }
-        }
+            let publication = self
+                .catalog_publication
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.current.store(Arc::new(PublishedMcpRuntime {
+                connections,
+                config: Some(config),
+                auth,
+                auth_token,
+                auth_manager,
+                auth_owner,
+                auth_generation,
+                plugins_available,
+                ready_selected_capability_roots,
+                environment_selections,
+                ready_environments,
+                cached_binding: Mutex::new(None),
+            }));
+            drop(publication);
+            let _ = publish.send(true);
+            cancellation.event_server_available = hosted_event_server_retained;
+            if !hosted_event_server_retained {
+                cancellation
+                    .cancel_event_streams_on_server_removal
+                    .send_replace(());
+                if let Some(retained) = &cancellation.retained_subscription_cancellation {
+                    retained.send_replace(());
+                }
+            }
+        });
     }
 
     /// Ensures the next refresh creates fresh connections for every configured server.

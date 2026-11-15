@@ -66,6 +66,19 @@ impl McpConnectionSet {
 fn startup_outcome_error_message(error: StartupOutcomeError) -> String {
     match error {
         StartupOutcomeError::Cancelled => "MCP startup cancelled".to_string(),
+        StartupOutcomeError::Refused(error) => error.to_string(),
         StartupOutcomeError::Failed { error, .. } => error,
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn admission_refusal_remains_distinct_from_transport_or_authentication_failure() {
+        let refused = StartupOutcomeError::Refused(crate::McpAttemptRefused);
+        assert!(!refused.is_authentication_required());
+        assert_eq!(startup_outcome_error_message(refused), "MCP startup account work is unavailable");
     }
 }

@@ -1096,3 +1096,6 @@ fn text(value: &str) -> UserInput {
         text_elements: Vec::new(),
     }
 }
+
+#[path = "turn_start_if_idle.rs"]
+mod turn_start_if_idle;

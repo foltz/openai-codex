@@ -439,7 +439,8 @@ impl ThreadConstructions {
             let deadline = state
                 .shutdown_deadline
                 .map_or(deadline, |edge| edge.min(deadline));
-            let deadline = *state.deadline.get_or_insert(deadline);
+            let deadline = state.deadline.map_or(deadline, |first| first.min(deadline));
+            state.deadline = Some(deadline);
             let pending = state
                 .constructions
                 .iter()

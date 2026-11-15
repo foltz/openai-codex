@@ -600,7 +600,7 @@ impl ConnectionLease {
                             let _ = entry
                                 .physical
                                 .lower
-                                .shutdown_until(
+                                .shutdown_within_latched(
                                     tokio::time::Instant::now()
                                         + codex_rmcp_client::DEFAULT_RETIREMENT_TIMEOUT,
                                 )

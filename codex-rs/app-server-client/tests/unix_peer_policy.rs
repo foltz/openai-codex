@@ -104,16 +104,19 @@ fn peer_client_helper() {
         let dir = tempfile::tempdir().unwrap();
         let current = std::env::current_exe().unwrap();
         let copy = dir.path().join("copied-peer");
-        std::fs::copy(&current, &copy).unwrap();
         let wrong = dir.path().join("different-image-peer");
-        std::fs::copy(&current, &wrong).unwrap();
+        let case_name = case.to_str().unwrap();
+        let needs_wrong = matches!(case_name, "wrong" | "ordinary" | "reconnect");
         use std::os::unix::fs::PermissionsExt;
-        for image in [&copy, &wrong] {
-            std::fs::set_permissions(image, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for (needed, image) in [(case_name == "copy", &copy), (needs_wrong, &wrong)] {
+            if needed {
+                let bytes = std::fs::copy(&current, image).unwrap();
+                assert_eq!(bytes, std::fs::metadata(&current).unwrap().len());
+                std::fs::set_permissions(image, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
         }
-
         #[cfg(target_os = "macos")]
-        {
+        if needs_wrong {
             let mut command = tokio::process::Command::new("/usr/bin/codesign");
             command
                 .args([

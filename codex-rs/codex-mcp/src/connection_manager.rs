@@ -1223,6 +1223,12 @@ impl McpConnectionSet {
                             Err(StartupOutcomeError::Cancelled) => {
                                 summary.cancelled.push(server_name)
                             }
+                            Err(StartupOutcomeError::Refused(error)) => {
+                                summary.failed.push(McpStartupFailure {
+                                    server: server_name,
+                                    error: error.to_string(),
+                                })
+                            }
                             Err(StartupOutcomeError::Failed { error, .. }) => {
                                 summary.failed.push(McpStartupFailure {
                                     server: server_name,

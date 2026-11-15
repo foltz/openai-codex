@@ -38,7 +38,9 @@ impl AsyncManagedClient {
             Some(Err(error)) if error.is_authentication_required() => {
                 Status::AuthenticationRequired
             }
-            Some(Err(StartupOutcomeError::Failed { .. })) => Status::Failed,
+            Some(Err(StartupOutcomeError::Failed { .. } | StartupOutcomeError::Refused(_))) => {
+                Status::Failed
+            }
             Some(Err(StartupOutcomeError::Cancelled)) => Status::Cancelled,
             None => Status::Starting,
         }

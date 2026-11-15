@@ -71,7 +71,6 @@ fn startup_outcome_error_message(error: StartupOutcomeError) -> String {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,6 +78,9 @@ mod tests {
     fn admission_refusal_remains_distinct_from_transport_or_authentication_failure() {
         let refused = StartupOutcomeError::Refused(crate::McpAttemptRefused);
         assert!(!refused.is_authentication_required());
-        assert_eq!(startup_outcome_error_message(refused), "MCP startup account work is unavailable");
+        assert_eq!(
+            startup_outcome_error_message(refused),
+            "MCP startup account work is unavailable"
+        );
     }
 }

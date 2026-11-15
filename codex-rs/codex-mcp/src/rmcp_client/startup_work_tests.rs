@@ -302,7 +302,7 @@ async fn private_original_keeps_account_work_after_every_client_observer_is_drop
         live: Arc::clone(&live),
         refused: Arc::new(AtomicBool::new(false)),
     };
-    let owner = crate::PrivateClientRetirement::default();
+    let owner = crate::rmcp_client::PrivateClientRetirement::default();
     let retained_owner = owner.clone();
     let (finish, receive) = oneshot::channel();
     let startup = ClientStartup::new_with_work(

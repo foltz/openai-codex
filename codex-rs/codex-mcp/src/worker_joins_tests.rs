@@ -626,3 +626,46 @@ async fn dropping_shutdown_caller_and_runtime_retains_original_router_and_connec
             .all(|c| c.pending + c.cancelled + c.panicked == 0)
     );
 }
+
+#[tokio::test]
+async fn external_drain_never_hides_original_panic_or_unrequested_cancellation() {
+    let runtime = crate::McpRuntime::empty(true);
+    let root = runtime.retirement_owner();
+    let workers = runtime.worker_owner();
+    let guard = workers
+        .spawn_abort_on_drop(
+            &Handle::current(),
+            McpWorkerKind::AuthNotification,
+            std::future::pending(),
+        )
+        .unwrap();
+    guard.abort.handle.abort();
+    drop(
+        workers.spawn(&Handle::current(), McpWorkerKind::DeferredStartup, async {
+            panic!("injected external drain worker panic");
+        }),
+    );
+    let report = root
+        .drain_workers_until(Instant::now() + Duration::from_secs(1))
+        .await;
+    assert!(!report.are_recorded_workers_drained());
+    assert!(report.workers[0].all_admission_closed);
+    assert_eq!(
+        count(&report.workers[0], McpWorkerKind::AuthNotification).cancelled,
+        1
+    );
+    assert_eq!(
+        count(&report.workers[0], McpWorkerKind::AuthNotification).requested_cancelled,
+        0
+    );
+    assert_eq!(
+        count(&report.workers[0], McpWorkerKind::DeferredStartup).panicked,
+        1
+    );
+    drop(guard);
+    let replay = root
+        .drain_workers_until(Instant::now() + Duration::from_secs(1))
+        .await;
+    assert!(!replay.are_recorded_workers_drained());
+    assert_eq!(replay.workers[0].counts, report.workers[0].counts);
+}

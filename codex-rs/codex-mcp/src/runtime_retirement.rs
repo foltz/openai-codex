@@ -56,6 +56,46 @@ impl RuntimeConnectionReport {
     }
 }
 
+/// Registered Session/runtime worker scope only. This does not cover delegated
+/// process-pool workers or independently retained event subscriptions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeWorkerDrainReport {
+    pub connections: RuntimeConnectionReport,
+    pub runtime_shutdowns: u64,
+    pub runtime_shutdowns_joined: u64,
+    pub workers: Vec<crate::McpWorkerSnapshot>,
+    pub poisoned: bool,
+}
+
+impl RuntimeWorkerDrainReport {
+    pub fn are_recorded_workers_drained(&self) -> bool {
+        self.connections.are_connections_released()
+            && !self.poisoned
+            && self.runtime_shutdowns > 0
+            && self.runtime_shutdowns_joined == self.runtime_shutdowns
+            && !self.workers.is_empty()
+            && self.workers.iter().all(|worker| {
+                worker.startup_admission_closed
+                    && worker.all_admission_closed
+                    && !worker.poisoned
+                    && worker.registered_at_start == worker.registered_at_end
+                    && worker
+                        .counts
+                        .iter()
+                        .map(|count| {
+                            count.joined + count.panicked + count.cancelled + count.pending
+                        })
+                        .sum::<u64>()
+                        == worker.registered_at_end
+                    && worker.counts.iter().all(|count| {
+                        count.pending == 0
+                            && count.panicked == 0
+                            && count.cancelled == count.requested_cancelled
+                    })
+            })
+    }
+}
+
 struct ConnectionOwner {
     id: u64,
     private: PrivateClientRetirement,
@@ -72,6 +112,7 @@ struct State {
     constructing_generations: BTreeSet<u64>,
     connections: Vec<Arc<ConnectionOwner>>,
     workers: Vec<crate::McpWorkerOwner>,
+    shutdowns: Vec<Arc<crate::runtime::RuntimeShutdown>>,
 }
 
 /// Retain before asynchronous connection construction or cleanup can be dropped.
@@ -132,6 +173,16 @@ impl Drop for RuntimeGenerationPermit {
 }
 
 impl McpRuntimeRetirement {
+    pub(crate) fn register_shutdown(&self, shutdown: Arc<crate::runtime::RuntimeShutdown>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.closed && !self.state.is_poisoned() {
+            state.shutdowns.push(shutdown);
+        }
+    }
+
     pub(crate) fn register_workers(&self, workers: crate::McpWorkerOwner) {
         let mut state = self
             .state
@@ -139,6 +190,7 @@ impl McpRuntimeRetirement {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.closed || self.state.is_poisoned() {
             workers.close_startup_admission();
+            return;
         }
         if !state
             .workers
@@ -238,6 +290,55 @@ impl McpRuntimeRetirement {
             if let Some(slot) = &record.shared {
                 slot.release_closed_acquisitions();
             }
+        }
+    }
+
+    /// Start the birth-retained runtime cleanup even if McpRuntime or its
+    /// original observer was dropped. All waits share the supplied deadline.
+    pub async fn drain_workers_until(&self, deadline: Instant) -> RuntimeWorkerDrainReport {
+        self.close_registration();
+        let (shutdowns, workers) = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                state
+                    .shutdowns
+                    .iter()
+                    .map(|owner| owner.start())
+                    .collect::<Vec<_>>(),
+                state.workers.clone(),
+            )
+        };
+        let observe =
+            futures::future::join_all(workers.iter().map(|worker| worker.observe_until(deadline)));
+        let (connections, observed) = tokio::join!(self.shutdown_until(deadline), observe);
+        let workers = if connections.are_connections_released() {
+            futures::future::join_all(
+                workers
+                    .iter()
+                    .map(|worker| worker.drain_and_seal_until(deadline)),
+            )
+            .await
+        } else {
+            observed
+        };
+        let runtime_shutdowns_joined = shutdowns
+            .iter()
+            .filter(|completion| {
+                matches!(
+                    completion.peek(),
+                    Some(crate::worker_joins::WorkerExit::Joined)
+                )
+            })
+            .count() as u64;
+        RuntimeWorkerDrainReport {
+            connections,
+            runtime_shutdowns: shutdowns.len() as u64,
+            runtime_shutdowns_joined,
+            workers,
+            poisoned: self.state.is_poisoned(),
         }
     }
 

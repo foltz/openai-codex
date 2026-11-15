@@ -440,3 +440,156 @@ async fn closing_session_worker_admission_does_not_close_shared_process_owner() 
         1
     );
 }
+
+#[tokio::test]
+async fn connection_empty_success_is_not_registered_runtime_worker_drain() {
+    let root = McpRuntimeRetirement::default();
+    let report = root
+        .drain_workers_until(Instant::now() + Duration::from_secs(1))
+        .await;
+    assert!(report.connections.are_connections_released());
+    assert_eq!(report.runtime_shutdowns, 0);
+    assert!(!report.are_recorded_workers_drained());
+}
+
+#[tokio::test]
+async fn external_census_starts_one_actual_runtime_shutdown_and_seals_after_join_proof() {
+    let runtime = crate::McpRuntime::empty(true);
+    let root = runtime.retirement_owner();
+    let workers = runtime.worker_owner();
+    let report = root
+        .drain_workers_until(Instant::now() + Duration::from_secs(1))
+        .await;
+    assert!(report.are_recorded_workers_drained(), "{report:?}");
+    assert_eq!(report.runtime_shutdowns, 1);
+    assert_eq!(report.runtime_shutdowns_joined, 1);
+    assert_eq!(report.workers.len(), 1);
+    assert_eq!(report.workers[0].registered_at_end, 2);
+    assert!(report.workers[0].all_admission_closed);
+    runtime.shutdown().await;
+    assert!(matches!(
+        workers
+            .spawn(
+                &tokio::runtime::Handle::current(),
+                crate::McpWorkerKind::DiscoveryCleanup,
+                async {
+                    panic!("cleanup after positive seal");
+                }
+            )
+            .await,
+        crate::worker_joins::WorkerExit::NotAdmitted
+    ));
+    let replay = root
+        .drain_workers_until(Instant::now() + Duration::from_secs(1))
+        .await;
+    assert!(replay.are_recorded_workers_drained());
+    assert_eq!(
+        replay.workers[0].registered_at_end,
+        report.workers[0].registered_at_end
+    );
+    assert_eq!(replay.workers[0].counts, report.workers[0].counts);
+    assert_eq!(
+        replay.workers[0].refused_at_end,
+        report.workers[0].refused_at_end + 1
+    );
+}
+
+#[tokio::test]
+async fn birth_retained_shutdown_control_does_not_hold_current_snapshot_after_runtime_drop() {
+    let runtime = crate::McpRuntime::empty(true);
+    let root = runtime.retirement_owner();
+    let current = Arc::downgrade(&runtime.latest_connections());
+    drop(runtime);
+    assert!(current.upgrade().is_none());
+    let report = root
+        .drain_workers_until(Instant::now() + Duration::from_secs(1))
+        .await;
+    assert!(report.are_recorded_workers_drained(), "{report:?}");
+    assert_eq!(report.runtime_shutdowns_joined, 1);
+    assert_eq!(report.workers[0].registered_at_end, 1);
+}
+
+#[tokio::test]
+async fn cancelled_external_worker_drain_retains_actual_shutdown_for_later_observer() {
+    let runtime = crate::McpRuntime::empty(true);
+    let root = runtime.retirement_owner();
+    let mut observer = Box::pin(root.drain_workers_until(Instant::now() + Duration::from_secs(1)));
+    assert!(futures::poll!(&mut observer).is_pending());
+    drop(observer);
+    drop(runtime);
+    let report = root
+        .drain_workers_until(Instant::now() + Duration::from_secs(1))
+        .await;
+    assert!(report.are_recorded_workers_drained(), "{report:?}");
+    assert_eq!(report.runtime_shutdowns, 1);
+    assert_eq!(report.workers[0].registered_at_end, 2);
+}
+
+#[tokio::test]
+async fn expired_external_worker_drain_keeps_late_cleanup_and_uses_one_deadline() {
+    let runtime = crate::McpRuntime::empty(true);
+    let root = runtime.retirement_owner();
+    let workers = runtime.worker_owner();
+    let cleanup = workers.clone();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let resume = Arc::clone(&release);
+    let called = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&called);
+    drop(workers.spawn(
+        &tokio::runtime::Handle::current(),
+        crate::McpWorkerKind::DeferredStartup,
+        async move {
+            resume.notified().await;
+            drop(cleanup.spawn(
+                &tokio::runtime::Handle::current(),
+                crate::McpWorkerKind::DiscoveryCleanup,
+                async move {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                },
+            ));
+        },
+    ));
+    let deadline = Instant::now() + Duration::from_millis(20);
+    let incomplete = root.drain_workers_until(deadline).await;
+    assert!(!incomplete.are_recorded_workers_drained());
+    assert!(!incomplete.workers[0].all_admission_closed);
+    assert_eq!(called.load(Ordering::SeqCst), 0);
+    release.notify_one();
+    let complete = root
+        .drain_workers_until(Instant::now() + Duration::from_secs(1))
+        .await;
+    assert!(complete.are_recorded_workers_drained(), "{complete:?}");
+    assert_eq!(called.load(Ordering::SeqCst), 1);
+    assert_eq!(complete.workers[0].registered_at_end, 4);
+    assert!(complete.workers[0].all_admission_closed);
+}
+
+#[tokio::test]
+async fn unsettled_generation_prevents_worker_seal_despite_empty_connection_population() {
+    let runtime = crate::McpRuntime::empty(true);
+    let root = runtime.retirement_owner();
+    let workers = runtime.worker_owner();
+    let constructor = root.admit_generation().unwrap();
+    let report = root
+        .drain_workers_until(Instant::now() + Duration::from_millis(20))
+        .await;
+    assert!(!report.are_recorded_workers_drained());
+    assert_eq!(report.connections.constructing_generations.len(), 1);
+    assert!(!report.workers[0].all_admission_closed);
+    assert!(matches!(
+        workers
+            .spawn(
+                &tokio::runtime::Handle::current(),
+                crate::McpWorkerKind::DiscoveryCleanup,
+                async {}
+            )
+            .await,
+        crate::worker_joins::WorkerExit::Joined
+    ));
+    drop(constructor);
+    let settled = root
+        .drain_workers_until(Instant::now() + Duration::from_secs(1))
+        .await;
+    assert!(settled.are_recorded_workers_drained(), "{settled:?}");
+    assert_eq!(settled.workers[0].registered_at_end, 3);
+}

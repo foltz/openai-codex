@@ -79,6 +79,7 @@ impl McpWorkerCounts {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct McpWorkerSnapshot {
     pub startup_admission_closed: bool,
+    pub all_admission_closed: bool,
     pub refused_at_start: u64,
     pub refused_at_end: u64,
     pub registered_at_start: u64,
@@ -89,6 +90,7 @@ pub struct McpWorkerSnapshot {
 
 struct State {
     startup_closed: bool,
+    all_closed: bool,
     refused: u64,
     registered: u64,
     completed: Vec<McpWorkerCounts>,
@@ -99,6 +101,7 @@ impl Default for State {
     fn default() -> Self {
         Self {
             startup_closed: false,
+            all_closed: false,
             refused: 0,
             registered: 0,
             completed: [
@@ -145,7 +148,7 @@ impl McpWorkerKind {
 
 impl State {
     fn admit(&mut self, kind: McpWorkerKind, poisoned: bool) -> bool {
-        if !kind.is_cleanup() && (self.startup_closed || poisoned) {
+        if self.all_closed || (!kind.is_cleanup() && (self.startup_closed || poisoned)) {
             self.refused += 1;
             false
         } else {
@@ -396,6 +399,41 @@ impl McpWorkerOwner {
         Ok((completion, abort))
     }
 
+    /// Call only after the containing constructor/connection population has
+    /// settled positively. Newly born cleanup is observed under the same bound.
+    pub(crate) async fn drain_and_seal_until(&self, deadline: Instant) -> McpWorkerSnapshot {
+        loop {
+            let observed = self.observe_until(deadline).await;
+            {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.compact(false);
+                if state.startup_closed && state.pending.is_empty() && !self.state.is_poisoned() {
+                    state.all_closed = true;
+                    return McpWorkerSnapshot {
+                        startup_admission_closed: true,
+                        all_admission_closed: true,
+                        refused_at_start: state.refused,
+                        refused_at_end: state.refused,
+                        registered_at_start: state.registered,
+                        registered_at_end: state.registered,
+                        counts: state.completed.clone(),
+                        poisoned: false,
+                    };
+                }
+            }
+            if Instant::now() >= deadline || !observed.startup_admission_closed || observed.poisoned
+            {
+                return observed;
+            }
+            // A cleanup worker may have been born while its parent was being
+            // joined. It must get its own observed join, never a quiet-period
+            // assumption or an extended deadline.
+        }
+    }
+
     pub async fn observe_until(&self, deadline: Instant) -> McpWorkerSnapshot {
         let (registered_at_start, refused_at_start, mut counts, pending) = {
             let mut state = self
@@ -431,6 +469,7 @@ impl McpWorkerOwner {
         state.compact(false);
         McpWorkerSnapshot {
             startup_admission_closed: state.startup_closed,
+            all_admission_closed: state.all_closed,
             refused_at_start,
             refused_at_end: state.refused,
             registered_at_start,

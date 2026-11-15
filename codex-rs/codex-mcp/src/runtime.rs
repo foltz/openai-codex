@@ -128,18 +128,69 @@ pub struct McpRuntimeInput {
 pub struct McpRuntime {
     retirement: crate::McpRuntimeRetirement,
     workers: crate::McpWorkerOwner,
-    shutdown_once: OnceLock<crate::worker_joins::Completion>,
-    current: ArcSwap<PublishedMcpRuntime>,
+    shutdown: Arc<RuntimeShutdown>,
+    current: Arc<ArcSwap<PublishedMcpRuntime>>,
     // This mutex is held only through synchronous publication, never network I/O or call drain.
     catalog_publication: Mutex<u64>,
     // Old bindings keep leases alive after publication; cancellation alone does not release them.
-    superseded_connections: Mutex<Vec<Weak<McpConnectionSet>>>,
+    superseded_connections: Arc<Mutex<Vec<Weak<McpConnectionSet>>>>,
     event_stream_cancellation: Mutex<EventStreamCancellation>,
     reconnect_pending: AtomicBool,
     resource_cache_generation: AtomicU64,
     elicitation_router: ElicitationRequestRouter,
     resource_origins: Mutex<ResourceOrigins>,
     ema_auth: OnceLock<crate::ema_auth::EmaAuthContext>,
+}
+
+/// Retained at runtime birth without owning a current snapshot or McpRuntime.
+/// The external census can start the same original cleanup after runtime drop.
+pub(crate) struct RuntimeShutdown {
+    completion: OnceLock<crate::worker_joins::Completion>,
+    workers: crate::McpWorkerOwner,
+    current: Weak<ArcSwap<PublishedMcpRuntime>>,
+    superseded: Weak<Mutex<Vec<Weak<McpConnectionSet>>>>,
+    router: ElicitationRequestRouter,
+}
+
+impl RuntimeShutdown {
+    pub(crate) fn start(&self) -> crate::worker_joins::Completion {
+        self.completion
+            .get_or_init(|| {
+                let current = self
+                    .current
+                    .upgrade()
+                    .map(|current| Arc::clone(&current.load().connections));
+                let superseded = self
+                    .superseded
+                    .upgrade()
+                    .map(|superseded| {
+                        std::mem::take(
+                            &mut *superseded
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner),
+                        )
+                    })
+                    .unwrap_or_default();
+                let router = self.router.clone();
+                self.workers.spawn(
+                    &tokio::runtime::Handle::current(),
+                    crate::McpWorkerKind::RuntimeShutdown,
+                    async move {
+                        router.close().await;
+                        for connections in superseded
+                            .into_iter()
+                            .filter_map(|connections| connections.upgrade())
+                        {
+                            connections.shutdown_shared_connections().await;
+                        }
+                        if let Some(current) = current {
+                            current.shutdown().await;
+                        }
+                    },
+                )
+            })
+            .clone()
+    }
 }
 
 struct EventStreamCancellation {
@@ -297,30 +348,41 @@ impl McpRuntime {
     ) -> Self {
         let workers = crate::McpWorkerOwner::default();
         retirement.register_workers(workers.clone());
+        let current = Arc::new(ArcSwap::from_pointee(PublishedMcpRuntime {
+            connections: Arc::new(
+                McpConnectionSet::empty(prefix_mcp_tool_names)
+                    .with_worker_owner(workers.clone())
+                    .with_retirement_owner(retirement.clone()),
+            ),
+            config: None,
+            auth: None,
+            auth_token: None,
+            auth_manager: None,
+            auth_owner: None,
+            auth_generation: Arc::new(()),
+            plugins_available: false,
+            ready_selected_capability_roots: Vec::new(),
+            environment_selections: Arc::default(),
+            ready_environments: HashMap::new(),
+            cached_binding: Mutex::new(None),
+        }));
+        let superseded_connections = Arc::new(Mutex::new(Vec::new()));
+        let elicitation_router = ElicitationRequestRouter::default();
+        let shutdown = Arc::new(RuntimeShutdown {
+            completion: OnceLock::new(),
+            workers: workers.clone(),
+            current: Arc::downgrade(&current),
+            superseded: Arc::downgrade(&superseded_connections),
+            router: elicitation_router.clone(),
+        });
+        retirement.register_shutdown(Arc::clone(&shutdown));
         Self {
             retirement: retirement.clone(),
-            workers: workers.clone(),
-            shutdown_once: OnceLock::new(),
-            current: ArcSwap::from_pointee(PublishedMcpRuntime {
-                connections: Arc::new(
-                    McpConnectionSet::empty(prefix_mcp_tool_names)
-                        .with_worker_owner(workers)
-                        .with_retirement_owner(retirement),
-                ),
-                config: None,
-                auth: None,
-                auth_token: None,
-                auth_manager: None,
-                auth_owner: None,
-                auth_generation: Arc::new(()),
-                plugins_available: false,
-                ready_selected_capability_roots: Vec::new(),
-                environment_selections: Arc::default(),
-                ready_environments: HashMap::new(),
-                cached_binding: Mutex::new(None),
-            }),
+            workers,
+            shutdown,
+            current,
             catalog_publication: Mutex::new(0),
-            superseded_connections: Mutex::default(),
+            superseded_connections,
             event_stream_cancellation: Mutex::new(EventStreamCancellation {
                 event_server_available: false,
                 cancel_event_streams_on_server_removal: watch::channel(()).0,
@@ -328,7 +390,7 @@ impl McpRuntime {
             }),
             reconnect_pending: AtomicBool::new(false),
             resource_cache_generation: AtomicU64::new(0),
-            elicitation_router: ElicitationRequestRouter::default(),
+            elicitation_router,
             resource_origins: Mutex::default(),
             ema_auth: OnceLock::new(),
         }
@@ -1077,37 +1139,10 @@ impl McpRuntime {
 
     pub async fn shutdown(&self) {
         self.retirement.close_registration();
-        // Register the one original cleanup worker before the first await.
-        // Repeated callers observe that join; an interrupted caller cannot
-        // strand the router before connection cleanup has an owner.
-        let shutdown = self
-            .shutdown_once
-            .get_or_init(|| {
-                let superseded = std::mem::take(
-                    &mut *self
-                        .superseded_connections
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner),
-                );
-                let current = self.latest_connections();
-                let router = self.elicitation_router.clone();
-                self.workers.spawn(
-                    &tokio::runtime::Handle::current(),
-                    crate::McpWorkerKind::RuntimeShutdown,
-                    async move {
-                        router.close().await;
-                        for connections in superseded
-                            .into_iter()
-                            .filter_map(|connections| connections.upgrade())
-                        {
-                            connections.shutdown_shared_connections().await;
-                        }
-                        current.shutdown().await;
-                    },
-                )
-            })
-            .clone();
-        if !matches!(shutdown.await, crate::worker_joins::WorkerExit::Joined) {
+        if !matches!(
+            self.shutdown.start().await,
+            crate::worker_joins::WorkerExit::Joined
+        ) {
             warn!("MCP runtime shutdown worker did not join normally");
         }
     }

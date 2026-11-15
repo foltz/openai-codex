@@ -173,3 +173,5 @@ pub use private_retirement::PrivateTerminationReport;
 pub use runtime_retirement::McpRuntimeRetirement;
 pub use runtime_retirement::RuntimeConnectionReport;
 pub use runtime_retirement::RuntimeConnectionResult;
+
+pub use runtime_retirement::RuntimeWorkerDrainReport;

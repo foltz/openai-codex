@@ -79,6 +79,8 @@ async fn forced_refresh_replaces_pending_connection_without_interrupting_other_c
         cached_binding: Mutex::new(None),
     }));
     let input = McpRuntimeInput {
+        attempt_requirement: crate::McpAttemptRequirement::Ungated,
+        startup_work: None,
         network_policy_metadata: None,
         runtime_auth: None,
         startup_policy: McpStartupPolicy::Eager,
@@ -176,6 +178,8 @@ async fn forced_refresh_replaces_pending_connection_without_interrupting_other_c
 async fn actual_runtime_publication_uses_one_generation_and_refuses_after_closure() {
     let config = Arc::new(crate::mcp::tests::test_mcp_config(std::env::temp_dir()));
     let input = || McpRuntimeInput {
+        attempt_requirement: crate::McpAttemptRequirement::Ungated,
+        startup_work: None,
         network_policy_metadata: None,
         runtime_auth: None,
         startup_policy: McpStartupPolicy::Eager,

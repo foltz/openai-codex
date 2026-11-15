@@ -95,6 +95,11 @@ pub struct McpToolCallResult {
 
 /// Configuration and owning-thread state needed to materialize an MCP runtime.
 pub struct McpRuntimeInput {
+    /// Uncounted policy retained by connections, never idle account authority.
+    pub attempt_requirement: crate::McpAttemptRequirement,
+    /// Finite publication work. Eager drivers derive before detaching; dormant
+    /// drivers never retain this input or acquire work until an admitted trigger.
+    pub startup_work: Option<Box<dyn crate::McpAttemptWork>>,
     /// Policy source captured with the configuration and connections in this publication.
     pub network_policy_metadata: Option<Arc<dyn crate::NetworkPolicyMetadataProvider>>,
     pub startup_policy: McpStartupPolicy,
@@ -1039,7 +1044,17 @@ impl McpRuntime {
     }
 
     pub async fn validate_required_servers(&self) -> anyhow::Result<()> {
-        self.latest_connections().validate_required_servers().await
+        self.validate_required_servers_with_authority(crate::McpAttemptAccess::Unscoped)
+            .await
+    }
+
+    pub async fn validate_required_servers_with_authority(
+        &self,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> anyhow::Result<()> {
+        self.latest_connections()
+            .validate_required_servers_with_authority(access)
+            .await
     }
 
     pub fn cancel_startup(&self) {

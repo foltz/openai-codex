@@ -2147,6 +2147,8 @@ async fn shared_apps_snapshot_requires_writable_discovery_and_a_shared_cache() -
             /*previous*/ None,
             McpPublicationGate::already_published(),
             McpRuntimeInput {
+                attempt_requirement: crate::McpAttemptRequirement::Ungated,
+                startup_work: None,
                 network_policy_metadata: None,
                 runtime_auth: None,
                 startup_policy: McpStartupPolicy::Eager,
@@ -2228,6 +2230,8 @@ async fn hosted_apps_protocol_mode_is_independent_of_generic_mode() -> anyhow::R
             /*previous*/ None,
             McpPublicationGate::already_published(),
             McpRuntimeInput {
+                attempt_requirement: crate::McpAttemptRequirement::Ungated,
+                startup_work: None,
                 network_policy_metadata: None,
                 runtime_auth: None,
                 startup_policy: McpStartupPolicy::Eager,
@@ -2403,6 +2407,8 @@ async fn codex_apps_extension_does_not_share_host_owned_tools_cache() -> anyhow:
             /*previous*/ None,
             McpPublicationGate::already_published(),
             McpRuntimeInput {
+                attempt_requirement: crate::McpAttemptRequirement::Ungated,
+                startup_work: None,
                 network_policy_metadata: None,
                 runtime_auth: None,
                 startup_policy: McpStartupPolicy::Eager,
@@ -5068,6 +5074,8 @@ async fn executor_owned_chatgpt_mcp_accepts_only_safe_explicit_authorization() -
             /*previous*/ None,
             McpPublicationGate::already_published(),
             McpRuntimeInput {
+                attempt_requirement: crate::McpAttemptRequirement::Ungated,
+                startup_work: None,
                 network_policy_metadata: None,
                 runtime_auth: None,
                 startup_policy: McpStartupPolicy::Eager,
@@ -5194,6 +5202,8 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
         /*previous*/ None,
         McpPublicationGate::already_published(),
         McpRuntimeInput {
+            attempt_requirement: crate::McpAttemptRequirement::Ungated,
+            startup_work: None,
             network_policy_metadata: None,
             runtime_auth: None,
             startup_policy: McpStartupPolicy::Eager,
@@ -5591,7 +5601,7 @@ pub(crate) fn reusable_server_identity(
     )
 }
 
-async fn manager_with_reusable_ready_server(
+pub(super) async fn manager_with_reusable_ready_server(
     config: &McpServerConfig,
     runtime_context: &McpRuntimeContext,
     tools: Vec<ToolInfo>,
@@ -5664,6 +5674,8 @@ async fn reconcile_reusable_server_with_mcp_config(
         }),
         McpPublicationGate::already_published(),
         McpRuntimeInput {
+            attempt_requirement: crate::McpAttemptRequirement::Ungated,
+            startup_work: None,
             network_policy_metadata: None,
             runtime_auth: None,
             startup_policy: McpStartupPolicy::Eager,
@@ -6647,6 +6659,8 @@ async fn reconciliation_replaces_connection_when_protocol_mode_changes() {
         }),
         McpPublicationGate::already_published(),
         McpRuntimeInput {
+            attempt_requirement: crate::McpAttemptRequirement::Ungated,
+            startup_work: None,
             network_policy_metadata: None,
             runtime_auth: None,
             startup_policy: McpStartupPolicy::Eager,
@@ -6712,6 +6726,8 @@ async fn reconciliation_reuses_legacy_stdio_server_when_modern_protocol_is_enabl
         }),
         McpPublicationGate::already_published(),
         McpRuntimeInput {
+            attempt_requirement: crate::McpAttemptRequirement::Ungated,
+            startup_work: None,
             network_policy_metadata: None,
             runtime_auth: None,
             startup_policy: McpStartupPolicy::Eager,

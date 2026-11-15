@@ -101,6 +101,8 @@ impl AppsRequestProcessor {
                             .then(|| Arc::clone(&auth_manager));
                     self.thread_manager.runtime_auth_for_mcp_manager(&config, &mcp_manager)?;
                     let runtime = McpRuntime::new(McpRuntimeInput {
+                        attempt_requirement: codex_mcp::McpAttemptRequirement::Ungated,
+                        startup_work: None,
                         network_policy_metadata: None,
                         runtime_auth: mcp_manager.runtime_auth_for_config(&config),
                         startup_policy: McpStartupPolicy::Eager,

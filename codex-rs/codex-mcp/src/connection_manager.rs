@@ -399,6 +399,8 @@ impl McpConnectionSet {
         let previous = previous.map(|state| state.connections);
         let trusted_access = TrustedAccessContext::from_runtime(&input);
         let McpRuntimeInput {
+            attempt_requirement,
+            startup_work,
             startup_policy,
             config,
             network_policy_metadata,
@@ -419,6 +421,7 @@ impl McpConnectionSet {
             elicitation_reviewer,
             elicitation_lifecycle,
         } = input;
+        let startup_access = crate::McpAttemptAccess::from_work(startup_work.as_deref());
         let retirement = runtime_context.retirement.clone().unwrap_or_default();
         let workers = runtime_context.workers.clone();
         retirement.register_workers(workers.clone());
@@ -765,7 +768,8 @@ impl McpConnectionSet {
                             .as_ref()
                             .is_some_and(|authority| authority.check_new_request().is_ok())
                     };
-                    let same_identity = connection.identity.as_ref() == Some(&connection_identity)
+                    let same_identity = connection.client.client.requirement == attempt_requirement
+                        && connection.identity.as_ref() == Some(&connection_identity)
                         && previous_view.catalog_item_limit == catalog_item_limit
                         && previous_view.protocol_mode == protocol_mode;
                     let pending = same_identity
@@ -781,7 +785,17 @@ impl McpConnectionSet {
                             .is_some_and(|client| {
                                 expected_protocol_mode == Some(client.client.protocol_mode())
                             });
-                    if authority_is_current() && (pending || ready) {
+                    let driver_work = if pending {
+                        admit_startup_driver(
+                            &connection.client,
+                            attempt_requirement,
+                            startup_access,
+                        )
+                    } else {
+                        Ok(None)
+                    };
+                    if authority_is_current() && (pending || ready) && driver_work.is_ok() {
+                        let driver_work = driver_work.expect("checked startup admission");
                         servers.insert(
                             server_name.clone(),
                             McpServerView {
@@ -798,8 +812,13 @@ impl McpConnectionSet {
                         );
                         if pending {
                             let client = connection.client.clone();
-                            eager_workers
-                                .push(async move { (server_name, client.client().await) }.boxed());
+                            eager_workers.push(
+                                async move {
+                                    let _driver_work = driver_work;
+                                    (server_name, client.client().await)
+                                }
+                                .boxed(),
+                            );
                         } else {
                             reused_ready.push(server_name);
                         }
@@ -811,6 +830,7 @@ impl McpConnectionSet {
             let mut legacy_to_upgrade = None;
             if let Some(previous_view) =
                 reusable_previous.and_then(|previous| previous.servers.get(&server_name))
+                && previous_view.connection.client.client.requirement == attempt_requirement
                 && previous_view.refresh_tool_list == config.mcp_tool_list_changed
                 && (same_owner || !previous_view.connection.may_use_legacy_fallback())
             {
@@ -846,7 +866,13 @@ impl McpConnectionSet {
                     .reusable_client(&connection_identity)
                     .await
                     .filter(|_| previous_view.catalog_item_limit == catalog_item_limit);
+                let driver_work = if reusable_pending_startup {
+                    admit_startup_driver(&connection.client, attempt_requirement, startup_access)
+                } else {
+                    Ok(None)
+                };
                 if can_reuse
+                    && driver_work.is_ok()
                     && (reusable_pending_startup
                         || unchanged_auth_failure.is_some()
                         || ready.as_ref().is_some_and(|client| {
@@ -856,6 +882,7 @@ impl McpConnectionSet {
                             })
                         }))
                 {
+                    let driver_work = driver_work.expect("checked startup admission");
                     let pending_client =
                         reusable_pending_startup.then(|| connection.client.clone());
                     servers.insert(
@@ -908,8 +935,13 @@ impl McpConnectionSet {
                             .boxed(),
                         );
                     } else if let Some(client) = pending_client {
-                        eager_workers
-                            .push(async move { (server_name, client.client().await) }.boxed());
+                        eager_workers.push(
+                            async move {
+                                let _driver_work = driver_work;
+                                (server_name, client.client().await)
+                            }
+                            .boxed(),
+                        );
                     } else {
                         reused_ready.push(server_name);
                     }
@@ -937,7 +969,7 @@ impl McpConnectionSet {
                     ConnectionKey {
                         server_name: server_name.clone(),
                         identity: connection_identity.clone(),
-                        attempt_requirement: crate::McpAttemptRequirement::Ungated,
+                        attempt_requirement,
                         account: codex_apps_tools_cache_key.clone(),
                         auth_state: auth_manager.as_ref().map(|manager| {
                             (
@@ -989,7 +1021,7 @@ impl McpConnectionSet {
                 catalog_item_limit,
                 connection_pool,
                 publish_apps,
-                crate::McpAttemptRequirement::Ungated,
+                attempt_requirement,
             );
             // A forced reconnect must also wait for the previously published helper to exit.
             if let Some(previous) = existing_ema.and_then(|set| set.servers.get(&server_name)) {
@@ -1002,6 +1034,23 @@ impl McpConnectionSet {
                 (Some(trigger), Some(receiver))
             } else {
                 (None, None)
+            };
+            let driver_work = if defer_startup {
+                None
+            } else {
+                match admit_startup_driver(
+                    &async_managed_client,
+                    attempt_requirement,
+                    startup_access,
+                ) {
+                    Ok(work) => work,
+                    Err(error) => {
+                        warn!(server = %server_name, %error, "MCP startup not admitted");
+                        cancel_token.cancel();
+                        async_managed_client.client.cancel_unstarted();
+                        continue;
+                    }
+                }
             };
             servers.insert(
                 server_name.clone(),
@@ -1031,7 +1080,12 @@ impl McpConnectionSet {
             if !defer_startup {
                 eager_starts.push(server_name.clone());
             }
+            // Construct the cancellation guard outside the async body: refusal
+            // of publication or worker registration may drop an unpolled driver.
+            let unstarted_guard = UnstartedDriverGuard(async_managed_client.client.clone());
             let startup = async move {
+                let _unstarted_guard = unstarted_guard;
+                let driver_work = driver_work;
                 if let Some(mut startup_receiver) = startup_receiver
                     && tokio::select! {
                         started = startup_receiver.wait_for(|started| *started) => started.is_err(),
@@ -1131,7 +1185,11 @@ impl McpConnectionSet {
                 }
 
                 if matches!(&outcome, Err(StartupOutcomeError::Failed { .. })) {
-                    async_managed_client.reconnect_failed_startup().await;
+                    async_managed_client
+                        .reconnect_failed_startup_with_authority(
+                            crate::McpAttemptAccess::from_work(driver_work.as_deref()),
+                        )
+                        .await;
                 }
 
                 (server_name, outcome)
@@ -1570,3 +1628,28 @@ pub(crate) mod tests;
 #[cfg(test)]
 #[path = "connection_manager/startup_admission_tests.rs"]
 mod startup_admission_tests;
+
+/// Derive a finite driver lease and stage the original before detaching it.
+/// The connection retains policy only; a dormant driver calls this only on its
+/// admitted trigger, through McpServerConnection::client_with_authority.
+fn admit_startup_driver(
+    client: &AsyncManagedClient,
+    requirement: crate::McpAttemptRequirement,
+    access: crate::McpAttemptAccess<'_>,
+) -> Result<Option<Box<dyn crate::McpAttemptWork>>, StartupOutcomeError> {
+    let work = requirement
+        .derive(access)
+        .map_err(StartupOutcomeError::Refused)?;
+    client
+        .client
+        .admit(crate::McpAttemptAccess::from_work(work.as_deref()))?;
+    Ok(work)
+}
+
+struct UnstartedDriverGuard(crate::rmcp_client::ClientStartup);
+
+impl Drop for UnstartedDriverGuard {
+    fn drop(&mut self) {
+        self.0.cancel_unstarted();
+    }
+}

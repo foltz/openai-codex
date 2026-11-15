@@ -493,6 +493,8 @@ pub async fn read_mcp_resource(
         /*previous*/ None,
         McpPublicationGate::already_published(),
         McpRuntimeInput {
+            attempt_requirement: crate::McpAttemptRequirement::Ungated,
+            startup_work: None,
             network_policy_metadata: None,
             runtime_auth,
             startup_policy: McpStartupPolicy::Eager,
@@ -587,6 +589,8 @@ pub async fn collect_mcp_server_status_snapshot_with_detail(
         /*previous*/ None,
         McpPublicationGate::already_published(),
         McpRuntimeInput {
+            attempt_requirement: crate::McpAttemptRequirement::Ungated,
+            startup_work: None,
             network_policy_metadata: None,
             runtime_auth,
             startup_policy: McpStartupPolicy::Eager,

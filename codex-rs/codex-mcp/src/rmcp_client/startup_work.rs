@@ -136,7 +136,15 @@ impl ClientStartup {
 #[cfg(test)]
 impl From<ManagedClientFuture> for ClientStartup {
     fn from(future: ManagedClientFuture) -> Self {
-        Self::new(future, McpAttemptRequirement::Ungated)
+        // Existing synthetic fixtures inject an original that may already own
+        // a live transport before its Shared is first-polled. Do not relabel it
+        // as unstarted or let shutdown skip its actual cleanup. Production has
+        // no raw-Future conversion; new admission tests use the gated factories.
+        Self {
+            requirement: McpAttemptRequirement::Ungated,
+            admission: Arc::new(Mutex::new(Admission::Running)),
+            completion: future,
+        }
     }
 }
 

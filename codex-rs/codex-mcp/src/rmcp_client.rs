@@ -85,6 +85,7 @@ use codex_rmcp_client::LocalStdioServerLauncher;
 use codex_rmcp_client::McpOAuthRefreshMode;
 use codex_rmcp_client::McpProtocolMode;
 use codex_rmcp_client::RmcpClient;
+use codex_rmcp_client::RmcpClientRetirement;
 use codex_rmcp_client::StdioServerLauncher;
 use codex_rmcp_client::StreamableHttpBearerToken;
 use codex_rmcp_client::StreamableHttpRedirectMode;
@@ -301,6 +302,19 @@ impl ManagedClientStartup {
         sharing_declined: Option<CancellationToken>,
         publish_apps: Option<watch::Sender<Option<std::sync::Weak<RmcpClient>>>>,
     ) -> ManagedClientFuture {
+        self.start_in_retirement(
+            sharing_declined,
+            publish_apps,
+            RmcpClientRetirement::default(),
+        )
+    }
+
+    fn start_in_retirement(
+        &self,
+        sharing_declined: Option<CancellationToken>,
+        publish_apps: Option<watch::Sender<Option<std::sync::Weak<RmcpClient>>>>,
+        retirement: RmcpClientRetirement,
+    ) -> ManagedClientFuture {
         // A new attempt must not expose capabilities from an earlier connection.
         *self
             .server_capabilities
@@ -350,7 +364,7 @@ impl ManagedClientStartup {
 
                 let client = match tokio::time::timeout(
                     startup_timeout,
-                    make_rmcp_client(
+                    make_rmcp_client_in_retirement(
                         ema_auth,
                         &server_name,
                         server.clone(),
@@ -361,6 +375,7 @@ impl ManagedClientStartup {
                         resolved_environment,
                         runtime_auth_provider,
                         protocol_mode,
+                        retirement,
                     ),
                 )
                 .await
@@ -581,10 +596,18 @@ impl AsyncManagedClient {
                         server_capabilities,
                         pool_catalog,
                         cancel_token,
-                        |cancellation, sharing_declined| {
+                        |cancellation, sharing_declined, retirement| {
                             let mut shared_startup = (*startup).clone();
                             shared_startup.cancel_token = cancellation;
-                            shared_startup.start(sharing_declined, /*publish_apps*/ None)
+                            match retirement {
+                                Some(retirement) => shared_startup.start_in_retirement(
+                                    sharing_declined,
+                                    /*publish_apps*/ None,
+                                    retirement,
+                                ),
+                                None => shared_startup
+                                    .start(sharing_declined, /*publish_apps*/ None),
+                            }
                         },
                     )
                     .await
@@ -1444,7 +1467,6 @@ struct StartServerTaskParams {
 }
 
 #[allow(clippy::too_many_arguments)]
-#[instrument(level = "trace", skip_all, fields(server_name = %server_name))]
 pub(crate) async fn make_rmcp_client(
     ema_auth: Option<Result<crate::ema_auth::EmaConnectionAuth, StartupOutcomeError>>,
     server_name: &str,
@@ -1456,6 +1478,37 @@ pub(crate) async fn make_rmcp_client(
     resolved_environment: std::result::Result<Option<Arc<Environment>>, String>,
     runtime_auth_provider: Option<McpAuthProvider>,
     protocol_mode: McpProtocolMode,
+) -> Result<RmcpClient, StartupOutcomeError> {
+    make_rmcp_client_in_retirement(
+        ema_auth,
+        server_name,
+        server,
+        store_mode,
+        keyring_backend_kind,
+        oauth_refresh_mode,
+        runtime_context,
+        resolved_environment,
+        runtime_auth_provider,
+        protocol_mode,
+        RmcpClientRetirement::default(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+#[instrument(name = "make_rmcp_client", level = "trace", skip_all, fields(server_name = %server_name))]
+pub(crate) async fn make_rmcp_client_in_retirement(
+    ema_auth: Option<Result<crate::ema_auth::EmaConnectionAuth, StartupOutcomeError>>,
+    server_name: &str,
+    server: EffectiveMcpServer,
+    store_mode: OAuthCredentialsStoreMode,
+    keyring_backend_kind: AuthKeyringBackendKind,
+    oauth_refresh_mode: McpOAuthRefreshMode,
+    runtime_context: McpRuntimeContext,
+    resolved_environment: std::result::Result<Option<Arc<Environment>>, String>,
+    runtime_auth_provider: Option<McpAuthProvider>,
+    protocol_mode: McpProtocolMode,
+    retirement: RmcpClientRetirement,
 ) -> Result<RmcpClient, StartupOutcomeError> {
     let config = server.config().clone();
     if server.credential_policy() == McpCredentialPolicy::ExecutorOnly {
@@ -1489,6 +1542,7 @@ pub(crate) async fn make_rmcp_client(
                 &server,
                 runtime_context.local_http_client(),
                 protocol_mode,
+                retirement,
             )
             .await
             .map_err(Into::into);
@@ -1541,7 +1595,7 @@ pub(crate) async fn make_rmcp_client(
             };
 
             let cwd = cwd.map(codex_utils_path_uri::LegacyAppPathString::into_string);
-            RmcpClient::new_stdio_client_with_protocol_mode(
+            RmcpClient::new_stdio_client_with_protocol_mode_in_retirement(
                 command_os,
                 args_os,
                 env_os,
@@ -1549,6 +1603,7 @@ pub(crate) async fn make_rmcp_client(
                 cwd,
                 launcher,
                 protocol_mode,
+                retirement,
             )
             .await
             .map_err(|err| StartupOutcomeError::from(anyhow!(err)))
@@ -1613,7 +1668,7 @@ pub(crate) async fn make_rmcp_client(
             } else {
                 StreamableHttpRedirectMode::Legacy
             };
-            RmcpClient::new_streamable_http_client_with_protocol_mode_and_redirect_mode(
+            RmcpClient::new_streamable_http_client_with_protocol_mode_and_redirect_mode_in_retirement(
                 oauth_credential_name.as_ref(),
                 &url,
                 resolved_bearer_token,
@@ -1627,6 +1682,7 @@ pub(crate) async fn make_rmcp_client(
                 protocol_mode,
                 redirect_mode,
                 oauth_refresh_mode,
+                retirement,
             )
             .await
             .map_err(StartupOutcomeError::from)

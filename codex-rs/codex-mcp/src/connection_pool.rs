@@ -4,7 +4,12 @@
 //! Request continuations use the calling chat's elicitation authority. Legacy connections and
 //! servers that request input during startup remain private.
 
+mod physical;
 mod worker_joins;
+
+use physical::PhysicalOwner;
+use physical::PoolPhysicalOwners;
+pub use physical::PoolPhysicalSnapshot;
 
 pub use worker_joins::PoolWorkerCounts;
 use worker_joins::PoolWorkerJoins;
@@ -24,6 +29,7 @@ use codex_login::AuthManager;
 use codex_rmcp_client::ElicitationResponse;
 use codex_rmcp_client::RequestScope;
 use codex_rmcp_client::RmcpClient;
+use codex_rmcp_client::RmcpClientRetirement;
 use codex_rmcp_client::SendElicitation;
 use futures::FutureExt;
 use futures::future::BoxFuture;
@@ -84,6 +90,7 @@ pub struct McpConnectionPool {
     entries: Arc<Mutex<Vec<Weak<Entry>>>>,
     // Process-owned custody independent of ordinary chat/client ownership.
     workers: Arc<PoolWorkerJoins>,
+    physical: Arc<PoolPhysicalOwners>,
 }
 
 #[derive(Clone)]
@@ -127,12 +134,23 @@ struct Entry {
     /// Wakes joiners without cancelling the creator's startup.
     sharing_declined: CancellationToken,
     owners: Weak<LeaseOwners>,
+    physical: Arc<PhysicalOwner>,
     pool: Weak<Mutex<Vec<Weak<Entry>>>>,
 }
 
 /// One strong reference per active chat lease, independent of retained client bindings.
 /// Every strong reference must be consumed by `ConnectionLease::release`.
-struct LeaseOwners;
+struct LeaseOwners {
+    physical: Arc<PhysicalOwner>,
+}
+
+impl Drop for LeaseOwners {
+    fn drop(&mut self) {
+        // The last ordinary holder, not a snapshot/binding/cleanup observer,
+        // closes further physical construction before any cancellation.
+        self.physical.mark_released();
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AcquisitionRole {
@@ -275,6 +293,15 @@ impl McpConnectionPool {
         self.workers.observe_until(deadline).await
     }
 
+    /// Drain only connections whose final ordinary owner has released them.
+    /// Active holders, foreign registries and open admission remain explicit.
+    pub async fn retire_released_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> PoolPhysicalSnapshot {
+        self.physical.retire_released_until(deadline).await
+    }
+
     pub(crate) async fn connect(
         &self,
         slot: Arc<ConnectionSlot>,
@@ -282,7 +309,12 @@ impl McpConnectionPool {
         capabilities: Arc<Mutex<Option<serde_json::Value>>>,
         tool_catalog_cache_context: Option<McpToolCatalogCacheContext>,
         cancellation: CancellationToken,
-        start: impl Fn(CancellationToken, Option<CancellationToken>) -> ManagedClientFuture + Sync,
+        start: impl Fn(
+            CancellationToken,
+            Option<CancellationToken>,
+            Option<RmcpClientRetirement>,
+        ) -> ManagedClientFuture
+        + Sync,
     ) -> Result<ManagedClient, StartupOutcomeError> {
         let (lease, role) = self
             .acquire(key, &slot, Arc::clone(&capabilities), &cancellation, &start)
@@ -299,6 +331,12 @@ impl McpConnectionPool {
                 if role == AcquisitionRole::Creator
                     || matches!(client.connection_sharing, ConnectionSharing::Negotiated) =>
             {
+                if !lease.entry.physical.accepts(&client.client) {
+                    lease.entry.remove_from_pool();
+                    return Err(StartupOutcomeError::from(anyhow::anyhow!(
+                        "MCP factory returned a client outside its retained retirement owner"
+                    )));
+                }
                 let shared_capabilities = lease
                     .entry
                     .capabilities
@@ -345,7 +383,12 @@ impl McpConnectionPool {
                 // Older or failed servers leave other chats to initialize privately
                 // with their own elicitation authority.
                 drop(lease);
-                start(cancellation, /*sharing_declined*/ None).await
+                start(
+                    cancellation,
+                    /*sharing_declined*/ None,
+                    /*pooled_retirement*/ None,
+                )
+                .await
             }
         }
     }
@@ -356,7 +399,11 @@ impl McpConnectionPool {
         slot: &Arc<ConnectionSlot>,
         capabilities: Arc<Mutex<Option<serde_json::Value>>>,
         cancellation: &CancellationToken,
-        start: impl Fn(CancellationToken, Option<CancellationToken>) -> ManagedClientFuture,
+        start: impl Fn(
+            CancellationToken,
+            Option<CancellationToken>,
+            Option<RmcpClientRetirement>,
+        ) -> ManagedClientFuture,
     ) -> Result<(Arc<ConnectionLease>, AcquisitionRole), StartupOutcomeError> {
         loop {
             let (lease, role) = {
@@ -394,8 +441,15 @@ impl McpConnectionPool {
                 } else {
                     let startup_cancellation = CancellationToken::new();
                     let sharing_declined = CancellationToken::new();
-                    let client =
-                        start(startup_cancellation.clone(), Some(sharing_declined.clone()));
+                    let physical = self.physical.reserve();
+                    let owner = Arc::new(LeaseOwners {
+                        physical: Arc::clone(&physical),
+                    });
+                    let client = start(
+                        startup_cancellation.clone(),
+                        Some(sharing_declined.clone()),
+                        Some(physical.lower.clone()),
+                    );
                     // Startup belongs to the connection, including if its first chat is cancelled.
                     let startup = client.clone();
                     drop(self.workers.spawn(
@@ -405,7 +459,6 @@ impl McpConnectionPool {
                             let _ = startup.await;
                         },
                     ));
-                    let owner = Arc::new(LeaseOwners);
                     let entry = Arc::new(Entry {
                         runtime: tokio::runtime::Handle::current(),
                         key: key.clone(),
@@ -415,6 +468,7 @@ impl McpConnectionPool {
                         cancellation: startup_cancellation,
                         sharing_declined,
                         owners: Arc::downgrade(&owner),
+                        physical,
                         pool: Arc::downgrade(&self.entries),
                     });
                     entries.push(Arc::downgrade(&entry));
@@ -516,6 +570,9 @@ impl ConnectionLease {
             .workers
             .spawn(&self.entry.runtime, PoolWorkerKind::Release, async move {
                 match (entry.client.clone().await, server_lease) {
+                    (Ok(client), _) if !entry.physical.accepts(&client.client) => {
+                        // Preserve the mismatch receipt; do not stop a foreign holder.
+                    }
                     (Ok(client), None) => client.client.shutdown().await,
                     (Ok(client), Some(lease)) => {
                         let release = lease
@@ -533,7 +590,19 @@ impl ConnectionLease {
                             let _ = release.await;
                         }
                     }
-                    (Err(error), _) => error.wait_for_shutdown().await,
+                    (Err(error), _) => {
+                        error.wait_for_shutdown().await;
+                        if entry.physical.released() {
+                            let _ = entry
+                                .physical
+                                .lower
+                                .shutdown_until(
+                                    tokio::time::Instant::now()
+                                        + codex_rmcp_client::DEFAULT_RETIREMENT_TIMEOUT,
+                                )
+                                .await;
+                        }
+                    }
                 }
             });
         // The owner lock spans both registrations: a repeated release cannot

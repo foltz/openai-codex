@@ -4,6 +4,7 @@ use super::*;
 use crate::McpServerPermissions;
 use crate::binding_clients::McpBindingClients;
 use crate::connection_manager::tests::create_ready_async_managed_client;
+use crate::connection_manager::tests::create_test_managed_client_for_transport;
 use crate::connection_manager::tests::create_test_tool;
 use crate::connection_manager::tests::reusable_server_identity;
 use crate::runtime::McpRuntimeContext;
@@ -13,6 +14,7 @@ use codex_login::CodexAuth;
 use codex_rmcp_client::Elicitation;
 use codex_rmcp_client::InProcessTransportFactory;
 use codex_rmcp_client::RmcpClient;
+use codex_rmcp_client::RmcpClientRetirement;
 use futures::future::BoxFuture;
 use pretty_assertions::assert_eq;
 use rmcp::ServerHandler;
@@ -176,8 +178,12 @@ pub(crate) fn startup(
     first_started: Arc<Notify>,
     release_first: Arc<Notify>,
     server: impl InProcessTransportFactory + Clone + 'static,
-) -> impl Fn(CancellationToken, Option<CancellationToken>) -> ManagedClientFuture {
-    move |cancellation, _sharing_declined| {
+) -> impl Fn(
+    CancellationToken,
+    Option<CancellationToken>,
+    Option<RmcpClientRetirement>,
+) -> ManagedClientFuture {
+    move |cancellation, _sharing_declined, retirement| {
         let sharing = sharing.clone();
         let starts = Arc::clone(&starts);
         let first_started = Arc::clone(&first_started);
@@ -189,15 +195,13 @@ pub(crate) fn startup(
                     first_started.notify_one();
                     release_first.notified().await;
                 }
-                let mut client = create_ready_async_managed_client(Vec::new())
-                    .await
-                    .client()
-                    .await?;
-                client.client = Arc::new(
-                    RmcpClient::new_in_process_client(Arc::new(server))
-                        .await
-                        .expect("create test MCP client"),
-                );
+                let transport = RmcpClient::new_in_process_client_in_retirement(
+                    Arc::new(server),
+                    retirement.unwrap_or_default(),
+                )
+                .await
+                .expect("create test MCP client");
+                let mut client = create_test_managed_client_for_transport(Vec::new(), transport);
                 client
                     .client
                     .initialize(
@@ -589,8 +593,8 @@ async fn callback_during_startup_releases_waiting_chats_without_sharing_authorit
         let callbacks = Arc::clone(&callbacks);
         let second_callback = Arc::clone(&second_callback);
         let release_second = Arc::clone(&release_second);
-        move |cancellation, sharing_declined: Option<CancellationToken>| {
-            let startup = launch(cancellation, sharing_declined.clone());
+        move |cancellation, sharing_declined: Option<CancellationToken>, retirement| {
+            let startup = launch(cancellation, sharing_declined.clone(), retirement);
             let callbacks = Arc::clone(&callbacks);
             let second_callback = Arc::clone(&second_callback);
             let release_second = Arc::clone(&release_second);
@@ -1055,4 +1059,198 @@ async fn expired_worker_observer_does_not_poll_an_unobserved_join_or_lose_it() {
             .await,
         settled
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn physical_pool_retirement_waits_for_the_final_ordinary_holder() {
+    let mut peer = LeasePeer::new();
+    let (first, _) = peer.chat().await;
+    let (other, _) = peer.chat().await;
+    let ConnectionSharing::Shared(first_lease) = &first.connection_sharing else {
+        panic!("expected shared lease");
+    };
+    first_lease.release();
+    let release = peer.next("codex/connection/release").await;
+    let before = peer
+        .pool
+        .retire_released_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await;
+    assert_eq!(before.registered_at_start, 1);
+    assert_eq!(before.held_connections, vec![0]);
+    assert!(before.connections.is_empty());
+    assert!(before.foreign_connections.is_empty());
+    assert!(!other.client.is_closed().await);
+    let (result, ()) = tokio::join!(
+        other.call_tool("test".into(), None, |_| Ok(None), None),
+        async {
+            peer.next("tools/call").await.reply(json!({"content": []}));
+        }
+    );
+    result.unwrap();
+    release.reply(json!({}));
+    let ConnectionSharing::Shared(last) = &other.connection_sharing else {
+        panic!("expected final shared lease");
+    };
+    last.release()
+        .expect("final owner")
+        .wait_for_shutdown()
+        .await;
+    let after = peer
+        .pool
+        .retire_released_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await;
+    assert!(after.held_connections.is_empty());
+    assert!(after.foreign_connections.is_empty());
+    assert!(!after.poisoned);
+    assert_eq!(after.retired_before + after.connections.len() as u64, 1);
+    assert!(
+        after
+            .connections
+            .iter()
+            .all(|(_, report)| !report.attempts.is_empty() && report.is_complete())
+    );
+    assert!(other.client.retirement().retirement_proof().is_proven());
+    let workers = peer
+        .pool
+        .observe_workers_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await;
+    assert_eq!(workers.counts[1].joined, 2);
+    assert_eq!(workers.counts[1].pending, 0);
+}
+
+#[derive(Clone)]
+struct DelayedPoolTransport {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+    server: TestServer,
+}
+
+impl InProcessTransportFactory for DelayedPoolTransport {
+    fn open(&self) -> BoxFuture<'static, std::io::Result<tokio::io::DuplexStream>> {
+        let this = self.clone();
+        async move {
+            this.entered.notify_one();
+            this.release.notified().await;
+            this.server.open().await
+        }
+        .boxed()
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelled_pool_constructor_retains_its_late_transport_owner() {
+    let pool = McpConnectionPool::default();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let ready = Arc::new(Notify::new());
+    ready.notify_one();
+    let launch = startup(
+        ConnectionSharing::Negotiated,
+        Arc::default(),
+        Arc::default(),
+        ready,
+        DelayedPoolTransport {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            server: TestServer::default(),
+        },
+    );
+    let mut connecting = Box::pin(pool.connect(
+        Arc::default(),
+        key(&context(), &config()),
+        Arc::default(),
+        None,
+        CancellationToken::new(),
+        launch,
+    ));
+    tokio::select! {
+        _ = entered.notified() => {}
+        _ = &mut connecting => panic!("constructor must wait for the transport"),
+    }
+    drop(connecting);
+    let pending = pool
+        .retire_released_until(tokio::time::Instant::now())
+        .await;
+    assert!(pending.held_connections.is_empty());
+    assert_eq!(pending.connections.len(), 1);
+    assert!(!pending.connections[0].1.is_complete());
+    release.notify_one();
+    let settled = pool
+        .retire_released_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await;
+    assert!(settled.held_connections.is_empty());
+    assert!(settled.foreign_connections.is_empty());
+    assert_eq!(settled.retired_before + settled.connections.len() as u64, 1);
+    assert!(
+        settled
+            .connections
+            .iter()
+            .all(|(_, report)| !report.attempts.is_empty() && report.is_complete())
+    );
+    let workers = pool
+        .observe_workers_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await;
+    assert_eq!(workers.counts[0].joined, 1);
+    assert_eq!(workers.counts[1].joined, 1);
+    assert_eq!(workers.counts[0].pending + workers.counts[1].pending, 0);
+}
+
+#[tokio::test]
+async fn pool_refuses_foreign_retirement_owner_without_closing_that_clients_transport() {
+    let mut source_peer = LeasePeer::new();
+    let (foreign, _) = source_peer.chat().await;
+    let supplied = foreign.clone();
+    let bad_pool = McpConnectionPool::default();
+    let result = bad_pool
+        .connect(
+            Arc::default(),
+            key(&context(), &config()),
+            Arc::default(),
+            None,
+            CancellationToken::new(),
+            move |_, _, _| {
+                futures::future::ready(Ok(supplied.clone()))
+                    .boxed()
+                    .shared()
+            },
+        )
+        .await;
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("foreign owner must refuse publication"),
+    };
+    assert!(error.to_string().contains("retained retirement owner"));
+    let report = bad_pool
+        .retire_released_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await;
+    assert_eq!(report.foreign_connections, vec![0]);
+    assert!(report.held_connections.is_empty());
+    assert_eq!(report.retired_before, 0);
+    let workers = bad_pool
+        .observe_workers_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await;
+    assert_eq!(workers.counts[1].joined, 1);
+    assert!(!foreign.client.is_closed().await);
+    let (result, ()) = tokio::join!(
+        foreign.call_tool("test".into(), None, |_| Ok(None), None),
+        async {
+            source_peer
+                .next("tools/call")
+                .await
+                .reply(json!({"content": []}));
+        }
+    );
+    result.unwrap();
+    let ConnectionSharing::Shared(last) = &foreign.connection_sharing else {
+        panic!("expected foreign holder still intact");
+    };
+    last.release()
+        .expect("fixture owner releases its own connection")
+        .wait_for_shutdown()
+        .await;
+    let _ = source_peer
+        .pool
+        .observe_workers_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await;
+    assert!(foreign.client.is_closed().await);
 }

@@ -505,15 +505,21 @@ async fn legacy_tool_catalog_rejects_repeated_pagination_cursor() -> anyhow::Res
 }
 
 async fn create_test_managed_client(tools: Vec<ToolInfo>) -> ManagedClient {
+    let client = RmcpClient::new_in_process_client(Arc::new(TestInProcessTransportFactory))
+        .await
+        .expect("create in-process RMCP client");
+    create_test_managed_client_for_transport(tools, client)
+}
+
+pub(crate) fn create_test_managed_client_for_transport(
+    tools: Vec<ToolInfo>,
+    client: RmcpClient,
+) -> ManagedClient {
     ManagedClient {
         connection_sharing: Default::default(),
         shared_elicitation: None,
         _auth_change_notifications: None,
-        client: Arc::new(
-            RmcpClient::new_in_process_client(Arc::new(TestInProcessTransportFactory))
-                .await
-                .expect("create in-process RMCP client"),
-        ),
+        client: Arc::new(client),
         server_info: create_test_server_info("Ready"),
         tool_catalog: Arc::new(ClientToolCatalog::new(
             tools, /*meta*/ None, /*updates*/ None,

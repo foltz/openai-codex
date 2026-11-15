@@ -26,6 +26,7 @@ use codex_rmcp_client::EmaRequestAuthority;
 use codex_rmcp_client::McpOAuthRefreshMode;
 use codex_rmcp_client::McpProtocolMode;
 use codex_rmcp_client::RmcpClient;
+use codex_rmcp_client::RmcpClientRetirement;
 use codex_rmcp_client::StoredOAuthCredentialSnapshot;
 use codex_rmcp_client::StreamableHttpBearerToken;
 use codex_rmcp_client::StreamableHttpRedirectMode;
@@ -150,6 +151,7 @@ impl EmaAuth {
         server: &EffectiveMcpServer,
         http_client: Arc<dyn HttpClient>,
         protocol_mode: McpProtocolMode,
+        retirement: RmcpClientRetirement,
     ) -> Result<RmcpClient> {
         self.authority.check()?;
         let config = server.config();
@@ -184,7 +186,7 @@ impl EmaAuth {
             token,
             authority,
         ));
-        RmcpClient::new_streamable_http_client_with_protocol_mode_and_redirect_mode(
+        RmcpClient::new_streamable_http_client_with_protocol_mode_and_redirect_mode_in_retirement(
             server_name,
             &url,
             Some(StreamableHttpBearerToken::ProvidedByHttpClient),
@@ -198,6 +200,7 @@ impl EmaAuth {
             protocol_mode,
             StreamableHttpRedirectMode::Legacy,
             McpOAuthRefreshMode::Legacy,
+            retirement,
         )
         .await
     }

@@ -207,7 +207,7 @@ async fn closed_auth_worker_admission_refuses_before_initial_notification() -> R
         .await?;
     let (changes, receiver) = watch::channel(AuthChangeState::default());
     let mut capabilities = ServerCapabilities::default();
-    capabilities.experimental = Some([(CAPABILITY.to_owned(), json!({}))].into());
+    capabilities.experimental = Some([(CAPABILITY.to_owned(), Default::default())].into());
     workers.close_startup_admission();
     assert!(
         start(&workers, Arc::clone(&client), &capabilities, Some(receiver))

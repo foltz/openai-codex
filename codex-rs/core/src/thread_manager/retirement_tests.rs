@@ -1679,6 +1679,12 @@ async fn real_account_constructor_case(explicit: bool, hold_mcp: bool) {
     .await
     .expect("constructor reaches held instructions");
     assert_eq!(provider.entered.load(Ordering::SeqCst), 1);
+    let startup = first_startup(&manager);
+    assert_eq!(
+        startup.constructor_stage_for_test(),
+        Some((false, false, false)),
+        "real early-resource owner exists before Session/MCP birth"
+    );
     assert_eq!(
         host.request_derivations.load(Ordering::SeqCst),
         usize::from(!explicit),
@@ -1693,6 +1699,11 @@ async fn real_account_constructor_case(explicit: bool, hold_mcp: bool) {
             .expect("advance actual constructor into MCP startup");
         reach_held_initialize(observer.as_mut(), mcp).await;
         assert_eq!(mcp.initialize_attempts(), 1);
+        assert_eq!(
+            startup.constructor_stage_for_test(),
+            Some((true, true, false)),
+            "same original owns the real Session and MCP runtime"
+        );
         // Constructor and initial-publication input each retain one operation;
         // eager driver and actual original each own one further descendant.
         assert_eq!(host.operations.load(Ordering::SeqCst), 4);
@@ -1735,7 +1746,11 @@ async fn real_account_constructor_case(explicit: bool, hold_mcp: bool) {
         );
         mcp.release();
     }
-    let startup = first_startup(&manager);
+    assert_eq!(
+        startup.constructor_stage_for_test(),
+        Some((false, hold_mcp, true)),
+        "original construction ends and releases the unpublished Session"
+    );
     assert!(
         manager
             .shutdown_unpublished_constructions_bounded(Duration::from_secs(20))
@@ -1763,7 +1778,11 @@ async fn real_account_constructor_case(explicit: bool, hold_mcp: bool) {
             panicked: false,
             unavailable: false,
             unpublished: 0,
-            sessions: vec![],
+            sessions: vec![StartupCleanup::BeforeLoop(
+                crate::session::retirement::CleanupExecution::Finished {
+                    persistence_failed: false,
+                }
+            )],
         }
     );
     assert!(

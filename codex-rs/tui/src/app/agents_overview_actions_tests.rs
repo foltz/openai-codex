@@ -757,6 +757,8 @@ async fn hidden_task_stays_hidden_through_activity_and_seed_until_explicit_resum
     Box::pin(app.handle_event(&mut tui, &mut app_server, hide)).await?;
     app.track_agents_overview_notification(&ServerNotification::ThreadStarted(
         ThreadStartedNotification {
+            session_start_source: None,
+            clear_predecessor_thread_id: None,
             thread: thread.clone(),
         },
     ));

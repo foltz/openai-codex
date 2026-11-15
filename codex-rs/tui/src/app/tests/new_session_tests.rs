@@ -1488,3 +1488,59 @@ async fn cloud_switch_wait_displays_pending_submission_hint() -> Result<()> {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn fresh_session_carries_only_the_displayed_clear_predecessor() -> Result<()> {
+    use codex_app_server_protocol::ThreadStartSource;
+    for source in [
+        None,
+        Some(ThreadStartSource::Startup),
+        Some(ThreadStartSource::Clear),
+    ] {
+        let (mut app, _events, _ops) = make_test_app_with_channels().await;
+        let home = tempdir()?;
+        app.config.codex_home = home.path().abs();
+        app.config.sqlite = SqliteConfig::new_for_testing(home.path().abs());
+        let (mut server, requests, proxy) = start_recording_app_server(
+            &app.config,
+            /*blocked_thread_list*/ None,
+            /*failed_thread_name*/ None,
+        )
+        .await?;
+        let mut tui = crate::tui::test_support::make_test_tui()?;
+        let displayed = server.start_thread(&app.config).await?.session.thread_id;
+        app.select_agents_overview_thread(&mut tui, &mut server, displayed)
+            .await?;
+        // A later same-workspace thread is not lifecycle authority for this client.
+        let bystander = server.start_thread(&app.config).await?.session.thread_id;
+        assert_ne!(displayed, bystander);
+        requests.lock().expect("request recorder lock").clear();
+        app.start_fresh_session(
+            &mut tui,
+            &mut server,
+            source,
+            /*initial_user_message*/ None,
+            /*new_thread_name*/ None,
+        )
+        .await;
+        let starts = recorded_params(&requests, "thread/start");
+        assert_eq!(starts.len(), 1);
+        assert_eq!(
+            starts[0]["sessionStartSource"],
+            serde_json::to_value(source)?
+        );
+        let predecessor = if source == Some(ThreadStartSource::Clear) {
+            Some(displayed.to_string())
+        } else {
+            None
+        };
+        assert_eq!(
+            starts[0]["clearPredecessorThreadId"],
+            serde_json::to_value(predecessor)?
+        );
+        assert_ne!(app.chat_widget.thread_id(), Some(displayed));
+        server.shutdown().await?;
+        proxy.await??;
+    }
+    Ok(())
+}

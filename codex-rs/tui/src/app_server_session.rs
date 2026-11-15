@@ -1100,6 +1100,7 @@ impl AppServerSession {
             &LocalSettings::from(config),
             config,
             /*session_start_source*/ None,
+            /*clear_predecessor_thread_id*/ None,
             /*remote_cwd_override*/ None,
             /*selected_profile*/ None,
             /*host_project_cwd*/ None,
@@ -1112,6 +1113,7 @@ impl AppServerSession {
         local_settings: &LocalSettings,
         config: &Config,
         session_start_source: Option<ThreadStartSource>,
+        clear_predecessor_thread_id: Option<String>,
         remote_cwd_override: Option<&std::path::Path>,
         selected_profile: Option<&PermissionProfileSelection>,
         host_project_cwd: Option<&std::path::Path>,
@@ -1131,6 +1133,7 @@ impl AppServerSession {
             remote_cwd_override.or(self.remote_cwd_override.as_deref()),
             session_start_source,
         );
+        params.clear_predecessor_thread_id = clear_predecessor_thread_id;
         if self.thread_params_mode.settings_owner() == ThreadSettingsOwner::Client {
             params.model_provider = self
                 .model_provider_override

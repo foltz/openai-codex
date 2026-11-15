@@ -5661,7 +5661,9 @@ fn fresh_session_keeps_its_name_and_draft_when_cycling_backends() -> Result<()> 
                 assert_eq!(thread.name.as_deref(), Some("Add User"));
                 // Deliver the metadata notification that populates Command Center.
                 app.track_agents_overview_notification(&ServerNotification::ThreadStarted(
-                    codex_app_server_protocol::ThreadStartedNotification { thread: thread.clone() },
+                    codex_app_server_protocol::ThreadStartedNotification {
+ session_start_source: None,
+ clear_predecessor_thread_id: None, thread: thread.clone() },
                 ));
                 let retained_thread = ThreadId::new();
                 let mut retained = thread;

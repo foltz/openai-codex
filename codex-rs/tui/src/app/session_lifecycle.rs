@@ -1279,10 +1279,17 @@ impl App {
                 .map_err(|err| {
                     color_eyre::eyre::eyre!("Failed to read new session defaults: {err}")
                 })?;
+        let clear_predecessor_thread_id = if session_start_source == Some(ThreadStartSource::Clear)
+        {
+            self.current_displayed_thread_id().map(|id| id.to_string())
+        } else {
+            None
+        };
         let started = crate::boxed_future!(app_server.start_thread_with_session_start_source(
             &self.local_settings,
             &config,
             session_start_source,
+            clear_predecessor_thread_id,
             /*remote_cwd_override*/ None,
             /*selected_profile*/ None,
             self.backend_preference_context.local_cwd.as_deref(),

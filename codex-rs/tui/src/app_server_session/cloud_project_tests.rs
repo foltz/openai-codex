@@ -123,6 +123,7 @@ async fn cloud_starts_use_each_requests_host_project_without_caching() {
                 &local_settings,
                 &config,
                 /*session_start_source*/ None,
+                /*clear_predecessor_thread_id*/ None,
                 /*remote_cwd_override*/ None,
                 /*selected_profile*/ None,
                 host,

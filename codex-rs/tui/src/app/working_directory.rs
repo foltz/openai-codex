@@ -464,6 +464,7 @@ impl App {
                     &local_settings,
                     &config,
                     /*session_start_source*/ None,
+                    /*clear_predecessor_thread_id*/ None,
                     /*remote_cwd_override*/ None,
                     selected_profile.as_ref(),
                     /*host_project_cwd*/ None,

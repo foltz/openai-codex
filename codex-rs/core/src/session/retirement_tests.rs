@@ -722,12 +722,12 @@ async fn exact_thread_fixture_with(
         let _owner = loop_cleanup_owner;
         match mode {
             ThreadLoopFixture::Ordinary => {
-                super::super::handlers::submission_loop_with_dispatch(
+                Box::pin(super::super::handlers::submission_loop_with_dispatch(
                     loop_session,
                     config,
                     rx_sub,
                     Some(submissions),
-                )
+                ))
                 .await;
             }
             ThreadLoopFixture::Hung | ThreadLoopFixture::Cancelled => {

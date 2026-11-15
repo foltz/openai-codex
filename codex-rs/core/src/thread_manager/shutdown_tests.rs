@@ -339,7 +339,7 @@ async fn manager_shutdown_completes_cancelled_admitted_constructor_without_a_ses
     })
     .await
     .expect("real constructor reaches held instruction refresh");
-    let startup = Arc::clone(&manager.constructions.state.lock().unwrap().constructions[0].startup);
+    let startup = manager.constructions.first_startup_for_test();
     assert_eq!(
         startup.constructor_stage_for_test(),
         Some((false, false, false)),

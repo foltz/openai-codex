@@ -295,6 +295,11 @@ pub(super) struct ConstructionDrain {
 
 impl ThreadConstructions {
     #[cfg(test)]
+    pub(in crate::thread_manager) fn first_startup_for_test(&self) -> Arc<SessionStartupCustody> {
+        Arc::clone(&self.state.lock().unwrap().constructions[0].startup)
+    }
+
+    #[cfg(test)]
     pub(in crate::thread_manager) fn retains_without_compaction(
         &self,
         thread: &Arc<CodexThread>,

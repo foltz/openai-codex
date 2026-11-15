@@ -271,6 +271,7 @@ pub(crate) use submission::IdleAdmissionError;
 pub(crate) use submission::Submission;
 pub(crate) use submission::SubmissionSender;
 mod input_queue;
+mod mailbox;
 mod mcp;
 mod mcp_prewarm;
 mod mcp_refresh;

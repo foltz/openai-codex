@@ -404,9 +404,9 @@ async fn private_adapter_retains_cancelled_caller_and_late_transport() {
             let client =
                 codex_rmcp_client::RmcpClient::new_in_process_client_in_retirement(factory, lower)
                     .await
-                    .map_err(crate::rmcp_client::StartupOutcomeError::from)?;
+                    .map_err(anyhow::Error::from)?;
             Ok(
-                crate::connection_manager_tests::create_test_managed_client_for_transport(
+                crate::connection_manager::tests::create_test_managed_client_for_transport(
                     Vec::new(),
                     client,
                 ),

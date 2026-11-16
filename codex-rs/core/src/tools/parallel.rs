@@ -37,7 +37,7 @@ use codex_protocol::models::ToolResultMetadata;
 
 // Field order is deliberate: destroy the original future and all captured
 // payloads before releasing its finite account operation, even if never polled.
-struct ToolWorkFuture<F> {
+pub(super) struct ToolWorkFuture<F> {
     future: std::pin::Pin<Box<F>>,
     _work: Option<Box<dyn codex_extension_api::HostOperationWork>>,
 }

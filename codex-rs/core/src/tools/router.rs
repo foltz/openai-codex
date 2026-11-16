@@ -357,14 +357,22 @@ impl ToolRouter {
         call: ToolCall,
         source: ToolCallSource,
     ) -> Result<AnyToolResult, FunctionCallError> {
-        self.dispatch_tool_call_with_code_mode_result_inner(
-            session,
-            step_context,
-            cancellation_token,
-            tracker,
-            call,
-            source,
-            /*call_state*/ None,
+        let work = session
+            .turn_operation_work(&step_context.turn)
+            .map_err(|_| {
+                FunctionCallError::RespondToModel("tool account work is unavailable".to_owned())
+            })?;
+        super::parallel::ToolWorkFuture::new(
+            self.dispatch_tool_call_with_code_mode_result_inner(
+                session,
+                step_context,
+                cancellation_token,
+                tracker,
+                call,
+                source,
+                /*call_state*/ None,
+            ),
+            work,
         )
         .await
     }

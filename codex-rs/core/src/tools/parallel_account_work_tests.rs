@@ -451,3 +451,43 @@ async fn direct_and_nested_tagged_dispatch_keep_no_lease_on_reusable_runtime() {
         ]
     );
 }
+
+#[tokio::test]
+async fn standalone_router_keeps_exact_turn_work_through_callback_cancellation() {
+    let (runtime, state) = fixture(true).await;
+    state.hold_finish.store(true, Ordering::SeqCst);
+    let router = runtime.step_context.tool_router.clone();
+    let session = runtime.session.clone();
+    let step = runtime.step_context.clone();
+    let tracker = runtime.tracker.clone();
+    let caller = tokio::spawn(async move {
+        router
+            .dispatch_tool_call_with_code_mode_result(
+                session,
+                step,
+                CancellationToken::new(),
+                tracker,
+                ToolCall {
+                    tool_name: codex_tools::ToolName::plain("owned_tool"),
+                    call_id: "standalone".into(),
+                    payload: ToolPayload::Function {
+                        arguments: "{}".into(),
+                    },
+                    encrypted_function_args: None,
+                    native_call: None,
+                },
+                ToolCallSource::Direct,
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), state.finish_entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(state.live.load(Ordering::SeqCst), 1);
+    assert_eq!(state.requests.load(Ordering::SeqCst), 0);
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    assert_eq!(state.live.load(Ordering::SeqCst), 0);
+    assert!(state.min_live_on_payload_drop.load(Ordering::SeqCst) >= 1);
+    assert!(state.outcomes.lock().unwrap().is_empty());
+}

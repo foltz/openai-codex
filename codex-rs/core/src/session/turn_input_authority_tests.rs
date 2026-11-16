@@ -13,6 +13,7 @@ struct Counts {
     refused: AtomicUsize,
     pause: AtomicBool,
 }
+#[derive(Debug)]
 struct Work(Arc<Counts>);
 impl Work {
     fn new(c: &Arc<Counts>) -> Self {

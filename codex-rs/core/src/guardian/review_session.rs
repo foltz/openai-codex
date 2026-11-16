@@ -9,6 +9,7 @@ pub use setup::PreparedGuardianContext;
 pub(super) use setup::prepare_review;
 pub use setup::prepare_review_prewarm;
 pub use setup::prepare_review_prewarm_invocation;
+pub(super) use setup::prepare_review_with_work;
 pub(crate) use setup::run_guardian_review_session;
 
 #[path = "review_session_prompt.rs"]

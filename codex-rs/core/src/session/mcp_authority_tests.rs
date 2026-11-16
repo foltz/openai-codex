@@ -934,3 +934,115 @@ async fn exhausted_dispatched_prewarm_fails_before_client_setup_or_turn_lookup()
         crate::tasks::TaskJoinOutcome::Complete { panicked: false }
     );
 }
+
+#[tokio::test]
+async fn speculative_request_capture_refuses_unscoped_or_exhausted_before_state_wait() {
+    let (session, mut turn, counts) = fixture().await;
+    turn.sub_id = "speculative-uninstalled".into();
+    let turn = Arc::new(turn);
+    let root = Work::new(&counts);
+    let cancel = CancellationToken::new();
+    let _held = session.state.lock().await;
+    for access in [
+        McpAttemptAccess::Unscoped,
+        McpAttemptAccess::Admitted(&root),
+    ] {
+        counts.refuse.store(true, Ordering::SeqCst);
+        let mut capture = Box::pin(session.capture_speculative_step_context_with_authority(
+            Arc::clone(&turn),
+            &cancel,
+            access,
+        ));
+        assert!(matches!(
+            futures::poll!(&mut capture),
+            std::task::Poll::Ready(Err(_))
+        ));
+    }
+    assert_eq!(counts.turns.load(Ordering::SeqCst), 0);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+}
+#[tokio::test]
+async fn speculative_request_capture_keeps_finite_work_until_cancelled_wait_drops() {
+    let (session, mut turn, counts) = fixture().await;
+    turn.sub_id = "speculative-uninstalled".into();
+    let turn = Arc::new(turn);
+    let root = Work::new(&counts);
+    let cancel = CancellationToken::new();
+    let _held = session.state.lock().await;
+    let mut capture = Box::pin(session.capture_speculative_step_context_with_authority(
+        Arc::clone(&turn),
+        &cancel,
+        McpAttemptAccess::Admitted(&root),
+    ));
+    assert!(futures::poll!(&mut capture).is_pending());
+    assert_eq!(counts.live.load(Ordering::SeqCst), 2);
+    assert_eq!(counts.turns.load(Ordering::SeqCst), 0);
+    drop(capture);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    drop(root);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    assert_eq!(Arc::strong_count(&turn), 1);
+}
+#[tokio::test]
+async fn speculative_captured_step_keeps_no_request_lease_when_retained() {
+    let (session, mut turn, counts) = fixture().await;
+    turn.sub_id = "speculative-uninstalled".into();
+    let root = Work::new(&counts);
+    let step = session
+        .capture_speculative_step_context_with_authority(
+            Arc::new(turn),
+            &CancellationToken::new(),
+            McpAttemptAccess::Admitted(&root),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while counts.live.load(Ordering::SeqCst) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(counts.turns.load(Ordering::SeqCst), 0);
+    assert_eq!(step.turn.sub_id, "speculative-uninstalled");
+    drop(root);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+}
+#[tokio::test]
+async fn standalone_mcp_prepare_refuses_before_refresh_permit_without_turn_lookup() {
+    let (session, _, counts) = fixture().await;
+    let root = Work::new(&counts);
+    let tool = advertised_tool();
+    let _held = session.mcp_refresh.acquire().await.unwrap();
+    for access in [
+        McpAttemptAccess::Unscoped,
+        McpAttemptAccess::Admitted(&root),
+    ] {
+        counts.refuse.store(true, Ordering::SeqCst);
+        let mut prepare = Box::pin(session.prepare_mcp_call_with_authority(&tool, access));
+        assert!(matches!(
+            futures::poll!(&mut prepare),
+            std::task::Poll::Ready(Err(_))
+        ));
+    }
+    assert_eq!(counts.turns.load(Ordering::SeqCst), 0);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    assert!(session.mcp_refresh.is_pending());
+}
+#[tokio::test]
+async fn standalone_mcp_prepare_owns_work_during_refresh_wait_and_releases_on_cancel() {
+    let (session, _, counts) = fixture().await;
+    let root = Work::new(&counts);
+    let tool = advertised_tool();
+    let _held = session.mcp_refresh.acquire().await.unwrap();
+    let mut prepare =
+        Box::pin(session.prepare_mcp_call_with_authority(&tool, McpAttemptAccess::Admitted(&root)));
+    assert!(futures::poll!(&mut prepare).is_pending());
+    assert_eq!(counts.live.load(Ordering::SeqCst), 3);
+    assert_eq!(counts.turns.load(Ordering::SeqCst), 0);
+    drop(prepare);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    drop(root);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    assert!(session.mcp_refresh.is_pending());
+}

@@ -448,6 +448,24 @@ pub(in crate::guardian) async fn prepare_review(
     let work = params
         .parent_session
         .turn_operation_work(params.parent_context.turn())?;
+    prepare_review_with_work(params, work).await
+}
+
+/// An isolated request has explicit operation custody, not a synthetic live turn.
+pub(in crate::guardian) async fn prepare_review_with_work(
+    params: GuardianReviewSessionParams,
+    work: Option<Box<dyn codex_extension_api::HostOperationWork>>,
+) -> anyhow::Result<PreparedReview> {
+    anyhow::ensure!(
+        work.is_some()
+            || !params
+                .parent_session
+                .services
+                .host_admission
+                .as_ref()
+                .is_some_and(|host| host.requires_account_work()),
+        "Guardian preparation requires account work"
+    );
     let preparation_work = work
         .as_deref()
         .map(|work| work.derive_operation())

@@ -72,6 +72,28 @@ impl Session {
     ) -> anyhow::Result<PreparedMcpCall> {
         let work = self.turn_mcp_work(turn)?;
         let access = codex_mcp::McpAttemptAccess::from_work(work.as_deref());
+        self.prepare_mcp_call_inner(advertised_tool, access).await
+    }
+
+    /// Captures a call for standalone review without consulting an uninstalled turn.
+    pub(crate) async fn prepare_mcp_call_with_authority(
+        self: &Arc<Self>,
+        advertised_tool: &ToolInfo,
+        access: codex_mcp::McpAttemptAccess<'_>,
+    ) -> anyhow::Result<PreparedMcpCall> {
+        let work = self.derive_mcp_attempt_work(access)?;
+        self.prepare_mcp_call_inner(
+            advertised_tool,
+            codex_mcp::McpAttemptAccess::from_work(work.as_deref()),
+        )
+        .await
+    }
+
+    async fn prepare_mcp_call_inner(
+        self: &Arc<Self>,
+        advertised_tool: &ToolInfo,
+        access: codex_mcp::McpAttemptAccess<'_>,
+    ) -> anyhow::Result<PreparedMcpCall> {
         self.refresh_mcp_if_dirty_with_authority(access).await?;
         if advertised_tool.server_name == CODEX_APPS_MCP_SERVER_NAME {
             self.wait_for_apps_tool_refresh().await;

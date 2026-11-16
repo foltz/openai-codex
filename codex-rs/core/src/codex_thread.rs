@@ -1155,6 +1155,10 @@ impl CodexThread {
         &self,
         cancellation: &CancellationToken,
     ) -> CodexResult<crate::guardian_review::GuardianReviewResult> {
+        let work = self
+            .session
+            .request_operation_work()
+            .map_err(|_| CodexErr::Fatal("Guardian request account work is unavailable".into()))?;
         if self.session.active_turn.lock().await.is_some() {
             return Err(CodexErr::InvalidRequest("thread has an active turn".into()));
         }
@@ -1165,7 +1169,8 @@ impl CodexThread {
                     .into(),
             )
         })?;
-        crate::guardian::review_tool_call(&self.session, history, &tool_call, cancellation).await
+        crate::guardian::review_tool_call(&self.session, history, &tool_call, cancellation, work)
+            .await
     }
 
     /// Record raw Responses API items without starting a new turn.

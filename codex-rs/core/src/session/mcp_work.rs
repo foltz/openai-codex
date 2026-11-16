@@ -73,6 +73,16 @@ impl Session {
     /// Capture before the first await in a host-request entry point. Absence
     /// remains ungated; exhausted derivation refuses without fresh admission.
     pub(crate) fn request_mcp_work(&self) -> anyhow::Result<Option<Box<dyn McpAttemptWork>>> {
+        self.request_operation_work().map(|work| {
+            work.map(|work| Box::new(McpOperationWork(work)) as Box<dyn McpAttemptWork>)
+        })
+    }
+
+    /// General finite request root, captured by standalone operations before
+    /// their first await. A missing required root is never fresh admission.
+    pub(crate) fn request_operation_work(
+        &self,
+    ) -> anyhow::Result<Option<Box<dyn HostOperationWork>>> {
         let Some(host) = &self.services.host_admission else {
             return Ok(None);
         };
@@ -81,9 +91,9 @@ impl Session {
                 if work.is_none() && host.requires_account_work() {
                     return Err(codex_extension_api::TurnWorkRefused::Unavailable);
                 }
-                Ok(work.map(|work| Box::new(McpOperationWork(work)) as Box<dyn McpAttemptWork>))
+                Ok(work)
             })
-            .map_err(|_| anyhow::anyhow!("MCP request account work is unavailable"))
+            .map_err(|_| anyhow::anyhow!("request account work is unavailable"))
     }
 }
 

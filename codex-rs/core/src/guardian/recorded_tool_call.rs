@@ -42,6 +42,7 @@ pub(crate) async fn review_tool_call(
     history: ContextManager,
     tool_call: &ResponseItem,
     cancellation: &CancellationToken,
+    work: Option<Box<dyn codex_extension_api::HostOperationWork>>,
 ) -> Result<GuardianReviewResult> {
     let is_supported_builtin = match tool_call {
         ResponseItem::FunctionCall {
@@ -86,6 +87,26 @@ pub(crate) async fn review_tool_call(
             "direct review does not support replaying request_permissions".into(),
         ));
     }
+    if work.is_none()
+        && session
+            .services
+            .host_admission
+            .as_ref()
+            .is_some_and(|host| host.requires_account_work())
+    {
+        return Err(CodexErr::Fatal(
+            "Guardian request account work is unavailable".into(),
+        ));
+    }
+    let preparation_work = work
+        .as_deref()
+        .map(|work| work.derive_operation())
+        .transpose()
+        .map_err(|_| CodexErr::Fatal("Guardian request preparation work refused".into()))?
+        .map(|work| {
+            Box::new(crate::session::McpOperationWork(work)) as Box<dyn codex_mcp::McpAttemptWork>
+        });
+    let access = codex_mcp::McpAttemptAccess::from_work(preparation_work.as_deref());
     let deadline = ReviewDeadline::from_timeout(session.get_config().await.guardian_review_timeout);
 
     let review = async {
@@ -93,7 +114,7 @@ pub(crate) async fn review_tool_call(
             .new_turn_with_default_settings(uuid::Uuid::now_v7().to_string(), Default::default())
             .await;
         let step = session
-            .capture_speculative_step_context(turn, cancellation)
+            .capture_speculative_step_context_with_authority(turn, cancellation, access)
             .await?;
         let parsed_call = step
             .tool_router
@@ -145,9 +166,10 @@ pub(crate) async fn review_tool_call(
             })?;
         let step = &invocation.step_context;
         let (requirement, action) = if let Some(tool_info) = advertised_mcp_tool {
-            let prepared = mcp_tool_call::recorded::prepare_approval_action(&invocation, tool_info)
-                .await
-                .map_err(tool_error)?;
+            let prepared =
+                mcp_tool_call::recorded::prepare_approval_action(&invocation, tool_info, access)
+                    .await
+                    .map_err(tool_error)?;
             let Some(action) = prepared else {
                 return Ok(GuardianReviewResult {
                     call_id: invocation.call_id,
@@ -276,7 +298,7 @@ pub(crate) async fn review_tool_call(
             },
         };
         let assessment = input
-            .assess_isolated(deadline, cancellation)
+            .assess_isolated_with_work(deadline, cancellation, work)
             .await
             .map_err(|error| match error {
                 GuardianReviewError::Cancelled => CodexErr::TurnAborted,

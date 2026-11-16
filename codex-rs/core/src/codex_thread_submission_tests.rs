@@ -895,3 +895,53 @@ async fn ready_callback_ungated_missing_work_preserves_local_notification() {
     assert_eq!(callback.unscoped.load(Ordering::SeqCst), 1);
     assert_eq!(callback.refused.load(Ordering::SeqCst), 0);
 }
+
+#[tokio::test]
+async fn recorded_review_refuses_request_work_before_waiting_for_active_turn() {
+    let (mut thread, queue, _) = fixture().await;
+    let gate = Arc::new(RefusingMcpRequest::default());
+    Arc::get_mut(&mut thread.session)
+        .unwrap()
+        .services
+        .host_admission = Some(gate.clone());
+    let _held = thread.session.active_turn.lock().await;
+    let cancel = CancellationToken::new();
+    let mut review = Box::pin(thread.guardian_review(&cancel));
+    assert!(matches!(
+        futures::poll!(&mut review),
+        std::task::Poll::Ready(Err(_))
+    ));
+    assert_eq!(gate.0.load(Ordering::SeqCst), 1);
+    assert!(queue.is_empty());
+}
+#[tokio::test]
+async fn recorded_review_cancellation_releases_root_captured_before_history() {
+    let (thread, counts) = history_fixture().await;
+    let held = thread.session.active_turn.lock().await;
+    let cancel = CancellationToken::new();
+    let mut review = Box::pin(thread.guardian_review(&cancel));
+    assert!(futures::poll!(&mut review).is_pending());
+    assert_eq!(counts.requests.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    drop(review);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    drop(held);
+}
+#[tokio::test]
+async fn recorded_builtin_preparation_uses_request_work_not_an_installed_turn() {
+    let (thread, counts) = history_fixture().await;
+    let call:ResponseItem=serde_json::from_value(serde_json::json!({"type":"function_call","name":"exec_command","call_id":"standalone-request","arguments":"{\"cmd\":\"pwd\"}","status":"completed"})).unwrap();
+    thread.inject_response_items(vec![call]).await.unwrap();
+    let before = counts.requests.load(Ordering::SeqCst);
+    let derives = counts.derives.load(Ordering::SeqCst);
+    let result = thread
+        .guardian_review(&CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(result.call_id, "standalone-request");
+    assert!(result.assessment.is_none());
+    assert_eq!(counts.requests.load(Ordering::SeqCst), before + 1);
+    assert!(counts.derives.load(Ordering::SeqCst) > derives);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    assert!(thread.session.active_turn.lock().await.is_none());
+}

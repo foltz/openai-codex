@@ -17,6 +17,7 @@ use crate::tools::sandboxing::ApprovalAction;
 pub(crate) async fn prepare_approval_action(
     invocation: &ToolInvocation,
     advertised_tool: &ToolInfo,
+    access: codex_mcp::McpAttemptAccess<'_>,
 ) -> Result<Option<ApprovalAction>, FunctionCallError> {
     let ToolPayload::Function { arguments } = &invocation.payload else {
         return Err(FunctionCallError::RespondToModel(
@@ -27,7 +28,7 @@ pub(crate) async fn prepare_approval_action(
         .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
     let call = invocation
         .session
-        .prepare_mcp_call(&invocation.turn, advertised_tool)
+        .prepare_mcp_call_with_authority(advertised_tool, access)
         .await
         .map_err(|err| FunctionCallError::RespondToModel(format!("{err:#}")))?;
     let mcp_invocation = McpInvocation {

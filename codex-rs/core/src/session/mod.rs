@@ -4563,6 +4563,27 @@ impl Session {
         .await
     }
 
+    /// Standalone speculative capture uses request authority without publishing
+    /// the candidate as the active turn's retained step.
+    pub(crate) async fn capture_speculative_step_context_with_authority(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        cancellation_token: &CancellationToken,
+        access: codex_mcp::McpAttemptAccess<'_>,
+    ) -> CodexResult<Arc<StepContext>> {
+        let work = self
+            .derive_mcp_attempt_work(access)
+            .map_err(|err| CodexErr::Fatal(err.to_string()))?;
+        self.capture_step_context_inner(
+            turn_context,
+            cancellation_token,
+            &[],
+            &HashSet::new(),
+            codex_mcp::McpAttemptAccess::from_work(work.as_deref()),
+        )
+        .await
+    }
+
     fn inherits_root_service_tier(&self, session_source: &SessionSource) -> bool {
         match &self.agent_runtime {
             crate::agent::host::AgentRuntimeServices::Controller => matches!(

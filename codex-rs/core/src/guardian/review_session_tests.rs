@@ -1934,3 +1934,41 @@ async fn guardian_turn_child_receives_the_original_loop_receipt() {
     drop(root);
     assert_eq!(counts.live.load(Ordering::SeqCst), 0);
 }
+
+#[tokio::test]
+async fn explicit_isolated_preparation_refuses_missing_or_exhausted_work_without_turn_lookup() {
+    for missing in [true, false] {
+        let (params, gate) = required_guardian_params().await;
+        gate.counts.refuse.store(true, Ordering::SeqCst);
+        let work = (!missing).then(|| {
+            Box::new(GuardianWork::new(&gate.counts))
+                as Box<dyn codex_extension_api::HostOperationWork>
+        });
+        let mut prepare = Box::pin(setup::prepare_review_with_work(params, work));
+        assert!(matches!(
+            futures::poll!(&mut prepare),
+            std::task::Poll::Ready(Err(_))
+        ));
+        drop(prepare);
+        assert_eq!(gate.counts.turns.load(Ordering::SeqCst), 0);
+        assert_eq!(gate.counts.live.load(Ordering::SeqCst), 0);
+    }
+}
+#[tokio::test]
+async fn explicit_isolated_preparation_uses_request_root_and_leaves_uncounted_projection() {
+    let (mut params, gate) = required_guardian_params().await;
+    Arc::get_mut(&mut params.parent_context.turn)
+        .unwrap()
+        .sub_id = "request-only-uninstalled".into();
+    let work = Box::new(GuardianWork::new(&gate.counts));
+    let prepared = setup::prepare_review_with_work(params, Some(work))
+        .await
+        .unwrap();
+    assert_eq!(gate.counts.turns.load(Ordering::SeqCst), 0);
+    assert_eq!(gate.counts.live.load(Ordering::SeqCst), 1);
+    assert!(gate.counts.derives.load(Ordering::SeqCst) > 0);
+    let projection = prepared.setup().projection();
+    drop(prepared);
+    assert_eq!(gate.counts.live.load(Ordering::SeqCst), 0);
+    let _key = projection.reuse_key(None);
+}

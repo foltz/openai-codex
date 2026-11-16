@@ -195,11 +195,38 @@ impl ReviewInput {
     }
 
     /// Assess the supplied request in a fresh reviewer without publishing a live approval.
+    #[cfg(test)]
     pub(super) async fn assess_isolated(
         self,
         deadline: ReviewDeadline,
         cancellation: &CancellationToken,
     ) -> Result<GuardianAssessment, GuardianReviewError> {
+        let work = self
+            .session
+            .turn_operation_work(self.context.turn())
+            .map_err(GuardianReviewError::prompt_build)?;
+        self.assess_isolated_with_work(deadline, cancellation, work)
+            .await
+    }
+
+    pub(super) async fn assess_isolated_with_work(
+        self,
+        deadline: ReviewDeadline,
+        cancellation: &CancellationToken,
+        work: Option<Box<dyn codex_extension_api::HostOperationWork>>,
+    ) -> Result<GuardianAssessment, GuardianReviewError> {
+        if work.is_none()
+            && self
+                .session
+                .services
+                .host_admission
+                .as_ref()
+                .is_some_and(|host| host.requires_account_work())
+        {
+            return Err(GuardianReviewError::prompt_build(anyhow::anyhow!(
+                "Guardian isolated review requires account work"
+            )));
+        }
         let review = async {
             let pool = self.session.guardian_review_session().ok_or_else(|| {
                 GuardianReviewError::session(anyhow::anyhow!("Guardian reviewer is unavailable"))
@@ -217,7 +244,7 @@ impl ReviewInput {
                     deadline,
                 },
             );
-            let prepared = super::review_session::prepare_review(params)
+            let prepared = super::review_session::prepare_review_with_work(params, work)
                 .await
                 .map_err(GuardianReviewError::prompt_build)?;
             Ok::<_, GuardianReviewError>(pool.review_isolated(&prepared).await.0)

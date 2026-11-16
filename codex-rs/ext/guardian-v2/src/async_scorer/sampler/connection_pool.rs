@@ -123,6 +123,8 @@ pub(super) struct ConnectionLease {
     connection: Connection,
     pool: Arc<ConnectionPool>,
     _permit: OwnedSemaphorePermit,
+    // Last field: connection and permit destruction precede terminal cleanup.
+    cleanup: Option<super::super::tasks::Continuation>,
 }
 
 impl ConnectionPool {
@@ -275,6 +277,11 @@ impl ConnectionPool {
     }
 
     pub(super) async fn lease(self: &Arc<Self>) -> Result<ConnectionLease, LunaSamplerError> {
+        // Reserve before the first semaphore, routing or transport await. A
+        // dropped response transfers this exact token, even after stop closes.
+        let cleanup = self.workers.continuation().ok_or_else(|| {
+            LunaSamplerError::Api(ApiError::Stream("classifier task owner is closed".into()))
+        })?;
         let started = Instant::now();
         let permit = Arc::clone(&self.classifications)
             .acquire_owned()
@@ -429,6 +436,7 @@ impl ConnectionPool {
             connection,
             pool: Arc::clone(self),
             _permit: permit,
+            cleanup: Some(cleanup),
         })
     }
 
@@ -674,6 +682,12 @@ impl ConnectionPool {
 }
 
 impl ConnectionLease {
+    pub(super) fn take_cleanup(&mut self) -> super::super::tasks::Continuation {
+        self.cleanup
+            .take()
+            .expect("lease cleanup transferred only once")
+    }
+
     pub(super) async fn stream_request(
         &self,
         request: &ResponsesApiRequest,

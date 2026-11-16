@@ -198,3 +198,74 @@ async fn cancellation_preserves_unused_sockets_and_backpressured_completion() ->
     server.shutdown().await;
     Ok(())
 }
+
+#[tokio::test]
+async fn shutdown_joins_response_drain_reserved_before_close() -> Result<()> {
+    let server =
+        responses::start_websocket_server_with_headers(vec![
+            responses::WebSocketConnectionConfig {
+                requests: Vec::new(),
+                response_headers: Vec::new(),
+                accept_delay: None,
+                close_after_requests: false,
+            };
+            INITIAL_WEBSOCKET_CONNECTIONS
+        ])
+        .await;
+    let sampler = LunaSampler::new(sampler_config(format!(
+        "http://{}/v1",
+        server.uri().trim_start_matches("ws://")
+    )));
+    sampler.prewarm().await;
+    *sampler.connections.retry_after.lock().unwrap() = Some(Instant::now() + CONNECT_COOLDOWN);
+    let lease = sampler.connections.lease().await?;
+    assert!(matches!(lease.connection, Connection::Websocket(_)));
+    let (send, rx_event) = tokio::sync::mpsc::channel(1);
+    let (interrupt, cancelled) = tokio::sync::oneshot::channel();
+    let stream = codex_api::ResponseStream {
+        routing_affinity: None,
+        rx_event,
+        upstream_request_id: None,
+        interrupt: Some(interrupt),
+    };
+    let mut stop = Box::pin(sampler.shutdown());
+    assert!(
+        std::future::Future::poll(
+            stop.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop())
+        )
+        .is_pending()
+    );
+    drop(PendingResponse::new(stream, lease, None));
+    assert!(matches!(cancelled.await?, ResponseInterrupt::Cancel { .. }));
+    assert!(
+        std::future::Future::poll(
+            stop.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop())
+        )
+        .is_pending()
+    );
+    drop(stop);
+    // Cancelling the stop waiter cannot abandon this same original drain.
+    let mut stop = Box::pin(sampler.shutdown());
+    assert!(
+        std::future::Future::poll(
+            stop.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop())
+        )
+        .is_pending()
+    );
+    drop(send);
+    tokio::time::timeout(Duration::from_secs(5), stop).await?;
+    assert!(
+        sampler
+            .connections
+            .idle_connections
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(sampler.connections.lease().await.is_err());
+    server.shutdown().await;
+    Ok(())
+}

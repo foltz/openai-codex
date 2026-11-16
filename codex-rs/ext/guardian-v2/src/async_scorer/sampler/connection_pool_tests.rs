@@ -1121,8 +1121,7 @@ async fn classifier_shutdown_joins_detached_refill_and_connection_opens() -> Res
 }
 #[tokio::test]
 async fn classifier_shutdown_clears_idle_and_refuses_late_connection_return() -> Result<()> {
-    let server =
-        responses::start_websocket_server_with_headers(vec![
+    let server = responses::start_websocket_server_with_headers(vec![
             responses::WebSocketConnectionConfig {
                 requests: Vec::new(),
                 response_headers: Vec::new(),
@@ -1131,7 +1130,7 @@ async fn classifier_shutdown_clears_idle_and_refuses_late_connection_return() ->
             };
             INITIAL_WEBSOCKET_CONNECTIONS
         ])
-        .await;
+    .await;
     let sampler = LunaSampler::new(sampler_config(format!(
         "http://{}/v1",
         server.uri().trim_start_matches("ws://")
@@ -1144,7 +1143,17 @@ async fn classifier_shutdown_clears_idle_and_refuses_late_connection_return() ->
     *sampler.connections.retry_after.lock().unwrap() = Some(Instant::now() + CONNECT_COOLDOWN);
     let lease = sampler.connections.lease().await?;
     assert!(matches!(lease.connection, Connection::Websocket(_)));
-    sampler.shutdown().await;
+    let mut stop = Box::pin(sampler.shutdown());
+    assert!(
+        std::future::Future::poll(
+            stop.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop()),
+        )
+        .is_pending()
+    );
+    assert!(sampler.connections.lease().await.is_err());
+    lease.reuse().await;
+    tokio::time::timeout(Duration::from_secs(5), stop).await?;
     assert!(
         sampler
             .connections
@@ -1153,7 +1162,6 @@ async fn classifier_shutdown_clears_idle_and_refuses_late_connection_return() ->
             .unwrap()
             .is_empty()
     );
-    lease.reuse().await;
     assert!(
         sampler
             .connections

@@ -186,3 +186,41 @@ async fn poisoned_classifier_registration_refuses_but_existing_tasks_still_join(
     task.await.unwrap();
     assert!(owner.runtime.tasks.is_empty());
 }
+
+#[tokio::test]
+async fn reserved_cleanup_handoff_after_close_keeps_original_terminal_token() {
+    let owner = Arc::new(ClassifierTasks::default());
+    let continuation = owner.continuation().unwrap();
+    let mut stop = Box::pin(owner.shutdown());
+    assert!(
+        Future::poll(
+            stop.as_mut(),
+            &mut Context::from_waker(std::task::Waker::noop())
+        )
+        .is_pending()
+    );
+    assert!(owner.continuation().is_none());
+    let live = Arc::new(AtomicUsize::new(0));
+    let saw = Arc::new(AtomicBool::new(false));
+    let payload = Payload::new(&owner, &live, &saw);
+    let (release, wait) = tokio::sync::oneshot::channel::<()>();
+    let cleanup = tokio::spawn(continuation.track(async move {
+        let _payload = payload;
+        wait.await.unwrap();
+    }));
+    assert!(
+        Future::poll(
+            stop.as_mut(),
+            &mut Context::from_waker(std::task::Waker::noop())
+        )
+        .is_pending()
+    );
+    assert_eq!(live.load(Ordering::SeqCst), 1);
+    release.send(()).unwrap();
+    cleanup.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), stop)
+        .await
+        .unwrap();
+    assert!(saw.load(Ordering::SeqCst));
+    assert_eq!(live.load(Ordering::SeqCst), 0);
+}

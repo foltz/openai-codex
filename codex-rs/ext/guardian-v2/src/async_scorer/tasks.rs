@@ -25,19 +25,33 @@ impl<F: Future> Future for Tracked<F> {
         self.get_mut().future.as_mut().poll(cx)
     }
 }
+// Reserved while admission is open, before transport I/O. Cleanup may use it
+// after closure without admitting a new task or releasing the original token.
+pub(super) struct Continuation {
+    terminal: Box<dyn Send + Sync>,
+}
+impl Continuation {
+    pub(super) fn track<F: Future + Send + 'static>(self, future: F) -> Tracked<F> {
+        Tracked {
+            future: Box::pin(future),
+            _terminal: self.terminal,
+        }
+    }
+}
 impl ClassifierTasks {
-    pub(super) fn track<F: Future + Send + 'static>(&self, future: F) -> Option<Tracked<F>> {
-        // Poisoned admission is closed, not permission to create new work.
+    pub(super) fn continuation(&self) -> Option<Continuation> {
         let closed = self.closed.lock().ok()?;
         if *closed {
             return None;
         }
-        // Register under the same short fence that closes admission. The token
-        // spans any gap before spawn and survives until actual payload drop.
-        Some(Tracked {
-            future: Box::pin(future),
-            _terminal: Box::new(self.runtime.tasks.token()),
+        Some(Continuation {
+            terminal: Box::new(self.runtime.tasks.token()),
         })
+    }
+
+    pub(super) fn track<F: Future + Send + 'static>(&self, future: F) -> Option<Tracked<F>> {
+        self.continuation()
+            .map(|continuation| continuation.track(future))
     }
 
     pub(super) fn spawn<F: Future<Output = ()> + Send + 'static>(

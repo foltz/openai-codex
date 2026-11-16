@@ -194,7 +194,10 @@ async fn ready_hook_derives_before_runtime_lookup_and_releases_unused_child() {
         thread_store: &thread,
     });
     assert!(matches!(
-        futures::poll!(&mut ready),
+        std::future::Future::poll(
+            ready.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop()),
+        ),
         std::task::Poll::Ready(())
     ));
     drop(ready);

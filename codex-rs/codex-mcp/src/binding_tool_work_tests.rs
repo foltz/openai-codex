@@ -1,5 +1,6 @@
 //! Prepared-call invocation custody. Local wire peer, no account/provider/OS sandbox.
 use super::*;
+use pretty_assertions::assert_eq;
 use crate::{McpAttemptAccess, McpAttemptRefused, McpAttemptRequirement, McpAttemptWork};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, ClientCapabilities, Implementation,

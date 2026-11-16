@@ -92,7 +92,7 @@ pub(super) async fn maybe_start(
         }
     };
     let base_instructions = sess.get_prompt_base_instructions().await;
-    let (prepared_input, tasks, shutdown_cancellation, launch, send) = {
+    let (prepared_input, shutdown_cancellation, launch, send) = {
         let mut state = sess.state.lock().await;
         let model_info = &step_context.settings.model_info;
         let attempt = CompactionAttempt {
@@ -128,7 +128,7 @@ pub(super) async fn maybe_start(
         state.async_compaction.last_attempt = Some(attempt);
         let (send, result) = oneshot::channel();
         state.async_compaction.result = Some(result);
-        (prepared_input, tasks, shutdown_cancellation, launch, send)
+        (prepared_input, shutdown_cancellation, launch, send)
     };
 
     // Prepare outside the lock on the foreground task so its step cannot advance before tool
@@ -138,7 +138,11 @@ pub(super) async fn maybe_start(
     let task_step = Arc::clone(step_context);
     let cutoff_world_state = Arc::clone(world_state);
     let storage_originator = AuthStorageOriginator::from_client_name(&turn_context.originator);
+    // The inner operation keeps its sticky auth-failure scope before publication.
+    let task_auth_access = auth_access.clone();
     let task = async move {
+        // Preserve launch-to-terminal TaskTracker lifetime, including panic/cancellation.
+        let _launch = launch;
         match run_background_compaction(
             &task_session,
             task_step,
@@ -146,7 +150,7 @@ pub(super) async fn maybe_start(
             phase,
             prepared_input,
             &shutdown_cancellation,
-            auth_access,
+            task_auth_access,
         )
         .await
         {
@@ -158,8 +162,15 @@ pub(super) async fn maybe_start(
             }
         }
     };
-    tasks.spawn(storage_originator.scope(task));
-    drop(launch);
+    // Managed parents register their original join before dispatch. Dropping only
+    // this observer never aborts the parent or its credential descendants.
+    match codex_model_provider::spawn_provider_task_with_access(
+        auth_access,
+        Box::pin(storage_originator.scope(task)),
+    ) {
+        Ok(observation) => drop(observation),
+        Err(error) => debug!(?error, "background compaction parent registration refused"),
+    }
 }
 
 pub(super) async fn take_ready(

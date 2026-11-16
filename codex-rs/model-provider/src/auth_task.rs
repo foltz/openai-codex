@@ -7,6 +7,8 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
+/// Cloning shares the same finite admitted root; it does not reopen admission.
+#[derive(Clone)]
 pub enum AuthTaskAccess {
     /// Existing independent callers have no managed account host.
     Ungated,

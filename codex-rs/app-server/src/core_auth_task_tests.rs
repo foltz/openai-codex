@@ -497,6 +497,15 @@ async fn actual_background_compaction_captures_work_before_originating_turn_ends
         .await??
         .forget();
     permits.close();
+    assert_eq!(
+        tasks.len(),
+        2,
+        "original background parent and held auth child"
+    );
+    assert!(
+        permits.admitted_count() >= 3,
+        "shared finite factory, parent and auth child"
+    );
     assert!(
         permits.admitted_count() > 0,
         "post-turn background work has no live originating turn to rely on"
@@ -930,5 +939,127 @@ async fn actual_stream_pump_owns_nested_auth_and_original_join(cancel: bool) -> 
     );
     assert!(held.finished.load(Ordering::SeqCst));
     assert_eq!(permits.admitted_count(), 0);
+    Ok(())
+}
+
+#[derive(Debug)]
+struct PanicInBackgroundRequest {
+    generations: std::sync::atomic::AtomicUsize,
+    entered: Semaphore,
+}
+impl codex_extension_api::ModelRequestContributor for PanicInBackgroundRequest {
+    fn request(
+        &self,
+        input: codex_extension_api::ModelRequestInput<'_>,
+    ) -> Option<Box<dyn codex_extension_api::ModelResponseInterceptor>> {
+        if input.kind == codex_extension_api::ModelRequestKind::Generation
+            && self.generations.fetch_add(1, Ordering::SeqCst) == 1
+        {
+            self.entered.add_permits(1);
+            panic!("synthetic actual background parent panic before transport");
+        }
+        None
+    }
+}
+
+#[tokio::test]
+async fn actual_background_parent_panic_is_not_clean_tracker_completion() -> anyhow::Result<()> {
+    let tasks = Arc::new(ProcessorTasks::default());
+    let permits = AccountWorkPermits::new();
+    let (_home, auth, held) = held_auth(&tasks, false).await;
+    held.armed.store(false, Ordering::SeqCst);
+    let panic = Arc::new(PanicInBackgroundRequest {
+        generations: std::sync::atomic::AtomicUsize::new(0),
+        entered: Semaphore::new(0),
+    });
+    let mut extensions = ExtensionRegistryBuilder::new();
+    extensions.turn_start_admission(Arc::new(host(&permits, Some(tasks.ticket()))));
+    extensions.turn_lifecycle_contributor(Arc::new(
+        crate::account_turn_admission::AccountTurnLifecycle,
+    ));
+    extensions.model_request_contributor(panic.clone());
+    let server = core_test_support::responses::start_mock_server().await;
+    let response = core_test_support::responses::mount_sse_once(
+        &server,
+        core_test_support::responses::sse(vec![
+            core_test_support::responses::ev_completed_with_tokens(
+                "launch-panicking-background",
+                60_000,
+            ),
+        ]),
+    )
+    .await;
+    let test = within_request(Some(permits.try_acquire().unwrap()), async {
+        core_test_support::test_codex::test_codex()
+            .with_auth_manager(auth)
+            .with_extensions(Arc::new(extensions.build()))
+            .with_config(|config| {
+                config.model = Some("gpt-5.2".into());
+                config.model_provider.supports_websockets = false;
+                config.model_context_window = Some(100_000);
+                config.model_auto_compact_token_limit = Some(90_000);
+                config.async_compaction_threshold_percent = 50;
+                config
+                    .features
+                    .enable(codex_features::Feature::AsyncCompaction)
+                    .unwrap();
+                config
+                    .features
+                    .disable(codex_features::Feature::TokenBudget)
+                    .unwrap();
+            })
+            .build_with_auto_env(&server)
+            .await
+    })
+    .await?;
+    idle_constructor(&permits, &tasks).await;
+    assert!(matches!(
+        within_request(
+            permits.try_acquire(),
+            test.codex.start_turn_if_idle(input())
+        )
+        .await?,
+        codex_core::StartIfIdleSubmission::Started { .. }
+    ));
+    core_test_support::wait_for_successful_turn(&test.codex).await;
+    tokio::time::timeout(DRAIN_DEADLINE, panic.entered.acquire())
+        .await??
+        .forget();
+    permits.close();
+    tokio::time::timeout(
+        DRAIN_DEADLINE,
+        test.codex.wait_for_background_compaction_for_test(),
+    )
+    .await?;
+    let original = tasks.observe_until(Instant::now() + DRAIN_DEADLINE).await;
+    assert!(
+        original.terminal && original.panicked && !original.is_clean(),
+        "TaskTracker drained, but the actual original parent panicked"
+    );
+    assert!(
+        tasks.observe_until(Instant::now()).await.panicked,
+        "panic survives compaction and repeated observation"
+    );
+    assert_eq!(panic.generations.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        response.requests().len(),
+        1,
+        "only foreground reached HTTP transport"
+    );
+    assert_eq!(
+        permits.admitted_count(),
+        0,
+        "no factory or parent account-work cycle"
+    );
+    assert!(
+        test.codex
+            .shutdown_and_wait_with_cleanup()
+            .await
+            .is_complete()
+    );
+    assert!(
+        !tasks.observe_until(Instant::now()).await.is_clean(),
+        "Core parent cleanup cannot erase host-owned failure"
+    );
     Ok(())
 }

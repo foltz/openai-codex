@@ -961,8 +961,8 @@ impl Session {
             }
         }
 
-        // Validate/capture the original request before any constructor await or auth work.
-        let initial_auth_access = crate::provider_auth_work::initial_access(
+        // Validate the original request before any await; auth factories are per-call.
+        crate::provider_auth_work::require_initial_work(
             initial_mcp_work.as_deref(),
             host_admission.as_deref(),
         )?;
@@ -1228,11 +1228,16 @@ impl Session {
         // - initialize thread persistence with new or resumed session info
         // - perform default shell discovery
         // - load history metadata (skipped for subagents)
-        let persistence_auth =
-            futures::FutureExt::shared(codex_model_provider::run_auth_call(initial_auth_access, {
+        let persistence_auth = futures::FutureExt::shared(codex_model_provider::run_auth_call(
+            crate::provider_auth_work::initial_access(
+                initial_mcp_work.as_deref(),
+                host_admission.as_deref(),
+            )?,
+            {
                 let auth_manager = Arc::clone(&auth_manager);
                 async move { auth_manager.auth().await }
-            }));
+            },
+        ));
         let mcp_auth = persistence_auth.clone();
         let thread_persistence_fut = async {
             if config.ephemeral {

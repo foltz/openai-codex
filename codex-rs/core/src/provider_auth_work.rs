@@ -20,10 +20,20 @@ pub(crate) fn initial_access(
     work: Option<&dyn McpAttemptWork>,
     host: Option<&dyn codex_extension_api::TurnStartAdmission>,
 ) -> Result<AuthTaskAccess> {
+    require_initial_work(work, host)?;
+    access(work)
+}
+
+/// The captured request itself spans preparation; derive an auth factory only
+/// at an actual call, so unrelated preparation holds no duplicate auth guard.
+pub(crate) fn require_initial_work(
+    work: Option<&dyn McpAttemptWork>,
+    host: Option<&dyn codex_extension_api::TurnStartAdmission>,
+) -> Result<()> {
     if work.is_none() && host.is_some_and(|host| host.requires_account_work()) {
         return Err(AuthTaskFailure::Refused.error());
     }
-    access(work)
+    Ok(())
 }
 
 /// Snapshot the exact current turn once; descendants do not look up a later turn or admit fresh work.

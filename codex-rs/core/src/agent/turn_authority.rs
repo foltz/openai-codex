@@ -98,12 +98,14 @@ pub(crate) mod tests {
         pub(crate) calls: AtomicUsize,
         pub(crate) live: Arc<AtomicUsize>,
         pub(crate) refuse_descendants: Arc<AtomicBool>,
+        pub(crate) auth: Arc<crate::thread_manager::TestAuthTasks>,
     }
 
     #[derive(Debug)]
     struct Work {
         live: Arc<AtomicUsize>,
         refuse: Arc<AtomicBool>,
+        auth: std::sync::Weak<crate::thread_manager::TestAuthTasks>,
     }
 
     impl Drop for Work {
@@ -113,6 +115,13 @@ pub(crate) mod tests {
     }
 
     impl HostOperationWork for Work {
+        fn auth_task_spawner(
+            &self,
+        ) -> Result<Arc<dyn codex_protocol::host_auth_work::AuthTaskSpawner>, TurnWorkRefused>
+        {
+            let owner = self.auth.upgrade().ok_or(TurnWorkRefused::Unavailable)?;
+            Ok(owner.spawner(self.derive_operation()?))
+        }
         fn derive_operation(&self) -> Result<Box<dyn HostOperationWork>, TurnWorkRefused> {
             if self.refuse.load(Ordering::SeqCst) {
                 return Err(TurnWorkRefused::Unavailable);
@@ -121,6 +130,7 @@ pub(crate) mod tests {
             Ok(Box::new(Self {
                 live: Arc::clone(&self.live),
                 refuse: Arc::clone(&self.refuse),
+                auth: self.auth.clone(),
             }))
         }
         fn derive_turn_work(
@@ -163,6 +173,7 @@ pub(crate) mod tests {
             Ok(Some(Box::new(Work {
                 live: Arc::clone(&self.live),
                 refuse: Arc::clone(&self.refuse_descendants),
+                auth: Arc::downgrade(&self.auth),
             })))
         }
     }
@@ -175,6 +186,7 @@ pub(crate) mod tests {
             calls: AtomicUsize::new(0),
             live: Arc::new(AtomicUsize::new(0)),
             refuse_descendants: Arc::new(AtomicBool::new(false)),
+            auth: Arc::new(crate::thread_manager::TestAuthTasks::default()),
         });
         session.services.host_admission = Some(gate.clone());
         (Arc::new(session), gate)

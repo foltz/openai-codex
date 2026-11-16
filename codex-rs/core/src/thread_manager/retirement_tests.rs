@@ -4,6 +4,136 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+// Test-only original-task owner for unrelated constructor fixtures. Work and
+// factories carry weak tickets, never the owner whose ledger retains them.
+type FixtureAuthResult = std::result::Result<(), codex_protocol::host_auth_work::AuthTaskFailure>;
+type FixtureAuthReceipt =
+    futures::future::Shared<futures::future::BoxFuture<'static, FixtureAuthResult>>;
+#[derive(Clone)]
+struct FixtureAuthEntry {
+    receipt: FixtureAuthReceipt,
+    abort: tokio::task::AbortHandle,
+}
+#[derive(Default)]
+struct FixtureAuthState {
+    originals: Vec<FixtureAuthEntry>,
+    failure: Option<codex_protocol::host_auth_work::AuthTaskFailure>,
+}
+#[derive(Default)]
+pub(crate) struct TestAuthTasks {
+    state: std::sync::Mutex<FixtureAuthState>,
+}
+impl std::fmt::Debug for TestAuthTasks {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("TestAuthTasks")
+    }
+}
+impl TestAuthTasks {
+    pub(crate) fn spawner(
+        self: &Arc<Self>,
+        work: Box<dyn codex_extension_api::HostOperationWork>,
+    ) -> Arc<dyn codex_protocol::host_auth_work::AuthTaskSpawner> {
+        Arc::new(FixtureAuthSpawner {
+            owner: Arc::downgrade(self),
+            work,
+        })
+    }
+    fn register(
+        &self,
+        future: codex_protocol::host_auth_work::AuthTaskFuture,
+    ) -> std::result::Result<
+        codex_protocol::host_auth_work::AuthTaskObservation,
+        codex_protocol::host_auth_work::AuthTaskFailure,
+    > {
+        use codex_protocol::host_auth_work::AuthTaskFailure;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| AuthTaskFailure::Unavailable)?;
+        let (start, started) = tokio::sync::oneshot::channel();
+        let original = tokio::spawn(async move {
+            if started.await.is_ok() {
+                future.await;
+            }
+        });
+        let abort = original.abort_handle();
+        let receipt = futures::FutureExt::shared(futures::FutureExt::boxed(async move {
+            match original.await {
+                Ok(()) => Ok(()),
+                Err(error) if error.is_cancelled() => Err(AuthTaskFailure::Cancelled),
+                Err(_) => Err(AuthTaskFailure::Panicked),
+            }
+        }));
+        state.originals.push(FixtureAuthEntry {
+            receipt: receipt.clone(),
+            abort,
+        });
+        drop(state);
+        // No body can poll before its original is retained by the external owner.
+        start.send(()).map_err(|_| AuthTaskFailure::Unavailable)?;
+        Ok(Box::pin(receipt))
+    }
+    pub(crate) async fn drain(&self) -> FixtureAuthResult {
+        use codex_protocol::host_auth_work::AuthTaskFailure;
+        loop {
+            let originals = {
+                let state = self
+                    .state
+                    .lock()
+                    .map_err(|_| AuthTaskFailure::Unavailable)?;
+                if state.originals.is_empty() {
+                    return state.failure.map_or(Ok(()), Err);
+                }
+                state.originals.clone()
+            };
+            for original in originals {
+                if let Err(reason) = original.receipt.await {
+                    self.state
+                        .lock()
+                        .map_err(|_| AuthTaskFailure::Unavailable)?
+                        .failure
+                        .get_or_insert(reason);
+                }
+            }
+            // Cancellation of this drain drops only clones, not the original ledger.
+            self.state
+                .lock()
+                .map_err(|_| AuthTaskFailure::Unavailable)?
+                .originals
+                .retain(|entry| entry.receipt.peek().is_none());
+        }
+    }
+}
+struct FixtureAuthSpawner {
+    owner: std::sync::Weak<TestAuthTasks>,
+    work: Box<dyn codex_extension_api::HostOperationWork>,
+}
+impl std::fmt::Debug for FixtureAuthSpawner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("FixtureAuthSpawner")
+    }
+}
+impl codex_protocol::host_auth_work::AuthTaskSpawner for FixtureAuthSpawner {
+    fn spawn(
+        &self,
+        future: codex_protocol::host_auth_work::AuthTaskFuture,
+    ) -> std::result::Result<
+        codex_protocol::host_auth_work::AuthTaskObservation,
+        codex_protocol::host_auth_work::AuthTaskFailure,
+    > {
+        use codex_protocol::host_auth_work::AuthTaskFailure;
+        let owner = self.owner.upgrade().ok_or(AuthTaskFailure::Unavailable)?;
+        let work = self
+            .work
+            .derive_operation()
+            .map_err(|_| AuthTaskFailure::Refused)?;
+        owner.register(Box::pin(async move {
+            let _work = work;
+            future.await;
+        }))
+    }
+}
+
 #[tokio::test]
 async fn cancelled_constructor_observer_preserves_original_until_drain() {
     let owner = ThreadConstructions::default();
@@ -1543,6 +1673,7 @@ async fn real_account_constructor_case(explicit: bool, hold_mcp: bool) {
     use crate::thread_manager::ThreadManager;
     #[derive(Debug, Default)]
     struct RequestHost {
+        auth: std::sync::Weak<TestAuthTasks>,
         request_alive: std::sync::atomic::AtomicBool,
         operations: AtomicUsize,
         request_derivations: AtomicUsize,
@@ -1557,6 +1688,19 @@ async fn real_account_constructor_case(explicit: bool, hold_mcp: bool) {
         }
     }
     impl codex_extension_api::HostOperationWork for ConstructionWork {
+        fn auth_task_spawner(
+            &self,
+        ) -> Result<
+            Arc<dyn codex_protocol::host_auth_work::AuthTaskSpawner>,
+            codex_extension_api::TurnWorkRefused,
+        > {
+            let owner = self
+                .0
+                .auth
+                .upgrade()
+                .ok_or(codex_extension_api::TurnWorkRefused::Unavailable)?;
+            Ok(owner.spawner(self.derive_operation()?))
+        }
         fn derive_operation(
             &self,
         ) -> Result<
@@ -1654,7 +1798,11 @@ async fn real_account_constructor_case(explicit: bool, hold_mcp: bool) {
     Arc::get_mut(&mut manager.state)
         .expect("builders retain unique State")
         .user_instructions_provider = provider.clone();
-    let host = Arc::new(RequestHost::default());
+    let auth_owner = Arc::new(TestAuthTasks::default());
+    let host = Arc::new(RequestHost {
+        auth: Arc::downgrade(&auth_owner),
+        ..Default::default()
+    });
     host.request_alive.store(true, Ordering::SeqCst);
     let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
     extensions.turn_start_admission(Arc::new(ConstructionAdmission(Arc::clone(&host))));
@@ -1731,6 +1879,7 @@ async fn real_account_constructor_case(explicit: bool, hold_mcp: bool) {
     })
     .await
     .expect("abandoned constructor completes before retirement");
+    auth_owner.drain().await.unwrap();
     assert_eq!(host.operations.load(Ordering::SeqCst), 0);
     if let Some(release) = instruction_release {
         assert!(
@@ -1811,6 +1960,7 @@ tokio::task_local! {
 
 #[derive(Debug)]
 struct ManagedRequestHost {
+    auth: std::sync::Weak<TestAuthTasks>,
     required: bool,
     produce_work: bool,
     refuse: bool,
@@ -1828,6 +1978,19 @@ impl Drop for ManagedRequestWork {
 }
 
 impl codex_extension_api::HostOperationWork for ManagedRequestWork {
+    fn auth_task_spawner(
+        &self,
+    ) -> Result<
+        Arc<dyn codex_protocol::host_auth_work::AuthTaskSpawner>,
+        codex_extension_api::TurnWorkRefused,
+    > {
+        let owner = self
+            .0
+            .auth
+            .upgrade()
+            .ok_or(codex_extension_api::TurnWorkRefused::Unavailable)?;
+        Ok(owner.spawner(self.derive_operation()?))
+    }
     fn derive_operation(
         &self,
     ) -> Result<Box<dyn codex_extension_api::HostOperationWork>, codex_extension_api::TurnWorkRefused>
@@ -1891,7 +2054,9 @@ async fn managed_account_capture_case(explicit: bool, required: bool) {
     use crate::thread_manager::StartThreadOptions;
     let (_home, mut manager, mut config) = expiry_manager(/*ephemeral*/ true).await;
     let mut mcp = HeldRequiredMcp::install(&mut config).await;
+    let auth_owner = Arc::new(TestAuthTasks::default());
     let host = Arc::new(ManagedRequestHost {
+        auth: Arc::downgrade(&auth_owner),
         required,
         produce_work: required,
         refuse: false,
@@ -1936,6 +2101,7 @@ async fn managed_account_capture_case(explicit: bool, required: bool) {
     tokio::time::timeout(Duration::from_secs(20), tasks.wait())
         .await
         .expect("managed original drains");
+    auth_owner.drain().await.unwrap();
     assert_eq!(host.operations.load(Ordering::SeqCst), 0);
     assert_eq!(host.lookups.load(Ordering::SeqCst), usize::from(!explicit));
     assert!(manager.state.threads.read().await.is_empty());
@@ -1961,7 +2127,9 @@ async fn managed_constructor_preserves_ungated_empty_capture_without_rediscovery
 async fn managed_account_refusal_case(refuse: bool) {
     use crate::thread_manager::StartThreadOptions;
     let (_home, mut manager, config) = expiry_manager(/*ephemeral*/ true).await;
+    let auth_owner = Arc::new(TestAuthTasks::default());
     let host = Arc::new(ManagedRequestHost {
+        auth: Arc::downgrade(&auth_owner),
         required: true,
         produce_work: true,
         refuse,
@@ -2052,6 +2220,7 @@ async fn agent_constructor_retains_exact_parent_work_across_held_mcp_and_caller_
     })
     .await
     .expect("agent original releases counted work");
+    gate.auth.drain().await.unwrap();
     assert_eq!(gate.live.load(Ordering::SeqCst), 0);
     assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
     assert!(manager.state.threads.read().await.is_empty());
@@ -2172,7 +2341,9 @@ impl codex_extension_api::ThreadLifecycleContributor<crate::config::Config>
 async fn managed_constructor_carries_explicit_work_into_ready_callbacks_without_rediscovery() {
     use crate::thread_manager::StartThreadOptions;
     let (_home, mut manager, config) = expiry_manager(true).await;
+    let auth_owner = Arc::new(TestAuthTasks::default());
     let host = Arc::new(ManagedRequestHost {
+        auth: Arc::downgrade(&auth_owner),
         required: true,
         produce_work: true,
         refuse: false,
@@ -2211,6 +2382,7 @@ async fn managed_constructor_carries_explicit_work_into_ready_callbacks_without_
             .await
             .unwrap();
     }
+    auth_owner.drain().await.unwrap();
     assert_eq!(host.operations.load(Ordering::SeqCst), 0);
     thread.thread.shutdown_and_wait().await.unwrap();
     tasks.close();
@@ -2244,7 +2416,9 @@ impl codex_extension_api::ThreadLifecycleContributor<crate::config::Config>
 async fn resumed_constructor_keeps_explicit_work_with_emitted_or_deferred_ready() {
     for defer_ready in [false, true] {
         let (_home, mut manager, config) = expiry_manager(true).await;
+        let auth_owner = Arc::new(TestAuthTasks::default());
         let host = Arc::new(ManagedRequestHost {
+            auth: Arc::downgrade(&auth_owner),
             required: true,
             produce_work: true,
             refuse: false,
@@ -2292,6 +2466,7 @@ async fn resumed_constructor_keeps_explicit_work_with_emitted_or_deferred_ready(
                 .await
                 .unwrap();
         }
+        auth_owner.drain().await.unwrap();
         assert_eq!(host.operations.load(Ordering::SeqCst), 0);
         thread.thread.shutdown_and_wait().await.unwrap();
     }
@@ -2301,7 +2476,9 @@ async fn resumed_constructor_keeps_explicit_work_with_emitted_or_deferred_ready(
 async fn manager_request_capture_uses_original_scope_and_retains_no_idle_lease() {
     let (_home, mut manager, _) = expiry_manager(true).await;
     assert!(manager.capture_request_operation_work().unwrap().is_none());
+    let auth_owner = Arc::new(TestAuthTasks::default());
     let host = Arc::new(ManagedRequestHost {
+        auth: Arc::downgrade(&auth_owner),
         required: true,
         produce_work: true,
         refuse: false,
@@ -2326,7 +2503,9 @@ async fn manager_request_capture_uses_original_scope_and_retains_no_idle_lease()
     drop(child);
     assert_eq!(host.operations.load(Ordering::SeqCst), 0);
     for (required, refuse) in [(true, true), (true, false), (false, false)] {
+        let auth_owner = Arc::new(TestAuthTasks::default());
         let host = Arc::new(ManagedRequestHost {
+            auth: Arc::downgrade(&auth_owner),
             required,
             produce_work: false,
             refuse,
@@ -2346,4 +2525,141 @@ async fn manager_request_capture_uses_original_scope_and_retains_no_idle_lease()
         assert_eq!(host.lookups.load(Ordering::SeqCst), 1);
         assert_eq!(host.operations.load(Ordering::SeqCst), 0);
     }
+}
+
+#[derive(Debug)]
+struct FixtureAuthWork(Arc<AtomicUsize>);
+impl Drop for FixtureAuthWork {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+impl codex_extension_api::HostOperationWork for FixtureAuthWork {
+    fn derive_operation(
+        &self,
+    ) -> Result<Box<dyn codex_extension_api::HostOperationWork>, codex_extension_api::TurnWorkRefused>
+    {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(Self(self.0.clone())))
+    }
+    fn derive_turn_work(
+        &self,
+        _: &codex_extension_api::ExtensionData,
+        _: codex_extension_api::ExtensionFuture<'static, ()>,
+    ) -> Result<
+        Box<dyn codex_protocol::host_turn_work::HostTurnWork>,
+        codex_extension_api::TurnWorkRefused,
+    > {
+        Err(codex_extension_api::TurnWorkRefused::Unavailable)
+    }
+}
+fn fixture_auth_spawner(
+    owner: &Arc<TestAuthTasks>,
+) -> (
+    Arc<AtomicUsize>,
+    Arc<dyn codex_protocol::host_auth_work::AuthTaskSpawner>,
+) {
+    let count = Arc::new(AtomicUsize::new(1));
+    let spawner = owner.spawner(Box::new(FixtureAuthWork(count.clone())));
+    (count, spawner)
+}
+#[tokio::test]
+async fn auth_fixture_observer_drop_keeps_original_and_work() {
+    let owner = Arc::new(TestAuthTasks::default());
+    let (count, spawner) = fixture_auth_spawner(&owner);
+    let (send, receive) = oneshot::channel();
+    let observation = spawner
+        .spawn(Box::pin(async move {
+            receive.await.unwrap();
+        }))
+        .unwrap();
+    drop(spawner);
+    drop(observation);
+    let mut drain = Box::pin(owner.drain());
+    assert!(futures::poll!(drain.as_mut()).is_pending());
+    drop(drain);
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    send.send(()).unwrap();
+    owner.drain().await.unwrap();
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+}
+#[tokio::test]
+async fn auth_fixture_registration_precedes_body_poll() {
+    let owner = Arc::new(TestAuthTasks::default());
+    let (_, spawner) = fixture_auth_spawner(&owner);
+    let weak = Arc::downgrade(&owner);
+    spawner
+        .spawn(Box::pin(async move {
+            assert_eq!(
+                weak.upgrade()
+                    .unwrap()
+                    .state
+                    .lock()
+                    .unwrap()
+                    .originals
+                    .len(),
+                1
+            );
+        }))
+        .unwrap()
+        .await
+        .unwrap();
+    owner.drain().await.unwrap();
+}
+#[tokio::test]
+async fn auth_fixture_factory_cannot_keep_owner_alive_or_poll_after_retirement() {
+    let owner = Arc::new(TestAuthTasks::default());
+    let (count, spawner) = fixture_auth_spawner(&owner);
+    let weak = Arc::downgrade(&owner);
+    drop(owner);
+    assert!(weak.upgrade().is_none());
+    let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let child = polled.clone();
+    assert!(matches!(
+        spawner.spawn(Box::pin(async move {
+            child.store(true, Ordering::SeqCst);
+        })),
+        Err(codex_protocol::host_auth_work::AuthTaskFailure::Unavailable)
+    ));
+    assert!(!polled.load(Ordering::SeqCst));
+    drop(spawner);
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+}
+#[tokio::test]
+async fn auth_fixture_original_panic_is_sticky() {
+    let owner = Arc::new(TestAuthTasks::default());
+    let (_, spawner) = fixture_auth_spawner(&owner);
+    let observation = spawner
+        .spawn(Box::pin(async {
+            panic!("synthetic fixture original panic");
+        }))
+        .unwrap();
+    assert_eq!(
+        observation.await,
+        Err(codex_protocol::host_auth_work::AuthTaskFailure::Panicked)
+    );
+    assert_eq!(
+        owner.drain().await,
+        Err(codex_protocol::host_auth_work::AuthTaskFailure::Panicked)
+    );
+    assert_eq!(
+        owner.drain().await,
+        Err(codex_protocol::host_auth_work::AuthTaskFailure::Panicked)
+    );
+}
+#[tokio::test]
+async fn auth_fixture_original_cancellation_is_not_success() {
+    let owner = Arc::new(TestAuthTasks::default());
+    let (_, spawner) = fixture_auth_spawner(&owner);
+    let observation = spawner.spawn(Box::pin(std::future::pending())).unwrap();
+    // Only this synthetic pending unit is aborted, never a credential call.
+    owner.state.lock().unwrap().originals[0].abort.abort();
+    assert_eq!(
+        observation.await,
+        Err(codex_protocol::host_auth_work::AuthTaskFailure::Cancelled)
+    );
+    assert_eq!(
+        owner.drain().await,
+        Err(codex_protocol::host_auth_work::AuthTaskFailure::Cancelled)
+    );
 }

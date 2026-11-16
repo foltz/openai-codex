@@ -5,6 +5,8 @@ pub(crate) use account_work::CapturedConstructionWork;
 mod managed;
 mod model_catalog;
 mod retirement;
+#[cfg(test)]
+pub(crate) use retirement::tests::TestAuthTasks;
 mod shared_instructions;
 mod shutdown;
 

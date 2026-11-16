@@ -22,9 +22,19 @@ pub enum PluginInstallError {
 
     #[error("failed to join plugin install task: {0}")]
     Join(#[from] tokio::task::JoinError),
+
+    #[error("plugin operation task custody failed: {0:?}")]
+    Custody(codex_model_provider::AuthTaskFailure),
 }
 
 impl PluginInstallError {
+    pub(super) fn blocking(error: codex_model_provider::AuthBlockingCallError) -> Self {
+        match error {
+            codex_model_provider::AuthBlockingCallError::Join(error) => Self::join(error),
+            codex_model_provider::AuthBlockingCallError::Custody(failure) => Self::Custody(failure),
+        }
+    }
+
     pub(super) fn join(source: tokio::task::JoinError) -> Self {
         Self::Join(source)
     }
@@ -49,6 +59,7 @@ impl PluginInstallError {
             Self::Store(err) => err.sub_error_type(),
             Self::Config(_) => Some("failed_to_enable_plugin".to_string()),
             Self::Join(_) => Some("plugin_install_task_failed".to_string()),
+            Self::Custody(_) => Some("plugin_install_task_custody_failed".to_string()),
         }
     }
 }
@@ -60,6 +71,7 @@ pub(super) fn plugin_install_error_type(err: &PluginInstallError) -> &'static st
         PluginInstallError::Store(err) => plugin_store_error_type(err),
         PluginInstallError::Config(_) => "config",
         PluginInstallError::Join(_) => "join",
+        PluginInstallError::Custody(_) => "custody",
     }
 }
 
@@ -129,14 +141,52 @@ pub enum PluginUninstallError {
 
     #[error("failed to join plugin uninstall task: {0}")]
     Join(#[from] tokio::task::JoinError),
+
+    #[error("plugin operation task custody failed: {0:?}")]
+    Custody(codex_model_provider::AuthTaskFailure),
 }
 
 impl PluginUninstallError {
+    pub(super) fn blocking(error: codex_model_provider::AuthBlockingCallError) -> Self {
+        match error {
+            codex_model_provider::AuthBlockingCallError::Join(error) => Self::join(error),
+            codex_model_provider::AuthBlockingCallError::Custody(failure) => Self::Custody(failure),
+        }
+    }
+
     pub(super) fn join(source: tokio::task::JoinError) -> Self {
         Self::Join(source)
     }
 
     pub fn is_invalid_request(&self) -> bool {
         matches!(self, Self::InvalidPluginId(_))
+    }
+}
+
+#[cfg(test)]
+mod custody_tests {
+    use super::*;
+    #[test]
+    fn custody_failures_are_internal_not_invalid_plugin_requests() {
+        for failure in [
+            codex_model_provider::AuthTaskFailure::Refused,
+            codex_model_provider::AuthTaskFailure::Unavailable,
+            codex_model_provider::AuthTaskFailure::Cancelled,
+            codex_model_provider::AuthTaskFailure::Panicked,
+        ] {
+            let install = PluginInstallError::blocking(
+                codex_model_provider::AuthBlockingCallError::Custody(failure),
+            );
+            assert!(!install.is_invalid_request());
+            assert_eq!(plugin_install_error_type(&install), "custody");
+            assert_eq!(
+                install.sub_error_type().as_deref(),
+                Some("plugin_install_task_custody_failed")
+            );
+            let uninstall = PluginUninstallError::blocking(
+                codex_model_provider::AuthBlockingCallError::Custody(failure),
+            );
+            assert!(!uninstall.is_invalid_request());
+        }
     }
 }

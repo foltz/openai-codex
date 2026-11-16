@@ -3,6 +3,9 @@
 use std::future::Future;
 use std::pin::Pin;
 
+/// A physical synchronous original. Its output stays in a private caller channel.
+pub type AuthTaskBlocking = Box<dyn FnOnce() + Send + 'static>;
+
 pub type AuthTaskFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 pub type AuthTaskObservation =
     Pin<Box<dyn Future<Output = std::result::Result<(), AuthTaskFailure>> + Send + 'static>>;
@@ -27,4 +30,40 @@ pub trait AuthTaskSpawner: std::fmt::Debug + Send + Sync {
         &self,
         task: AuthTaskFuture,
     ) -> std::result::Result<AuthTaskObservation, AuthTaskFailure>;
+    /// Derive and register BEFORE the physical blocking task is dispatched.
+    /// Never implement this as an abortable async wrapper around an unowned
+    /// blocking join. Unsupported hosts must refuse without invoking the body.
+    fn spawn_blocking(
+        &self,
+        task: AuthTaskBlocking,
+    ) -> std::result::Result<AuthTaskObservation, AuthTaskFailure> {
+        drop(task);
+        Err(AuthTaskFailure::Unavailable)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn legacy_host_refuses_physical_blocking_custody_without_invoking_body() {
+        #[derive(Debug)]
+        struct Legacy;
+        impl AuthTaskSpawner for Legacy {
+            fn spawn(&self, _: AuthTaskFuture) -> Result<AuthTaskObservation, AuthTaskFailure> {
+                Err(AuthTaskFailure::Refused)
+            }
+        }
+        let polled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let invoked = polled.clone();
+        assert_eq!(
+            Legacy
+                .spawn_blocking(Box::new(
+                    move || invoked.store(true, std::sync::atomic::Ordering::SeqCst)
+                ))
+                .err(),
+            Some(AuthTaskFailure::Unavailable)
+        );
+        assert!(!polled.load(std::sync::atomic::Ordering::SeqCst));
+    }
 }

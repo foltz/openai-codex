@@ -2,7 +2,8 @@
 use crate::processor_task_retirement::{ProcessorTaskJoin, ProcessorTaskTicket, ProcessorTasks};
 use codex_extension_api::HostOperationWork;
 use codex_model_provider::{
-    AuthTaskAccess, AuthTaskFailure, AuthTaskFuture, AuthTaskObservation, AuthTaskSpawner,
+    AuthTaskAccess, AuthTaskBlocking, AuthTaskFailure, AuthTaskFuture, AuthTaskObservation,
+    AuthTaskSpawner,
 };
 use std::future::Future;
 use std::sync::Arc;
@@ -30,6 +31,31 @@ impl AuthTaskSpawner for CatalogAuthTasks {
             .spawn(async move {
                 let _work = work;
                 future.await;
+            })
+            .map_err(|_| AuthTaskFailure::Unavailable)?;
+        Ok(Box::pin(async move {
+            match receipt.await {
+                ProcessorTaskJoin::Joined => Ok(()),
+                ProcessorTaskJoin::Cancelled => Err(AuthTaskFailure::Cancelled),
+                ProcessorTaskJoin::Panicked => Err(AuthTaskFailure::Panicked),
+            }
+        }))
+    }
+    fn spawn_blocking(
+        &self,
+        task: AuthTaskBlocking,
+    ) -> Result<AuthTaskObservation, AuthTaskFailure> {
+        let work = self
+            .work
+            .as_deref()
+            .map(|work| work.derive_operation())
+            .transpose()
+            .map_err(|_| AuthTaskFailure::Refused)?;
+        let receipt = self
+            .ticket
+            .spawn_blocking(move || {
+                let _work = work;
+                task();
             })
             .map_err(|_| AuthTaskFailure::Unavailable)?;
         Ok(Box::pin(async move {

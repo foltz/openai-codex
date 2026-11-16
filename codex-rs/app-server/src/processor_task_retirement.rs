@@ -96,6 +96,17 @@ impl ProcessorTaskTicket {
             .ok_or(ProcessorTaskAdmissionError::Unavailable)?;
         ProcessorTasks { state }.spawn(future)
     }
+
+    pub(crate) fn spawn_blocking(
+        &self,
+        task: impl FnOnce() + Send + 'static,
+    ) -> Result<Receipt, ProcessorTaskAdmissionError> {
+        let state = self
+            .state
+            .upgrade()
+            .ok_or(ProcessorTaskAdmissionError::Unavailable)?;
+        ProcessorTasks { state }.spawn_blocking(task)
+    }
 }
 
 impl ProcessorTasks {
@@ -118,6 +129,36 @@ impl ProcessorTasks {
         future: impl Future<Output = ()> + Send + 'static,
     ) -> Result<Receipt, ProcessorTaskAdmissionError> {
         self.spawn_inner(future, false)
+    }
+
+    /// Retain the actual blocking JoinHandle. Cancelling an observer cannot
+    /// release work captured by a body that is still physically running.
+    pub(crate) fn spawn_blocking(
+        &self,
+        task: impl FnOnce() + Send + 'static,
+    ) -> Result<Receipt, ProcessorTaskAdmissionError> {
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|_| ProcessorTaskAdmissionError::Unavailable)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ProcessorTaskAdmissionError::Unavailable)?;
+        if state.closed {
+            return Err(ProcessorTaskAdmissionError::Closed);
+        }
+        state.compact();
+        let original = runtime.spawn_blocking(task);
+        let receipt = async move {
+            match original.await {
+                Ok(()) => ProcessorTaskJoin::Joined,
+                Err(error) if error.is_cancelled() => ProcessorTaskJoin::Cancelled,
+                Err(_) => ProcessorTaskJoin::Panicked,
+            }
+        }
+        .boxed()
+        .shared();
+        state.tasks.push(receipt.clone());
+        Ok(receipt)
     }
 
     pub(crate) fn spawn_unverified(

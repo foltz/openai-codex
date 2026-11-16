@@ -2,8 +2,10 @@ mod amazon_bedrock;
 mod auth;
 mod auth_task;
 pub use auth_task::{
-    AuthTaskAccess, AuthTaskFailure, AuthTaskFuture, AuthTaskObservation, AuthTaskSpawner,
-    run_auth_call, spawn_provider_task, spawn_provider_task_with_access, with_auth_task_scope,
+    AuthBlockingCallError, AuthTaskAccess, AuthTaskBlocking, AuthTaskFailure, AuthTaskFuture,
+    AuthTaskObservation, AuthTaskSpawner, run_auth_call, run_blocking_call,
+    run_blocking_call_with_scope, spawn_provider_task, spawn_provider_task_with_access,
+    with_auth_task_scope,
 };
 mod bearer_auth_provider;
 mod capabilities;

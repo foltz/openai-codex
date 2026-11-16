@@ -1438,3 +1438,367 @@ async fn actual_recommendation_original_survives_constructor_retirement(
     assert_eq!(permits.admitted_count(), 0);
     Ok(())
 }
+
+#[tokio::test]
+async fn actual_blocking_work_remains_counted_after_caller_abort_and_owner_close() {
+    let tasks = Arc::new(ProcessorTasks::default());
+    let permits = AccountWorkPermits::new();
+    let operation = host(&permits, Some(tasks.ticket()))
+        .admit_operation_work()
+        .unwrap()
+        .unwrap();
+    let spawner = operation.auth_task_spawner().unwrap();
+    drop(operation);
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let finished = Arc::new(AtomicBool::new(false));
+    let done = finished.clone();
+    let caller = tokio::spawn(codex_model_provider::with_auth_task_scope(
+        codex_model_provider::AuthTaskAccess::Admitted(spawner),
+        async move {
+            codex_model_provider::run_blocking_call(move || {
+                entered.send(()).unwrap();
+                released.recv().unwrap();
+                done.store(true, Ordering::SeqCst);
+                9
+            })
+            .await
+        },
+    ));
+    tokio::time::timeout(DRAIN_DEADLINE, started)
+        .await
+        .unwrap()
+        .unwrap();
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    permits.close();
+    assert!(permits.admitted_count() > 0);
+    assert_eq!(tasks.pending_len_for_test(), 1);
+    let first = tasks.shutdown_until(Instant::now()).await;
+    assert!(!first.terminal && !finished.load(Ordering::SeqCst));
+    release.send(()).unwrap();
+    tokio::time::timeout(DRAIN_DEADLINE, async {
+        loop {
+            let report = tasks.shutdown_until(Instant::now()).await;
+            if report.terminal {
+                assert!(report.is_clean());
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(finished.load(Ordering::SeqCst));
+    assert_eq!(permits.admitted_count(), 0);
+}
+
+#[tokio::test]
+async fn actual_blocking_scope_transfers_nested_auth_original_after_parent_returns() {
+    let tasks = ProcessorTasks::default();
+    let permits = AccountWorkPermits::new();
+    let operation = host(&permits, Some(tasks.ticket()))
+        .admit_operation_work()
+        .unwrap()
+        .unwrap();
+    let spawner = operation.auth_task_spawner().unwrap();
+    drop(operation);
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let value = codex_model_provider::with_auth_task_scope(
+        codex_model_provider::AuthTaskAccess::Admitted(spawner),
+        async move {
+            codex_model_provider::run_blocking_call(move || {
+                let observation = codex_model_provider::spawn_provider_task(Box::pin(async move {
+                    entered.send(()).unwrap();
+                    released.await.unwrap();
+                }))
+                .unwrap();
+                assert!(observation.is_some());
+                drop(observation);
+                21
+            })
+            .await
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(value, 21);
+    tokio::time::timeout(DRAIN_DEADLINE, started)
+        .await
+        .unwrap()
+        .unwrap();
+    permits.close();
+    assert!(permits.admitted_count() > 0);
+    assert_eq!(tasks.pending_len_for_test(), 1);
+    assert!(!tasks.observe_until(Instant::now()).await.terminal);
+    release.send(()).unwrap();
+    assert!(
+        tasks
+            .shutdown_until(Instant::now() + DRAIN_DEADLINE)
+            .await
+            .is_clean()
+    );
+    assert_eq!(permits.admitted_count(), 0);
+}
+
+#[tokio::test]
+async fn actual_blocking_closed_registration_refuses_body_without_fresh_work() {
+    let tasks = ProcessorTasks::default();
+    let permits = AccountWorkPermits::new();
+    let operation = host(&permits, Some(tasks.ticket()))
+        .admit_operation_work()
+        .unwrap()
+        .unwrap();
+    let spawner = operation.auth_task_spawner().unwrap();
+    drop(operation);
+    tasks.close_registration().unwrap();
+    permits.close();
+    let polled = Arc::new(AtomicBool::new(false));
+    let invoked = polled.clone();
+    let result = codex_model_provider::with_auth_task_scope(
+        codex_model_provider::AuthTaskAccess::Admitted(spawner),
+        async move {
+            let _ = codex_model_provider::run_blocking_call(move || {
+                invoked.store(true, Ordering::SeqCst)
+            })
+            .await;
+        },
+    )
+    .await;
+    assert!(result.is_err());
+    assert!(!polled.load(Ordering::SeqCst));
+    assert_eq!(permits.admitted_count(), 0);
+    assert!(tasks.shutdown_until(Instant::now()).await.is_clean());
+}
+
+#[tokio::test]
+async fn actual_blocking_panic_releases_work_but_never_reports_clean_retirement() {
+    let tasks = ProcessorTasks::default();
+    let permits = AccountWorkPermits::new();
+    let operation = host(&permits, Some(tasks.ticket()))
+        .admit_operation_work()
+        .unwrap()
+        .unwrap();
+    let spawner = operation.auth_task_spawner().unwrap();
+    drop(operation);
+    let result = codex_model_provider::with_auth_task_scope(
+        codex_model_provider::AuthTaskAccess::Admitted(spawner),
+        async {
+            codex_model_provider::run_blocking_call(|| -> () {
+                panic!("synthetic actual counted blocking panic");
+            })
+            .await
+        },
+    )
+    .await;
+    assert!(result.is_err());
+    assert_eq!(permits.admitted_count(), 0);
+    let report = tasks.shutdown_until(Instant::now()).await;
+    assert!(report.terminal && report.panicked && !report.is_clean());
+}
+
+#[tokio::test]
+async fn actual_blocking_nonsend_scope_drop_stays_inside_finite_auth_context() {
+    struct ScopeExit {
+        dropped: Arc<AtomicBool>,
+        entered: Option<tokio::sync::oneshot::Sender<()>>,
+        release: Option<tokio::sync::oneshot::Receiver<()>>,
+        _not_send: std::rc::Rc<()>,
+    }
+    impl Drop for ScopeExit {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+            let entered = self.entered.take().unwrap();
+            let release = self.release.take().unwrap();
+            assert!(tokio::runtime::Handle::try_current().is_ok());
+            assert!(
+                codex_model_provider::spawn_provider_task(Box::pin(async move {
+                    entered.send(()).unwrap();
+                    release.await.unwrap();
+                }))
+                .unwrap()
+                .is_some()
+            );
+        }
+    }
+    let tasks = ProcessorTasks::default();
+    let permits = AccountWorkPermits::new();
+    let operation = host(&permits, Some(tasks.ticket()))
+        .admit_operation_work()
+        .unwrap()
+        .unwrap();
+    let spawner = operation.auth_task_spawner().unwrap();
+    drop(operation);
+    let dropped = Arc::new(AtomicBool::new(false));
+    let scoped = dropped.clone();
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let value = codex_model_provider::with_auth_task_scope(
+        codex_model_provider::AuthTaskAccess::Admitted(spawner),
+        async move {
+            codex_model_provider::run_blocking_call_with_scope(
+                move || ScopeExit {
+                    dropped: scoped,
+                    entered: Some(entered),
+                    release: Some(released),
+                    _not_send: std::rc::Rc::new(()),
+                },
+                || 33,
+            )
+            .await
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(value, 33);
+    assert!(dropped.load(Ordering::SeqCst));
+    tokio::time::timeout(DRAIN_DEADLINE, started)
+        .await
+        .unwrap()
+        .unwrap();
+    permits.close();
+    assert!(permits.admitted_count() > 0);
+    release.send(()).unwrap();
+    assert!(
+        tasks
+            .shutdown_until(Instant::now() + DRAIN_DEADLINE)
+            .await
+            .is_clean()
+    );
+    assert_eq!(permits.admitted_count(), 0);
+}
+
+#[test]
+fn actual_blocking_original_keeps_work_after_runtime_shutdown() {
+    let tasks = Arc::new(ProcessorTasks::default());
+    let permits = AccountWorkPermits::new();
+    let operation = host(&permits, Some(tasks.ticket()))
+        .admit_operation_work()
+        .unwrap()
+        .unwrap();
+    let spawner = operation.auth_task_spawner().unwrap();
+    drop(operation);
+    let (release, released) = std::sync::mpsc::channel();
+    let (shutdown, shutdown_seen) = std::sync::mpsc::channel();
+    let (finished, finished_seen) = std::sync::mpsc::channel();
+    let runtime_thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let (entered, started) = tokio::sync::oneshot::channel();
+            let caller = tokio::spawn(codex_model_provider::with_auth_task_scope(
+                codex_model_provider::AuthTaskAccess::Admitted(spawner),
+                async move {
+                    codex_model_provider::run_blocking_call(move || {
+                        entered.send(()).unwrap();
+                        released.recv().unwrap();
+                        finished.send(()).unwrap();
+                    })
+                    .await
+                },
+            ));
+            started.await.unwrap();
+            caller.abort();
+            assert!(caller.await.unwrap_err().is_cancelled());
+        });
+        // This new fixture ends the async runtime while the confirmed-running
+        // physical body is held. Product/runtime/test-profile settings unchanged.
+        runtime.shutdown_timeout(std::time::Duration::ZERO);
+        shutdown.send(()).unwrap();
+    });
+    shutdown_seen
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    permits.close();
+    let count_while_held = permits.admitted_count();
+    let originals_while_held = tasks.pending_len_for_test();
+    let unfinished_while_held = finished_seen.try_recv().is_err();
+    // Always release the fixture before reporting assertions.
+    release.send(()).unwrap();
+    runtime_thread.join().unwrap();
+    finished_seen
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    let start = std::time::Instant::now();
+    while tasks.pending_len_for_test() != 0 {
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        std::thread::yield_now();
+    }
+    assert!(count_while_held > 0);
+    assert_eq!(originals_while_held, 1);
+    assert!(unfinished_while_held);
+    assert_eq!(permits.admitted_count(), 0);
+    let observer = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    assert!(
+        observer
+            .block_on(tasks.shutdown_until(Instant::now()))
+            .is_clean()
+    );
+}
+
+#[tokio::test]
+async fn actual_retained_operation_runs_its_tail_after_blocking_caller_cancellation() {
+    let tasks = ProcessorTasks::default();
+    let permits = AccountWorkPermits::new();
+    let operation = host(&permits, Some(tasks.ticket()))
+        .admit_operation_work()
+        .unwrap()
+        .unwrap();
+    let spawner = operation.auth_task_spawner().unwrap();
+    drop(operation);
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let tail = Arc::new(AtomicBool::new(false));
+    let tail_done = tail.clone();
+    let caller = tokio::spawn(codex_model_provider::run_auth_call(
+        codex_model_provider::AuthTaskAccess::Admitted(spawner),
+        async move {
+            codex_model_provider::run_blocking_call(move || {
+                entered.send(()).unwrap();
+                released.recv().unwrap();
+            })
+            .await
+            .unwrap();
+            tail_done.store(true, Ordering::SeqCst);
+        },
+    ));
+    tokio::time::timeout(DRAIN_DEADLINE, started)
+        .await
+        .unwrap()
+        .unwrap();
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    permits.close();
+    assert!(!tail.load(Ordering::SeqCst));
+    assert!(permits.admitted_count() > 0);
+    assert_eq!(
+        tasks.pending_len_for_test(),
+        2,
+        "retained whole operation plus physical blocking original"
+    );
+    let report = tasks.shutdown_until(Instant::now()).await;
+    release.send(()).unwrap();
+    assert!(!report.terminal);
+    tokio::time::timeout(DRAIN_DEADLINE, async {
+        loop {
+            let report = tasks.shutdown_until(Instant::now()).await;
+            if report.terminal {
+                assert!(report.is_clean());
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(tail.load(Ordering::SeqCst));
+    assert_eq!(permits.admitted_count(), 0);
+}

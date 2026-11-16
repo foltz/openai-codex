@@ -2560,32 +2560,36 @@ impl PluginsManager {
             .manifest_fallback
             .contents_if_has_metadata()
             .map(str::to_string);
-        let result: StorePluginInstallResult = tokio::task::spawn_blocking(move || {
-            let materialized =
-                materialize_marketplace_plugin_source(codex_home.as_path(), &resolved.source)
-                    .map_err(PluginStoreError::Invalid)?;
-            let source_path = materialized.path;
-            match (plugin_version, manifest_fallback_contents.as_deref()) {
-                (Some(plugin_version), Some(manifest_contents)) => store
-                    .install_with_version_and_fallback_manifest(
+        let stop = self.task_registry.worker_stop();
+        let result: StorePluginInstallResult = codex_model_provider::run_blocking_call_with_scope(
+            move || crate::retirement::WorkerStopScope::enter(stop),
+            move || {
+                let materialized =
+                    materialize_marketplace_plugin_source(codex_home.as_path(), &resolved.source)
+                        .map_err(PluginStoreError::Invalid)?;
+                let source_path = materialized.path;
+                match (plugin_version, manifest_fallback_contents.as_deref()) {
+                    (Some(plugin_version), Some(manifest_contents)) => store
+                        .install_with_version_and_fallback_manifest(
+                            source_path,
+                            resolved.plugin_id,
+                            plugin_version,
+                            manifest_contents,
+                        ),
+                    (Some(plugin_version), None) => {
+                        store.install_with_version(source_path, resolved.plugin_id, plugin_version)
+                    }
+                    (None, Some(manifest_contents)) => store.install_with_fallback_manifest(
                         source_path,
                         resolved.plugin_id,
-                        plugin_version,
                         manifest_contents,
                     ),
-                (Some(plugin_version), None) => {
-                    store.install_with_version(source_path, resolved.plugin_id, plugin_version)
+                    (None, None) => store.install(source_path, resolved.plugin_id),
                 }
-                (None, Some(manifest_contents)) => store.install_with_fallback_manifest(
-                    source_path,
-                    resolved.plugin_id,
-                    manifest_contents,
-                ),
-                (None, None) => store.install(source_path, resolved.plugin_id),
-            }
-        })
+            },
+        )
         .await
-        .map_err(PluginInstallError::join)??;
+        .map_err(PluginInstallError::blocking)??;
 
         set_user_plugin_enabled(
             &self.codex_home,
@@ -2651,9 +2655,13 @@ impl PluginsManager {
         };
         let store = self.store.clone();
         let plugin_id_for_store = plugin_id.clone();
-        tokio::task::spawn_blocking(move || store.uninstall(&plugin_id_for_store))
-            .await
-            .map_err(PluginUninstallError::join)??;
+        let stop = self.task_registry.worker_stop();
+        codex_model_provider::run_blocking_call_with_scope(
+            move || crate::retirement::WorkerStopScope::enter(stop),
+            move || store.uninstall(&plugin_id_for_store),
+        )
+        .await
+        .map_err(PluginUninstallError::blocking)??;
 
         clear_user_plugin(&self.codex_home, plugin_id.as_key())
             .await
@@ -2958,14 +2966,24 @@ impl PluginsManager {
         } else {
             let codex_home = self.codex_home.clone();
             let source = plugin.source.clone();
-            let materialized = tokio::task::spawn_blocking(move || {
-                materialize_marketplace_plugin_source(codex_home.as_path(), &source)
-            })
+            let stop = self.task_registry.worker_stop();
+            let materialized = codex_model_provider::run_blocking_call_with_scope(
+                move || crate::retirement::WorkerStopScope::enter(stop),
+                move || materialize_marketplace_plugin_source(codex_home.as_path(), &source),
+            )
             .await
-            .map_err(|err| {
-                MarketplaceError::InvalidPlugin(format!(
-                    "failed to materialize plugin source: {err}"
-                ))
+            .map_err(|err| match err {
+                codex_model_provider::AuthBlockingCallError::Join(err) => {
+                    MarketplaceError::InvalidPlugin(format!(
+                        "failed to materialize plugin source: {err}"
+                    ))
+                }
+                codex_model_provider::AuthBlockingCallError::Custody(failure) => {
+                    MarketplaceError::Io {
+                        context: "plugin materialization custody failed",
+                        source: std::io::Error::other(format!("{failure:?}")),
+                    }
+                }
             })?
             .map_err(MarketplaceError::InvalidPlugin)?;
             materialized.path.clone()

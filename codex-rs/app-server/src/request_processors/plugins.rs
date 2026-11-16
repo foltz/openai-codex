@@ -451,9 +451,20 @@ impl PluginRequestProcessor {
         &self,
         params: PluginReadParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        self.plugin_read_response(params)
-            .await
-            .map(|response| Some(response.into()))
+        let processor = self.clone();
+        codex_model_provider::run_auth_call(
+            codex_model_provider::AuthTaskAccess::Ungated,
+            async move {
+                processor
+                    .plugin_read_response(params)
+                    .await
+                    .map(|response| Some(response.into()))
+            },
+        )
+        .await
+        .map_err(|failure| {
+            internal_error(format!("plugin/read operation custody failed: {failure:?}"))
+        })?
     }
 
     pub(crate) async fn plugin_skill_read(
@@ -514,18 +525,44 @@ impl PluginRequestProcessor {
         &self,
         params: PluginInstallParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        self.plugin_install_response(params)
-            .await
-            .map(|response| Some(response.into()))
+        let processor = self.clone();
+        codex_model_provider::run_auth_call(
+            codex_model_provider::AuthTaskAccess::Ungated,
+            async move {
+                processor
+                    .plugin_install_response(params)
+                    .await
+                    .map(|response| Some(response.into()))
+            },
+        )
+        .await
+        .map_err(|failure| {
+            internal_error(format!(
+                "plugin/install operation custody failed: {failure:?}"
+            ))
+        })?
     }
 
     pub(crate) async fn plugin_uninstall(
         &self,
         params: PluginUninstallParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        self.plugin_uninstall_response(params)
-            .await
-            .map(|response| Some(response.into()))
+        let processor = self.clone();
+        codex_model_provider::run_auth_call(
+            codex_model_provider::AuthTaskAccess::Ungated,
+            async move {
+                processor
+                    .plugin_uninstall_response(params)
+                    .await
+                    .map(|response| Some(response.into()))
+            },
+        )
+        .await
+        .map_err(|failure| {
+            internal_error(format!(
+                "plugin/uninstall operation custody failed: {failure:?}"
+            ))
+        })?
     }
 
     pub(crate) fn effective_plugins_changed_callback(
@@ -2112,6 +2149,9 @@ impl PluginRequestProcessor {
             CorePluginInstallError::Remote(err) => {
                 internal_error(format!("failed to enable remote plugin: {err}"))
             }
+            CorePluginInstallError::Custody(failure) => {
+                internal_error(format!("plugin install custody failed: {failure:?}"))
+            }
             CorePluginInstallError::Join(err) => {
                 internal_error(format!("failed to install plugin: {err}"))
             }
@@ -2132,6 +2172,9 @@ impl PluginRequestProcessor {
             }
             CorePluginUninstallError::Remote(err) => {
                 internal_error(format!("failed to uninstall remote plugin: {err}"))
+            }
+            CorePluginUninstallError::Custody(failure) => {
+                internal_error(format!("plugin uninstall custody failed: {failure:?}"))
             }
             CorePluginUninstallError::Join(err) => {
                 internal_error(format!("failed to uninstall plugin: {err}"))
@@ -2561,5 +2604,30 @@ fn remote_plugin_operation_error_to_jsonrpc(err: RemotePluginOperationError) -> 
         | RemotePluginOperationErrorKind::NotAvailable(_)
         | RemotePluginOperationErrorKind::InvalidRequest(_)) => invalid_request(err.to_string()),
         RemotePluginOperationErrorKind::Internal(message) => internal_error(message),
+    }
+}
+
+#[cfg(test)]
+mod custody_tests {
+    use super::*;
+    #[test]
+    fn blocking_custody_failure_maps_to_internal_rpc_error() {
+        for failure in [
+            codex_model_provider::AuthTaskFailure::Refused,
+            codex_model_provider::AuthTaskFailure::Unavailable,
+            codex_model_provider::AuthTaskFailure::Cancelled,
+            codex_model_provider::AuthTaskFailure::Panicked,
+        ] {
+            let install = PluginRequestProcessor::plugin_install_error(
+                CorePluginInstallError::Custody(failure),
+            );
+            let uninstall = PluginRequestProcessor::plugin_uninstall_error(
+                CorePluginUninstallError::Custody(failure),
+            );
+            for error in [install, uninstall] {
+                assert_eq!(error.code, -32603);
+                assert!(error.message.contains("custody"));
+            }
+        }
     }
 }

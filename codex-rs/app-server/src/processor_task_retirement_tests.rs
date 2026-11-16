@@ -170,3 +170,85 @@ async fn nested_ticket_cannot_reopen_or_keep_registry_alive() {
         Err(ProcessorTaskAdmissionError::Unavailable)
     ));
 }
+
+#[tokio::test]
+async fn blocking_original_survives_observer_abort_and_deadline() {
+    let tasks = ProcessorTasks::default();
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let receipt = tasks
+        .ticket()
+        .spawn_blocking(move || {
+            entered.send(()).unwrap();
+            released.recv().unwrap();
+        })
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), started)
+        .await
+        .unwrap()
+        .unwrap();
+    let observer = tokio::spawn(receipt.clone());
+    observer.abort();
+    assert!(observer.await.unwrap_err().is_cancelled());
+    let report = tasks.shutdown_until(Instant::now()).await;
+    release.send(()).unwrap();
+    assert!(!report.terminal);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), receipt)
+            .await
+            .unwrap(),
+        ProcessorTaskJoin::Joined
+    );
+    assert!(tasks.shutdown_until(Instant::now()).await.is_clean());
+}
+
+#[tokio::test]
+async fn closed_ticket_refuses_blocking_body_before_dispatch() {
+    let tasks = ProcessorTasks::default();
+    tasks.close_registration().unwrap();
+    let polled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let work = polled.clone();
+    assert_eq!(
+        tasks
+            .ticket()
+            .spawn_blocking(move || work.store(true, std::sync::atomic::Ordering::SeqCst))
+            .err(),
+        Some(ProcessorTaskAdmissionError::Closed)
+    );
+    assert!(!polled.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(tasks.shutdown_until(Instant::now()).await.is_clean());
+}
+
+#[test]
+fn dead_ticket_and_missing_runtime_refuse_blocking_birth_without_fallback() {
+    let dead = {
+        let tasks = ProcessorTasks::default();
+        tasks.ticket()
+    };
+    assert_eq!(
+        dead.spawn_blocking(|| panic!("dead owner must not dispatch"))
+            .err(),
+        Some(ProcessorTaskAdmissionError::Unavailable)
+    );
+    let live = ProcessorTasks::default();
+    assert_eq!(
+        live.ticket()
+            .spawn_blocking(|| panic!("missing runtime must not dispatch"))
+            .err(),
+        Some(ProcessorTaskAdmissionError::Unavailable)
+    );
+    assert_eq!(live.len(), 0);
+}
+
+#[tokio::test]
+async fn blocking_panic_is_sticky_after_original_join() {
+    let tasks = ProcessorTasks::default();
+    let receipt = tasks
+        .spawn_blocking(|| panic!("synthetic physical blocking panic"))
+        .unwrap();
+    assert_eq!(receipt.await, ProcessorTaskJoin::Panicked);
+    for _ in 0..2 {
+        let report = tasks.shutdown_until(Instant::now()).await;
+        assert!(report.terminal && report.panicked && !report.is_clean());
+    }
+}

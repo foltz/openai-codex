@@ -1,7 +1,7 @@
 //! Original auth-task custody supplied by a finite host invocation, never a provider factory.
 use codex_protocol::error::{CodexErr, Result};
 pub use codex_protocol::host_auth_work::{
-    AuthTaskFailure, AuthTaskFuture, AuthTaskObservation, AuthTaskSpawner,
+    AuthTaskBlocking, AuthTaskFailure, AuthTaskFuture, AuthTaskObservation, AuthTaskSpawner,
 };
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -144,6 +144,84 @@ pub async fn run_auth_call<T: Send + 'static>(
     receive.await.map_err(|_| AuthTaskFailure::Unavailable)
 }
 
+/// Legacy unmanaged JoinError is preserved; custody failure is a distinct
+/// managed error, never an invalid request or implicit ungated fallback.
+#[derive(Debug)]
+pub enum AuthBlockingCallError {
+    Join(tokio::task::JoinError),
+    Custody(AuthTaskFailure),
+}
+impl std::fmt::Display for AuthBlockingCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Join(error) => std::fmt::Display::fmt(error, f),
+            Self::Custody(failure) => write!(f, "blocking task custody failed: {failure:?}"),
+        }
+    }
+}
+impl std::error::Error for AuthBlockingCallError {}
+
+/// The supplied scope factory is entered ONLY on a physically admitted managed
+/// blocking original. Its guard need not be Send: it never leaves that thread.
+/// It must not hold account authority in a reusable factory or manager.
+pub async fn run_blocking_call_with_scope<T, F, S, G>(
+    scope: S,
+    work: F,
+) -> std::result::Result<T, AuthBlockingCallError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+    S: FnOnce() -> G + Send + 'static,
+    G: 'static,
+{
+    let Some(context) = AUTH_TASK_CONTEXT.try_with(Clone::clone).ok() else {
+        // Match the existing independent caller's Tokio blocking join semantics.
+        drop(scope);
+        return tokio::task::spawn_blocking(work)
+            .await
+            .map_err(AuthBlockingCallError::Join);
+    };
+    let (send, receive) = oneshot::channel();
+    let child_context = context.clone();
+    let observation = context
+        .spawner
+        .spawn_blocking(Box::new(move || {
+            // sync_scope restores on panic and permits nested auth/provider births
+            // from this exact finite root, not from an idle worker/factory.
+            AUTH_TASK_CONTEXT.sync_scope(child_context, || {
+                let _scope = scope();
+                let value = work();
+                // A cancelled observer drops its result inside the same owned scope.
+                let _ = send.send(value);
+            });
+        }))
+        .map_err(|failure| {
+            let _ = context.fail(failure);
+            AuthBlockingCallError::Custody(failure)
+        })?;
+    observation.await.map_err(|failure| {
+        let _ = context.fail(failure);
+        AuthBlockingCallError::Custody(failure)
+    })?;
+    let failure = *context
+        .failure
+        .lock()
+        .map_err(|_| AuthBlockingCallError::Custody(AuthTaskFailure::Unavailable))?;
+    if let Some(failure) = failure {
+        return Err(AuthBlockingCallError::Custody(failure));
+    }
+    receive.await.map_err(|_| {
+        let _ = context.fail(AuthTaskFailure::Unavailable);
+        AuthBlockingCallError::Custody(AuthTaskFailure::Unavailable)
+    })
+}
+
+pub async fn run_blocking_call<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> std::result::Result<T, AuthBlockingCallError> {
+    run_blocking_call_with_scope(|| (), work).await
+}
+
 pub(crate) async fn spawn<T: Send + 'static>(
     future: impl Future<Output = T> + Send + 'static,
 ) -> Result<T> {
@@ -166,4 +244,104 @@ pub(crate) async fn spawn<T: Send + 'static>(
     receive
         .await
         .map_err(|_| context.fail(AuthTaskFailure::Unavailable))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[tokio::test]
+    async fn unmanaged_blocking_call_keeps_legacy_thread_and_does_not_enter_managed_scope() {
+        let caller = std::thread::current().id();
+        let entered = Arc::new(AtomicBool::new(false));
+        let entered_scope = entered.clone();
+        let (worker, context_absent, value) = run_blocking_call_with_scope(
+            move || {
+                entered_scope.store(true, Ordering::SeqCst);
+            },
+            || {
+                (
+                    std::thread::current().id(),
+                    AUTH_TASK_CONTEXT.try_with(|_| ()).is_err(),
+                    17,
+                )
+            },
+        )
+        .await
+        .unwrap();
+        assert_ne!(worker, caller);
+        assert!(context_absent);
+        assert_eq!(value, 17);
+        assert!(!entered.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn unmanaged_blocking_panic_retains_legacy_join_error_variant() {
+        match run_blocking_call(|| -> () {
+            panic!("synthetic unmanaged blocking panic");
+        })
+        .await
+        .unwrap_err()
+        {
+            AuthBlockingCallError::Join(error) => assert!(error.is_panic()),
+            AuthBlockingCallError::Custody(failure) => panic!("legacy join changed to {failure:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_managed_blocking_host_refuses_scope_and_body_with_sticky_failure() {
+        #[derive(Debug)]
+        struct Unsupported;
+        impl AuthTaskSpawner for Unsupported {
+            fn spawn(
+                &self,
+                _: AuthTaskFuture,
+            ) -> std::result::Result<AuthTaskObservation, AuthTaskFailure> {
+                panic!("must not wrap blocking work in async fallback");
+            }
+        }
+        let scoped = Arc::new(AtomicBool::new(false));
+        let polled = Arc::new(AtomicBool::new(false));
+        let scoped_work = scoped.clone();
+        let polled_work = polled.clone();
+        let result = with_auth_task_scope(
+            AuthTaskAccess::Admitted(Arc::new(Unsupported)),
+            async move {
+                let _ = run_blocking_call_with_scope(
+                    move || {
+                        scoped_work.store(true, Ordering::SeqCst);
+                    },
+                    move || polled_work.store(true, Ordering::SeqCst),
+                )
+                .await;
+                // Even deliberately swallowing the inner error cannot hide it.
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(!scoped.load(Ordering::SeqCst));
+        assert!(!polled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn required_absence_never_enters_blocking_scope_or_body() {
+        let entered = Arc::new(AtomicBool::new(false));
+        let polled = Arc::new(AtomicBool::new(false));
+        let a = entered.clone();
+        let b = polled.clone();
+        assert!(
+            with_auth_task_scope(AuthTaskAccess::Required, async move {
+                run_blocking_call_with_scope(
+                    move || a.store(true, Ordering::SeqCst),
+                    move || b.store(true, Ordering::SeqCst),
+                )
+                .await
+            })
+            .await
+            .is_err()
+        );
+        assert!(!entered.load(Ordering::SeqCst));
+        assert!(!polled.load(Ordering::SeqCst));
+    }
 }

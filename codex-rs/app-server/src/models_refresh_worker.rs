@@ -2,7 +2,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use codex_models_manager::manager::RefreshStrategy;
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::model_catalog::ModelCatalog;
@@ -12,12 +14,66 @@ const MODELS_REFRESH_INTERVAL: Duration = Duration::from_secs(4 * 60 + 30);
 #[derive(Debug)]
 pub(crate) struct ModelsRefreshWorker {
     shutdown: CancellationToken,
-    _task: JoinHandle<()>,
+    completion: Mutex<RefreshCompletion>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ModelsRefreshShutdown {
+    Joined,
+    Cancelled,
+    Panicked,
+    TimedOut,
+}
+
+#[derive(Debug)]
+enum RefreshCompletion {
+    Running(JoinHandle<()>),
+    Finished(ModelsRefreshShutdown),
 }
 
 impl ModelsRefreshWorker {
     pub(crate) fn shutdown(&self) {
         self.shutdown.cancel();
+    }
+
+    /// Observe the actual worker, retaining its join on timeout/cancellation.
+    /// This mutex is the exclusive join poll right, not a worker dependency;
+    /// the worker never needs it to finish. No timeout aborts an active fetch.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "exclusive join polling retains custody across observer cancellation; the worker never takes this lock"
+    )]
+    pub(crate) async fn shutdown_until(&self, deadline: Instant) -> ModelsRefreshShutdown {
+        if let Ok(completion) = self.completion.try_lock()
+            && let RefreshCompletion::Finished(outcome) = &*completion
+        {
+            return *outcome;
+        }
+        if Instant::now() >= deadline {
+            return ModelsRefreshShutdown::TimedOut;
+        }
+        self.shutdown();
+        let mut completion = tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline) => return ModelsRefreshShutdown::TimedOut,
+            completion = self.completion.lock() => completion,
+        };
+        let task = match &mut *completion {
+            RefreshCompletion::Finished(outcome) => return *outcome,
+            RefreshCompletion::Running(task) => task,
+        };
+        let joined = tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline) => return ModelsRefreshShutdown::TimedOut,
+            joined = task => joined,
+        };
+        let outcome = match joined {
+            Ok(()) => ModelsRefreshShutdown::Joined,
+            Err(error) if error.is_cancelled() => ModelsRefreshShutdown::Cancelled,
+            Err(_) => ModelsRefreshShutdown::Panicked,
+        };
+        *completion = RefreshCompletion::Finished(outcome);
+        outcome
     }
 }
 
@@ -60,7 +116,7 @@ fn spawn_with_interval(
     });
     ModelsRefreshWorker {
         shutdown,
-        _task: task,
+        completion: Mutex::new(RefreshCompletion::Running(task)),
     }
 }
 

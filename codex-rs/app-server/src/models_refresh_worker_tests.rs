@@ -29,6 +29,124 @@ use tracing_subscriber::layer::SubscriberExt;
 
 use super::*;
 
+#[tokio::test]
+async fn shutdown_observers_retain_and_join_the_same_in_flight_refresh() {
+    let home = tempdir().unwrap();
+    let endpoint = TestModelsEndpoint::new();
+    let models_manager: SharedModelsManager = Arc::new(OpenAiModelsManager::new(
+        home.path().to_path_buf(),
+        endpoint.clone(),
+        /*auth_manager*/ None,
+    ));
+    let config_manager = crate::config_manager::ConfigManager::without_managed_config_for_tests(
+        home.path().to_path_buf(),
+    );
+    let config = Arc::new(config_manager.load_non_project_config().await.unwrap());
+    let auth_manager = codex_login::AuthManager::shared_from_config(&config, false);
+    let thread_manager = test_thread_manager(&config, Some(models_manager), auth_manager);
+    let catalog = Arc::new(ModelCatalog::new(
+        config_manager,
+        None,
+        config,
+        thread_manager,
+    ));
+    let worker = spawn_with_interval(&catalog, Duration::from_millis(/*millis*/ 1));
+    endpoint.wait_for_fetch_count(/*expected*/ 2).await;
+    let mut cancelled = Box::pin(worker.shutdown_until(Instant::now() + Duration::from_secs(1)));
+    assert!(futures::poll!(cancelled.as_mut()).is_pending());
+    drop(cancelled);
+    assert_eq!(
+        worker
+            .shutdown_until(Instant::now() + Duration::from_millis(10))
+            .await,
+        ModelsRefreshShutdown::TimedOut
+    );
+    assert!(matches!(
+        &*worker.completion.lock().await,
+        RefreshCompletion::Running(_)
+    ));
+    endpoint.release_second_fetch.notify_one();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let (first, second) = tokio::join!(
+        worker.shutdown_until(deadline),
+        worker.shutdown_until(deadline)
+    );
+    assert_eq!(
+        (first, second),
+        (ModelsRefreshShutdown::Joined, ModelsRefreshShutdown::Joined)
+    );
+    assert_eq!(
+        worker.shutdown_until(Instant::now()).await,
+        ModelsRefreshShutdown::Joined
+    );
+    assert_eq!(endpoint.fetch_count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn panicked_original_worker_is_not_successful_retirement() {
+    let task = tokio::spawn(async { panic!("synthetic worker failure") });
+    let worker = ModelsRefreshWorker {
+        shutdown: CancellationToken::new(),
+        completion: Mutex::new(RefreshCompletion::Running(task)),
+    };
+    assert_eq!(
+        worker
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await,
+        ModelsRefreshShutdown::Panicked
+    );
+    assert_eq!(
+        worker.shutdown_until(Instant::now()).await,
+        ModelsRefreshShutdown::Panicked
+    );
+}
+
+#[tokio::test]
+async fn cancelled_original_worker_is_not_successful_retirement() {
+    let task = tokio::spawn(std::future::pending::<()>());
+    task.abort();
+    let worker = ModelsRefreshWorker {
+        shutdown: CancellationToken::new(),
+        completion: Mutex::new(RefreshCompletion::Running(task)),
+    };
+    assert_eq!(
+        worker
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await,
+        ModelsRefreshShutdown::Cancelled
+    );
+    assert_eq!(
+        worker.shutdown_until(Instant::now()).await,
+        ModelsRefreshShutdown::Cancelled
+    );
+}
+
+#[tokio::test]
+async fn expired_observer_does_not_cancel_or_discard_original_worker() {
+    let (release, wait) = oneshot::channel::<()>();
+    let task = tokio::spawn(async { wait.await.unwrap() });
+    let worker = ModelsRefreshWorker {
+        shutdown: CancellationToken::new(),
+        completion: Mutex::new(RefreshCompletion::Running(task)),
+    };
+    assert_eq!(
+        worker.shutdown_until(Instant::now()).await,
+        ModelsRefreshShutdown::TimedOut
+    );
+    assert!(!worker.shutdown.is_cancelled());
+    assert!(matches!(
+        &*worker.completion.lock().await,
+        RefreshCompletion::Running(_)
+    ));
+    release.send(()).unwrap();
+    assert_eq!(
+        worker
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await,
+        ModelsRefreshShutdown::Joined
+    );
+}
+
 fn test_thread_manager(
     config: &codex_core::config::Config,
     models_manager: Option<SharedModelsManager>,

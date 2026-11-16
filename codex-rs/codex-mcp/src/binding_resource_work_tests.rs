@@ -441,7 +441,7 @@ async fn admitted_status_collection_preserves_detail_filters_and_retains_no_work
     assert_eq!(snapshot.server_names, vec![SERVER_NAME]);
     server.finish(&step.client).await;
 }
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn cancelled_status_collection_keeps_fanout_work_until_task_destruction() {
     let (step, server) = fixture(McpAttemptRequirement::Required).await;
     let manager = status_manager(&step).await;
@@ -470,6 +470,13 @@ async fn cancelled_status_collection_keeps_fanout_work_until_task_destruction() 
         "root, collector and each live fanout have separate work"
     );
     drop(status);
+    // No yield on this current-thread runtime: abort has been requested, but
+    // both spawned tasks still own work until the scheduler destroys them.
+    assert_eq!(
+        root.0.live.load(Ordering::SeqCst),
+        3,
+        "root and both aborted child tasks retain work after parent destruction"
+    );
     tokio::time::timeout(Duration::from_secs(5), async {
         while root.0.live.load(Ordering::SeqCst) != 1 {
             tokio::task::yield_now().await;

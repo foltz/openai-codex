@@ -9075,13 +9075,24 @@ async fn installed_queue_keeps_prior_callback_original_and_latest_backend(indepe
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/ps/plugins/installed"))
+        .and(wiremock::matchers::query_param_is_missing("pageToken"))
+        .and(header("authorization", "Bearer header.e30.installed-new"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            serde_json::json!({"plugins":[],"pagination":{"next_page_token":"queue-page-2"}}),
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/ps/plugins/installed"))
+        .and(wiremock::matchers::query_param("pageToken", "queue-page-2"))
         .and(header("authorization", "Bearer header.e30.installed-new"))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(
                 serde_json::json!({"plugins":[],"pagination":{"next_page_token":null}}),
             ),
         )
-        .expect(2)
+        .expect(1)
         .mount(&server)
         .await;
     let (config, records) = queued_recording_config(&server.uri());

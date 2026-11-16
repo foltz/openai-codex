@@ -155,6 +155,17 @@ pub struct RefreshedModelCatalog {
     models: Arc<[ModelInfo]>,
 }
 
+/// Secret-safe failure to establish a fresh account-bound model catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedModelsResetError {
+    Unsupported,
+    BundledCatalog,
+    Cache,
+    Endpoint,
+    AuthChanged,
+    OriginatorInventory,
+}
+
 /// Coordinates model discovery plus cached metadata on disk.
 pub trait ModelsManager: fmt::Debug + Send + Sync {
     /// Initialize a newly selected catalog without replacing an already-loaded snapshot.
@@ -191,6 +202,15 @@ pub trait ModelsManager: fmt::Debug + Send + Sync {
     /// Update API-key discovery for this catalog and its derived catalogs.
     /// Static catalogs ignore this setting.
     fn set_api_key_model_discovery_enabled(&self, _enabled: bool) {}
+
+    /// Fence prior publications and replace account-bound state before managed success.
+    /// Unknown implementations must refuse rather than acknowledge an incomplete reset.
+    fn reset_for_managed_auth(
+        &self,
+        _http_client_factory: HttpClientFactory,
+    ) -> ModelsManagerFuture<'_, Result<(), ManagedModelsResetError>> {
+        Box::pin(async { Err(ManagedModelsResetError::Unsupported) })
+    }
 
     /// List all available models, refreshing according to the specified strategy.
     ///
@@ -409,7 +429,10 @@ impl ModelCatalogSettings {
 /// OpenAI-compatible model manager backed by bundled models, cache, and `/models`.
 #[derive(Debug)]
 pub struct OpenAiModelsManager {
-    originator_managers: std::sync::Mutex<HashMap<ModelCatalogOriginator, SharedModelsManager>>,
+    originator_managers: std::sync::Mutex<HashMap<ModelCatalogOriginator, Arc<Self>>>,
+    // A family shares this fence, including derived Work/Chat catalogs. Ordinary refreshes
+    // retain their existing concurrency; reset alone excludes complete cache/publication work.
+    reset_publication: Arc<RwLock<()>>,
     remote_models: RwLock<CatalogState>,
     catalog_updates: watch::Sender<Option<Arc<RefreshedModelCatalog>>>,
     settings: ModelCatalogSettings,
@@ -475,6 +498,7 @@ impl OpenAiModelsManager {
     ) -> Self {
         Self {
             originator_managers: std::sync::Mutex::new(HashMap::new()),
+            reset_publication: Arc::new(RwLock::new(())),
             catalog_updates: watch::Sender::new(None),
             remote_models: RwLock::new(CatalogState::bundled(ModelsCacheEntry {
                 fetched_at: Utc::now(),
@@ -515,6 +539,62 @@ impl StaticModelsManager {
 }
 
 impl ModelsManager for OpenAiModelsManager {
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "exclusive family publication fence spans reset; ordinary refreshes use its read side and hold no catalog state across I/O"
+    )]
+    fn reset_for_managed_auth(
+        &self,
+        http_client_factory: HttpClientFactory,
+    ) -> ModelsManagerFuture<'_, Result<(), ManagedModelsResetError>> {
+        Box::pin(async move {
+            // Wait for every prior refresh/cache/TTL publication before invalidation.
+            // No task is detached or aborted. The inventory caller owns the deadline.
+            let _reset = self.reset_publication.write().await;
+            let auth_changes = self
+                .auth_manager
+                .as_ref()
+                .map(|auth| auth.auth_change_receiver());
+            let mut pending: Vec<_> = self
+                .originator_managers
+                .lock()
+                .map_err(|_| ManagedModelsResetError::OriginatorInventory)?
+                .values()
+                .cloned()
+                .collect();
+            let mut descendants = Vec::new();
+            while let Some(manager) = pending.pop() {
+                pending.extend(
+                    manager
+                        .originator_managers
+                        .lock()
+                        .map_err(|_| ManagedModelsResetError::OriginatorInventory)?
+                        .values()
+                        .cloned(),
+                );
+                descendants.push(manager);
+                // Keep a large inventory cancellable by its caller-owned deadline.
+                tokio::task::yield_now().await;
+            }
+            // A concurrently created descendant starts with an account-independent seed.
+            // Its first cache/endpoint access must wait on this same family fence.
+            self.reset_local_for_managed_auth(http_client_factory.clone())
+                .await?;
+            for manager in descendants {
+                manager
+                    .reset_local_for_managed_auth(http_client_factory.clone())
+                    .await?;
+            }
+            if auth_changes
+                .as_ref()
+                .is_some_and(|changes| changes.has_changed().unwrap_or(true))
+            {
+                return Err(ManagedModelsResetError::AuthChanged);
+            }
+            Ok(())
+        })
+    }
+
     fn ensure_initialized(
         &self,
         http_client_factory: HttpClientFactory,
@@ -594,7 +674,7 @@ impl ModelsManager for OpenAiModelsManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(manager) = managers.get(&originator) {
-            return Some(Arc::clone(manager));
+            return Some(manager.clone());
         }
         let endpoint = self.endpoint_client.for_originator(originator)?;
         // A backend that cannot partition must not overwrite the default catalog.
@@ -604,10 +684,11 @@ impl ModelsManager for OpenAiModelsManager {
             .as_ref()
             .and_then(|cache| cache.for_originator(originator));
         let mut manager = Self::with_settings(settings, endpoint, self.auth_manager.clone());
+        manager.reset_publication = Arc::clone(&self.reset_publication);
         if matches!(self.catalog_source, CatalogSource::ExplicitProvider(_)) {
             manager = manager.with_provider_catalog();
         }
-        let manager: SharedModelsManager = Arc::new(manager);
+        let manager = Arc::new(manager);
         managers.insert(originator, Arc::clone(&manager));
         Some(manager)
     }
@@ -716,6 +797,102 @@ impl ModelsManager for OpenAiModelsManager {
 }
 
 impl OpenAiModelsManager {
+    /// Called only with the family's exclusive reset publication right.
+    async fn reset_local_for_managed_auth(
+        &self,
+        http_client_factory: HttpClientFactory,
+    ) -> Result<(), ManagedModelsResetError> {
+        let auth_changes = self
+            .auth_manager
+            .as_ref()
+            .map(|auth| auth.auth_change_receiver());
+        let models = match self.catalog_source {
+            CatalogSource::Default => load_remote_models_from_file()
+                .map_err(|_| ManagedModelsResetError::BundledCatalog)?,
+            CatalogSource::ExplicitProvider(_) => Vec::new(),
+        };
+        let client_version = crate::client_version_to_whole();
+        // Unscoped invalidation is never a provider response, initialized catalog or cache hit.
+        let invalidation = ModelsCacheEntry {
+            fetched_at: Utc::now(),
+            etag: None,
+            client_version: Some(client_version.clone()),
+            identity: None,
+            models,
+        };
+        {
+            let mut current = self.remote_models.write().await;
+            *current = CatalogState::bundled(invalidation.clone());
+            self.catalog_updates.send_replace(None);
+        }
+        if let Some(cache) = self.settings.cache.as_ref() {
+            cache
+                .store(&invalidation)
+                .await
+                .map_err(|_| ManagedModelsResetError::Cache)?;
+        }
+        let should_refresh =
+            !self.api_key_discovery_disabled() && self.should_refresh_models().await;
+        if auth_changes
+            .as_ref()
+            .is_some_and(|changes| changes.has_changed().unwrap_or(true))
+        {
+            return Err(ManagedModelsResetError::AuthChanged);
+        }
+        if !should_refresh {
+            return Ok(());
+        }
+        let ModelsEndpointResponse {
+            models,
+            etag,
+            identity,
+        } = self
+            .endpoint_client
+            .list_models(&client_version, http_client_factory)
+            .await
+            .map_err(|_| ManagedModelsResetError::Endpoint)?;
+        if self.endpoint_client.identity().as_ref() != Some(&identity)
+            || auth_changes
+                .as_ref()
+                .is_some_and(|changes| changes.has_changed().unwrap_or(true))
+        {
+            return Err(ManagedModelsResetError::AuthChanged);
+        }
+        let refreshed = Arc::new(RefreshedModelCatalog {
+            identity: identity.clone(),
+            models: models.clone().into(),
+        });
+        let entry = ModelsCacheEntry {
+            fetched_at: Utc::now(),
+            etag,
+            client_version: Some(client_version),
+            identity: Some(identity),
+            models,
+        };
+        if let Some(cache) = self.settings.cache.as_ref() {
+            cache
+                .store(&entry)
+                .await
+                .map_err(|_| ManagedModelsResetError::Cache)?;
+        }
+        if auth_changes
+            .as_ref()
+            .is_some_and(|changes| changes.has_changed().unwrap_or(true))
+        {
+            return Err(ManagedModelsResetError::AuthChanged);
+        }
+        let mut current = self.remote_models.write().await;
+        if !self.apply_remote_models(
+            &mut current,
+            entry,
+            CatalogLoadMode::Refresh(RefreshStrategy::Online),
+        ) {
+            return Err(ManagedModelsResetError::AuthChanged);
+        }
+        self.catalog_updates.send_replace(Some(refreshed));
+        Ok(())
+    }
+
     fn catalog_is_initialized(&self, catalog: &CatalogState) -> bool {
         catalog.initialized
             && catalog.entry.identity.is_some()
@@ -737,6 +914,7 @@ impl OpenAiModelsManager {
     }
 
     async fn refresh_if_new_etag(&self, etag: String, http_client_factory: HttpClientFactory) {
+        let publication_guard = self.reset_publication.read().await;
         let refresh_guard = self.catalog_source.refresh_lock().await;
         let (identity, current_etag) = {
             let entry = self.remote_models.read().await;
@@ -756,6 +934,7 @@ impl OpenAiModelsManager {
             return;
         }
         drop(refresh_guard);
+        drop(publication_guard);
         if let Err(err) = self
             .refresh_available_models(RefreshStrategy::Online, &http_client_factory)
             .await
@@ -782,6 +961,7 @@ impl OpenAiModelsManager {
         mode: CatalogLoadMode,
         http_client_factory: &HttpClientFactory,
     ) -> CoreResult<()> {
+        let _publication_guard = self.reset_publication.read().await;
         let _refresh_guard = self.catalog_source.refresh_lock().await;
         // API-key discovery must be enabled and supported before reusing a remote catalog.
         // Otherwise even a matching cache from an earlier run would bypass bundled-only behavior.
@@ -1059,6 +1239,14 @@ impl OpenAiModelsManager {
 }
 
 impl ModelsManager for StaticModelsManager {
+    fn reset_for_managed_auth(
+        &self,
+        _http_client_factory: HttpClientFactory,
+    ) -> ModelsManagerFuture<'_, Result<(), ManagedModelsResetError>> {
+        // Authoritative static metadata has no account-derived cache or refresh publisher.
+        Box::pin(async { Ok(()) })
+    }
+
     fn ensure_initialized(
         &self,
         _http_client_factory: HttpClientFactory,

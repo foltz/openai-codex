@@ -1,4 +1,7 @@
 use super::*;
+
+#[path = "managed_reset_tests.rs"]
+mod managed_reset_tests;
 use crate::ModelsManagerConfig;
 use crate::cache::FileModelsCache;
 use crate::cache::ModelsCache;

@@ -1155,22 +1155,37 @@ impl CodexThread {
         &self,
         cancellation: &CancellationToken,
     ) -> CodexResult<crate::guardian_review::GuardianReviewResult> {
+        if cancellation.is_cancelled() {
+            return Err(CodexErr::TurnAborted);
+        }
         let work = self
             .session
             .request_operation_work()
             .map_err(|_| CodexErr::Fatal("Guardian request account work is unavailable".into()))?;
-        if self.session.active_turn.lock().await.is_some() {
-            return Err(CodexErr::InvalidRequest("thread has an active turn".into()));
-        }
-        let history = self.session.clone_history().await;
-        let tool_call = history.raw_items().next_back().cloned().ok_or_else(|| {
+        let review = async {
+            if self.session.active_turn.lock().await.is_some() {
+                return Err(CodexErr::InvalidRequest("thread has an active turn".into()));
+            }
+            let history = self.session.clone_history().await;
+            let tool_call = history.raw_items().next_back().cloned().ok_or_else(|| {
             CodexErr::InvalidRequest(
                 "expected a final plaintext exec_command, apply_patch, request_permissions, or MCP call"
                     .into(),
             )
         })?;
-        crate::guardian::review_tool_call(&self.session, history, &tool_call, cancellation, work)
+            crate::guardian::review_tool_call(
+                &self.session,
+                history,
+                &tool_call,
+                cancellation,
+                work,
+            )
             .await
+        };
+        tokio::select! { biased;
+            () = cancellation.cancelled() => Err(CodexErr::TurnAborted),
+            result = review => result,
+        }
     }
 
     /// Record raw Responses API items without starting a new turn.

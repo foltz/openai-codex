@@ -6,7 +6,6 @@
 mod setup;
 pub use setup::GuardianInvocationSetup;
 pub use setup::PreparedGuardianContext;
-pub(super) use setup::prepare_review;
 pub use setup::prepare_review_prewarm;
 pub use setup::prepare_review_prewarm_invocation;
 pub(super) use setup::prepare_review_with_work;

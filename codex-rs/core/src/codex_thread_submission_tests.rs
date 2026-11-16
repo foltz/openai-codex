@@ -945,3 +945,34 @@ async fn recorded_builtin_preparation_uses_request_work_not_an_installed_turn() 
     assert_eq!(counts.live.load(Ordering::SeqCst), 0);
     assert!(thread.session.active_turn.lock().await.is_none());
 }
+
+#[tokio::test]
+async fn recorded_review_token_cancellation_releases_root_while_public_wait_is_blocked() {
+    let (thread, counts) = history_fixture().await;
+    let _held = thread.session.active_turn.lock().await;
+    let cancel = CancellationToken::new();
+    let mut review = Box::pin(thread.guardian_review(&cancel));
+    assert!(futures::poll!(&mut review).is_pending());
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    cancel.cancel();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), review)
+        .await
+        .unwrap();
+    assert!(matches!(result, Err(CodexErr::TurnAborted)));
+    assert_eq!(counts.requests.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+}
+#[tokio::test]
+async fn already_cancelled_recorded_review_never_captures_request_authority() {
+    let (thread, counts) = history_fixture().await;
+    let _held = thread.session.active_turn.lock().await;
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let mut review = Box::pin(thread.guardian_review(&cancel));
+    assert!(matches!(
+        futures::poll!(&mut review),
+        std::task::Poll::Ready(Err(CodexErr::TurnAborted))
+    ));
+    assert_eq!(counts.requests.load(Ordering::SeqCst), 0);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+}

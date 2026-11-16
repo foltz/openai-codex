@@ -1574,6 +1574,8 @@ impl McpConnectionSet {
         access: crate::McpAttemptAccess<'_>,
     ) -> Result<CallToolResult> {
         self.validate_tool_call(server, tool, environment_id)?;
+        let work = self.attempt_requirement.derive(access)?;
+        let access = crate::McpAttemptAccess::from_work(work.as_deref());
         let view = &self.servers[server];
         let client = if wait_for_server {
             view.connection

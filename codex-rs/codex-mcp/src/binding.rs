@@ -504,13 +504,24 @@ impl PreparedMcpCall {
         meta: Option<JsonValue>,
         timeout: Option<Duration>,
     ) -> Result<CallToolResult> {
-        self.call_with_preparation(timeout, || async move { Ok((arguments, meta)) })
+        self.call_with_authority(arguments, meta, timeout, crate::McpAttemptAccess::Unscoped)
             .await
     }
 
-    /// Runs irreversible call preparation and execution under the authority of
-    /// this call's captured catalog and the extensions owned by the Codex session.
-    /// A caller-supplied timeout can further restrict the server's configured timeout.
+    pub async fn call_with_authority(
+        &self,
+        arguments: Option<JsonValue>,
+        meta: Option<JsonValue>,
+        timeout: Option<Duration>,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> Result<CallToolResult> {
+        self.call_with_preparation_and_authority(timeout, access, || async move {
+            Ok((arguments, meta))
+        })
+        .await
+    }
+
+    /// Compatibility entry point for ungated callers. Required calls refuse before preparation.
     pub async fn call_with_preparation<F, Fut>(
         &self,
         requested_timeout: Option<Duration>,
@@ -520,6 +531,28 @@ impl PreparedMcpCall {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<(Option<JsonValue>, Option<JsonValue>)>>,
     {
+        self.call_with_preparation_and_authority(
+            requested_timeout,
+            crate::McpAttemptAccess::Unscoped,
+            prepare,
+        )
+        .await
+    }
+
+    /// Admit finite invocation work before catalog waits, irreversible preparation or execution.
+    /// The prepared call retains connection/catalog identity only, never counted account work.
+    /// Timeout, catalog, shared-lease, entitlement and network-policy semantics are unchanged.
+    pub async fn call_with_preparation_and_authority<F, Fut>(
+        &self,
+        requested_timeout: Option<Duration>,
+        access: crate::McpAttemptAccess<'_>,
+        prepare: F,
+    ) -> Result<CallToolResult>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<(Option<JsonValue>, Option<JsonValue>)>>,
+    {
+        let _work = self.connections.attempt_requirement.derive(access)?;
         let effective_timeout = match (self.client.tool_timeout, requested_timeout) {
             (Some(server_timeout), Some(requested_timeout)) => {
                 Some(server_timeout.min(requested_timeout))

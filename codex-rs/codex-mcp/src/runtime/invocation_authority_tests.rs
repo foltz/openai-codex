@@ -447,3 +447,55 @@ async fn nonwaiting_tool_call_never_acquires_new_startup_work() {
     assert!(f.client.client.peek().is_none());
     f.runtime.shutdown().await;
 }
+
+#[tokio::test]
+async fn direct_ready_tool_call_refuses_missing_and_exhausted_authority_before_client_use() {
+    let name = "docs";
+    let client = create_ready_async_managed_client(vec![create_test_tool(name, "search")]).await;
+    client.client().await.unwrap();
+    let mut set = McpConnectionSet::empty(true);
+    set.attempt_requirement = McpAttemptRequirement::Required;
+    set.insert_test_client(name, client);
+    let live = Arc::new(AtomicUsize::new(1));
+    let refuse = Arc::new(AtomicBool::new(false));
+    let work = Work {
+        live: live.clone(),
+        refuse: refuse.clone(),
+    };
+    for access in [
+        McpAttemptAccess::Unscoped,
+        McpAttemptAccess::Admitted(&work),
+    ] {
+        refuse.store(true, Ordering::SeqCst);
+        let error = set
+            .call_tool_with_authority(name, "search", None, None, None, None, false, access)
+            .await
+            .unwrap_err();
+        assert!(error.is::<McpAttemptRefused>());
+        assert_eq!(live.load(Ordering::SeqCst), 1);
+    }
+    refuse.store(false, Ordering::SeqCst);
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        set.call_tool_with_authority(
+            name,
+            "search",
+            None,
+            None,
+            None,
+            None,
+            false,
+            McpAttemptAccess::Admitted(&work),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(
+        !error.is::<McpAttemptRefused>(),
+        "admitted path reaches the deliberately disconnected test transport"
+    );
+    assert_eq!(live.load(Ordering::SeqCst), 1);
+    drop(work);
+    assert_eq!(live.load(Ordering::SeqCst), 0);
+}

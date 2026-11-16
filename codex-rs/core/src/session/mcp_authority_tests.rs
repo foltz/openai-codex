@@ -711,3 +711,41 @@ async fn refused_dependency_publication_restores_invalidation_and_keeps_the_old_
     assert!(!session.mcp_refresh.is_pending());
     assert_eq!(counts.live.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn actual_mcp_handler_refuses_wrong_or_exhausted_turn_without_peer_attribution() {
+    for wrong in [false, true] {
+        let (session, mut turn, counts) = fixture().await;
+        if wrong {
+            turn.sub_id = "wrong-turn".into();
+        } else {
+            counts.refuse.store(true, Ordering::SeqCst);
+        }
+        let step = crate::session::step_context::StepContext::for_test(Arc::new(turn));
+        let result = crate::mcp_tool_call::handle_mcp_tool_call(
+            session.clone(),
+            &step,
+            &CancellationToken::new(),
+            "refused-tool".into(),
+            None,
+            &advertised_tool(),
+            Err(anyhow::anyhow!("unreached prepared call")),
+            crate::tools::hook_names::HookToolName::new("mcp_test"),
+            codex_tools::ToolName::plain("test"),
+            &crate::tools::context::ToolCallSource::Direct,
+            "{}".into(),
+        )
+        .await;
+        assert!(format!("{:?}", result.result).contains("MCP turn account work is unavailable"));
+        assert_eq!(counts.turns.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+        assert!(
+            session
+                .services
+                .executed_tool_calls
+                .mcp_attribution_snapshot()
+                .sources
+                .is_empty()
+        );
+    }
+}

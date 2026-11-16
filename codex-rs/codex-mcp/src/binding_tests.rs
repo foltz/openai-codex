@@ -595,3 +595,6 @@ async fn sandbox_executable_requires_local_stdio_and_a_full_cli() -> anyhow::Res
 
 #[path = "binding_resource_work_tests.rs"]
 mod resource_work;
+
+#[path = "binding_tool_work_tests.rs"]
+mod tool_work_tests;

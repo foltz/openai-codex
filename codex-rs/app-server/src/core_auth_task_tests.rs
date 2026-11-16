@@ -1190,3 +1190,247 @@ async fn actual_constructor_auth_original_survives_cancelled_start_caller(
     assert_eq!(permits.admitted_count(), 0);
     Ok(())
 }
+
+/// Owned loopback IO only. Unknown routes cannot impersonate a recommendation
+/// response, and every socket task is joined before the fixture is retired.
+struct HeldRecommendation {
+    base: String,
+    entered: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+    requests: Arc<std::sync::atomic::AtomicUsize>,
+    stop: tokio_util::sync::CancellationToken,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+impl HeldRecommendation {
+    async fn start() -> anyhow::Result<Self> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let base = format!("http://{}", listener.local_addr()?);
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stop = tokio_util::sync::CancellationToken::new();
+        let (child_entered, child_release, child_requests, child_stop) = (
+            entered.clone(),
+            release.clone(),
+            requests.clone(),
+            stop.clone(),
+        );
+        let task = tokio::spawn(async move {
+            let mut sockets = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = child_stop.cancelled() => break,
+                    done = sockets.join_next(), if !sockets.is_empty() => {
+                        done.unwrap().expect("recommendation fixture socket panicked");
+                    }
+                    accepted = listener.accept() => {
+                        let (mut socket, _) = accepted.unwrap();
+                        let (entered, release, requests, stop) =
+                            (child_entered.clone(), child_release.clone(), child_requests.clone(), child_stop.clone());
+                        sockets.spawn(async move {
+                            let serve = async {
+                                let mut header = Vec::new();
+                                loop {
+                                    let byte = socket.read_u8().await.unwrap();
+                                    header.push(byte);
+                                    assert!(header.len() <= 1024 * 1024, "fixture request headers oversized");
+                                    if header.ends_with(b"\r\n\r\n") { break; }
+                                }
+                                let header = String::from_utf8(header).unwrap();
+                                let is_recommendation = header.lines().next().unwrap()
+                                    == "GET /ps/plugins/suggested/codex?scope=GLOBAL HTTP/1.1";
+                                let (status, body) = if is_recommendation {
+                                    let lower = header.to_ascii_lowercase();
+                                    assert!(lower.contains("authorization: bearer access token\r\n"), "missing synthetic auth");
+                                    assert!(lower.contains("chatgpt-account-id: account_id\r\n"), "missing synthetic account");
+                                    requests.fetch_add(1, Ordering::SeqCst);
+                                    entered.add_permits(1);
+                                    release.acquire().await.unwrap().forget();
+                                    ("200 OK", r#"{"enabled":true,"plugins":[]}"#)
+                                } else {
+                                    ("404 Not Found", "{}")
+                                };
+                                let reply = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                                socket.write_all(reply.as_bytes()).await.unwrap();
+                                socket.shutdown().await.unwrap();
+                            };
+                            tokio::select! {
+                                biased;
+                                _ = stop.cancelled() => {},
+                                result = tokio::time::timeout(DRAIN_DEADLINE, serve) => result.expect("fixture IO timeout"),
+                            }
+                        });
+                    }
+                }
+            }
+            while let Some(result) = sockets.join_next().await {
+                result.expect("recommendation fixture socket panicked during retirement");
+            }
+        });
+        Ok(Self {
+            base,
+            entered,
+            release,
+            requests,
+            stop,
+            task: Some(task),
+        })
+    }
+    async fn finish(mut self) {
+        self.stop.cancel();
+        tokio::time::timeout(DRAIN_DEADLINE, self.task.take().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+impl Drop for HeldRecommendation {
+    fn drop(&mut self) {
+        // Only fixture sockets are interrupted on a failed assertion. This is
+        // never an abort handle for the production recommendation/auth original.
+        self.stop.cancel();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+#[test_case::test_case(false; "published_constructor")]
+#[test_case::test_case(true; "cancelled_unpublished_constructor")]
+#[tokio::test]
+async fn actual_recommendation_original_survives_constructor_retirement(
+    cancel_unpublished: bool,
+) -> anyhow::Result<()> {
+    let tasks = Arc::new(ProcessorTasks::default());
+    let permits = AccountWorkPermits::new();
+    let (_home, auth, held) = held_auth(&tasks, false).await;
+    held.armed.store(false, Ordering::SeqCst);
+    let mut extensions = ExtensionRegistryBuilder::new();
+    extensions.turn_start_admission(Arc::new(host(&permits, Some(tasks.ticket()))));
+    extensions.turn_lifecycle_contributor(Arc::new(
+        crate::account_turn_admission::AccountTurnLifecycle,
+    ));
+    let model_server = core_test_support::responses::start_mock_server().await;
+    let seed = within_request(Some(permits.try_acquire().unwrap()), async {
+        core_test_support::test_codex::test_codex()
+            .with_auth_manager(auth)
+            .with_extensions(Arc::new(extensions.build()))
+            .with_config(|config| config.model_provider.supports_websockets = false)
+            .build_with_auto_env(&model_server)
+            .await
+    })
+    .await?;
+    idle_constructor(&permits, &tasks).await;
+    let recommendation = HeldRecommendation::start().await?;
+    let mut options = seed.start_thread_options().await;
+    options.config.chatgpt_base_url = recommendation.base.clone();
+    for feature in [
+        codex_core::features::Feature::Apps,
+        codex_core::features::Feature::Plugins,
+        codex_core::features::Feature::RemotePlugin,
+        codex_core::features::Feature::RecommendedPlugins,
+    ] {
+        options.config.features.enable(feature);
+    }
+    assert!(options.config.features.plugin_recommendations_enabled());
+    let plugins = seed.thread_manager.plugins_manager();
+    let plugins_config = options.config.plugins_config_input();
+    let mcp_server = core_test_support::responses::start_mock_server().await;
+    let (mcp_control, mcp_release) = if cancel_unpublished {
+        let (apps, control) =
+            core_test_support::apps_test_server::AppsTestServer::mount_with_startup_control(
+                &mcp_server,
+            )
+            .await?;
+        let release = control.hold_next_successful_initialize();
+        let mut servers = options.config.mcp_servers.get().clone();
+        servers.insert(
+            "stalled".into(),
+            serde_json::from_value(serde_json::json!({
+                "url": format!("{}/api/codex/ps/mcp", apps.chatgpt_base_url),
+                "http_headers": {"Authorization":"Bearer synthetic-test-token"},
+                "required":true, "startup_timeout_sec":120
+            }))?,
+        );
+        options.config.mcp_servers.set(servers)?;
+        (Some(control), Some(release))
+    } else {
+        (None, None)
+    };
+    let manager = seed.thread_manager.clone();
+    let root = permits.try_acquire().unwrap();
+    let caller = tokio::spawn(within_request(Some(root), async move {
+        manager.start_thread(options).await
+    }));
+    tokio::time::timeout(DRAIN_DEADLINE, recommendation.entered.acquire())
+        .await??
+        .forget();
+    assert_eq!(recommendation.requests.load(Ordering::SeqCst), 1);
+    if let Some(control) = mcp_control.as_ref() {
+        tokio::time::timeout(DRAIN_DEADLINE, async {
+            while control.initialize_attempts() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        permits.close();
+        caller.abort();
+        assert!(matches!(caller.await, Err(error) if error.is_cancelled()));
+    } else {
+        let created = tokio::time::timeout(DRAIN_DEADLINE, caller).await???;
+        permits.close();
+        assert!(
+            created
+                .thread
+                .shutdown_and_wait_with_cleanup()
+                .await
+                .is_complete()
+        );
+    }
+    // Poll actual completed original joins once; stale auth-read receipts cannot
+    // impersonate the sole request which the loopback fixture still holds.
+    assert_eq!(
+        tasks.pending_len_for_test(),
+        1,
+        "exact pending recommendation original"
+    );
+    assert!(!tasks.observe_until(Instant::now()).await.terminal);
+    assert!(permits.admitted_count() > 0);
+    recommendation.release.add_permits(1);
+    assert!(
+        tasks
+            .observe_until(Instant::now() + DRAIN_DEADLINE)
+            .await
+            .is_clean()
+    );
+    let retirement = seed
+        .thread_manager
+        .begin_shutdown(Instant::now() + DRAIN_DEADLINE)
+        .unwrap();
+    let report = retirement.wait().await.unwrap();
+    assert!(
+        report.is_complete(),
+        "original constructor cleanup: {report:?}"
+    );
+    drop(mcp_release);
+    idle_constructor(&permits, &tasks).await;
+    assert_eq!(
+        permits.admitted_count(),
+        0,
+        "retained plugin manager cannot retain finite authority"
+    );
+    // Stop the endpoint before asking the same manager: only a successful cache
+    // publication can return Endpoint without another network response.
+    recommendation.finish().await;
+    let credential = CodexAuth::create_dummy_chatgpt_auth_for_testing();
+    assert!(matches!(
+        plugins
+            .recommended_plugins_mode_for_config(&plugins_config, Some(&credential))
+            .await,
+        codex_core_plugins::RecommendedPluginsMode::Endpoint { .. }
+    ));
+    assert_eq!(permits.admitted_count(), 0);
+    Ok(())
+}

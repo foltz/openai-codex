@@ -1401,6 +1401,8 @@ impl Session {
         let mcp_originator = session_configuration.originator.clone();
         let mcp_session_source = session_configuration.session_source.clone();
         let mcp_disabled_plugin_ids = session_configuration.disabled_plugin_ids.clone();
+        let recommendation_work = initial_mcp_work.as_deref();
+        let recommendation_host = host_admission.as_deref();
         let auth_and_mcp_fut = async move {
             let auth = mcp_auth
                 .await
@@ -1410,14 +1412,32 @@ impl Session {
                 let auth_for_prewarm = auth.clone();
                 // Fetch the catalog while MCP and plugin/skill initialization continue.
                 // Context construction still handles filtering and prompt insertion.
-                tokio::spawn(async move {
+                let recommendation = async move {
                     plugins_manager_for_prewarm
                         .recommended_plugins_mode_for_config(
                             &plugins_config,
                             auth_for_prewarm.as_ref(),
                         )
                         .await;
+                };
+                // Optional prewarm uses the constructor's existing finite root.
+                // Losing its observer cannot detach the original account work.
+                let dispatched = crate::provider_auth_work::initial_access(
+                    recommendation_work,
+                    recommendation_host,
+                )
+                .and_then(|access| {
+                    codex_model_provider::spawn_provider_task_with_access(
+                        access,
+                        Box::pin(recommendation),
+                    )
+                    .map_err(codex_model_provider::AuthTaskFailure::error)
                 });
+                if let Err(error) = dispatched {
+                    // Refusal is before body polling, not an auth fallback or
+                    // constructor failure after persistence acquired resources.
+                    warn!("recommendation prewarm work refused: {error}");
+                }
             }
             let mcp_projection = mcp_manager_for_mcp
                 .runtime_config_for_step(

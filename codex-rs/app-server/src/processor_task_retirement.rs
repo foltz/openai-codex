@@ -242,6 +242,15 @@ impl ProcessorTasks {
         }
     }
 
+    /// A test snapshot polls existing originals once, without waiting, closing,
+    /// spawning replacement work, or discarding a pending/failure receipt.
+    #[cfg(test)]
+    pub(crate) fn pending_len_for_test(&self) -> usize {
+        let mut state = self.state.lock().unwrap();
+        state.compact();
+        state.tasks.len()
+    }
+
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.state.lock().unwrap().tasks.len()

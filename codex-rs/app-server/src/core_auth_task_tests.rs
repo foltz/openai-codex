@@ -1327,12 +1327,16 @@ async fn actual_recommendation_original_survives_constructor_retirement(
     let mut options = seed.start_thread_options().await;
     options.config.chatgpt_base_url = recommendation.base.clone();
     for feature in [
-        codex_core::features::Feature::Apps,
-        codex_core::features::Feature::Plugins,
-        codex_core::features::Feature::RemotePlugin,
-        codex_core::features::Feature::RecommendedPlugins,
+        codex_features::Feature::Apps,
+        codex_features::Feature::Plugins,
+        codex_features::Feature::RemotePlugin,
+        codex_features::Feature::RecommendedPlugins,
     ] {
-        options.config.features.enable(feature);
+        options
+            .config
+            .features
+            .enable(feature)
+            .expect("fixture feature must be enabled");
     }
     assert!(options.config.features.plugin_recommendations_enabled());
     let plugins = seed.thread_manager.plugins_manager();

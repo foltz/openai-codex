@@ -82,6 +82,7 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+    #[derive(Debug)]
     struct Work(Arc<AtomicUsize>);
     impl Drop for Work {
         fn drop(&mut self) {
@@ -89,11 +90,20 @@ mod tests {
         }
     }
     impl HostOperationWork for Work {
+        fn derive_turn_work(
+            &self,
+            _store: &codex_extension_api::ExtensionData,
+            _termination: codex_extension_api::ExtensionFuture<'static, ()>,
+        ) -> Result<Box<dyn codex_protocol::host_turn_work::HostTurnWork>, TurnWorkRefused>
+        {
+            panic!("fresh retry must not become turn admission")
+        }
         fn derive_operation(&self) -> Result<Box<dyn HostOperationWork>, TurnWorkRefused> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(Box::new(Self(Arc::clone(&self.0))))
         }
     }
+    #[derive(Debug)]
     struct Host {
         required: bool,
         mode: u8,

@@ -6364,12 +6364,22 @@ async fn warm_v2_lookup_needs_no_parent_work_but_cold_reload_requires_exact_live
         .await
         .unwrap();
     assert_eq!(gate.calls.load(Ordering::SeqCst), 2);
+    let reloaded = harness.manager.get_thread(child.thread_id).await.unwrap();
+    // Reload starts a real constructor-owned prewarm. Join that finite work
+    // before asserting that the retained idle runtime owns no construction work.
+    let prewarm = reloaded
+        .session
+        .take_session_startup_prewarm()
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), prewarm.abort())
+        .await
+        .unwrap();
     assert_eq!(
         gate.live.load(Ordering::SeqCst),
         0,
         "idle reloaded runtime retains no construction work"
     );
-    let reloaded = harness.manager.get_thread(child.thread_id).await.unwrap();
     assert!(!Arc::ptr_eq(&loaded.session, &reloaded.session));
     assert_eq!(reloaded.session.thread_id, child.thread_id);
     drop(pin);

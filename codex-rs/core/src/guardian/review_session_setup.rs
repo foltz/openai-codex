@@ -35,7 +35,9 @@ impl PreparedGuardianContext {
         config: Config,
         history: &ContextManager,
         node_repl_policy: &GuardianNodeReplPolicy,
+        access: codex_mcp::McpAttemptAccess<'_>,
     ) -> anyhow::Result<Self> {
+        let _work = parent.derive_mcp_attempt_work(access)?;
         let (reset_version, history_reset) = parent.history_reset().await;
         // Preparation may have raced with a history reset before capturing the reviewer context.
         if reset_version != history.reset_version {
@@ -362,12 +364,16 @@ pub(crate) async fn run_guardian_review_session(
 pub(in crate::guardian) async fn prepare_review(
     params: GuardianReviewSessionParams,
 ) -> anyhow::Result<PreparedReview> {
+    let work = params
+        .parent_session
+        .turn_mcp_work(params.parent_context.turn())?;
     let context = PreparedGuardianContext::prepare(
         Arc::clone(&params.parent_session),
         params.parent_context.clone(),
         params.spawn_config.clone(),
         &params.parent_history,
         &params.node_repl_policy,
+        codex_mcp::McpAttemptAccess::from_work(work.as_deref()),
     )
     .await?;
     Ok(PreparedReview {
@@ -382,18 +388,27 @@ pub(in crate::guardian) async fn prepare_review(
 pub async fn prepare_review_prewarm(
     parent: &crate::CodexThread,
 ) -> anyhow::Result<PreparedGuardianContext> {
+    let work = parent.session.request_mcp_work()?;
     let turn = parent
         .session
         .new_startup_prewarm_turn_with_sub_id(crate::session::INITIAL_SUBMIT_ID.to_owned())
         .await;
-    prepare_prewarm(Arc::clone(&parent.session), turn).await
+    prepare_prewarm(
+        Arc::clone(&parent.session),
+        turn,
+        codex_mcp::McpAttemptAccess::from_work(work.as_deref()),
+    )
+    .await
 }
 
-pub(super) fn prepare_prewarm(
+pub(super) fn prepare_prewarm<'a>(
     parent: Arc<Session>,
     turn: Arc<TurnContext>,
-) -> BoxFuture<'static, anyhow::Result<PreparedGuardianContext>> {
+    access: codex_mcp::McpAttemptAccess<'a>,
+) -> BoxFuture<'a, anyhow::Result<PreparedGuardianContext>> {
     Box::pin(async move {
+        let work = parent.derive_mcp_attempt_work(access)?;
+        let access = codex_mcp::McpAttemptAccess::from_work(work.as_deref());
         let context = GuardianReviewContext::from(turn);
         let config = guardian_review_session_config(&parent, &context).await?;
         let history = parent.clone_history().await;
@@ -403,6 +418,7 @@ pub(super) fn prepare_prewarm(
             config.spawn_config,
             &history,
             &config.node_repl_policy,
+            access,
         )
         .await
     })

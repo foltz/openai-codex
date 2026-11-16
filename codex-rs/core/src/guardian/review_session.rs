@@ -770,6 +770,12 @@ async fn ensure_guardian_node_repl_policy(
         return Ok(());
     }
 
+    // This standalone history update borrows the issuing parent operation; the
+    // reviewer has no installed turn yet, and must not invent fresh admission.
+    let work = params
+        .parent_session
+        .turn_mcp_work(params.parent_context.turn())?;
+    let access = codex_mcp::McpAttemptAccess::from_work(work.as_deref());
     let policy = &params.node_repl_policy;
     let policy_body = policy.body().into_text().unwrap_or_default();
     if policy_body.is_empty() {
@@ -801,7 +807,11 @@ async fn ensure_guardian_node_repl_policy(
         let initialize_context: BoxFuture<'_, anyhow::Result<()>> = Box::pin(async {
             let step_context = review_session
                 .session
-                .capture_step_context(Arc::clone(&turn_context), &review_session.cancel_token)
+                .capture_step_context_with_authority(
+                    Arc::clone(&turn_context),
+                    &review_session.cancel_token,
+                    access,
+                )
                 .await?;
             review_session
                 .session

@@ -1073,6 +1073,7 @@ async fn prewarm_test_session(
     let context = setup::prepare_prewarm(
         Arc::clone(&params.parent_session),
         Arc::clone(params.parent_context.turn()),
+        codex_mcp::McpAttemptAccess::Unscoped,
     )
     .await
     .unwrap();
@@ -1214,4 +1215,247 @@ async fn compaction_and_review_submissions_share_execution_observer() {
         .durations(start, end);
     assert_eq!(totals.auto_review, Duration::from_millis(100));
     assert_eq!(totals.auto_review_overhead, Some(Duration::from_millis(50)));
+}
+
+#[derive(Debug, Default)]
+struct GuardianWorkCounts {
+    live: std::sync::atomic::AtomicUsize,
+    turns: std::sync::atomic::AtomicUsize,
+    derives: std::sync::atomic::AtomicUsize,
+    refuse: std::sync::atomic::AtomicBool,
+}
+#[derive(Debug)]
+struct GuardianWork(Arc<GuardianWorkCounts>);
+impl GuardianWork {
+    fn new(counts: &Arc<GuardianWorkCounts>) -> Self {
+        counts.live.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(counts))
+    }
+}
+impl Drop for GuardianWork {
+    fn drop(&mut self) {
+        self.0.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+impl codex_extension_api::HostOperationWork for GuardianWork {
+    fn derive_operation(
+        &self,
+    ) -> Result<Box<dyn codex_extension_api::HostOperationWork>, codex_extension_api::TurnWorkRefused>
+    {
+        if self.0.refuse.load(Ordering::SeqCst) {
+            return Err(codex_extension_api::TurnWorkRefused::Unavailable);
+        }
+        self.0.derives.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(Self::new(&self.0)))
+    }
+    fn derive_turn_work(
+        &self,
+        _: &codex_extension_api::ExtensionData,
+        _: codex_extension_api::ExtensionFuture<'static, ()>,
+    ) -> Result<
+        Box<dyn codex_protocol::host_turn_work::HostTurnWork>,
+        codex_extension_api::TurnWorkRefused,
+    > {
+        panic!("preparation must not create a turn")
+    }
+}
+impl codex_mcp::McpAttemptWork for GuardianWork {
+    fn derive_attempt(
+        &self,
+    ) -> Result<Box<dyn codex_mcp::McpAttemptWork>, codex_mcp::McpAttemptRefused> {
+        if self.0.refuse.load(Ordering::SeqCst) {
+            return Err(codex_mcp::McpAttemptRefused);
+        }
+        self.0.derives.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(Self::new(&self.0)))
+    }
+}
+#[derive(Debug)]
+struct GuardianWorkGate {
+    counts: Arc<GuardianWorkCounts>,
+    store: String,
+    turn: String,
+}
+impl codex_extension_api::TurnStartAdmission for GuardianWorkGate {
+    fn admit_turn_start(&self) -> Option<Box<dyn Send>> {
+        panic!("no fresh admission fallback")
+    }
+    fn requires_account_work(&self) -> bool {
+        true
+    }
+    fn derive_operation_work(
+        &self,
+        store: &codex_extension_api::ExtensionData,
+        turn: &str,
+    ) -> Result<
+        Option<Box<dyn codex_extension_api::HostOperationWork>>,
+        codex_extension_api::TurnWorkRefused,
+    > {
+        self.counts.turns.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(store.level_id(), self.store);
+        assert_eq!(turn, self.turn);
+        if self.counts.refuse.load(Ordering::SeqCst) {
+            return Err(codex_extension_api::TurnWorkRefused::Unavailable);
+        }
+        Ok(Some(Box::new(GuardianWork::new(&self.counts))))
+    }
+}
+async fn required_guardian_params() -> (GuardianReviewSessionParams, Arc<GuardianWorkGate>) {
+    let mut params = test_review_params().await;
+    let gate = Arc::new(GuardianWorkGate {
+        counts: Arc::new(GuardianWorkCounts::default()),
+        store: params
+            .parent_session
+            .services
+            .thread_extension_data
+            .level_id()
+            .to_owned(),
+        turn: params.parent_context.turn().sub_id.clone(),
+    });
+    Arc::get_mut(&mut params.parent_session)
+        .unwrap()
+        .services
+        .host_admission = Some(gate.clone());
+    (params, gate)
+}
+fn required_node_policy(params: &mut GuardianReviewSessionParams) -> String {
+    crate::session::tests::update_turn_settings_for_test(
+        Arc::get_mut(&mut params.parent_context.turn).unwrap(),
+        |settings| Arc::make_mut(&mut settings.model_info).node_repl_auto_review_required = true,
+    );
+    params.category = GuardianScope::ComputerUse;
+    let mut model = model_info_from_slug("policy-work-fixture");
+    model.model_messages = Some(
+        serde_json::from_value(serde_json::json!({
+            "auto_review": { "node_repl_policy": "Counted standalone policy fixture." }
+        }))
+        .unwrap(),
+    );
+    params.node_repl_policy =
+        GuardianNodeReplPolicy::from_messages(ResolvedModelMessages::from_model(&model));
+    let body = params.node_repl_policy.body().into_text().unwrap();
+    assert!(!body.is_empty());
+    body
+}
+
+#[tokio::test]
+async fn guardian_preparation_refuses_ended_parent_before_context_capture() {
+    let (params, gate) = required_guardian_params().await;
+    gate.counts.refuse.store(true, Ordering::SeqCst);
+    let mut prepare = Box::pin(setup::prepare_review(params));
+    assert!(matches!(
+        futures::poll!(&mut prepare),
+        std::task::Poll::Ready(Err(_))
+    ));
+    assert_eq!(gate.counts.turns.load(Ordering::SeqCst), 1);
+    assert_eq!(gate.counts.live.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn prepared_guardian_context_retains_no_parent_work() {
+    let (params, gate) = required_guardian_params().await;
+    let prepared = setup::prepare_review(params).await.unwrap();
+    assert_eq!(gate.counts.turns.load(Ordering::SeqCst), 1);
+    assert!(gate.counts.derives.load(Ordering::SeqCst) > 0);
+    assert_eq!(gate.counts.live.load(Ordering::SeqCst), 0);
+    let context = prepared.setup();
+    let _key = context.reuse_key(None);
+    drop(prepared);
+    assert_eq!(gate.counts.live.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn guardian_prewarm_preparation_refuses_unscoped_and_exhausted_work() {
+    let (params, gate) = required_guardian_params().await;
+    let root = GuardianWork::new(&gate.counts);
+    for access in [
+        codex_mcp::McpAttemptAccess::Unscoped,
+        codex_mcp::McpAttemptAccess::Admitted(&root),
+    ] {
+        gate.counts.refuse.store(true, Ordering::SeqCst);
+        let mut prepare = setup::prepare_prewarm(
+            Arc::clone(&params.parent_session),
+            Arc::clone(params.parent_context.turn()),
+            access,
+        );
+        assert!(matches!(
+            futures::poll!(&mut prepare),
+            std::task::Poll::Ready(Err(_))
+        ));
+        assert_eq!(gate.counts.live.load(Ordering::SeqCst), 1);
+    }
+    assert_eq!(gate.counts.turns.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn guardian_prewarm_preparation_borrows_work_without_a_turn_or_cached_lease() {
+    let (params, gate) = required_guardian_params().await;
+    params.parent_session.services.thread_extension_data.insert(
+        codex_guardian_reviewer::ReviewerConfig::<Config>(
+            crate::guardian::test_host::build_reviewer_config,
+        ),
+    );
+    let root = GuardianWork::new(&gate.counts);
+    let context = setup::prepare_prewarm(
+        Arc::clone(&params.parent_session),
+        Arc::clone(params.parent_context.turn()),
+        codex_mcp::McpAttemptAccess::Admitted(&root),
+    )
+    .await
+    .unwrap();
+    assert_eq!(gate.counts.turns.load(Ordering::SeqCst), 0);
+    assert!(gate.counts.derives.load(Ordering::SeqCst) > 0);
+    assert_eq!(gate.counts.live.load(Ordering::SeqCst), 1);
+    drop(root);
+    let _key = context.reuse_key(None);
+    assert_eq!(gate.counts.live.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn node_policy_history_uses_parent_work_without_an_installed_reviewer_turn() {
+    let (mut params, gate) = required_guardian_params().await;
+    let body = required_node_policy(&mut params);
+    let (mut reviewer, _, _) = test_review_session().await;
+    Arc::get_mut(&mut reviewer.session)
+        .unwrap()
+        .services
+        .host_admission = Some(gate.clone());
+    assert!(reviewer.session.reference_context_item().await.is_none());
+    ensure_guardian_node_repl_policy(&reviewer, &params)
+        .await
+        .unwrap();
+    assert!(reviewer.session.reference_context_item().await.is_some());
+    assert_eq!(gate.counts.live.load(Ordering::SeqCst), 0);
+    assert!(gate.counts.derives.load(Ordering::SeqCst) > 0);
+    let derives = gate.counts.derives.load(Ordering::SeqCst);
+    ensure_guardian_node_repl_policy(&reviewer, &params)
+        .await
+        .unwrap();
+    assert_eq!(gate.counts.turns.load(Ordering::SeqCst), 2);
+    assert_eq!(gate.counts.derives.load(Ordering::SeqCst), derives);
+    assert_eq!(gate.counts.live.load(Ordering::SeqCst), 0);
+    let history = reviewer.session.clone_history().await;
+    assert_eq!(history.raw_items().filter(|item| matches!(item, ResponseItem::Message { role, content, .. } if role == "developer" && content.iter().any(|part| matches!(part, ContentItem::InputText { text } if text == &body)))).count(), 1);
+}
+
+#[tokio::test]
+async fn node_policy_refuses_ended_parent_without_recording_history() {
+    let (mut params, gate) = required_guardian_params().await;
+    required_node_policy(&mut params);
+    let (reviewer, _, _) = test_review_session().await;
+    let before = reviewer.session.clone_history().await;
+    gate.counts.refuse.store(true, Ordering::SeqCst);
+    assert!(
+        ensure_guardian_node_repl_policy(&reviewer, &params)
+            .await
+            .is_err()
+    );
+    assert_eq!(gate.counts.turns.load(Ordering::SeqCst), 1);
+    assert_eq!(gate.counts.live.load(Ordering::SeqCst), 0);
+    let after = reviewer.session.clone_history().await;
+    assert_eq!(
+        before.raw_items().collect::<Vec<_>>(),
+        after.raw_items().collect::<Vec<_>>()
+    );
+    assert!(reviewer.session.reference_context_item().await.is_none());
 }

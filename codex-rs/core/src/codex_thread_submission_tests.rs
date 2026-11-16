@@ -731,3 +731,20 @@ async fn public_prewarm_refuses_without_request_work_before_scheduling() {
         crate::tasks::TaskJoinOutcome::Complete { panicked: false }
     );
 }
+
+#[tokio::test]
+async fn public_guardian_preparation_refuses_request_work_before_configuration() {
+    let (mut thread, queue, _) = fixture().await;
+    let gate = Arc::new(RefusingMcpRequest::default());
+    Arc::get_mut(&mut thread.session)
+        .unwrap()
+        .services
+        .host_admission = Some(gate.clone());
+    let mut prepare = Box::pin(crate::guardian_review::prepare_review_prewarm(&thread));
+    assert!(matches!(
+        futures::poll!(&mut prepare),
+        std::task::Poll::Ready(Err(_))
+    ));
+    assert_eq!(gate.0.load(Ordering::SeqCst), 1);
+    assert!(queue.is_empty());
+}

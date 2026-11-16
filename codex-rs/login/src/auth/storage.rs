@@ -225,6 +225,12 @@ pub(super) trait AuthStorageBackend: Debug + Send + Sync {
     ) -> Result<bool, ManagedAuthStorageError> {
         Ok(self.read_managed_bytes()?.preimage == *expected)
     }
+    fn lock_managed_source(&self) -> Result<ManagedAuthSourceGuard<'_>, ManagedAuthStorageError> {
+        Err(ManagedAuthStorageError::ReadFailed(
+            ManagedAuthStorageFailure::UnsupportedStorage,
+        ))
+    }
+
     fn read_managed_bytes(&self) -> Result<ManagedAuthStorageBytes, ManagedAuthStorageError> {
         Err(ManagedAuthStorageError::ReadFailed(
             ManagedAuthStorageFailure::UnsupportedStorage,
@@ -248,6 +254,104 @@ pub(super) trait AuthStorageBackend: Debug + Send + Sync {
         self.save(auth)
     }
     fn delete(&self) -> std::io::Result<bool>;
+}
+
+/// Holds cooperating factory writers out during a synchronous managed commit.
+/// Advisory locking does not exclude uncooperative OS mutation of this namespace.
+pub(super) struct ManagedAuthSourceGuard<'a> {
+    file: File,
+    backend: &'a dyn AuthStorageBackend,
+    home: PathBuf,
+    mode: AuthCredentialsStoreMode,
+    lock_path: PathBuf,
+}
+
+impl Debug for ManagedAuthSourceGuard<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ManagedAuthSourceGuard([locked])")
+    }
+}
+
+fn managed_coordination_error(error: std::io::Error) -> ManagedAuthStorageError {
+    ManagedAuthStorageError::ReadFailed(ManagedAuthStorageFailure::CoordinationUnavailable(
+        error.kind(),
+    ))
+}
+
+fn validate_managed_lock_metadata(
+    metadata: &std::fs::Metadata,
+    _home: &Path,
+) -> Result<(), ManagedAuthStorageError> {
+    let denied = || managed_coordination_error(std::io::ErrorKind::PermissionDenied.into());
+    if !metadata.file_type().is_file() {
+        return Err(denied());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let owner = std::fs::metadata(_home)
+            .map_err(managed_coordination_error)?
+            .uid();
+        if metadata.nlink() != 1 || metadata.uid() != owner || metadata.mode() & 0o077 != 0 {
+            return Err(denied());
+        }
+    }
+    Ok(())
+}
+
+fn validate_managed_lock(
+    path: &Path,
+    file: &File,
+    home: &Path,
+) -> Result<(), ManagedAuthStorageError> {
+    let named = std::fs::symlink_metadata(path).map_err(managed_coordination_error)?;
+    let opened = file.metadata().map_err(managed_coordination_error)?;
+    validate_managed_lock_metadata(&named, home)?;
+    validate_managed_lock_metadata(&opened, home)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if named.dev() != opened.dev() || named.ino() != opened.ino() {
+            return Err(managed_coordination_error(
+                std::io::ErrorKind::PermissionDenied.into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+impl ManagedAuthSourceGuard<'_> {
+    fn domain_current(&self) -> Result<bool, ManagedAuthStorageError> {
+        let current = storage_commit::managed_lock_path(&self.home, self.mode)
+            .map_err(managed_coordination_error)?;
+        if current != self.lock_path {
+            return Ok(false);
+        }
+        validate_managed_lock(&self.lock_path, &self.file, &self.home)?;
+        Ok(true)
+    }
+
+    fn require_current_domain(&self) -> Result<(), ManagedAuthStorageError> {
+        if self.domain_current()? {
+            Ok(())
+        } else {
+            Err(managed_coordination_error(
+                std::io::ErrorKind::InvalidData.into(),
+            ))
+        }
+    }
+
+    /// Revalidate source bytes without parsing or adopting replacement auth.
+    pub(super) fn verify_managed_preimage(
+        &self,
+        expected: &ManagedAuthStoragePreimage,
+    ) -> Result<bool, ManagedAuthStorageError> {
+        if !self.domain_current()? {
+            return Ok(false);
+        }
+        let matches = self.backend.verify_managed_preimage(expected)?;
+        Ok(matches && self.domain_current()?)
+    }
 }
 
 /// Provenance of the single parsed snapshot used by managed adoption.

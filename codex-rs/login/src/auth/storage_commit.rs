@@ -68,9 +68,102 @@ impl CommittedStorage {
     }
 }
 
+// The ordinary writer above remains unchanged. Managed reads must use exactly
+// that writer's resolved lock domain, with an immediate contention refusal.
+pub(super) fn managed_lock_path(
+    home: &Path,
+    mode: AuthCredentialsStoreMode,
+) -> std::io::Result<PathBuf> {
+    let auth_file = get_auth_file(home);
+    let path = match storage_file::resolve_auth_file(auth_file.clone()) {
+        Ok(path) => path,
+        Err(_) if mode == AuthCredentialsStoreMode::Keyring => auth_file,
+        Err(error) => return Err(error),
+    }
+    .with_extension("json.lock");
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("credential lock has no parent"))?;
+    Ok(parent.canonicalize()?.join(
+        path.file_name()
+            .ok_or_else(|| std::io::Error::other("credential lock has no name"))?,
+    ))
+}
+
+fn open_managed_lock(path: &Path, home: &Path) -> Result<File, ManagedAuthStorageError> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = std::fs::symlink_metadata(path).map_err(managed_coordination_error)?;
+            validate_managed_lock_metadata(&metadata, home)?;
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .map_err(managed_coordination_error)?
+        }
+        Err(error) => return Err(managed_coordination_error(error)),
+    };
+    validate_managed_lock(path, &file, home)?;
+    Ok(file)
+}
+
 impl AuthStorageBackend for CommittedStorage {
     fn persistent_home(&self) -> Option<&Path> {
         self.inner.persistent_home()
+    }
+
+    fn lock_managed_source(&self) -> Result<ManagedAuthSourceGuard<'_>, ManagedAuthStorageError> {
+        // A failed lookup is not an absent authority and must not create a home.
+        self.home
+            .canonicalize()
+            .map_err(managed_coordination_error)?;
+        let path = managed_lock_path(&self.home, self.mode).map_err(managed_coordination_error)?;
+        let file = open_managed_lock(&path, &self.home)?;
+        file.try_lock().map_err(|error| match error {
+            TryLockError::WouldBlock => ManagedAuthStorageError::ReadFailed(
+                ManagedAuthStorageFailure::CoordinationContended,
+            ),
+            TryLockError::Error(error) => managed_coordination_error(error),
+        })?;
+        let guard = ManagedAuthSourceGuard {
+            file,
+            backend: self.inner.as_ref(),
+            home: self.home.clone(),
+            mode: self.mode,
+            lock_path: path,
+        };
+        guard.require_current_domain()?;
+        Ok(guard)
+    }
+
+    fn load_managed(&self) -> Result<ManagedAuthStorageRead, ManagedAuthStorageError> {
+        let guard = self.lock_managed_source()?;
+        let read = self.inner.load_managed()?;
+        guard.require_current_domain()?;
+        Ok(read)
+    }
+
+    fn read_managed_bytes(&self) -> Result<ManagedAuthStorageBytes, ManagedAuthStorageError> {
+        let guard = self.lock_managed_source()?;
+        let read = self.inner.read_managed_bytes()?;
+        guard.require_current_domain()?;
+        Ok(read)
+    }
+
+    fn verify_managed_preimage(
+        &self,
+        expected: &ManagedAuthStoragePreimage,
+    ) -> Result<bool, ManagedAuthStorageError> {
+        self.lock_managed_source()?
+            .verify_managed_preimage(expected)
     }
 
     fn load(&self) -> std::io::Result<Option<AuthDotJson>> {
@@ -103,3 +196,7 @@ impl AuthStorageBackend for CommittedStorage {
 #[cfg(test)]
 #[path = "storage_commit_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "storage_guard_tests.rs"]
+mod guard_tests;

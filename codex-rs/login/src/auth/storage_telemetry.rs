@@ -75,6 +75,18 @@ impl AuthStorageBackend for ObservedStorage {
         self.inner.persistent_home()
     }
 
+    fn load_managed(
+        &self,
+    ) -> Result<super::ManagedAuthStorageRead, super::ManagedAuthStorageError> {
+        self.inner.load_managed()
+    }
+
+    fn read_managed_bytes(
+        &self,
+    ) -> Result<super::ManagedAuthStorageBytes, super::ManagedAuthStorageError> {
+        self.inner.read_managed_bytes()
+    }
+
     fn load(&self) -> std::io::Result<Option<AuthDotJson>> {
         let mut telemetry = telemetry(self.mode, self.kind, Operation::Load);
         let result = self.inner.load();

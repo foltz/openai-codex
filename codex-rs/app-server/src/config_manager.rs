@@ -248,6 +248,78 @@ impl ConfigManager {
         }
     }
 
+    /// Strict reset participant: load the real process configuration without
+    /// startup's defaults fallback or poisoned-publication defaults. The caller
+    /// must first retire and replace the account-bound cloud loader; this method
+    /// alone acknowledges neither cloud retirement nor the whole reset inventory.
+    pub(crate) async fn load_managed_reset_config(
+        &self,
+    ) -> Result<Config, crate::managed_transition::ResetInventoryError> {
+        use crate::managed_transition::ResetInventoryError;
+        let cli = self
+            .cli_overrides
+            .read()
+            .map_err(|_| ResetInventoryError::ConfigPublicationUnavailable)?
+            .clone();
+        let features = self
+            .runtime_feature_enablement
+            .read()
+            .map_err(|_| ResetInventoryError::ConfigPublicationUnavailable)?
+            .clone();
+        // Do not let the compatibility accessor substitute an empty cloud loader.
+        drop(
+            self.cloud_config_bundle
+                .read()
+                .map_err(|_| ResetInventoryError::ConfigPublicationUnavailable)?,
+        );
+        let mcp_ema_cancellation = {
+            let roots = self
+                .mcp_ema_cancellation
+                .lock()
+                .map_err(|_| ResetInventoryError::ConfigPublicationUnavailable)?;
+            codex_config::McpEmaCancellation::pending(roots.startup.clone(), roots.lifetime.clone())
+        };
+        let policy_load = self
+            .refresh_application_network_policy()
+            .await
+            .map_err(|_| ResetInventoryError::ConfigLoadUnavailable)?;
+        let mut config = ConfigBuilder::default()
+            .codex_home(self.codex_home.clone())
+            .cli_overrides(cli)
+            .loader_overrides(self.loader_overrides.clone())
+            .strict_config(self.strict_config)
+            .fallback_cwd(Some(self.codex_home.clone()))
+            .cloud_config_bundle(policy_load.cloud_config.clone())
+            .thread_config_loader(Arc::clone(&self.thread_config_loader))
+            .without_project_context()
+            .build()
+            .await
+            .map_err(|_| ResetInventoryError::ConfigLoadUnavailable)?;
+        self.check_application_policy_load(&policy_load)
+            .map_err(|_| ResetInventoryError::ConfigLoadUnavailable)?;
+        self.apply_network_policy(&mut config);
+        config.runtime_feature_defaults = features
+            .iter()
+            .filter_map(|(name, enabled)| feature_for_key(name).map(|feature| (feature, *enabled)))
+            .collect();
+        let protected = protected_feature_keys(&config.config_layer_stack);
+        for (name, enabled) in features {
+            if !protected.contains(&name)
+                && let Some(feature) = feature_for_key(&name)
+            {
+                config
+                    .features
+                    .set_enabled(feature, enabled)
+                    .map_err(|_| ResetInventoryError::ConfigLoadUnavailable)?;
+            }
+        }
+        self.apply_arg0_paths(&mut config);
+        config.config_layer_stack = config
+            .config_layer_stack
+            .with_mcp_ema_cancellation(mcp_ema_cancellation);
+        Ok(config)
+    }
+
     pub(crate) async fn load_latest_config(
         &self,
         fallback_cwd: Option<PathBuf>,
@@ -850,3 +922,7 @@ pub(crate) fn apply_runtime_feature_enablement(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "config_manager_reset_tests.rs"]
+mod reset_tests;

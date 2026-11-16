@@ -75,7 +75,13 @@ impl ConfigManager {
             .map_err(io::Error::other)?;
         let revision = self.network_policy.policy().revision();
         let local_sources = self.load_local_network_policy(revision).await?;
-        let cloud_config = self.current_managed_config_loader();
+        let cloud_config = match self.cloud_config_bundle.read() {
+            Ok(loader) => loader.clone(),
+            Err(_) => {
+                self.fail_application_policy(revision)?;
+                return Err(io::Error::other("cloud config publication lock poisoned"));
+            }
+        };
         let result = async {
             let cloud_snapshot = cloud_config.get_snapshot().await;
             let cloud = cloud_snapshot.bundle.clone().map_err(io::Error::other)?;

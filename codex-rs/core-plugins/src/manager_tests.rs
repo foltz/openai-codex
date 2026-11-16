@@ -9065,7 +9065,13 @@ impl Drop for ReenterInstalledQueueOnDrop {
 
 async fn installed_queue_keeps_prior_callback_original_and_latest_backend(independent: bool) {
     let home = TempDir::new().unwrap();
-    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    let auth_manager = test_auth_manager(None);
+    set_test_auth(&auth_manager, Some(queued_auth("header.e30.installed-old"))).await;
+    let manager = Arc::new(test_plugins_manager_with_auth_manager(
+        home.path().to_owned(),
+        None,
+        auth_manager,
+    ));
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/ps/plugins/installed"))
@@ -9529,7 +9535,13 @@ async fn remote_async_request_births_preserve_real_http_origin(bundle_sync: bool
         &home.path().join(CONFIG_TOML_FILE),
         "[features]\nplugins = true\nremote_plugin = true\n",
     );
-    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    let auth_manager = test_auth_manager(None);
+    set_test_auth(&auth_manager, Some(queued_auth("header.e30.direct"))).await;
+    let manager = Arc::new(test_plugins_manager_with_auth_manager(
+        home.path().to_owned(),
+        None,
+        auth_manager,
+    ));
     let host = QueuedTestHost::new(9);
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -9595,7 +9607,6 @@ async fn remote_async_request_births_preserve_real_http_origin(bundle_sync: bool
 }
 
 mod installed_queue_keeps_prior_callback_original_and_latest_backend {
-    use super::*;
     #[tokio::test(flavor = "current_thread")]
     async fn managed_replacement() {
         super::installed_queue_keeps_prior_callback_original_and_latest_backend(false).await;
@@ -9607,7 +9618,6 @@ mod installed_queue_keeps_prior_callback_original_and_latest_backend {
 }
 
 mod remote_async_request_births_preserve_real_http_origin {
-    use super::*;
     #[tokio::test(flavor = "current_thread")]
     async fn recommendations() {
         super::remote_async_request_births_preserve_real_http_origin(false).await;

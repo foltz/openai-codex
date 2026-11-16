@@ -3529,3 +3529,6 @@ async fn missing_plan_type_maps_to_unknown() {
 
     pretty_assertions::assert_eq!(auth.account_plan_type(), Some(AccountPlanType::Unknown));
 }
+
+#[path = "authoritative_cache_tests.rs"]
+mod authoritative_cache;

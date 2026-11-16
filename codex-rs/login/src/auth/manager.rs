@@ -1983,6 +1983,11 @@ struct AuthReload {
 #[derive(Clone)]
 struct CachedAuth {
     auth: Option<CodexAuth>,
+    /// `None` auth is authoritative only when the initial persisted-state read
+    /// completed successfully. Keep an initialization failure distinct so a
+    /// restart-sensitive consumer cannot mistake an unreadable authority for a
+    /// logged-out account.
+    initial_load_failed: bool,
     /// Permanent refresh failure cached for the current auth snapshot so
     /// later refresh attempts for the same credentials fail fast without network.
     permanent_refresh_failure: Option<AuthScopedRefreshFailure>,
@@ -1992,6 +1997,14 @@ struct CachedAuth {
 struct AuthScopedRefreshFailure {
     auth: CodexAuth,
     error: RefreshTokenFailedError,
+}
+
+/// A caller that needs a restart-safe account snapshot must distinguish a
+/// confirmed logged-out state from an unreadable cached authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthoritativeAuthUnavailable {
+    InitialLoadFailed,
+    CacheLockUnavailable,
 }
 
 impl Debug for CachedAuth {
@@ -2377,11 +2390,11 @@ impl AuthManager {
         enable_codex_api_key_env: bool,
         allowed_auth_modes: Option<Vec<AuthMode>>,
     ) -> Self {
-        let managed_auth = auth_config
+        let initial_load = auth_config
             .load_auth_with_modes(enable_codex_api_key_env, allowed_auth_modes.as_deref())
-            .await
-            .ok()
-            .flatten();
+            .await;
+        let initial_load_failed = initial_load.is_err();
+        let managed_auth = initial_load.ok().flatten();
         let AuthConfig {
             codex_home,
             auth_credentials_store_mode,
@@ -2399,6 +2412,7 @@ impl AuthManager {
             codex_home,
             inner: RwLock::new(CachedAuth {
                 auth: managed_auth,
+                initial_load_failed,
                 permanent_refresh_failure: None,
             }),
             auth_change_tx,
@@ -2474,6 +2488,7 @@ impl AuthManager {
     ) -> Arc<Self> {
         let cached = CachedAuth {
             auth,
+            initial_load_failed: false,
             permanent_refresh_failure: None,
         };
         let (auth_change_tx, _auth_change_rx) = watch::channel(0);
@@ -2512,6 +2527,7 @@ impl AuthManager {
     pub fn from_auth_for_testing_with_home(auth: CodexAuth, codex_home: PathBuf) -> Arc<Self> {
         let cached = CachedAuth {
             auth: Some(auth),
+            initial_load_failed: false,
             permanent_refresh_failure: None,
         };
         let (auth_change_tx, _auth_change_rx) = watch::channel(0);
@@ -2549,6 +2565,7 @@ impl AuthManager {
     ) -> Arc<Self> {
         let cached = CachedAuth {
             auth: Some(auth),
+            initial_load_failed: false,
             permanent_refresh_failure: None,
         };
         let (auth_change_tx, _auth_change_rx) = watch::channel(0);
@@ -2597,6 +2614,7 @@ impl AuthManager {
             codex_home: PathBuf::from("non-existent"),
             inner: RwLock::new(CachedAuth {
                 auth: None,
+                initial_load_failed: false,
                 permanent_refresh_failure: None,
             }),
             auth_change_tx,
@@ -2632,6 +2650,67 @@ impl AuthManager {
             .read()
             .ok()
             .and_then(|cached| cached.auth.clone())
+    }
+
+    /// Returns the cached startup authority without collapsing an unavailable
+    /// source into a logged-out state. This is intentionally separate from
+    /// [`Self::auth_cached`], whose established callers treat unavailable auth
+    /// as unauthenticated for their own compatibility reasons.
+    pub fn authoritative_auth_cached(
+        &self,
+    ) -> Result<Option<CodexAuth>, AuthoritativeAuthUnavailable> {
+        let cached = self
+            .inner
+            .read()
+            .map_err(|_| AuthoritativeAuthUnavailable::CacheLockUnavailable)?;
+        if cached.initial_load_failed {
+            return Err(AuthoritativeAuthUnavailable::InitialLoadFailed);
+        }
+        Ok(cached.auth.clone())
+    }
+
+    /// Credential-free startup identity with the same availability semantics
+    /// as `authoritative_auth_cached`. Mode eligibility is a separate check;
+    /// this snapshot does not turn an unsupported mode into unavailable auth.
+    pub fn authoritative_managed_auth_fingerprint(
+        &self,
+    ) -> Result<Option<String>, AuthoritativeAuthUnavailable> {
+        let cached = self
+            .inner
+            .read()
+            .map_err(|_| AuthoritativeAuthUnavailable::CacheLockUnavailable)?;
+        if cached.initial_load_failed {
+            return Err(AuthoritativeAuthUnavailable::InitialLoadFailed);
+        }
+        Ok(cached
+            .auth
+            .as_ref()
+            .and_then(CodexAuth::get_account_id)
+            .as_deref()
+            .map(Self::managed_account_fingerprint))
+    }
+
+    /// Eligibility of the current cached authority, without refreshing or
+    /// reading a new durable result. Unavailable state is never logout.
+    pub fn managed_transition_eligible(&self) -> Result<bool, AuthoritativeAuthUnavailable> {
+        let external = self
+            .external_auth
+            .read()
+            .map_err(|_| AuthoritativeAuthUnavailable::CacheLockUnavailable)?;
+        if external.is_some() {
+            return Ok(false);
+        }
+        let auth = self.authoritative_auth_cached()?;
+        Ok(matches!(auth, Some(CodexAuth::Chatgpt(_))))
+    }
+
+    /// Token-free equality fingerprint shared by managed admission and install.
+    pub fn managed_account_fingerprint(account_id: &str) -> String {
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"codex-app-server/managed-auth-transition/account/v1\\0");
+        hasher.update(account_id.as_bytes());
+        format!("{:x}", hasher.finalize())
     }
 
     /// Current revisions if the selected credential still belongs to this manager's source.

@@ -98,6 +98,10 @@ fn is_unsupported_untrusted_approval_policy_error(err: &std::io::Error) -> bool 
 pub use codex_agent_message_board_host::delete_agent_message_boards;
 pub use codex_agent_message_board_host::install_agent_message_board;
 
+mod account_operation_work;
+mod account_turn_admission;
+mod account_turn_work;
+mod account_work_permits;
 mod analytics_utils;
 mod app_info;
 mod app_server_tracing;

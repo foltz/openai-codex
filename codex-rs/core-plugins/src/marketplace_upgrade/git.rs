@@ -101,6 +101,7 @@ pub(super) fn stage_git_clone(
     reference: Option<CloneReference<'_>>,
     mode: PluginGitMode,
 ) -> Result<MarketplaceStagingDir, String> {
+    crate::retirement::ensure_worker_running("marketplace clone staging")?;
     let run_git_clone = |reference| -> Result<_, String> {
         let staged_dir = MarketplaceStagingDir::new(install_root).map_err(|err| {
             format!(
@@ -125,6 +126,7 @@ pub(super) fn stage_git_clone(
     {
         return Ok(staged_dir);
     }
+    crate::retirement::ensure_worker_running("plain-clone fallback")?;
     run_git_clone(/*reference*/ None)
 }
 
@@ -275,6 +277,11 @@ fn run_git_command_with_timeout(
     context: &str,
     timeout: Duration,
 ) -> Result<Output, String> {
+    let stop = crate::retirement::current_worker_stop();
+    if stop.is_managed() {
+        crate::retirement::ensure_worker_running(context)?;
+        return crate::owned_process::run_output(command, context, timeout, stop);
+    }
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -411,5 +418,60 @@ mod tests {
             .get_envs()
             .find(|(key, _)| key == &OsStr::new(name))
             .map(|(_, value)| value)
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn managed_marketplace_git_observes_late_owner_deadline() {
+        let home = tempfile::tempdir().unwrap();
+        let ready = home.path().join("ready");
+        let command_ready = ready.clone();
+        let registry = crate::PluginTaskRegistry::default();
+        let (done, result) = tokio::sync::oneshot::channel();
+        let receipt = registry
+            .spawn_thread("marketplace-command-stop-probe", move || {
+                let mut command = std::process::Command::new("/bin/sh");
+                command
+                    .args(["-c", "printf '%s' $$ > \"$1\"; exec /bin/sleep 5", "probe"])
+                    .arg(command_ready);
+                let _ = done.send(super::run_git_command_with_timeout(
+                    &mut command,
+                    "owned marketplace git",
+                    std::time::Duration::from_secs(5),
+                ));
+            })
+            .unwrap();
+        let pid: i32 = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(raw) = std::fs::read_to_string(&ready) {
+                    if let Ok(pid) = raw.parse() {
+                        break pid;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let _ = registry.shutdown_until(tokio::time::Instant::now()).await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), result)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err()
+                .contains("shutdown deadline")
+        );
+        assert_eq!(receipt.await, crate::retirement::JoinOutcome::Joined);
+        assert!(
+            registry
+                .shutdown_until(tokio::time::Instant::now())
+                .await
+                .is_clean()
+        );
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
     }
 }

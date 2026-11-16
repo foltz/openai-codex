@@ -129,6 +129,9 @@ pub(crate) fn unpack_plugin_bundle_tar_gz(
     destination: &Path,
     max_total_bytes: u64,
 ) -> Result<(), PluginBundleUnpackError> {
+    crate::retirement::ensure_worker_running("plugin archive extraction").map_err(|error| {
+        PluginBundleUnpackError::io("plugin worker stopped", io::Error::other(error))
+    })?;
     fs::create_dir_all(destination).map_err(|source| {
         PluginBundleUnpackError::io(
             "failed to create plugin bundle extraction directory",
@@ -137,7 +140,7 @@ pub(crate) fn unpack_plugin_bundle_tar_gz(
     })?;
 
     let archive = GzDecoder::new(std::io::Cursor::new(bytes));
-    let mut archive = Archive::new(archive);
+    let mut archive = Archive::new(crate::retirement::WorkerRead::new(archive));
     unpack_plugin_bundle_tar(&mut archive, destination, max_total_bytes)
 }
 
@@ -151,6 +154,9 @@ fn unpack_plugin_bundle_tar<R: Read>(
         PluginBundleUnpackError::io("failed to read plugin bundle tar", source)
     })?;
     for entry in entries {
+        crate::retirement::ensure_worker_running("plugin archive entry").map_err(|error| {
+            PluginBundleUnpackError::io("plugin worker stopped", io::Error::other(error))
+        })?;
         let mut entry = entry.map_err(|source| {
             PluginBundleUnpackError::io("failed to read plugin bundle tar entry", source)
         })?;

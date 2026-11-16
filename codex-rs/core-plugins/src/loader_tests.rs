@@ -1194,3 +1194,26 @@ fn materialize_git_source_rejects_sha_that_resolves_to_hostile_default_branch() 
         format!("checked out Git SHA {malicious_sha} does not match requested SHA {benign_sha}")
     );
 }
+
+#[tokio::test]
+async fn expired_local_materialization_refuses_before_source_use() {
+    let home = tempfile::tempdir().unwrap();
+    let root = AbsolutePathBuf::try_from(home.path().to_owned()).unwrap();
+    fs::write(home.path().join("original"), "unchanged").unwrap();
+    let registry = crate::PluginTaskRegistry::default();
+    registry.shutdown_until(tokio::time::Instant::now()).await;
+    let _scope = crate::retirement::WorkerStopScope::enter(registry.worker_stop());
+    let error = materialize_marketplace_plugin_source_with_mode(
+        home.path(),
+        &MarketplacePluginSource::Local { path: root },
+        PluginGitMode::Automatic,
+    )
+    .err()
+    .unwrap();
+    assert!(error.contains("shutdown deadline"));
+    assert_eq!(
+        fs::read(home.path().join("original")).unwrap(),
+        b"unchanged"
+    );
+    assert!(!home.path().join("plugins").exists());
+}

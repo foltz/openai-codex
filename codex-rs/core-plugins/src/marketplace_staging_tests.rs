@@ -195,3 +195,52 @@ fn cleanup_limits_each_pass_and_skips_contended_locks() -> Result<()> {
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn owned_staging_lock_stops_without_stealing_existing_coordination() {
+    let root = tempfile::tempdir().unwrap();
+    let held = open_lock(&root.path().join(COORDINATION_LOCK)).unwrap();
+    held.lock().unwrap();
+    let registry = crate::PluginTaskRegistry::default();
+    let install = root.path().to_owned();
+    let (done, result) = tokio::sync::oneshot::channel();
+    let receipt = registry
+        .spawn_thread("staging-lock-stop-probe", move || {
+            let _ = done.send(MarketplaceStagingDir::new(&install).map(|_| ()));
+        })
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !root.path().join(".staging").exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let _ = registry.shutdown_until(tokio::time::Instant::now()).await;
+    let outcome = tokio::time::timeout(Duration::from_secs(2), result).await;
+    // Release even on a regression, so the fixture itself cannot strand the
+    // real original while the assertion is being reported.
+    held.unlock().unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), receipt)
+            .await
+            .unwrap(),
+        crate::retirement::JoinOutcome::Joined
+    );
+    assert!(
+        outcome
+            .unwrap()
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("shutdown deadline")
+    );
+    let check = open_lock(&root.path().join(COORDINATION_LOCK)).unwrap();
+    check.try_lock().unwrap();
+    assert!(
+        registry
+            .shutdown_until(tokio::time::Instant::now())
+            .await
+            .is_clean()
+    );
+}

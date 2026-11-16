@@ -34,10 +34,12 @@ pub(crate) struct MarketplaceStagingDir {
 
 impl MarketplaceStagingDir {
     pub(crate) fn new(install_root: &Path) -> io::Result<Self> {
+        crate::retirement::ensure_worker_running("marketplace staging")
+            .map_err(io::Error::other)?;
         let staging_root = Self::staging_root(install_root);
         fs::create_dir_all(&staging_root)?;
         let coordination = open_lock(&install_root.join(COORDINATION_LOCK))?;
-        coordination.lock()?;
+        crate::retirement::lock_worker_file(&coordination)?;
         let directory = tempfile::Builder::new()
             .prefix(&Self::directory_prefix())
             .tempdir_in(&staging_root)?;
@@ -70,6 +72,9 @@ impl MarketplaceStagingDir {
 }
 
 pub(crate) fn cleanup_marketplace_staging(install_root: &Path) {
+    if crate::retirement::ensure_worker_running("stale staging cleanup").is_err() {
+        return;
+    }
     if let Err(err) = remove_stale_staging_dirs(install_root, SystemTime::now()) {
         warn!("failed to clean up marketplace staging directories: {err}");
     }

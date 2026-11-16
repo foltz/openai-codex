@@ -39,3 +39,19 @@ fn invalid_portable_manifest_is_rejected_before_packing() {
         PluginBundlePackError::InvalidPluginPath { .. }
     ));
 }
+
+#[tokio::test]
+async fn expired_archive_extraction_creates_no_destination() {
+    let home = tempfile::tempdir().unwrap();
+    let destination = home.path().join("extracted");
+    let registry = crate::PluginTaskRegistry::default();
+    registry.shutdown_until(tokio::time::Instant::now()).await;
+    let _scope = crate::retirement::WorkerStopScope::enter(registry.worker_stop());
+    assert!(
+        unpack_plugin_bundle_tar_gz(&[], &destination, 1024)
+            .unwrap_err()
+            .to_string()
+            .contains("shutdown deadline")
+    );
+    assert!(!destination.exists());
+}

@@ -116,7 +116,9 @@ pub(crate) fn upgrade_configured_git_marketplaces_with_mode(
     reload_config: &ConfigLayerReload,
 ) -> ConfiguredMarketplaceUpgradeOutcome {
     let install_root = marketplace_install_root(codex_home);
-    cleanup_marketplace_staging(&install_root);
+    if crate::retirement::ensure_worker_running("stale marketplace staging cleanup").is_ok() {
+        cleanup_marketplace_staging(&install_root);
+    }
     let loaded = load_configured_git_marketplaces(config_layer_stack);
     let marketplaces = loaded
         .marketplaces
@@ -142,6 +144,13 @@ pub(crate) fn upgrade_configured_git_marketplaces_with_mode(
     let mut upgraded_roots = Vec::new();
     let policy = MarketplacePolicy::from_requirements(config_layer_stack.requirements());
     for marketplace in marketplaces {
+        if let Err(message) = crate::retirement::ensure_worker_running("next marketplace upgrade") {
+            errors.push(ConfiguredMarketplaceUpgradeError {
+                marketplace_name: marketplace.name,
+                message,
+            });
+            break;
+        }
         let normalized_source =
             match validate_marketplace_name_for_add(/*expected_name*/ None, &marketplace.name)
                 .and_then(|()| {
@@ -253,6 +262,7 @@ fn upgrade_configured_git_marketplace(
     normalized_source: Option<&MarketplaceSource>,
     mode: PluginGitMode,
 ) -> Result<Option<AbsolutePathBuf>, String> {
+    crate::retirement::ensure_worker_running("marketplace source lookup")?;
     validate_plugin_segment(&marketplace.name, "marketplace name")?;
     let (resolved_source, ref_name) = match normalized_source {
         Some(MarketplaceSource::Git { url, ref_name }) => (url.as_str(), ref_name.as_deref()),
@@ -327,6 +337,7 @@ fn upgrade_configured_git_marketplace(
     let marketplace_name = validate_marketplace_root(staged_dir.path())
         .map_err(|err| format!("failed to validate upgraded marketplace root: {err}"))?;
     if marketplace_name != marketplace.name {
+        crate::retirement::ensure_worker_running("marketplace rejection cache")?;
         let error = name_mismatch(&marketplace_name);
         // HEAD may have moved since ls-remote. Only cache the revision we validated.
         if let Some((path, inputs)) = rejection
@@ -341,6 +352,7 @@ fn upgrade_configured_git_marketplace(
         }
         return Err(error);
     }
+    crate::retirement::ensure_worker_running("marketplace installation metadata")?;
     write_installed_marketplace_metadata(staged_dir.path(), marketplace, &activated_revision)?;
     activate_marketplace_root(&destination, staged_dir.path(), &previous_snapshot, || {
         ensure_configured_git_marketplace_unchanged(reload_config, marketplace)

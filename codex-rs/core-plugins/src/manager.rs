@@ -166,6 +166,44 @@ const LOADED_PLUGINS_CACHE_CAPACITY: usize = 8;
 
 type EffectivePluginsChangedCallback = Arc<dyn Fn(EffectivePluginsChange) + Send + Sync + 'static>;
 
+enum BlockingPluginWorkerKind {
+    MarketplaceUpgrade,
+    NonCuratedRefresh,
+}
+struct BlockingPluginWorkerReset {
+    manager: Arc<PluginsManager>,
+    kind: BlockingPluginWorkerKind,
+}
+impl Drop for BlockingPluginWorkerReset {
+    fn drop(&mut self) {
+        match self.kind {
+            BlockingPluginWorkerKind::MarketplaceUpgrade => {
+                self.manager
+                    .configured_marketplace_upgrade_state
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .in_flight = false;
+            }
+            BlockingPluginWorkerKind::NonCuratedRefresh => {
+                let mut state = self
+                    .manager
+                    .non_curated_cache_refresh_state
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state.in_flight || state.requested.is_some() {
+                    state.in_flight = false;
+                    state.requested = None;
+                    self.manager
+                        .non_curated_cache_refresh_completion
+                        .send_modify(|completion| {
+                            completion.sequence = completion.sequence.wrapping_add(1)
+                        });
+                }
+            }
+        }
+    }
+}
+
 /// Existing once-per-process start flag, released on refusal, creation failure
 /// or panic as well as ordinary sync failure. Only successful sync commits it.
 struct CuratedSyncStart {
@@ -3093,64 +3131,77 @@ impl PluginsManager {
             if should_spawn_marketplace_auto_upgrade {
                 let manager = Arc::clone(self);
                 let config = config.clone();
-                let on_effective_plugins_changed = on_effective_plugins_changed.clone();
-                let runtime = tokio::runtime::Handle::current();
+                let completion = BlockingPluginWorkerReset {
+                    manager: manager.clone(),
+                    kind: BlockingPluginWorkerKind::MarketplaceUpgrade,
+                };
+                let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+                    warn!("failed to admit marketplace upgrade without a runtime");
+                    let _ = upgrade_warnings.send(
+                        "Codex could not start marketplace updates: runtime unavailable"
+                            .to_string(),
+                    );
+                    return;
+                };
+                let on_effective_plugins_changed =
+                    on_effective_plugins_changed.clone().map(|callback| {
+                        dispatch_on_runtime(self.task_registry.clone(), runtime, callback)
+                    });
                 let task_warnings = upgrade_warnings.clone();
-                if let Err(err) = std::thread::Builder::new()
-                    .name("plugins-marketplace-auto-upgrade".to_string())
-                    .spawn(move || {
-                        let outcome = manager.upgrade_configured_marketplaces_for_config_with_mode(
-                            &config,
-                            /*marketplace_name*/ None,
-                            PluginGitMode::Automatic,
-                            &reload_config,
-                        );
-                        match outcome {
-                            Ok(outcome) => {
-                                if !outcome.upgraded_roots.is_empty()
-                                    && let Some(on_effective_plugins_changed) =
-                                        on_effective_plugins_changed
-                                {
-                                    runtime.spawn(async move {
+                if let Err(()) =
+                    self.task_registry
+                        .spawn_thread("plugins-marketplace-auto-upgrade", move || {
+                            let _completion = completion;
+                            let outcome = manager
+                                .upgrade_configured_marketplaces_for_config_with_mode(
+                                    &config,
+                                    /*marketplace_name*/ None,
+                                    PluginGitMode::Automatic,
+                                    &reload_config,
+                                );
+                            match outcome {
+                                Ok(outcome) => {
+                                    if !outcome.upgraded_roots.is_empty()
+                                        && let Some(on_effective_plugins_changed) =
+                                            on_effective_plugins_changed
+                                    {
                                         on_effective_plugins_changed(
                                             EffectivePluginsChange::default(),
                                         );
-                                    });
+                                    }
+                                    for error in outcome.errors {
+                                        warn!(
+                                            marketplace = error.marketplace_name,
+                                            error = %error.message,
+                                            "failed to auto-upgrade configured marketplace"
+                                        );
+                                        let _ = task_warnings.send(format!(
+                                            "Codex could not update marketplace `{}`: {}",
+                                            error.marketplace_name, error.message
+                                        ));
+                                    }
                                 }
-                                for error in outcome.errors {
-                                    warn!(
-                                        marketplace = error.marketplace_name,
-                                        error = %error.message,
-                                        "failed to auto-upgrade configured marketplace"
-                                    );
+                                Err(err) => {
+                                    warn!("failed to auto-upgrade configured marketplaces: {err}");
                                     let _ = task_warnings.send(format!(
-                                        "Codex could not update marketplace `{}`: {}",
-                                        error.marketplace_name, error.message
+                                        "Codex could not update marketplaces: {err}"
                                     ));
                                 }
                             }
-                            Err(err) => {
-                                warn!("failed to auto-upgrade configured marketplaces: {err}");
-                                let _ = task_warnings
-                                    .send(format!("Codex could not update marketplaces: {err}"));
-                            }
-                        }
 
-                        let mut state = match manager.configured_marketplace_upgrade_state.write() {
-                            Ok(state) => state,
-                            Err(err) => err.into_inner(),
-                        };
-                        state.in_flight = false;
-                    })
+                            let mut state =
+                                match manager.configured_marketplace_upgrade_state.write() {
+                                    Ok(state) => state,
+                                    Err(err) => err.into_inner(),
+                                };
+                            state.in_flight = false;
+                        })
                 {
-                    let mut state = match self.configured_marketplace_upgrade_state.write() {
-                        Ok(state) => state,
-                        Err(err) => err.into_inner(),
-                    };
-                    state.in_flight = false;
-                    warn!("failed to start configured marketplace auto-upgrade task: {err}");
-                    let _ = upgrade_warnings
-                        .send(format!("Codex could not start marketplace updates: {err}"));
+                    warn!("failed to admit configured marketplace auto-upgrade task");
+                    let _ = upgrade_warnings.send(
+                        "Codex could not start marketplace updates: task owner unavailable"
+                            .to_string(),
+                    );
                 }
             }
             let config_for_remote_sync = config.clone();
@@ -3196,6 +3247,7 @@ impl PluginsManager {
         mode: PluginGitMode,
         reload_config: &ConfigLayerReload,
     ) -> Result<ConfiguredMarketplaceUpgradeOutcome, String> {
+        crate::retirement::ensure_worker_running("configured marketplace upgrade")?;
         let mut outcome = upgrade_configured_git_marketplaces_with_mode(
             self.codex_home.as_path(),
             &config.config_layer_stack,
@@ -3211,6 +3263,18 @@ impl PluginsManager {
             ));
         }
         if !outcome.upgraded_roots.is_empty() {
+            if let Err(message) =
+                crate::retirement::ensure_worker_running("post-upgrade plugin refresh")
+            {
+                self.clear_cache();
+                outcome.errors.push(ConfiguredMarketplaceUpgradeError {
+                    marketplace_name: marketplace_name
+                        .unwrap_or("all configured marketplaces")
+                        .to_string(),
+                    message,
+                });
+                return Ok(outcome);
+            }
             let mut configured_plugin_keys = configured_plugins_from_stack(
                 &config.config_layer_stack,
                 self.codex_home.as_path(),
@@ -3518,21 +3582,18 @@ impl PluginsManager {
         }
 
         let manager = Arc::clone(self);
-        if let Err(err) = std::thread::Builder::new()
-            .name("plugins-non-curated-cache-refresh".to_string())
-            .spawn(move || manager.run_non_curated_plugin_cache_refresh_loop())
+        let completion = BlockingPluginWorkerReset {
+            manager: manager.clone(),
+            kind: BlockingPluginWorkerKind::NonCuratedRefresh,
+        };
+        if let Err(()) =
+            self.task_registry
+                .spawn_thread("plugins-non-curated-cache-refresh", move || {
+                    let _completion = completion;
+                    manager.run_non_curated_plugin_cache_refresh_loop();
+                })
         {
-            let mut state = match self.non_curated_cache_refresh_state.write() {
-                Ok(state) => state,
-                Err(err) => err.into_inner(),
-            };
-            state.in_flight = false;
-            state.requested = None;
-            self.non_curated_cache_refresh_completion
-                .send_modify(|completion| {
-                    completion.sequence = completion.sequence.wrapping_add(1);
-                });
-            warn!("failed to start non-curated plugin cache refresh task: {err}");
+            warn!("failed to admit non-curated plugin cache refresh task");
         }
     }
 
@@ -3753,6 +3814,12 @@ impl PluginsManager {
 
     fn run_non_curated_plugin_cache_refresh_loop(self: Arc<Self>) {
         loop {
+            if let Err(error) =
+                crate::retirement::ensure_worker_running("next non-curated cache request")
+            {
+                warn!(%error, "non-curated plugin cache worker stopped");
+                return;
+            }
             let request = {
                 let state = match self.non_curated_cache_refresh_state.read() {
                     Ok(state) => state,

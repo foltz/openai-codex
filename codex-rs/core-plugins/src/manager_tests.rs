@@ -8640,3 +8640,155 @@ async fn curated_worker_late_sync_success_does_not_begin_cache_publication() {
         "uncommitted sync remains retryable"
     );
 }
+
+#[tokio::test]
+async fn closed_owner_refuses_blocking_plugin_workers_and_releases_queue_flags() {
+    let home = tempfile::tempdir().unwrap();
+    let unused_remote = home.path().join("unused-remote");
+    fs::create_dir_all(&unused_remote).unwrap();
+    let remote = url::Url::from_directory_path(&unused_remote).unwrap();
+    write_file(
+        &home.path().join(CONFIG_TOML_FILE),
+        &format!(
+            "[features]\nplugins = true\n[marketplaces.debug]\nsource_type = \"git\"\nsource = \"{remote}\"\n"
+        ),
+    );
+    let config = load_config(home.path(), home.path()).await;
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    assert!(
+        manager
+            .shutdown_until(tokio::time::Instant::now())
+            .await
+            .is_clean()
+    );
+    let stack = config.config_layer_stack.clone();
+    let reload: ConfigLayerReload = Arc::new(move || Ok(stack.clone()));
+    let (warnings, mut received) = mpsc::unbounded_channel();
+    manager.maybe_start_plugin_startup_tasks_for_config(&config, reload, None, warnings);
+    assert!(
+        !manager
+            .configured_marketplace_upgrade_state
+            .read()
+            .unwrap()
+            .in_flight
+    );
+    assert!(
+        received
+            .try_recv()
+            .unwrap()
+            .contains("task owner unavailable")
+    );
+    manager.schedule_non_curated_plugin_cache_refresh(NonCuratedCacheRefreshRequest {
+        roots: Vec::new(),
+        configured_plugin_keys: Vec::new(),
+        configured_plugin_sources: Vec::new(),
+        mode: NonCuratedCacheRefreshMode::IfVersionChanged,
+        git_mode: PluginGitMode::Automatic,
+    });
+    let state = manager.non_curated_cache_refresh_state.read().unwrap();
+    assert!(!state.in_flight && state.requested.is_none() && state.last_refreshed.is_none());
+    drop(state);
+    assert!(
+        !crate::installed_marketplaces::marketplace_install_root(home.path())
+            .join(".staging")
+            .exists()
+    );
+    assert!(
+        manager
+            .shutdown_until(tokio::time::Instant::now())
+            .await
+            .is_clean()
+    );
+}
+
+#[tokio::test]
+async fn blocking_plugin_panic_resets_pending_cache_request_without_clean_join() {
+    let home = tempfile::tempdir().unwrap();
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    {
+        let mut state = manager.non_curated_cache_refresh_state.write().unwrap();
+        state.in_flight = true;
+        state.requested = Some(NonCuratedCacheRefreshRequest {
+            roots: Vec::new(),
+            configured_plugin_keys: Vec::new(),
+            configured_plugin_sources: Vec::new(),
+            mode: NonCuratedCacheRefreshMode::IfVersionChanged,
+            git_mode: PluginGitMode::Automatic,
+        });
+    }
+    let completion = BlockingPluginWorkerReset {
+        manager: manager.clone(),
+        kind: BlockingPluginWorkerKind::NonCuratedRefresh,
+    };
+    let receipt = manager
+        .task_registry
+        .spawn_thread("non-curated-panic-probe", move || {
+            let _completion = completion;
+            panic!("synthetic actual blocking plugin worker panic");
+        })
+        .unwrap();
+    assert_eq!(receipt.await, crate::retirement::JoinOutcome::Panicked);
+    let state = manager.non_curated_cache_refresh_state.read().unwrap();
+    assert!(!state.in_flight && state.requested.is_none() && state.last_refreshed.is_none());
+    drop(state);
+    let report = manager.shutdown_until(tokio::time::Instant::now()).await;
+    assert!(report.terminal && report.panicked && !report.is_clean());
+}
+
+#[test]
+fn missing_runtime_refuses_both_blocking_workers_without_stuck_gates() {
+    let home = tempfile::tempdir().unwrap();
+    write_file(
+        &home.path().join(CONFIG_TOML_FILE),
+        "[features]\nplugins = true\n",
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let config = runtime.block_on(load_config(home.path(), home.path()));
+    drop(runtime);
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    let stack = config.config_layer_stack.clone();
+    let reload: ConfigLayerReload = Arc::new(move || Ok(stack.clone()));
+    let (warnings, mut received) = mpsc::unbounded_channel();
+    manager.maybe_start_plugin_startup_tasks_for_config(&config, reload, None, warnings);
+    assert!(
+        !manager
+            .configured_marketplace_upgrade_state
+            .read()
+            .unwrap()
+            .in_flight
+    );
+    assert!(received.try_recv().unwrap().contains("runtime unavailable"));
+    let before = manager
+        .non_curated_cache_refresh_completion
+        .borrow()
+        .sequence;
+    manager.schedule_non_curated_plugin_cache_refresh(NonCuratedCacheRefreshRequest {
+        roots: Vec::new(),
+        configured_plugin_keys: Vec::new(),
+        configured_plugin_sources: Vec::new(),
+        mode: NonCuratedCacheRefreshMode::IfVersionChanged,
+        git_mode: PluginGitMode::Automatic,
+    });
+    let state = manager.non_curated_cache_refresh_state.read().unwrap();
+    assert!(!state.in_flight && state.requested.is_none() && state.last_refreshed.is_none());
+    drop(state);
+    assert_eq!(
+        manager
+            .non_curated_cache_refresh_completion
+            .borrow()
+            .sequence,
+        before.wrapping_add(1)
+    );
+    let observer = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    assert!(
+        observer
+            .block_on(manager.shutdown_until(tokio::time::Instant::now()))
+            .is_clean()
+    );
+}

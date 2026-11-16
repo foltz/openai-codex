@@ -557,6 +557,8 @@ fn replace_plugin_root_atomically(
     plugin_version: &str,
     manifest: InstallManifest<'_>,
 ) -> Result<(), PluginStoreError> {
+    crate::retirement::ensure_worker_running("plugin cache staging")
+        .map_err(PluginStoreError::Invalid)?;
     let Some(parent) = target_root.parent() else {
         return Err(PluginStoreError::Invalid(format!(
             "plugin cache path has no parent: {}",
@@ -645,6 +647,8 @@ fn replace_plugin_root_atomically(
         tracing::warn!(%err, "failed to migrate plugin commands into skills");
     }
 
+    crate::retirement::ensure_worker_running("plugin cache activation")
+        .map_err(PluginStoreError::Invalid)?;
     let target_version_root = target_root.join(plugin_version);
     if target_root.exists() && !target_version_root.exists() {
         fs::rename(&staged_version_root, &target_version_root).map_err(|err| {
@@ -734,6 +738,8 @@ fn compare_plugin_versions(left: &str, right: &str) -> Ordering {
 }
 
 fn copy_dir_recursive(source: &Path, target: &Path) -> Result<(), PluginStoreError> {
+    crate::retirement::ensure_worker_running("plugin source copy")
+        .map_err(PluginStoreError::Invalid)?;
     fs::create_dir_all(target)
         .map_err(|err| PluginStoreError::io("failed to create plugin target directory", err))?;
 
@@ -742,6 +748,8 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> Result<(), PluginStoreErr
     {
         let entry =
             entry.map_err(|err| PluginStoreError::io("failed to enumerate plugin source", err))?;
+        crate::retirement::ensure_worker_running("next plugin copy entry")
+            .map_err(PluginStoreError::Invalid)?;
         let source_path = entry.path();
         let target_path = target.join(entry.file_name());
         let file_type = entry

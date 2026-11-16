@@ -128,6 +128,7 @@ pub(super) fn activate_marketplace_root(
     previous_snapshot: &InstalledMarketplaceSnapshot,
     after_activate: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
+    crate::retirement::ensure_worker_running("marketplace activation")?;
     let Some(parent) = destination.parent() else {
         return Err(format!(
             "failed to determine marketplace install parent for {}",
@@ -257,4 +258,36 @@ fn installed_marketplace_metadata(
 
 fn installed_marketplace_metadata_path(root: &Path) -> PathBuf {
     root.join(MARKETPLACE_INSTALL_METADATA_FILE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn expired_activation_never_moves_original_or_staging() {
+        let home = tempfile::tempdir().unwrap();
+        let destination = home.path().join("installed");
+        let staging = home.path().join("staged");
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(destination.join("data"), "original").unwrap();
+        std::fs::write(staging.join("data"), "replacement").unwrap();
+        let snapshot = read_installed_marketplace_snapshot(&destination, "debug");
+        let registry = crate::PluginTaskRegistry::default();
+        registry.shutdown_until(tokio::time::Instant::now()).await;
+        let _scope = crate::retirement::WorkerStopScope::enter(registry.worker_stop());
+        let called = std::sync::atomic::AtomicBool::new(false);
+        let error = activate_marketplace_root(&destination, &staging, &snapshot, || {
+            called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.contains("shutdown deadline"));
+        assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            std::fs::read(destination.join("data")).unwrap(),
+            b"original"
+        );
+        assert_eq!(std::fs::read(staging.join("data")).unwrap(), b"replacement");
+    }
 }

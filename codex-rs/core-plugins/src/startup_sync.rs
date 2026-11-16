@@ -1,5 +1,4 @@
 use crate::retirement::WorkerStop;
-use std::cell::RefCell;
 use std::fs::File;
 use std::path::Path;
 use std::path::PathBuf;
@@ -76,37 +75,15 @@ fn curated_plugins_sha_path(codex_home: &Path) -> PathBuf {
     codex_home.join(CURATED_PLUGINS_SHA_FILE)
 }
 
-thread_local! {
-    /// The dedicated curated-sync worker thread's cooperative stop. Every git
-    /// and HTTP step on this thread reads it, so the stop reaches each step
-    /// without threading it through every helper.
-    static SYNC_STOP: RefCell<WorkerStop> = RefCell::new(WorkerStop::never());
-}
-
-/// Restores the previous stop when the sync returns.
-struct SyncStopScope(Option<WorkerStop>);
-
-impl SyncStopScope {
-    fn enter(stop: WorkerStop) -> Self {
-        Self(Some(SYNC_STOP.with(|current| current.replace(stop))))
-    }
-}
-
-impl Drop for SyncStopScope {
-    fn drop(&mut self) {
-        if let Some(previous) = self.0.take() {
-            SYNC_STOP.with(|current| current.replace(previous));
-        }
-    }
-}
+use crate::retirement::WorkerStopScope as SyncStopScope;
 
 /// `min(cap, owner remaining)` for this thread's current step.
 fn step_budget(cap: Duration) -> Duration {
-    SYNC_STOP.with(|stop| stop.borrow().step_timeout(cap))
+    crate::retirement::current_worker_stop().step_timeout(cap)
 }
 
 fn sync_stopped() -> bool {
-    SYNC_STOP.with(|stop| stop.borrow().is_stopped())
+    crate::retirement::ensure_worker_running("curated sync").is_err()
 }
 
 /// Checked between steps: at the shutdown deadline the worker schedules no
@@ -127,7 +104,8 @@ async fn with_step_budget<T>(
     context: &str,
     step: impl std::future::Future<Output = Result<T, String>>,
 ) -> Result<T, String> {
-    let stop = SYNC_STOP.with(|stop| stop.borrow().clone());
+    crate::retirement::ensure_worker_running(context)?;
+    let stop = crate::retirement::current_worker_stop();
     if !stop.is_managed() {
         // Upstream's request builders already bound each individual request.
         // Do not add an aggregate cap to existing unowned multi-request steps.
@@ -795,7 +773,7 @@ fn run_git_command_with_timeout(
 ) -> Result<Output, String> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        let stop = SYNC_STOP.with(|stop| stop.borrow().clone());
+        let stop = crate::retirement::current_worker_stop();
         if stop.is_managed() {
             return crate::owned_process::run_output(command, context, timeout, stop);
         }

@@ -747,3 +747,35 @@ fn install_rejects_manifest_names_that_do_not_match_marketplace_plugin_name() {
         "plugin.json name `manifest-name` does not match marketplace plugin name `different-name`"
     );
 }
+
+#[tokio::test]
+async fn expired_store_install_preserves_previously_active_version() {
+    let home = tempdir().unwrap();
+    write_plugin_with_version(home.path(), "source", "sample", Some("1.0.0"));
+    let source = AbsolutePathBuf::try_from(home.path().join("source")).unwrap();
+    let id = PluginId::new("sample".into(), "debug".into()).unwrap();
+    let store = PluginStore::new(home.path().to_owned());
+    let installed = store
+        .install_with_version(source.clone(), id.clone(), "1.0.0".into())
+        .unwrap();
+    let manifest = installed.installed_path.join(".codex-plugin/plugin.json");
+    let before = fs::read(&manifest).unwrap();
+    let registry = crate::PluginTaskRegistry::default();
+    registry.shutdown_until(tokio::time::Instant::now()).await;
+    let _scope = crate::retirement::WorkerStopScope::enter(registry.worker_stop());
+    assert!(
+        store
+            .install_with_version(source, id.clone(), "2.0.0".into())
+            .unwrap_err()
+            .to_string()
+            .contains("shutdown deadline")
+    );
+    assert_eq!(store.active_plugin_version(&id).as_deref(), Some("1.0.0"));
+    assert_eq!(fs::read(manifest).unwrap(), before);
+    assert!(
+        !home
+            .path()
+            .join("plugins/cache/debug/sample/2.0.0")
+            .exists()
+    );
+}

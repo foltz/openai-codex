@@ -593,6 +593,7 @@ fn refresh_non_curated_plugin_cache_with_mode(
     mode: NonCuratedCacheRefreshMode,
     git_mode: PluginGitMode,
 ) -> Result<NonCuratedCacheRefreshOutcome, String> {
+    crate::retirement::ensure_worker_running("non-curated cache refresh")?;
     let mut configured_non_curated_plugin_ids = configured_plugin_keys
         .iter()
         .filter_map(|plugin_key| match PluginId::parse(plugin_key) {
@@ -681,6 +682,14 @@ fn refresh_non_curated_plugin_cache_with_mode(
     let mut cache_refreshed = false;
     let mut refresh_errors = Vec::new();
     for plugin_id in configured_non_curated_plugin_ids {
+        if let Err(message) = crate::retirement::ensure_worker_running("next plugin cache refresh")
+        {
+            refresh_errors.push(NonCuratedCacheRefreshError {
+                marketplace_name: plugin_id.marketplace_name,
+                message,
+            });
+            break;
+        }
         let plugin_key = plugin_id.as_key();
         let Some((source, manifest_fallback_contents)) = plugin_sources.get(&plugin_key).cloned()
         else {
@@ -714,6 +723,7 @@ fn refresh_non_curated_plugin_cache_with_mode(
                 return Ok(false);
             }
 
+            crate::retirement::ensure_worker_running("plugin cache installation")?;
             match manifest_fallback_contents.as_deref() {
                 Some(manifest_contents) => store.install_with_version_and_fallback_manifest(
                     source_path,
@@ -1779,6 +1789,7 @@ pub(crate) fn materialize_marketplace_plugin_source_with_mode(
     source: &MarketplacePluginSource,
     mode: PluginGitMode,
 ) -> Result<MaterializedMarketplacePluginSource, String> {
+    crate::retirement::ensure_worker_running("plugin source materialization")?;
     match source {
         MarketplacePluginSource::Local { path } => Ok(MaterializedMarketplacePluginSource {
             path: path.clone(),
@@ -1917,6 +1928,7 @@ fn run_git_output(
     cwd: Option<&Path>,
     mode: PluginGitMode,
 ) -> Result<String, String> {
+    crate::retirement::ensure_worker_running("Git command preparation")?;
     let mut command = mode.command(Path::new("git"));
     command.args(args);
     command.env("GIT_TERMINAL_PROMPT", "0");
@@ -1934,9 +1946,8 @@ fn run_git_output(
         None
     };
 
-    let output = command
-        .output()
-        .map_err(|err| format!("failed to run git {}: {err}", args.join(" ")))?;
+    let output =
+        crate::retirement::current_worker_output(&mut command, &format!("git {}", args.join(" ")))?;
     if output.status.success() {
         return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
     }

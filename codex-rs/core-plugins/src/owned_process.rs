@@ -16,6 +16,7 @@ pub(crate) fn run_output(
     if !stop.is_managed() {
         return Err(format!("{context} requires a managed process owner"));
     }
+    stop.ensure_running("process creation")?;
     if cap.is_zero() || stop.is_stopped() {
         return Err(format!(
             "{context} stopped at the shutdown deadline or step budget before process creation"
@@ -613,5 +614,17 @@ mod tests {
         println!("unreaped_zombie_group_signal_zero={observed}; errno={errno:?}");
         original.signal_group().unwrap();
         assert!(original.reap().unwrap().success());
+    }
+    #[test]
+    fn unavailable_process_owner_refuses_before_new_child_birth() {
+        let registry = PluginTaskRegistry::default();
+        let stop = registry.worker_stop();
+        stop.mark_unavailable();
+        let mut command = Command::new("/not/a/real/program");
+        assert!(
+            run_output(&mut command, "unavailable", Duration::from_secs(2), stop)
+                .unwrap_err()
+                .contains("unavailable custody")
+        );
     }
 }

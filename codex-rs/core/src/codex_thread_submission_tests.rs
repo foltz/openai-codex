@@ -699,3 +699,35 @@ async fn exhausted_history_capture_does_not_record_or_admit_a_fresh_turn() {
     assert!(thread.session.reference_context_item().await.is_none());
     assert_eq!(thread.session.clone_history().await.raw_items().count(), 0);
 }
+
+#[tokio::test]
+async fn public_prewarm_refuses_without_request_work_before_scheduling() {
+    let (mut thread, queue, _) = fixture().await;
+    let gate = Arc::new(RefusingMcpRequest::default());
+    Arc::get_mut(&mut thread.session)
+        .unwrap()
+        .services
+        .host_admission = Some(gate.clone());
+    let mut base = Box::pin(thread.prewarm());
+    assert!(matches!(
+        futures::poll!(&mut base),
+        std::task::Poll::Ready(())
+    ));
+    drop(base);
+    let mut history = Box::pin(thread.prewarm_with_history());
+    assert!(matches!(
+        futures::poll!(&mut history),
+        std::task::Poll::Ready(())
+    ));
+    drop(history);
+    assert_eq!(gate.0.load(Ordering::SeqCst), 2);
+    assert!(queue.is_empty());
+    assert_eq!(
+        thread
+            .session
+            .task_joins
+            .shutdown_until(tokio::time::Instant::now())
+            .await,
+        crate::tasks::TaskJoinOutcome::Complete { panicked: false }
+    );
+}

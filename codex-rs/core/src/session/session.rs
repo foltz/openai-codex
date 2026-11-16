@@ -2282,14 +2282,21 @@ impl Session {
                 codex_mcp::McpAttemptAccess::from_work(initial_mcp_work.as_deref()),
             ))
             .await?;
-            drop(initial_mcp_work);
             sess.start_mcp_prewarm_worker(mcp_prewarm_rx, mcp_auth_changes);
             sess.follow_inherited_environment_configurations(
                 &inherited_environments,
                 &session_configuration.environments,
             );
-            sess.schedule_startup_prewarm(super::startup_prewarm::PrewarmInput::Base)
-                .await;
+            if let Err(err) = sess
+                .schedule_startup_prewarm_with_authority(
+                    super::startup_prewarm::PrewarmInput::Base,
+                    codex_mcp::McpAttemptAccess::from_work(initial_mcp_work.as_deref()),
+                )
+                .await
+            {
+                warn!("constructor startup prewarm work refused: {err:#}");
+            }
+            drop(initial_mcp_work);
             let session_start_source = match &initial_history {
                 InitialHistory::Forked(_) if forked_from_id.is_some() => {
                     codex_hooks::SessionStartSource::Fork

@@ -226,7 +226,35 @@ impl Session {
         drop(self.task_joins.register(tokio::spawn(work)).detach());
     }
 
+    /// Idle/public entry: derive request work before the first configuration await.
     pub(crate) async fn schedule_startup_prewarm(self: &Arc<Self>, input: PrewarmInput) {
+        let work = match self.request_mcp_work() {
+            Ok(work) => work,
+            Err(err) => {
+                warn!("startup prewarm request work refused: {err:#}");
+                return;
+            }
+        };
+        if let Err(err) = self
+            .schedule_startup_prewarm_with_authority(
+                input,
+                codex_mcp::McpAttemptAccess::from_work(work.as_deref()),
+            )
+            .await
+        {
+            warn!("startup prewarm work refused: {err:#}");
+        }
+    }
+
+    /// Constructor callers provide their existing work; no installed turn or
+    /// fresh admission substitutes for that authority.
+    pub(crate) async fn schedule_startup_prewarm_with_authority(
+        self: &Arc<Self>,
+        input: PrewarmInput,
+        access: codex_mcp::McpAttemptAccess<'_>,
+    ) -> anyhow::Result<()> {
+        let work = self.derive_mcp_attempt_work(access)?;
+        let access = codex_mcp::McpAttemptAccess::from_work(work.as_deref());
         let websocket_connect_timeout = self.provider().await.websocket_connect_timeout();
         let mut state = self.state.lock().await;
         if state.shutting_down
@@ -234,23 +262,23 @@ impl Session {
                 .task_admission_closed
                 .load(std::sync::atomic::Ordering::Acquire)
         {
-            return;
+            return Ok(());
         }
         // Publish the warmup before another turn can be admitted. No network work
         // or awaits occur while these guards are held.
         let Ok(active_turn) = self.active_turn.try_lock() else {
-            return;
+            return Ok(());
         };
         if active_turn.is_some()
             || self
                 .task_admission_closed
                 .load(std::sync::atomic::Ordering::Acquire)
         {
-            return;
+            return Ok(());
         }
         if let Some(prewarm) = state.startup_prewarm.as_mut() {
             let Some(completed) = (&mut prewarm.result).now_or_never() else {
-                return;
+                return Ok(());
             };
             // Return a completed warmup's client to the existing cache before
             // rechecking its socket: it may have closed since the last resume.
@@ -258,13 +286,22 @@ impl Session {
             state.startup_prewarm = None;
         }
 
-        if self.features().enabled(Feature::CodeModePrewarm)
-            && self.services.code_mode_service.is_available()
-        {
+        let code_mode_prewarm = self.features().enabled(Feature::CodeModePrewarm)
+            && self.services.code_mode_service.is_available();
+        // Derive every child before dispatching any task. A refused child
+        // cannot leave a partially dispatched prewarm behind.
+        let code_mode_work = if code_mode_prewarm {
+            self.derive_mcp_attempt_work(access)?
+        } else {
+            None
+        };
+        let model_work = self.derive_mcp_attempt_work(access)?;
+        if code_mode_prewarm {
             let session = Arc::clone(self);
             drop(
                 self.task_joins
                     .register(tokio::spawn(async move {
+                        let _work = code_mode_work;
                         if session.services.code_mode_service.session().await.is_err() {
                             warn!("code-mode host startup prewarm failed");
                         }
@@ -280,13 +317,14 @@ impl Session {
             drop(
                 self.task_joins
                     .register(tokio::spawn(async move {
+                        let _work = model_work;
                         if let Err(err) = model_client.prewarm_auth().await {
                             warn!("startup auth prewarm failed: {err:#}");
                         }
                     }))
                     .detach(),
             );
-            return;
+            return Ok(());
         }
 
         let session_telemetry = self.services.session_telemetry.clone();
@@ -295,7 +333,13 @@ impl Session {
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let startup_prewarm = tokio::spawn(
             async move {
-                let result = schedule_startup_prewarm_inner(startup_prewarm_session, input).await;
+                let work = model_work;
+                let result = schedule_startup_prewarm_inner(
+                    startup_prewarm_session,
+                    input,
+                    codex_mcp::McpAttemptAccess::from_work(work.as_deref()),
+                )
+                .await;
                 let status = if result.is_ok() { "ready" } else { "failed" };
                 session_telemetry.record_startup_phase(
                     "startup_prewarm_total",
@@ -322,6 +366,7 @@ impl Session {
             started_at,
             websocket_connect_timeout,
         ));
+        Ok(())
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
@@ -344,7 +389,12 @@ impl Session {
 async fn schedule_startup_prewarm_inner(
     session: Arc<Session>,
     input: PrewarmInput,
+    access: codex_mcp::McpAttemptAccess<'_>,
 ) -> CodexResult<ModelClientSession> {
+    let work = session
+        .derive_mcp_attempt_work(access)
+        .map_err(|err| codex_protocol::error::CodexErr::Fatal(err.to_string()))?;
+    let access = codex_mcp::McpAttemptAccess::from_work(work.as_deref());
     let prewarm_started_at = Instant::now();
     let mut client_session = session.services.model_client.new_session();
     let websocket_ready = client_session.is_websocket_prewarmed().await;
@@ -417,9 +467,10 @@ async fn schedule_startup_prewarm_inner(
         async {
             let built_tools_started_at = Instant::now();
             let step_context = session
-                .capture_step_context(
+                .capture_step_context_with_authority(
                     Arc::clone(&startup_turn_context),
                     &startup_cancellation_token,
+                    access,
                 )
                 .await?;
             startup_turn_context.session_telemetry.record_startup_phase(

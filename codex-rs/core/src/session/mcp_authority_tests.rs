@@ -749,3 +749,146 @@ async fn actual_mcp_handler_refuses_wrong_or_exhausted_turn_without_peer_attribu
         );
     }
 }
+
+#[tokio::test]
+async fn prewarm_refuses_missing_or_exhausted_work_before_configuration_waits() {
+    let (session, _, counts) = fixture().await;
+    let root = Work::new(&counts);
+    let state = session.state.lock().await;
+    for access in [
+        McpAttemptAccess::Unscoped,
+        McpAttemptAccess::Admitted(&root),
+    ] {
+        counts.refuse.store(true, Ordering::SeqCst);
+        let mut call = Box::pin(session.schedule_startup_prewarm_with_authority(
+            super::startup_prewarm::PrewarmInput::Base,
+            access,
+        ));
+        assert!(matches!(
+            futures::poll!(&mut call),
+            std::task::Poll::Ready(Err(_))
+        ));
+        assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+        assert!(state.startup_prewarm.is_none());
+    }
+    assert_eq!(counts.turns.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn cancelled_prewarm_scheduler_releases_its_work_before_dispatch() {
+    let (session, _, counts) = fixture().await;
+    let root = Work::new(&counts);
+    let state = session.state.lock().await;
+    let mut call = Box::pin(session.schedule_startup_prewarm_with_authority(
+        super::startup_prewarm::PrewarmInput::History,
+        McpAttemptAccess::Admitted(&root),
+    ));
+    assert!(futures::poll!(&mut call).is_pending());
+    assert_eq!(counts.live.load(Ordering::SeqCst), 2);
+    drop(call);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    assert!(state.startup_prewarm.is_none());
+    assert_eq!(counts.turns.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn prewarm_child_derivation_failure_prevents_task_dispatch() {
+    let (session, _, counts) = fixture().await;
+    let root = Work::new(&counts);
+    counts.refuse_after.store(1, Ordering::SeqCst);
+    assert!(
+        session
+            .schedule_startup_prewarm_with_authority(
+                super::startup_prewarm::PrewarmInput::Base,
+                McpAttemptAccess::Admitted(&root),
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(counts.derives.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    assert!(session.state.lock().await.startup_prewarm.is_none());
+    assert_eq!(
+        session
+            .task_joins
+            .shutdown_until(tokio::time::Instant::now())
+            .await,
+        crate::tasks::TaskJoinOutcome::Complete { panicked: false }
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn websocket_prewarm_task_keeps_child_work_after_scheduler_and_root_drop() {
+    let (session, _, counts) = fixture().await;
+    assert!(session.services.model_client.responses_websocket_enabled());
+    assert!(
+        !session
+            .features()
+            .enabled(codex_features::Feature::CodeModePrewarm)
+    );
+    let root = Work::new(&counts);
+    session
+        .schedule_startup_prewarm_with_authority(
+            super::startup_prewarm::PrewarmInput::Base,
+            McpAttemptAccess::Admitted(&root),
+        )
+        .await
+        .unwrap();
+    // No yield: ownership has moved into the actual spawned, unpolled task.
+    assert_eq!(counts.live.load(Ordering::SeqCst), 2);
+    assert_eq!(counts.turns.load(Ordering::SeqCst), 0);
+    let prewarm = session.state.lock().await.startup_prewarm.take().unwrap();
+    drop(root);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    prewarm.abort().await;
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        session
+            .task_joins
+            .shutdown_until(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+            .await,
+        crate::tasks::TaskJoinOutcome::Complete { panicked: false }
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn auth_only_prewarm_task_releases_work_without_a_cached_lease() {
+    let (session, turn, counts) = fixture().await;
+    session
+        .services
+        .model_client
+        .force_http_fallback(&session.services.session_telemetry, turn.model_info());
+    assert!(!session.services.model_client.responses_websocket_enabled());
+    assert!(
+        !session
+            .features()
+            .enabled(codex_features::Feature::CodeModePrewarm)
+    );
+    let root = Work::new(&counts);
+    session
+        .schedule_startup_prewarm_with_authority(
+            super::startup_prewarm::PrewarmInput::History,
+            McpAttemptAccess::Admitted(&root),
+        )
+        .await
+        .unwrap();
+    assert_eq!(counts.live.load(Ordering::SeqCst), 2);
+    assert!(session.state.lock().await.startup_prewarm.is_none());
+    drop(root);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while counts.live.load(Ordering::SeqCst) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(counts.turns.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        session
+            .task_joins
+            .shutdown_until(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+            .await,
+        crate::tasks::TaskJoinOutcome::Complete { panicked: false }
+    );
+}

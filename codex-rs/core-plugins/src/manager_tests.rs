@@ -6908,7 +6908,15 @@ enabled = true
             .expect("refresh state lock");
         assert!(!state.in_flight);
         assert!(state.requested.is_none());
-        state.requested = state.last_refreshed.clone();
+        state.requested = state
+            .last_refreshed
+            .clone()
+            .map(|request| QueuedPluginRequest {
+                request,
+                owner: None,
+                obligations: Vec::new(),
+                callback_owner: None,
+            });
         state.in_flight = true;
     }
 
@@ -9055,9 +9063,6 @@ impl Drop for ReenterInstalledQueueOnDrop {
     }
 }
 
-#[test_case::test_case(false; "managed_replacement")]
-#[test_case::test_case(true; "independent_replacement")]
-#[tokio::test(flavor = "current_thread")]
 async fn installed_queue_keeps_prior_callback_original_and_latest_backend(independent: bool) {
     let home = TempDir::new().unwrap();
     let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
@@ -9518,9 +9523,6 @@ async fn abandoned_async_queue_marks_pending_managed_originals_unavailable() {
     assert!(!state.in_flight && state.requests.is_empty());
 }
 
-#[test_case::test_case(false; "recommendations")]
-#[test_case::test_case(true; "bundle_sync")]
-#[tokio::test(flavor = "current_thread")]
 async fn remote_async_request_births_preserve_real_http_origin(bundle_sync: bool) {
     let home = TempDir::new().unwrap();
     write_file(
@@ -9590,4 +9592,28 @@ async fn remote_async_request_births_preserve_real_http_origin(bundle_sync: bool
     } else {
         url.contains("/ps/plugins/suggested/codex")
     }));
+}
+
+mod installed_queue_keeps_prior_callback_original_and_latest_backend {
+    use super::*;
+    #[tokio::test(flavor = "current_thread")]
+    async fn managed_replacement() {
+        super::installed_queue_keeps_prior_callback_original_and_latest_backend(false).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn independent_replacement() {
+        super::installed_queue_keeps_prior_callback_original_and_latest_backend(true).await;
+    }
+}
+
+mod remote_async_request_births_preserve_real_http_origin {
+    use super::*;
+    #[tokio::test(flavor = "current_thread")]
+    async fn recommendations() {
+        super::remote_async_request_births_preserve_real_http_origin(false).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn bundle_sync() {
+        super::remote_async_request_births_preserve_real_http_origin(true).await;
+    }
 }

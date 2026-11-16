@@ -979,3 +979,166 @@ async fn already_cancelled_recorded_review_never_captures_request_authority() {
     assert_eq!(counts.requests.load(Ordering::SeqCst), 0);
     assert_eq!(counts.live.load(Ordering::SeqCst), 0);
 }
+
+struct ResumeMetadataRestored;
+struct ResumeWorkContributor {
+    mode: ReadyWorkMode,
+    wait: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    join: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    entered: AtomicUsize,
+    refused: AtomicUsize,
+    unscoped: AtomicUsize,
+}
+impl codex_extension_api::ThreadLifecycleContributor<crate::config::Config>
+    for ResumeWorkContributor
+{
+    fn on_thread_resume<'a>(
+        &'a self,
+        input: codex_extension_api::ThreadResumeInput<'a>,
+    ) -> ExtensionFuture<'a, ()> {
+        Box::pin(async move {
+            input.thread_store.insert(ResumeMetadataRestored);
+            let work = match input.mcp_access {
+                Ok(codex_mcp::McpAttemptAccess::Admitted(work)) => match work.derive_attempt() {
+                    Ok(work) => work,
+                    Err(_) => {
+                        self.refused.fetch_add(1, Ordering::SeqCst);
+                        return;
+                    }
+                },
+                Ok(codex_mcp::McpAttemptAccess::Unscoped) => {
+                    self.unscoped.fetch_add(1, Ordering::SeqCst);
+                    return;
+                }
+                Err(_) => {
+                    self.refused.fetch_add(1, Ordering::SeqCst);
+                    return;
+                }
+            };
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            let wait = self.wait.lock().unwrap().take().unwrap();
+            match self.mode {
+                ReadyWorkMode::Inline => {
+                    let _work = work;
+                    wait.await.unwrap();
+                }
+                ReadyWorkMode::Detached => {
+                    *self.join.lock().unwrap() = Some(tokio::spawn(async move {
+                        let _work = work;
+                        wait.await.unwrap();
+                    }));
+                }
+                ReadyWorkMode::Observe => {
+                    panic!("observation-only fixture must not receive valid work")
+                }
+            }
+        })
+    }
+}
+fn resume_work_contributor(
+    thread: &mut CodexThread,
+    mode: ReadyWorkMode,
+) -> (Arc<ResumeWorkContributor>, tokio::sync::oneshot::Sender<()>) {
+    let (release, wait) = tokio::sync::oneshot::channel();
+    let callback = Arc::new(ResumeWorkContributor {
+        mode,
+        wait: std::sync::Mutex::new(Some(wait)),
+        join: std::sync::Mutex::new(None),
+        entered: AtomicUsize::new(0),
+        refused: AtomicUsize::new(0),
+        unscoped: AtomicUsize::new(0),
+    });
+    let mut registry = ExtensionRegistryBuilder::new();
+    registry.thread_lifecycle_contributor(callback.clone());
+    Arc::get_mut(&mut thread.session)
+        .unwrap()
+        .services
+        .extensions = Arc::new(registry.build());
+    (callback, release)
+}
+#[tokio::test(flavor = "current_thread")]
+async fn resume_callback_background_child_outlives_notification_without_idle_lease() {
+    let (mut thread, _, _) = fixture().await;
+    let (callback, release) = resume_work_contributor(&mut thread, ReadyWorkMode::Detached);
+    let counts = Arc::new(HistoryWorkCounts::default());
+    let root = ready_root(&counts);
+    thread.emit_thread_resume_lifecycle(Some(&root)).await;
+    assert_eq!(callback.entered.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 2);
+    drop(root);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    let join = callback.join.lock().unwrap().take().unwrap();
+    release.send(()).unwrap();
+    join.await.unwrap();
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+}
+#[tokio::test]
+async fn cancelled_resume_callback_releases_notification_and_callback_work() {
+    let (mut thread, _, _) = fixture().await;
+    let (callback, release) = resume_work_contributor(&mut thread, ReadyWorkMode::Inline);
+    let counts = Arc::new(HistoryWorkCounts::default());
+    let root = ready_root(&counts);
+    let mut ready = Box::pin(thread.emit_thread_resume_lifecycle(Some(&root)));
+    assert!(futures::poll!(&mut ready).is_pending());
+    assert_eq!(callback.entered.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 3);
+    drop(ready);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    assert!(release.send(()).is_err());
+    drop(root);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+}
+#[tokio::test]
+async fn resume_callback_required_missing_or_exhausted_work_never_becomes_unscoped() {
+    let (mut thread, _, _) = fixture().await;
+    let (callback, _) = resume_work_contributor(&mut thread, ReadyWorkMode::Observe);
+    let gate = Arc::new(RefusingMcpRequest::default());
+    Arc::get_mut(&mut thread.session)
+        .unwrap()
+        .services
+        .host_admission = Some(gate.clone());
+    thread.emit_thread_resume_lifecycle(None).await;
+    let counts = Arc::new(HistoryWorkCounts::default());
+    let root = ready_root(&counts);
+    counts.refuse_child.store(true, Ordering::SeqCst);
+    thread.emit_thread_resume_lifecycle(Some(&root)).await;
+    assert!(
+        thread
+            .session
+            .services
+            .thread_extension_data
+            .get::<ResumeMetadataRestored>()
+            .is_some()
+    );
+    assert_eq!(callback.refused.load(Ordering::SeqCst), 2);
+    assert_eq!(callback.unscoped.load(Ordering::SeqCst), 0);
+    assert_eq!(callback.entered.load(Ordering::SeqCst), 0);
+    assert_eq!(gate.0.load(Ordering::SeqCst), 0, "no request rediscovery");
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    drop(root);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+}
+#[tokio::test]
+async fn resume_callback_ungated_missing_work_preserves_local_notification() {
+    let (mut thread, _, _) = fixture().await;
+    let (callback, _) = resume_work_contributor(&mut thread, ReadyWorkMode::Observe);
+    thread.emit_thread_resume_lifecycle(None).await;
+    assert_eq!(callback.unscoped.load(Ordering::SeqCst), 1);
+    assert_eq!(callback.refused.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn hook_free_resume_does_not_derive_or_suspend() {
+    fn require_sync<T: Sync>() {}
+    require_sync::<codex_extension_api::ThreadResumeInput<'static>>();
+    let (thread, _, _) = fixture().await;
+    let counts = Arc::new(HistoryWorkCounts::default());
+    let root = ready_root(&counts);
+    counts.refuse_child.store(true, Ordering::SeqCst);
+    let mut resume = Box::pin(thread.emit_thread_resume_lifecycle(Some(&root)));
+    assert!(futures::poll!(&mut resume).is_ready());
+    assert_eq!(counts.derives.load(Ordering::SeqCst), 0);
+    drop(resume);
+    drop(root);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+}

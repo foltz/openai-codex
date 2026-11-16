@@ -61,6 +61,10 @@ pub struct ThreadReadyInput<'a, C> {
 
 /// Input supplied when the host resumes an existing thread.
 pub struct ThreadResumeInput<'a> {
+    /// Finite constructor authority. Derive before account-bound work or spawning;
+    /// metadata-only restoration remains valid even when authority is refused.
+    /// Never retain counted work in reusable session or thread stores.
+    pub mcp_access: Result<codex_mcp::McpAttemptAccess<'a>, codex_mcp::McpAttemptRefused>,
     /// Store scoped to the host session runtime.
     pub session_store: &'a ExtensionData,
     /// Store scoped to this thread runtime.

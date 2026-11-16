@@ -501,15 +501,46 @@ impl CodexThread {
         }
     }
 
-    pub(crate) async fn emit_thread_resume_lifecycle(&self) {
-        for contributor in self
+    pub(crate) async fn emit_thread_resume_lifecycle(
+        &self,
+        constructor_work: Option<&dyn codex_extension_api::HostOperationWork>,
+    ) {
+        let contributors = self
             .session
             .services
             .extensions
-            .thread_lifecycle_contributors()
-        {
+            .thread_lifecycle_contributors();
+        if contributors.is_empty() {
+            return;
+        }
+        // Derive from the original constructor before invoking any callback.
+        // Never rediscover a turn/request or acquire fresh account admission.
+        let captured = match constructor_work {
+            Some(work) => work
+                .derive_operation()
+                .map(|work| {
+                    Some(Box::new(crate::session::McpOperationWork(work))
+                        as Box<dyn codex_mcp::McpAttemptWork>)
+                })
+                .map_err(|_| codex_mcp::McpAttemptRefused),
+            None if self
+                .session
+                .services
+                .host_admission
+                .as_ref()
+                .is_some_and(|host| host.requires_account_work()) =>
+            {
+                Err(codex_mcp::McpAttemptRefused)
+            }
+            None => Ok(None),
+        };
+        for contributor in contributors {
             contributor
                 .on_thread_resume(codex_extension_api::ThreadResumeInput {
+                    mcp_access: captured
+                        .as_ref()
+                        .map(|work| codex_mcp::McpAttemptAccess::from_work(work.as_deref()))
+                        .map_err(|_| codex_mcp::McpAttemptRefused),
                     session_store: &self.session.services.session_extension_data,
                     thread_store: &self.session.services.thread_extension_data,
                 })

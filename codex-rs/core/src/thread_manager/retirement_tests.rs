@@ -2218,3 +2218,81 @@ async fn managed_constructor_carries_explicit_work_into_ready_callbacks_without_
         .await
         .unwrap();
 }
+
+struct ManagedResumeWitness(Arc<AtomicUsize>);
+impl codex_extension_api::ThreadLifecycleContributor<crate::config::Config>
+    for ManagedResumeWitness
+{
+    fn on_thread_resume<'a>(
+        &'a self,
+        input: codex_extension_api::ThreadResumeInput<'a>,
+    ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+        Box::pin(async move {
+            let codex_mcp::McpAttemptAccess::Admitted(work) =
+                input.mcp_access.expect("constructor authority")
+            else {
+                panic!("required resume authority became unscoped");
+            };
+            let child = work.derive_attempt().expect("derive resume callback work");
+            self.0.fetch_add(1, Ordering::SeqCst);
+            drop(child);
+        })
+    }
+}
+
+#[tokio::test]
+async fn resumed_constructor_keeps_explicit_work_with_emitted_or_deferred_ready() {
+    for defer_ready in [false, true] {
+        let (_home, mut manager, config) = expiry_manager(true).await;
+        let host = Arc::new(ManagedRequestHost {
+            required: true,
+            produce_work: true,
+            refuse: false,
+            lookups: AtomicUsize::new(0),
+            operations: AtomicUsize::new(1),
+        });
+        let observed = Arc::new(AtomicUsize::new(0));
+        let mut global = codex_extension_api::ExtensionRegistryBuilder::new();
+        global.turn_start_admission(Arc::new(ManagedRequestAdmission(Arc::clone(&host))));
+        let global = Arc::new(global.build());
+        Arc::get_mut(&mut manager.state).unwrap().extensions = Arc::clone(&global);
+        let mut isolated = global.to_builder();
+        isolated
+            .thread_lifecycle_contributor(Arc::new(ManagedResumeWitness(Arc::clone(&observed))));
+        let mut options = crate::thread_manager::StartThreadOptions::new(config.clone(), None);
+        options.account_work = Some(Box::new(ManagedRequestWork(Arc::clone(&host))));
+        options.initial_history =
+            codex_history::InitialHistory::Resumed(codex_history::ResumedHistory {
+                conversation_id: ThreadId::new(),
+                history: Arc::new(Vec::new()),
+                history_revision: None,
+                rollout_path: None,
+            });
+        options
+            .thread_extension_init
+            .insert(codex_extension_api::SessionIsolation::Isolated);
+        options
+            .thread_extension_init
+            .insert(codex_extension_api::IsolatedSessionExtensions(Arc::new(
+                isolated.build(),
+            )));
+        let mut request = crate::thread_manager::ThreadSpawnRequest::new(
+            options,
+            Arc::clone(&manager.state.auth_manager),
+            manager.agent_control_for_config(&config),
+        );
+        if defer_ready {
+            request.ready_notification = crate::thread_manager::ThreadReadyNotification::Defer;
+        }
+        let thread = manager.state.spawn_thread(request).await.unwrap();
+        assert_eq!(observed.load(Ordering::SeqCst), 1);
+        assert_eq!(host.lookups.load(Ordering::SeqCst), 0);
+        if let Some(prewarm) = thread.thread.session.take_session_startup_prewarm().await {
+            tokio::time::timeout(Duration::from_secs(5), prewarm.abort())
+                .await
+                .unwrap();
+        }
+        assert_eq!(host.operations.load(Ordering::SeqCst), 0);
+        thread.thread.shutdown_and_wait().await.unwrap();
+    }
+}

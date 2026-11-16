@@ -2720,7 +2720,9 @@ impl ThreadManagerState {
                     })
             })
             .transpose()?;
-        let ready_work = if matches!(request.ready_notification, ThreadReadyNotification::Emit)
+        // Resume notifications also need constructor authority when ready is deferred.
+        let ready_work = if (matches!(request.ready_notification, ThreadReadyNotification::Emit)
+            || matches!(&request.options.initial_history, InitialHistory::Resumed(_)))
             && self.needs_thread_ready_work(&request.options)
         {
             account_work
@@ -2729,7 +2731,7 @@ impl ThreadManagerState {
                 .transpose()
                 .map_err(|_| {
                     CodexErr::Fatal(
-                        "construction account work cannot admit thread-ready callbacks".to_owned(),
+                        "construction account work cannot admit lifecycle callbacks".to_owned(),
                     )
                 })?
         } else {
@@ -3337,7 +3339,6 @@ impl ThreadManagerState {
                 .emit_thread_ready_lifecycle(ready_work.as_deref())
                 .await;
         }
-        drop(ready_work);
         for reason in std::mem::take(
             &mut *startup_invalidations
                 .lock()
@@ -3349,8 +3350,12 @@ impl ThreadManagerState {
                 .request_mcp_runtime_refresh(reason);
         }
         if is_resumed_thread {
-            new_thread.thread.emit_thread_resume_lifecycle().await;
+            new_thread
+                .thread
+                .emit_thread_resume_lifecycle(ready_work.as_deref())
+                .await;
         }
+        drop(ready_work);
         // Cancelling this wait must leave the registered runtime and the host handoff intact.
         if let Some(accepted) = tier_acceptance {
             let _ = accepted.await;

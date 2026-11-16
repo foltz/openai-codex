@@ -1431,6 +1431,18 @@ async fn thread_stop_unregisters_goal_runtime_from_service() -> anyhow::Result<(
 
 #[tokio::test]
 async fn thread_resume_rehydrates_active_goal_idle_accounting() -> anyhow::Result<()> {
+    check_resume_accounting(Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped)).await
+}
+
+#[tokio::test]
+async fn thread_resume_refused_account_work_preserves_local_goal_accounting() -> anyhow::Result<()>
+{
+    check_resume_accounting(Err(codex_protocol::mcp_work::McpAttemptRefused)).await
+}
+
+async fn check_resume_accounting(
+    access: Result<codex_protocol::mcp_work::McpAttemptAccess<'_>, codex_protocol::mcp_work::McpAttemptRefused>,
+) -> anyhow::Result<()> {
     let runtime = test_runtime().await?;
     let thread_id = test_thread_id()?;
     seed_thread_metadata(runtime.as_ref(), thread_id).await?;
@@ -1445,7 +1457,7 @@ async fn thread_resume_rehydrates_active_goal_idle_accounting() -> anyhow::Resul
         .await?;
     let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
 
-    harness.resume_thread().await;
+    harness.resume_thread_with_access(access).await;
     let child = harness.spawn_child(ThreadId::new()).await?;
     child.start_turn("child-turn", &TokenUsage::default()).await;
     let usage = input_token_usage(/*input_tokens*/ 23);
@@ -1932,9 +1944,18 @@ impl GoalExtensionHarness {
     }
 
     async fn resume_thread(&self) {
+        self.resume_thread_with_access(Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped))
+            .await;
+    }
+
+    async fn resume_thread_with_access(
+        &self,
+        access: Result<codex_protocol::mcp_work::McpAttemptAccess<'_>, codex_protocol::mcp_work::McpAttemptRefused>,
+    ) {
         for contributor in self.registry.thread_lifecycle_contributors() {
             contributor
                 .on_thread_resume(ThreadResumeInput {
+                    mcp_access: access,
                     session_store: &self.session_store,
                     thread_store: &self.thread_store,
                 })

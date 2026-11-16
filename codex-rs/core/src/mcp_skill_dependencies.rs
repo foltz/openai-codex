@@ -59,6 +59,14 @@ pub(crate) async fn maybe_prompt_and_install_mcp_dependencies(
         return;
     }
 
+    let work = match sess.turn_mcp_work(turn_context) {
+        Ok(work) => work,
+        Err(error) => {
+            warn!("skill MCP dependency work was not admitted: {error}");
+            return;
+        }
+    };
+    let access = codex_mcp::McpAttemptAccess::from_work(work.as_deref());
     let installed = sess.runtime_mcp_servers(config.as_ref()).await;
     let missing = collect_missing_mcp_dependencies(mentioned_skills, &installed);
     if missing.is_empty() {
@@ -78,7 +86,8 @@ pub(crate) async fn maybe_prompt_and_install_mcp_dependencies(
     {
         // Policy may have changed while waiting for the installation prompt.
         let missing = admit_mcp_dependencies(sess, config.as_ref(), unprompted_missing).await;
-        maybe_install_mcp_dependencies(sess, turn_context, missing, elicitation_reviewer).await;
+        maybe_install_mcp_dependencies(sess, turn_context, missing, elicitation_reviewer, access)
+            .await;
     }
 }
 
@@ -117,11 +126,21 @@ async fn maybe_install_mcp_dependencies(
     turn_context: &TurnContext,
     missing: HashMap<String, McpServerConfig>,
     elicitation_reviewer: Option<ElicitationReviewerHandle>,
+    access: codex_mcp::McpAttemptAccess<'_>,
 ) {
     if missing.is_empty() {
         return;
     }
 
+    // Hold finite invocation work across persistence, OAuth and publication.
+    let work = match sess.derive_mcp_attempt_work(access) {
+        Ok(work) => work,
+        Err(error) => {
+            warn!("skill MCP dependency installation was not admitted: {error}");
+            return;
+        }
+    };
+    let access = codex_mcp::McpAttemptAccess::from_work(work.as_deref());
     let config = turn_context.config.as_ref();
     let codex_home = config.codex_home.clone();
     let mut servers = match load_global_mcp_servers(&codex_home).await {
@@ -238,8 +257,12 @@ async fn maybe_install_mcp_dependencies(
         }
     }
 
-    sess.refresh_mcp_servers_now(added.into_iter().collect(), elicitation_reviewer)
-        .await;
+    if let Err(error) = sess
+        .refresh_mcp_servers_now(added.into_iter().collect(), elicitation_reviewer, access)
+        .await
+    {
+        warn!("failed to publish MCP dependencies for mentioned skills: {error}");
+    }
 }
 
 async fn should_install_mcp_dependencies(
@@ -526,3 +549,7 @@ fn collect_missing_mcp_dependencies(
 
     missing
 }
+
+#[cfg(test)]
+#[path = "mcp_skill_dependency_authority_tests.rs"]
+mod authority_tests;

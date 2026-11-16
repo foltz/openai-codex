@@ -10377,8 +10377,12 @@ async fn step_context_keeps_its_mcp_runtime_for_tools() -> anyhow::Result<()> {
     expected_servers.extend(current_config.mcp_servers.get().clone());
     expected_servers.insert("newer".to_string(), added_servers["newer"].clone());
     session
-        .refresh_mcp_servers_now(added_servers, /*elicitation_reviewer*/ None)
-        .await;
+        .refresh_mcp_servers_now(
+            added_servers,
+            /*elicitation_reviewer*/ None,
+            codex_mcp::McpAttemptAccess::Unscoped,
+        )
+        .await?;
 
     let next_step = session
         .capture_step_context(Arc::clone(&step_context.turn), &CancellationToken::new())
@@ -10433,16 +10437,17 @@ async fn mcp_dependency_refresh_preserves_current_server_constraints() -> anyhow
         .session_configuration
         .original_config_do_not_use = Arc::clone(&config);
 
-    session
+    let result = session
         .refresh_mcp_servers_now(
             HashMap::from([(
                 "dependency".to_string(),
                 serde_json::from_value(json!({"command": "missing-test-mcp-server"}))?,
             )]),
             /*elicitation_reviewer*/ None,
+            codex_mcp::McpAttemptAccess::Unscoped,
         )
         .await;
-
+    assert!(result.is_err());
     assert!(Arc::ptr_eq(&session.get_config().await, &config));
     Ok(())
 }

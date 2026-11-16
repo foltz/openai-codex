@@ -942,11 +942,15 @@ impl Session {
         &self,
         added_servers: HashMap<String, McpServerConfig>,
         elicitation_reviewer: Option<ElicitationReviewerHandle>,
-    ) {
-        let Ok(_refresh) = self.mcp_refresh.acquire().await else {
-            error!("MCP runtime refresh semaphore closed");
-            return;
-        };
+        access: codex_mcp::McpAttemptAccess<'_>,
+    ) -> anyhow::Result<()> {
+        let work = self.derive_mcp_attempt_work(access)?;
+        let access = codex_mcp::McpAttemptAccess::from_work(work.as_deref());
+        let _refresh = self
+            .mcp_refresh
+            .acquire()
+            .await
+            .context("MCP runtime refresh semaphore closed")?;
         {
             let mut state = self.state.lock().await;
             let mut config = (*state.session_configuration.original_config_do_not_use).clone();
@@ -954,10 +958,10 @@ impl Session {
             for (name, server) in added_servers {
                 servers.entry(name).or_insert(server);
             }
-            if let Err(err) = config.mcp_servers.set(servers) {
-                warn!("failed to refresh MCP dependencies for mentioned skills: {err}");
-                return;
-            }
+            config
+                .mcp_servers
+                .set(servers)
+                .context("failed to refresh MCP dependencies for mentioned skills")?;
             state.session_configuration.original_config_do_not_use = Arc::new(config);
         }
         // Claim after config mutation, before capturing the state this forced refresh handles.
@@ -1028,14 +1032,16 @@ impl Session {
                 executor_capability_discovery_v2.as_deref(),
             )
             .await;
-        self.publish_mcp_runtime(
+        self.publish_mcp_runtime_with_authority(
             &desired,
             mcp_projection,
             &ready_selected_capability_roots,
             elicitation_reviewer,
+            access,
         )
-        .await;
+        .await?;
         refresh_invalidation.published = true;
+        Ok(())
     }
 
     pub(crate) fn ready_selected_capability_roots(

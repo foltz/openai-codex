@@ -13,6 +13,7 @@ struct Counts {
     live: Arc<AtomicUsize>,
     derives: AtomicUsize,
     refuse: AtomicBool,
+    refuse_after: AtomicUsize,
     turns: AtomicUsize,
 }
 #[derive(Debug)]
@@ -30,7 +31,10 @@ impl Drop for Work {
 }
 impl McpAttemptWork for Work {
     fn derive_attempt(&self) -> Result<Box<dyn McpAttemptWork>, McpAttemptRefused> {
-        if self.0.refuse.load(Ordering::SeqCst) {
+        let limit = self.0.refuse_after.load(Ordering::SeqCst);
+        if self.0.refuse.load(Ordering::SeqCst)
+            || (limit != 0 && self.0.derives.load(Ordering::SeqCst) >= limit)
+        {
             return Err(McpAttemptRefused);
         }
         self.0.derives.fetch_add(1, Ordering::SeqCst);
@@ -580,4 +584,127 @@ async fn extension_callback_work_is_finite_on_cancellation_and_success() {
         "retained tool/step must own no callback work"
     );
     drop(retained_step);
+}
+
+fn disabled_skill_dependency() -> HashMap<String, codex_config::McpServerConfig> {
+    HashMap::from([(
+        "skill-dependency".into(),
+        serde_json::from_value(
+            serde_json::json!({"command":"no-such-test-mcp-server","enabled":false}),
+        )
+        .unwrap(),
+    )])
+}
+#[tokio::test]
+async fn dependency_refresh_refuses_before_the_permit_and_configuration_mutation() {
+    let (session, _, counts) = fixture().await;
+    let original = session.get_config().await;
+    let root = Work::new(&counts);
+    let _permit = session.mcp_refresh.acquire().await.unwrap();
+    for access in [
+        McpAttemptAccess::Unscoped,
+        McpAttemptAccess::Admitted(&root),
+    ] {
+        counts.refuse.store(true, Ordering::SeqCst);
+        let mut refresh =
+            Box::pin(session.refresh_mcp_servers_now(disabled_skill_dependency(), None, access));
+        assert!(matches!(
+            futures::poll!(&mut refresh),
+            std::task::Poll::Ready(Err(_))
+        ));
+        assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    }
+    assert!(Arc::ptr_eq(&session.get_config().await, &original));
+    assert!(session.mcp_refresh.is_pending());
+}
+#[tokio::test]
+async fn cancelled_dependency_refresh_waiter_releases_work_without_mutating_configuration() {
+    let (session, _, counts) = fixture().await;
+    let original = session.get_config().await;
+    let root = Work::new(&counts);
+    let _permit = session.mcp_refresh.acquire().await.unwrap();
+    let mut refresh = Box::pin(session.refresh_mcp_servers_now(
+        disabled_skill_dependency(),
+        None,
+        McpAttemptAccess::Admitted(&root),
+    ));
+    assert!(futures::poll!(&mut refresh).is_pending());
+    assert_eq!(counts.live.load(Ordering::SeqCst), 2);
+    drop(refresh);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    assert!(Arc::ptr_eq(&session.get_config().await, &original));
+    assert!(session.mcp_refresh.is_pending());
+}
+#[tokio::test]
+async fn successful_dependency_publication_leaves_no_work_on_the_idle_runtime() {
+    let (session, _, counts) = fixture().await;
+    let root = Work::new(&counts);
+    session
+        .refresh_mcp_servers_now(
+            disabled_skill_dependency(),
+            None,
+            McpAttemptAccess::Admitted(&root),
+        )
+        .await
+        .unwrap();
+    assert!(!session.mcp_refresh.is_pending());
+    assert!(
+        session
+            .get_config()
+            .await
+            .mcp_servers
+            .get()
+            .contains_key("skill-dependency")
+    );
+    let binding = session
+        .services
+        .mcp_runtime
+        .current_binding()
+        .await
+        .unwrap();
+    assert!(codex_mcp::configured_mcp_servers(binding.config()).contains_key("skill-dependency"));
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    drop(root);
+    assert_eq!(
+        counts.live.load(Ordering::SeqCst),
+        0,
+        "idle runtime/binding must own no work"
+    );
+}
+#[tokio::test]
+async fn refused_dependency_publication_restores_invalidation_and_keeps_the_old_runtime() {
+    let (session, _, counts) = fixture().await;
+    let root = Work::new(&counts);
+    let client = codex_mcp::McpResourceClient::new(session.services.mcp_runtime.clone());
+    let original = client.cache_key();
+    counts.refuse_after.store(1, Ordering::SeqCst);
+    assert!(
+        session
+            .refresh_mcp_servers_now(
+                disabled_skill_dependency(),
+                None,
+                McpAttemptAccess::Admitted(&root)
+            )
+            .await
+            .is_err()
+    );
+    assert!(session.mcp_refresh.is_pending());
+    assert_eq!(client.cache_key(), original);
+    // The existing configuration edit survives a failed publication for a later reconcile.
+    assert!(
+        session
+            .get_config()
+            .await
+            .mcp_servers
+            .get()
+            .contains_key("skill-dependency")
+    );
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    counts.refuse_after.store(0, Ordering::SeqCst);
+    session
+        .refresh_mcp_if_dirty_with_authority(McpAttemptAccess::Admitted(&root))
+        .await
+        .unwrap();
+    assert!(!session.mcp_refresh.is_pending());
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
 }

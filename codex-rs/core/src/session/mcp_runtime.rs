@@ -289,7 +289,6 @@ impl Session {
         })
     }
 
-    #[tracing::instrument(name = "mcp.runtime.refresh", skip_all)]
     pub(super) async fn publish_mcp_runtime(
         &self,
         desired: &McpDesiredState,
@@ -308,6 +307,7 @@ impl Session {
         .expect("unscoped publication cannot derive work");
     }
 
+    #[tracing::instrument(name = "mcp.runtime.refresh", skip_all)]
     pub(super) async fn publish_mcp_runtime_with_authority(
         &self,
         desired: &McpDesiredState,

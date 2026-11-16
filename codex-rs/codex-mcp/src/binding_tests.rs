@@ -60,6 +60,23 @@ async fn test_step(
     approval_mode: AppToolApproval,
     supports_sandbox_state_meta: bool,
 ) -> TestStep {
+    test_step_with_transport(
+        label,
+        approval_mode,
+        supports_sandbox_state_meta,
+        Arc::new(TestInProcessTransportFactory),
+        crate::McpAttemptRequirement::Ungated,
+    )
+    .await
+}
+
+async fn test_step_with_transport(
+    label: &str,
+    approval_mode: AppToolApproval,
+    supports_sandbox_state_meta: bool,
+    transport: Arc<dyn InProcessTransportFactory>,
+    requirement: crate::McpAttemptRequirement,
+) -> TestStep {
     let tool = ToolInfo {
         server_name: SERVER_NAME.to_string(),
         supports_parallel_tool_calls: false,
@@ -78,7 +95,7 @@ async fn test_step(
         plugin_display_names: Vec::new(),
     };
     let client = Arc::new(
-        RmcpClient::new_in_process_client(Arc::new(TestInProcessTransportFactory))
+        RmcpClient::new_in_process_client(transport)
             .await
             .expect("create in-process MCP client"),
     );
@@ -111,7 +128,9 @@ async fn test_step(
         HashMap::from([(SERVER_NAME.to_string(), Arc::clone(&managed_client))]),
         Vec::new(),
     ));
-    let connections = Arc::new(McpConnectionSet::empty(/*prefix_mcp_tool_names*/ true));
+    let mut connections = McpConnectionSet::empty(/*prefix_mcp_tool_names*/ true);
+    connections.attempt_requirement = requirement;
+    let connections = Arc::new(connections);
     let mut config = crate::mcp::tests::test_mcp_config(std::env::temp_dir());
     config.host_cwd = config.host_cwd.join(label);
     config.environment_cwds.insert(
@@ -573,3 +592,6 @@ async fn sandbox_executable_requires_local_stdio_and_a_full_cli() -> anyhow::Res
     }
     Ok(())
 }
+
+#[path = "binding_resource_work_tests.rs"]
+mod resource_work;

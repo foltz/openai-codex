@@ -108,6 +108,7 @@ impl McpConnectionSet {
         prefix_mcp_tool_names: bool,
     ) -> Self {
         Self {
+            attempt_requirement: crate::McpAttemptRequirement::Ungated,
             config: None,
             network_policy_metadata: None,
             servers: HashMap::new(),

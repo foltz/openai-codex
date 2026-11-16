@@ -58,7 +58,10 @@ impl McpBindingClients {
         &self,
         server: &str,
         params: Option<PaginatedRequestParams>,
+        requirement: crate::McpAttemptRequirement,
+        access: crate::McpAttemptAccess<'_>,
     ) -> Result<ListResourcesResult> {
+        let _work = requirement.derive(access)?;
         let managed = self
             .client(server)
             .ok_or_else(|| anyhow!("MCP server '{server}' was not ready for this step"))?;
@@ -72,7 +75,10 @@ impl McpBindingClients {
         &self,
         server: &str,
         params: Option<PaginatedRequestParams>,
+        requirement: crate::McpAttemptRequirement,
+        access: crate::McpAttemptAccess<'_>,
     ) -> Result<ListResourceTemplatesResult> {
+        let _work = requirement.derive(access)?;
         let managed = self
             .client(server)
             .ok_or_else(|| anyhow!("MCP server '{server}' was not ready for this step"))?;
@@ -86,7 +92,10 @@ impl McpBindingClients {
         &self,
         server: &str,
         params: ReadResourceRequestParams,
+        requirement: crate::McpAttemptRequirement,
+        access: crate::McpAttemptAccess<'_>,
     ) -> Result<ReadResourceResult> {
+        let _work = requirement.derive(access)?;
         let managed = self
             .client(server)
             .ok_or_else(|| anyhow!("MCP server '{server}' was not ready for this step"))?;
@@ -100,6 +109,8 @@ impl McpBindingClients {
     pub(crate) async fn list_all_resources(
         &self,
         include_server: impl Fn(&str) -> bool,
+        requirement: crate::McpAttemptRequirement,
+        access: crate::McpAttemptAccess<'_>,
     ) -> McpResourceListing<Resource> {
         let mut join_set = JoinSet::new();
         for (server_name, managed) in self
@@ -107,6 +118,15 @@ impl McpBindingClients {
             .iter()
             .filter(|(server_name, _)| include_server(server_name))
         {
+            // Each spawned pagination task owns an independently counted child.
+            // Cancelling the parent only releases it when that task is dropped.
+            let work = match requirement.derive(access) {
+                Ok(work) => work,
+                Err(error) => {
+                    warn!("MCP resource work refused for '{server_name}': {error}");
+                    continue;
+                }
+            };
             let server_name = server_name.clone();
             let client = Arc::clone(managed);
             let timeout = managed.tool_timeout;
@@ -119,6 +139,7 @@ impl McpBindingClients {
                     }
                 })
                 .await;
+                drop(work);
                 (server_name, resources)
             });
         }
@@ -131,6 +152,8 @@ impl McpBindingClients {
     pub(crate) async fn list_all_resource_templates(
         &self,
         include_server: impl Fn(&str) -> bool,
+        requirement: crate::McpAttemptRequirement,
+        access: crate::McpAttemptAccess<'_>,
     ) -> McpResourceListing<ResourceTemplate> {
         let mut join_set = JoinSet::new();
         for (server_name, managed) in self
@@ -138,6 +161,15 @@ impl McpBindingClients {
             .iter()
             .filter(|(server_name, _)| include_server(server_name))
         {
+            // Each spawned pagination task owns an independently counted child.
+            // Cancelling the parent only releases it when that task is dropped.
+            let work = match requirement.derive(access) {
+                Ok(work) => work,
+                Err(error) => {
+                    warn!("MCP resource work refused for '{server_name}': {error}");
+                    continue;
+                }
+            };
             let server_name = server_name.clone();
             let client = Arc::clone(managed);
             let timeout = managed.tool_timeout;
@@ -150,6 +182,7 @@ impl McpBindingClients {
                     }
                 })
                 .await;
+                drop(work);
                 (server_name, templates)
             });
         }

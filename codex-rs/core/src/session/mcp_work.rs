@@ -30,8 +30,11 @@ impl Session {
             return Ok(None);
         };
         host.derive_operation_work(&self.services.thread_extension_data, &turn.sub_id)
-            .map(|work| {
-                work.map(|work| Box::new(McpOperationWork(work)) as Box<dyn McpAttemptWork>)
+            .and_then(|work| {
+                if work.is_none() && host.requires_account_work() {
+                    return Err(codex_extension_api::TurnWorkRefused::Unavailable);
+                }
+                Ok(work.map(|work| Box::new(McpOperationWork(work)) as Box<dyn McpAttemptWork>))
             })
             .map_err(|_| anyhow::anyhow!("MCP turn account work is unavailable"))
     }
@@ -43,8 +46,11 @@ impl Session {
             return Ok(None);
         };
         host.derive_request_operation_work()
-            .map(|work| {
-                work.map(|work| Box::new(McpOperationWork(work)) as Box<dyn McpAttemptWork>)
+            .and_then(|work| {
+                if work.is_none() && host.requires_account_work() {
+                    return Err(codex_extension_api::TurnWorkRefused::Unavailable);
+                }
+                Ok(work.map(|work| Box::new(McpOperationWork(work)) as Box<dyn McpAttemptWork>))
             })
             .map_err(|_| anyhow::anyhow!("MCP request account work is unavailable"))
     }
@@ -213,5 +219,23 @@ mod tests {
         assert_eq!(host.live.load(Ordering::SeqCst), 1);
         drop(existing);
         assert_eq!(host.live.load(Ordering::SeqCst), 0);
+    }
+    #[derive(Debug)]
+    struct MissingRequiredWork;
+    impl codex_extension_api::TurnStartAdmission for MissingRequiredWork {
+        fn admit_turn_start(&self) -> Option<Box<dyn Send>> {
+            panic!("no fresh fallback")
+        }
+        fn requires_account_work(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn required_host_missing_request_or_turn_work_refuses_without_fallback() {
+        let (mut session, turn) = crate::session::tests::make_session_and_context().await;
+        session.services.host_admission = Some(Arc::new(MissingRequiredWork));
+        assert!(session.request_mcp_work().is_err());
+        assert!(session.turn_mcp_work(&turn).is_err());
     }
 }

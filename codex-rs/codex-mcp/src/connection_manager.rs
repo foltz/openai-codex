@@ -351,6 +351,7 @@ pub(crate) struct PreviousMcpConnections<'a> {
 
 /// A published view over a set of running MCP server connections.
 pub(crate) struct McpConnectionSet {
+    pub(crate) attempt_requirement: crate::McpAttemptRequirement,
     pub(crate) retirement: crate::McpRuntimeRetirement,
     pub(crate) workers: crate::McpWorkerOwner,
     config: Option<Arc<crate::McpConfig>>,
@@ -1200,6 +1201,7 @@ impl McpConnectionSet {
             }
         }
         let manager = Self {
+            attempt_requirement,
             retirement,
             workers: workers.clone(),
             config: Some(config),
@@ -1308,6 +1310,7 @@ impl McpConnectionSet {
         let workers = crate::McpWorkerOwner::default();
         retirement.register_workers(workers.clone());
         Self {
+            attempt_requirement: crate::McpAttemptRequirement::Ungated,
             retirement,
             workers,
             config: None,

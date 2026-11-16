@@ -1,6 +1,7 @@
 //! Classifier cancellation preserves usage and reuses only unused or fully drained sockets.
 
 use super::*;
+use crate::async_scorer::sampler::LunaSampler;
 use crate::async_scorer::sampler::CLASSIFICATION_TOKEN_USAGE_METRIC;
 use crate::async_scorer::sampler::response::PendingResponse;
 use crate::async_scorer::sampler::tests::RecordingMetrics;

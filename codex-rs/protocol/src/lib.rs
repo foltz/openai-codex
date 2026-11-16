@@ -35,6 +35,7 @@ mod environment;
 pub mod error;
 pub mod exec_output;
 pub mod hooks;
+pub mod host_auth_work;
 pub mod host_turn_work;
 pub mod items;
 mod legacy_events;

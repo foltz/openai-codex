@@ -1,35 +1,11 @@
 //! Original auth-task custody supplied by a finite host invocation, never a provider factory.
 use codex_protocol::error::{CodexErr, Result};
+pub use codex_protocol::host_auth_work::{
+    AuthTaskFailure, AuthTaskFuture, AuthTaskObservation, AuthTaskSpawner,
+};
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
-
-pub type AuthTaskFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
-pub type AuthTaskObservation =
-    Pin<Box<dyn Future<Output = std::result::Result<(), AuthTaskFailure>> + Send + 'static>>;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AuthTaskFailure {
-    Refused,
-    Unavailable,
-    Cancelled,
-    Panicked,
-}
-impl AuthTaskFailure {
-    fn error(self) -> CodexErr {
-        CodexErr::Fatal(format!("provider auth task custody failed: {self:?}"))
-    }
-}
-
-/// Must capture/derive before dispatch and retain the original join independently of observers.
-/// The future owns no credential output: its private caller channel owns that result.
-pub trait AuthTaskSpawner: std::fmt::Debug + Send + Sync {
-    fn spawn(
-        &self,
-        task: AuthTaskFuture,
-    ) -> std::result::Result<AuthTaskObservation, AuthTaskFailure>;
-}
 
 pub enum AuthTaskAccess {
     /// Existing independent callers have no managed account host.

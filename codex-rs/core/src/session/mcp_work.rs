@@ -11,6 +11,15 @@ use codex_mcp::McpAttemptWork;
 pub(crate) struct McpOperationWork(pub(crate) Box<dyn HostOperationWork>);
 
 impl McpAttemptWork for McpOperationWork {
+    fn auth_task_spawner(
+        &self,
+    ) -> Result<
+        std::sync::Arc<dyn codex_protocol::host_auth_work::AuthTaskSpawner>,
+        McpAttemptRefused,
+    > {
+        self.0.auth_task_spawner().map_err(|_| McpAttemptRefused)
+    }
+
     fn derive_attempt(&self) -> Result<Box<dyn McpAttemptWork>, McpAttemptRefused> {
         self.0
             .derive_operation()

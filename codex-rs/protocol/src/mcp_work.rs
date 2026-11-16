@@ -8,6 +8,14 @@
 /// or a reusable startup factory. Implementations derive independently counted
 /// work without waiting, acquiring fresh authority, or re-entering MCP.
 pub trait McpAttemptWork: Send + Sync {
+    /// Obtain auth-child custody from this live operation. Unsupported hosts
+    /// refuse; this must never mint fresh admission or detached auth work.
+    fn auth_task_spawner(
+        &self,
+    ) -> Result<std::sync::Arc<dyn crate::host_auth_work::AuthTaskSpawner>, McpAttemptRefused> {
+        Err(McpAttemptRefused)
+    }
+
     /// Derive one descendant attempt from this still-live operation. Refusal
     /// must not fall back to uncounted or newly admitted work.
     fn derive_attempt(&self) -> Result<Box<dyn McpAttemptWork>, McpAttemptRefused>;

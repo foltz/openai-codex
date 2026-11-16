@@ -1851,3 +1851,341 @@ async fn recommendation_fixture_partial_header_eof_still_fails() -> anyhow::Resu
     assert_eq!(fixture.requests.load(Ordering::SeqCst), 0);
     Ok(())
 }
+
+fn queued_auth_access(
+    tasks: &ProcessorTasks,
+    permits: &AccountWorkPermits,
+) -> codex_model_provider::AuthTaskAccess {
+    let operation = host(permits, Some(tasks.ticket()))
+        .admit_operation_work()
+        .unwrap()
+        .unwrap();
+    let spawner = operation.auth_task_spawner().unwrap();
+    drop(operation);
+    codex_model_provider::AuthTaskAccess::Admitted(spawner)
+}
+
+#[tokio::test]
+async fn queued_auth_request_is_counted_before_dispatch_and_ends_after_last_endpoint() {
+    let tasks = ProcessorTasks::default();
+    let permits = AccountWorkPermits::new();
+    let family = codex_core_plugins::PluginTaskRegistry::default();
+    let request =
+        codex_model_provider::with_auth_task_scope(queued_auth_access(&tasks, &permits), async {
+            family.prepare_auth_request()
+        })
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    permits.close();
+    assert!(permits.try_acquire().is_none());
+    assert!(permits.admitted_count() > 0);
+    assert_eq!(tasks.pending_len_for_test(), 1);
+    assert!(!tasks.observe_until(Instant::now()).await.terminal);
+    assert_eq!(request.run(async { 42 }).await.unwrap(), 42);
+    assert!(
+        permits.admitted_count() > 0,
+        "endpoint retains only this finite request"
+    );
+    drop(request);
+    assert!(
+        family
+            .shutdown_until(Instant::now() + DRAIN_DEADLINE)
+            .await
+            .is_clean()
+    );
+    assert!(
+        tasks
+            .shutdown_until(Instant::now() + DRAIN_DEADLINE)
+            .await
+            .is_clean()
+    );
+    assert_eq!(permits.admitted_count(), 0);
+}
+
+#[tokio::test]
+async fn queued_auth_command_survives_result_observer_abort_and_family_deadline() {
+    let tasks = ProcessorTasks::default();
+    let permits = AccountWorkPermits::new();
+    let family = codex_core_plugins::PluginTaskRegistry::default();
+    let request =
+        codex_model_provider::with_auth_task_scope(queued_auth_access(&tasks, &permits), async {
+            family.prepare_auth_request()
+        })
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let finished = Arc::new(AtomicBool::new(false));
+    let done = finished.clone();
+    let observer = tokio::spawn(async move {
+        request
+            .run(async move {
+                entered.send(()).unwrap();
+                released.await.unwrap();
+                done.store(true, Ordering::SeqCst);
+            })
+            .await
+    });
+    tokio::time::timeout(DRAIN_DEADLINE, started)
+        .await
+        .unwrap()
+        .unwrap();
+    permits.close();
+    observer.abort();
+    assert!(observer.await.unwrap_err().is_cancelled());
+    assert!(!finished.load(Ordering::SeqCst));
+    assert!(permits.admitted_count() > 0);
+    assert!(!family.shutdown_until(Instant::now()).await.terminal);
+    assert!(!tasks.observe_until(Instant::now()).await.terminal);
+    release.send(()).unwrap();
+    assert!(
+        tasks
+            .shutdown_until(Instant::now() + DRAIN_DEADLINE)
+            .await
+            .is_clean()
+    );
+    assert!(family.shutdown_until(Instant::now()).await.is_clean());
+    assert!(finished.load(Ordering::SeqCst));
+    assert_eq!(permits.admitted_count(), 0);
+}
+
+#[tokio::test]
+async fn queued_auth_endpoint_aliases_never_exchange_separate_invoking_roots() {
+    let a = ProcessorTasks::default();
+    let b = ProcessorTasks::default();
+    let pa = AccountWorkPermits::new();
+    let pb = AccountWorkPermits::new();
+    let family = codex_core_plugins::PluginTaskRegistry::default();
+    let ra = codex_model_provider::with_auth_task_scope(queued_auth_access(&a, &pa), async {
+        family.prepare_auth_request()
+    })
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    let rb = codex_model_provider::with_auth_task_scope(queued_auth_access(&b, &pb), async {
+        family.prepare_auth_request()
+    })
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    let selected_callback_a = ra.clone();
+    pa.close();
+    pb.close();
+    drop(ra);
+    assert!(pa.admitted_count() > 0 && pb.admitted_count() > 0);
+    rb.run(async {}).await.unwrap();
+    drop(rb);
+    assert!(
+        b.shutdown_until(Instant::now() + DRAIN_DEADLINE)
+            .await
+            .is_clean()
+    );
+    assert_eq!(pb.admitted_count(), 0);
+    assert!(pa.admitted_count() > 0);
+    selected_callback_a.run(async {}).await.unwrap();
+    drop(selected_callback_a);
+    assert!(
+        a.shutdown_until(Instant::now() + DRAIN_DEADLINE)
+            .await
+            .is_clean()
+    );
+    assert!(
+        family
+            .shutdown_until(Instant::now() + DRAIN_DEADLINE)
+            .await
+            .is_clean()
+    );
+    assert_eq!(pa.admitted_count(), 0);
+}
+
+#[tokio::test]
+async fn queued_auth_closed_family_refuses_before_external_host_birth() {
+    let tasks = ProcessorTasks::default();
+    let permits = AccountWorkPermits::new();
+    let family = codex_core_plugins::PluginTaskRegistry::default();
+    family.close();
+    let result =
+        codex_model_provider::with_auth_task_scope(queued_auth_access(&tasks, &permits), async {
+            family.prepare_auth_request()
+        })
+        .await
+        .unwrap();
+    assert!(result.is_err());
+    assert_eq!(tasks.len(), 0);
+    assert_eq!(permits.admitted_count(), 0);
+    assert!(family.shutdown_until(Instant::now()).await.is_clean());
+}
+
+#[tokio::test]
+async fn queued_auth_closed_host_attaches_unavailable_without_fallback() {
+    let tasks = ProcessorTasks::default();
+    let permits = AccountWorkPermits::new();
+    let access = queued_auth_access(&tasks, &permits);
+    tasks.close_registration().unwrap();
+    permits.close();
+    let family = codex_core_plugins::PluginTaskRegistry::default();
+    let result = codex_model_provider::with_auth_task_scope(access, async {
+        assert!(family.prepare_auth_request().is_err());
+    })
+    .await;
+    assert!(result.is_err());
+    assert_eq!(tasks.len(), 0);
+    assert_eq!(permits.admitted_count(), 0);
+    let report = family.shutdown_until(Instant::now() + DRAIN_DEADLINE).await;
+    assert!(report.terminal && report.unavailable && !report.is_clean());
+}
+
+#[tokio::test]
+async fn queued_auth_command_panic_is_sticky_in_both_original_ledgers() {
+    let tasks = ProcessorTasks::default();
+    let permits = AccountWorkPermits::new();
+    let family = codex_core_plugins::PluginTaskRegistry::default();
+    let request =
+        codex_model_provider::with_auth_task_scope(queued_auth_access(&tasks, &permits), async {
+            family.prepare_auth_request()
+        })
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    request
+        .dispatch(Box::pin(async {
+            panic!("synthetic deferred command panic");
+        }))
+        .unwrap();
+    let report = tasks.shutdown_until(Instant::now() + DRAIN_DEADLINE).await;
+    assert!(report.terminal && report.panicked && !report.is_clean());
+    let invoked = Arc::new(AtomicBool::new(false));
+    let child = invoked.clone();
+    assert!(
+        request
+            .dispatch(Box::pin(async move {
+                child.store(true, Ordering::SeqCst);
+            }))
+            .is_err()
+    );
+    assert!(!invoked.load(Ordering::SeqCst));
+    drop(request);
+    let report = family.shutdown_until(Instant::now() + DRAIN_DEADLINE).await;
+    assert!(report.terminal && report.panicked && !report.is_clean());
+    assert!(family.shutdown_until(Instant::now()).await.panicked);
+    assert_eq!(permits.admitted_count(), 0);
+}
+
+struct ReentrantQueuedAuthSpawner {
+    family: codex_core_plugins::PluginTaskRegistry,
+    inner: Arc<dyn codex_model_provider::AuthTaskSpawner>,
+    panic_before_birth: bool,
+}
+impl std::fmt::Debug for ReentrantQueuedAuthSpawner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReentrantQueuedAuthSpawner")
+    }
+}
+impl codex_model_provider::AuthTaskSpawner for ReentrantQueuedAuthSpawner {
+    fn spawn(
+        &self,
+        future: codex_model_provider::AuthTaskFuture,
+    ) -> Result<codex_model_provider::AuthTaskObservation, codex_model_provider::AuthTaskFailure>
+    {
+        self.family.close(); // Takes the family lock; reserve must have released it.
+        assert!(
+            !self.panic_before_birth,
+            "synthetic reservation attachment panic"
+        );
+        self.inner.spawn(future)
+    }
+}
+
+#[tokio::test]
+async fn queued_auth_family_close_during_external_birth_retains_prior_reservation() {
+    let tasks = ProcessorTasks::default();
+    let permits = AccountWorkPermits::new();
+    let family = codex_core_plugins::PluginTaskRegistry::default();
+    let codex_model_provider::AuthTaskAccess::Admitted(inner) =
+        queued_auth_access(&tasks, &permits)
+    else {
+        panic!("admitted fixture");
+    };
+    let access =
+        codex_model_provider::AuthTaskAccess::Admitted(Arc::new(ReentrantQueuedAuthSpawner {
+            family: family.clone(),
+            inner,
+            panic_before_birth: false,
+        }));
+    let request =
+        codex_model_provider::with_auth_task_scope(access, async { family.prepare_auth_request() })
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    assert!(
+        family.prepare_auth_request().is_err(),
+        "no later admission after reentrant close"
+    );
+    assert!(permits.admitted_count() > 0);
+    request.run(async {}).await.unwrap();
+    drop(request);
+    assert!(
+        family
+            .shutdown_until(Instant::now() + DRAIN_DEADLINE)
+            .await
+            .is_clean()
+    );
+    assert!(
+        tasks
+            .shutdown_until(Instant::now() + DRAIN_DEADLINE)
+            .await
+            .is_clean()
+    );
+    assert_eq!(permits.admitted_count(), 0);
+}
+
+#[tokio::test]
+async fn queued_auth_unattached_reservation_panic_is_unavailable_not_clean() {
+    use futures::FutureExt;
+    let tasks = ProcessorTasks::default();
+    let permits = AccountWorkPermits::new();
+    let family = codex_core_plugins::PluginTaskRegistry::default();
+    let codex_model_provider::AuthTaskAccess::Admitted(inner) =
+        queued_auth_access(&tasks, &permits)
+    else {
+        panic!("admitted fixture");
+    };
+    let access =
+        codex_model_provider::AuthTaskAccess::Admitted(Arc::new(ReentrantQueuedAuthSpawner {
+            family: family.clone(),
+            inner,
+            panic_before_birth: true,
+        }));
+    assert!(
+        std::panic::AssertUnwindSafe(codex_model_provider::with_auth_task_scope(access, async {
+            let _ = family.prepare_auth_request();
+        }))
+        .catch_unwind()
+        .await
+        .is_err()
+    );
+    assert_eq!(tasks.len(), 0);
+    assert_eq!(permits.admitted_count(), 0);
+    let report = family.shutdown_until(Instant::now() + DRAIN_DEADLINE).await;
+    assert!(report.terminal && report.unavailable && !report.is_clean());
+}
+
+#[tokio::test]
+async fn queued_auth_unmanaged_preparation_creates_no_managed_endpoint() {
+    let family = codex_core_plugins::PluginTaskRegistry::default();
+    assert!(family.prepare_auth_request().unwrap().is_none());
+    assert!(
+        family
+            .shutdown_until(Instant::now() + DRAIN_DEADLINE)
+            .await
+            .is_clean()
+    );
+}

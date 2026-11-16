@@ -286,6 +286,61 @@ impl PluginTaskRegistry {
         }
     }
 
+    /// Reserve this family BEFORE a finite external host original can be born.
+    /// Its alias awaits the same original observation; there is no spawned
+    /// async supervisor and no second account-work counter. The state lock is
+    /// released before calling the host or dropping any external observation.
+    pub fn prepare_auth_request(
+        &self,
+    ) -> Result<Option<codex_model_provider::DeferredAuthTask>, ()> {
+        let (attach, receive) = tokio::sync::oneshot::channel::<BoxFuture<'static, JoinOutcome>>();
+        {
+            let mut state = self.state.lock().map_err(|_| ())?;
+            if state.closed {
+                return Err(());
+            }
+            state.compact();
+            state.tasks.push(
+                async move {
+                    match receive.await {
+                        Ok(original) => original.await,
+                        Err(_) => JoinOutcome::Unavailable,
+                    }
+                }
+                .boxed()
+                .shared(),
+            );
+        }
+        // A panic before attachment closes the sender and leaves the reserved
+        // receipt explicitly Unavailable, never a false clean empty census.
+        let (result, original): (_, BoxFuture<'static, JoinOutcome>) =
+            match codex_model_provider::prepare_deferred_auth_task() {
+                Ok(Some((request, observation))) => (
+                    Ok(Some(request)),
+                    async move {
+                        match observation.await {
+                            Ok(()) => JoinOutcome::Joined,
+                            Err(codex_model_provider::AuthTaskFailure::Cancelled) => {
+                                JoinOutcome::Cancelled
+                            }
+                            Err(codex_model_provider::AuthTaskFailure::Panicked) => {
+                                JoinOutcome::Panicked
+                            }
+                            Err(_) => JoinOutcome::Unavailable,
+                        }
+                    }
+                    .boxed(),
+                ),
+                Ok(None) => (Ok(None), async { JoinOutcome::Joined }.boxed()),
+                Err(_) => (Err(()), async { JoinOutcome::Unavailable }.boxed()),
+            };
+        if attach.send(original).is_err() {
+            self.worker_stop().mark_unavailable();
+            return Err(());
+        }
+        result
+    }
+
     pub(crate) fn spawn(
         &self,
         future: impl Future<Output = ()> + Send + 'static,

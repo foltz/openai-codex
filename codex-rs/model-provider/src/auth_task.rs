@@ -103,14 +103,18 @@ fn dispatch_provider_task(
     let observation = observation.inspect_err(|reason| {
         let _ = context.fail(*reason);
     })?;
+    // The observation aliases terminal evidence, not finite account authority.
+    // Only the actual original holds the spawner/root until its body ends.
+    let observed_failure = context.failure.clone();
     Ok(Box::pin(async move {
         observation.await.inspect_err(|reason| {
-            let _ = context.fail(*reason);
+            if let Ok(mut failure) = observed_failure.lock() {
+                failure.get_or_insert(*reason);
+            }
         })?;
         // An enclosing scope may already have returned its observer. A child
         // registration error caught inside the parent must still be observable.
-        let failure = *context
-            .failure
+        let failure = *observed_failure
             .lock()
             .map_err(|_| AuthTaskFailure::Unavailable)?;
         match failure {
@@ -142,6 +146,56 @@ pub async fn run_auth_call<T: Send + 'static>(
     .ok_or(AuthTaskFailure::Unavailable)?;
     observation.await?;
     receive.await.map_err(|_| AuthTaskFailure::Unavailable)
+}
+
+/// Endpoint for one finite queued request, never a reusable service identity.
+/// Clones alias that SAME original. Dropping every endpoint lets it finish after
+/// all accepted commands; no endpoint is retained by its own receiver.
+#[derive(Clone)]
+pub struct DeferredAuthTask {
+    commands: tokio::sync::mpsc::UnboundedSender<AuthTaskFuture>,
+}
+impl DeferredAuthTask {
+    /// Fire-and-observe through the original host ledger, without creating a
+    /// supervisor task. This must only carry effects of the admitted request.
+    pub fn dispatch(&self, future: AuthTaskFuture) -> std::result::Result<(), AuthTaskFailure> {
+        self.commands
+            .send(future)
+            .map_err(|_| AuthTaskFailure::Unavailable)
+    }
+
+    /// A cancelled result observer cannot cancel an accepted physical command.
+    pub async fn run<T: Send + 'static>(
+        &self,
+        future: impl Future<Output = T> + Send + 'static,
+    ) -> std::result::Result<T, AuthTaskFailure> {
+        let (send, receive) = oneshot::channel();
+        self.dispatch(Box::pin(async move {
+            let value = future.await;
+            let _ = send.send(value);
+        }))?;
+        receive.await.map_err(|_| AuthTaskFailure::Unavailable)
+    }
+}
+
+/// Admit the actual finite original before a caller publishes its queue entry.
+/// No inherited context means no managed task and no implicit fresh admission.
+/// The caller MUST retain the returned observation in its owning task family.
+pub fn prepare_deferred_auth_task()
+-> std::result::Result<Option<(DeferredAuthTask, AuthTaskObservation)>, AuthTaskFailure> {
+    let Some(context) = AUTH_TASK_CONTEXT.try_with(Clone::clone).ok() else {
+        return Ok(None);
+    };
+    let (commands, mut receiver) = tokio::sync::mpsc::unbounded_channel::<AuthTaskFuture>();
+    let observation = dispatch_provider_task(
+        context,
+        Box::pin(async move {
+            while let Some(command) = receiver.recv().await {
+                command.await;
+            }
+        }),
+    )?;
+    Ok(Some((DeferredAuthTask { commands }, observation)))
 }
 
 /// Legacy unmanaged JoinError is preserved; custody failure is a distinct

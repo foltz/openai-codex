@@ -5,7 +5,7 @@ use codex_extension_api::{
     ExtensionRegistryBuilder, HostOperationWork, TurnStartAdmission, TurnWorkRefused,
 };
 use codex_login::{AuthManager, CodexAuth, ExternalAuth};
-use codex_models_manager::manager::{ModelsManager, RefreshStrategy};
+use codex_models_manager::manager::RefreshStrategy;
 use pretty_assertions::assert_eq;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -23,6 +23,12 @@ struct HeldAuth {
     panic: bool,
 }
 impl ExternalAuth for HeldAuth {
+    fn refresh(
+        &self,
+        _: codex_login::ExternalAuthRefreshContext,
+    ) -> codex_login::ExternalAuthFuture<'_, CodexAuth> {
+        Box::pin(async { panic!("fixture must not perform external credential refresh") })
+    }
     fn resolve(&self) -> codex_login::ExternalAuthFuture<'_, CodexAuth> {
         Box::pin(async move {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
@@ -170,7 +176,7 @@ async fn prove_cancelled_catalog_child(nested: bool, request: bool) {
     entered(&f).await;
     f.permits.close();
     job.abort();
-    assert!(job.await.unwrap_err().is_cancelled());
+    assert!(matches!(job.await, Err(error) if error.is_cancelled()));
     assert!(
         f.permits.admitted_count() > 0,
         "the real auth child retains finite work after parent end"
@@ -247,7 +253,7 @@ async fn request_setup_auth_child_survives_cancelled_caller() {
     entered(&f).await;
     f.permits.close();
     job.abort();
-    assert!(job.await.unwrap_err().is_cancelled());
+    assert!(matches!(job.await, Err(error) if error.is_cancelled()));
     assert!(f.permits.admitted_count() > 0);
     f.held.release.add_permits(1);
     assert!(
@@ -338,7 +344,9 @@ async fn explicit_required_scope_never_polls_an_unrooted_operation() {
     assert!(result.is_err());
     assert!(!entered.load(Ordering::SeqCst));
 }
-struct RefusedWork(Box<dyn HostOperationWork>);
+struct RefusedWork {
+    _work: Box<dyn HostOperationWork>,
+}
 impl std::fmt::Debug for RefusedWork {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("RefusedWork")
@@ -360,12 +368,12 @@ impl HostOperationWork for RefusedWork {
 async fn refused_child_derivation_has_no_fresh_fallback_or_auth_effect() {
     let f = fixture(false, false, false).await;
     let tasks = ProcessorTasks::default();
-    let work = Box::new(RefusedWork(Box::new(
-        crate::account_operation_work::AccountOperationWork {
+    let work = Box::new(RefusedWork {
+        _work: Box::new(crate::account_operation_work::AccountOperationWork {
             permit: f.permits.try_acquire().unwrap(),
             turns: Default::default(),
-        },
-    ))) as Box<dyn HostOperationWork>;
+        }),
+    }) as Box<dyn HostOperationWork>;
     assert!(
         crate::auth_task_work::scope(&tasks, Some(work), f.provider.request_auth(None))
             .await

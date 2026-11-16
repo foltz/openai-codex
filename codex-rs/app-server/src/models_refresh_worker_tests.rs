@@ -42,7 +42,7 @@ async fn shutdown_observers_retain_and_join_the_same_in_flight_refresh() {
         home.path().to_path_buf(),
     );
     let config = Arc::new(config_manager.load_non_project_config().await.unwrap());
-    let auth_manager = codex_login::AuthManager::shared_from_config(&config, false);
+    let auth_manager = codex_login::AuthManager::shared_from_config(config.as_ref(), false).await;
     let thread_manager = test_thread_manager(&config, Some(models_manager), auth_manager);
     let catalog = Arc::new(ModelCatalog::new(
         config_manager,

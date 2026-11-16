@@ -73,10 +73,24 @@ impl GoalSetOutcome {
         }))
     }
 
-    pub async fn apply_runtime_effects(&self, goal_service: &GoalService) {
+    /// Applies effects with authority retained by the original request. The
+    /// clonable outcome itself never owns account custody. Refusal still allows
+    /// local Goal bookkeeping, but not steering or automatic continuation.
+    pub async fn apply_runtime_effects(
+        &self,
+        goal_service: &GoalService,
+        account_work: Result<
+            Option<&dyn codex_extension_api::HostOperationWork>,
+            codex_protocol::mcp_work::McpAttemptRefused,
+        >,
+    ) {
         if let Some(runtime) = goal_service.runtime_for_thread(self.goal.thread_id)
             && let Err(err) = runtime
-                .apply_external_goal_set(self.state_goal.clone(), self.previous_goal.clone())
+                .apply_external_goal_set(
+                    self.state_goal.clone(),
+                    self.previous_goal.clone(),
+                    account_work,
+                )
                 .await
         {
             tracing::warn!("failed to apply external goal status runtime effects: {err}");

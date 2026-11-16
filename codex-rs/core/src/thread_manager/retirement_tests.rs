@@ -2296,3 +2296,54 @@ async fn resumed_constructor_keeps_explicit_work_with_emitted_or_deferred_ready(
         thread.thread.shutdown_and_wait().await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn manager_request_capture_uses_original_scope_and_retains_no_idle_lease() {
+    let (_home, mut manager, _) = expiry_manager(true).await;
+    assert!(manager.capture_request_operation_work().unwrap().is_none());
+    let host = Arc::new(ManagedRequestHost {
+        required: true,
+        produce_work: true,
+        refuse: false,
+        lookups: AtomicUsize::new(0),
+        operations: AtomicUsize::new(0),
+    });
+    let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
+    extensions.turn_start_admission(Arc::new(ManagedRequestAdmission(host.clone())));
+    Arc::get_mut(&mut manager.state).unwrap().extensions = Arc::new(extensions.build());
+    assert!(manager.capture_request_operation_work().is_err());
+    assert_eq!(host.operations.load(Ordering::SeqCst), 0);
+    let work = MANAGED_REQUEST_SCOPE
+        .scope((), async {
+            manager.capture_request_operation_work().unwrap().unwrap()
+        })
+        .await;
+    assert_eq!(host.lookups.load(Ordering::SeqCst), 2);
+    assert_eq!(host.operations.load(Ordering::SeqCst), 1);
+    let child = work.derive_operation().unwrap();
+    drop(work);
+    assert_eq!(host.operations.load(Ordering::SeqCst), 1);
+    drop(child);
+    assert_eq!(host.operations.load(Ordering::SeqCst), 0);
+    for (required, refuse) in [(true, true), (true, false), (false, false)] {
+        let host = Arc::new(ManagedRequestHost {
+            required,
+            produce_work: false,
+            refuse,
+            lookups: AtomicUsize::new(0),
+            operations: AtomicUsize::new(0),
+        });
+        let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
+        extensions.turn_start_admission(Arc::new(ManagedRequestAdmission(host.clone())));
+        Arc::get_mut(&mut manager.state).unwrap().extensions = Arc::new(extensions.build());
+        let captured = MANAGED_REQUEST_SCOPE
+            .scope((), async { manager.capture_request_operation_work() })
+            .await;
+        assert_eq!(captured.is_err(), required);
+        if let Ok(work) = captured {
+            assert!(work.is_none());
+        }
+        assert_eq!(host.lookups.load(Ordering::SeqCst), 1);
+        assert_eq!(host.operations.load(Ordering::SeqCst), 0);
+    }
+}

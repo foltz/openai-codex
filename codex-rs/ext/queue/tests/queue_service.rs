@@ -1419,3 +1419,229 @@ async fn admitted_idle_queue_dispatch_binds_derived_turn_to_the_actual_loop_rece
     assert_eq!(state.live.load(Ordering::SeqCst), 0);
     Ok(())
 }
+
+tokio::task_local! { static MANUAL_QUEUE_REQUEST_SCOPE: (); }
+#[derive(Debug, Default)]
+struct ManualRequestGate {
+    enabled: AtomicBool,
+    mode: std::sync::atomic::AtomicUsize,
+    requests: std::sync::atomic::AtomicUsize,
+    state: Arc<QueueWorkState>,
+    thread: Mutex<Option<ThreadId>>,
+}
+impl TurnStartAdmission for ManualRequestGate {
+    fn admit_turn_start(&self) -> Option<Box<dyn Send>> {
+        Some(Box::new(()))
+    }
+    fn requires_account_work(&self) -> bool {
+        self.enabled.load(Ordering::SeqCst) && self.mode.load(Ordering::SeqCst) != 0
+    }
+    fn derive_request_operation_work(
+        &self,
+    ) -> Result<
+        Option<Box<dyn codex_extension_api::HostOperationWork>>,
+        codex_extension_api::TurnWorkRefused,
+    > {
+        if !self.enabled.load(Ordering::SeqCst)
+            || MANUAL_QUEUE_REQUEST_SCOPE.try_with(|_| ()).is_err()
+        {
+            return Ok(None);
+        }
+        self.requests.fetch_add(1, Ordering::SeqCst);
+        match self.mode.load(Ordering::SeqCst) {
+            1 => Err(codex_extension_api::TurnWorkRefused::Unavailable),
+            2 => Ok(None),
+            3 => Err(codex_extension_api::TurnWorkRefused::RetryAfter(Box::pin(
+                std::future::pending(),
+            ))),
+            _ => {
+                self.state.live.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(Box::new(QueueOperationWork {
+                    state: self.state.clone(),
+                    thread: self.thread.lock().unwrap().unwrap(),
+                })))
+            }
+        }
+    }
+    fn admit_operation_work(
+        &self,
+    ) -> Result<
+        Option<Box<dyn codex_extension_api::HostOperationWork>>,
+        codex_extension_api::TurnWorkRefused,
+    > {
+        panic!("manual request must never fall back to fresh operation admission")
+    }
+    fn admit_turn_work(
+        &self,
+        _: &ExtensionData,
+        _: ExtensionFuture<'static, ()>,
+    ) -> Result<
+        Option<Box<dyn codex_protocol::host_turn_work::HostTurnWork>>,
+        codex_extension_api::TurnWorkRefused,
+    > {
+        panic!("manual request must use its explicit derived turn, not fresh admission")
+    }
+}
+struct HeldQueueStore {
+    inner: Arc<dyn QueueStore>,
+    hold: AtomicBool,
+    reads: std::sync::atomic::AtomicUsize,
+}
+impl QueueStore for HeldQueueStore {
+    fn change_version(&self) -> codex_thread_store::ThreadStoreFuture<'_, i64> {
+        self.inner.change_version()
+    }
+    fn changes_since<'a>(
+        &'a self,
+        revision: i64,
+        thread_ids: &'a [ThreadId],
+    ) -> codex_thread_store::ThreadStoreFuture<'a, Vec<(ThreadId, i64)>> {
+        self.inner.changes_since(revision, thread_ids)
+    }
+    fn enqueue(
+        &self,
+        thread_id: ThreadId,
+        payload: String,
+    ) -> codex_thread_store::ThreadStoreFuture<'_, codex_state::QueuedUserSubmissionRecord> {
+        self.inner.enqueue(thread_id, payload)
+    }
+    fn list_page(
+        &self,
+        thread_id: ThreadId,
+        offset: usize,
+        limit: usize,
+    ) -> codex_thread_store::ThreadStoreFuture<'_, Vec<codex_state::QueuedUserSubmissionRecord>>
+    {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        if self.hold.load(Ordering::SeqCst) {
+            Box::pin(std::future::pending())
+        } else {
+            self.inner.list_page(thread_id, offset, limit)
+        }
+    }
+    fn update(
+        &self,
+        thread_id: ThreadId,
+        item_id: String,
+        payload: String,
+    ) -> codex_thread_store::ThreadStoreFuture<'_, Option<codex_state::QueuedUserSubmissionRecord>>
+    {
+        self.inner.update(thread_id, item_id, payload)
+    }
+    fn delete(
+        &self,
+        thread_id: ThreadId,
+        item_id: String,
+    ) -> codex_thread_store::ThreadStoreFuture<'_, bool> {
+        self.inner.delete(thread_id, item_id)
+    }
+    fn reorder(
+        &self,
+        thread_id: ThreadId,
+        item_ids: Vec<String>,
+    ) -> codex_thread_store::ThreadStoreFuture<'_, ()> {
+        self.inner.reorder(thread_id, item_ids)
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_queue_captures_request_before_store_wait_and_never_reopens_admission()
+-> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let response =
+        responses::mount_sse_once(&server, responses::sse_completed("manual-request-turn")).await;
+    let gate = Arc::new(ManualRequestGate::default());
+    let mut extensions = ExtensionRegistryBuilder::new();
+    extensions.turn_start_admission(gate.clone());
+    let test = test_codex()
+        .with_extensions(Arc::new(extensions.build()))
+        .build_with_auto_env(&server)
+        .await?;
+    let thread_id = test.session_configured.thread_id;
+    *gate.thread.lock().unwrap() = Some(thread_id);
+    gate.enabled.store(true, Ordering::SeqCst);
+    let queue = loaded_thread_queue(&test)?;
+    let staged =
+        QueuedItemService::new(queue.clone(), Weak::new(), Arc::new(NoopExtensionEventSink));
+    let item = staged
+        .enqueue(thread_id, user_input("manual request-owned message"))
+        .await?;
+    let observed = Arc::new(HeldQueueStore {
+        inner: queue,
+        hold: AtomicBool::new(true),
+        reads: Default::default(),
+    });
+    let service = QueuedItemService::new(
+        observed.clone(),
+        Arc::downgrade(&test.thread_manager),
+        Arc::new(NoopExtensionEventSink),
+    );
+    let mut start = Box::pin(MANUAL_QUEUE_REQUEST_SCOPE.scope(
+        (),
+        service.start(test.codex.as_ref(), Some(item.id.clone()), None),
+    ));
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(
+            std::future::Future::poll(start.as_mut(), cx).is_pending()
+        ))
+        .await
+    );
+    assert_eq!(gate.requests.load(Ordering::SeqCst), 1);
+    assert_eq!(observed.reads.load(Ordering::SeqCst), 1);
+    assert_eq!(gate.state.live.load(Ordering::SeqCst), 1);
+    drop(start);
+    assert_eq!(gate.state.live.load(Ordering::SeqCst), 0);
+    assert_eq!(gate.state.turns.load(Ordering::SeqCst), 0);
+    assert_eq!(staged.list(thread_id).await?, vec![item.clone()]);
+    for mode in [1, 2, 3] {
+        gate.mode.store(mode, Ordering::SeqCst);
+        let result = MANUAL_QUEUE_REQUEST_SCOPE
+            .scope(
+                (),
+                service.start(test.codex.as_ref(), Some(item.id.clone()), None),
+            )
+            .await?;
+        assert!(matches!(
+            result,
+            StartIfIdleSubmission::NotSubmitted {
+                reason: NotSubmittedReason::ServerDraining
+            }
+        ));
+        assert_eq!(observed.reads.load(Ordering::SeqCst), 1);
+        assert_eq!(gate.state.live.load(Ordering::SeqCst), 0);
+        assert_eq!(staged.list(thread_id).await?, vec![item.clone()]);
+        assert!(response.requests().is_empty());
+    }
+    gate.mode.store(0, Ordering::SeqCst);
+    observed.hold.store(false, Ordering::SeqCst);
+    let result = MANUAL_QUEUE_REQUEST_SCOPE
+        .scope((), service.start(test.codex.as_ref(), Some(item.id), None))
+        .await?;
+    let StartIfIdleSubmission::Started { turn_id, .. } = result else {
+        panic!("valid explicit request must start");
+    };
+    wait_for_event_match(test.codex.as_ref(), |event| {
+        matches!(event, EventMsg::TurnComplete(_)).then_some(())
+    })
+    .await;
+    assert_eq!(gate.requests.load(Ordering::SeqCst), 5);
+    assert_eq!(gate.state.turns.load(Ordering::SeqCst), 1);
+    assert_eq!(*gate.state.bound.lock().unwrap(), vec![turn_id]);
+    assert_eq!(gate.state.live.load(Ordering::SeqCst), 1);
+    assert!(staged.list(thread_id).await?.is_empty());
+    assert_eq!(
+        response
+            .single_request()
+            .message_input_texts("user")
+            .last()
+            .map(String::as_str),
+        Some("manual request-owned message")
+    );
+    test.codex.shutdown_and_wait().await?;
+    let joins = std::mem::take(&mut *gate.state.joins.lock().unwrap());
+    assert_eq!(joins.len(), 1);
+    for join in joins {
+        tokio::time::timeout(Duration::from_secs(5), join).await??;
+    }
+    assert_eq!(gate.state.live.load(Ordering::SeqCst), 0);
+    Ok(())
+}

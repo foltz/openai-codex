@@ -716,6 +716,17 @@ impl CodexThread {
         }
     }
 
+    /// Capture the current host request before extension-owned waits. Required
+    /// missing/exhausted work refuses without fresh admission or turn lookup.
+    pub fn capture_request_operation_work(
+        &self,
+    ) -> Result<Option<Box<dyn codex_extension_api::HostOperationWork>>, codex_mcp::McpAttemptRefused>
+    {
+        self.session
+            .request_operation_work()
+            .map_err(|_| codex_mcp::McpAttemptRefused)
+    }
+
     /// Start automatic idle work from an explicit finite operation. Derive
     /// custody for the queued turn before capacity waits, with no fresh account
     /// admission or ambient request/turn lookup on refusal.

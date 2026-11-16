@@ -140,6 +140,9 @@ impl ThreadGoalRequestProcessor {
         }
 
         let thread_id = parse_thread_id_for_request(params.thread_id.as_str())?;
+        // Capture before resume/DB/configuration/rollout/response waits. Local
+        // mutation and stopping remain available if account effects are refused.
+        let account_work = self.thread_manager.capture_request_operation_work();
         let _goal_resume_guard = self.thread_state_manager.lock_goal_resume(thread_id).await;
         let state_db = self
             .state_db_for_materialized_thread(thread_id, GoalAccess::Mutate)
@@ -247,7 +250,15 @@ impl ThreadGoalRequestProcessor {
             .await;
         self.emit_thread_goal_updated_ordered(thread_id, goal, listener_command_tx)
             .await;
-        outcome.apply_runtime_effects(&self.goal_service).await;
+        outcome
+            .apply_runtime_effects(
+                &self.goal_service,
+                account_work
+                    .as_ref()
+                    .map(|work| work.as_deref())
+                    .map_err(|_| codex_protocol::mcp_work::McpAttemptRefused),
+            )
+            .await;
         Ok(())
     }
 

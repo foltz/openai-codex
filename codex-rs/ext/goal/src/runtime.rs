@@ -190,10 +190,23 @@ impl GoalRuntimeHandle {
         &self,
         goal: codex_state::ThreadGoal,
         previous_goal: Option<PreviousGoalSnapshot>,
+        account_work: Result<
+            Option<&dyn codex_extension_api::HostOperationWork>,
+            codex_protocol::mcp_work::McpAttemptRefused,
+        >,
     ) -> Result<(), String> {
         if !self.is_enabled() {
             return Ok(());
         }
+        // Derive once before steering/configuration/preparation waits. The
+        // caller's original request retains its own independent operation.
+        let work = account_work.and_then(|work| {
+            work.map(|work| {
+                work.derive_operation()
+                    .map_err(|_| codex_protocol::mcp_work::McpAttemptRefused)
+            })
+            .transpose()
+        });
 
         self.inner.accounting_state.reset_empty_responses();
         let replaced_existing_goal = previous_goal
@@ -232,11 +245,13 @@ impl GoalRuntimeHandle {
                         .accounting_state
                         .mark_idle_goal_active(goal.goal_id.clone());
                 }
-                if objective_changed {
+                if objective_changed && work.is_ok() {
                     let item = objective_updated_steering_item(&protocol_goal_from_state(goal));
                     self.inject_active_turn_steering(item).await;
                 }
-                self.continue_if_idle().await?;
+                if let Ok(work) = work {
+                    self.continue_if_idle_with_work(work.as_deref()).await?;
+                }
             }
             codex_state::ThreadGoalStatus::BudgetLimited => {
                 if self.inner.accounting_state.current_turn_id().is_none() {
@@ -430,10 +445,6 @@ impl GoalRuntimeHandle {
             Some(_) | None => self.inner.accounting_state.clear_active_goal(),
         }
         Ok(())
-    }
-
-    pub(crate) async fn continue_if_idle(&self) -> Result<(), String> {
-        self.continue_if_idle_with_work(None).await
     }
 
     pub(crate) async fn continue_if_idle_with_work(

@@ -1222,3 +1222,27 @@ async fn idle_turn_exhausted_work_refuses_without_fresh_admission_or_submission(
     assert_eq!(gate.calls.load(Ordering::SeqCst), 0);
     assert_eq!(gate.dropped.load(Ordering::SeqCst), 0);
 }
+
+#[tokio::test]
+async fn public_request_operation_capture_is_finite_and_never_falls_back() {
+    let (thread, counts) = history_fixture().await;
+    let work = thread.capture_request_operation_work().unwrap().unwrap();
+    assert_eq!(counts.requests.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    let child = work.derive_operation().unwrap();
+    drop(work);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    drop(child);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    let (mut thread, rx, gate) = fixture().await;
+    assert!(thread.capture_request_operation_work().unwrap().is_none());
+    assert_eq!(gate.calls.load(Ordering::SeqCst), 0);
+    let refused = Arc::new(RefusingMcpRequest::default());
+    Arc::get_mut(&mut thread.session)
+        .unwrap()
+        .services
+        .host_admission = Some(refused.clone());
+    assert!(thread.capture_request_operation_work().is_err());
+    assert_eq!(refused.0.load(Ordering::SeqCst), 1);
+    assert!(rx.is_empty());
+}

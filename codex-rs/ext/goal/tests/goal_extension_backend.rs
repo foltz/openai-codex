@@ -1364,7 +1364,9 @@ async fn goal_service_external_set_active_preserves_concurrent_usage() -> anyhow
     child
         .record_token_usage_with_last("child-turn", &child_usage, &child_usage)
         .await;
-    outcome.apply_runtime_effects(&harness.goal_service).await;
+    outcome
+        .apply_runtime_effects(&harness.goal_service, Ok(None))
+        .await;
 
     harness
         .record_token_usage(
@@ -2326,7 +2328,9 @@ async fn staged_goal_preparation_respects_persisted_set_before_runtime_effects_a
             },
             goal.tokens_used
         );
-        outcome.apply_runtime_effects(&harness.goal_service).await;
+        outcome
+            .apply_runtime_effects(&harness.goal_service, Ok(None))
+            .await;
         let staged = harness
             .prepare_turn("cleared", ModeKind::Default, &TokenUsage::default())
             .await;
@@ -2620,5 +2624,108 @@ async fn idle_goal_work_is_derived_before_preparation_wait_and_released_on_cance
     assert_eq!(live.load(std::sync::atomic::Ordering::SeqCst), 1);
     drop(work);
     assert_eq!(live.load(std::sync::atomic::Ordering::SeqCst), 0);
+    Ok(())
+}
+
+async fn external_effect_fixture() -> anyhow::Result<(
+    Arc<codex_state::StateRuntime>,
+    GoalExtensionHarness,
+    codex_goal_extension::GoalSetOutcome,
+)> {
+    let runtime = test_runtime().await?;
+    let thread_id = test_thread_id()?;
+    seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+    let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
+    let outcome = harness
+        .goal_service
+        .set_thread_goal(
+            runtime.as_ref(),
+            GoalSetRequest {
+                thread_id,
+                objective: GoalObjectiveUpdate::Set("retained external request"),
+                status: Some(ThreadGoalStatus::Active),
+                token_budget: GoalTokenBudgetUpdate::Keep,
+                max_goal_token_budget: None,
+            },
+            std::future::ready(Ok(())),
+        )
+        .await?;
+    Ok((runtime, harness, outcome))
+}
+#[tokio::test]
+async fn external_goal_effects_refused_or_exhausted_do_not_wait_or_reopen_admission()
+-> anyhow::Result<()> {
+    let (runtime, harness, outcome) = external_effect_fixture().await?;
+    let prepared = harness
+        .prepare_turn(
+            "held-external-effects",
+            ModeKind::Default,
+            &TokenUsage::default(),
+        )
+        .await;
+    let work = GoalIdleWork {
+        live: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+        derives: Default::default(),
+        refuse: true,
+    };
+    for access in [
+        Err(codex_protocol::mcp_work::McpAttemptRefused),
+        Ok(Some(&work as &dyn codex_extension_api::HostOperationWork)),
+    ] {
+        let mut effects = Box::pin(outcome.apply_runtime_effects(&harness.goal_service, access));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                std::future::Future::poll(effects.as_mut(), cx).is_ready()
+            ))
+            .await,
+            "refused external effects must not wait for Goal continuation preparation"
+        );
+    }
+    assert_eq!(work.derives.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(work.live.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let current = runtime
+        .thread_goals()
+        .get_thread_goal(outcome.goal.thread_id)
+        .await?
+        .unwrap();
+    assert_eq!(current.objective, "retained external request");
+    assert_eq!(current.status, codex_state::ThreadGoalStatus::Active);
+    drop(prepared);
+    Ok(())
+}
+#[tokio::test]
+async fn external_goal_effects_derive_before_wait_without_storing_work_in_outcome()
+-> anyhow::Result<()> {
+    let (_runtime, harness, outcome) = external_effect_fixture().await?;
+    let retained = outcome.clone();
+    let prepared = harness
+        .prepare_turn(
+            "held-external-effects",
+            ModeKind::Default,
+            &TokenUsage::default(),
+        )
+        .await;
+    let work = GoalIdleWork {
+        live: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+        derives: Default::default(),
+        refuse: false,
+    };
+    let live = work.live.clone();
+    let mut effects =
+        Box::pin(outcome.apply_runtime_effects(&harness.goal_service, Ok(Some(&work))));
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(
+            std::future::Future::poll(effects.as_mut(), cx).is_pending()
+        ))
+        .await
+    );
+    assert_eq!(work.derives.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(live.load(std::sync::atomic::Ordering::SeqCst), 2);
+    drop(effects);
+    assert_eq!(live.load(std::sync::atomic::Ordering::SeqCst), 1);
+    drop(prepared);
+    drop(work);
+    assert_eq!(live.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(retained.goal.objective, outcome.goal.objective);
     Ok(())
 }

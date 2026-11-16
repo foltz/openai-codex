@@ -679,6 +679,24 @@ pub fn local_agent_graph_store_from_state_db(
 }
 
 impl ThreadManager {
+    /// Capture process-host request authority before looking up a loaded thread
+    /// or waiting on request-local resources. This never admits fresh work.
+    pub fn capture_request_operation_work(
+        &self,
+    ) -> Result<Option<Box<dyn codex_extension_api::HostOperationWork>>, codex_mcp::McpAttemptRefused>
+    {
+        let Some(host) = self.state.extensions.host_admission() else {
+            return Ok(None);
+        };
+        let work = host
+            .derive_request_operation_work()
+            .map_err(|_| codex_mcp::McpAttemptRefused)?;
+        if work.is_none() && host.requires_account_work() {
+            return Err(codex_mcp::McpAttemptRefused);
+        }
+        Ok(work)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: &Config,

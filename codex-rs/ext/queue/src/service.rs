@@ -403,6 +403,14 @@ impl QueuedItemService {
         queued_item_id: Option<String>,
         trace: Option<W3cTraceContext>,
     ) -> Result<StartIfIdleSubmission, QueueServiceError> {
+        let work = match thread.capture_request_operation_work() {
+            Ok(work) => work,
+            Err(_) => {
+                return Ok(StartIfIdleSubmission::NotSubmitted {
+                    reason: codex_core::NotSubmittedReason::ServerDraining,
+                });
+            }
+        };
         let thread_id = thread.startup_metadata().thread_id;
         let _dispatch_guard = self.dispatch_guard(thread_id).await;
         let item = self
@@ -420,17 +428,17 @@ impl QueuedItemService {
         let input @ TurnInput::UserInput { .. } = item.input else {
             return Err(QueueServiceError::InvalidInput);
         };
-        let submission = thread
-            .start_turn_if_idle(
-                TurnInputRequest::new(input)
-                    .with_responses_metadata(item.responsesapi_client_metadata)
-                    .with_trace(trace)
-                    .on_start(TurnStartOptions {
-                        turn_trigger: Some("queue".to_string()),
-                        ..Default::default()
-                    }),
-            )
-            .await?;
+        let request = TurnInputRequest::new(input)
+            .with_responses_metadata(item.responsesapi_client_metadata)
+            .with_trace(trace)
+            .on_start(TurnStartOptions {
+                turn_trigger: Some("queue".to_string()),
+                ..Default::default()
+            });
+        let submission = match work.as_deref() {
+            Some(work) => thread.start_turn_if_idle_with_work(request, work).await,
+            None => thread.start_turn_if_idle(request).await,
+        }?;
         if matches!(submission, StartIfIdleSubmission::Started { .. }) {
             self.delete_locked(thread_id, queued_item_id).await?;
         }

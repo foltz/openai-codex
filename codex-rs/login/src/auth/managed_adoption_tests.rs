@@ -928,9 +928,10 @@ async fn strict_managed_reader_rejects_malformed_and_restricted_without_logout()
 #[tokio::test]
 #[serial_test::serial(codex_auth_env)]
 async fn managed_publication_preserves_source_and_login_fences_for_same_account() {
-    for (access, login, expected_source, expected_login) in [
-        ("new-access", None, 1, 0),
-        ("test-access-token", Some("new-login"), 0, 1),
+    for (access, login, expected_owner, expected_source, expected_login) in [
+        ("new-access", None, 0, 1, 0),
+        // Upstream same_owner treats a new non-null login ID as a new owner.
+        ("test-access-token", Some("new-login"), 1, 0, 1),
     ] {
         let home = tempdir().unwrap();
         let manager = manager_with_account(home.path(), "account").await;
@@ -957,7 +958,7 @@ async fn managed_publication_preserves_source_and_login_fences_for_same_account(
             *manager.auth_change_state_receiver().borrow(),
             AuthChangeState {
                 generation: before.generation + 1,
-                owner_generation: before.owner_generation,
+                owner_generation: before.owner_generation + expected_owner,
                 source_generation: before.source_generation + expected_source,
                 login_generation: before.login_generation + expected_login,
             }

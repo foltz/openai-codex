@@ -36,11 +36,22 @@ async fn detached_operation_constructs_and_starts_child_after_request_and_parent
         ],
     )
     .await;
-    let test = test_codex()
-        .with_extensions(Arc::new(extensions.build()))
-        .build_with_auto_env(&server)
-        .await
-        .inspect_err(|error| eprintln!("detached child fixture returned: {error:#}"))?;
+    // The initial thread is also a real host request. Current Core refuses
+    // missing required constructor authority instead of acquiring it silently.
+    let initial_request = permits.try_acquire().expect("initial request is admitted");
+    let test = crate::account_turn_admission::within_request(Some(initial_request), async {
+        test_codex()
+            .with_extensions(Arc::new(extensions.build()))
+            .build_with_auto_env(&server)
+            .await
+    })
+    .await
+    .inspect_err(|error| eprintln!("detached child fixture returned: {error:#}"))?;
+    assert_eq!(
+        permits.admitted_count(),
+        0,
+        "initial request/constructor work ended"
+    );
     let operation = crate::account_turn_admission::within_request(permits.try_acquire(), async {
         test.thread_manager
             .derive_request_operation_work()

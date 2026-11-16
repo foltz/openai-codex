@@ -892,3 +892,45 @@ async fn auth_only_prewarm_task_releases_work_without_a_cached_lease() {
         crate::tasks::TaskJoinOutcome::Complete { panicked: false }
     );
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn exhausted_dispatched_prewarm_fails_before_client_setup_or_turn_lookup() {
+    let (session, _, counts) = fixture().await;
+    assert!(session.services.model_client.responses_websocket_enabled());
+    let root = Work::new(&counts);
+    session
+        .schedule_startup_prewarm_with_authority(
+            super::startup_prewarm::PrewarmInput::History,
+            McpAttemptAccess::Admitted(&root),
+        )
+        .await
+        .unwrap();
+    assert_eq!(counts.live.load(Ordering::SeqCst), 2);
+    // The actual spawned task has not been polled on this current-thread runtime.
+    counts.refuse.store(true, Ordering::SeqCst);
+    drop(root);
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        session
+            .consume_startup_prewarm_for_regular_turn(&tokio_util::sync::CancellationToken::new()),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        result,
+        super::startup_prewarm::SessionStartupPrewarmResolution::Unavailable {
+            status: "failed",
+            ..
+        }
+    ));
+    assert_eq!(counts.turns.load(Ordering::SeqCst), 0);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    assert!(session.state.lock().await.startup_prewarm.is_none());
+    assert_eq!(
+        session
+            .task_joins
+            .shutdown_until(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+            .await,
+        crate::tasks::TaskJoinOutcome::Complete { panicked: false }
+    );
+}

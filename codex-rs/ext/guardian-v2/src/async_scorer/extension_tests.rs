@@ -4148,3 +4148,80 @@ async fn classifier_startup_metadata_keeps_no_invocation_work() -> Result<()> {
     assert!(thread.get::<LunaSampler>().is_some());
     Ok(())
 }
+
+#[tokio::test]
+async fn classifier_startup_hands_work_to_real_prewarm_without_retaining_it_in_cache() -> Result<()>
+{
+    use std::sync::atomic::Ordering;
+    let home = tempfile::tempdir()?;
+    let mut config = core_test_support::load_default_config_for_test(&home).await;
+    config.features.enable(Feature::GuardianV2)?;
+    config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+    config
+        .permissions
+        .approval_policy
+        .set(codex_protocol::protocol::AskForApproval::OnRequest)?;
+    let server = responses::start_websocket_server_with_headers(vec![
+        WebSocketConnectionConfig {
+            requests: Vec::new(),
+            response_headers: Vec::new(),
+            accept_delay: None,
+            close_after_requests: false,
+        };
+        INITIAL_WEBSOCKET_CONNECTIONS
+    ])
+    .await;
+    config.model_provider = ModelProviderInfo::create_openai_provider(Some(format!(
+        "http://{}/v1",
+        server.uri().trim_start_matches("ws://")
+    )));
+    let auth = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("fixture"));
+    let mut builder = ExtensionRegistryBuilder::new();
+    super::install(&mut builder, Arc::clone(&auth), std::sync::Weak::new());
+    let registry = builder.build();
+    let session = ExtensionData::new("session");
+    let thread = ExtensionData::new("thread");
+    thread.insert(codex_model_provider::ProviderAuthContext {
+        credentials: auth,
+        runtime_auth: None,
+    });
+    let mut model = codex_core::test_support::construct_model_info_offline("gpt-5", &config);
+    model.node_repl_auto_review_required = true;
+    thread.insert(model);
+    let counts = Arc::new(StartupWorkCounts::default());
+    let root = StartupWork::new(&counts);
+    registry.thread_lifecycle_contributors()[0]
+        .on_thread_start(ThreadStartInput {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Admitted(&root)),
+            config: &config,
+            session_source: &SessionSource::Exec,
+            persistent_thread_state_available: false,
+            environments: &[],
+            mcp_resource_client: None,
+            extension_metrics: None,
+            session_store: &session,
+            thread_store: &thread,
+        })
+        .await;
+    // Current-thread scheduling: the spawned prewarm cannot have polled yet.
+    assert_eq!(counts.derives.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 2);
+    drop(root);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    let sampler = thread.get::<LunaSampler>().expect("classifier sampler");
+    sampler.wait_for_prewarm(PREWARM_TIMEOUT).await?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while counts.live.load(Ordering::SeqCst) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert_eq!(
+        counts.derives.load(Ordering::SeqCst),
+        INITIAL_WEBSOCKET_CONNECTIONS + 1
+    );
+    assert_eq!(server.handshakes().len(), INITIAL_WEBSOCKET_CONNECTIONS);
+    assert!(thread.get::<LunaSampler>().is_some());
+    server.shutdown().await;
+    Ok(())
+}

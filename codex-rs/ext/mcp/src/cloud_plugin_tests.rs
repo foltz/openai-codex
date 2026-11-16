@@ -431,7 +431,7 @@ impl CloudProvider {
 }
 
 impl PluginProvider for CloudProvider {
-    fn list(&self, query: PluginListQuery) -> PluginProviderFuture<'_, PluginCatalog> {
+    fn list<'a>(&'a self, query: PluginListQuery<'a>) -> PluginProviderFuture<'a, PluginCatalog> {
         *self
             .resources
             .lock()
@@ -888,4 +888,122 @@ async fn run_cloud_catalog_refresh_lifecycle() -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+#[derive(Default)]
+struct DiscoveryCounts {
+    live: AtomicUsize,
+    refuse: AtomicBool,
+}
+struct DiscoveryWork(Arc<DiscoveryCounts>);
+impl DiscoveryWork {
+    fn new(counts: &Arc<DiscoveryCounts>) -> Self {
+        counts.live.fetch_add(1, Ordering::SeqCst);
+        Self(counts.clone())
+    }
+}
+impl Drop for DiscoveryWork {
+    fn drop(&mut self) {
+        self.0.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+impl codex_mcp::McpAttemptWork for DiscoveryWork {
+    fn derive_attempt(
+        &self,
+    ) -> Result<Box<dyn codex_mcp::McpAttemptWork>, codex_mcp::McpAttemptRefused> {
+        if self.0.refuse.load(Ordering::SeqCst) {
+            return Err(codex_mcp::McpAttemptRefused);
+        }
+        Ok(Box::new(Self::new(&self.0)))
+    }
+}
+#[derive(Default)]
+struct AdmittedDiscoveryProvider {
+    calls: AtomicUsize,
+    pause: AtomicBool,
+    resume: Notify,
+}
+
+impl PluginProvider for AdmittedDiscoveryProvider {
+    fn list<'a>(&'a self, query: PluginListQuery<'a>) -> PluginProviderFuture<'a, PluginCatalog> {
+        Box::pin(async move {
+            let codex_mcp::McpAttemptAccess::Admitted(work) = query.mcp_access else {
+                return Err(PluginProviderError::Message(
+                    "missing invocation work".into(),
+                ));
+            };
+            let _rpc = work
+                .derive_attempt()
+                .map_err(|error| PluginProviderError::Message(error.to_string()))?;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.pause.swap(false, Ordering::SeqCst) {
+                self.resume.notified().await;
+            }
+            Ok(cloud_catalog())
+        })
+    }
+}
+
+#[tokio::test]
+async fn admitted_cloud_discovery_is_finite_and_refuses_before_serialization() {
+    let counts = Arc::new(DiscoveryCounts::default());
+    let root = DiscoveryWork::new(&counts);
+    let provider = Arc::new(AdmittedDiscoveryProvider::default());
+    let contributor = PluginContributor {
+        providers: PluginProviders::new(Arc::new(ExecutorPluginProvider::new(Arc::new(
+            EnvironmentManager::default_for_tests(),
+        ))))
+        .with_cloud_provider(provider.clone()),
+    };
+    let session = ExtensionData::new("session");
+    let thread = ExtensionData::new("thread");
+    let turn = ExtensionData::new("turn");
+    let state = thread.get_or_init(PluginsThreadState::default);
+    state.contributor_state().plugins_enabled = true;
+    let input = CatalogRefreshInput {
+        mcp_access: Ok(codex_mcp::McpAttemptAccess::Admitted(&root)),
+        turn_id: "turn",
+        session_store: &session,
+        thread_store: &thread,
+        turn_store: &turn,
+    };
+    counts.refuse.store(true, Ordering::SeqCst);
+    assert!(!contributor.refresh_catalog_for_step(input).await);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(state.cloud_catalog(), None);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    counts.refuse.store(false, Ordering::SeqCst);
+    provider.pause.store(true, Ordering::SeqCst);
+    let mut first = contributor.refresh_catalog_for_step(input);
+    assert!(futures::poll!(&mut first).is_pending());
+    assert_eq!(counts.live.load(Ordering::SeqCst), 3);
+    let mut waiter = contributor.refresh_catalog_for_step(input);
+    assert!(futures::poll!(&mut waiter).is_pending());
+    assert_eq!(counts.live.load(Ordering::SeqCst), 4);
+    counts.refuse.store(true, Ordering::SeqCst);
+    let mut refused = contributor.refresh_catalog_for_step(input);
+    assert!(matches!(
+        futures::poll!(&mut refused),
+        std::task::Poll::Ready(false)
+    ));
+    drop(refused);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    drop(waiter);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 3);
+    drop(first);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    assert_eq!(state.cloud_catalog(), None);
+    counts.refuse.store(false, Ordering::SeqCst);
+    assert!(contributor.refresh_catalog_for_step(input).await);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    assert!(!contributor.refresh_catalog_for_step(input).await);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(state.cloud_catalog(), Some(cloud_catalog()));
+    drop(root);
+    assert_eq!(
+        counts.live.load(Ordering::SeqCst),
+        0,
+        "retained catalog must not retain invocation work"
+    );
 }

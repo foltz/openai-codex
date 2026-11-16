@@ -1127,7 +1127,7 @@ struct Cloud {
 }
 
 impl PluginProvider for Cloud {
-    fn list(&self, _query: PluginListQuery) -> PluginProviderFuture<'_, PluginCatalog> {
+    fn list<'a>(&'a self, _query: PluginListQuery<'a>) -> PluginProviderFuture<'a, PluginCatalog> {
         Box::pin(async move {
             Ok(PluginCatalog {
                 entries: if !self.available.load(Ordering::SeqCst) {

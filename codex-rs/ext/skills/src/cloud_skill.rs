@@ -17,9 +17,17 @@ struct CloudDiscoveryWarningEmitted;
 
 impl<C: Send + Sync + 'static> SkillsExtension<C> {
     async fn refresh_cloud_catalog(&self, input: CatalogRefreshInput<'_>) {
-        if input.mcp_access.is_err() {
+        let Ok(access) = input.mcp_access else {
             return;
-        }
+        };
+        // Refuse exhausted authority before serialization, cache mutation or discovery.
+        let work = match access {
+            codex_mcp::McpAttemptAccess::Admitted(work) => match work.derive_attempt() {
+                Ok(work) => Some(work),
+                Err(_) => return,
+            },
+            codex_mcp::McpAttemptAccess::Unscoped => None,
+        };
         let Some(state) = input.thread_store.get::<SkillsThreadState>() else {
             return;
         };
@@ -28,6 +36,7 @@ impl<C: Send + Sync + 'static> SkillsExtension<C> {
         }
         let config = state.config();
         let query = SkillListQuery {
+            mcp_access: codex_mcp::McpAttemptAccess::from_work(work.as_deref()),
             turn_id: input.turn_id.to_string(),
             executor_roots: Vec::new(),
             host_snapshot: None,

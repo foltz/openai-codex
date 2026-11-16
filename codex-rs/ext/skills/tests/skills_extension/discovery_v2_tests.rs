@@ -90,6 +90,7 @@ async fn v2_steps_refresh_metadata_and_preserve_separate_environments() -> TestR
             });
     }
     let query = SkillListQuery {
+        mcp_access: codex_mcp::McpAttemptAccess::Unscoped,
         turn_id: "turn-1".to_string(),
         executor_roots: Vec::new(),
         host_snapshot: None,
@@ -297,6 +298,7 @@ async fn v2_empty_failed_and_partial_results_never_load_legacy_roots() -> TestRe
     };
     let access = FileSystemEnvironmentAccessor::unrestricted(&LOCAL_FS);
     let query = |snapshots| SkillListQuery {
+        mcp_access: codex_mcp::McpAttemptAccess::Unscoped,
         turn_id: "turn-1".to_string(),
         // V2 must ignore this unavailable legacy root.
         executor_roots: vec![AccessedSelectedCapabilityRoot {

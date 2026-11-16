@@ -638,6 +638,7 @@ async fn host_alias_roots_follow_core_discovery_order() -> Result<(), Box<dyn st
     .await;
     let catalog = HostSkillProvider::new()
         .list(SkillListQuery {
+            mcp_access: codex_mcp::McpAttemptAccess::Unscoped,
             turn_id: "turn-1".to_string(),
             executor_roots: Vec::new(),
             host_snapshot: Some(Arc::new(HostSkillsSnapshot::new(Arc::new(outcome)))),
@@ -1014,6 +1015,7 @@ async fn singleton_plugin_versions_share_the_marketplace_alias_root()
     .await;
     let catalog = HostSkillProvider::new()
         .list(SkillListQuery {
+            mcp_access: codex_mcp::McpAttemptAccess::Unscoped,
             turn_id: "turn-1".to_string(),
             executor_roots: Vec::new(),
             host_snapshot: Some(Arc::new(HostSkillsSnapshot::new(Arc::new(outcome)))),

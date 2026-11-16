@@ -11,7 +11,10 @@ use thiserror::Error;
 
 /// Identifiers, MCP client, and executor inventories used to request one catalog snapshot.
 #[derive(Clone, Debug)]
-pub struct PluginListQuery {
+pub struct PluginListQuery<'a> {
+    /// Borrowed invocation authority; providers must pass it to authority-aware MCP calls.
+    /// Never retain this authority in catalog snapshots or idle clients.
+    pub mcp_access: codex_mcp::McpAttemptAccess<'a>,
     pub thread_id: String,
     pub turn_id: String,
     pub mcp_resources: Option<Arc<McpResourceClient>>,
@@ -40,7 +43,7 @@ pub type PluginProviderFuture<'a, T> =
 pub trait PluginProvider: Send + Sync {
     /// Returns a snapshot; on error, callers retain the previous snapshot.
     /// Providers set `is_partial` when listing omits entries; warnings are diagnostic only.
-    fn list(&self, _query: PluginListQuery) -> PluginProviderFuture<'_, PluginCatalog> {
+    fn list<'a>(&'a self, _query: PluginListQuery<'a>) -> PluginProviderFuture<'a, PluginCatalog> {
         Box::pin(async { Ok(PluginCatalog::default()) })
     }
 }

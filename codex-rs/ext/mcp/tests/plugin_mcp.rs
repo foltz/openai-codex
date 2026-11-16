@@ -698,7 +698,7 @@ struct CloudCatalogFixture {
 }
 
 impl PluginProvider for CloudCatalogFixture {
-    fn list(&self, _query: PluginListQuery) -> PluginProviderFuture<'_, PluginCatalog> {
+    fn list<'a>(&'a self, _query: PluginListQuery<'a>) -> PluginProviderFuture<'a, PluginCatalog> {
         Box::pin(async {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.reply.clone().map_err(PluginProviderError::Message)

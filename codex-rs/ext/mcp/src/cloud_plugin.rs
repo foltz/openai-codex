@@ -36,9 +36,18 @@ impl PluginContributor {
         reason = "cloud discovery must remain serialized through fetching and catalog publication"
     )]
     async fn refresh_cloud_catalog(&self, input: CatalogRefreshInput<'_>) -> bool {
-        if input.mcp_access.is_err() {
+        let Ok(access) = input.mcp_access else {
             return false;
-        }
+        };
+        // Validate/derive before refresh serialization, auth-cache inspection or discovery.
+        // Only this invocation owns the descendant; catalogs retain no work.
+        let work = match access {
+            codex_mcp::McpAttemptAccess::Admitted(work) => match work.derive_attempt() {
+                Ok(work) => Some(work),
+                Err(_) => return false,
+            },
+            codex_mcp::McpAttemptAccess::Unscoped => None,
+        };
         let Some(provider) = &self.providers.cloud else {
             return false;
         };
@@ -51,6 +60,7 @@ impl PluginContributor {
             Err(_) => (state.cloud_refresh_lock.lock().await, true),
         };
         let query = PluginListQuery {
+            mcp_access: codex_mcp::McpAttemptAccess::from_work(work.as_deref()),
             thread_id: input.thread_store.level_id().to_string(),
             turn_id: input.turn_id.to_string(),
             mcp_resources: input.session_store.get::<McpResourceClient>(),

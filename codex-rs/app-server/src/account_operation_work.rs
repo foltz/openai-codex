@@ -11,6 +11,7 @@ use codex_protocol::host_turn_work::HostTurnWork;
 pub(crate) struct AccountOperationWork {
     pub(crate) permit: AccountWorkPermitGuard,
     pub(crate) turns: AccountTurnWork,
+    pub(crate) auth_tasks: Option<crate::processor_task_retirement::ProcessorTaskTicket>,
 }
 
 impl codex_mcp::McpAttemptWork for AccountWorkPermitGuard {
@@ -30,6 +31,18 @@ impl std::fmt::Debug for AccountOperationWork {
 }
 
 impl HostOperationWork for AccountOperationWork {
+    fn auth_task_spawner(
+        &self,
+    ) -> Result<std::sync::Arc<dyn codex_protocol::host_auth_work::AuthTaskSpawner>, TurnWorkRefused>
+    {
+        let ticket = self
+            .auth_tasks
+            .clone()
+            .ok_or(TurnWorkRefused::Unavailable)?;
+        let work = self.derive_operation()?;
+        Ok(crate::auth_task_work::spawner(ticket, Some(work)))
+    }
+
     fn derive_operation(&self) -> Result<Box<dyn HostOperationWork>, TurnWorkRefused> {
         let permit = self
             .permit
@@ -38,6 +51,7 @@ impl HostOperationWork for AccountOperationWork {
         Ok(Box::new(Self {
             permit,
             turns: self.turns.clone(),
+            auth_tasks: self.auth_tasks.clone(),
         }))
     }
 

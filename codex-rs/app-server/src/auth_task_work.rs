@@ -42,14 +42,25 @@ impl AuthTaskSpawner for CatalogAuthTasks {
     }
 }
 
+/// A finite operation holds only a weak registration ticket, never its own ledger.
+pub(crate) fn spawner(
+    ticket: ProcessorTaskTicket,
+    work: Option<Box<dyn HostOperationWork>>,
+) -> Arc<dyn AuthTaskSpawner> {
+    Arc::new(CatalogAuthTasks {
+        ticket,
+        work: work.map(Arc::from),
+    })
+}
+
 pub(crate) async fn scope<T>(
     tasks: &ProcessorTasks,
     work: Option<Box<dyn HostOperationWork>>,
     future: impl Future<Output = T>,
 ) -> codex_protocol::error::Result<T> {
-    let spawner = Arc::new(CatalogAuthTasks {
-        ticket: tasks.ticket(),
-        work: work.map(Arc::from),
-    });
-    codex_model_provider::with_auth_task_scope(AuthTaskAccess::Admitted(spawner), future).await
+    codex_model_provider::with_auth_task_scope(
+        AuthTaskAccess::Admitted(spawner(tasks.ticket(), work)),
+        future,
+    )
+    .await
 }

@@ -113,6 +113,7 @@ async fn fixture(nested: bool, panic: bool, missing_work: bool) -> Fixture {
             shutdown: crate::turn_admission::TurnAdmission::default(),
             permits: permits.clone(),
             work: crate::account_turn_work::AccountTurnWork::default(),
+            auth_tasks: None,
         })
     };
     extensions.turn_start_admission(host);
@@ -241,6 +242,7 @@ async fn request_setup_auth_child_survives_cancelled_caller() {
     let work = Box::new(crate::account_operation_work::AccountOperationWork {
         permit: f.permits.try_acquire().unwrap(),
         turns: Default::default(),
+        auth_tasks: None,
     }) as Box<dyn HostOperationWork>;
     let provider = f.provider.clone();
     let owner = tasks.clone();
@@ -372,6 +374,7 @@ async fn refused_child_derivation_has_no_fresh_fallback_or_auth_effect() {
         _work: Box::new(crate::account_operation_work::AccountOperationWork {
             permit: f.permits.try_acquire().unwrap(),
             turns: Default::default(),
+            auth_tasks: None,
         }),
     }) as Box<dyn HostOperationWork>;
     assert!(

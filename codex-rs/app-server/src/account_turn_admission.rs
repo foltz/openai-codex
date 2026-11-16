@@ -51,6 +51,7 @@ pub(crate) struct AccountTurnAdmission {
     pub(crate) shutdown: TurnAdmission,
     pub(crate) permits: AccountWorkPermits,
     pub(crate) work: AccountTurnWork,
+    pub(crate) auth_tasks: Option<crate::processor_task_retirement::ProcessorTaskTicket>,
 }
 
 impl std::fmt::Debug for AccountTurnAdmission {
@@ -83,6 +84,7 @@ impl TurnStartAdmission for AccountTurnAdmission {
         Ok(Some(Box::new(AccountOperationWork {
             permit: self.acquire_fresh_work()?,
             turns: self.work.clone(),
+            auth_tasks: self.auth_tasks.clone(),
         })))
     }
 
@@ -100,6 +102,7 @@ impl TurnStartAdmission for AccountTurnAdmission {
         Ok(Some(Box::new(AccountOperationWork {
             permit,
             turns: self.work.clone(),
+            auth_tasks: self.auth_tasks.clone(),
         })))
     }
 
@@ -110,6 +113,7 @@ impl TurnStartAdmission for AccountTurnAdmission {
             Box::new(AccountOperationWork {
                 permit,
                 turns: self.work.clone(),
+                auth_tasks: self.auth_tasks.clone(),
             }) as Box<dyn HostOperationWork>
         }))
     }

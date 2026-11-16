@@ -16,12 +16,14 @@ async fn detached_operation_constructs_and_starts_child_after_request_and_parent
     use core_test_support::wait_for_event;
 
     let permits = AccountWorkPermits::new();
+    let auth_tasks = crate::processor_task_retirement::ProcessorTasks::default();
     let mut extensions = ExtensionRegistryBuilder::new();
     extensions.turn_start_admission(Arc::new(
         crate::account_turn_admission::AccountTurnAdmission {
             shutdown: crate::turn_admission::TurnAdmission::default(),
             permits: permits.clone(),
             work: crate::account_turn_work::AccountTurnWork::default(),
+            auth_tasks: Some(auth_tasks.ticket()),
         },
     ));
     extensions.turn_lifecycle_contributor(Arc::new(
@@ -168,6 +170,12 @@ async fn detached_operation_constructs_and_starts_child_after_request_and_parent
             .await
             .is_complete()
     );
+    assert!(
+        auth_tasks
+            .observe_until(tokio::time::Instant::now() + DRAIN_DEADLINE)
+            .await
+            .is_clean()
+    );
     Ok(())
 }
 
@@ -179,6 +187,7 @@ async fn admitted_request_derives_a_turn_after_close_and_outlives_request_return
         shutdown: crate::turn_admission::TurnAdmission::default(),
         permits: coordinator.account_work_permits(),
         work: coordinator.account_turn_work(),
+        auth_tasks: None,
     };
     let store = codex_extension_api::ExtensionData::new("thread");
     let request_guard = coordinator.try_acquire_account_work_permit().unwrap();

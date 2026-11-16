@@ -7,6 +7,7 @@
 
 mod apply_patch;
 mod apps;
+mod provider_auth_work;
 mod client;
 mod client_common;
 mod model_request;

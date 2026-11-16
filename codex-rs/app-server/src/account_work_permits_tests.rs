@@ -12,6 +12,7 @@ async fn operation_outlives_origin_loop_and_derives_child_during_drain() {
         shutdown: crate::turn_admission::TurnAdmission::default(),
         permits: permits.clone(),
         work: registry.clone(),
+        auth_tasks: None,
     };
     let parent = codex_extension_api::ExtensionData::new("parent");
     let (ended, termination) = tokio::sync::oneshot::channel();
@@ -67,6 +68,7 @@ async fn optional_background_admission_is_fresh_even_inside_an_admitted_request(
         shutdown: crate::turn_admission::TurnAdmission::default(),
         permits: permits.clone(),
         work: crate::account_turn_work::AccountTurnWork::default(),
+        auth_tasks: None,
     };
     let operation = admission.admit_operation_work().unwrap().unwrap();
     crate::account_turn_admission::within_request(permits.try_acquire(), async {
@@ -91,6 +93,7 @@ async fn request_operation_capture_derives_during_drain_without_a_turn_entry() {
         shutdown: crate::turn_admission::TurnAdmission::default(),
         permits: permits.clone(),
         work: crate::account_turn_work::AccountTurnWork::default(),
+        auth_tasks: None,
     };
     assert!(admission.derive_request_operation_work().unwrap().is_none());
     let operation = crate::account_turn_admission::within_request(permits.try_acquire(), async {
@@ -131,6 +134,7 @@ async fn child_derives_before_parent_reply_and_keeps_custody_after_parent_termin
         shutdown: crate::turn_admission::TurnAdmission::default(),
         permits: permits.clone(),
         work: crate::account_turn_work::AccountTurnWork::default(),
+        auth_tasks: None,
     };
     let parent = codex_extension_api::ExtensionData::new("parent");
     let child = codex_extension_api::ExtensionData::new("child");

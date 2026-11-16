@@ -317,8 +317,14 @@ impl Session {
             drop(
                 self.task_joins
                     .register(tokio::spawn(async move {
-                        let _work = model_work;
-                        if let Err(err) = model_client.prewarm_auth().await {
+                        let work = model_work;
+                        if let Err(err) = crate::provider_auth_work::scope(
+                            work.as_deref(),
+                            model_client.prewarm_auth(),
+                        )
+                        .await
+                        .and_then(|result| result)
+                        {
                             warn!("startup auth prewarm failed: {err:#}");
                         }
                     }))
@@ -394,7 +400,22 @@ async fn schedule_startup_prewarm_inner(
     let work = session
         .derive_mcp_attempt_work(access)
         .map_err(|err| codex_protocol::error::CodexErr::Fatal(err.to_string()))?;
-    let access = codex_mcp::McpAttemptAccess::from_work(work.as_deref());
+    crate::provider_auth_work::scope(
+        work.as_deref(),
+        startup_prewarm_with_work(
+            session,
+            input,
+            codex_mcp::McpAttemptAccess::from_work(work.as_deref()),
+        ),
+    )
+    .await?
+}
+
+async fn startup_prewarm_with_work(
+    session: Arc<Session>,
+    input: PrewarmInput,
+    access: codex_mcp::McpAttemptAccess<'_>,
+) -> CodexResult<ModelClientSession> {
     let prewarm_started_at = Instant::now();
     let mut client_session = session.services.model_client.new_session();
     let websocket_ready = client_session.is_websocket_prewarmed().await;

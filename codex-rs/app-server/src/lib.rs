@@ -108,6 +108,8 @@ mod app_server_tracing;
 mod attestation;
 mod auth_mode;
 mod auth_task_work;
+#[cfg(test)]
+mod core_auth_task_tests;
 mod bespoke_event_handling;
 mod code_mode_host;
 mod codex_home_metrics;

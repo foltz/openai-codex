@@ -397,7 +397,7 @@ async fn regular_task_reports_lifecycle_admission_failure_without_running_contri
     let session = Arc::new(session);
     assert!(
         session
-            .spawn_task(Arc::new(turn), Vec::new(), crate::tasks::RegularTask::new())
+            .try_spawn_task(Arc::new(turn), Vec::new(), crate::tasks::RegularTask::new())
             .await
     );
     tokio::time::timeout(std::time::Duration::from_secs(5), async {

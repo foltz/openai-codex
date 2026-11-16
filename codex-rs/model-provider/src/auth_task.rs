@@ -120,6 +120,30 @@ fn dispatch_provider_task(
     }))
 }
 
+/// Own a direct credential call until its original task completes. A cancelled
+/// observer discards only its private result; it never aborts credential work.
+/// The typed custody failure is cloneable for shared constructor reads.
+pub async fn run_auth_call<T: Send + 'static>(
+    access: AuthTaskAccess,
+    future: impl Future<Output = T> + Send + 'static,
+) -> std::result::Result<T, AuthTaskFailure> {
+    if matches!(&access, AuthTaskAccess::Ungated) && AUTH_TASK_CONTEXT.try_with(|_| ()).is_err() {
+        // Direct unmanaged calls stay inline, including their caller task locals.
+        return Ok(future.await);
+    }
+    let (send, receive) = oneshot::channel();
+    let observation = spawn_provider_task_with_access(
+        access,
+        Box::pin(async move {
+            let value = future.await;
+            let _ = send.send(value);
+        }),
+    )?
+    .ok_or(AuthTaskFailure::Unavailable)?;
+    observation.await?;
+    receive.await.map_err(|_| AuthTaskFailure::Unavailable)
+}
+
 pub(crate) async fn spawn<T: Send + 'static>(
     future: impl Future<Output = T> + Send + 'static,
 ) -> Result<T> {

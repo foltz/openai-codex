@@ -3,7 +3,7 @@ mod auth;
 mod auth_task;
 pub use auth_task::{
     AuthTaskAccess, AuthTaskFailure, AuthTaskFuture, AuthTaskObservation, AuthTaskSpawner,
-    spawn_provider_task, spawn_provider_task_with_access, with_auth_task_scope,
+    run_auth_call, spawn_provider_task, spawn_provider_task_with_access, with_auth_task_scope,
 };
 mod bearer_auth_provider;
 mod capabilities;

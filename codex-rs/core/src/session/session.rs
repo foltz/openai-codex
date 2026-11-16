@@ -961,6 +961,12 @@ impl Session {
             }
         }
 
+        // Validate/capture the original request before any constructor await or auth work.
+        let initial_auth_access = crate::provider_auth_work::initial_access(
+            initial_mcp_work.as_deref(),
+            host_admission.as_deref(),
+        )?;
+
         debug!(
             "Configuring session: model={}; provider={:?}",
             session_configuration
@@ -1222,7 +1228,11 @@ impl Session {
         // - initialize thread persistence with new or resumed session info
         // - perform default shell discovery
         // - load history metadata (skipped for subagents)
-        let persistence_auth = futures::FutureExt::shared(auth_manager.auth());
+        let persistence_auth =
+            futures::FutureExt::shared(codex_model_provider::run_auth_call(initial_auth_access, {
+                let auth_manager = Arc::clone(&auth_manager);
+                async move { auth_manager.auth().await }
+            }));
         let mcp_auth = persistence_auth.clone();
         let thread_persistence_fut = async {
             if config.ephemeral {
@@ -1249,7 +1259,9 @@ impl Session {
                 let guard = managed_guard.as_deref_mut().unwrap_or(&mut local_guard);
                 let live_thread = match &initial_history {
                     InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_) => {
-                        let auth = persistence_auth.await;
+                        let auth = persistence_auth
+                            .await
+                            .map_err(codex_model_provider::AuthTaskFailure::error)?;
                         let params = CreateThreadParams {
                             attached_thread,
                             creator_user_id: auth.as_ref().and_then(CodexAuth::get_chatgpt_user_id),
@@ -1385,7 +1397,9 @@ impl Session {
         let mcp_session_source = session_configuration.session_source.clone();
         let mcp_disabled_plugin_ids = session_configuration.disabled_plugin_ids.clone();
         let auth_and_mcp_fut = async move {
-            let auth = mcp_auth.await;
+            let auth = mcp_auth
+                .await
+                .map_err(codex_model_provider::AuthTaskFailure::error)?;
             if config_for_mcp.features.plugin_recommendations_enabled() {
                 let plugins_config = config_for_mcp.plugins_config_input();
                 let auth_for_prewarm = auth.clone();
@@ -1417,7 +1431,7 @@ impl Session {
                     /*executor_capability_discovery_v2*/ None,
                 )
                 .await;
-            (auth, mcp_projection)
+            Ok::<_, CodexErr>((auth, mcp_projection))
         }
         .instrument(info_span!(
             "session_init.auth_mcp",
@@ -1425,8 +1439,9 @@ impl Session {
         ));
 
         // Join all independent futures.
-        let (thread_persistence_result, state_db_ctx, (auth, mcp_projection)) =
+        let (thread_persistence_result, state_db_ctx, auth_and_mcp_result) =
             tokio::join!(thread_persistence_fut, state_db_fut, auth_and_mcp_fut);
+        let (auth, mcp_projection) = auth_and_mcp_result?;
 
         let (live_thread, mut live_thread_init, resume_context) = thread_persistence_result
             .map_err(|e| {
@@ -2247,7 +2262,16 @@ impl Session {
             if startup_auth_changed {
                 mcp_auth_changes.mark_unchanged();
             }
-            let latest_auth = sess.services.auth_manager.auth().await;
+            let latest_auth = codex_model_provider::run_auth_call(
+                crate::provider_auth_work::initial_access(
+                    initial_mcp_work.as_deref(),
+                    sess.services.host_admission.as_deref(),
+                )?,
+                {
+                    let auth_manager = Arc::clone(&sess.services.auth_manager);
+                    async move { auth_manager.auth().await }
+                },
+            ).await.map_err(codex_model_provider::AuthTaskFailure::error)?;
             let resolved_environment_selections = resolved_environments.all_selections();
             let mcp_projection = if startup_auth_changed
                 || mcp_auth_changes.has_changed().unwrap_or(false)

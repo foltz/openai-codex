@@ -15,6 +15,17 @@ pub(crate) fn access(work: Option<&dyn McpAttemptWork>) -> Result<AuthTaskAccess
     }
 }
 
+/// Constructors use their captured request root, never a newly admitted turn.
+pub(crate) fn initial_access(
+    work: Option<&dyn McpAttemptWork>,
+    host: Option<&dyn codex_extension_api::TurnStartAdmission>,
+) -> Result<AuthTaskAccess> {
+    if work.is_none() && host.is_some_and(|host| host.requires_account_work()) {
+        return Err(AuthTaskFailure::Refused.error());
+    }
+    access(work)
+}
+
 /// Snapshot the exact current turn once; descendants do not look up a later turn or admit fresh work.
 pub(crate) fn turn_access(
     session: &crate::session::session::Session,
@@ -76,5 +87,14 @@ mod tests {
         let (mut session, turn) = crate::session::tests::make_session_and_context().await;
         session.services.host_admission = Some(std::sync::Arc::new(Required));
         assert!(turn_access(&session, &turn).is_err());
+    }
+    #[test]
+    fn initial_capture_refuses_missing_required_or_unsupported_work_without_fallback() {
+        assert!(initial_access(None, Some(&Required)).is_err());
+        assert!(initial_access(Some(&Unsupported), None).is_err());
+        assert!(matches!(
+            initial_access(None, None).unwrap(),
+            AuthTaskAccess::Ungated
+        ));
     }
 }

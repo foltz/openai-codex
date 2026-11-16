@@ -17,6 +17,7 @@ struct HeldAuth {
     credential: CodexAuth,
     held: AtomicBool,
     armed: AtomicBool,
+    skip_owned: std::sync::atomic::AtomicUsize,
     entered: Semaphore,
     release: Semaphore,
     finished: AtomicBool,
@@ -31,11 +32,18 @@ impl ExternalAuth for HeldAuth {
     }
     fn resolve(&self) -> codex_login::ExternalAuthFuture<'_, CodexAuth> {
         Box::pin(async move {
-            // The initial constructor's unscoped auth is a separate open producer.
+            // Callback installation itself precedes Core and has no task owner.
             // Hold only a real child already registered in this strict owner.
             let owned = self.tasks.upgrade().is_some_and(|tasks| tasks.len() > 0);
-            if owned && self.armed.load(Ordering::SeqCst) && !self.held.swap(true, Ordering::SeqCst)
-            {
+            let armed = owned && self.armed.load(Ordering::SeqCst);
+            let skip = armed
+                && self
+                    .skip_owned
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok();
+            if armed && !skip && !self.held.swap(true, Ordering::SeqCst) {
                 self.entered.add_permits(1);
                 self.release.acquire().await.unwrap().forget();
                 if self.nested {
@@ -74,6 +82,7 @@ async fn held_auth(
         credential,
         held: AtomicBool::new(false),
         armed: AtomicBool::new(true),
+        skip_owned: std::sync::atomic::AtomicUsize::new(0),
         entered: Semaphore::new(0),
         release: Semaphore::new(0),
         finished: AtomicBool::new(false),
@@ -92,6 +101,9 @@ async fn actual_core_prewarm_auth_child_outlives_constructor_and_parent_shutdown
     let tasks = Arc::new(ProcessorTasks::default());
     let permits = AccountWorkPermits::new();
     let (_home, auth, held) = held_auth(&tasks, false).await;
+    // Shared persistence/MCP auth and latest-auth are separate tests below.
+    // This fixture still holds the actual subsequent prewarm resolution.
+    held.skip_owned.store(2, Ordering::SeqCst);
     let mut extensions = ExtensionRegistryBuilder::new();
     extensions.turn_start_admission(Arc::new(host(&permits, Some(tasks.ticket()))));
     extensions.turn_lifecycle_contributor(Arc::new(
@@ -1061,5 +1073,120 @@ async fn actual_background_parent_panic_is_not_clean_tracker_completion() -> any
         !tasks.observe_until(Instant::now()).await.is_clean(),
         "Core parent cleanup cannot erase host-owned failure"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn direct_auth_call_preserves_inline_unmanaged_and_required_refusal() {
+    tokio::task_local! { static INLINE_CALLER: u8; }
+    let observed = INLINE_CALLER
+        .scope(
+            17,
+            codex_model_provider::run_auth_call(
+                codex_model_provider::AuthTaskAccess::Ungated,
+                async { INLINE_CALLER.with(|value| *value) },
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        observed, 17,
+        "unmanaged direct auth must not introduce a Tokio hop"
+    );
+    let polled = Arc::new(AtomicBool::new(false));
+    let child_polled = polled.clone();
+    assert_eq!(
+        codex_model_provider::run_auth_call(
+            codex_model_provider::AuthTaskAccess::Required,
+            async move {
+                child_polled.store(true, Ordering::SeqCst);
+            },
+        )
+        .await,
+        Err(codex_model_provider::AuthTaskFailure::Refused)
+    );
+    assert!(!polled.load(Ordering::SeqCst));
+}
+
+#[test_case::test_case(0; "shared_persistence_mcp")]
+#[test_case::test_case(1; "latest_auth_after_configured")]
+#[tokio::test]
+async fn actual_constructor_auth_original_survives_cancelled_start_caller(
+    skip: usize,
+) -> anyhow::Result<()> {
+    let tasks = Arc::new(ProcessorTasks::default());
+    let permits = AccountWorkPermits::new();
+    let (_home, auth, held) = held_auth(&tasks, true).await;
+    held.armed.store(false, Ordering::SeqCst);
+    let mut extensions = ExtensionRegistryBuilder::new();
+    extensions.turn_start_admission(Arc::new(host(&permits, Some(tasks.ticket()))));
+    extensions.turn_lifecycle_contributor(Arc::new(
+        crate::account_turn_admission::AccountTurnLifecycle,
+    ));
+    let server = core_test_support::responses::start_mock_server().await;
+    // Keep genuine manager, home and environment ownership outside the cancelled caller.
+    let seed = within_request(Some(permits.try_acquire().unwrap()), async {
+        core_test_support::test_codex::test_codex()
+            .with_auth_manager(auth)
+            .with_extensions(Arc::new(extensions.build()))
+            .with_config(|config| config.model_provider.supports_websockets = false)
+            .build_with_auto_env(&server)
+            .await
+    })
+    .await?;
+    idle_constructor(&permits, &tasks).await;
+    let options = seed.start_thread_options().await;
+    held.skip_owned.store(skip, Ordering::SeqCst);
+    held.armed.store(true, Ordering::SeqCst);
+    let manager = seed.thread_manager.clone();
+    let root = permits.try_acquire().unwrap();
+    let caller = tokio::spawn(within_request(Some(root), async move {
+        manager.start_thread(options).await
+    }));
+    tokio::time::timeout(DRAIN_DEADLINE, held.entered.acquire())
+        .await??
+        .forget();
+    assert_eq!(held.skip_owned.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        tasks.len(),
+        1,
+        "actual constructor auth original, not fixture callback installation"
+    );
+    permits.close();
+    caller.abort();
+    assert!(matches!(caller.await, Err(error) if error.is_cancelled()));
+    assert!(!tasks.observe_until(Instant::now()).await.terminal);
+    assert!(
+        permits.admitted_count() > 0,
+        "credential work outlives original start caller"
+    );
+    assert!(!held.finished.load(Ordering::SeqCst));
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| !request.url.path().contains("responses"))
+    );
+    held.release.add_permits(1);
+    assert!(
+        tasks
+            .observe_until(Instant::now() + DRAIN_DEADLINE)
+            .await
+            .is_clean()
+    );
+    assert!(held.finished.load(Ordering::SeqCst));
+    let retirement = seed
+        .thread_manager
+        .begin_shutdown(Instant::now() + DRAIN_DEADLINE)
+        .unwrap();
+    let report = retirement.wait().await.unwrap();
+    assert!(
+        report.is_complete(),
+        "seed and original cancelled constructor cleanup: {report:?}"
+    );
+    idle_constructor(&permits, &tasks).await;
+    assert_eq!(permits.admitted_count(), 0);
     Ok(())
 }

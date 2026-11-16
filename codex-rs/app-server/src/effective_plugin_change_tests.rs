@@ -61,3 +61,228 @@ fn hook_trusted_hash_edit_targets_only_escaped_leaf() {
         }
     );
 }
+
+fn callback_access(
+    tasks: &crate::processor_task_retirement::ProcessorTasks,
+    permits: &crate::account_work_permits::AccountWorkPermits,
+) -> codex_model_provider::AuthTaskAccess {
+    use codex_extension_api::TurnStartAdmission;
+    let operation = crate::account_turn_admission::AccountTurnAdmission {
+        shutdown: Default::default(),
+        permits: permits.clone(),
+        work: Default::default(),
+        auth_tasks: Some(tasks.ticket()),
+    }
+    .admit_operation_work()
+    .unwrap()
+    .unwrap();
+    let spawner = operation.auth_task_spawner().unwrap();
+    drop(operation);
+    codex_model_provider::AuthTaskAccess::Admitted(spawner)
+}
+
+#[tokio::test]
+async fn callback_original_outlives_dropped_observer_and_closed_fresh_admission() {
+    use crate::account_work_permits::AccountWorkPermits;
+    use crate::processor_task_retirement::ProcessorTasks;
+    use tokio::time::Instant;
+    let tasks = ProcessorTasks::default();
+    let permits = AccountWorkPermits::new();
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let observation =
+        codex_model_provider::with_auth_task_scope(callback_access(&tasks, &permits), async move {
+            spawn_plugin_change_task(async move {
+                entered.send(()).unwrap();
+                released.await.unwrap();
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(observation.is_some());
+    drop(observation);
+    tokio::time::timeout(crate::managed_transition::DRAIN_DEADLINE, started)
+        .await
+        .unwrap()
+        .unwrap();
+    permits.close();
+    assert!(permits.try_acquire().is_none());
+    assert!(permits.admitted_count() > 0);
+    assert!(!tasks.observe_until(Instant::now()).await.terminal);
+    release.send(()).unwrap();
+    assert!(
+        tasks
+            .shutdown_until(Instant::now() + crate::managed_transition::DRAIN_DEADLINE)
+            .await
+            .is_clean()
+    );
+    assert_eq!(permits.admitted_count(), 0);
+}
+
+#[tokio::test]
+async fn reusable_callback_takes_each_invoking_root_not_its_factory_root() {
+    use crate::account_work_permits::AccountWorkPermits;
+    use crate::processor_task_retirement::ProcessorTasks;
+    use tokio::time::Instant;
+    // Constructed without a host scope; no authority can reside in this factory.
+    let callback = |released: tokio::sync::oneshot::Receiver<()>| {
+        spawn_plugin_change_task(async move {
+            released.await.unwrap();
+        })
+        .unwrap()
+    };
+    let a = ProcessorTasks::default();
+    let b = ProcessorTasks::default();
+    let pa = AccountWorkPermits::new();
+    let pb = AccountWorkPermits::new();
+    let (ra, wa) = tokio::sync::oneshot::channel();
+    let (rb, wb) = tokio::sync::oneshot::channel();
+    drop(
+        codex_model_provider::with_auth_task_scope(callback_access(&a, &pa), async {
+            callback(wa)
+        })
+        .await
+        .unwrap(),
+    );
+    drop(
+        codex_model_provider::with_auth_task_scope(callback_access(&b, &pb), async {
+            callback(wb)
+        })
+        .await
+        .unwrap(),
+    );
+    pa.close();
+    pb.close();
+    assert!(pa.admitted_count() > 0 && pb.admitted_count() > 0);
+    ra.send(()).unwrap();
+    assert!(
+        a.shutdown_until(Instant::now() + crate::managed_transition::DRAIN_DEADLINE)
+            .await
+            .is_clean()
+    );
+    assert_eq!(pa.admitted_count(), 0);
+    assert!(pb.admitted_count() > 0);
+    assert!(!b.observe_until(Instant::now()).await.terminal);
+    rb.send(()).unwrap();
+    assert!(
+        b.shutdown_until(Instant::now() + crate::managed_transition::DRAIN_DEADLINE)
+            .await
+            .is_clean()
+    );
+    assert_eq!(pb.admitted_count(), 0);
+}
+
+#[tokio::test]
+async fn callback_closed_ticket_refuses_body_and_records_sticky_failure() {
+    use crate::account_work_permits::AccountWorkPermits;
+    use crate::processor_task_retirement::ProcessorTasks;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let tasks = ProcessorTasks::default();
+    let permits = AccountWorkPermits::new();
+    let access = callback_access(&tasks, &permits);
+    tasks.close_registration().unwrap();
+    permits.close();
+    let polled = Arc::new(AtomicBool::new(false));
+    let child = polled.clone();
+    let result = codex_model_provider::with_auth_task_scope(access, async move {
+        assert!(matches!(
+            spawn_plugin_change_task(async move {
+                child.store(true, Ordering::SeqCst);
+            }),
+            Err(codex_model_provider::AuthTaskFailure::Unavailable)
+        ));
+    })
+    .await;
+    assert!(
+        result.is_err(),
+        "caller cannot hide a rejected callback original"
+    );
+    assert!(!polled.load(Ordering::SeqCst));
+    assert_eq!(permits.admitted_count(), 0);
+    assert_eq!(tasks.pending_len_for_test(), 0);
+}
+
+#[tokio::test]
+async fn callback_descendant_remains_counted_after_callback_body_returns() {
+    use crate::account_work_permits::AccountWorkPermits;
+    use crate::processor_task_retirement::ProcessorTasks;
+    use tokio::time::Instant;
+    let tasks = ProcessorTasks::default();
+    let permits = AccountWorkPermits::new();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let (entered, started) = tokio::sync::oneshot::channel();
+    drop(
+        codex_model_provider::with_auth_task_scope(callback_access(&tasks, &permits), async move {
+            spawn_plugin_change_task(async move {
+                drop(
+                    codex_model_provider::spawn_provider_task(Box::pin(async move {
+                        entered.send(()).unwrap();
+                        released.await.unwrap();
+                    }))
+                    .unwrap(),
+                );
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap(),
+    );
+    tokio::time::timeout(crate::managed_transition::DRAIN_DEADLINE, started)
+        .await
+        .unwrap()
+        .unwrap();
+    permits.close();
+    assert!(permits.admitted_count() > 0);
+    assert!(!tasks.observe_until(Instant::now()).await.terminal);
+    release.send(()).unwrap();
+    assert!(
+        tasks
+            .shutdown_until(Instant::now() + crate::managed_transition::DRAIN_DEADLINE)
+            .await
+            .is_clean()
+    );
+    assert_eq!(permits.admitted_count(), 0);
+}
+
+#[tokio::test]
+async fn callback_panic_is_nonclean_after_original_compaction() {
+    use crate::account_work_permits::AccountWorkPermits;
+    use crate::processor_task_retirement::ProcessorTasks;
+    use tokio::time::Instant;
+    let tasks = ProcessorTasks::default();
+    let permits = AccountWorkPermits::new();
+    drop(
+        codex_model_provider::with_auth_task_scope(callback_access(&tasks, &permits), async {
+            spawn_plugin_change_task(async {
+                panic!("synthetic callback original panic");
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap(),
+    );
+    let result = tasks
+        .shutdown_until(Instant::now() + crate::managed_transition::DRAIN_DEADLINE)
+        .await;
+    assert!(result.terminal && result.panicked && !result.is_clean());
+    assert!(tasks.observe_until(Instant::now()).await.panicked);
+    assert_eq!(permits.admitted_count(), 0);
+}
+
+#[tokio::test]
+async fn independent_callback_keeps_ordinary_tokio_dispatch_without_host() {
+    let (sent, received) = tokio::sync::oneshot::channel();
+    let observation = spawn_plugin_change_task(async move {
+        sent.send(17).unwrap();
+    })
+    .unwrap();
+    assert!(observation.is_none());
+    assert_eq!(
+        tokio::time::timeout(crate::managed_transition::DRAIN_DEADLINE, received)
+            .await
+            .unwrap()
+            .unwrap(),
+        17
+    );
+}

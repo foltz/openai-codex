@@ -346,13 +346,15 @@ impl AccountRequestProcessor {
         config_manager: ConfigManager,
         reason: McpRefreshReason,
     ) {
-        tokio::spawn(async move {
+        if let Err(error) = crate::effective_plugin_change::spawn_plugin_change_task(async move {
             thread_manager.plugins_manager().clear_cache();
             thread_manager.skills_service().clear_cache();
             crate::mcp_refresh::reload_mcp_config_best_effort(&thread_manager, &config_manager)
                 .await;
             thread_manager.invalidate_mcp_runtimes_for(reason).await;
-        });
+        }) {
+            warn!(?error, "failed to admit account plugin refresh task");
+        }
     }
 
     async fn login_v2(

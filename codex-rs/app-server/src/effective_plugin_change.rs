@@ -1,5 +1,6 @@
 use codex_core::McpRefreshReason;
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::sync::Arc;
 
 use codex_app_server_protocol::ConfigBatchWriteParams;
@@ -20,6 +21,16 @@ use crate::request_serialization::RequestSerializationAccess;
 use crate::request_serialization::RequestSerializationQueueKey;
 use crate::request_serialization::RequestSerializationQueues;
 
+/// Transfer only the invoking finite root; the reusable callback factory owns
+/// no account authority. Dropping the observer never detaches a managed original.
+/// Independent callers retain the provider bridge's ordinary Tokio behavior.
+pub(crate) fn spawn_plugin_change_task(
+    future: impl Future<Output = ()> + Send + 'static,
+) -> Result<Option<codex_model_provider::AuthTaskObservation>, codex_model_provider::AuthTaskFailure>
+{
+    codex_model_provider::spawn_provider_task(Box::pin(future))
+}
+
 /// Refresh plugin consumers and trust hooks from newly materialized Workspace + Listed bundles.
 pub(crate) fn effective_plugins_changed_callback(
     auth_manager: Arc<AuthManager>,
@@ -37,12 +48,14 @@ pub(crate) fn effective_plugins_changed_callback(
             McpRefreshReason::EffectivePluginsChanged,
             McpRefreshReason::InstalledPluginMetadata,
         );
-        tokio::spawn(async move {
+        if let Err(error) = spawn_plugin_change_task(async move {
             refresh_thread_manager
                 .invalidate_mcp_runtimes_for(reason)
                 .await;
             refresh_thread_manager.refresh_hook_runtimes().await;
-        });
+        }) {
+            warn!(?error, "failed to admit effective plugin refresh task");
+        }
 
         if change.materialized_remote_plugins.is_empty() {
             return;
@@ -53,7 +66,7 @@ pub(crate) fn effective_plugins_changed_callback(
         let trust_config_manager = config_manager.clone();
         let trust_config_processor = config_processor.clone();
         let trust_request_serialization_queues = request_serialization_queues.clone();
-        tokio::spawn(async move {
+        if let Err(error) = spawn_plugin_change_task(async move {
             trust_request_serialization_queues
                 .enqueue_background(
                     RequestSerializationQueueKey::Global("config"),
@@ -73,7 +86,9 @@ pub(crate) fn effective_plugins_changed_callback(
                     },
                 )
                 .await;
-        });
+        }) {
+            warn!(?error, "failed to admit materialized plugin trust task");
+        }
     })
 }
 
@@ -134,9 +149,10 @@ pub(crate) async fn trust_materialized_plugin_hooks(
         plugin_hook_load_warnings: plugin_outcome.effective_plugin_hook_warnings(),
         ..Default::default()
     };
-    let hooks = tokio::task::spawn_blocking(move || codex_hooks::list_hooks(hooks_config))
-        .await
-        .map_err(|err| format!("hook discovery task failed: {err}"))?;
+    let hooks =
+        codex_model_provider::run_blocking_call(move || codex_hooks::list_hooks(hooks_config))
+            .await
+            .map_err(|err| format!("hook discovery task failed: {err}"))?;
     if !hooks.warnings.is_empty() {
         warn!(
             warnings = ?hooks.warnings,

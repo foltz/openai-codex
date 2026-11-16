@@ -958,7 +958,10 @@ async fn recorded_review_token_cancellation_releases_root_while_public_wait_is_b
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), review)
         .await
         .unwrap();
-    assert!(matches!(result, Err(CodexErr::TurnAborted)));
+    assert!(matches!(
+        result.unwrap_err().details(),
+        codex_protocol::error::CodexErrorDetails::TurnAborted
+    ));
     assert_eq!(counts.requests.load(Ordering::SeqCst), 1);
     assert_eq!(counts.live.load(Ordering::SeqCst), 0);
 }
@@ -971,7 +974,7 @@ async fn already_cancelled_recorded_review_never_captures_request_authority() {
     let mut review = Box::pin(thread.guardian_review(&cancel));
     assert!(matches!(
         futures::poll!(&mut review),
-        std::task::Poll::Ready(Err(CodexErr::TurnAborted))
+        std::task::Poll::Ready(Err(error)) if matches!(error.details(), codex_protocol::error::CodexErrorDetails::TurnAborted)
     ));
     assert_eq!(counts.requests.load(Ordering::SeqCst), 0);
     assert_eq!(counts.live.load(Ordering::SeqCst), 0);

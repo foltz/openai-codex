@@ -47,6 +47,19 @@ async fn detached_operation_constructs_and_starts_child_after_request_and_parent
     })
     .await
     .inspect_err(|error| eprintln!("detached child fixture returned: {error:#}"))?;
+    // Construction schedules finite auth prewarm before returning; observe
+    // actual work release rather than assume publication means quiescence.
+    tokio::time::timeout(DRAIN_DEADLINE, async {
+        loop {
+            let released = permits.notified();
+            if permits.admitted_count() == 0 {
+                break;
+            }
+            released.await;
+        }
+    })
+    .await
+    .expect("initial finite startup work must finish within the unchanged drain bound");
     assert_eq!(
         permits.admitted_count(),
         0,

@@ -9759,11 +9759,11 @@ async fn curated_named_body_and_runtime_callback_keep_initiating_auth_originals(
     assert!(
         manager
             .store
-            .plugin_path(
-                "gmail",
-                OPENAI_CURATED_MARKETPLACE_NAME,
-                TEST_CURATED_PLUGIN_CACHE_VERSION
+            .plugin_root(
+                &PluginId::new("gmail".into(), OPENAI_CURATED_MARKETPLACE_NAME.into()).unwrap(),
+                TEST_CURATED_PLUGIN_CACHE_VERSION,
             )
+            .as_path()
             .is_dir()
     );
     release.add_permits(1);

@@ -560,8 +560,18 @@ async fn shared_startup_survives_first_chat_cancellation_and_rejects_released_bi
     server.block_listing.store(true, Ordering::Release);
     let waiting = async {
         tokio::join!(
-            bindings.list_resources("test_server", /*params*/ None),
-            bindings.list_resource_templates("test_server", /*params*/ None),
+            bindings.list_resources(
+                "test_server",
+                /*params*/ None,
+                crate::McpAttemptRequirement::Ungated,
+                crate::McpAttemptAccess::Unscoped
+            ),
+            bindings.list_resource_templates(
+                "test_server",
+                /*params*/ None,
+                crate::McpAttemptRequirement::Ungated,
+                crate::McpAttemptAccess::Unscoped
+            ),
         )
     };
     tokio::pin!(waiting);

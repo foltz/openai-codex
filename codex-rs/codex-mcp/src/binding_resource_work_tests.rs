@@ -1,8 +1,9 @@
 use super::*;
 use crate::{McpAttemptAccess, McpAttemptRefused, McpAttemptRequirement, McpAttemptWork};
+use pretty_assertions::assert_eq;
 use rmcp::model::{
     ClientCapabilities, Implementation, InitializeRequestParams, ListResourceTemplatesResult,
-    ListResourcesResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResult,
+    ListResourcesResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse,
     ServerCapabilities, ServerConfig,
 };
 use rmcp::service::RequestContext;
@@ -90,7 +91,7 @@ impl ServerHandler for Server {
         &self,
         _params: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, rmcp::ErrorData> {
+    ) -> Result<ReadResourceResponse, rmcp::ErrorData> {
         self.observe().await;
         Err(rmcp::ErrorData::invalid_params(
             "test read reached exact server",
@@ -307,7 +308,7 @@ async fn resource_fanout_owns_work_until_cancelled_task_is_dropped() {
         "parent plus independently owned fanout task"
     );
     request.abort();
-    assert!(request.await.unwrap_err().is_cancelled());
+    assert!(matches!(request.await, Err(error) if error.is_cancelled()));
     tokio::time::timeout(Duration::from_secs(5), async {
         while counts.live.load(Ordering::SeqCst) != 0 {
             tokio::task::yield_now().await;

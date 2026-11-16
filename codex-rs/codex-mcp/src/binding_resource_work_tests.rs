@@ -44,6 +44,7 @@ struct Server {
     calls: Arc<AtomicUsize>,
     hold: Arc<AtomicBool>,
     started: Arc<Notify>,
+    finish_request: Arc<Notify>,
     tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 impl Server {
@@ -51,10 +52,13 @@ impl Server {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.started.notify_one();
         if self.hold.load(Ordering::SeqCst) {
-            std::future::pending::<()>().await;
+            self.finish_request.notified().await;
         }
     }
     async fn finish(&self, client: &RmcpClient) {
+        // Teardown only: cancellation ownership was already asserted at zero.
+        // Local cancellation is not proof that remote server work stopped.
+        self.finish_request.notify_one();
         tokio::time::timeout(Duration::from_secs(5), client.shutdown())
             .await
             .unwrap();
@@ -246,18 +250,16 @@ async fn ready_resource_operations_derive_and_release_each_invocation() {
         .list_resource_templates_with_authority(SERVER_NAME, None, access)
         .await
         .unwrap();
-    assert!(
-        step.step
-            .read_resource_with_authority(
-                SERVER_NAME,
-                ReadResourceRequestParams::new("test://read"),
-                access
-            )
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("test read reached exact server")
-    );
+    let error = step
+        .step
+        .read_resource_with_authority(
+            SERVER_NAME,
+            ReadResourceRequestParams::new("test://read"),
+            access,
+        )
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("test read reached exact server"));
     assert_eq!(
         step.step
             .list_all_resources_with_authority(|_| true, access)

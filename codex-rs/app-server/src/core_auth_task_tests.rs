@@ -2306,3 +2306,89 @@ async fn queued_auth_observation_panic_is_unavailable_while_actual_original_stay
     assert_eq!(permits.admitted_count(), 0);
     assert!(family.shutdown_until(Instant::now()).await.unavailable);
 }
+
+struct SpawnAuthOnRejectedCommandDrop {
+    refused: Arc<AtomicBool>,
+    polled: Arc<AtomicBool>,
+}
+impl Drop for SpawnAuthOnRejectedCommandDrop {
+    fn drop(&mut self) {
+        let polled = self.polled.clone();
+        let result = codex_model_provider::spawn_provider_task(Box::pin(async move {
+            polled.store(true, Ordering::SeqCst);
+        }));
+        self.refused.store(result.is_err(), Ordering::SeqCst);
+    }
+}
+
+#[test_case::test_case(false; "unscoped_sender")]
+#[test_case::test_case(true; "other_admitted_sender")]
+#[tokio::test]
+async fn queued_auth_rejected_command_drop_cannot_spawn_ungated_or_borrow_sender_root(
+    other_root: bool,
+) {
+    let tasks = ProcessorTasks::default();
+    let permits = AccountWorkPermits::new();
+    let family = codex_core_plugins::PluginTaskRegistry::default();
+    let request =
+        codex_model_provider::with_auth_task_scope(queued_auth_access(&tasks, &permits), async {
+            family.prepare_auth_request()
+        })
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    request
+        .dispatch(Box::pin(async {
+            panic!("synthetic closed receiver original");
+        }))
+        .unwrap();
+    let original = tasks.shutdown_until(Instant::now() + DRAIN_DEADLINE).await;
+    assert!(original.terminal && original.panicked);
+    assert_eq!(
+        permits.admitted_count(),
+        0,
+        "endpoint is not a dead original's root"
+    );
+    let refused = Arc::new(AtomicBool::new(false));
+    let polled = Arc::new(AtomicBool::new(false));
+    let capture = SpawnAuthOnRejectedCommandDrop {
+        refused: refused.clone(),
+        polled: polled.clone(),
+    };
+    let command = Box::pin(async move {
+        std::hint::black_box(capture);
+    });
+    let other_tasks = ProcessorTasks::default();
+    let other_permits = AccountWorkPermits::new();
+    if other_root {
+        codex_model_provider::with_auth_task_scope(
+            queued_auth_access(&other_tasks, &other_permits),
+            async {
+                assert_eq!(
+                    request.dispatch(command),
+                    Err(codex_model_provider::AuthTaskFailure::Unavailable)
+                );
+            },
+        )
+        .await
+        .unwrap();
+    } else {
+        assert_eq!(
+            request.dispatch(command),
+            Err(codex_model_provider::AuthTaskFailure::Unavailable)
+        );
+    }
+    assert!(
+        refused.load(Ordering::SeqCst),
+        "rejected command destructor must see explicit refusal, never the sender's context"
+    );
+    tokio::task::yield_now().await;
+    assert!(!polled.load(Ordering::SeqCst));
+    assert_eq!(other_tasks.len(), 0);
+    assert_eq!(other_permits.admitted_count(), 0);
+    drop(request);
+    let report = family.shutdown_until(Instant::now() + DRAIN_DEADLINE).await;
+    assert!(report.terminal && report.panicked && !report.is_clean());
+    assert!(other_tasks.shutdown_until(Instant::now()).await.is_clean());
+}

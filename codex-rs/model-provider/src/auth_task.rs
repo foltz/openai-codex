@@ -154,14 +154,37 @@ pub async fn run_auth_call<T: Send + 'static>(
 #[derive(Clone)]
 pub struct DeferredAuthTask {
     commands: tokio::sync::mpsc::UnboundedSender<AuthTaskFuture>,
+    failure: Arc<Mutex<Option<AuthTaskFailure>>>,
+}
+
+#[derive(Debug)]
+struct RefusedDeferredAuthTask;
+impl AuthTaskSpawner for RefusedDeferredAuthTask {
+    fn spawn(
+        &self,
+        task: AuthTaskFuture,
+    ) -> std::result::Result<AuthTaskObservation, AuthTaskFailure> {
+        drop(task);
+        Err(AuthTaskFailure::Unavailable)
+    }
 }
 impl DeferredAuthTask {
     /// Fire-and-observe through the original host ledger, without creating a
     /// supervisor task. This must only carry effects of the admitted request.
     pub fn dispatch(&self, future: AuthTaskFuture) -> std::result::Result<(), AuthTaskFailure> {
-        self.commands
-            .send(future)
-            .map_err(|_| AuthTaskFailure::Unavailable)
+        let Err(rejected) = self.commands.send(future) else {
+            return Ok(());
+        };
+        // A failed command cannot borrow its sender's unrelated root or fall
+        // back to unscoped auth births from captured destructors. This context
+        // has NO authority; it explicitly refuses every nested auth birth.
+        let refusal = Context {
+            spawner: Arc::new(RefusedDeferredAuthTask),
+            failure: self.failure.clone(),
+        };
+        let _ = refusal.fail(AuthTaskFailure::Unavailable);
+        AUTH_TASK_CONTEXT.sync_scope(refusal, || drop(rejected.0));
+        Err(AuthTaskFailure::Unavailable)
     }
 
     /// A cancelled result observer cannot cancel an accepted physical command.
@@ -187,6 +210,7 @@ pub fn prepare_deferred_auth_task()
         return Ok(None);
     };
     let (commands, mut receiver) = tokio::sync::mpsc::unbounded_channel::<AuthTaskFuture>();
+    let failure = context.failure.clone();
     let observation = dispatch_provider_task(
         context,
         Box::pin(async move {
@@ -195,7 +219,7 @@ pub fn prepare_deferred_auth_task()
             }
         }),
     )?;
-    Ok(Some((DeferredAuthTask { commands }, observation)))
+    Ok(Some((DeferredAuthTask { commands, failure }, observation)))
 }
 
 /// Legacy unmanaged JoinError is preserved; custody failure is a distinct

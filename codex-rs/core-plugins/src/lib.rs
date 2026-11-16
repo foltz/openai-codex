@@ -21,6 +21,7 @@ pub mod marketplace_remove;
 mod marketplace_staging;
 pub mod marketplace_upgrade;
 mod npm_source;
+mod owned_process;
 mod plugin_bundle_archive;
 mod plugin_measurement_references;
 mod plugin_metrics;

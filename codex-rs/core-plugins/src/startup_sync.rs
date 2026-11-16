@@ -793,6 +793,15 @@ fn run_git_command_with_timeout(
     context: &str,
     timeout: Duration,
 ) -> Result<Output, String> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let stop = SYNC_STOP.with(|stop| stop.borrow().clone());
+        if stop.is_managed() {
+            return crate::owned_process::run_output(command, context, timeout, stop);
+        }
+    }
+    // Unmanaged execution (and the not-yet-ported Windows managed backend)
+    // keeps the original command/timeout semantics below.
     // min(step cap, owner remaining): the step never outlives the deadline.
     let timeout = step_budget(timeout);
     ensure_not_stopped(context)?;

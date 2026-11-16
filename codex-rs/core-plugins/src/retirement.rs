@@ -90,6 +90,17 @@ impl WorkerStop {
         self.state.is_some()
     }
 
+    /// A joined worker cannot hide an IO/identity/pipe custody failure even if
+    /// an intermediate caller logs its ordinary Result and continues.
+    pub(crate) fn mark_unavailable(&self) {
+        if let Some(state) = &self.state {
+            state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .unavailable = true;
+        }
+    }
+
     /// Bound an owned read step even when shutdown first latches a deadline
     /// after IO begins. No elapsed deadline polls a new step or extends its cap.
     pub(crate) async fn run_until<T>(

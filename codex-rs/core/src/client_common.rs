@@ -118,6 +118,11 @@ fn normalize_image_detail(detail: &mut Option<ImageDetail>, model_info: &ModelIn
     }
 }
 
+pub(crate) enum ProviderTaskCompletion {
+    Pending(codex_model_provider::AuthTaskObservation),
+    Finished(std::result::Result<(), codex_model_provider::AuthTaskFailure>),
+}
+
 pub struct ResponseStream {
     pub(crate) routing_affinity: Option<codex_http_client::ChatGptRoutingAffinity>,
     pub(crate) rx_event: mpsc::Receiver<Result<ResponseEvent>>,
@@ -125,6 +130,29 @@ pub struct ResponseStream {
     /// Signals the mapper task that the consumer stopped polling before the
     /// provider stream reached its own terminal event.
     pub(crate) consumer_dropped: CancellationToken,
+    pub(crate) pump: Option<ProviderTaskCompletion>,
+}
+
+impl ResponseStream {
+    /// Only after the canonical terminal event: signal normal consumer completion
+    /// and observe the managed original before publishing operation success.
+    /// Cancelling this observer retains the same original for a later observation.
+    pub(crate) async fn finish(&mut self) -> Result<()> {
+        let Some(task) = self.pump.as_mut() else {
+            // Preserve the unmanaged stream's existing event/drop semantics.
+            return Ok(());
+        };
+        let result = match task {
+            ProviderTaskCompletion::Pending(original) => {
+                self.rx_event.close();
+                self.consumer_dropped.cancel();
+                original.await
+            }
+            ProviderTaskCompletion::Finished(result) => *result,
+        };
+        self.pump = Some(ProviderTaskCompletion::Finished(result));
+        result.map_err(codex_model_provider::AuthTaskFailure::error)
+    }
 }
 
 impl Stream for ResponseStream {

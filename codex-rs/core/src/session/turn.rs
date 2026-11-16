@@ -3632,6 +3632,9 @@ async fn try_run_sampling_request_with_work(
                 if let Err(err) = budget_result {
                     break Err(err);
                 }
+                if let Err(err) = stream.finish().await {
+                    break Err(err);
+                }
                 if resampling.retry_pending {
                     response_completed = false;
                     response_id_for_assessment = None;

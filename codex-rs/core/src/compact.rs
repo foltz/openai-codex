@@ -940,6 +940,7 @@ async fn drain_to_completed(
                     includes_reasoning,
                 )
                 .await?;
+                stream.finish().await?;
                 return Ok(CompactionResponse {
                     response_id,
                     output,

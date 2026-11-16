@@ -2570,7 +2570,10 @@ impl ModelClientSession {
                 // Wait for the v2 warmup request to complete before sending the first turn request.
                 while let Some(event) = stream.next().await {
                     match event {
-                        Ok(ResponseEvent::Completed { .. }) => break,
+                        Ok(ResponseEvent::Completed { .. }) => {
+                            stream.finish().await?;
+                            break;
+                        }
                         Err(err) => return Err(err),
                         _ => {}
                     }
@@ -2774,7 +2777,8 @@ where
     let provider = Arc::clone(&client.provider);
     let item_id_generator = Arc::clone(&client.item_id_generator);
 
-    tokio::spawn(async move {
+    let failure_tx = tx_event.clone();
+    let pump = codex_model_provider::spawn_provider_task(Box::pin(async move {
         let mut logged_error = false;
         let collect_output_items =
             last_response_tx.is_some() || inference_trace_attempt.needs_output_items();
@@ -2934,13 +2938,27 @@ where
             upstream_request_id,
             &items_added,
         );
-    });
+    }));
+    let pump = match pump {
+        Ok(Some(original)) => Some(crate::client_common::ProviderTaskCompletion::Pending(
+            original,
+        )),
+        Ok(None) => None,
+        Err(reason) => {
+            let _ = failure_tx.try_send(Err(reason.error()));
+            Some(crate::client_common::ProviderTaskCompletion::Finished(Err(
+                reason,
+            )))
+        }
+    };
+    drop(failure_tx);
 
     ResponseStream {
         routing_affinity: None,
         rx_event,
         interrupt: None,
         consumer_dropped: consumer_dropped_for_stream,
+        pump,
     }
 }
 

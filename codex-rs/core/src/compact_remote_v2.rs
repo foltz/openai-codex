@@ -501,6 +501,7 @@ async fn collect_compaction_output(
                 }
                 completed_response_id = Some(response_id);
                 completed_token_usage = token_usage;
+                stream.finish().await?;
                 break;
             }
             _ => {}
@@ -990,6 +991,7 @@ mod tests {
             rx_event,
             interrupt: None,
             consumer_dropped: CancellationToken::new(),
+            pump: None,
         }
     }
 

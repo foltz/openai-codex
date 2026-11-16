@@ -770,3 +770,165 @@ async fn provider_parent_observer_preserves_caught_nested_registration_failure()
     );
     assert_eq!(permits.admitted_count(), 0);
 }
+
+struct PumpAuthContributor {
+    auth: Arc<AuthManager>,
+    held: Arc<HeldAuth>,
+    permits: AccountWorkPermits,
+}
+impl std::fmt::Debug for PumpAuthContributor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PumpAuthContributor")
+    }
+}
+struct PumpAuthInterceptor {
+    auth: Arc<AuthManager>,
+    held: Arc<HeldAuth>,
+    permits: AccountWorkPermits,
+}
+impl codex_extension_api::ModelRequestContributor for PumpAuthContributor {
+    fn request(
+        &self,
+        input: codex_extension_api::ModelRequestInput<'_>,
+    ) -> Option<Box<dyn codex_extension_api::ModelResponseInterceptor>> {
+        if input.kind != codex_extension_api::ModelRequestKind::Generation {
+            return None;
+        }
+        Some(Box::new(PumpAuthInterceptor {
+            auth: self.auth.clone(),
+            held: self.held.clone(),
+            permits: self.permits.clone(),
+        }))
+    }
+}
+impl codex_extension_api::ModelResponseInterceptor for PumpAuthInterceptor {
+    fn intercept(
+        self: Box<Self>,
+        stream: codex_extension_api::ModelResponseStream,
+    ) -> codex_extension_api::ModelResponseStream {
+        use futures::StreamExt;
+        let seen = Arc::new(AtomicBool::new(false));
+        Box::pin(stream.then(move |event| {
+            let seen = seen.clone();
+            let auth = self.auth.clone();
+            let held = self.held.clone();
+            let permits = self.permits.clone();
+            async move {
+                if !seen.swap(true, Ordering::SeqCst) {
+                    permits.close();
+                    held.armed.store(true, Ordering::SeqCst);
+                    codex_model_provider::create_model_provider(
+                        codex_model_provider_info::ModelProviderInfo::create_openai_provider(None),
+                        Some(auth),
+                    )
+                    .request_auth(None)
+                    .await
+                    .expect("real pump nested auth derives during drain");
+                }
+                event
+            }
+        }))
+    }
+}
+
+#[test_case::test_case(false; "normal_completion")]
+#[test_case::test_case(true; "cancelled_consumer")]
+#[tokio::test]
+async fn actual_stream_pump_owns_nested_auth_and_original_join(cancel: bool) -> anyhow::Result<()> {
+    let tasks = Arc::new(ProcessorTasks::default());
+    let permits = AccountWorkPermits::new();
+    let (_home, auth, held) = held_auth(&tasks, true).await;
+    held.armed.store(false, Ordering::SeqCst);
+    let mut extensions = ExtensionRegistryBuilder::new();
+    extensions.turn_start_admission(Arc::new(host(&permits, Some(tasks.ticket()))));
+    extensions.turn_lifecycle_contributor(Arc::new(
+        crate::account_turn_admission::AccountTurnLifecycle,
+    ));
+    extensions.model_request_contributor(Arc::new(PumpAuthContributor {
+        auth: auth.clone(),
+        held: held.clone(),
+        permits: permits.clone(),
+    }));
+    let server = core_test_support::responses::start_mock_server().await;
+    let response = core_test_support::responses::mount_sse_once(
+        &server,
+        core_test_support::responses::sse_completed("pump-completed"),
+    )
+    .await;
+    let test = within_request(Some(permits.try_acquire().unwrap()), async {
+        core_test_support::test_codex::test_codex()
+            .with_auth_manager(auth)
+            .with_extensions(Arc::new(extensions.build()))
+            .with_config(|config| config.model_provider.supports_websockets = false)
+            .build_with_auto_env(&server)
+            .await
+    })
+    .await?;
+    idle_constructor(&permits, &tasks).await;
+    assert!(matches!(
+        within_request(
+            permits.try_acquire(),
+            test.codex.start_turn_if_idle(input())
+        )
+        .await?,
+        codex_core::StartIfIdleSubmission::Started { .. }
+    ));
+    tokio::time::timeout(DRAIN_DEADLINE, held.entered.acquire())
+        .await??
+        .forget();
+    assert_eq!(
+        response.requests().len(),
+        1,
+        "real event interceptor after HTTP transport"
+    );
+    assert_eq!(tasks.len(), 2, "original stream pump and nested auth child");
+    assert!(
+        permits.admitted_count() >= 4,
+        "turn, finite factory, pump and auth child remain counted"
+    );
+    assert!(!tasks.observe_until(Instant::now()).await.terminal);
+    if cancel {
+        test.codex
+            .submit(codex_protocol::protocol::Op::Interrupt)
+            .await?;
+        core_test_support::wait_for_event(&test.codex, |event| {
+            matches!(event, codex_protocol::protocol::EventMsg::TurnAborted(_))
+        })
+        .await;
+        assert!(
+            test.codex
+                .shutdown_and_wait_with_cleanup()
+                .await
+                .is_complete()
+        );
+        assert!(!held.finished.load(Ordering::SeqCst));
+        assert!(!tasks.observe_until(Instant::now()).await.terminal);
+        assert!(
+            permits.admitted_count() > 0,
+            "credential child outlives cancelled consumer and Core parent"
+        );
+        held.release.add_permits(1);
+    } else {
+        held.release.add_permits(1);
+        core_test_support::wait_for_successful_turn(&test.codex).await;
+        assert!(
+            tasks.observe_until(Instant::now()).await.is_clean(),
+            "original pump joined before successful turn"
+        );
+        assert!(
+            test.codex
+                .shutdown_and_wait_with_cleanup()
+                .await
+                .is_complete()
+        );
+    }
+    assert!(
+        tasks
+            .observe_until(Instant::now() + DRAIN_DEADLINE)
+            .await
+            .is_clean()
+    );
+    assert!(held.finished.load(Ordering::SeqCst));
+    assert_eq!(permits.admitted_count(), 0);
+    Ok(())
+}

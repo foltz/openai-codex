@@ -198,7 +198,10 @@ impl Session {
             error!("MCP runtime refresh semaphore closed");
             return;
         };
-        self.reconcile_mcp_runtime().await;
+        // Erase the auth/discovery future's type at this ownership boundary.
+        // Keep the same permit and inline cancellation lifetime; no task is spawned.
+        let reconcile: BoxFuture<'_, ()> = Box::pin(self.reconcile_mcp_runtime());
+        reconcile.await;
     }
 
     /// Reconcile pending state under the session permit.
@@ -316,7 +319,10 @@ impl Session {
         self: &Arc<Self>,
         permit: SemaphorePermit<'_>,
     ) -> anyhow::Result<Option<codex_mcp::CodexAppsToolSnapshot>> {
-        self.reconcile_mcp_runtime().await;
+        // Erase the auth/discovery future's type at this ownership boundary.
+        // Keep the same permit and inline cancellation lifetime; no task is spawned.
+        let reconcile: BoxFuture<'_, ()> = Box::pin(self.reconcile_mcp_runtime());
+        reconcile.await;
         let refresh = self.services.mcp_runtime.capture_apps_tool_refresh();
         // An invalidation may arrive after reconciliation but before capture.
         if self.mcp_refresh.is_pending() {

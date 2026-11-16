@@ -25,6 +25,7 @@ pub(crate) struct ModelCatalog {
     thread_manager: Arc<ThreadManager>,
     startup_cwd: Option<PathBuf>,
     state: Mutex<CatalogState>,
+    auth_tasks: crate::processor_task_retirement::ProcessorTasks,
 }
 
 struct CatalogState {
@@ -45,6 +46,7 @@ impl ModelCatalog {
             config_manager,
             thread_manager,
             startup_cwd,
+            auth_tasks: Default::default(),
             state: Mutex::new(CatalogState {
                 needs_reload: false,
                 config,
@@ -118,9 +120,26 @@ impl ModelCatalog {
         &self,
         refresh_strategy: RefreshStrategy,
     ) -> std::io::Result<Vec<ModelPreset>> {
+        let work = self
+            .thread_manager
+            .admit_background_operation_work()
+            .map_err(|_| std::io::Error::other("background model account work unavailable"))?;
+        crate::auth_task_work::scope(
+            &self.auth_tasks,
+            work,
+            self.list_models_inner(refresh_strategy),
+        )
+        .await
+        .map_err(|_| std::io::Error::other("model auth task custody unavailable"))?
+    }
+
+    async fn list_models_inner(
+        &self,
+        refresh_strategy: RefreshStrategy,
+    ) -> std::io::Result<Vec<ModelPreset>> {
         let (config, models_manager) = self.current().await?;
         let models = self
-            .list_models_from_snapshot(
+            .list_models_from_snapshot_inner(
                 Arc::clone(&config),
                 Arc::clone(&models_manager),
                 refresh_strategy,
@@ -137,6 +156,33 @@ impl ModelCatalog {
     }
 
     pub(crate) async fn list_models_from_snapshot(
+        &self,
+        config: Arc<Config>,
+        models_manager: SharedModelsManager,
+        refresh_strategy: RefreshStrategy,
+    ) -> std::io::Result<Vec<ModelPreset>> {
+        let work = self
+            .thread_manager
+            .capture_request_operation_work()
+            .map_err(|_| std::io::Error::other("request model account work unavailable"))?;
+        crate::auth_task_work::scope(
+            &self.auth_tasks,
+            work,
+            self.list_models_from_snapshot_inner(config, models_manager, refresh_strategy),
+        )
+        .await
+        .map_err(|_| std::io::Error::other("model auth task custody unavailable"))?
+    }
+
+    /// Separate original-join proof: permit zero alone is not a clean auth-task census.
+    pub(crate) async fn observe_auth_tasks_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> crate::processor_task_retirement::ProcessorTaskDrain {
+        self.auth_tasks.observe_until(deadline).await
+    }
+
+    async fn list_models_from_snapshot_inner(
         &self,
         config: Arc<Config>,
         models_manager: SharedModelsManager,
@@ -177,3 +223,7 @@ impl ModelCatalog {
         Ok(presets)
     }
 }
+
+#[cfg(test)]
+#[path = "model_auth_task_tests.rs"]
+mod auth_task_tests;

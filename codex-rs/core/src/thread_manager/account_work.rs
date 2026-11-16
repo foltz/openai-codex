@@ -21,6 +21,28 @@ impl ThreadManager {
         }
     }
 
+    /// Admit a new finite background producer, never infer authority from an ambient request.
+    /// A Required host returning no work refuses before any account effect.
+    pub fn admit_background_operation_work(
+        &self,
+    ) -> codex_protocol::error::Result<Option<Box<dyn codex_extension_api::HostOperationWork>>>
+    {
+        let Some(host) = self.state.extensions.host_admission() else {
+            return Ok(None);
+        };
+        let work = host.admit_operation_work().map_err(|_| {
+            codex_protocol::error::CodexErr::Fatal(
+                "background account work is unavailable".to_owned(),
+            )
+        })?;
+        if work.is_none() && host.requires_account_work() {
+            return Err(codex_protocol::error::CodexErr::Fatal(
+                "background account work is required".to_owned(),
+            ));
+        }
+        Ok(work)
+    }
+
     /// Drive already-admitted constructors during account draining, without
     /// closing threads or initiating retirement. Cancelling this observer does
     /// not discard the retained constructors or their operation custody.

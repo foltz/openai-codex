@@ -123,7 +123,7 @@ impl OpenAiModelsEndpoint {
         let auth_manager = self.auth_manager.clone()?;
         // Catalog startup has its own deadline. Let rotating credentials finish
         // saving even when that caller stops waiting.
-        match tokio::spawn(async move { auth_manager.auth().await }).await {
+        match crate::auth_task::spawn(async move { auth_manager.auth().await }).await {
             Ok(auth) => auth,
             Err(error) => {
                 tracing::warn!(?error, "model catalog authentication task failed");

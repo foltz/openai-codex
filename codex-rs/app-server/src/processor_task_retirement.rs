@@ -155,6 +155,56 @@ impl ProcessorTasks {
         Ok(receipt)
     }
 
+    /// Observe a finite auth batch without permanently closing this reusable owner.
+    /// Caller owns its fixed phase deadline. No timeout aborts or discards original joins.
+    pub(crate) async fn observe_until(&self, deadline: Instant) -> ProcessorTaskDrain {
+        let tasks = {
+            let Ok(state) = self.state.lock() else {
+                return ProcessorTaskDrain {
+                    unavailable: true,
+                    ..Default::default()
+                };
+            };
+            state.tasks.clone()
+        };
+        if !tasks.is_empty() && Instant::now() < deadline {
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(deadline) => {},
+                _ = futures::future::join_all(tasks) => {},
+            }
+        }
+        let Ok(mut state) = self.state.lock() else {
+            return ProcessorTaskDrain {
+                unavailable: true,
+                ..Default::default()
+            };
+        };
+        let mut cancelled = false;
+        let mut panicked = false;
+        state.tasks.retain(|receipt| match receipt.peek() {
+            Some(ProcessorTaskJoin::Joined) => false,
+            Some(ProcessorTaskJoin::Cancelled) => {
+                cancelled = true;
+                false
+            }
+            Some(ProcessorTaskJoin::Panicked) => {
+                panicked = true;
+                false
+            }
+            None => true,
+        });
+        state.cancelled |= cancelled;
+        state.panicked |= panicked;
+        ProcessorTaskDrain {
+            terminal: state.tasks.is_empty(),
+            cancelled: state.cancelled,
+            panicked: state.panicked,
+            unavailable: false,
+            unverified: state.unverified,
+        }
+    }
+
     pub(crate) async fn shutdown_until(&self, deadline: Instant) -> ProcessorTaskDrain {
         let (deadline, tasks) = {
             let Ok(mut state) = self.state.lock() else {

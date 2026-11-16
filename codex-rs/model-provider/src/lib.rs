@@ -1,5 +1,10 @@
 mod amazon_bedrock;
 mod auth;
+mod auth_task;
+pub use auth_task::{
+    AuthTaskAccess, AuthTaskFailure, AuthTaskFuture, AuthTaskObservation, AuthTaskSpawner,
+    with_auth_task_scope,
+};
 mod bearer_auth_provider;
 mod capabilities;
 mod catalog_factory;

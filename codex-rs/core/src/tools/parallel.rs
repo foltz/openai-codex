@@ -35,6 +35,30 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ToolResultMetadata;
 
+// Field order is deliberate: destroy the original future and all captured
+// payloads before releasing its finite account operation, even if never polled.
+struct ToolWorkFuture<F> {
+    future: std::pin::Pin<Box<F>>,
+    _work: Option<Box<dyn codex_extension_api::HostOperationWork>>,
+}
+impl<F> ToolWorkFuture<F> {
+    fn new(future: F, work: Option<Box<dyn codex_extension_api::HostOperationWork>>) -> Self {
+        Self {
+            future: Box::pin(future),
+            _work: work,
+        }
+    }
+}
+impl<F: std::future::Future> std::future::Future for ToolWorkFuture<F> {
+    type Output = F::Output;
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        self.get_mut().future.as_mut().poll(cx)
+    }
+}
+
 struct ToolCallTimingGuard {
     started_at: Option<Instant>,
     execution_started_at: Arc<OnceLock<Instant>>,
@@ -166,6 +190,30 @@ impl ToolCallRuntime {
         cancellation_token: CancellationToken,
         call_state: Arc<ToolCallState>,
     ) -> impl std::future::Future<Output = Result<AnyToolResult, FunctionCallError>> {
+        // Capture from the exact live turn in the original caller, before
+        // readiness, gate waits or spawning. Never fresh or request admission.
+        let operation_work = match self.session.turn_operation_work(&step_context.turn) {
+            Ok(work) => work,
+            Err(_) => {
+                return Either::Left(std::future::ready(Err(FunctionCallError::RespondToModel(
+                    "tool account work is unavailable".to_owned(),
+                ))));
+            }
+        };
+        // The original dispatch and completion/abort callback each own finite
+        // custody. Dropping one waiter cannot release another task's operation.
+        let dispatch_work = match operation_work
+            .as_deref()
+            .map(|work| work.derive_operation())
+            .transpose()
+        {
+            Ok(work) => work,
+            Err(_) => {
+                return Either::Left(std::future::ready(Err(FunctionCallError::RespondToModel(
+                    "tool account work is unavailable".to_owned(),
+                ))));
+            }
+        };
         if let Err(err) =
             call_state
                 .invocation
@@ -275,7 +323,7 @@ impl ToolCallRuntime {
         );
         let abort_dispatch_span = dispatch_span.clone();
 
-        let mut dispatch_handle = AbortOnDropHandle::new(tokio::spawn(
+        let mut dispatch_handle = AbortOnDropHandle::new(tokio::spawn(ToolWorkFuture::new(
             async move {
                 let _message_admission = message_admission?;
                 // Readiness and admission remain cancellable even when the handler must finish.
@@ -363,7 +411,8 @@ impl ToolCallRuntime {
                 result
             }
             .instrument(dispatch_span.clone().or_current()),
-        ));
+            dispatch_work,
+        )));
 
         let completion = async move {
             let mut tool_call_timing_guard = tool_call_timing_guard;
@@ -444,7 +493,7 @@ impl ToolCallRuntime {
             result
         }
         .instrument(dispatch_span.or_current());
-        Either::Right(completion)
+        Either::Right(ToolWorkFuture::new(completion, operation_work))
     }
 }
 
@@ -1082,3 +1131,7 @@ mod observation_tests;
 #[cfg(test)]
 #[path = "parallel_trace_tests.rs"]
 mod trace_tests;
+
+#[cfg(test)]
+#[path = "parallel_account_work_tests.rs"]
+mod account_work_tests;

@@ -17,7 +17,9 @@ pub(crate) fn run_output(
         return Err(format!("{context} requires a managed process owner"));
     }
     if cap.is_zero() || stop.is_stopped() {
-        return Err(format!("{context} stopped before process creation"));
+        return Err(format!(
+            "{context} stopped at the shutdown deadline or step budget before process creation"
+        ));
     }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
@@ -65,7 +67,7 @@ mod supported {
             }
         }
 
-        fn exited_without_reap(&mut self) -> io::Result<bool> {
+        pub(super) fn exited_without_reap(&mut self) -> io::Result<bool> {
             if !self.pinned {
                 return Err(io::Error::other("child identity lease already released"));
             }
@@ -90,32 +92,44 @@ mod supported {
             Ok(unsafe { info.si_pid() } != 0)
         }
 
-        fn signal_group(&mut self) -> io::Result<()> {
+        pub(super) fn signal_group(&mut self) -> io::Result<()> {
             // Validate the still-unreaped original, not a getpgid lookup. This
             // private std Child has no Tokio reaper or concurrent wait owner.
-            loop {
+            let exited = loop {
                 match self.exited_without_reap() {
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                    result => {
-                        result?;
-                        break;
-                    }
+                    result => break result?,
                 }
-            }
+            };
             let pid = i32::try_from(self.child.id()).map_err(io::Error::other)?;
             if pid <= 0 {
                 return Err(io::Error::other("invalid process group leader"));
             }
             if unsafe { libc::killpg(pid, libc::SIGKILL) } == -1 {
                 let error = io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH) {
-                    return Err(error);
+                if error.raw_os_error() == Some(libc::ESRCH) {
+                    return Ok(());
                 }
+                #[cfg(target_os = "macos")]
+                if error.raw_os_error() == Some(libc::EPERM)
+                    && exited
+                    && only_known_zombie_group(pid, exited)
+                {
+                    // XNU excludes SZOMB from its group signal walk, yielding
+                    // EPERM for a group containing only our unreaped zombie.
+                    // Never reinterpret EPERM without this complete snapshot.
+                    return Ok(());
+                }
+                let _ = exited;
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("killpg before reap: {error}"),
+                ));
             }
             Ok(())
         }
 
-        fn reap(&mut self) -> io::Result<ExitStatus> {
+        pub(super) fn reap(&mut self) -> io::Result<ExitStatus> {
             loop {
                 match self.child.wait() {
                     Ok(status) => {
@@ -149,6 +163,42 @@ mod supported {
                 }
             }
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn membership_is_only_known_zombie(
+        leader: libc::pid_t,
+        exited: bool,
+        members: &[libc::pid_t],
+        count: i32,
+        errno: i32,
+    ) -> bool {
+        let Ok(count) = usize::try_from(count) else {
+            return false;
+        };
+        exited
+            && errno == 0
+            && count < members.len()
+            && members[..count].iter().all(|pid| *pid == leader)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn only_known_zombie_group(leader: libc::pid_t, exited: bool) -> bool {
+        let mut members = [0 as libc::pid_t; 2];
+        // The libproc wrapper can return zero on error, so clearing/capturing
+        // thread-local errno is essential; zero count alone is not a proof.
+        unsafe {
+            *libc::__error() = 0;
+        }
+        let count = unsafe {
+            libc::proc_listpgrppids(
+                leader,
+                members.as_mut_ptr().cast(),
+                std::mem::size_of_val(&members) as i32,
+            )
+        };
+        let errno = unsafe { *libc::__error() };
+        membership_is_only_known_zombie(leader, exited, &members, count, errno)
     }
 
     fn nonblocking(pipe: &impl AsRawFd) -> io::Result<()> {
@@ -250,7 +300,7 @@ mod supported {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!(
-                        "{context} stopped by its step budget or the shutdown deadline: {}",
+                        "{context} timed out: stopped by its step budget or the shutdown deadline: {}",
                         String::from_utf8_lossy(&diagnostic).trim()
                     ),
                 ));
@@ -524,5 +574,44 @@ mod tests {
             let report = registry.shutdown_until(tokio::time::Instant::now()).await;
             assert!(report.terminal && report.unavailable && !report.is_clean());
         }
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_zombie_group_requires_complete_error_free_membership() {
+        use supported::membership_is_only_known_zombie as check;
+        assert!(check(7, true, &[7, 0], 1, 0));
+        assert!(check(7, true, &[0, 0], 0, 0));
+        assert!(!check(7, false, &[7, 0], 1, 0));
+        assert!(!check(7, true, &[7, 0], 0, libc::EPERM));
+        assert!(!check(7, true, &[8, 0], 1, 0));
+        assert!(!check(7, true, &[7, 8], 2, 0));
+        assert!(!check(7, true, &[7, 0], -1, 0));
+        assert!(!check(7, true, &[7, 0], 3, 0));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_actual_unreaped_zombie_group_is_not_a_permission_failure() {
+        use std::os::unix::process::CommandExt;
+        let registry = PluginTaskRegistry::default();
+        let child = Command::new("/usr/bin/true")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut original = supported::OwnedChild::new(child, registry.worker_stop());
+        let start = std::time::Instant::now();
+        while !original.exited_without_reap().unwrap() {
+            assert!(start.elapsed() < Duration::from_secs(2));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let observed = unsafe { libc::killpg(original.child.id() as i32, 0) };
+        let errno = if observed == -1 {
+            std::io::Error::last_os_error().raw_os_error()
+        } else {
+            None
+        };
+        println!("unreaped_zombie_group_signal_zero={observed}; errno={errno:?}");
+        original.signal_group().unwrap();
+        assert!(original.reap().unwrap().success());
     }
 }

@@ -67,6 +67,7 @@ pub(super) enum RequestMode {
 
 pub(super) struct ConnectionPool {
     config: Arc<LunaSamplerConfig>,
+    pub(super) workers: Arc<super::super::tasks::ClassifierTasks>,
     pub(super) idle_connections: Mutex<Vec<PooledConnection>>,
     classifications: Arc<Semaphore>,
     // A socket holds its permit while opening, idle, leased, and draining.
@@ -128,6 +129,7 @@ impl ConnectionPool {
     pub(super) fn new(config: Arc<LunaSamplerConfig>) -> Arc<Self> {
         Arc::new(Self {
             config,
+            workers: Arc::default(),
             idle_connections: Mutex::new(Vec::new()),
             classifications: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS)),
             sockets: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS)),
@@ -143,6 +145,17 @@ impl ConnectionPool {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
+    }
+
+    pub(super) async fn shutdown(&self) {
+        self.classifications.close();
+        self.sockets.close();
+        self.workers.shutdown().await;
+        self.clear();
+        self.http_transport
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
     }
 
     /// Never waits for another opener or sleeps through the cooldown.
@@ -186,7 +199,7 @@ impl ConnectionPool {
         *retry_after = None;
         drop(retry_after);
         let pool = Arc::clone(self);
-        Some(tokio::spawn(async move {
+        self.workers.spawn(async move {
             let _guard = guard;
             let mut opening = JoinSet::new();
             let mut failed = false;
@@ -214,25 +227,36 @@ impl ConnectionPool {
                             break;
                         }
                     };
+                    let tracker = Arc::clone(&pool.workers);
                     let pool = Arc::clone(&pool);
-                    opening.spawn(async move {
+                    let Some(open) = tracker.track(async move {
                         let _work = child_work;
-                        pool.open_connection(permit).await
-                    });
+                        tokio::select! {
+                            biased;
+                            _ = pool.workers.cancelled() => Err(LunaSamplerError::Superseded),
+                            result = pool.open_connection(permit) => result,
+                        }
+                    }) else {
+                        failed = true;
+                        break;
+                    };
+                    opening.spawn(open);
                 }
                 let Some(result) = opening.join_next().await else {
                     break;
                 };
                 match result {
                     Ok(Ok(connection)) => {
-                        let mut idle = pool
-                            .idle_connections
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        // Returned leases may have refilled the pool while we opened.
-                        if idle.len() < INITIAL_WEBSOCKET_CONNECTIONS {
-                            idle.push(connection);
-                        }
+                        pool.workers.with_open(|| {
+                            let mut idle = pool
+                                .idle_connections
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            // Returned leases may have refilled the pool while we opened.
+                            if idle.len() < INITIAL_WEBSOCKET_CONNECTIONS {
+                                idle.push(connection);
+                            }
+                        });
                     }
                     Ok(Err(error)) => {
                         failed = true;
@@ -247,7 +271,7 @@ impl ConnectionPool {
                     Err(_) => failed = true,
                 }
             }
-        }))
+        })
     }
 
     pub(super) async fn lease(self: &Arc<Self>) -> Result<ConnectionLease, LunaSamplerError> {
@@ -693,11 +717,13 @@ impl ConnectionLease {
             && connection.runtime_id.is_none()
             && !connection.connection.is_closed().await
         {
-            self.pool
-                .idle_connections
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(connection);
+            self.pool.workers.with_open(|| {
+                self.pool
+                    .idle_connections
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(connection);
+            });
         }
     }
 }

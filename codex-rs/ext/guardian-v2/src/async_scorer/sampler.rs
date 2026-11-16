@@ -159,6 +159,20 @@ impl LunaSampler {
         }
     }
 
+    pub(super) fn spawn_prewarm(
+        self: &Arc<Self>,
+        work: Option<Box<dyn codex_protocol::mcp_work::McpAttemptWork>>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let sampler = Arc::clone(self);
+        self.connections.workers.spawn(async move {
+            sampler.prewarm_with_work(work).await;
+        })
+    }
+
+    pub(super) async fn shutdown(&self) {
+        self.connections.shutdown().await;
+    }
+
     #[cfg(test)]
     pub(super) async fn prewarm(&self) {
         self.prewarm_with_work(None).await;

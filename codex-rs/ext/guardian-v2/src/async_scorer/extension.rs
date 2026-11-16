@@ -97,7 +97,10 @@ impl ThreadLifecycleContributor<Config> for GuardianV2Extension {
                     .enable_image_capture();
             }
             input.thread_store.remove::<ConversationBackend>();
-            input.thread_store.remove::<LunaSampler>();
+            if let Some(previous) = input.thread_store.get::<LunaSampler>() {
+                previous.shutdown().await;
+                input.thread_store.remove::<LunaSampler>();
+            }
             let sampler = input
                 .thread_store
                 .get_or_init(|| LunaSampler::new(sampler_config));
@@ -144,15 +147,18 @@ impl ThreadLifecycleContributor<Config> for GuardianV2Extension {
                         .map(|environment| &environment.config),
                 )
             {
-                tokio::spawn(async move {
-                    sampler.prewarm_with_work(work).await;
-                });
+                sampler.spawn_prewarm(work);
             }
         })
     }
     fn on_thread_stop<'a>(&'a self, input: ThreadStopInput<'a>) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
             input.thread_store.remove::<ConversationBackend>();
+            // Keep the closed sampler/receipt discoverable for repeated or
+            // cancelled stop waiters until the owning thread store is dropped.
+            if let Some(sampler) = input.thread_store.get::<LunaSampler>() {
+                sampler.shutdown().await;
+            }
         })
     }
 }

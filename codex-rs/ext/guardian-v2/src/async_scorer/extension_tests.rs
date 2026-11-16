@@ -4225,3 +4225,187 @@ async fn classifier_startup_hands_work_to_real_prewarm_without_retaining_it_in_c
     server.shutdown().await;
     Ok(())
 }
+
+async fn classifier_cleanup_fixture(
+    url: String,
+) -> Result<(
+    tempfile::TempDir,
+    Config,
+    ExtensionRegistry<Config>,
+    ExtensionData,
+    ExtensionData,
+)> {
+    let home = tempfile::tempdir()?;
+    let mut config = core_test_support::load_default_config_for_test(&home).await;
+    config.features.enable(Feature::GuardianV2)?;
+    config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+    config
+        .permissions
+        .approval_policy
+        .set(codex_protocol::protocol::AskForApproval::OnRequest)?;
+    config.model_provider = ModelProviderInfo::create_openai_provider(Some(url));
+    let auth = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("fixture"));
+    let mut builder = ExtensionRegistryBuilder::new();
+    super::install(&mut builder, Arc::clone(&auth), std::sync::Weak::new());
+    let registry = builder.build();
+    let session = ExtensionData::new("session");
+    let thread = ExtensionData::new("thread");
+    thread.insert(codex_model_provider::ProviderAuthContext {
+        credentials: auth,
+        runtime_auth: None,
+    });
+    let mut model = codex_core::test_support::construct_model_info_offline("gpt-5", &config);
+    model.node_repl_auto_review_required = true;
+    thread.insert(model);
+    Ok((home, config, registry, session, thread))
+}
+async fn start_classifier_with_work(
+    registry: &ExtensionRegistry<Config>,
+    config: &Config,
+    session: &ExtensionData,
+    thread: &ExtensionData,
+    work: &StartupWork,
+) {
+    registry.thread_lifecycle_contributors()[0]
+        .on_thread_start(ThreadStartInput {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Admitted(work)),
+            config,
+            session_source: &SessionSource::Exec,
+            persistent_thread_state_available: false,
+            environments: &[],
+            mcp_resource_client: None,
+            extension_metrics: None,
+            session_store: session,
+            thread_store: thread,
+        })
+        .await;
+}
+async fn stop_classifier(
+    registry: &ExtensionRegistry<Config>,
+    session: &ExtensionData,
+    thread: &ExtensionData,
+) {
+    registry.thread_lifecycle_contributors()[0]
+        .on_thread_stop(codex_extension_api::ThreadStopInput {
+            session_store: session,
+            thread_store: thread,
+        })
+        .await;
+}
+#[tokio::test]
+async fn thread_stop_joins_classifier_startup_and_keeps_its_closed_receipt() -> Result<()> {
+    use std::sync::atomic::Ordering;
+    use tokio::io::AsyncReadExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let (_home, config, registry, session, thread) =
+        classifier_cleanup_fixture(format!("http://{}/v1", listener.local_addr()?)).await?;
+    let counts = Arc::new(StartupWorkCounts::default());
+    let root = StartupWork::new(&counts);
+    start_classifier_with_work(&registry, &config, &session, &thread, &root).await;
+    drop(root);
+    let mut sockets = Vec::new();
+    for _ in 0..INITIAL_WEBSOCKET_CONNECTIONS {
+        let (mut socket, _) =
+            tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
+        let mut method = [0; 4];
+        tokio::time::timeout(Duration::from_secs(5), socket.read_exact(&mut method)).await??;
+        assert_eq!(&method, b"GET ");
+        sockets.push(socket);
+    }
+    assert_eq!(
+        counts.live.load(Ordering::SeqCst),
+        INITIAL_WEBSOCKET_CONNECTIONS + 1
+    );
+    let sampler = thread.get::<LunaSampler>().unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        stop_classifier(&registry, &session, &thread),
+    )
+    .await?;
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    assert!(sampler.spawn_prewarm(None).is_none());
+    assert!(Arc::ptr_eq(&sampler, &thread.get::<LunaSampler>().unwrap()));
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        stop_classifier(&registry, &session, &thread),
+    )
+    .await?;
+    for mut socket in sockets {
+        let mut request = b"GET ".to_vec();
+        tokio::time::timeout(Duration::from_secs(5), socket.read_to_end(&mut request)).await??;
+        assert!(
+            request.starts_with(b"GET "),
+            "real prewarm upgrade reached the held socket"
+        );
+    }
+    Ok(())
+}
+#[tokio::test]
+async fn classifier_restart_joins_old_pool_before_replacing_it() -> Result<()> {
+    use std::sync::atomic::Ordering;
+    use tokio::io::AsyncReadExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let (_home, mut config, registry, session, thread) =
+        classifier_cleanup_fixture(format!("http://{}/v1", listener.local_addr()?)).await?;
+    let old_counts = Arc::new(StartupWorkCounts::default());
+    let root = StartupWork::new(&old_counts);
+    start_classifier_with_work(&registry, &config, &session, &thread, &root).await;
+    drop(root);
+    let mut sockets = Vec::new();
+    for _ in 0..INITIAL_WEBSOCKET_CONNECTIONS {
+        let (mut socket, _) =
+            tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
+        let mut method = [0; 4];
+        tokio::time::timeout(Duration::from_secs(5), socket.read_exact(&mut method)).await??;
+        assert_eq!(&method, b"GET ");
+        sockets.push(socket);
+    }
+    let previous = thread.get::<LunaSampler>().unwrap();
+    assert_eq!(
+        old_counts.live.load(Ordering::SeqCst),
+        INITIAL_WEBSOCKET_CONNECTIONS + 1
+    );
+    let server = responses::start_websocket_server_with_headers(vec![
+        WebSocketConnectionConfig {
+            requests: Vec::new(),
+            response_headers: Vec::new(),
+            accept_delay: None,
+            close_after_requests: false,
+        };
+        INITIAL_WEBSOCKET_CONNECTIONS
+    ])
+    .await;
+    config.model_provider = ModelProviderInfo::create_openai_provider(Some(format!(
+        "http://{}/v1",
+        server.uri().trim_start_matches("ws://")
+    )));
+    let new_counts = Arc::new(StartupWorkCounts::default());
+    let next = StartupWork::new(&new_counts);
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        start_classifier_with_work(&registry, &config, &session, &thread, &next),
+    )
+    .await?;
+    assert_eq!(old_counts.live.load(Ordering::SeqCst), 0);
+    assert!(
+        previous
+            .spawn_prewarm(Some(Box::new(StartupWork::new(&old_counts))))
+            .is_none()
+    );
+    assert_eq!(old_counts.live.load(Ordering::SeqCst), 0);
+    let current = thread.get::<LunaSampler>().unwrap();
+    assert!(!Arc::ptr_eq(&previous, &current));
+    drop(next);
+    current.wait_for_prewarm(PREWARM_TIMEOUT).await?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while new_counts.live.load(Ordering::SeqCst) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert_eq!(server.handshakes().len(), INITIAL_WEBSOCKET_CONNECTIONS);
+    stop_classifier(&registry, &session, &thread).await;
+    server.shutdown().await;
+    drop(sockets);
+    Ok(())
+}

@@ -985,8 +985,7 @@ async fn owned_prewarm_refill_keeps_work_after_its_waiter_is_cancelled() -> Resu
 }
 #[tokio::test]
 async fn cached_classifier_sockets_retain_no_prewarm_work() -> Result<()> {
-    let server =
-        responses::start_websocket_server_with_headers(vec![
+    let server = responses::start_websocket_server_with_headers(vec![
             responses::WebSocketConnectionConfig {
                 requests: Vec::new(),
                 response_headers: Vec::new(),
@@ -995,7 +994,7 @@ async fn cached_classifier_sockets_retain_no_prewarm_work() -> Result<()> {
             };
             INITIAL_WEBSOCKET_CONNECTIONS
         ])
-        .await;
+    .await;
     let sampler = LunaSampler::new(sampler_config(format!(
         "http://{}/v1",
         server.uri().trim_start_matches("ws://")
@@ -1078,4 +1077,93 @@ async fn cancelled_prewarm_lock_wait_releases_only_the_waiter_work() {
             .is_empty()
     );
     drop(guard);
+}
+
+#[tokio::test]
+async fn classifier_shutdown_joins_detached_refill_and_connection_opens() -> Result<()> {
+    let gateway = Gateway::new("http://127.0.0.1:9", "ws://127.0.0.1:9").await?;
+    let sampler = LunaSampler::new(sampler_config(gateway.url.clone()));
+    let counts = Arc::new(PrewarmCounts::default());
+    let work = PrewarmWork::new(&counts);
+    let pool = Arc::clone(&sampler.connections);
+    let waiter = tokio::spawn(async move {
+        pool.prewarm_with_work(Some(Box::new(work))).await;
+    });
+    let opens = INITIAL_WEBSOCKET_CONNECTIONS.min(MAX_CONCURRENT_OPENS);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while gateway.opens.load(Ordering::SeqCst) < opens {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    waiter.abort();
+    assert!(waiter.await.unwrap_err().is_cancelled());
+    assert_eq!(counts.live.load(Ordering::SeqCst), opens + 1);
+    tokio::time::timeout(Duration::from_secs(5), sampler.shutdown()).await?;
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    assert!(sampler.connections.workers.with_open(|| ()).is_none());
+    assert!(
+        sampler
+            .connections
+            .idle_connections
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(sampler.connections.replenish().is_none());
+    sampler
+        .prewarm_with_work(Some(Box::new(PrewarmWork::new(&counts))))
+        .await;
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    assert_eq!(counts.derives.load(Ordering::SeqCst), opens);
+    assert_eq!(gateway.opens.load(Ordering::SeqCst), opens);
+    Ok(())
+}
+#[tokio::test]
+async fn classifier_shutdown_clears_idle_and_refuses_late_connection_return() -> Result<()> {
+    let server =
+        responses::start_websocket_server_with_headers(vec![
+            responses::WebSocketConnectionConfig {
+                requests: Vec::new(),
+                response_headers: Vec::new(),
+                accept_delay: None,
+                close_after_requests: false,
+            };
+            INITIAL_WEBSOCKET_CONNECTIONS
+        ])
+        .await;
+    let sampler = LunaSampler::new(sampler_config(format!(
+        "http://{}/v1",
+        server.uri().trim_start_matches("ws://")
+    )));
+    let counts = Arc::new(PrewarmCounts::default());
+    sampler
+        .prewarm_with_work(Some(Box::new(PrewarmWork::new(&counts))))
+        .await;
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    *sampler.connections.retry_after.lock().unwrap() = Some(Instant::now() + CONNECT_COOLDOWN);
+    let lease = sampler.connections.lease().await?;
+    assert!(matches!(lease.connection, Connection::Websocket(_)));
+    sampler.shutdown().await;
+    assert!(
+        sampler
+            .connections
+            .idle_connections
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+    lease.reuse().await;
+    assert!(
+        sampler
+            .connections
+            .idle_connections
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(sampler.connections.lease().await.is_err());
+    sampler.shutdown().await;
+    server.shutdown().await;
+    Ok(())
 }

@@ -14,6 +14,7 @@ mod request;
 mod sampler;
 mod score;
 mod startup;
+mod tasks;
 mod transcript;
 mod truncation;
 mod trusted_skills;

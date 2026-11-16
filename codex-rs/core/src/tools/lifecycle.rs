@@ -30,6 +30,9 @@ pub(crate) async fn notify_tool_start(
     if contributors.is_empty() {
         return;
     }
+    // Capture from the exact live turn before history/origin lookups await.
+    // Keep work local to this callback group, never on the reusable stores.
+    let work = invocation.session.turn_mcp_work(&invocation.turn);
     invocation
         .turn
         .extension_data
@@ -45,6 +48,10 @@ pub(crate) async fn notify_tool_start(
     for contributor in contributors {
         contributor
             .on_tool_start(ToolStartInput {
+                mcp_access: match &work {
+                    Ok(work) => Ok(codex_mcp::McpAttemptAccess::from_work(work.as_deref())),
+                    Err(_) => Err(codex_mcp::McpAttemptRefused),
+                },
                 serving_assessment: invocation
                     .step_context
                     .serving_assessment
@@ -184,3 +191,7 @@ pub(crate) fn extension_tool_call_source(source: ToolCallSource) -> ExtensionToo
         },
     }
 }
+
+#[cfg(test)]
+#[path = "lifecycle_work_tests.rs"]
+mod work_tests;

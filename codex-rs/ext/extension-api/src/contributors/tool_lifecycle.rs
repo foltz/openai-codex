@@ -116,6 +116,10 @@ impl McpToolContext {
 
 /// Input supplied when the host starts executing one tool call.
 pub struct ToolStartInput<'a> {
+    /// Borrowed finite operation authority captured before callback preparation.
+    /// Consumers must derive independent work before an await or spawned job.
+    /// Refusal must not become unscoped or a fresh account admission.
+    pub mcp_access: Result<codex_mcp::McpAttemptAccess<'a>, codex_mcp::McpAttemptRefused>,
     /// Final serving assessment for the unchanged action, including its code cell's value.
     /// When present, replaces asynchronous scoring; it does not grant execution permission.
     pub serving_assessment: Option<bool>,

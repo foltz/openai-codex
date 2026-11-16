@@ -128,6 +128,11 @@ async fn with_step_budget<T>(
     step: impl std::future::Future<Output = Result<T, String>>,
 ) -> Result<T, String> {
     let stop = SYNC_STOP.with(|stop| stop.borrow().clone());
+    if !stop.is_managed() {
+        // Upstream's request builders already bound each individual request.
+        // Do not add an aggregate cap to existing unowned multi-request steps.
+        return step.await;
+    }
     stop.run_until(cap, step)
         .await
         .ok_or_else(|| format!("{context} stopped by its step budget or the shutdown deadline"))?

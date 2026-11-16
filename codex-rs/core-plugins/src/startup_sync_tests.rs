@@ -1707,3 +1707,28 @@ fn expired_extraction_creates_no_destination() {
     assert!(error.contains("shutdown deadline"), "{error}");
     assert!(!destination.exists());
 }
+
+#[tokio::test(start_paused = true)]
+async fn unowned_helper_preserves_request_local_caps_while_owned_steps_are_bounded() {
+    let began = tokio::time::Instant::now();
+    let result = with_step_budget(Duration::from_secs(1), "unowned read sequence", async {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        Ok(41)
+    })
+    .await;
+    assert_eq!(
+        result.unwrap(),
+        41,
+        "unowned callers retain request-local timeouts"
+    );
+    assert_eq!(tokio::time::Instant::now() - began, Duration::from_secs(2));
+    let registry = crate::PluginTaskRegistry::default();
+    let _scope = SyncStopScope::enter(registry.worker_stop());
+    let result = with_step_budget(Duration::from_secs(1), "owned read sequence", async {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        Ok(41)
+    })
+    .await;
+    assert!(result.unwrap_err().contains("step budget"));
+    assert_eq!(tokio::time::Instant::now() - began, Duration::from_secs(3));
+}

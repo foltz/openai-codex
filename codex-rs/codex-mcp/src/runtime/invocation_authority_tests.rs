@@ -341,7 +341,28 @@ async fn check_paths(paths: &[Path]) {
             "authority must reach held original: {path:?}"
         );
         assert_eq!(f.starts.load(Ordering::SeqCst), 1, "{path:?}");
-        assert_eq!(f.work.live.load(Ordering::SeqCst), 2, "{path:?}");
+        // Resource callers now retain their own finite operation while the shared
+        // startup separately owns its original. Other paths borrow only startup.
+        let live_while_observed = if matches!(
+            path,
+            Path::Read
+                | Path::AllResources
+                | Path::AllTemplates
+                | Path::BindingRead
+                | Path::BindingList
+                | Path::BindingTemplates
+                | Path::FacadeRead
+                | Path::FacadeList
+        ) {
+            3
+        } else {
+            2
+        };
+        assert_eq!(
+            f.work.live.load(Ordering::SeqCst),
+            live_while_observed,
+            "{path:?}"
+        );
         // Drop the API observer while retaining the same shared startup original.
         drop(admitted);
         assert_eq!(

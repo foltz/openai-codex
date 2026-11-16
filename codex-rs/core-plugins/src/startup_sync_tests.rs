@@ -1485,3 +1485,225 @@ fn curated_repo_backup_archive_zip_bytes(sha: &str) -> Vec<u8> {
 
     writer.finish().expect("finish zip writer").into_inner()
 }
+
+fn stopped_worker_stop() -> WorkerStop {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let registry = crate::PluginTaskRegistry::default();
+    let stop = registry.worker_stop();
+    runtime.block_on(registry.shutdown_until(tokio::time::Instant::now()));
+    assert!(stop.is_stopped());
+    stop
+}
+
+#[cfg(unix)]
+#[test]
+fn stopped_sync_terminates_its_own_git_child_instead_of_waiting_its_step_timeout() {
+    let stop = stopped_worker_stop();
+    let _scope = SyncStopScope::enter(stop);
+    // A fake long step (no network): it would take 30s, which is the git step cap.
+    let mut command = Command::new("sleep");
+    command.arg("30");
+    let started = std::time::Instant::now();
+    let error =
+        run_git_command_with_timeout(&mut command, "fake git step", Duration::from_secs(30))
+            .expect_err("a stopped worker must not run a step");
+    assert!(started.elapsed() < Duration::from_secs(5), "{error}");
+    assert!(error.contains("shutdown deadline"), "{error}");
+}
+
+#[test]
+fn stopped_sync_schedules_no_further_steps() {
+    let codex_home = tempdir().expect("tempdir");
+    let error = sync_openai_plugins_repo_until(
+        codex_home.path(),
+        crate::test_support::test_http_client_factory(),
+        stopped_worker_stop(),
+    )
+    .expect_err("a stopped worker must return before its first step");
+    assert!(error.contains("shutdown deadline"), "{error}");
+    // No lock, fetch or staging directory was created.
+    assert!(!codex_home.path().join(".tmp").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn late_shutdown_reaps_the_actual_in_flight_git_child() {
+    let fixture = tempdir().unwrap();
+    let marker = fixture.path().join("pid");
+    let worker_marker = marker.clone();
+    let registry = crate::PluginTaskRegistry::default();
+    let stop = registry.worker_stop();
+    let (done, result) = tokio::sync::oneshot::channel();
+    let receipt = registry
+        .spawn_thread("actual-curated-git-stop", move || {
+            let _scope = SyncStopScope::enter(stop);
+            let mut command = Command::new("/bin/sh");
+            command
+                .args([
+                    "-c",
+                    "echo $$ > \"$1\"; exec /bin/sleep 30",
+                    "synthetic-curated",
+                ])
+                .arg(worker_marker);
+            let outcome = run_git_command_with_timeout(
+                &mut command,
+                "owned synthetic git step",
+                Duration::from_secs(30),
+            );
+            let _ = done.send(outcome);
+        })
+        .unwrap();
+    let pid = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(raw) = tokio::fs::read_to_string(&marker).await {
+                if let Ok(pid) = raw.trim().parse::<libc::pid_t>() {
+                    break pid;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(pid > 0);
+    assert!(
+        !registry
+            .shutdown_until(tokio::time::Instant::now())
+            .await
+            .terminal
+    );
+    let error = tokio::time::timeout(Duration::from_secs(2), result)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(error.contains("timed out"), "{error}");
+    assert_eq!(receipt.await, crate::retirement::JoinOutcome::Joined);
+    assert!(
+        registry
+            .shutdown_until(tokio::time::Instant::now())
+            .await
+            .is_clean()
+    );
+    // Signal zero observes only this fixture's exact PID; it cannot kill it.
+    assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+}
+
+#[tokio::test]
+async fn late_shutdown_interrupts_actual_http_without_fallback_or_activation() {
+    let home = tempdir().unwrap();
+    let server = MockServer::start().await;
+    let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let request_entered = entered.clone();
+    let (release, released) = std::sync::mpsc::channel();
+    let released = std::sync::Mutex::new(released);
+    Mock::given(method("GET"))
+        .and(path("/repos/openai/plugins"))
+        .respond_with(move |_: &wiremock::Request| {
+            request_entered.notify_one();
+            let _ = released.lock().unwrap().recv();
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"default_branch":"main"}))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    let registry = crate::PluginTaskRegistry::default();
+    let stop = registry.worker_stop();
+    let owned_home = home.path().to_owned();
+    let api = server.uri();
+    let (done, result) = tokio::sync::oneshot::channel();
+    let receipt = registry
+        .spawn_thread("actual-curated-http-stop", move || {
+            let _scope = SyncStopScope::enter(stop);
+            let outcome = sync_openai_plugins_repo_with_transport_overrides(
+                &owned_home,
+                None,
+                &api,
+                &format!("{api}/backup"),
+                &crate::test_support::test_http_client_factory(),
+            );
+            let _ = done.send(outcome);
+        })
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .unwrap();
+    assert!(
+        !registry
+            .shutdown_until(tokio::time::Instant::now())
+            .await
+            .terminal
+    );
+    let error = tokio::time::timeout(Duration::from_secs(2), result)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(error.contains("shutdown deadline"), "{error}");
+    assert_eq!(receipt.await, crate::retirement::JoinOutcome::Joined);
+    assert!(
+        registry
+            .shutdown_until(tokio::time::Instant::now())
+            .await
+            .is_clean()
+    );
+    release.send(()).unwrap();
+    server.verify().await;
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        1,
+        "no fallback or subsequent step after expiry"
+    );
+    assert!(!curated_plugins_repo_path(home.path()).exists());
+    assert!(!curated_plugins_sha_path(home.path()).exists());
+}
+
+#[test]
+fn expired_owner_does_not_wait_for_or_steal_the_existing_sync_lock() {
+    let home = tempdir().unwrap();
+    let held = lock_curated_plugins_startup_sync(home.path()).unwrap();
+    let _scope = SyncStopScope::enter(stopped_worker_stop());
+    let error = lock_curated_plugins_startup_sync(home.path()).unwrap_err();
+    assert!(error.contains("shutdown deadline"), "{error}");
+    let contender = File::options()
+        .write(true)
+        .open(home.path().join(CURATED_PLUGINS_SYNC_LOCK_FILE))
+        .unwrap();
+    assert!(matches!(
+        contender.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    held.unlock().unwrap();
+    contender.try_lock().unwrap();
+}
+
+#[test]
+fn stop_scope_is_restored_after_unwind() {
+    assert!(!sync_stopped());
+    let stop = stopped_worker_stop();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _scope = SyncStopScope::enter(stop);
+        assert!(sync_stopped());
+        panic!("synthetic curated scope unwind");
+    }));
+    assert!(result.is_err());
+    assert!(!sync_stopped());
+}
+
+#[test]
+fn expired_extraction_creates_no_destination() {
+    let fixture = tempdir().unwrap();
+    let destination = fixture.path().join("uncreated");
+    let _scope = SyncStopScope::enter(stopped_worker_stop());
+    let error = extract_zipball_to_dir(&[], &destination).unwrap_err();
+    assert!(error.contains("shutdown deadline"), "{error}");
+    assert!(!destination.exists());
+}

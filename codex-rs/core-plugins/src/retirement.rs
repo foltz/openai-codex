@@ -44,6 +44,7 @@ struct State {
     cancelled: bool,
     panicked: bool,
     unavailable: bool,
+    deadline_changed: Arc<tokio::sync::Notify>,
 }
 
 impl State {
@@ -85,6 +86,46 @@ pub struct WorkerStop {
 }
 
 impl WorkerStop {
+    pub(crate) fn is_managed(&self) -> bool {
+        self.state.is_some()
+    }
+
+    /// Bound an owned read step even when shutdown first latches a deadline
+    /// after IO begins. No elapsed deadline polls a new step or extends its cap.
+    pub(crate) async fn run_until<T>(
+        &self,
+        cap: std::time::Duration,
+        future: impl Future<Output = T>,
+    ) -> Option<T> {
+        let cap_deadline = Instant::now() + cap;
+        let Some(state) = self.state.as_ref() else {
+            return tokio::time::timeout_at(cap_deadline, future).await.ok();
+        };
+        let changed = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .deadline_changed
+            .clone();
+        tokio::pin!(future);
+        loop {
+            let notification = changed.notified();
+            tokio::pin!(notification);
+            notification.as_mut().enable();
+            let deadline = self
+                .deadline()
+                .map_or(cap_deadline, |owner| owner.min(cap_deadline));
+            if Instant::now() >= deadline {
+                return None;
+            }
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(deadline) => return None,
+                _ = &mut notification => {},
+                result = &mut future => return Some(result),
+            }
+        }
+    }
+
     /// No owner: never stops (tests and callers without a registry).
     pub fn never() -> Self {
         Self::default()
@@ -219,7 +260,11 @@ impl PluginTaskRegistry {
                 };
             };
             state.closed = true;
+            let first_deadline = state.deadline.is_none();
             let deadline = *state.deadline.get_or_insert(deadline);
+            if first_deadline {
+                state.deadline_changed.notify_waiters();
+            }
             state.compact();
             (deadline, state.tasks.clone())
         };
@@ -665,5 +710,35 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn in_flight_step_observes_a_deadline_latched_after_its_first_poll() {
+        let registry = PluginTaskRegistry::default();
+        let stop = registry.worker_stop();
+        let step = stop.run_until(Duration::from_secs(30), std::future::pending::<()>());
+        tokio::pin!(step);
+        assert!(futures::poll!(step.as_mut()).is_pending());
+        let deadline = Instant::now() + Duration::from_secs(1);
+        assert!(registry.shutdown_until(deadline).await.is_clean());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(step.await, None);
+        assert_eq!(Instant::now(), deadline);
+    }
+
+    #[tokio::test]
+    async fn expired_owner_does_not_poll_a_new_budgeted_step() {
+        let registry = PluginTaskRegistry::default();
+        let stop = registry.worker_stop();
+        assert!(registry.shutdown_until(Instant::now()).await.is_clean());
+        let polled = AtomicBool::new(false);
+        assert_eq!(
+            stop.run_until(Duration::from_secs(30), async {
+                polled.store(true, Ordering::SeqCst);
+            })
+            .await,
+            None
+        );
+        assert!(!polled.load(Ordering::SeqCst));
     }
 }

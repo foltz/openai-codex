@@ -2674,6 +2674,25 @@ impl ThreadManagerState {
             .unwrap_or_default()
     }
 
+    /// Match Session's captured isolation policy; an explicit isolated registry
+    /// replaces, rather than augments, the inherited contributors.
+    pub(crate) fn needs_thread_ready_work(&self, options: &StartThreadOptions) -> bool {
+        if options
+            .thread_extension_init
+            .get::<codex_extension_api::SessionIsolation>()
+            .as_deref()
+            == Some(&codex_extension_api::SessionIsolation::Isolated)
+        {
+            options
+                .thread_extension_init
+                .get::<codex_extension_api::IsolatedSessionExtensions<Config>>()
+                .as_deref()
+                .is_some_and(|registry| !registry.0.thread_lifecycle_contributors().is_empty())
+        } else {
+            !self.extensions.thread_lifecycle_contributors().is_empty()
+        }
+    }
+
     /// Spawn a new thread under a retained original constructor and publication fence.
     async fn spawn_thread(
         self: &Arc<Self>,
@@ -2702,7 +2721,7 @@ impl ThreadManagerState {
             })
             .transpose()?;
         let ready_work = if matches!(request.ready_notification, ThreadReadyNotification::Emit)
-            && !self.extensions.thread_lifecycle_contributors().is_empty()
+            && self.needs_thread_ready_work(&request.options)
         {
             account_work
                 .as_deref()

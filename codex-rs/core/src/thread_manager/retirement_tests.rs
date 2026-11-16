@@ -2164,14 +2164,20 @@ async fn managed_constructor_carries_explicit_work_into_ready_callbacks_without_
     let observed = Arc::new(AtomicUsize::new(0));
     let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
     extensions.turn_start_admission(Arc::new(ManagedRequestAdmission(Arc::clone(&host))));
-    extensions.thread_lifecycle_contributor(Arc::new(ManagedReadyWitness(Arc::clone(&observed))));
-    Arc::get_mut(&mut manager.state).unwrap().extensions = Arc::new(extensions.build());
+    let inherited = Arc::new(extensions.build());
+    Arc::get_mut(&mut manager.state).unwrap().extensions = Arc::clone(&inherited);
+    let mut isolated = inherited.to_builder();
+    isolated.thread_lifecycle_contributor(Arc::new(ManagedReadyWitness(Arc::clone(&observed))));
+    let isolated = Arc::new(isolated.build());
     let manager = Arc::new(manager);
     let mut options = StartThreadOptions::new(config, None);
     options.account_work = Some(Box::new(ManagedRequestWork(Arc::clone(&host))));
     options
         .thread_extension_init
         .insert(codex_extension_api::SessionIsolation::Isolated);
+    options
+        .thread_extension_init
+        .insert(codex_extension_api::IsolatedSessionExtensions(isolated));
     let tasks = tokio_util::task::TaskTracker::new();
     let thread = manager
         .start_thread_until(options, std::future::pending(), &tasks)

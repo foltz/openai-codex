@@ -499,3 +499,175 @@ async fn public_mcp_requests_refuse_before_refresh_or_rpc_without_request_author
         "request refusal cannot become a queued turn"
     );
 }
+
+fn history_message(text: &str) -> ResponseItem {
+    ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
+        id: None,
+        role: "developer".into(),
+        content: vec![codex_protocol::models::ContentItem::InputText { text: text.into() }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
+
+#[derive(Debug, Default)]
+struct HistoryWorkCounts {
+    live: AtomicUsize,
+    requests: AtomicUsize,
+    derives: AtomicUsize,
+    refuse_child: AtomicBool,
+}
+#[derive(Debug)]
+struct HistoryWork(Arc<HistoryWorkCounts>);
+impl Drop for HistoryWork {
+    fn drop(&mut self) {
+        self.0.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+impl codex_extension_api::HostOperationWork for HistoryWork {
+    fn derive_operation(
+        &self,
+    ) -> Result<Box<dyn codex_extension_api::HostOperationWork>, TurnWorkRefused> {
+        self.0.derives.fetch_add(1, Ordering::SeqCst);
+        if self.0.refuse_child.load(Ordering::SeqCst) {
+            return Err(TurnWorkRefused::Unavailable);
+        }
+        self.0.live.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(Self(Arc::clone(&self.0))))
+    }
+    fn derive_turn_work(
+        &self,
+        _: &ExtensionData,
+        _: ExtensionFuture<'static, ()>,
+    ) -> Result<Box<dyn HostTurnWork>, TurnWorkRefused> {
+        panic!("history must not create a turn")
+    }
+}
+#[derive(Debug)]
+struct HistoryAdmission(Arc<HistoryWorkCounts>);
+impl TurnStartAdmission for HistoryAdmission {
+    fn admit_turn_start(&self) -> Option<Box<dyn Send>> {
+        panic!("no fresh fallback")
+    }
+    fn requires_account_work(&self) -> bool {
+        true
+    }
+    fn derive_request_operation_work(
+        &self,
+    ) -> Result<Option<Box<dyn codex_extension_api::HostOperationWork>>, TurnWorkRefused> {
+        self.0.requests.fetch_add(1, Ordering::SeqCst);
+        self.0.live.fetch_add(1, Ordering::SeqCst);
+        Ok(Some(Box::new(HistoryWork(Arc::clone(&self.0)))))
+    }
+    fn derive_operation_work(
+        &self,
+        _: &ExtensionData,
+        _: &str,
+    ) -> Result<Option<Box<dyn codex_extension_api::HostOperationWork>>, TurnWorkRefused> {
+        panic!("standalone history cannot borrow an installed turn")
+    }
+}
+async fn history_fixture() -> (CodexThread, Arc<HistoryWorkCounts>) {
+    let (mut thread, _, _) = fixture().await;
+    let counts = Arc::new(HistoryWorkCounts::default());
+    Arc::get_mut(&mut thread.session)
+        .unwrap()
+        .services
+        .host_admission = Some(Arc::new(HistoryAdmission(Arc::clone(&counts))));
+    (thread, counts)
+}
+
+#[tokio::test]
+async fn history_preparation_refuses_request_work_before_recording_context() {
+    let (mut thread, queue, _) = fixture().await;
+    let gate = Arc::new(RefusingMcpRequest::default());
+    Arc::get_mut(&mut thread.session)
+        .unwrap()
+        .services
+        .host_admission = Some(gate.clone());
+    let mut call =
+        Box::pin(thread.inject_response_items_for_turn(vec![history_message("refused")]));
+    assert!(matches!(
+        futures::poll!(&mut call),
+        std::task::Poll::Ready(Err(_))
+    ));
+    drop(call);
+    assert_eq!(gate.0.load(Ordering::SeqCst), 1);
+    assert!(thread.session.reference_context_item().await.is_none());
+    assert_eq!(thread.session.clone_history().await.raw_items().count(), 0);
+    assert!(queue.is_empty());
+}
+
+#[tokio::test]
+async fn history_preparation_uses_request_work_for_initial_and_existing_context() {
+    let (thread, counts) = history_fixture().await;
+    assert!(thread.session.reference_context_item().await.is_none());
+    thread
+        .inject_response_items_for_turn(vec![history_message("first")])
+        .await
+        .unwrap();
+    assert!(thread.session.reference_context_item().await.is_some());
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    assert!(counts.derives.load(Ordering::SeqCst) > 0);
+    let derives = counts.derives.load(Ordering::SeqCst);
+    thread
+        .inject_response_items_for_turn(vec![history_message("second")])
+        .await
+        .unwrap();
+    assert_eq!(counts.requests.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        counts.derives.load(Ordering::SeqCst),
+        derives,
+        "existing history does not rediscover skills/tools"
+    );
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    let history = thread.session.clone_history().await;
+    let items: Vec<_> = history.raw_items().collect();
+    assert!(items.contains(&&history_message("first")));
+    assert!(items.contains(&&history_message("second")));
+}
+
+#[tokio::test]
+async fn cancelled_history_preparation_releases_request_work_without_recording() {
+    let (thread, counts) = history_fixture().await;
+    // Initial capture retains its context only after acquiring this lock.
+    let guard = thread.session.active_turn.lock().await;
+    let mut call =
+        Box::pin(thread.inject_response_items_for_turn(vec![history_message("cancelled")]));
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            assert!(futures::poll!(&mut call).is_pending());
+            if counts.live.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(counts.requests.load(Ordering::SeqCst), 1);
+    drop(call);
+    drop(guard);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    assert!(thread.session.reference_context_item().await.is_none());
+    assert_eq!(thread.session.clone_history().await.raw_items().count(), 0);
+}
+
+#[tokio::test]
+async fn exhausted_history_capture_does_not_record_or_admit_a_fresh_turn() {
+    let (thread, counts) = history_fixture().await;
+    counts.refuse_child.store(true, Ordering::SeqCst);
+    assert!(
+        thread
+            .inject_response_items_for_turn(vec![history_message("exhausted")])
+            .await
+            .is_err()
+    );
+    assert_eq!(counts.requests.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.derives.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    assert!(thread.session.reference_context_item().await.is_none());
+    assert_eq!(thread.session.clone_history().await.raw_items().count(), 0);
+}

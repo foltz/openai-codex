@@ -1177,6 +1177,14 @@ impl CodexThread {
         }
         items.iter().try_for_each(validate_injected_response_item)?;
 
+        // History preparation has no installed turn. Capture request authority
+        // before context/configuration awaits and keep it through recording.
+        let work = self
+            .session
+            .request_mcp_work()
+            .map_err(|err| CodexErr::Fatal(err.to_string()))?;
+        let access = codex_mcp::McpAttemptAccess::from_work(work.as_deref());
+
         let had_reference_context = self.session.reference_context_item().await.is_some();
         let mut turn_context = if had_reference_context {
             self.session.new_inject_items_context().await
@@ -1192,7 +1200,11 @@ impl CodexThread {
             // This history-only API runs without run_turn, so it owns its initial step.
             let step_context = self
                 .session
-                .capture_step_context(Arc::clone(&turn_context), &CancellationToken::new())
+                .capture_step_context_with_authority(
+                    Arc::clone(&turn_context),
+                    &CancellationToken::new(),
+                    access,
+                )
                 .await?;
             self.session
                 .record_context_updates_and_set_reference_context_item(step_context.as_ref())

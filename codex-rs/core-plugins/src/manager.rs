@@ -625,6 +625,7 @@ pub struct PluginsManager {
     runtime_auth: RuntimeAuthSlot,
     analytics_events_client: RwLock<Option<AnalyticsEventsClient>>,
     plugin_install_source: PluginInstallSource,
+    task_registry: crate::PluginTaskRegistry,
 }
 
 #[derive(Clone)]
@@ -744,6 +745,11 @@ impl PluginsManager {
         )
     }
 
+    /// Observe this manager's actual plugin originals, never a cancellation acknowledgement.
+    pub async fn shutdown_until(&self, deadline: tokio::time::Instant) -> crate::PluginTaskDrain {
+        self.task_registry.shutdown_until(deadline).await
+    }
+
     pub fn auth_manager(&self) -> Arc<AuthManager> {
         Arc::clone(&self.auth_manager)
     }
@@ -833,6 +839,7 @@ impl PluginsManager {
             runtime_auth,
             analytics_events_client: RwLock::new(None),
             plugin_install_source: PluginInstallSource::Manual,
+            task_registry: crate::PluginTaskRegistry::default(),
         }
     }
 
@@ -1712,7 +1719,7 @@ impl PluginsManager {
 
         let manager = Arc::clone(self);
         let config = config.clone();
-        tokio::spawn(async move {
+        let _ = self.task_registry.spawn(async move {
             manager
                 .recommended_plugins_mode_for_config(&config, auth.as_ref())
                 .await;
@@ -1784,7 +1791,7 @@ impl PluginsManager {
         };
         let manager = Arc::clone(self);
         let config = config.clone();
-        tokio::spawn(async move {
+        let admitted = self.task_registry.spawn(async move {
             let _permit = permit;
             let result = manager
                 .reconcile_remote_installed_plugins_after_acquiring_gate(&config, Some(&auth))
@@ -1824,6 +1831,9 @@ impl PluginsManager {
                 }
             }
         });
+        if admitted.is_err() {
+            warn!("failed to admit remote installed plugin bundle sync task");
+        }
     }
 
     /// Acquires the cache-root gate shared by full installed-bundle sync, reconciliation, and
@@ -3079,7 +3089,7 @@ impl PluginsManager {
             }
             let config_for_remote_sync = config.clone();
             let manager = Arc::clone(self);
-            tokio::spawn(async move {
+            let _ = self.task_registry.spawn(async move {
                 let auth = manager.auth_manager.auth().await;
                 manager.maybe_start_remote_installed_plugins_cache_refresh_with_notify(
                     &config_for_remote_sync,
@@ -3306,11 +3316,23 @@ impl PluginsManager {
         }
 
         let manager = Arc::clone(self);
-        tokio::spawn(async move {
-            manager
-                .run_remote_installed_plugins_cache_refresh_loop()
-                .await;
-        });
+        if self
+            .task_registry
+            .spawn(async move {
+                manager
+                    .run_remote_installed_plugins_cache_refresh_loop()
+                    .await;
+            })
+            .is_err()
+        {
+            let mut state = match self.remote_installed_plugins_cache_refresh_state.write() {
+                Ok(state) => state,
+                Err(err) => err.into_inner(),
+            };
+            state.in_flight = false;
+            state.requested = None;
+            warn!("failed to admit schedule_remote_installed_plugins_cache_refresh task");
+        }
     }
 
     fn schedule_remote_catalog_cache_refresh(
@@ -3344,9 +3366,21 @@ impl PluginsManager {
         }
 
         let manager = Arc::clone(self);
-        tokio::spawn(async move {
-            manager.run_remote_catalog_cache_refresh_loop().await;
-        });
+        if self
+            .task_registry
+            .spawn(async move {
+                manager.run_remote_catalog_cache_refresh_loop().await;
+            })
+            .is_err()
+        {
+            let mut state = match self.remote_catalog_cache_refresh_state.write() {
+                Ok(state) => state,
+                Err(err) => err.into_inner(),
+            };
+            state.in_flight = false;
+            state.requests.clear();
+            warn!("failed to admit schedule_remote_catalog_cache_refresh task");
+        }
     }
 
     fn schedule_non_curated_plugin_cache_refresh(

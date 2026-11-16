@@ -8008,3 +8008,126 @@ fn plugin_install_error_preserves_store_io_sub_error_type() {
         Some("failed_to_copy_plugin_file".to_string())
     );
 }
+
+#[tokio::test]
+async fn owned_recommendation_original_is_pending_until_actual_http_completion() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_file(
+        &tmp.path().join(CONFIG_TOML_FILE),
+        "[features]\nplugins = true\n",
+    );
+    let server = MockServer::start().await;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let request_entered = entered.clone();
+    let (release, released) = std::sync::mpsc::channel();
+    let released = std::sync::Mutex::new(released);
+    Mock::given(method("GET"))
+        .and(path("/ps/plugins/suggested/codex"))
+        .respond_with(move |_: &wiremock::Request| {
+            request_entered.notify_one();
+            // Wiremock's own server thread, released on assertion unwinding too.
+            let _ = released.lock().unwrap().recv();
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"enabled":true,"plugins":[]}))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut config = load_config(tmp.path(), tmp.path())
+        .await
+        .with_plugin_recommendations_enabled(true);
+    config.chatgpt_base_url = server.uri();
+    let manager = Arc::new(test_plugins_manager(tmp.path().to_path_buf()));
+    let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
+    manager.maybe_start_remote_plugin_caches_refresh(&config, Some(auth), None);
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .unwrap();
+    let report = manager.shutdown_until(tokio::time::Instant::now()).await;
+    assert!(
+        !report.terminal && !report.is_clean(),
+        "actual recommendation still holds HTTP"
+    );
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let report = manager
+                .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(30))
+                .await;
+            if report.terminal {
+                assert!(report.is_clean(), "real plugin original joins: {report:?}");
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        manager.cached_recommended_plugins_mode(&recommended_plugins_cache_key(&config)),
+        Some(RecommendedPluginsMode::Endpoint {
+            plugins: Vec::new()
+        })
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn closed_plugin_owner_refuses_all_async_worker_births_and_clears_queue_flags() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_file(
+        &tmp.path().join(CONFIG_TOML_FILE),
+        "[features]\nplugins = true\n",
+    );
+    let server = MockServer::start().await;
+    let mut config = load_config(tmp.path(), tmp.path())
+        .await
+        .with_plugin_recommendations_enabled(true);
+    config.chatgpt_base_url = server.uri();
+    let manager = Arc::new(test_plugins_manager(tmp.path().to_path_buf()));
+    let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
+    assert!(
+        manager
+            .shutdown_until(tokio::time::Instant::now())
+            .await
+            .is_clean()
+    );
+    manager.maybe_start_remote_plugin_caches_refresh(&config, Some(auth.clone()), None);
+    manager.maybe_start_remote_catalog_cache_refresh(
+        &config,
+        Some(auth.clone()),
+        [RemotePluginScope::Global].into_iter().collect(),
+    );
+    manager.maybe_start_remote_installed_plugin_bundle_sync(
+        &config,
+        Some(auth),
+        None,
+        InstalledPluginSyncSource::PluginList,
+    );
+    let installed = manager
+        .remote_installed_plugins_cache_refresh_state
+        .read()
+        .unwrap();
+    assert!(!installed.in_flight && installed.requested.is_none());
+    drop(installed);
+    let catalog = manager.remote_catalog_cache_refresh_state.read().unwrap();
+    assert!(!catalog.in_flight && catalog.requests.is_empty());
+    drop(catalog);
+    assert!(
+        manager
+            .remote_installed_plugin_bundle_sync_gate
+            .clone()
+            .try_acquire_owned()
+            .is_ok()
+    );
+    assert!(
+        manager
+            .shutdown_until(tokio::time::Instant::now())
+            .await
+            .is_clean()
+    );
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "refused before any HTTP"
+    );
+}

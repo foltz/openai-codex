@@ -8490,3 +8490,153 @@ async fn curated_runtime_callback_panic_is_sticky_nonclean() {
             .panicked
     );
 }
+
+// Occupy the only blocking worker so the admitted original cannot begin until
+// its owner has already latched an expired deadline.
+#[test]
+fn curated_worker_delayed_start_does_not_poll_read_after_deadline() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            entered.send(()).unwrap();
+            released.recv().unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(2), started)
+            .await
+            .unwrap()
+            .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+        let polled = Arc::new(AtomicBool::new(false));
+        let read_polled = polled.clone();
+        let receipt = manager
+            .start_curated_repo_sync_with(
+                test_http_client_factory(),
+                None,
+                CuratedSyncStart::begin(&STARTED).unwrap(),
+                move |_, _, _| {
+                    read_polled.store(true, Ordering::SeqCst);
+                    Err("read must not begin after deadline".into())
+                },
+            )
+            .unwrap();
+        let report = manager.shutdown_until(tokio::time::Instant::now()).await;
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), blocker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!report.terminal);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), receipt)
+                .await
+                .unwrap(),
+            crate::retirement::JoinOutcome::Joined
+        );
+        assert!(!polled.load(Ordering::SeqCst));
+        assert!(!STARTED.load(Ordering::SeqCst));
+        assert!(
+            manager
+                .shutdown_until(tokio::time::Instant::now())
+                .await
+                .is_clean()
+        );
+    });
+}
+
+#[tokio::test]
+async fn curated_worker_late_sync_success_does_not_begin_cache_publication() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    fn snapshot(
+        root: &std::path::Path,
+    ) -> std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>> {
+        fn walk(
+            root: &std::path::Path,
+            path: &std::path::Path,
+            rows: &mut std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>>,
+        ) {
+            for entry in std::fs::read_dir(path).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let kind = entry.file_type().unwrap();
+                assert!(!kind.is_symlink());
+                let key = path.strip_prefix(root).unwrap().to_owned();
+                if kind.is_dir() {
+                    rows.insert(key, None);
+                    walk(root, &path, rows);
+                } else {
+                    assert!(kind.is_file());
+                    rows.insert(key, Some(std::fs::read(path).unwrap()));
+                }
+            }
+        }
+        let mut rows = std::collections::BTreeMap::new();
+        walk(root, root, &mut rows);
+        rows
+    }
+    let home = tempfile::tempdir().unwrap();
+    let source = curated_plugins_repo_path(home.path());
+    write_curated_plugin(&source, "gmail");
+    write_openai_curated_marketplace(&source, &["gmail"]);
+    write_file(
+        &home.path().join(CONFIG_TOML_FILE),
+        "[plugins.\"gmail@openai-curated\"]\nenabled = true\n",
+    );
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    let before = snapshot(home.path());
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let called = Arc::new(AtomicBool::new(false));
+    let callback_called = called.clone();
+    let callback: EffectivePluginsChangedCallback = Arc::new(move |_| {
+        callback_called.store(true, Ordering::SeqCst);
+    });
+    let receipt = manager
+        .start_curated_repo_sync_with(
+            test_http_client_factory(),
+            Some(callback),
+            CuratedSyncStart::begin(&STARTED).unwrap(),
+            move |_, _, _| {
+                entered.send(()).unwrap();
+                released.recv().unwrap();
+                Ok(TEST_CURATED_PLUGIN_SHA.into())
+            },
+        )
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), started)
+        .await
+        .unwrap()
+        .unwrap();
+    let report = manager.shutdown_until(tokio::time::Instant::now()).await;
+    release.send(()).unwrap();
+    assert!(!report.terminal);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), receipt)
+            .await
+            .unwrap(),
+        crate::retirement::JoinOutcome::Joined
+    );
+    assert!(
+        manager
+            .shutdown_until(tokio::time::Instant::now())
+            .await
+            .is_clean()
+    );
+    assert_eq!(
+        snapshot(home.path()),
+        before,
+        "no new cache publication after the deadline"
+    );
+    assert!(!called.load(Ordering::SeqCst));
+    assert!(
+        !STARTED.load(Ordering::SeqCst),
+        "uncommitted sync remains retryable"
+    );
+}

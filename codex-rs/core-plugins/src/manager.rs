@@ -3579,8 +3579,16 @@ impl PluginsManager {
             .task_registry
             .spawn_thread("plugins-curated-repo-sync", move || {
                 let mut start = start;
-                match sync(codex_home.as_path(), http_client_factory, stop) {
+                if stop.is_stopped() {
+                    warn!("curated plugins repo sync stopped before reading");
+                    return;
+                }
+                match sync(codex_home.as_path(), http_client_factory, stop.clone()) {
                     Ok(curated_plugin_version) => {
+                        if stop.is_stopped() {
+                            warn!("curated plugins repo sync stopped before cache refresh");
+                            return;
+                        }
                         let configured_curated_plugin_ids =
                             configured_curated_plugin_ids_from_codex_home(codex_home.as_path());
                         match refresh_curated_plugin_cache(

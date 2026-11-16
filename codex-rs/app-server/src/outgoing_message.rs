@@ -47,6 +47,11 @@ pub(crate) type ClientRequestResult = std::result::Result<Result, JSONRPCErrorEr
 static IN_FLIGHT_REQUESTS: Gauge = Gauge::new("app.requests.in_flight");
 static PENDING_SERVER_REQUESTS: Gauge = Gauge::new("app.server_requests.pending");
 
+#[path = "account_projection.rs"]
+mod account_projection;
+pub(crate) use account_projection::AccountProjectionReservation;
+pub(crate) use account_projection::AccountProjectionReservationError;
+
 #[path = "account_notifications.rs"]
 mod account_notifications;
 pub(crate) use account_notifications::AccountNotification;

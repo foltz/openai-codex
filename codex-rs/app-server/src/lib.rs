@@ -102,6 +102,8 @@ mod account_operation_work;
 mod account_turn_admission;
 mod account_turn_work;
 mod account_work_permits;
+mod managed_transition;
+mod otel_reset_control;
 mod analytics_utils;
 mod app_info;
 mod app_server_tracing;

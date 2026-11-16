@@ -719,3 +719,54 @@ async fn unmanaged_provider_parent_preserves_detached_execution() {
         .unwrap()
         .unwrap();
 }
+
+#[tokio::test]
+async fn provider_parent_observer_preserves_caught_nested_registration_failure() {
+    let tasks = ProcessorTasks::default();
+    let permits = AccountWorkPermits::new();
+    let operation = host(&permits, Some(tasks.ticket()))
+        .admit_operation_work()
+        .unwrap()
+        .unwrap();
+    let spawner = operation.auth_task_spawner().unwrap();
+    drop(operation);
+    let (started_send, started_receive) = tokio::sync::oneshot::channel();
+    let (continue_send, continue_receive) = tokio::sync::oneshot::channel();
+    let polled = Arc::new(AtomicBool::new(false));
+    let child_polled = polled.clone();
+    let observation = codex_model_provider::spawn_provider_task_with_access(
+        codex_model_provider::AuthTaskAccess::Admitted(spawner),
+        Box::pin(async move {
+            started_send.send(()).unwrap();
+            continue_receive.await.unwrap();
+            // Deliberately catch it: the original parent's observer must retain it.
+            let _ = codex_model_provider::spawn_provider_task(Box::pin(async move {
+                child_polled.store(true, Ordering::SeqCst);
+            }));
+        }),
+    )
+    .unwrap()
+    .unwrap();
+    tokio::time::timeout(DRAIN_DEADLINE, started_receive)
+        .await
+        .unwrap()
+        .unwrap();
+    tasks.close_registration().unwrap();
+    permits.close();
+    continue_send.send(()).unwrap();
+    assert_eq!(
+        tokio::time::timeout(DRAIN_DEADLINE, observation)
+            .await
+            .unwrap(),
+        Err(codex_model_provider::AuthTaskFailure::Unavailable),
+    );
+    assert!(!polled.load(Ordering::SeqCst));
+    // The parent joined normally; that is distinct from the operation's refusal.
+    assert!(
+        tasks
+            .observe_until(Instant::now() + DRAIN_DEADLINE)
+            .await
+            .is_clean()
+    );
+    assert_eq!(permits.admitted_count(), 0);
+}

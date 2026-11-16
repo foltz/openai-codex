@@ -104,7 +104,17 @@ fn dispatch_provider_task(
     Ok(Box::pin(async move {
         observation.await.inspect_err(|reason| {
             let _ = context.fail(*reason);
-        })
+        })?;
+        // An enclosing scope may already have returned its observer. A child
+        // registration error caught inside the parent must still be observable.
+        let failure = *context
+            .failure
+            .lock()
+            .map_err(|_| AuthTaskFailure::Unavailable)?;
+        match failure {
+            Some(reason) => Err(reason),
+            None => Ok(()),
+        }
     }))
 }
 

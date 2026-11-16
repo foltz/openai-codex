@@ -702,6 +702,7 @@ async fn run_review_on_reused_session_waits_for_submitted_turn() {
         run_review_on_session(
             &review_session,
             &params,
+            None,
             GuardianReviewSessionKind::TrunkReused,
             codex_guardian_reviewer::ReviewDeadline::At(
                 tokio::time::Instant::now() + Duration::from_secs(1),
@@ -1135,7 +1136,24 @@ async fn parent_checkpoint_recovery_stops_after_one_restart() {
 
 #[tokio::test]
 async fn compaction_and_review_submissions_share_execution_observer() {
-    let (review_session, events, submissions) = test_review_session().await;
+    let (mut review_session, events, submissions) = test_review_session().await;
+    Arc::get_mut(&mut review_session.session)
+        .unwrap()
+        .services
+        .host_admission = Some(Arc::new(GuardianTurnGate));
+    let counts = Arc::new(GuardianTurnCounts {
+        live: 0.into(),
+        derives: 0.into(),
+        refuse: false.into(),
+        store: review_session
+            .session
+            .services
+            .thread_extension_data
+            .level_id()
+            .to_owned(),
+        terminations: std::sync::Mutex::new(Vec::new()),
+    });
+    let root = GuardianTurnRoot::new(&counts);
     let child_session = Arc::clone(&review_session.session);
     let mut params = test_review_params().await;
     params
@@ -1155,6 +1173,7 @@ async fn compaction_and_review_submissions_share_execution_observer() {
         run_review_on_session(
             &review_session,
             &params,
+            Some(&root),
             GuardianReviewSessionKind::TrunkReused,
             codex_guardian_reviewer::ReviewDeadline::At(
                 tokio::time::Instant::now() + Duration::from_secs(30),
@@ -1169,11 +1188,27 @@ async fn compaction_and_review_submissions_share_execution_observer() {
             .expect("child submission deadline")
             .expect("child submission");
         if index == 0 {
-            assert!(matches!(submission.op, Op::Compact));
+            let Op::HostTurn { action, work } = submission.op else {
+                panic!("counted compaction")
+            };
+            assert!(matches!(
+                action,
+                codex_protocol::host_turn_work::HostTurnAction::Compact
+            ));
+            assert_eq!(counts.live.load(Ordering::SeqCst), 2);
+            drop(work);
+            assert_eq!(counts.live.load(Ordering::SeqCst), 1);
         } else {
-            let Op::TurnInput { reply, .. } = submission.op else {
+            let Op::TurnInput {
+                reply, host_work, ..
+            } = submission.op
+            else {
                 panic!("expected review input after compaction");
             };
+            let work = host_work.expect("separate counted model turn");
+            assert_eq!(counts.live.load(Ordering::SeqCst), 2);
+            drop(work);
+            assert_eq!(counts.live.load(Ordering::SeqCst), 1);
             reply
                 .send(Ok(TurnInputSubmission::Started {
                     root_turn_id: submission.id.clone(),
@@ -1202,6 +1237,8 @@ async fn compaction_and_review_submissions_share_execution_observer() {
             .unwrap();
     }
     let result = review.await.unwrap();
+    assert_eq!(counts.derives.load(Ordering::SeqCst), 2);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
     assert!(matches!(
         result.outcome,
         GuardianReviewSessionOutcome::Completed(Ok(_))
@@ -1621,4 +1658,279 @@ async fn cancelled_guardian_pool_creation_releases_invocation_children() {
     drop(invocation);
     assert_eq!(gate.counts.live.load(Ordering::SeqCst), 0);
     pool.shutdown().await;
+}
+
+// These probes exercise the real SessionIo queue with synthetic account owners.
+// They do not execute a model, the submission loop, or terminal cleanup.
+struct GuardianTurnCounts {
+    live: std::sync::atomic::AtomicUsize,
+    derives: std::sync::atomic::AtomicUsize,
+    refuse: std::sync::atomic::AtomicBool,
+    store: String,
+    terminations: std::sync::Mutex<Vec<codex_extension_api::ExtensionFuture<'static, ()>>>,
+}
+impl std::fmt::Debug for GuardianTurnCounts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GuardianTurnCounts")
+    }
+}
+#[derive(Debug)]
+struct GuardianTurnRoot(Arc<GuardianTurnCounts>);
+impl GuardianTurnRoot {
+    fn new(counts: &Arc<GuardianTurnCounts>) -> Self {
+        counts.live.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(counts))
+    }
+}
+impl Drop for GuardianTurnRoot {
+    fn drop(&mut self) {
+        self.0.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+impl codex_extension_api::HostOperationWork for GuardianTurnRoot {
+    fn derive_operation(
+        &self,
+    ) -> Result<Box<dyn codex_extension_api::HostOperationWork>, codex_extension_api::TurnWorkRefused>
+    {
+        if self.0.refuse.load(Ordering::SeqCst) {
+            return Err(codex_extension_api::TurnWorkRefused::Unavailable);
+        }
+        Ok(Box::new(Self::new(&self.0)))
+    }
+    fn derive_turn_work(
+        &self,
+        store: &codex_extension_api::ExtensionData,
+        termination: codex_extension_api::ExtensionFuture<'static, ()>,
+    ) -> Result<
+        Box<dyn codex_protocol::host_turn_work::HostTurnWork>,
+        codex_extension_api::TurnWorkRefused,
+    > {
+        assert_eq!(store.level_id(), self.0.store);
+        self.0.derives.fetch_add(1, Ordering::SeqCst);
+        if self.0.refuse.load(Ordering::SeqCst) {
+            return Err(codex_extension_api::TurnWorkRefused::Unavailable);
+        }
+        self.0.terminations.lock().unwrap().push(termination);
+        Ok(Box::new(GuardianQueuedTurn(Self::new(&self.0))))
+    }
+}
+#[derive(Debug)]
+struct GuardianQueuedTurn(GuardianTurnRoot);
+impl codex_protocol::host_turn_work::HostTurnWork for GuardianQueuedTurn {
+    fn bind_submission(&mut self, _: &str) {
+        let _ = &self.0;
+    }
+    fn retain_until_terminal(self: Box<Self>) {
+        panic!("queue probes must not simulate task-terminal retention");
+    }
+}
+#[derive(Debug)]
+struct GuardianTurnGate;
+impl codex_extension_api::TurnStartAdmission for GuardianTurnGate {
+    fn requires_account_work(&self) -> bool {
+        true
+    }
+    fn admit_turn_start(&self) -> Option<Box<dyn Send>> {
+        panic!("no fresh admission")
+    }
+    fn derive_request_operation_work(
+        &self,
+    ) -> Result<
+        Option<Box<dyn codex_extension_api::HostOperationWork>>,
+        codex_extension_api::TurnWorkRefused,
+    > {
+        panic!("no ambient request lookup")
+    }
+}
+async fn guardian_turn_queue() -> (
+    GuardianReviewSession,
+    async_channel::Receiver<Submission>,
+    Arc<GuardianTurnCounts>,
+) {
+    let (mut reviewer, _, submissions) = test_review_session().await;
+    Arc::get_mut(&mut reviewer.session)
+        .unwrap()
+        .services
+        .host_admission = Some(Arc::new(GuardianTurnGate));
+    let counts = Arc::new(GuardianTurnCounts {
+        live: 0.into(),
+        derives: 0.into(),
+        refuse: false.into(),
+        store: reviewer
+            .session
+            .services
+            .thread_extension_data
+            .level_id()
+            .to_owned(),
+        terminations: std::sync::Mutex::new(Vec::new()),
+    });
+    (reviewer, submissions, counts)
+}
+fn guardian_queue_request() -> TurnInputRequest {
+    TurnInputRequest::user_input(vec![codex_protocol::user_input::UserInput::Text {
+        text: "guardian queue custody probe".to_owned(),
+        text_elements: Vec::new(),
+    }])
+}
+#[tokio::test]
+async fn guardian_model_queue_keeps_child_after_reply_waiter_and_invocation_drop() {
+    use codex_guardian_reviewer::ReviewerRuntime;
+    let (reviewer, submissions, counts) = guardian_turn_queue().await;
+    let root = GuardianTurnRoot::new(&counts);
+    let runtime = GuardianInvocationRuntime {
+        session: &reviewer,
+        work: Some(&root),
+    };
+    let mut submit = Box::pin(runtime.submit_turn(guardian_queue_request()));
+    assert!(futures::poll!(&mut submit).is_pending());
+    assert_eq!(counts.live.load(Ordering::SeqCst), 2);
+    drop(submit);
+    drop(runtime);
+    drop(root);
+    assert_eq!(
+        counts.live.load(Ordering::SeqCst),
+        1,
+        "the queue, not the waiter, owns the child"
+    );
+    let sub = submissions.try_recv().unwrap();
+    let Op::TurnInput {
+        host_work,
+        reply,
+        mode,
+        ..
+    } = sub.op
+    else {
+        panic!("typed turn input")
+    };
+    assert!(matches!(mode, TurnInputMode::StartIfIdle));
+    let work = host_work.expect("explicit invocation child");
+    assert!(
+        reply
+            .send(Ok(TurnInputSubmission::Started {
+                root_turn_id: sub.id.clone(),
+                turn_id: sub.id
+            }))
+            .is_err()
+    );
+    assert_eq!(counts.derives.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    drop(work);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+}
+#[tokio::test]
+async fn guardian_compaction_queue_owns_a_distinct_invocation_child() {
+    let (reviewer, submissions, counts) = guardian_turn_queue().await;
+    let root = GuardianTurnRoot::new(&counts);
+    let runtime = GuardianInvocationRuntime {
+        session: &reviewer,
+        work: Some(&root),
+    };
+    let id = runtime.submit_compaction().await.unwrap();
+    assert_eq!(counts.live.load(Ordering::SeqCst), 2);
+    drop(runtime);
+    drop(root);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    let sub = submissions.try_recv().unwrap();
+    assert_eq!(sub.id, id);
+    let Op::HostTurn { action, work } = sub.op else {
+        panic!("typed standalone turn")
+    };
+    assert!(matches!(
+        action,
+        codex_protocol::host_turn_work::HostTurnAction::Compact
+    ));
+    drop(work);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+}
+#[tokio::test]
+async fn guardian_required_turn_refuses_missing_or_expired_invocation_before_queue() {
+    use codex_guardian_reviewer::ReviewerRuntime;
+    let (reviewer, submissions, counts) = guardian_turn_queue().await;
+    assert!(
+        reviewer
+            .submit_turn(guardian_queue_request())
+            .await
+            .is_err()
+    );
+    let missing = GuardianInvocationRuntime {
+        session: &reviewer,
+        work: None,
+    };
+    assert!(missing.submit_compaction().await.is_err());
+    assert_eq!(counts.derives.load(Ordering::SeqCst), 0);
+    let root = GuardianTurnRoot::new(&counts);
+    counts.refuse.store(true, Ordering::SeqCst);
+    let expired = GuardianInvocationRuntime {
+        session: &reviewer,
+        work: Some(&root),
+    };
+    assert!(expired.submit_turn(guardian_queue_request()).await.is_err());
+    assert!(expired.submit_compaction().await.is_err());
+    assert!(submissions.is_empty());
+    assert_eq!(counts.derives.load(Ordering::SeqCst), 2);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    drop(expired);
+    drop(root);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+}
+#[tokio::test]
+async fn guardian_cancelled_full_queue_drops_unadmitted_children() {
+    use codex_guardian_reviewer::ReviewerRuntime;
+    let (reviewer, submissions, counts) = guardian_turn_queue().await;
+    for _ in 0..4 {
+        reviewer.io.submit(Op::Interrupt).await.unwrap();
+    }
+    let root = GuardianTurnRoot::new(&counts);
+    let runtime = GuardianInvocationRuntime {
+        session: &reviewer,
+        work: Some(&root),
+    };
+    let mut compact = Box::pin(runtime.submit_compaction());
+    assert!(futures::poll!(&mut compact).is_pending());
+    assert_eq!(counts.live.load(Ordering::SeqCst), 2);
+    drop(compact);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    let mut model = Box::pin(runtime.submit_turn(guardian_queue_request()));
+    assert!(futures::poll!(&mut model).is_pending());
+    assert_eq!(counts.live.load(Ordering::SeqCst), 2);
+    drop(model);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    assert_eq!(submissions.len(), 4);
+    while let Ok(sub) = submissions.try_recv() {
+        assert!(matches!(sub.op, Op::Interrupt));
+    }
+    drop(runtime);
+    drop(root);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+}
+#[tokio::test]
+async fn guardian_turn_child_receives_the_original_loop_receipt() {
+    let (mut reviewer, submissions, counts) = guardian_turn_queue().await;
+    let (finish, wait) = tokio::sync::oneshot::channel::<()>();
+    reviewer.io.session_loop_termination =
+        crate::session::session_loop_termination_from_handle(tokio::spawn(async move {
+            wait.await.unwrap();
+        }));
+    let root = GuardianTurnRoot::new(&counts);
+    let runtime = GuardianInvocationRuntime {
+        session: &reviewer,
+        work: Some(&root),
+    };
+    runtime.submit_compaction().await.unwrap();
+    let mut receipt = counts.terminations.lock().unwrap().pop().unwrap();
+    assert!(futures::poll!(&mut receipt).is_pending());
+    finish.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), receipt)
+        .await
+        .unwrap();
+    assert_eq!(
+        counts.live.load(Ordering::SeqCst),
+        2,
+        "loop observation is not operation/child destruction"
+    );
+    drop(submissions.try_recv().unwrap());
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    drop(runtime);
+    drop(root);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
 }

@@ -48,6 +48,10 @@ impl std::ops::DerefMut for GuardianInvocationSetup {
     }
 }
 impl GuardianInvocationSetup {
+    pub(super) fn operation_work(&self) -> Option<&dyn codex_extension_api::HostOperationWork> {
+        self.work.as_deref()
+    }
+
     /// Retain metadata without extending this finite invocation's work.
     pub fn projection(&self) -> Arc<PreparedGuardianContext> {
         Arc::clone(&self.context)
@@ -336,6 +340,7 @@ impl ReviewerRequest for PreparedReview {
         let mut result = Box::pin(run_review_on_session(
             session,
             &self.params,
+            self.context.operation_work(),
             kind,
             self.params.deadline,
         ))

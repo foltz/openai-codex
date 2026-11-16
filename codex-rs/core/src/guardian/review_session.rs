@@ -237,9 +237,14 @@ impl GuardianReviewSessionReuseKey {
 async fn run_review_on_session(
     review_session: &GuardianReviewSession,
     params: &GuardianReviewSessionParams,
+    work: Option<&dyn codex_extension_api::HostOperationWork>,
     guardian_session_kind: GuardianReviewSessionKind,
     deadline: ReviewDeadline,
 ) -> ReviewSessionResult {
+    let runtime = GuardianInvocationRuntime {
+        session: review_session,
+        work,
+    };
     let review_model = &params.review_model;
     let model_info = params
         .parent_session
@@ -338,7 +343,7 @@ async fn run_review_on_session(
         let compact_submission = run_before_review_deadline(
             deadline,
             params.external_cancel.as_ref(),
-            review_session.io.submit(Op::Compact),
+            runtime.submit_compaction(),
         )
         .await;
         let compact_turn_id = match compact_submission {
@@ -363,7 +368,7 @@ async fn run_review_on_session(
             }
         };
         let result = wait_for_guardian_review(
-            review_session,
+            &runtime,
             &compact_turn_id,
             deadline,
             params.external_cancel.as_ref(),
@@ -615,7 +620,7 @@ async fn run_review_on_session(
         store.insert(codex_guardian_reviewer::DenialResample::default());
     }
     let child_turn_id = match codex_guardian_reviewer::start_review_turn(
-        review_session,
+        &runtime,
         request,
         deadline,
         params.external_cancel.as_ref(),
@@ -652,7 +657,7 @@ async fn run_review_on_session(
     }
 
     let turn_result = wait_for_guardian_review(
-        review_session,
+        &runtime,
         child_turn_id.as_str(),
         deadline,
         params.external_cancel.as_ref(),
@@ -833,17 +838,94 @@ async fn ensure_guardian_node_repl_policy(
     Ok(())
 }
 
-impl codex_guardian_reviewer::ReviewerRuntime for GuardianReviewSession {
+/// A borrow of one finite invocation, never stored in the reusable session.
+/// Each submitted child owns its own work after the reply waiter is cancelled.
+struct GuardianInvocationRuntime<'a> {
+    session: &'a GuardianReviewSession,
+    work: Option<&'a dyn codex_extension_api::HostOperationWork>,
+}
+
+impl GuardianInvocationRuntime<'_> {
+    fn turn_work(
+        &self,
+    ) -> anyhow::Result<Option<Box<dyn codex_protocol::host_turn_work::HostTurnWork>>> {
+        let Some(work) = self.work else {
+            anyhow::ensure!(
+                !self
+                    .session
+                    .session
+                    .services
+                    .host_admission
+                    .as_ref()
+                    .is_some_and(|host| host.requires_account_work()),
+                "Guardian turn requires invocation work"
+            );
+            return Ok(None);
+        };
+        let termination = self.session.io.session_loop_termination.clone();
+        work.derive_turn_work(
+            &self.session.session.services.thread_extension_data,
+            Box::pin(async move {
+                termination.await;
+            }),
+        )
+        .map(Some)
+        .map_err(|_| anyhow::anyhow!("Guardian invocation cannot admit reviewer turn"))
+    }
+
+    async fn submit_compaction(&self) -> anyhow::Result<String> {
+        let op = match self.turn_work()? {
+            Some(work) => Op::HostTurn {
+                action: codex_protocol::host_turn_work::HostTurnAction::Compact,
+                work,
+            },
+            None => Op::Compact,
+        };
+        Ok(self.session.io.submit(op).await?)
+    }
+}
+
+impl codex_guardian_reviewer::ReviewerRuntime for GuardianInvocationRuntime<'_> {
     async fn submit_turn(&self, request: TurnInputRequest) -> anyhow::Result<TurnInputSubmission> {
+        let work = self.turn_work()?;
         Ok(self
+            .session
             .io
             .submit_turn_input(
                 request,
                 TurnInputMode::StartIfIdle,
-                /*host_work*/ None,
+                work,
                 /*residency_guard*/ None,
             )
             .await?)
+    }
+
+    async fn next_event(&self) -> anyhow::Result<Event> {
+        codex_guardian_reviewer::ReviewerRuntime::next_event(self.session).await
+    }
+    async fn admit_context(&self, event: &Event) {
+        codex_guardian_reviewer::ReviewerRuntime::admit_context(self.session, event).await;
+    }
+    async fn interrupt(&self) -> anyhow::Result<()> {
+        codex_guardian_reviewer::ReviewerRuntime::interrupt(self.session).await
+    }
+    fn retry_at(&self, turn_id: &str) -> Option<tokio::time::Instant> {
+        codex_guardian_reviewer::ReviewerRuntime::retry_at(self.session, turn_id)
+    }
+}
+
+impl codex_guardian_reviewer::ReviewerRuntime for GuardianReviewSession {
+    async fn submit_turn(&self, request: TurnInputRequest) -> anyhow::Result<TurnInputSubmission> {
+        // The compatibility surface is ungated only; Required callers must use
+        // the finite invocation adapter rather than ambient fresh admission.
+        codex_guardian_reviewer::ReviewerRuntime::submit_turn(
+            &GuardianInvocationRuntime {
+                session: self,
+                work: None,
+            },
+            request,
+        )
+        .await
     }
 
     async fn next_event(&self) -> anyhow::Result<Event> {

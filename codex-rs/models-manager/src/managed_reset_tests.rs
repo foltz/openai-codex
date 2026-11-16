@@ -888,3 +888,86 @@ async fn new_originator_created_during_reset_cannot_load_before_family_reopens()
     fetch.await;
     assert_eq!(work.leaf.calls.load(Ordering::SeqCst), 1);
 }
+
+// Logout intent advances the complete source generation even if cached auth is already None.
+// The legacy credential revision intentionally stays unchanged in this case.
+async fn empty_fixture_auth(home: &Path) -> Arc<AuthManager> {
+    let auth = AuthManager::from_auth_for_testing_with_home(
+        CodexAuth::from_api_key("synthetic-not-persisted"),
+        home.to_path_buf(),
+    );
+    auth.logout()
+        .await
+        .expect("clear only disposable fixture auth");
+    assert!(auth.auth_cached().is_none());
+    auth
+}
+
+#[tokio::test]
+async fn managed_reset_refuses_logout_intent_without_credential_change_during_endpoint() {
+    let home = tempdir().unwrap();
+    let auth = empty_fixture_auth(home.path()).await;
+    let legacy = auth.auth_change_receiver();
+    let complete = auth.auth_change_state_receiver();
+    let endpoint = PartitionEndpoint::new(false);
+    let manager = Arc::new(
+        OpenAiModelsManager::new_without_cache(endpoint.clone(), Some(auth.clone()))
+            .with_provider_catalog(),
+    );
+    let m = manager.clone();
+    let reset =
+        tokio::spawn(async move { m.reset_for_managed_auth(DEFAULT_HTTP_CLIENT_FACTORY).await });
+    entered(&endpoint.leaf).await;
+    auth.logout()
+        .await
+        .expect("repeat logout in disposable fixture");
+    assert!(
+        !legacy.has_changed().unwrap(),
+        "credential content has not changed"
+    );
+    assert!(
+        complete.has_changed().unwrap(),
+        "source intent generation has changed"
+    );
+    endpoint.leaf.release.add_permits(1);
+    assert_eq!(
+        reset.await.unwrap(),
+        Err(ManagedModelsResetError::AuthChanged)
+    );
+    assert!(manager.get_remote_models().await.is_empty());
+    assert!(manager.refreshed_model_catalog().is_none());
+}
+
+#[tokio::test]
+async fn managed_reset_refuses_logout_intent_without_credential_change_during_cache_write() {
+    let home = tempdir().unwrap();
+    let auth = empty_fixture_auth(home.path()).await;
+    let legacy = auth.auth_change_receiver();
+    let complete = auth.auth_change_state_receiver();
+    let cache = ControlledStoreCache::new(2, 0);
+    let endpoint = TestModelsEndpoint::new(vec![vec![remote_model("new-provider", "New", 0)]]);
+    let manager = Arc::new(
+        OpenAiModelsManager::new_with_cache(cache.clone(), endpoint, Some(auth.clone()))
+            .with_provider_catalog(),
+    );
+    let m = manager.clone();
+    let reset =
+        tokio::spawn(async move { m.reset_for_managed_auth(DEFAULT_HTTP_CLIENT_FACTORY).await });
+    tokio::time::timeout(Duration::from_secs(1), cache.entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    auth.logout()
+        .await
+        .expect("repeat logout in disposable fixture");
+    assert!(!legacy.has_changed().unwrap());
+    assert!(complete.has_changed().unwrap());
+    cache.release.add_permits(1);
+    assert_eq!(
+        reset.await.unwrap(),
+        Err(ManagedModelsResetError::AuthChanged)
+    );
+    assert!(manager.get_remote_models().await.is_empty());
+    assert!(manager.refreshed_model_catalog().is_none());
+}

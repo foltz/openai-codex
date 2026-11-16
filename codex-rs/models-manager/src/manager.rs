@@ -554,7 +554,7 @@ impl ModelsManager for OpenAiModelsManager {
             let auth_changes = self
                 .auth_manager
                 .as_ref()
-                .map(|auth| auth.auth_change_receiver());
+                .map(|auth| auth.auth_change_state_receiver());
             let mut pending: Vec<_> = self
                 .originator_managers
                 .lock()
@@ -805,7 +805,7 @@ impl OpenAiModelsManager {
         let auth_changes = self
             .auth_manager
             .as_ref()
-            .map(|auth| auth.auth_change_receiver());
+            .map(|auth| auth.auth_change_state_receiver());
         let models = match self.catalog_source {
             CatalogSource::Default => load_remote_models_from_file()
                 .map_err(|_| ManagedModelsResetError::BundledCatalog)?,

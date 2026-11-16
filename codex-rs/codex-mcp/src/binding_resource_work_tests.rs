@@ -346,3 +346,200 @@ async fn resource_filters_preserve_deferred_names_without_deriving_or_dispatchin
     assert_eq!(server.calls.load(Ordering::SeqCst), 0);
     server.finish(&step.client).await;
 }
+
+async fn status_manager(step: &TestStep) -> McpConnectionSet {
+    let mut manager = McpConnectionSet::empty(true);
+    manager.attempt_requirement = McpAttemptRequirement::Required;
+    let managed = step
+        .step
+        .prepare_call(SERVER_NAME, TOOL_NAME)
+        .unwrap()
+        .client;
+    let mut client =
+        crate::connection_manager::tests::create_ready_async_managed_client(Vec::new()).await;
+    client.client = futures::future::ready(Ok((*managed).clone()))
+        .boxed()
+        .shared()
+        .into();
+    manager.insert_test_client(SERVER_NAME, client);
+    manager
+}
+#[tokio::test]
+async fn status_collection_refuses_missing_and_exhausted_work_without_wire_requests() {
+    let (step, server) = fixture(McpAttemptRequirement::Required).await;
+    let manager = status_manager(&step).await;
+    let root = work();
+    for access in [
+        McpAttemptAccess::Unscoped,
+        McpAttemptAccess::Admitted(&root),
+    ] {
+        root.0.refuse.store(true, Ordering::SeqCst);
+        let error = crate::mcp::collect_mcp_server_status_snapshot_from_manager(
+            &manager,
+            HashMap::new(),
+            vec![SERVER_NAME.into()],
+            crate::McpSnapshotDetail::Full,
+            access,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(error.is::<McpAttemptRefused>());
+        assert_eq!(server.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(root.0.live.load(Ordering::SeqCst), 1);
+    }
+    server.finish(&step.client).await;
+}
+#[tokio::test]
+async fn admitted_status_collection_preserves_detail_filters_and_retains_no_work() {
+    let (step, server) = fixture(McpAttemptRequirement::Required).await;
+    let manager = status_manager(&step).await;
+    let root = work();
+    let access = McpAttemptAccess::Admitted(&root);
+    let snapshot = crate::mcp::collect_mcp_server_status_snapshot_from_manager(
+        &manager,
+        HashMap::new(),
+        vec![SERVER_NAME.into()],
+        crate::McpSnapshotDetail::Full,
+        access,
+    )
+    .await
+    .unwrap();
+    assert_eq!(server.calls.load(Ordering::SeqCst), 2);
+    assert!(snapshot.resources.contains_key(SERVER_NAME));
+    assert!(snapshot.resource_templates.contains_key(SERVER_NAME));
+    assert_eq!(root.0.live.load(Ordering::SeqCst), 1);
+    let tools = crate::mcp::collect_mcp_server_status_snapshot_from_manager(
+        &manager,
+        HashMap::new(),
+        vec![SERVER_NAME.into()],
+        crate::McpSnapshotDetail::ToolsAndAuthOnly,
+        access,
+    )
+    .await
+    .unwrap();
+    assert!(tools.resources.is_empty() && tools.resource_templates.is_empty());
+    assert_eq!(server.calls.load(Ordering::SeqCst), 2);
+    let filtered = crate::mcp::collect_mcp_server_status_snapshot_from_manager(
+        &manager,
+        HashMap::new(),
+        vec!["absent".into()],
+        crate::McpSnapshotDetail::Full,
+        access,
+    )
+    .await
+    .unwrap();
+    assert!(filtered.resources.is_empty() && filtered.resource_templates.is_empty());
+    assert_eq!(server.calls.load(Ordering::SeqCst), 2);
+    let counts = root.0.clone();
+    drop(root);
+    assert_eq!(
+        counts.live.load(Ordering::SeqCst),
+        0,
+        "retained status snapshot owns no work"
+    );
+    assert_eq!(snapshot.server_names, vec![SERVER_NAME]);
+    server.finish(&step.client).await;
+}
+#[tokio::test]
+async fn cancelled_status_collection_keeps_fanout_work_until_task_destruction() {
+    let (step, server) = fixture(McpAttemptRequirement::Required).await;
+    let manager = status_manager(&step).await;
+    let root = work();
+    server.hold.store(true, Ordering::SeqCst);
+    let mut status = Box::pin(crate::mcp::collect_mcp_server_status_snapshot_from_manager(
+        &manager,
+        HashMap::new(),
+        vec![SERVER_NAME.into()],
+        crate::McpSnapshotDetail::Full,
+        McpAttemptAccess::Admitted(&root),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            assert!(futures::poll!(&mut status).is_pending());
+            if server.calls.load(Ordering::SeqCst) == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        root.0.live.load(Ordering::SeqCst) >= 4,
+        "root, collector and each live fanout have separate work"
+    );
+    drop(status);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while root.0.live.load(Ordering::SeqCst) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(server.calls.load(Ordering::SeqCst), 2);
+    // Teardown releases both remote handlers only after local task ownership was checked.
+    server.finish_request.notify_waiters();
+    server.finish(&step.client).await;
+}
+#[tokio::test]
+async fn direct_ready_resource_operations_refuse_without_authority_and_release_valid_work() {
+    let (step, server) = fixture(McpAttemptRequirement::Required).await;
+    let manager = status_manager(&step).await;
+    let root = work();
+    for access in [
+        McpAttemptAccess::Unscoped,
+        McpAttemptAccess::Admitted(&root),
+    ] {
+        root.0.refuse.store(true, Ordering::SeqCst);
+        assert!(
+            manager
+                .list_resources_with_authority(SERVER_NAME, None, access)
+                .await
+                .unwrap_err()
+                .is::<McpAttemptRefused>()
+        );
+        assert!(
+            manager
+                .list_resource_templates_with_authority(SERVER_NAME, None, access)
+                .await
+                .unwrap_err()
+                .is::<McpAttemptRefused>()
+        );
+        assert!(
+            manager
+                .read_resource_with_authority(
+                    SERVER_NAME,
+                    ReadResourceRequestParams::new("test://read"),
+                    access
+                )
+                .await
+                .unwrap_err()
+                .is::<McpAttemptRefused>()
+        );
+        assert_eq!(server.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(root.0.live.load(Ordering::SeqCst), 1);
+    }
+    root.0.refuse.store(false, Ordering::SeqCst);
+    let access = McpAttemptAccess::Admitted(&root);
+    manager
+        .list_resources_with_authority(SERVER_NAME, None, access)
+        .await
+        .unwrap();
+    manager
+        .list_resource_templates_with_authority(SERVER_NAME, None, access)
+        .await
+        .unwrap();
+    let error = manager
+        .read_resource_with_authority(
+            SERVER_NAME,
+            ReadResourceRequestParams::new("test://read"),
+            access,
+        )
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("test read reached exact server"));
+    assert_eq!(server.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(root.0.live.load(Ordering::SeqCst), 1);
+    server.finish(&step.client).await;
+}

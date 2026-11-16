@@ -470,7 +470,16 @@ async fn public_mcp_requests_refuse_before_refresh_or_rpc_without_request_author
             .to_string()
             .contains("request account work")
     );
-    assert_eq!(gate.0.load(Ordering::SeqCst), 5);
+    assert!(
+        thread
+            .mcp_server_status_snapshot("test", codex_mcp::McpSnapshotDetail::Full, None)
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("request account work")
+    );
+    assert_eq!(gate.0.load(Ordering::SeqCst), 6);
     assert!(
         thread
             .start_mcp_event_stream_with_authority(

@@ -66,6 +66,7 @@ async fn fixture(apps: bool) -> Fixture {
         McpAttemptRequirement::Required,
     );
     let mut set = McpConnectionSet::empty(true);
+    set.attempt_requirement = McpAttemptRequirement::Required;
     set.insert_test_client(name, client.clone());
     let set = Arc::new(set);
     let mut config = crate::mcp::tests::test_mcp_config(std::env::temp_dir());
@@ -498,4 +499,34 @@ async fn direct_ready_tool_call_refuses_missing_and_exhausted_authority_before_c
     assert_eq!(live.load(Ordering::SeqCst), 1);
     drop(work);
     assert_eq!(live.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn selected_status_snapshot_refuses_missing_and_exhausted_work_before_discovery() {
+    let f = fixture(false).await;
+    let context = crate::McpRuntimeContext::new(
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        std::env::temp_dir(),
+    );
+    for access in [
+        McpAttemptAccess::Unscoped,
+        McpAttemptAccess::Admitted(&f.work),
+    ] {
+        f.work.refuse.store(true, Ordering::SeqCst);
+        let mut status = Box::pin(f.runtime.server_status_snapshot_with_authority(
+            f.name,
+            crate::McpSnapshotDetail::Full,
+            None,
+            &context,
+            access,
+        ));
+        let std::task::Poll::Ready(Err(error)) = futures::poll!(&mut status) else {
+            panic!("status refusal must precede discovery")
+        };
+        assert!(error.is::<McpAttemptRefused>());
+        assert_eq!(f.starts.load(Ordering::SeqCst), 0);
+        assert_eq!(f.work.live.load(Ordering::SeqCst), 1);
+    }
+    let _ = f.finish.send(());
+    f.runtime.shutdown().await;
 }

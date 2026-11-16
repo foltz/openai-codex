@@ -190,8 +190,10 @@ async fn status_snapshot_only_downgrades_oauth_and_ema_authentication_failures()
         auth_status_entries,
         server_names,
         McpSnapshotDetail::ToolsAndAuthOnly,
+        crate::McpAttemptAccess::Unscoped,
     )
-    .await;
+    .await
+    .unwrap();
 
     assert_eq!(
         snapshot.auth_statuses,

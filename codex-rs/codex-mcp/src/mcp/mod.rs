@@ -620,8 +620,10 @@ pub async fn collect_mcp_server_status_snapshot_with_detail(
         auth_status_entries,
         server_names,
         detail,
+        crate::McpAttemptAccess::Unscoped,
     )
-    .await;
+    .await
+    .expect("threadless status manager is explicitly Ungated");
 
     cancel_token.cancel();
 
@@ -854,23 +856,26 @@ pub(crate) async fn collect_mcp_server_status_snapshot_from_manager(
     auth_status_entries: HashMap<String, crate::mcp::auth::McpAuthStatusEntry>,
     server_names: Vec<String>,
     detail: McpSnapshotDetail,
-) -> McpServerStatusSnapshot {
+    access: crate::McpAttemptAccess<'_>,
+) -> anyhow::Result<McpServerStatusSnapshot> {
+    let work = mcp_connection_manager.attempt_requirement.derive(access)?;
+    let access = crate::McpAttemptAccess::from_work(work.as_deref());
     let selected_servers: HashSet<&str> = server_names.iter().map(String::as_str).collect();
     let include_server = |name: &str| selected_servers.contains(name);
     let ((server_infos, (tools, tools_errors, tool_list_meta)), resources, resource_templates) = tokio::join!(
         async {
             let server_infos = mcp_connection_manager
-                .list_available_server_infos(include_server)
+                .list_available_server_infos_with_authority(include_server, access)
                 .await;
             let tools = mcp_connection_manager
-                .list_catalogs_with_errors(include_server)
+                .list_catalogs_with_errors_with_authority(include_server, access)
                 .await;
             (server_infos, tools)
         },
         async {
             if detail.include_resources() {
                 mcp_connection_manager
-                    .list_all_resources(include_server)
+                    .list_all_resources_with_authority(include_server, access)
                     .await
             } else {
                 HashMap::new()
@@ -879,7 +884,7 @@ pub(crate) async fn collect_mcp_server_status_snapshot_from_manager(
         async {
             if detail.include_resources() {
                 mcp_connection_manager
-                    .list_all_resource_templates(include_server)
+                    .list_all_resource_templates_with_authority(include_server, access)
                     .await
             } else {
                 HashMap::new()
@@ -916,7 +921,7 @@ pub(crate) async fn collect_mcp_server_status_snapshot_from_manager(
         }
     }
 
-    McpServerStatusSnapshot {
+    Ok(McpServerStatusSnapshot {
         server_capabilities,
         tool_list_meta,
         server_infos,
@@ -926,7 +931,7 @@ pub(crate) async fn collect_mcp_server_status_snapshot_from_manager(
         resource_templates: convert_mcp_resource_templates(resource_templates),
         auth_statuses,
         server_names,
-    }
+    })
 }
 
 #[cfg(test)]

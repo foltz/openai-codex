@@ -23,7 +23,29 @@ impl McpRuntime {
         expected_registration: Option<&ResolvedMcpServer>,
         runtime_context: &McpRuntimeContext,
     ) -> anyhow::Result<(Arc<McpConfig>, McpServerStatusSnapshot)> {
+        self.server_status_snapshot_with_authority(
+            server,
+            detail,
+            expected_registration,
+            runtime_context,
+            crate::McpAttemptAccess::Unscoped,
+        )
+        .await
+    }
+
+    /// Derive finite invocation work before auth probing and selected discovery.
+    /// Returned configuration/status snapshots retain no counted work.
+    pub async fn server_status_snapshot_with_authority(
+        &self,
+        server: &str,
+        detail: McpSnapshotDetail,
+        expected_registration: Option<&ResolvedMcpServer>,
+        runtime_context: &McpRuntimeContext,
+        access: crate::McpAttemptAccess<'_>,
+    ) -> anyhow::Result<(Arc<McpConfig>, McpServerStatusSnapshot)> {
         let current = self.current.load_full();
+        let work = current.connections.attempt_requirement.derive(access)?;
+        let access = crate::McpAttemptAccess::from_work(work.as_deref());
         let runtime_context = runtime_context.clone().with_selected_environments(
             Arc::clone(&current.environment_selections),
             current.ready_environments.clone(),
@@ -48,7 +70,7 @@ impl McpRuntime {
             // Finish selected startup and any rejected-grant cleanup before reading auth.
             current
                 .connections
-                .list_available_server_infos(|name| name == server)
+                .list_available_server_infos_with_authority(|name| name == server, access)
                 .await;
         }
         let auth_statuses = compute_auth_statuses(
@@ -66,8 +88,9 @@ impl McpRuntime {
             auth_statuses,
             servers.into_keys().collect(),
             detail,
+            access,
         )
-        .await;
+        .await?;
         Ok((config, snapshot))
     }
 }

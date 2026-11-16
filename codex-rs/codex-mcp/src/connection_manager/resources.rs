@@ -63,11 +63,16 @@ impl McpConnectionSet {
             .filter(|(server_name, _)| include_server(server_name))
         {
             let server_name = server_name.clone();
-            let Ok(client) = view.connection.client_with_authority(access).await else {
+            let Ok(work) = self.attempt_requirement.derive(access) else {
+                continue;
+            };
+            let child_access = crate::McpAttemptAccess::from_work(work.as_deref());
+            let Ok(client) = view.connection.client_with_authority(child_access).await else {
                 continue;
             };
             let timeout = view.tool_timeout;
             let task = async move {
+                let _work = work;
                 let resources = collect_paginated("resources/list", timeout, |params| {
                     let client = client.clone();
                     async move {
@@ -120,11 +125,16 @@ impl McpConnectionSet {
             include_server(server_name) && !self.skips_resource_template_listing(server_name)
         }) {
             let server_name = server_name.clone();
-            let Ok(client) = view.connection.client_with_authority(access).await else {
+            let Ok(work) = self.attempt_requirement.derive(access) else {
+                continue;
+            };
+            let child_access = crate::McpAttemptAccess::from_work(work.as_deref());
+            let Ok(client) = view.connection.client_with_authority(child_access).await else {
                 continue;
             };
             let timeout = view.tool_timeout;
             let task = async move {
+                let _work = work;
                 let templates = collect_paginated("resources/templates/list", timeout, |params| {
                     let client = client.clone();
                     async move {
@@ -163,6 +173,8 @@ impl McpConnectionSet {
         params: Option<PaginatedRequestParams>,
         access: crate::McpAttemptAccess<'_>,
     ) -> Result<ListResourcesResult> {
+        let work = self.attempt_requirement.derive(access)?;
+        let access = crate::McpAttemptAccess::from_work(work.as_deref());
         let (managed, timeout) = self.client_by_name_with_authority(server, access).await?;
         managed
             .list_resources(params, timeout)
@@ -176,6 +188,8 @@ impl McpConnectionSet {
         params: Option<PaginatedRequestParams>,
         access: crate::McpAttemptAccess<'_>,
     ) -> Result<ListResourceTemplatesResult> {
+        let work = self.attempt_requirement.derive(access)?;
+        let access = crate::McpAttemptAccess::from_work(work.as_deref());
         let (managed, timeout) = self.client_by_name_with_authority(server, access).await?;
         managed
             .list_resource_templates(params, timeout)
@@ -212,6 +226,8 @@ impl McpConnectionSet {
         params: ReadResourceRequestParams,
         access: crate::McpAttemptAccess<'_>,
     ) -> Result<ReadResourceResult> {
+        let work = self.attempt_requirement.derive(access)?;
+        let access = crate::McpAttemptAccess::from_work(work.as_deref());
         let (managed, timeout) = self.client_by_name_with_authority(server, access).await?;
         let uri = params.uri.clone();
         managed

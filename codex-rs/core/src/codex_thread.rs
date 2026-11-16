@@ -1533,12 +1533,22 @@ impl CodexThread {
         Arc<codex_mcp::McpConfig>,
         codex_mcp::McpServerStatusSnapshot,
     )> {
-        self.session.refresh_mcp_if_dirty().await;
+        let work = self.session.request_mcp_work()?;
+        let access = codex_mcp::McpAttemptAccess::from_work(work.as_deref());
+        self.session
+            .refresh_mcp_if_dirty_with_authority(access)
+            .await?;
         let runtime_context = self.session.current_mcp_runtime_context().await;
         self.session
             .services
             .mcp_runtime
-            .server_status_snapshot(server, detail, expected_registration, &runtime_context)
+            .server_status_snapshot_with_authority(
+                server,
+                detail,
+                expected_registration,
+                &runtime_context,
+                access,
+            )
             .await
     }
 

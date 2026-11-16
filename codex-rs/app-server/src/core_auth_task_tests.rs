@@ -2014,9 +2014,11 @@ async fn queued_auth_closed_family_refuses_before_external_host_birth() {
         codex_model_provider::with_auth_task_scope(queued_auth_access(&tasks, &permits), async {
             family.prepare_auth_request()
         })
-        .await
-        .unwrap();
-    assert!(result.is_err());
+        .await;
+    assert!(
+        result.is_err(),
+        "managed family refusal is sticky in the invoking scope"
+    );
     assert_eq!(tasks.len(), 0);
     assert_eq!(permits.admitted_count(), 0);
     assert!(family.shutdown_until(Instant::now()).await.is_clean());
@@ -2391,4 +2393,103 @@ async fn queued_auth_rejected_command_drop_cannot_spawn_ungated_or_borrow_sender
     let report = family.shutdown_until(Instant::now() + DRAIN_DEADLINE).await;
     assert!(report.terminal && report.panicked && !report.is_clean());
     assert!(other_tasks.shutdown_until(Instant::now()).await.is_clean());
+}
+
+#[tokio::test]
+async fn queued_auth_handled_command_failure_is_not_success_and_result_drop_is_refused() {
+    let tasks = ProcessorTasks::default();
+    let permits = AccountWorkPermits::new();
+    let family = codex_core_plugins::PluginTaskRegistry::default();
+    let request =
+        codex_model_provider::with_auth_task_scope(queued_auth_access(&tasks, &permits), async {
+            family.prepare_auth_request()
+        })
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let refused = Arc::new(AtomicBool::new(false));
+    let polled = Arc::new(AtomicBool::new(false));
+    let capture = SpawnAuthOnRejectedCommandDrop {
+        refused: refused.clone(),
+        polled: polled.clone(),
+    };
+    let result = request
+        .run(async move {
+            codex_model_provider::record_auth_task_failure(
+                codex_model_provider::AuthTaskFailure::Refused,
+            );
+            capture
+        })
+        .await;
+    assert!(
+        matches!(result, Err(codex_model_provider::AuthTaskFailure::Refused)),
+        "caught internal custody failure cannot become a successful command result"
+    );
+    assert!(refused.load(Ordering::SeqCst));
+    tokio::task::yield_now().await;
+    assert!(!polled.load(Ordering::SeqCst));
+    drop(request);
+    let report = family.shutdown_until(Instant::now() + DRAIN_DEADLINE).await;
+    assert!(report.terminal && report.unavailable && !report.is_clean());
+    assert!(
+        tasks
+            .shutdown_until(Instant::now() + DRAIN_DEADLINE)
+            .await
+            .is_clean()
+    );
+    assert_eq!(permits.admitted_count(), 0);
+}
+
+#[tokio::test]
+async fn queued_auth_known_failed_origin_refuses_new_body_without_borrowing_other_root() {
+    let a = ProcessorTasks::default();
+    let pa = AccountWorkPermits::new();
+    let b = ProcessorTasks::default();
+    let pb = AccountWorkPermits::new();
+    let family = codex_core_plugins::PluginTaskRegistry::default();
+    let request = codex_model_provider::with_auth_task_scope(queued_auth_access(&a, &pa), async {
+        family.prepare_auth_request()
+    })
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    request.record_failure(codex_model_provider::AuthTaskFailure::Unavailable);
+    let refused = Arc::new(AtomicBool::new(false));
+    let polled = Arc::new(AtomicBool::new(false));
+    let capture = SpawnAuthOnRejectedCommandDrop {
+        refused: refused.clone(),
+        polled: polled.clone(),
+    };
+    let result = codex_model_provider::with_auth_task_scope(queued_auth_access(&b, &pb), async {
+        request.dispatch(Box::pin(async move {
+            std::hint::black_box(capture);
+        }))
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        result,
+        Err(codex_model_provider::AuthTaskFailure::Unavailable)
+    );
+    assert!(refused.load(Ordering::SeqCst));
+    tokio::task::yield_now().await;
+    assert!(!polled.load(Ordering::SeqCst));
+    assert_eq!(b.len(), 0);
+    assert_eq!(pb.admitted_count(), 0);
+    assert!(
+        pa.admitted_count() > 0,
+        "failed request remains owned until its actual original finishes"
+    );
+    drop(request);
+    let report = family.shutdown_until(Instant::now() + DRAIN_DEADLINE).await;
+    assert!(report.terminal && report.unavailable && !report.is_clean());
+    assert!(
+        a.shutdown_until(Instant::now() + DRAIN_DEADLINE)
+            .await
+            .is_clean()
+    );
+    assert!(b.shutdown_until(Instant::now()).await.is_clean());
+    assert_eq!(pa.admitted_count(), 0);
 }

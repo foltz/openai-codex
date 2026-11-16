@@ -168,22 +168,55 @@ impl AuthTaskSpawner for RefusedDeferredAuthTask {
         Err(AuthTaskFailure::Unavailable)
     }
 }
+/// Record an explicit managed birth refusal without granting authority.
+/// Independent callers have no context to mutate and retain their behavior.
+pub fn record_auth_task_failure(failure: AuthTaskFailure) -> AuthTaskFailure {
+    let _ = AUTH_TASK_CONTEXT.try_with(|context| {
+        let _ = context.fail(failure);
+    });
+    failure
+}
+
 impl DeferredAuthTask {
+    pub fn same_original(&self, other: &Self) -> bool {
+        self.commands.same_channel(&other.commands)
+    }
+
+    pub fn record_failure(&self, failure: AuthTaskFailure) {
+        if let Ok(mut slot) = self.failure.lock() {
+            slot.get_or_insert(failure);
+        }
+    }
+
+    fn known_failure(&self) -> Option<AuthTaskFailure> {
+        self.failure
+            .lock()
+            .map(|failure| *failure)
+            .unwrap_or(Some(AuthTaskFailure::Unavailable))
+    }
+
+    fn drop_refused<T>(&self, value: T, failure: AuthTaskFailure) {
+        let refusal = Context {
+            spawner: Arc::new(RefusedDeferredAuthTask),
+            failure: self.failure.clone(),
+        };
+        let _ = refusal.fail(failure);
+        AUTH_TASK_CONTEXT.sync_scope(refusal, || drop(value));
+    }
     /// Fire-and-observe through the original host ledger, without creating a
     /// supervisor task. This must only carry effects of the admitted request.
     pub fn dispatch(&self, future: AuthTaskFuture) -> std::result::Result<(), AuthTaskFailure> {
+        if let Some(failure) = self.known_failure() {
+            self.drop_refused(future, failure);
+            return Err(failure);
+        }
         let Err(rejected) = self.commands.send(future) else {
             return Ok(());
         };
         // A failed command cannot borrow its sender's unrelated root or fall
         // back to unscoped auth births from captured destructors. This context
         // has NO authority; it explicitly refuses every nested auth birth.
-        let refusal = Context {
-            spawner: Arc::new(RefusedDeferredAuthTask),
-            failure: self.failure.clone(),
-        };
-        let _ = refusal.fail(AuthTaskFailure::Unavailable);
-        AUTH_TASK_CONTEXT.sync_scope(refusal, || drop(rejected.0));
+        self.drop_refused(rejected.0, AuthTaskFailure::Unavailable);
         Err(AuthTaskFailure::Unavailable)
     }
 
@@ -197,7 +230,12 @@ impl DeferredAuthTask {
             let value = future.await;
             let _ = send.send(value);
         }))?;
-        receive.await.map_err(|_| AuthTaskFailure::Unavailable)
+        let value = receive.await.map_err(|_| AuthTaskFailure::Unavailable)?;
+        if let Some(failure) = self.known_failure() {
+            self.drop_refused(value, failure);
+            return Err(failure);
+        }
+        Ok(value)
     }
 }
 

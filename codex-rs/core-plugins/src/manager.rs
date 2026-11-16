@@ -166,6 +166,185 @@ const LOADED_PLUGINS_CACHE_CAPACITY: usize = 8;
 
 type EffectivePluginsChangedCallback = Arc<dyn Fn(EffectivePluginsChange) + Send + Sync + 'static>;
 
+/// Per-queue lifetime metadata, deliberately outside every cache identity.
+#[derive(Clone)]
+struct QueuedPluginRequest<T> {
+    request: T,
+    owner: Option<codex_model_provider::DeferredAuthTask>,
+    obligations: Vec<codex_model_provider::DeferredAuthTask>,
+    callback_owner: Option<codex_model_provider::DeferredAuthTask>,
+}
+impl<T> QueuedPluginRequest<T> {
+    fn prepare(registry: &crate::PluginTaskRegistry, request: T) -> Result<Self, ()> {
+        Ok(Self {
+            request,
+            owner: registry.prepare_auth_request()?,
+            obligations: Vec::new(),
+            callback_owner: None,
+        })
+    }
+
+    /// Only for a pending request whose effects are retained by coalescing.
+    /// Non-curated replacement/dedup does not transfer unrelated old work.
+    fn inherit(&mut self, previous: &Self) {
+        if self.owner.is_none() {
+            self.owner = previous.owner.clone();
+        } else {
+            self.obligations.extend(previous.owner.iter().cloned());
+        }
+        self.obligations
+            .extend(previous.obligations.iter().cloned());
+    }
+
+    fn mark_unavailable(&self) -> bool {
+        let mut managed = false;
+        for owner in self
+            .owner
+            .iter()
+            .chain(self.callback_owner.iter())
+            .chain(self.obligations.iter())
+        {
+            owner.record_failure(codex_model_provider::AuthTaskFailure::Unavailable);
+            managed = true;
+        }
+        managed
+    }
+}
+impl<T> std::ops::Deref for QueuedPluginRequest<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.request
+    }
+}
+impl<T> std::ops::DerefMut for QueuedPluginRequest<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.request
+    }
+}
+
+/// Kept by the accepted command itself, not its cancellable result observer.
+/// Refused/unpolled/panicked dispatch cannot silently finish inherited work.
+struct QueuedPluginObligations {
+    owners: Vec<codex_model_provider::DeferredAuthTask>,
+    completed: bool,
+}
+impl QueuedPluginObligations {
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+impl Drop for QueuedPluginObligations {
+    fn drop(&mut self) {
+        if !self.completed {
+            for owner in &self.owners {
+                owner.record_failure(codex_model_provider::AuthTaskFailure::Unavailable);
+            }
+        }
+    }
+}
+
+async fn run_queued_plugin_work<T: Send + 'static>(
+    owner: &Option<codex_model_provider::DeferredAuthTask>,
+    obligations: Vec<codex_model_provider::DeferredAuthTask>,
+    future: impl std::future::Future<Output = T> + Send + 'static,
+) -> Result<T, codex_model_provider::AuthTaskFailure> {
+    let mut obligations = QueuedPluginObligations {
+        owners: obligations,
+        completed: false,
+    };
+    let command = async move {
+        let value = future.await;
+        obligations.complete();
+        value
+    };
+    match owner {
+        Some(owner) => owner.run(command).await,
+        None => Ok(command.await),
+    }
+}
+
+async fn invoke_queued_plugin_callback(
+    callback: EffectivePluginsChangedCallback,
+    change: EffectivePluginsChange,
+    owner: Option<codex_model_provider::DeferredAuthTask>,
+    backend: Option<codex_model_provider::DeferredAuthTask>,
+) {
+    // A callback retained from A runs in A, not replacement backend B. A same-
+    // original callback runs directly, preserving synchronous effects/order and
+    // avoiding a command awaiting itself in its own serial mailbox.
+    let separate = owner.filter(|owner| {
+        backend
+            .as_ref()
+            .is_none_or(|backend| !owner.same_original(backend))
+    });
+    match separate {
+        Some(owner) => {
+            if let Err(failure) = owner
+                .run(async move {
+                    callback(change);
+                })
+                .await
+            {
+                codex_model_provider::record_auth_task_failure(failure);
+                warn!(?failure, "queued plugin callback custody failed");
+            }
+        }
+        None => callback(change),
+    }
+}
+
+enum AsyncPluginWorkerKind {
+    InstalledRefresh,
+    CatalogRefresh,
+}
+struct AsyncPluginWorkerReset {
+    manager: Arc<PluginsManager>,
+    kind: AsyncPluginWorkerKind,
+    armed: bool,
+}
+impl Drop for AsyncPluginWorkerReset {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Move captures out before dropping or marking them; no external
+        // destructor/host call runs under a queue write lock.
+        let managed = match self.kind {
+            AsyncPluginWorkerKind::InstalledRefresh => {
+                let abandoned = {
+                    let mut state = self
+                        .manager
+                        .remote_installed_plugins_cache_refresh_state
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    state.in_flight = false;
+                    state.requested.take()
+                };
+                abandoned
+                    .as_ref()
+                    .is_some_and(QueuedPluginRequest::mark_unavailable)
+            }
+            AsyncPluginWorkerKind::CatalogRefresh => {
+                let abandoned = {
+                    let mut state = self
+                        .manager
+                        .remote_catalog_cache_refresh_state
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    state.in_flight = false;
+                    std::mem::take(&mut state.requests)
+                };
+                abandoned.iter().fold(false, |managed, request| {
+                    request.mark_unavailable() || managed
+                })
+            }
+        };
+        if managed {
+            self.manager.task_registry.worker_stop().mark_unavailable();
+        }
+    }
+}
+
 enum BlockingPluginWorkerKind {
     MarketplaceUpgrade,
     NonCuratedRefresh,
@@ -173,9 +352,13 @@ enum BlockingPluginWorkerKind {
 struct BlockingPluginWorkerReset {
     manager: Arc<PluginsManager>,
     kind: BlockingPluginWorkerKind,
+    armed: bool,
 }
 impl Drop for BlockingPluginWorkerReset {
     fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
         match self.kind {
             BlockingPluginWorkerKind::MarketplaceUpgrade => {
                 self.manager
@@ -185,19 +368,27 @@ impl Drop for BlockingPluginWorkerReset {
                     .in_flight = false;
             }
             BlockingPluginWorkerKind::NonCuratedRefresh => {
-                let mut state = self
-                    .manager
-                    .non_curated_cache_refresh_state
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if state.in_flight || state.requested.is_some() {
-                    state.in_flight = false;
-                    state.requested = None;
-                    self.manager
-                        .non_curated_cache_refresh_completion
-                        .send_modify(|completion| {
-                            completion.sequence = completion.sequence.wrapping_add(1)
-                        });
+                let abandoned = {
+                    let mut state = self
+                        .manager
+                        .non_curated_cache_refresh_state
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if state.in_flight || state.requested.is_some() {
+                        state.in_flight = false;
+                        self.manager
+                            .non_curated_cache_refresh_completion
+                            .send_modify(|completion| {
+                                completion.sequence = completion.sequence.wrapping_add(1);
+                            });
+                    }
+                    state.requested.take()
+                };
+                if abandoned
+                    .as_ref()
+                    .is_some_and(QueuedPluginRequest::mark_unavailable)
+                {
+                    self.manager.task_registry.worker_stop().mark_unavailable();
                 }
             }
         }
@@ -260,7 +451,7 @@ fn dispatch_on_runtime(
         let runtime = invocation.runtime.clone();
         let _entered = runtime.enter();
         if registry
-            .spawn_on(&runtime, async move {
+            .spawn_callback_on(&runtime, async move {
                 invocation.call(change);
             })
             .is_err()
@@ -496,7 +687,7 @@ enum RemoteInstalledPluginsCacheRefreshNotify {
 
 #[derive(Default)]
 struct RemoteInstalledPluginsCacheRefreshState {
-    requested: Option<RemoteInstalledPluginsCacheRefreshRequest>,
+    requested: Option<QueuedPluginRequest<RemoteInstalledPluginsCacheRefreshRequest>>,
     in_flight: bool,
 }
 
@@ -520,7 +711,7 @@ impl RemoteCatalogCacheRefreshRequest {
 
 #[derive(Default)]
 struct RemoteCatalogCacheRefreshState {
-    requests: VecDeque<RemoteCatalogCacheRefreshRequest>,
+    requests: VecDeque<QueuedPluginRequest<RemoteCatalogCacheRefreshRequest>>,
     in_flight: bool,
 }
 
@@ -555,7 +746,7 @@ enum NonCuratedCacheRefreshMode {
 
 #[derive(Default)]
 struct NonCuratedCacheRefreshState {
-    requested: Option<NonCuratedCacheRefreshRequest>,
+    requested: Option<QueuedPluginRequest<NonCuratedCacheRefreshRequest>>,
     last_refreshed: Option<NonCuratedCacheRefreshRequest>,
     in_flight: bool,
 }
@@ -1823,7 +2014,7 @@ impl PluginsManager {
 
         let manager = Arc::clone(self);
         let config = config.clone();
-        let _ = self.task_registry.spawn(async move {
+        let _ = self.task_registry.spawn_callback(async move {
             manager
                 .recommended_plugins_mode_for_config(&config, auth.as_ref())
                 .await;
@@ -1895,7 +2086,7 @@ impl PluginsManager {
         };
         let manager = Arc::clone(self);
         let config = config.clone();
-        let admitted = self.task_registry.spawn(async move {
+        let admitted = self.task_registry.spawn_callback(async move {
             let _permit = permit;
             let result = manager
                 .reconcile_remote_installed_plugins_after_acquiring_gate(&config, Some(&auth))
@@ -3152,6 +3343,7 @@ impl PluginsManager {
                 let completion = BlockingPluginWorkerReset {
                     manager: manager.clone(),
                     kind: BlockingPluginWorkerKind::MarketplaceUpgrade,
+                    armed: true,
                 };
                 let Ok(runtime) = tokio::runtime::Handle::try_current() else {
                     warn!("failed to admit marketplace upgrade without a runtime");
@@ -3394,14 +3586,22 @@ impl PluginsManager {
 
     fn schedule_remote_installed_plugins_cache_refresh(
         self: &Arc<Self>,
-        mut request: RemoteInstalledPluginsCacheRefreshRequest,
+        request: RemoteInstalledPluginsCacheRefreshRequest,
     ) {
         if self.remote_installed_plugins_cache_generation_if_current(request.auth.as_ref())
             != Some(request.generation)
         {
             return;
         }
-        let should_spawn = {
+        let Ok(mut request) = QueuedPluginRequest::prepare(&self.task_registry, request) else {
+            warn!("failed to admit queued installed-plugin request");
+            return;
+        };
+        if request.request.on_effective_plugins_changed.is_some() {
+            request.callback_owner = request.owner.clone();
+        }
+        let mut discarded_callbacks = Vec::new();
+        let (should_spawn, displaced) = {
             let mut state = match self.remote_installed_plugins_cache_refresh_state.write() {
                 Ok(state) => state,
                 Err(err) => err.into_inner(),
@@ -3428,10 +3628,13 @@ impl PluginsManager {
                     && let Some(existing_callback) =
                         existing_request.on_effective_plugins_changed.as_ref()
                 {
+                    discarded_callbacks.extend(request.on_effective_plugins_changed.take());
                     request.on_effective_plugins_changed = Some(Arc::clone(existing_callback));
+                    request.callback_owner = existing_request.callback_owner.clone();
                 } else if request.on_effective_plugins_changed.is_none() {
                     request.on_effective_plugins_changed =
                         existing_request.on_effective_plugins_changed.clone();
+                    request.callback_owner = existing_request.callback_owner.clone();
                 }
                 for materialization in &existing_request.change.materialized_remote_plugins {
                     if !request
@@ -3450,35 +3653,34 @@ impl PluginsManager {
                     .change
                     .materialized_remote_plugins
                     .sort_by_key(|materialization| materialization.plugin_id.as_key());
+                request.inherit(existing_request);
             }
-            state.requested = Some(request);
-            if state.in_flight {
-                false
-            } else {
-                state.in_flight = true;
-                true
-            }
+            let displaced = state.requested.replace(request);
+            let should_spawn = !state.in_flight;
+            state.in_flight = true;
+            (should_spawn, displaced)
         };
+        drop(displaced);
+        drop(discarded_callbacks);
         if !should_spawn {
             return;
         }
 
         let manager = Arc::clone(self);
+        let completion = AsyncPluginWorkerReset {
+            manager: manager.clone(),
+            kind: AsyncPluginWorkerKind::InstalledRefresh,
+            armed: true,
+        };
         if self
             .task_registry
             .spawn(async move {
                 manager
-                    .run_remote_installed_plugins_cache_refresh_loop()
+                    .run_remote_installed_plugins_cache_refresh_loop(completion)
                     .await;
             })
             .is_err()
         {
-            let mut state = match self.remote_installed_plugins_cache_refresh_state.write() {
-                Ok(state) => state,
-                Err(err) => err.into_inner(),
-            };
-            state.in_flight = false;
-            state.requested = None;
             warn!("failed to admit schedule_remote_installed_plugins_cache_refresh task");
         }
     }
@@ -3487,55 +3689,77 @@ impl PluginsManager {
         self: &Arc<Self>,
         request: RemoteCatalogCacheRefreshRequest,
     ) {
-        let should_spawn = {
-            let mut state = match self.remote_catalog_cache_refresh_state.write() {
-                Ok(state) => state,
-                Err(err) => err.into_inner(),
-            };
-            if let Some(pending) = state
+        let Ok(mut request) = QueuedPluginRequest::prepare(&self.task_registry, request) else {
+            warn!("failed to admit queued catalog request");
+            return;
+        };
+        let (should_spawn, displaced) = {
+            let mut state = self
+                .remote_catalog_cache_refresh_state
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let displaced = if let Some(index) = state
                 .requests
-                .iter_mut()
-                .find(|pending| pending.has_same_cache_identity(&request))
+                .iter()
+                .position(|pending| pending.request.has_same_cache_identity(&request.request))
             {
-                pending.scopes.extend(request.scopes);
-                pending.auth = request.auth;
+                let mut previous = state
+                    .requests
+                    .remove(index)
+                    .expect("selected pending catalog request");
+                request
+                    .request
+                    .scopes
+                    .extend(previous.request.scopes.iter().cloned());
+                // Preserve the original pending service config and latest auth,
+                // exactly as the old coalescer; equality is not authority.
+                std::mem::swap(
+                    &mut request.request.service_config,
+                    &mut previous.request.service_config,
+                );
+                request.inherit(&previous);
+                state.requests.insert(index, request);
+                Some(previous)
             } else {
                 state.requests.push_back(request);
-            }
-            if state.in_flight {
-                false
-            } else {
-                state.in_flight = true;
-                true
-            }
+                None
+            };
+            let should_spawn = !state.in_flight;
+            state.in_flight = true;
+            (should_spawn, displaced)
         };
+        drop(displaced);
         if !should_spawn {
             return;
         }
-
         let manager = Arc::clone(self);
+        let completion = AsyncPluginWorkerReset {
+            manager: manager.clone(),
+            kind: AsyncPluginWorkerKind::CatalogRefresh,
+            armed: true,
+        };
         if self
             .task_registry
             .spawn(async move {
-                manager.run_remote_catalog_cache_refresh_loop().await;
+                manager
+                    .run_remote_catalog_cache_refresh_loop(completion)
+                    .await;
             })
             .is_err()
         {
-            let mut state = match self.remote_catalog_cache_refresh_state.write() {
-                Ok(state) => state,
-                Err(err) => err.into_inner(),
-            };
-            state.in_flight = false;
-            state.requests.clear();
             warn!("failed to admit schedule_remote_catalog_cache_refresh task");
         }
     }
 
     fn schedule_non_curated_plugin_cache_refresh(
         self: &Arc<Self>,
-        mut request: NonCuratedCacheRefreshRequest,
+        request: NonCuratedCacheRefreshRequest,
     ) {
-        let should_spawn = {
+        let Ok(mut request) = QueuedPluginRequest::prepare(&self.task_registry, request) else {
+            warn!("failed to admit queued non-curated request");
+            return;
+        };
+        let (should_spawn, displaced) = {
             let mut state = match self.non_curated_cache_refresh_state.write() {
                 Ok(state) => state,
                 Err(err) => err.into_inner(),
@@ -3567,7 +3791,7 @@ impl PluginsManager {
             }
             // Reconcile each canonical plugin generation once before publishing its resource.
             if state.requested.as_ref().is_some_and(|requested| {
-                requested == &request
+                requested.request == request.request
                     || (requested.git_mode == PluginGitMode::Manual
                         && request.git_mode == PluginGitMode::Automatic
                         && requested.roots == request.roots
@@ -3587,14 +3811,12 @@ impl PluginsManager {
             {
                 return;
             }
-            state.requested = Some(request);
-            if state.in_flight {
-                false
-            } else {
-                state.in_flight = true;
-                true
-            }
+            let displaced = state.requested.replace(request);
+            let should_spawn = !state.in_flight;
+            state.in_flight = true;
+            (should_spawn, displaced)
         };
+        drop(displaced);
         if !should_spawn {
             return;
         }
@@ -3603,12 +3825,12 @@ impl PluginsManager {
         let completion = BlockingPluginWorkerReset {
             manager: manager.clone(),
             kind: BlockingPluginWorkerKind::NonCuratedRefresh,
+            armed: true,
         };
         if let Err(()) =
             self.task_registry
                 .spawn_thread("plugins-non-curated-cache-refresh", move || {
-                    let _completion = completion;
-                    manager.run_non_curated_plugin_cache_refresh_loop();
+                    manager.run_non_curated_plugin_cache_refresh_loop(completion);
                 })
         {
             warn!("failed to admit non-curated plugin cache refresh task");
@@ -3701,136 +3923,217 @@ impl PluginsManager {
         }
     }
 
-    async fn run_remote_installed_plugins_cache_refresh_loop(self: Arc<Self>) {
+    async fn run_remote_installed_plugins_cache_refresh_loop(
+        self: Arc<Self>,
+        mut completion: AsyncPluginWorkerReset,
+    ) {
         loop {
-            let request = {
-                let mut state = match self.remote_installed_plugins_cache_refresh_state.write() {
-                    Ok(state) => state,
-                    Err(err) => err.into_inner(),
-                };
+            if let Err(error) = self
+                .task_registry
+                .worker_stop()
+                .ensure_running("next installed cache request")
+            {
+                warn!(%error, "installed plugin cache worker stopped");
+                return;
+            }
+            let queued = {
+                let mut state = self
+                    .remote_installed_plugins_cache_refresh_state
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 match state.requested.take() {
                     Some(request) => request,
                     None => {
+                        completion.armed = false;
                         state.in_flight = false;
                         return;
                     }
                 }
             };
-
-            let plugins = crate::remote::fetch_remote_installed_plugins(
-                &request.service_config,
-                request.auth.as_ref(),
-            )
+            let QueuedPluginRequest {
+                request,
+                owner,
+                obligations,
+                callback_owner,
+            } = queued;
+            let manager = Arc::clone(&self);
+            let backend_owner = owner.clone();
+            let result = run_queued_plugin_work(&owner, obligations, async move {
+                manager
+                    .refresh_remote_installed_request(request, callback_owner, backend_owner)
+                    .await;
+            })
             .await;
-            match plugins {
-                Ok(plugins) => {
-                    let Some(update) = self.write_remote_installed_plugins_cache_snapshot(
-                        request.generation,
-                        plugins,
-                        request.auth.as_ref(),
-                        RemoteInstalledPluginsCachePublication::Refresh(
-                            InstalledPluginDisplayAssets::Include,
-                        ),
-                    ) else {
-                        continue;
-                    };
-                    let should_notify = update.metadata_change_id.is_some()
-                        || !request.change.materialized_remote_plugins.is_empty()
-                        || matches!(
-                            request.notify,
-                            RemoteInstalledPluginsCacheRefreshNotify::AfterSuccessfulRefresh
-                        );
-                    if should_notify
-                        && let Some(on_effective_plugins_changed) =
-                            request.on_effective_plugins_changed
-                    {
-                        let mut change = request.change;
-                        change.metadata_change_id = update.metadata_change_id;
-                        on_effective_plugins_changed(change);
+            if let Err(failure) = result {
+                self.task_registry.worker_stop().mark_unavailable();
+                warn!(?failure, "installed plugin queued operation custody failed");
+                return;
+            }
+        }
+    }
+
+    async fn refresh_remote_installed_request(
+        &self,
+        request: RemoteInstalledPluginsCacheRefreshRequest,
+        callback_owner: Option<codex_model_provider::DeferredAuthTask>,
+        backend_owner: Option<codex_model_provider::DeferredAuthTask>,
+    ) {
+        let plugins = crate::remote::fetch_remote_installed_plugins(
+            &request.service_config,
+            request.auth.as_ref(),
+        )
+        .await;
+        match plugins {
+            Ok(plugins) => {
+                let Some(update) = self.write_remote_installed_plugins_cache_snapshot(
+                    request.generation,
+                    plugins,
+                    request.auth.as_ref(),
+                    RemoteInstalledPluginsCachePublication::Refresh(
+                        InstalledPluginDisplayAssets::Include,
+                    ),
+                ) else {
+                    return;
+                };
+                let should_notify = update.metadata_change_id.is_some()
+                    || !request.change.materialized_remote_plugins.is_empty()
+                    || matches!(
+                        request.notify,
+                        RemoteInstalledPluginsCacheRefreshNotify::AfterSuccessfulRefresh
+                    );
+                if should_notify
+                    && let Some(on_effective_plugins_changed) = request.on_effective_plugins_changed
+                {
+                    let mut change = request.change;
+                    change.metadata_change_id = update.metadata_change_id;
+                    invoke_queued_plugin_callback(
+                        on_effective_plugins_changed,
+                        change,
+                        callback_owner.clone(),
+                        backend_owner.clone(),
+                    )
+                    .await;
+                }
+            }
+            Err(
+                RemotePluginCatalogError::AuthRequired
+                | RemotePluginCatalogError::UnsupportedAuthMode,
+            ) => {
+                let Some(changed) =
+                    self.clear_remote_installed_plugins_cache_if_current(request.generation)
+                else {
+                    return;
+                };
+                if changed
+                    && let Some(on_effective_plugins_changed) = request.on_effective_plugins_changed
+                {
+                    invoke_queued_plugin_callback(
+                        on_effective_plugins_changed,
+                        EffectivePluginsChange::default(),
+                        callback_owner.clone(),
+                        backend_owner.clone(),
+                    )
+                    .await;
+                }
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    materialized_remote_plugin_count = request
+                        .change
+                        .materialized_remote_plugins
+                        .len(),
+                    "failed to refresh remote installed plugins cache"
+                );
+            }
+        }
+    }
+
+    async fn run_remote_catalog_cache_refresh_loop(
+        self: Arc<Self>,
+        mut completion: AsyncPluginWorkerReset,
+    ) {
+        loop {
+            if let Err(error) = self
+                .task_registry
+                .worker_stop()
+                .ensure_running("next catalog cache request")
+            {
+                warn!(%error, "catalog plugin cache worker stopped");
+                return;
+            }
+            let queued = {
+                let mut state = self
+                    .remote_catalog_cache_refresh_state
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match state.requests.pop_front() {
+                    Some(request) => request,
+                    None => {
+                        completion.armed = false;
+                        state.in_flight = false;
+                        return;
                     }
                 }
+            };
+            let QueuedPluginRequest {
+                request,
+                owner,
+                obligations,
+                callback_owner: _,
+            } = queued;
+            let manager = Arc::clone(&self);
+            if let Err(failure) = run_queued_plugin_work(&owner, obligations, async move {
+                manager.refresh_remote_catalog_request(request).await;
+            })
+            .await
+            {
+                self.task_registry.worker_stop().mark_unavailable();
+                warn!(?failure, "catalog plugin queued operation custody failed");
+                return;
+            }
+        }
+    }
+
+    async fn refresh_remote_catalog_request(&self, request: RemoteCatalogCacheRefreshRequest) {
+        for scope in request.scopes {
+            if crate::remote::has_fresh_cached_remote_plugin_catalog(
+                self.codex_home.as_path(),
+                &request.service_config,
+                request.auth.as_ref(),
+                scope,
+            ) {
+                continue;
+            }
+
+            match crate::remote::fetch_and_cache_remote_plugin_catalog(
+                self.codex_home.as_path(),
+                &request.service_config,
+                request.auth.as_ref(),
+                scope,
+            )
+            .await
+            {
+                Ok(()) => {}
                 Err(
                     RemotePluginCatalogError::AuthRequired
                     | RemotePluginCatalogError::UnsupportedAuthMode,
-                ) => {
-                    let Some(changed) =
-                        self.clear_remote_installed_plugins_cache_if_current(request.generation)
-                    else {
-                        continue;
-                    };
-                    if changed
-                        && let Some(on_effective_plugins_changed) =
-                            request.on_effective_plugins_changed
-                    {
-                        on_effective_plugins_changed(EffectivePluginsChange::default());
-                    }
-                }
+                ) => {}
                 Err(err) => {
                     warn!(
                         error = %err,
-                        materialized_remote_plugin_count = request
-                            .change
-                            .materialized_remote_plugins
-                            .len(),
-                        "failed to refresh remote installed plugins cache"
+                        scope = ?scope,
+                        "failed to refresh cached remote plugin catalog"
                     );
                 }
             }
         }
     }
 
-    async fn run_remote_catalog_cache_refresh_loop(self: Arc<Self>) {
-        loop {
-            let request = {
-                let mut state = match self.remote_catalog_cache_refresh_state.write() {
-                    Ok(state) => state,
-                    Err(err) => err.into_inner(),
-                };
-                match state.requests.pop_front() {
-                    Some(request) => request,
-                    None => {
-                        state.in_flight = false;
-                        return;
-                    }
-                }
-            };
-
-            for scope in request.scopes {
-                if crate::remote::has_fresh_cached_remote_plugin_catalog(
-                    self.codex_home.as_path(),
-                    &request.service_config,
-                    request.auth.as_ref(),
-                    scope,
-                ) {
-                    continue;
-                }
-
-                match crate::remote::fetch_and_cache_remote_plugin_catalog(
-                    self.codex_home.as_path(),
-                    &request.service_config,
-                    request.auth.as_ref(),
-                    scope,
-                )
-                .await
-                {
-                    Ok(()) => {}
-                    Err(
-                        RemotePluginCatalogError::AuthRequired
-                        | RemotePluginCatalogError::UnsupportedAuthMode,
-                    ) => {}
-                    Err(err) => {
-                        warn!(
-                            error = %err,
-                            scope = ?scope,
-                            "failed to refresh cached remote plugin catalog"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    fn run_non_curated_plugin_cache_refresh_loop(self: Arc<Self>) {
+    fn run_non_curated_plugin_cache_refresh_loop(
+        self: Arc<Self>,
+        mut completion: BlockingPluginWorkerReset,
+    ) {
         loop {
             if let Err(error) =
                 crate::retirement::ensure_worker_running("next non-curated cache request")
@@ -3851,6 +4154,7 @@ impl PluginsManager {
                     Ok(state) => state,
                     Err(err) => err.into_inner(),
                 };
+                completion.armed = false;
                 state.in_flight = false;
                 self.non_curated_cache_refresh_completion
                     .send_modify(|completion| {
@@ -3859,23 +4163,37 @@ impl PluginsManager {
                 return;
             };
 
-            let refresh_result = match request.mode {
-                NonCuratedCacheRefreshMode::IfVersionChanged => {
-                    refresh_non_curated_plugin_cache_detailed(
-                        self.codex_home.as_path(),
-                        &request.roots,
-                        &request.configured_plugin_keys,
-                        request.git_mode,
-                    )
+            let refresh_result = if let Some(owner) = request.owner.as_ref() {
+                let owner = owner.clone();
+                let manager = Arc::clone(&self);
+                let physical_request = request.request.clone();
+                let stop = self.task_registry.worker_stop();
+                let result = tokio::runtime::Handle::current().block_on(async move {
+                    owner
+                        .run(async move {
+                            codex_model_provider::run_blocking_call_with_scope(
+                                move || crate::retirement::WorkerStopScope::enter(stop),
+                                move || manager.refresh_non_curated_request(&physical_request),
+                            )
+                            .await
+                        })
+                        .await
+                });
+                match result {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(error)) => {
+                        self.task_registry.worker_stop().mark_unavailable();
+                        Err(format!("non-curated physical task custody failed: {error}"))
+                    }
+                    Err(failure) => {
+                        self.task_registry.worker_stop().mark_unavailable();
+                        Err(format!(
+                            "non-curated queued task custody failed: {failure:?}"
+                        ))
+                    }
                 }
-                NonCuratedCacheRefreshMode::ForceReinstall => {
-                    refresh_non_curated_plugin_cache_force_reinstall_detailed(
-                        self.codex_home.as_path(),
-                        &request.roots,
-                        &request.configured_plugin_keys,
-                        request.git_mode,
-                    )
-                }
+            } else {
+                self.refresh_non_curated_request(&request.request)
             };
             let (refreshed, cache_changed) = match refresh_result {
                 Ok(refresh_outcome) => {
@@ -3906,13 +4224,17 @@ impl PluginsManager {
                 Err(err) => err.into_inner(),
             };
             if refreshed {
-                state.last_refreshed = Some(request.clone());
+                state.last_refreshed = Some(request.request.clone());
             }
-            let complete = state.requested.as_ref() == Some(&request);
-            if complete {
-                state.requested = None;
+            let complete =
+                state.requested.as_ref().map(|queued| &queued.request) == Some(&request.request);
+            let retired = if complete {
+                completion.armed = false;
                 state.in_flight = false;
-            }
+                state.requested.take()
+            } else {
+                None
+            };
             self.non_curated_cache_refresh_completion
                 .send_modify(|completion| {
                     completion.sequence = completion.sequence.wrapping_add(1);
@@ -3920,8 +4242,34 @@ impl PluginsManager {
                         completion.changed_sequence = completion.changed_sequence.wrapping_add(1);
                     }
                 });
+            drop(state);
+            drop(retired);
             if complete {
                 return;
+            }
+        }
+    }
+
+    fn refresh_non_curated_request(
+        &self,
+        request: &NonCuratedCacheRefreshRequest,
+    ) -> Result<crate::loader::NonCuratedCacheRefreshOutcome, String> {
+        match request.mode {
+            NonCuratedCacheRefreshMode::IfVersionChanged => {
+                refresh_non_curated_plugin_cache_detailed(
+                    self.codex_home.as_path(),
+                    &request.roots,
+                    &request.configured_plugin_keys,
+                    request.git_mode,
+                )
+            }
+            NonCuratedCacheRefreshMode::ForceReinstall => {
+                refresh_non_curated_plugin_cache_force_reinstall_detailed(
+                    self.codex_home.as_path(),
+                    &request.roots,
+                    &request.configured_plugin_keys,
+                    request.git_mode,
+                )
             }
         }
     }

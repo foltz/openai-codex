@@ -302,11 +302,19 @@ impl PluginTaskRegistry {
     pub fn prepare_auth_request(
         &self,
     ) -> Result<Option<codex_model_provider::DeferredAuthTask>, ()> {
-        self.poll_originals()?;
+        self.poll_originals().map_err(|_| {
+            codex_model_provider::record_auth_task_failure(
+                codex_model_provider::AuthTaskFailure::Unavailable,
+            );
+        })?;
         let (attach, receive) = tokio::sync::oneshot::channel::<BoxFuture<'static, JoinOutcome>>();
         {
             let mut state = self.state.lock().map_err(|_| ())?;
             if state.closed {
+                drop(state);
+                codex_model_provider::record_auth_task_failure(
+                    codex_model_provider::AuthTaskFailure::Refused,
+                );
                 return Err(());
             }
             state.compact();
@@ -352,6 +360,30 @@ impl PluginTaskRegistry {
             return Err(());
         }
         result
+    }
+
+    pub(crate) fn spawn_callback(
+        &self,
+        future: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<(), ()> {
+        let runtime = Handle::try_current().map_err(|_| ())?;
+        self.spawn_callback_on(&runtime, future)
+    }
+
+    /// Callback runtime hops derive from the invoking finite scope, never from
+    /// a root captured by the reusable callback factory.
+    pub(crate) fn spawn_callback_on(
+        &self,
+        runtime: &Handle,
+        future: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<(), ()> {
+        let _entered = runtime.enter();
+        match self.prepare_auth_request()? {
+            Some(request) => request.dispatch(Box::pin(future)).map_err(|failure| {
+                codex_model_provider::record_auth_task_failure(failure);
+            }),
+            None => self.spawn_on(runtime, future).map(|_| ()),
+        }
     }
 
     pub(crate) fn spawn(

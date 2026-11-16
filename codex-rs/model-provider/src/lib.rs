@@ -4,8 +4,8 @@ mod auth_task;
 pub use auth_task::{
     AuthBlockingCallError, AuthTaskAccess, AuthTaskBlocking, AuthTaskFailure, AuthTaskFuture,
     AuthTaskObservation, AuthTaskSpawner, DeferredAuthTask, prepare_deferred_auth_task,
-    run_auth_call, run_blocking_call, run_blocking_call_with_scope, spawn_provider_task,
-    spawn_provider_task_with_access, with_auth_task_scope,
+    record_auth_task_failure, run_auth_call, run_blocking_call, run_blocking_call_with_scope,
+    spawn_provider_task, spawn_provider_task_with_access, with_auth_task_scope,
 };
 mod bearer_auth_provider;
 mod capabilities;

@@ -6895,7 +6895,7 @@ enabled = true
             state.requested.as_ref().map(|request| request.git_mode),
             Some(PluginGitMode::Manual)
         ));
-        state.last_refreshed = state.requested.take();
+        state.last_refreshed = state.requested.take().map(|queued| queued.request);
         state.in_flight = false;
     }
 
@@ -8708,17 +8708,23 @@ async fn blocking_plugin_panic_resets_pending_cache_request_without_clean_join()
     {
         let mut state = manager.non_curated_cache_refresh_state.write().unwrap();
         state.in_flight = true;
-        state.requested = Some(NonCuratedCacheRefreshRequest {
-            roots: Vec::new(),
-            configured_plugin_keys: Vec::new(),
-            configured_plugin_sources: Vec::new(),
-            mode: NonCuratedCacheRefreshMode::IfVersionChanged,
-            git_mode: PluginGitMode::Automatic,
+        state.requested = Some(QueuedPluginRequest {
+            request: NonCuratedCacheRefreshRequest {
+                roots: Vec::new(),
+                configured_plugin_keys: Vec::new(),
+                configured_plugin_sources: Vec::new(),
+                mode: NonCuratedCacheRefreshMode::IfVersionChanged,
+                git_mode: PluginGitMode::Automatic,
+            },
+            owner: None,
+            obligations: Vec::new(),
+            callback_owner: None,
         });
     }
     let completion = BlockingPluginWorkerReset {
         manager: manager.clone(),
         kind: BlockingPluginWorkerKind::NonCuratedRefresh,
+        armed: true,
     };
     let receipt = manager
         .task_registry
@@ -8791,4 +8797,797 @@ fn missing_runtime_refuses_both_blocking_workers_without_stuck_gates() {
             .block_on(manager.shutdown_until(tokio::time::Instant::now()))
             .is_clean()
     );
+}
+
+// These hosts retain actual original Tokio joins. Their marker is read by the
+// real HTTP selector / physical body, not used as an account-work counter.
+tokio::task_local! { static QUEUED_TEST_ORIGIN: u64; }
+type QueuedTestReceipt = futures::future::Shared<
+    futures::future::BoxFuture<'static, Result<(), codex_model_provider::AuthTaskFailure>>,
+>;
+struct QueuedTestHost {
+    origin: u64,
+    originals: std::sync::Mutex<Vec<QueuedTestReceipt>>,
+    physical: Arc<std::sync::Mutex<Vec<u64>>>,
+    gate: std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, std::sync::mpsc::Receiver<()>)>>,
+}
+impl std::fmt::Debug for QueuedTestHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("QueuedTestHost").field(&self.origin).finish()
+    }
+}
+impl QueuedTestHost {
+    fn new(origin: u64) -> Arc<Self> {
+        Arc::new(Self {
+            origin,
+            originals: Default::default(),
+            physical: Default::default(),
+            gate: Default::default(),
+        })
+    }
+    fn access(self: &Arc<Self>) -> codex_model_provider::AuthTaskAccess {
+        codex_model_provider::AuthTaskAccess::Admitted(self.clone())
+    }
+    fn track(
+        &self,
+        original: tokio::task::JoinHandle<()>,
+    ) -> codex_model_provider::AuthTaskObservation {
+        use futures::FutureExt;
+        let receipt = async move {
+            original.await.map_err(|error| {
+                if error.is_cancelled() {
+                    codex_model_provider::AuthTaskFailure::Cancelled
+                } else {
+                    codex_model_provider::AuthTaskFailure::Panicked
+                }
+            })
+        }
+        .boxed()
+        .shared();
+        self.originals.lock().unwrap().push(receipt.clone());
+        Box::pin(receipt)
+    }
+    fn pending(&self) -> usize {
+        use futures::FutureExt;
+        let originals = self.originals.lock().unwrap().clone();
+        originals
+            .into_iter()
+            .filter(|receipt| receipt.clone().now_or_never().is_none())
+            .count()
+    }
+    async fn joined(&self) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let originals = self.originals.lock().unwrap().clone();
+            let count = originals.len();
+            let results = tokio::time::timeout_at(deadline, futures::future::join_all(originals))
+                .await
+                .expect("actual host originals still pending");
+            assert!(
+                results.iter().all(Result::is_ok),
+                "actual host join failure: {results:?}"
+            );
+            if count == self.originals.lock().unwrap().len() {
+                return;
+            }
+        }
+    }
+    fn hold_physical(&self) -> (Arc<tokio::sync::Semaphore>, std::sync::mpsc::Sender<()>) {
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let (release, wait) = std::sync::mpsc::channel();
+        *self.gate.lock().unwrap() = Some((entered.clone(), wait));
+        (entered, release)
+    }
+}
+impl codex_model_provider::AuthTaskSpawner for QueuedTestHost {
+    fn spawn(
+        &self,
+        future: codex_model_provider::AuthTaskFuture,
+    ) -> Result<codex_model_provider::AuthTaskObservation, codex_model_provider::AuthTaskFailure>
+    {
+        Ok(self.track(tokio::spawn(QUEUED_TEST_ORIGIN.scope(self.origin, future))))
+    }
+    fn spawn_blocking(
+        &self,
+        task: codex_model_provider::AuthTaskBlocking,
+    ) -> Result<codex_model_provider::AuthTaskObservation, codex_model_provider::AuthTaskFailure>
+    {
+        let origin = self.origin;
+        let physical = self.physical.clone();
+        let gate = self.gate.lock().unwrap().take();
+        Ok(self.track(tokio::task::spawn_blocking(move || {
+            QUEUED_TEST_ORIGIN.sync_scope(origin, || {
+                physical.lock().unwrap().push(origin);
+                if let Some((entered, wait)) = gate {
+                    entered.add_permits(1);
+                    let _ = wait.recv(); // Sender drop releases this test-only gate on failure too.
+                }
+                task();
+            })
+        })))
+    }
+}
+
+#[derive(Debug)]
+struct QueuedOriginSelector {
+    delegate: Arc<dyn crate::http_client_selector::HttpClientSelector>,
+    records: Arc<std::sync::Mutex<Vec<(String, Option<u64>)>>>,
+}
+impl QueuedOriginSelector {
+    fn record(&self, url: &str) {
+        self.records.lock().unwrap().push((
+            url.to_owned(),
+            QUEUED_TEST_ORIGIN.try_with(|origin| *origin).ok(),
+        ));
+    }
+}
+impl crate::http_client_selector::HttpClientSelector for QueuedOriginSelector {
+    fn for_current_account(&self) -> Arc<dyn crate::http_client_selector::HttpClientSelector> {
+        Arc::new(Self {
+            delegate: self.delegate.for_current_account(),
+            records: self.records.clone(),
+        })
+    }
+    fn request(&self, method: http::Method, url: &str) -> codex_http_client::RequestBuilder {
+        self.record(url);
+        self.delegate.request(method, url)
+    }
+    fn request_for_account(
+        &self,
+        method: http::Method,
+        url: &str,
+        binding: &codex_http_client::NetworkPolicy,
+    ) -> Option<codex_http_client::RequestBuilder> {
+        self.record(url);
+        self.delegate.request_for_account(method, url, binding)
+    }
+    fn outbound_proxy_policy(&self) -> codex_http_client::OutboundProxyPolicy {
+        self.delegate.outbound_proxy_policy()
+    }
+}
+fn queued_recording_config(
+    base: &str,
+) -> (
+    RemotePluginServiceConfig,
+    Arc<std::sync::Mutex<Vec<(String, Option<u64>)>>>,
+) {
+    let mut config =
+        RemotePluginServiceConfig::new(base.to_owned(), test_http_client_factory(), None);
+    let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+    config.http_clients = Arc::new(QueuedOriginSelector {
+        delegate: config.http_clients,
+        records: records.clone(),
+    });
+    (config, records)
+}
+fn queued_auth(token: &str) -> CodexAuth {
+    CodexAuth::from_external_chatgpt_tokens(token, "queue-account", None).unwrap()
+}
+async fn queued_wait(entered: &tokio::sync::Semaphore) {
+    tokio::time::timeout(Duration::from_secs(2), entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn catalog_queue_coalesces_scopes_under_latest_request_original_and_auth() {
+    let home = TempDir::new().unwrap();
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/ps/plugins/list"))
+        .and(header("authorization", "Bearer header.e30.catalog-new"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"plugins":[],"pagination":{"next_page_token":null}}),
+            ),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+    let (config, records) = queued_recording_config(&server.uri());
+    let a = QueuedTestHost::new(1);
+    let b = QueuedTestHost::new(2);
+    // No yield between scheduler calls: both real pending requests coalesce
+    // before the actual coordinator's first poll on this current-thread runtime.
+    codex_model_provider::with_auth_task_scope(a.access(), async {
+        manager.schedule_remote_catalog_cache_refresh(RemoteCatalogCacheRefreshRequest {
+            service_config: config.clone(),
+            auth: Some(queued_auth("header.e30.catalog-old")),
+            scopes: [RemotePluginScope::Global].into(),
+        });
+    })
+    .await
+    .unwrap();
+    codex_model_provider::with_auth_task_scope(b.access(), async {
+        manager.schedule_remote_catalog_cache_refresh(RemoteCatalogCacheRefreshRequest {
+            service_config: config,
+            auth: Some(queued_auth("header.e30.catalog-new")),
+            scopes: [RemotePluginScope::Workspace].into(),
+        });
+    })
+    .await
+    .unwrap();
+    {
+        let state = manager.remote_catalog_cache_refresh_state.read().unwrap();
+        assert_eq!(state.requests.len(), 1);
+        assert_eq!(
+            state.requests[0].scopes,
+            [RemotePluginScope::Global, RemotePluginScope::Workspace].into()
+        );
+        assert_eq!(state.requests[0].obligations.len(), 1);
+    }
+    assert!(a.pending() > 0 && b.pending() > 0);
+    assert!(
+        manager
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await
+            .is_clean()
+    );
+    a.joined().await;
+    b.joined().await;
+    let records = records.lock().unwrap();
+    assert_eq!(records.len(), 2);
+    assert!(
+        records.iter().all(|(_, origin)| *origin == Some(2)),
+        "actual HTTP must execute in B, not an unscoped worker: {records:?}"
+    );
+    server.verify().await;
+}
+
+struct ReenterInstalledQueueOnDrop {
+    manager: std::sync::Weak<PluginsManager>,
+    dropped: Arc<std::sync::atomic::AtomicBool>,
+}
+impl Drop for ReenterInstalledQueueOnDrop {
+    fn drop(&mut self) {
+        if let Some(manager) = self.manager.upgrade() {
+            drop(
+                manager
+                    .remote_installed_plugins_cache_refresh_state
+                    .write()
+                    .unwrap(),
+            );
+        }
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+#[test_case::test_case(false; "managed_replacement")]
+#[test_case::test_case(true; "independent_replacement")]
+#[tokio::test(flavor = "current_thread")]
+async fn installed_queue_keeps_prior_callback_original_and_latest_backend(independent: bool) {
+    let home = TempDir::new().unwrap();
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/ps/plugins/installed"))
+        .and(header("authorization", "Bearer header.e30.installed-new"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"plugins":[],"pagination":{"next_page_token":null}}),
+            ),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+    let (config, records) = queued_recording_config(&server.uri());
+    let a = QueuedTestHost::new(1);
+    let b = QueuedTestHost::new(2);
+    let generation = manager
+        .prepare_remote_installed_plugins_cache_generation(Some(&queued_auth(
+            "header.e30.installed-old",
+        )))
+        .unwrap();
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let callback_origins = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_changes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let callback: EffectivePluginsChangedCallback = {
+        let (entered, release, origins, changes) = (
+            entered.clone(),
+            release.clone(),
+            callback_origins.clone(),
+            seen_changes.clone(),
+        );
+        Arc::new(move |change| {
+            origins
+                .lock()
+                .unwrap()
+                .push(QUEUED_TEST_ORIGIN.try_with(|origin| *origin).ok());
+            changes.lock().unwrap().push(change);
+            let (entered, release) = (entered.clone(), release.clone());
+            let original = codex_model_provider::spawn_provider_task(Box::pin(async move {
+                entered.add_permits(1);
+                release.acquire().await.unwrap().forget();
+            }))
+            .unwrap();
+            assert!(
+                original.is_some(),
+                "callback descendant must have A's actual host original"
+            );
+            drop(original);
+        })
+    };
+    let materialization = RemotePluginMaterialization {
+        plugin_id: PluginId::new("retained".into(), "workspace".into()).unwrap(),
+        scope: RemotePluginScope::Workspace,
+        discoverability: Some(crate::remote::RemotePluginShareDiscoverability::Listed),
+        authenticated_account_id: Some("queue-account".into()),
+    };
+    codex_model_provider::with_auth_task_scope(a.access(), async {
+        manager.schedule_remote_installed_plugins_cache_refresh(
+            RemoteInstalledPluginsCacheRefreshRequest {
+                generation,
+                service_config: config.clone(),
+                auth: Some(queued_auth("header.e30.installed-old")),
+                notify: RemoteInstalledPluginsCacheRefreshNotify::IfCacheChanged,
+                on_effective_plugins_changed: Some(callback),
+                change: EffectivePluginsChange {
+                    metadata_change_id: None,
+                    materialized_remote_plugins: vec![materialization],
+                },
+            },
+        );
+    })
+    .await
+    .unwrap();
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let wrong_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let guard = ReenterInstalledQueueOnDrop {
+        manager: Arc::downgrade(&manager),
+        dropped: dropped.clone(),
+    };
+    let wrong = wrong_called.clone();
+    let replacement: EffectivePluginsChangedCallback = Arc::new(move |_| {
+        std::hint::black_box(&guard);
+        wrong.store(true, Ordering::SeqCst);
+    });
+    let schedule = async {
+        manager.schedule_remote_installed_plugins_cache_refresh(
+            RemoteInstalledPluginsCacheRefreshRequest {
+                generation,
+                service_config: config,
+                auth: Some(queued_auth("header.e30.installed-new")),
+                notify: RemoteInstalledPluginsCacheRefreshNotify::AfterSuccessfulRefresh,
+                on_effective_plugins_changed: Some(replacement),
+                change: Default::default(),
+            },
+        );
+    };
+    if independent {
+        schedule.await;
+    } else {
+        codex_model_provider::with_auth_task_scope(b.access(), schedule)
+            .await
+            .unwrap();
+    }
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "superseded capture dropped outside queue lock"
+    );
+    queued_wait(&entered).await;
+    // Callback A and its descendant outlive B's body; B never owns that child.
+    b.joined().await;
+    assert!(a.pending() > 0);
+    assert_eq!(*callback_origins.lock().unwrap(), vec![Some(1)]);
+    assert!(!wrong_called.load(Ordering::SeqCst));
+    assert_eq!(
+        seen_changes.lock().unwrap()[0]
+            .materialized_remote_plugins
+            .len(),
+        1
+    );
+    release.add_permits(1);
+    assert!(
+        manager
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await
+            .is_clean()
+    );
+    a.joined().await;
+    let records = records.lock().unwrap();
+    assert_eq!(records.len(), 2);
+    assert!(
+        records
+            .iter()
+            .all(|(_, origin)| *origin == Some(if independent { 1 } else { 2 })),
+        "actual backend lineage: {records:?}"
+    );
+    server.verify().await;
+}
+
+fn queued_local_marketplace(
+    home: &Path,
+    root: &Path,
+    version: &str,
+) -> NonCuratedCacheRefreshRequest {
+    fs::create_dir_all(root.join(".git")).unwrap();
+    write_plugin_with_version(root, "sample-plugin", "sample-plugin", Some(version));
+    write_file(
+        &root.join(".agents/plugins/marketplace.json"),
+        r#"{"name":"debug","plugins":[{"name":"sample-plugin","source":{"source":"local","path":"./sample-plugin"}}]}"#,
+    );
+    write_file(
+        &home.join(CONFIG_TOML_FILE),
+        "[features]\nplugins = true\n[plugins.\"sample-plugin@debug\"]\nenabled = true\n",
+    );
+    NonCuratedCacheRefreshRequest {
+        roots: vec![AbsolutePathBuf::try_from(root.to_owned()).unwrap()],
+        configured_plugin_keys: vec!["sample-plugin@debug".into()],
+        configured_plugin_sources: Vec::new(),
+        mode: NonCuratedCacheRefreshMode::ForceReinstall,
+        git_mode: PluginGitMode::Automatic,
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn non_curated_queue_owns_each_actual_physical_body_without_caching_roots() {
+    let home = TempDir::new().unwrap();
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    let a = QueuedTestHost::new(1);
+    let b = QueuedTestHost::new(2);
+    let (a_started, a_release) = a.hold_physical();
+    let (b_started, b_release) = b.hold_physical();
+    let first = queued_local_marketplace(home.path(), &home.path().join("first"), "1.0.0");
+    let second = queued_local_marketplace(home.path(), &home.path().join("second"), "2.0.0");
+    let expected_roots = second.roots.clone();
+    codex_model_provider::with_auth_task_scope(a.access(), async {
+        manager.schedule_non_curated_plugin_cache_refresh(first);
+    })
+    .await
+    .unwrap();
+    queued_wait(&a_started).await;
+    codex_model_provider::with_auth_task_scope(b.access(), async {
+        manager.schedule_non_curated_plugin_cache_refresh(second);
+    })
+    .await
+    .unwrap();
+    assert!(a.pending() > 0 && b.pending() > 0);
+    a_release.send(()).unwrap();
+    queued_wait(&b_started).await;
+    a.joined().await;
+    assert!(b.pending() > 0);
+    assert!(
+        home.path()
+            .join("plugins/cache/debug/sample-plugin/1.0.0")
+            .is_dir()
+    );
+    assert!(
+        !home
+            .path()
+            .join("plugins/cache/debug/sample-plugin/2.0.0")
+            .exists()
+    );
+    b_release.send(()).unwrap();
+    assert!(
+        manager
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await
+            .is_clean()
+    );
+    b.joined().await;
+    assert!(
+        home.path()
+            .join("plugins/cache/debug/sample-plugin/2.0.0")
+            .is_dir()
+    );
+    assert_eq!(*a.physical.lock().unwrap(), vec![1]);
+    assert_eq!(*b.physical.lock().unwrap(), vec![2]);
+    let state = manager.non_curated_cache_refresh_state.read().unwrap();
+    assert_eq!(state.last_refreshed.as_ref().unwrap().roots, expected_roots);
+    assert!(!state.in_flight && state.requested.is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn non_curated_queue_dedup_releases_unused_request_without_borrowing_active_root() {
+    let home = TempDir::new().unwrap();
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    let a = QueuedTestHost::new(1);
+    let b = QueuedTestHost::new(2);
+    let (started, release) = a.hold_physical();
+    let request = queued_local_marketplace(home.path(), &home.path().join("repo"), "1.0.0");
+    codex_model_provider::with_auth_task_scope(a.access(), async {
+        manager.schedule_non_curated_plugin_cache_refresh(request.clone());
+    })
+    .await
+    .unwrap();
+    queued_wait(&started).await;
+    codex_model_provider::with_auth_task_scope(b.access(), async {
+        manager.schedule_non_curated_plugin_cache_refresh(request);
+    })
+    .await
+    .unwrap();
+    b.joined().await;
+    assert!(a.pending() > 0);
+    assert!(b.physical.lock().unwrap().is_empty());
+    release.send(()).unwrap();
+    assert!(
+        manager
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await
+            .is_clean()
+    );
+    a.joined().await;
+    assert!(
+        home.path()
+            .join("plugins/cache/debug/sample-plugin/1.0.0")
+            .is_dir()
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn runtime_callback_hop_uses_invoking_original_for_body_and_descendant() {
+    let registry = crate::PluginTaskRegistry::default();
+    let host = QueuedTestHost::new(7);
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let callback: EffectivePluginsChangedCallback = {
+        let (entered, release, observed) = (entered.clone(), release.clone(), observed.clone());
+        Arc::new(move |_| {
+            observed
+                .lock()
+                .unwrap()
+                .push(QUEUED_TEST_ORIGIN.try_with(|origin| *origin).ok());
+            let (entered, release) = (entered.clone(), release.clone());
+            let child = codex_model_provider::spawn_provider_task(Box::pin(async move {
+                entered.add_permits(1);
+                release.acquire().await.unwrap().forget();
+            }))
+            .unwrap();
+            assert!(child.is_some());
+            drop(child);
+        })
+    };
+    let callback = dispatch_on_runtime(
+        registry.clone(),
+        tokio::runtime::Handle::current(),
+        callback,
+    );
+    let weak_host = Arc::downgrade(&host);
+    codex_model_provider::with_auth_task_scope(host.access(), async {
+        callback(Default::default());
+    })
+    .await
+    .unwrap();
+    queued_wait(&entered).await;
+    assert_eq!(*observed.lock().unwrap(), vec![Some(7)]);
+    assert!(host.pending() > 0);
+    release.add_permits(1);
+    host.joined().await;
+    assert!(
+        registry
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await
+            .is_clean()
+    );
+    drop(host);
+    assert!(
+        weak_host.upgrade().is_none(),
+        "reusable callback does not cache its invoking host/root"
+    );
+    drop(callback);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn inherited_queue_obligations_survive_coordinator_observer_abort() {
+    let registry = crate::PluginTaskRegistry::default();
+    let a = QueuedTestHost::new(1);
+    let b = QueuedTestHost::new(2);
+    let owner_a = codex_model_provider::with_auth_task_scope(a.access(), async {
+        registry.prepare_auth_request()
+    })
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    let owner_b = codex_model_provider::with_auth_task_scope(b.access(), async {
+        registry.prepare_auth_request()
+    })
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let (child_entered, child_release) = (entered.clone(), release.clone());
+    let observer = tokio::spawn(async move {
+        run_queued_plugin_work(&Some(owner_b), vec![owner_a], async move {
+            child_entered.add_permits(1);
+            child_release.acquire().await.unwrap().forget();
+        })
+        .await
+    });
+    queued_wait(&entered).await;
+    observer.abort();
+    assert!(observer.await.unwrap_err().is_cancelled());
+    assert!(
+        a.pending() > 0 && b.pending() > 0,
+        "actual accepted B command retains inherited A despite observer cancellation"
+    );
+    release.add_permits(1);
+    assert!(
+        registry
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await
+            .is_clean()
+    );
+    a.joined().await;
+    b.joined().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn disarmed_queue_cleanup_does_not_erase_a_newly_started_epoch() {
+    let home = TempDir::new().unwrap();
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    let host = QueuedTestHost::new(1);
+    let old = AsyncPluginWorkerReset {
+        manager: manager.clone(),
+        kind: AsyncPluginWorkerKind::CatalogRefresh,
+        armed: false,
+    };
+    let queued = codex_model_provider::with_auth_task_scope(host.access(), async {
+        QueuedPluginRequest::prepare(
+            &manager.task_registry,
+            RemoteCatalogCacheRefreshRequest {
+                service_config: RemotePluginServiceConfig::new(
+                    "http://127.0.0.1:1".into(),
+                    test_http_client_factory(),
+                    None,
+                ),
+                auth: None,
+                scopes: [RemotePluginScope::Global].into(),
+            },
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    {
+        let mut state = manager.remote_catalog_cache_refresh_state.write().unwrap();
+        state.in_flight = true;
+        state.requests.push_back(queued);
+    }
+    drop(old);
+    let queued = {
+        let mut state = manager.remote_catalog_cache_refresh_state.write().unwrap();
+        assert!(state.in_flight);
+        assert_eq!(state.requests.len(), 1);
+        state.in_flight = false;
+        state.requests.pop_front().unwrap()
+    };
+    drop(queued);
+    host.joined().await;
+    assert!(
+        manager
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await
+            .is_clean()
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn abandoned_async_queue_marks_pending_managed_originals_unavailable() {
+    let home = TempDir::new().unwrap();
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    let host = QueuedTestHost::new(1);
+    let queued = codex_model_provider::with_auth_task_scope(host.access(), async {
+        QueuedPluginRequest::prepare(
+            &manager.task_registry,
+            RemoteCatalogCacheRefreshRequest {
+                service_config: RemotePluginServiceConfig::new(
+                    "http://127.0.0.1:1".into(),
+                    test_http_client_factory(),
+                    None,
+                ),
+                auth: None,
+                scopes: [RemotePluginScope::Global].into(),
+            },
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    {
+        let mut state = manager.remote_catalog_cache_refresh_state.write().unwrap();
+        state.in_flight = true;
+        state.requests.push_back(queued);
+    }
+    let completion = AsyncPluginWorkerReset {
+        manager: manager.clone(),
+        kind: AsyncPluginWorkerKind::CatalogRefresh,
+        armed: true,
+    };
+    let panic = manager
+        .task_registry
+        .spawn(async move {
+            let _completion = completion;
+            panic!("synthetic actual queue coordinator panic");
+        })
+        .unwrap();
+    assert_eq!(panic.await, crate::retirement::JoinOutcome::Panicked);
+    let report = manager
+        .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await;
+    assert!(report.terminal && report.panicked && report.unavailable && !report.is_clean());
+    host.joined().await;
+    let state = manager.remote_catalog_cache_refresh_state.read().unwrap();
+    assert!(!state.in_flight && state.requests.is_empty());
+}
+
+#[test_case::test_case(false; "recommendations")]
+#[test_case::test_case(true; "bundle_sync")]
+#[tokio::test(flavor = "current_thread")]
+async fn remote_async_request_births_preserve_real_http_origin(bundle_sync: bool) {
+    let home = TempDir::new().unwrap();
+    write_file(
+        &home.path().join(CONFIG_TOML_FILE),
+        "[features]\nplugins = true\nremote_plugin = true\n",
+    );
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    let host = QueuedTestHost::new(9);
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/ps/plugins/installed"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"plugins":[],"pagination":{"next_page_token":null}}),
+            ),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/ps/plugins/suggested/codex"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"enabled":true,"plugins":[]})),
+        )
+        .mount(&server)
+        .await;
+    let mut config = load_config(home.path(), home.path())
+        .await
+        .with_plugin_recommendations_enabled(true)
+        .with_runtime_auth_mode(None);
+    config.chatgpt_base_url = server.uri();
+    let (recording, records) = queued_recording_config(&server.uri());
+    config.remote_http_clients = Arc::new(std::sync::OnceLock::from(recording.http_clients));
+    codex_model_provider::with_auth_task_scope(host.access(), async {
+        if bundle_sync {
+            manager.maybe_start_remote_installed_plugin_bundle_sync(
+                &config,
+                Some(queued_auth("header.e30.direct")),
+                None,
+                InstalledPluginSyncSource::PluginList,
+            );
+        } else {
+            manager.maybe_start_remote_plugin_caches_refresh(
+                &config,
+                Some(queued_auth("header.e30.direct")),
+                None,
+            );
+        }
+    })
+    .await
+    .unwrap();
+    host.joined().await;
+    assert!(
+        manager
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await
+            .is_clean()
+    );
+    let records = records.lock().unwrap();
+    assert!(!records.is_empty());
+    assert!(
+        records.iter().all(|(_, origin)| *origin == Some(9)),
+        "real remote HTTP origin: {records:?}"
+    );
+    assert!(records.iter().any(|(url, _)| if bundle_sync {
+        url.contains("/ps/plugins/installed")
+    } else {
+        url.contains("/ps/plugins/suggested/codex")
+    }));
 }

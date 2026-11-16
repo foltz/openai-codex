@@ -1,8 +1,8 @@
 //! Constructor-time callback authority, independent of reusable extension stores.
 use codex_extension_api::ThreadLifecycleContributor;
 use codex_extension_api::ThreadStartInput;
-use codex_extension_api::TurnWorkRefused;
 use codex_mcp::McpAttemptAccess;
+use codex_mcp::McpAttemptRefused;
 use std::sync::Arc;
 
 pub(super) async fn emit_thread_start_lifecycle<C: Send + Sync>(
@@ -12,14 +12,14 @@ pub(super) async fn emit_thread_start_lifecycle<C: Send + Sync>(
     if contributors.is_empty() {
         return;
     }
-    // One-shot notifications never reacquire admission or keep retry wakeups.
+    // One-shot notifications carry a plain refusal, never a retry future.
     let captured = match input.mcp_access {
         Ok(McpAttemptAccess::Admitted(work)) => work
             .derive_attempt()
             .map(Some)
-            .map_err(|_| TurnWorkRefused::Unavailable),
+            .map_err(|_| McpAttemptRefused),
         Ok(McpAttemptAccess::Unscoped) => Ok(None),
-        Err(_) => Err(TurnWorkRefused::Unavailable),
+        Err(_) => Err(McpAttemptRefused),
     };
     let (work, refused) = match captured {
         Ok(work) => (work, false),
@@ -29,7 +29,7 @@ pub(super) async fn emit_thread_start_lifecycle<C: Send + Sync>(
         contributor
             .on_thread_start(ThreadStartInput {
                 mcp_access: if refused {
-                    Err(TurnWorkRefused::Unavailable)
+                    Err(McpAttemptRefused)
                 } else {
                     Ok(McpAttemptAccess::from_work(work.as_deref()))
                 },

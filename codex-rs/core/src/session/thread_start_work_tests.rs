@@ -71,7 +71,7 @@ impl ThreadLifecycleContributor<()> for Callback {
     }
 }
 fn input<'a>(
-    access: Result<McpAttemptAccess<'a>, TurnWorkRefused>,
+    access: Result<McpAttemptAccess<'a>, McpAttemptRefused>,
     session: &'a ExtensionData,
     thread: &'a ExtensionData,
 ) -> ThreadStartInput<'a, ()> {
@@ -126,13 +126,13 @@ async fn hook_free_thread_start_does_not_derive_work() {
     assert_eq!(counts.live.load(Ordering::SeqCst), 0);
 }
 #[tokio::test]
-async fn thread_start_missing_exhausted_and_retry_authority_refuse_without_reacquisition() {
+async fn thread_start_missing_and_exhausted_authority_refuse_without_reacquisition() {
     let session = ExtensionData::new("session");
     let thread = ExtensionData::new("thread");
     let callback = Arc::new(Callback::default());
     emit_thread_start_lifecycle(
         &contributors(&callback),
-        input(Err(TurnWorkRefused::Unavailable), &session, &thread),
+        input(Err(McpAttemptRefused), &session, &thread),
     )
     .await;
     let counts = Arc::new(Counts::default());
@@ -143,20 +143,9 @@ async fn thread_start_missing_exhausted_and_retry_authority_refuse_without_reacq
         input(Ok(McpAttemptAccess::Admitted(&root)), &session, &thread),
     )
     .await;
-    let (wake, wait) = tokio::sync::oneshot::channel::<()>();
-    emit_thread_start_lifecycle(
-        &contributors(&callback),
-        input(
-            Err(TurnWorkRefused::RetryAfter(Box::pin(async move {
-                let _ = wait.await;
-            }))),
-            &session,
-            &thread,
-        ),
-    )
-    .await;
-    assert!(wake.send(()).is_err(), "one-shot refusal retains no wakeup");
-    assert_eq!(callback.refused.load(Ordering::SeqCst), 3);
+    fn shared_callback_input<T: Sync>() {}
+    shared_callback_input::<ThreadStartInput<'_, ()>>();
+    assert_eq!(callback.refused.load(Ordering::SeqCst), 2);
     assert_eq!(callback.calls.load(Ordering::SeqCst), 0);
     assert_eq!(callback.unscoped.load(Ordering::SeqCst), 0);
     assert_eq!(counts.derives.load(Ordering::SeqCst), 1);

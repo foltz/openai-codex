@@ -4085,7 +4085,7 @@ async fn classifier_startup_refuses_missing_or_expired_work_before_provider_look
     counts.refuse.store(true, Ordering::SeqCst);
     let root = StartupWork::new(&counts);
     for access in [
-        Err(codex_extension_api::TurnWorkRefused::Unavailable),
+        Err(codex_protocol::mcp_work::McpAttemptRefused),
         Ok(codex_protocol::mcp_work::McpAttemptAccess::Admitted(&root)),
     ] {
         registry.thread_lifecycle_contributors()[0]

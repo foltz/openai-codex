@@ -1931,7 +1931,7 @@ impl Session {
                     mcp_access: if initial_mcp_work.is_none()
                         && host_admission.as_ref().is_some_and(|host| host.requires_account_work())
                     {
-                        Err(codex_extension_api::TurnWorkRefused::Unavailable)
+                        Err(codex_mcp::McpAttemptRefused)
                     } else {
                         Ok(codex_mcp::McpAttemptAccess::from_work(initial_mcp_work.as_deref()))
                     },

@@ -208,9 +208,10 @@ async fn failed_publication_derivation_restores_pending_state_without_replacing_
     drop(state);
     assert!(refresh.await.is_err());
     assert!(session.mcp_refresh.is_pending());
-    assert_eq!(
-        before,
-        codex_mcp::McpResourceClient::new(session.services.mcp_runtime.clone()).cache_key()
+    assert!(
+        before
+            == codex_mcp::McpResourceClient::new(session.services.mcp_runtime.clone()).cache_key(),
+        "failed publication keeps the same opaque runtime identity"
     );
     assert_eq!(counts.live.load(Ordering::SeqCst), 1);
 }

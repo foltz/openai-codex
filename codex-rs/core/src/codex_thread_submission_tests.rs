@@ -432,7 +432,8 @@ async fn public_mcp_requests_refuse_before_refresh_or_rpc_without_request_author
         thread
             .refresh_codex_apps_tools()
             .await
-            .unwrap_err()
+            .err()
+            .unwrap()
             .to_string()
             .contains("request account work")
     );
@@ -485,7 +486,7 @@ async fn public_mcp_requests_refuse_before_refresh_or_rpc_without_request_author
             .contains("account work is required")
     );
     assert!(
-        _queue.is_empty(),
+        queue.is_empty(),
         "request refusal cannot become a queued turn"
     );
 }

@@ -269,6 +269,30 @@ async fn run_compact_task_inner_impl(
     world_state: Arc<WorldState>,
     compaction_metadata: CompactionTurnMetadata,
 ) -> CodexResult<String> {
+    let access = crate::provider_auth_work::turn_access(&sess, &turn_context)?;
+    codex_model_provider::with_auth_task_scope(
+        access,
+        run_compact_task_with_work(
+            sess,
+            turn_context,
+            replacement_step_context,
+            input,
+            world_state,
+            compaction_metadata,
+        ),
+    )
+    .await?
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_compact_task_with_work(
+    sess: Arc<Session>,
+    turn_context: Arc<TurnContext>,
+    replacement_step_context: Arc<StepContext>,
+    input: Vec<UserInput>,
+    world_state: Arc<WorldState>,
+    compaction_metadata: CompactionTurnMetadata,
+) -> CodexResult<String> {
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
     sess.emit_turn_item_started(&turn_context, &compaction_item)
         .await;

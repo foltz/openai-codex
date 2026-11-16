@@ -15,6 +15,7 @@ use tokio::time::Instant;
 struct HeldAuth {
     tasks: Weak<ProcessorTasks>,
     held: AtomicBool,
+    armed: AtomicBool,
     entered: Semaphore,
     release: Semaphore,
     finished: AtomicBool,
@@ -32,7 +33,8 @@ impl ExternalAuth for HeldAuth {
             // The initial constructor's unscoped auth is a separate open producer.
             // Hold only a real child already registered in this strict owner.
             let owned = self.tasks.upgrade().is_some_and(|tasks| tasks.len() > 0);
-            if owned && !self.held.swap(true, Ordering::SeqCst) {
+            if owned && self.armed.load(Ordering::SeqCst) && !self.held.swap(true, Ordering::SeqCst)
+            {
                 self.entered.add_permits(1);
                 self.release.acquire().await.unwrap().forget();
                 if self.nested {
@@ -70,6 +72,7 @@ async fn held_auth(
     let held = Arc::new(HeldAuth {
         tasks: Arc::downgrade(tasks),
         held: AtomicBool::new(false),
+        armed: AtomicBool::new(true),
         entered: Semaphore::new(0),
         release: Semaphore::new(0),
         finished: AtomicBool::new(false),
@@ -223,4 +226,311 @@ async fn auth_capability_cannot_keep_its_task_owner_alive_or_spawn_after_retirem
     );
     drop(spawner);
     assert_eq!(permits.admitted_count(), 0);
+}
+
+/// Wait for the constructor's actual finite work, not merely its publication reply.
+async fn idle_constructor(permits: &AccountWorkPermits, tasks: &ProcessorTasks) {
+    tokio::time::timeout(DRAIN_DEADLINE, async {
+        loop {
+            let released = permits.notified();
+            if permits.admitted_count() == 0 {
+                break;
+            }
+            released.await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        tasks
+            .observe_until(Instant::now() + DRAIN_DEADLINE)
+            .await
+            .is_clean()
+    );
+}
+fn input() -> codex_core::TurnInputRequest {
+    codex_core::TurnInputRequest::user_input(vec![codex_protocol::user_input::UserInput::Text {
+        text: "synthetic inference custody".into(),
+        text_elements: Vec::new(),
+    }])
+}
+
+#[test_case::test_case(false, false; "http_complete")]
+#[test_case::test_case(false, true; "http_cancel")]
+#[test_case::test_case(true, true; "websocket_cancel_before_transport")]
+#[tokio::test]
+async fn actual_sampling_auth_has_finite_original_custody(
+    websocket: bool,
+    cancel: bool,
+) -> anyhow::Result<()> {
+    let tasks = Arc::new(ProcessorTasks::default());
+    let permits = AccountWorkPermits::new();
+    let (_home, auth, held) = held_auth(&tasks, false).await;
+    held.armed.store(false, Ordering::SeqCst);
+    let mut extensions = ExtensionRegistryBuilder::new();
+    extensions.turn_start_admission(Arc::new(host(&permits, Some(tasks.ticket()))));
+    extensions.turn_lifecycle_contributor(Arc::new(
+        crate::account_turn_admission::AccountTurnLifecycle,
+    ));
+    let server = core_test_support::responses::start_mock_server().await;
+    let response = core_test_support::responses::mount_sse_once(
+        &server,
+        core_test_support::responses::sse_completed("sampled"),
+    )
+    .await;
+    let test = within_request(Some(permits.try_acquire().unwrap()), async {
+        core_test_support::test_codex::test_codex()
+            .with_auth_manager(auth)
+            .with_extensions(Arc::new(extensions.build()))
+            .with_config(move |config| config.model_provider.supports_websockets = websocket)
+            .build_with_auto_env(&server)
+            .await
+    })
+    .await?;
+    idle_constructor(&permits, &tasks).await;
+    held.armed.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        within_request(
+            permits.try_acquire(),
+            test.codex.start_turn_if_idle(input())
+        )
+        .await?,
+        codex_core::StartIfIdleSubmission::Started { .. }
+    ));
+    tokio::time::timeout(DRAIN_DEADLINE, held.entered.acquire())
+        .await??
+        .forget();
+    permits.close();
+    assert!(
+        response.requests().is_empty(),
+        "auth is held before actual inference transport"
+    );
+    if cancel {
+        test.codex
+            .submit(codex_protocol::protocol::Op::Interrupt)
+            .await?;
+        core_test_support::wait_for_event(&test.codex, |e| {
+            matches!(e, codex_protocol::protocol::EventMsg::TurnAborted(_))
+        })
+        .await;
+        assert!(
+            test.codex
+                .shutdown_and_wait_with_cleanup()
+                .await
+                .is_complete()
+        );
+        assert!(!tasks.observe_until(Instant::now()).await.terminal);
+        assert!(
+            permits.admitted_count() > 0,
+            "auth survives originating turn and parent shutdown"
+        );
+        assert!(!held.finished.load(Ordering::SeqCst));
+        held.release.add_permits(1);
+    } else {
+        held.release.add_permits(1);
+        core_test_support::wait_for_event(&test.codex, |e| {
+            matches!(e, codex_protocol::protocol::EventMsg::TurnComplete(_))
+        })
+        .await;
+        assert_eq!(response.requests().len(), 1);
+        assert!(
+            test.codex
+                .shutdown_and_wait_with_cleanup()
+                .await
+                .is_complete()
+        );
+    }
+    assert!(
+        tasks
+            .observe_until(Instant::now() + DRAIN_DEADLINE)
+            .await
+            .is_clean()
+    );
+    assert!(held.finished.load(Ordering::SeqCst));
+    assert_eq!(permits.admitted_count(), 0);
+    Ok(())
+}
+
+#[test_case::test_case(false; "local")]
+#[test_case::test_case(true; "remote_v2")]
+#[tokio::test]
+async fn actual_manual_compaction_auth_outlives_cancelled_parent(
+    remote: bool,
+) -> anyhow::Result<()> {
+    let tasks = Arc::new(ProcessorTasks::default());
+    let permits = AccountWorkPermits::new();
+    let (_home, auth, held) = held_auth(&tasks, false).await;
+    held.armed.store(false, Ordering::SeqCst);
+    let mut extensions = ExtensionRegistryBuilder::new();
+    extensions.turn_start_admission(Arc::new(host(&permits, Some(tasks.ticket()))));
+    extensions.turn_lifecycle_contributor(Arc::new(
+        crate::account_turn_admission::AccountTurnLifecycle,
+    ));
+    let server = core_test_support::responses::start_mock_server().await;
+    let test = within_request(Some(permits.try_acquire().unwrap()), async {
+        core_test_support::test_codex::test_codex()
+            .with_auth_manager(auth)
+            .with_extensions(Arc::new(extensions.build()))
+            .with_config(move |config| {
+                config
+                    .features
+                    .disable(codex_features::Feature::TokenBudget)
+                    .unwrap();
+                config.model_provider.capabilities =
+                    Some(codex_model_provider_info::ModelProviderCapabilities {
+                        remote_compaction: Some(if remote {
+                            codex_model_provider_info::RemoteCompactionSupport::V2
+                        } else {
+                            codex_model_provider_info::RemoteCompactionSupport::Unsupported
+                        }),
+                        ..Default::default()
+                    });
+            })
+            .build_with_auto_env(&server)
+            .await
+    })
+    .await?;
+    idle_constructor(&permits, &tasks).await;
+    held.armed.store(true, Ordering::SeqCst);
+    within_request(
+        permits.try_acquire(),
+        test.codex.submit(codex_protocol::protocol::Op::Compact),
+    )
+    .await?;
+    tokio::time::timeout(DRAIN_DEADLINE, held.entered.acquire())
+        .await??
+        .forget();
+    permits.close();
+    test.codex
+        .submit(codex_protocol::protocol::Op::Interrupt)
+        .await?;
+    core_test_support::wait_for_event(&test.codex, |e| {
+        matches!(e, codex_protocol::protocol::EventMsg::TurnAborted(_))
+    })
+    .await;
+    assert!(
+        test.codex
+            .shutdown_and_wait_with_cleanup()
+            .await
+            .is_complete()
+    );
+    assert!(permits.admitted_count() > 0);
+    assert!(!tasks.observe_until(Instant::now()).await.terminal);
+    assert!(!held.finished.load(Ordering::SeqCst));
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| !r.url.path().contains("responses"))
+    );
+    held.release.add_permits(1);
+    assert!(
+        tasks
+            .observe_until(Instant::now() + DRAIN_DEADLINE)
+            .await
+            .is_clean()
+    );
+    assert!(held.finished.load(Ordering::SeqCst));
+    assert_eq!(permits.admitted_count(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn actual_background_compaction_captures_work_before_originating_turn_ends()
+-> anyhow::Result<()> {
+    let tasks = Arc::new(ProcessorTasks::default());
+    let permits = AccountWorkPermits::new();
+    let (_home, auth, held) = held_auth(&tasks, false).await;
+    held.armed.store(false, Ordering::SeqCst);
+    let mut extensions = ExtensionRegistryBuilder::new();
+    extensions.turn_start_admission(Arc::new(host(&permits, Some(tasks.ticket()))));
+    extensions.turn_lifecycle_contributor(Arc::new(
+        crate::account_turn_admission::AccountTurnLifecycle,
+    ));
+    let server = core_test_support::responses::start_mock_server().await;
+    let arm = held.clone();
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/responses"))
+        .respond_with(move |_: &wiremock::Request| {
+            // Foreground auth has finished. Only the genuine post-turn background resolution is held.
+            arm.armed.store(true, Ordering::SeqCst);
+            core_test_support::responses::sse_response(core_test_support::responses::sse(vec![
+                core_test_support::responses::ev_completed_with_tokens("launch-background", 60_000),
+            ]))
+        })
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    let test = within_request(Some(permits.try_acquire().unwrap()), async {
+        core_test_support::test_codex::test_codex()
+            .with_auth_manager(auth)
+            .with_extensions(Arc::new(extensions.build()))
+            .with_config(|config| {
+                config.model = Some("gpt-5.2".into());
+                config.model_context_window = Some(100_000);
+                config.model_auto_compact_token_limit = Some(90_000);
+                config.async_compaction_threshold_percent = 50;
+                config
+                    .features
+                    .enable(codex_features::Feature::AsyncCompaction)
+                    .unwrap();
+                config
+                    .features
+                    .disable(codex_features::Feature::TokenBudget)
+                    .unwrap();
+            })
+            .build_with_auto_env(&server)
+            .await
+    })
+    .await?;
+    idle_constructor(&permits, &tasks).await;
+    assert!(matches!(
+        within_request(
+            permits.try_acquire(),
+            test.codex.start_turn_if_idle(input())
+        )
+        .await?,
+        codex_core::StartIfIdleSubmission::Started { .. }
+    ));
+    core_test_support::wait_for_event(&test.codex, |e| {
+        matches!(e, codex_protocol::protocol::EventMsg::TurnComplete(_))
+    })
+    .await;
+    tokio::time::timeout(DRAIN_DEADLINE, held.entered.acquire())
+        .await??
+        .forget();
+    permits.close();
+    assert!(
+        permits.admitted_count() > 0,
+        "post-turn background work has no live originating turn to rely on"
+    );
+    assert!(
+        test.codex
+            .shutdown_and_wait_with_cleanup()
+            .await
+            .is_complete()
+    );
+    assert!(!tasks.observe_until(Instant::now()).await.terminal);
+    assert!(!held.finished.load(Ordering::SeqCst));
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.url.path().contains("responses"))
+            .count(),
+        1,
+        "only foreground reached transport; background is held in real auth"
+    );
+    held.release.add_permits(1);
+    assert!(
+        tasks
+            .observe_until(Instant::now() + DRAIN_DEADLINE)
+            .await
+            .is_clean()
+    );
+    assert!(held.finished.load(Ordering::SeqCst));
+    assert_eq!(permits.admitted_count(), 0);
+    Ok(())
 }

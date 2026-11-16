@@ -2903,6 +2903,42 @@ async fn try_run_sampling_request(
     responses_metadata: &CodexResponsesMetadata,
     turn_diff_tracker: SharedTurnDiffTracker,
     prompt: Prompt,
+    pending_audio: Option<codex_history::AcceptedFileAudio>,
+    input_item_count: usize,
+    cancellation_token: CancellationToken,
+    draining_for_mailbox: &mut bool,
+) -> CodexResult<SamplingRequestResult> {
+    let access = crate::provider_auth_work::turn_access(&sess, &step_context.turn)?;
+    codex_model_provider::with_auth_task_scope(
+        access,
+        try_run_sampling_request_with_work(
+            tool_runtime,
+            sess,
+            step_context,
+            turn_store,
+            client_session,
+            responses_metadata,
+            turn_diff_tracker,
+            prompt,
+            pending_audio,
+            input_item_count,
+            cancellation_token,
+            draining_for_mailbox,
+        ),
+    )
+    .await?
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn try_run_sampling_request_with_work(
+    tool_runtime: ToolCallRuntime,
+    sess: Arc<Session>,
+    step_context: Arc<StepContext>,
+    turn_store: Arc<codex_extension_api::ExtensionData>,
+    client_session: &mut ModelClientSession,
+    responses_metadata: &CodexResponsesMetadata,
+    turn_diff_tracker: SharedTurnDiffTracker,
+    prompt: Prompt,
     mut pending_audio: Option<codex_history::AcceptedFileAudio>,
     input_item_count: usize,
     cancellation_token: CancellationToken,

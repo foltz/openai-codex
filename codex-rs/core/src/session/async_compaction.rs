@@ -82,6 +82,15 @@ pub(super) async fn maybe_start(
         return;
     }
 
+    // Capture live finite authority before preparation awaits and before publishing a launch.
+    // The captured factory moves into this one task, never the cached candidate or client.
+    let auth_access = match crate::provider_auth_work::turn_access(sess, turn_context) {
+        Ok(access) => access,
+        Err(error) => {
+            debug!(%error, "background compaction account work refused");
+            return;
+        }
+    };
     let base_instructions = sess.get_prompt_base_instructions().await;
     let (prepared_input, tasks, shutdown_cancellation, launch, send) = {
         let mut state = sess.state.lock().await;
@@ -137,6 +146,7 @@ pub(super) async fn maybe_start(
             phase,
             prepared_input,
             &shutdown_cancellation,
+            auth_access,
         )
         .await
         {

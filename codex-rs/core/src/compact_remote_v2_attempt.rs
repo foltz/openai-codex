@@ -333,6 +333,29 @@ pub(crate) async fn run_background_compaction(
     step_context: Arc<StepContext>,
     cutoff_world_state: Arc<WorldState>,
     phase: CompactionPhase,
+    prepared_input: BackgroundCompactionInput,
+    shutdown_cancellation: &CancellationToken,
+    auth_access: codex_model_provider::AuthTaskAccess,
+) -> CodexResult<BackgroundCompactionCandidate> {
+    codex_model_provider::with_auth_task_scope(
+        auth_access,
+        run_background_compaction_with_work(
+            sess,
+            step_context,
+            cutoff_world_state,
+            phase,
+            prepared_input,
+            shutdown_cancellation,
+        ),
+    )
+    .await?
+}
+
+async fn run_background_compaction_with_work(
+    sess: &Arc<Session>,
+    step_context: Arc<StepContext>,
+    cutoff_world_state: Arc<WorldState>,
+    phase: CompactionPhase,
     mut prepared_input: BackgroundCompactionInput,
     shutdown_cancellation: &CancellationToken,
 ) -> CodexResult<BackgroundCompactionCandidate> {

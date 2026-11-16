@@ -296,6 +296,44 @@ async fn run_remote_compaction_request_v2(
     transport: &mut CompactionRequestTransport<'_>,
     submitted_audio: Option<&crate::context_manager::rejected_audio::SubmittedFileAudio>,
 ) -> CodexResult<RemoteCompactionV2Output> {
+    // Background authority was captured at launch and installed by run_background_compaction.
+    // Never look up its originating logical turn after that turn may have ended.
+    if matches!(&*transport, CompactionRequestTransport::Foreground(_)) {
+        let access = crate::provider_auth_work::turn_access(sess, &step_context.turn)?;
+        codex_model_provider::with_auth_task_scope(
+            access,
+            run_remote_compaction_request_v2_with_work(
+                sess,
+                step_context,
+                prompt,
+                responses_metadata,
+                transport,
+                submitted_audio,
+            ),
+        )
+        .await?
+    } else {
+        run_remote_compaction_request_v2_with_work(
+            sess,
+            step_context,
+            prompt,
+            responses_metadata,
+            transport,
+            submitted_audio,
+        )
+        .await
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_remote_compaction_request_v2_with_work(
+    sess: &Session,
+    step_context: &StepContext,
+    prompt: &Prompt,
+    responses_metadata: &CodexResponsesMetadata,
+    transport: &mut CompactionRequestTransport<'_>,
+    submitted_audio: Option<&crate::context_manager::rejected_audio::SubmittedFileAudio>,
+) -> CodexResult<RemoteCompactionV2Output> {
     let turn_context = &step_context.turn;
     let client_session = match transport {
         CompactionRequestTransport::Background(turn_state, auth_owner) => {

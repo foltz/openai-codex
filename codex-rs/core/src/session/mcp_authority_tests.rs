@@ -689,7 +689,10 @@ async fn refused_dependency_publication_restores_invalidation_and_keeps_the_old_
             .is_err()
     );
     assert!(session.mcp_refresh.is_pending());
-    assert_eq!(client.cache_key(), original);
+    assert!(
+        client.cache_key() == original,
+        "failed publication must keep the exact original runtime"
+    );
     // The existing configuration edit survives a failed publication for a later reconcile.
     assert!(
         session

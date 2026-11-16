@@ -15,7 +15,7 @@ async fn exhausted_installation_refuses_before_persistence_or_oauth() {
     let (session, mut turn) = crate::session::tests::make_session_and_context().await;
     let home = tempfile::tempdir().unwrap();
     let mut config = (*turn.config).clone();
-    config.codex_home = home.path().to_path_buf();
+    config.codex_home = codex_utils_absolute_path::AbsolutePathBuf::try_from(home.path()).unwrap();
     turn.config = Arc::new(config);
     let work = Refused(AtomicUsize::new(0));
     let missing = HashMap::from([(

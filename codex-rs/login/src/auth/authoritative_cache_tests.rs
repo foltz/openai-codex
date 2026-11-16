@@ -1,4 +1,5 @@
 use super::*;
+use pretty_assertions::assert_eq;
 
 #[test]
 fn authoritative_cached_auth_distinguishes_initial_failure_from_logged_out() {

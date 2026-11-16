@@ -143,6 +143,7 @@ async fn agent_followup_preserves_native_boundaries(
                 /*trigger_turn*/ false,
             ),
             start_options: Default::default(),
+            work: None,
         })
         .await?;
     child.submit(Op::RealtimeConversationListVoices).await?;

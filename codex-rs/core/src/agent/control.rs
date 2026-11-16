@@ -139,13 +139,20 @@ impl LocalAgentControl {
         agent_id: ThreadId,
         input: Vec<UserInput>,
         start_options: TurnStartOptions,
+        parent: Option<&crate::ParentTurnAuthority>,
     ) -> CodexResult<String> {
         let state = self.runtime.upgrade()?;
         let thread = state.get_thread(agent_id).await?;
-        let result = match thread
-            .start_or_steer_turn(TurnInputRequest::user_input(input).on_start(start_options))
-            .await
-        {
+        let request = TurnInputRequest::user_input(input).on_start(start_options);
+        let submission = match parent {
+            Some(parent) => {
+                thread
+                    .start_or_steer_turn_from_parent(request, parent)
+                    .await
+            }
+            None => thread.start_or_steer_turn(request).await,
+        };
+        let result = match submission {
             Ok(TurnInputSubmission::Started { turn_id, .. }) => Ok(turn_id),
             Ok(TurnInputSubmission::Accepted) => unreachable!("user input returns a turn outcome"),
             Ok(TurnInputSubmission::Steered { .. }) => {
@@ -170,6 +177,7 @@ impl LocalAgentControl {
         communication: InterAgentCommunication,
         agent_communication_context: AgentCommunicationContext,
         start_options: TurnStartOptions,
+        parent: Option<&crate::ParentTurnAuthority>,
     ) -> CodexResult<String> {
         let state = self.runtime.upgrade()?;
         if communication.trigger_turn {
@@ -184,6 +192,7 @@ impl LocalAgentControl {
             communication,
             agent_communication_context,
             start_options,
+            parent,
         )
         .await
     }
@@ -245,6 +254,7 @@ impl LocalAgentControl {
         communication: InterAgentCommunication,
         context: AgentCommunicationContext,
         start_options: TurnStartOptions,
+        parent: Option<&crate::ParentTurnAuthority>,
     ) -> CodexResult<String> {
         self.submit_inter_agent_communication(
             agent_id,
@@ -252,6 +262,7 @@ impl LocalAgentControl {
             communication,
             context,
             start_options,
+            parent,
         )
         .await
     }
@@ -263,6 +274,7 @@ impl LocalAgentControl {
         communication: InterAgentCommunication,
         context: AgentCommunicationContext,
         start_options: TurnStartOptions,
+        parent: Option<&crate::ParentTurnAuthority>,
     ) -> CodexResult<String> {
         let observers = state.extensions.message_lifecycle_contributors();
         let delivery = (!observers.is_empty())
@@ -290,6 +302,19 @@ impl LocalAgentControl {
                 return Ok(submission_id);
             }
         }
+        // Keep custody bound to the exact resolved runtime, even if lookup is
+        // removed while deriving work. Unloaded queue-only mail stays above.
+        let child = state.get_thread(agent_id).await?;
+        let work = if communication.trigger_turn {
+            match parent {
+                Some(parent) => parent.derive(&child).map_err(|_| {
+                    CodexErr::InvalidRequest("parent turn no longer admits child work".into())
+                })?,
+                None => None,
+            }
+        } else {
+            None
+        };
         // Loaded recipients retain submission ordering with follow-ups and interrupts.
         let result = submit_loaded_agent_communication(
             agent_id,
@@ -297,8 +322,9 @@ impl LocalAgentControl {
             context,
             log_content.as_deref(),
             start_options,
+            work,
             |op, parent_turn_id, root_turn_id| {
-                state.send_op(agent_id, op, parent_turn_id, root_turn_id, delivery)
+                state.send_op_to_thread(&child, op, parent_turn_id, root_turn_id, delivery)
             },
         )
         .await;
@@ -527,6 +553,7 @@ impl LocalAgentControl {
                         communication,
                         context,
                         TurnStartOptions::default(),
+                        /*parent*/ None,
                     )
                     .await;
                 return;
@@ -737,6 +764,7 @@ async fn submit_loaded_agent_communication<F>(
     context: AgentCommunicationContext,
     log_content: Option<&str>,
     start_options: TurnStartOptions,
+    work: Option<Box<dyn codex_protocol::host_turn_work::HostTurnWork>>,
     submit: impl FnOnce(Op, Option<String>, Option<String>) -> F,
 ) -> CodexResult<String>
 where
@@ -754,6 +782,7 @@ where
         Op::InterAgentCommunication {
             communication,
             start_options,
+            work,
         },
         parent_turn_id,
         root_turn_id,

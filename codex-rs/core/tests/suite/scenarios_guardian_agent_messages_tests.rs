@@ -275,6 +275,7 @@ async fn encrypted_parent_reply_survives_incremental_guardian_reviews(
         .submit(Op::InterAgentCommunication {
             communication,
             start_options: Default::default(),
+            work: None,
         })
         .await?;
     wait_for_event(&test.codex, |event| {

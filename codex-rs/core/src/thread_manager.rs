@@ -168,9 +168,12 @@ fn capture_test_op(op: &Op) -> Option<Op> {
         Op::InterAgentCommunication {
             communication,
             start_options,
+            work: _,
         } => Some(Op::InterAgentCommunication {
             communication: communication.clone(),
             start_options: start_options.clone(),
+            // Observations never duplicate the original operation's finite owner.
+            work: None,
         }),
         Op::Shutdown => Some(Op::Shutdown),
         _ => None,
@@ -2311,6 +2314,20 @@ impl ThreadManagerState {
         message_delivery: Option<crate::agent_communication::MessageDelivery>,
     ) -> CodexResult<String> {
         let thread = self.get_thread(thread_id).await?;
+        self.send_op_to_thread(&thread, op, parent_turn_id, root_turn_id, message_delivery)
+            .await
+    }
+
+    /// Submit to the exact runtime that supplied derived work, without another lookup.
+    pub(crate) async fn send_op_to_thread(
+        &self,
+        thread: &Arc<CodexThread>,
+        op: Op,
+        parent_turn_id: Option<String>,
+        root_turn_id: Option<String>,
+        message_delivery: Option<crate::agent_communication::MessageDelivery>,
+    ) -> CodexResult<String> {
+        let thread_id = thread.session.thread_id;
         let residency_guard = if matches!(op, Op::InterAgentCommunication { .. }) {
             thread
                 .session

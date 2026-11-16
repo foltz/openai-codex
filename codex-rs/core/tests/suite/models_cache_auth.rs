@@ -203,6 +203,7 @@ async fn auth_rotation_refreshes_before_turn_with_best_effort(
                         /*trigger_turn*/ true,
                     ),
                     start_options: Default::default(),
+                    work: None,
                 })
                 .await?;
         }

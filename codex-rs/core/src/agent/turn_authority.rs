@@ -60,15 +60,29 @@ impl ParentTurnAuthority {
         child: &CodexThread,
     ) -> Result<Option<Box<dyn HostTurnWork>>, TurnWorkRefused> {
         let parent = self.session.upgrade().ok_or(TurnWorkRefused::Unavailable)?;
+        let child_requires = child
+            .session
+            .services
+            .host_admission
+            .as_ref()
+            .is_some_and(|host| host.requires_account_work());
         let Some(host) = &parent.services.host_admission else {
-            return Ok(None);
+            return if child_requires {
+                Err(TurnWorkRefused::Unavailable)
+            } else {
+                Ok(None)
+            };
         };
-        host.derive_turn_work(
+        let work = host.derive_turn_work(
             &parent.services.thread_extension_data,
             &self.turn_id,
             &child.session.services.thread_extension_data,
             Box::pin(child.termination_receipt()),
-        )
+        )?;
+        if work.is_none() && (host.requires_account_work() || child_requires) {
+            return Err(TurnWorkRefused::Unavailable);
+        }
+        Ok(work)
     }
 }
 

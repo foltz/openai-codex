@@ -176,6 +176,7 @@ async fn pending_agent_message_wake_respects_control_changes(
             trigger_turn,
         ),
         start_options: Default::default(),
+        work: None,
     };
     let first_mail = "First deferred worker update.";
     let second_mail = "Worker update after stop.";

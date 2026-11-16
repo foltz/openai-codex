@@ -130,6 +130,7 @@ async fn interrupted_guardian_review_preserves_evidence_once(
                     /*trigger_turn*/ true,
                 ),
                 start_options: Default::default(),
+                work: None,
             })
             .await?;
         if evidence == "committed-evidence" {
@@ -304,6 +305,7 @@ async fn guardian_retry_executes_only_after_a_completed_approval() -> Result<()>
                 /*trigger_turn*/ true,
             ),
             start_options: Default::default(),
+            work: None,
         })
         .await?;
     let mut reviews = Vec::new();

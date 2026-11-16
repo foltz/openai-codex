@@ -110,6 +110,7 @@ impl Handler {
                     cyber_access_program: turn.cyber_access_program,
                     ..Default::default()
                 },
+                /*parent*/ None,
             )
             .await
             .map_err(|err| collab_agent_error(receiver_thread_id, err));

@@ -125,6 +125,8 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use toml::Value as TomlValue;
 
+#[path = "parent_authority_tests.rs"]
+mod parent_authority;
 #[path = "control/spawn_publication_tests.rs"]
 mod spawn_publication;
 
@@ -586,6 +588,7 @@ async fn send_input_errors_when_manager_dropped() {
                 text_elements: Vec::new(),
             }],
             Default::default(),
+            /*parent*/ None,
         )
         .await
         .expect_err("send_input should fail without a manager");
@@ -979,6 +982,7 @@ async fn send_input_errors_when_thread_missing() {
                 text_elements: Vec::new(),
             }],
             Default::default(),
+            /*parent*/ None,
         )
         .await
         .expect_err("send_input should fail for missing thread");
@@ -1063,6 +1067,7 @@ async fn send_input_submits_user_message() {
                 text_elements: Vec::new(),
             }],
             Default::default(),
+            /*parent*/ None,
         )
         .await
         .expect("send_input should succeed");
@@ -1089,6 +1094,7 @@ async fn send_inter_agent_communication_without_turn_queues_message_without_trig
             communication.clone(),
             AgentCommunicationContext::new(AgentCommunicationKind::Message, ThreadId::new()),
             Default::default(),
+            /*parent*/ None,
         )
         .await
         .expect("send_inter_agent_communication should succeed");
@@ -1099,6 +1105,7 @@ async fn send_inter_agent_communication_without_turn_queues_message_without_trig
         Op::InterAgentCommunication {
             communication: communication.clone(),
             start_options: Default::default(),
+            work: None,
         },
     );
     let captured = harness
@@ -1560,6 +1567,7 @@ async fn check_v2_agent_reload(route: V2ReloadRoute) {
             communication.clone(),
             AgentCommunicationContext::new(AgentCommunicationKind::Message, ThreadId::new()),
             Default::default(),
+            /*parent*/ None,
         )
         .await
         .expect("send_inter_agent_communication should succeed after reload");
@@ -1569,6 +1577,7 @@ async fn check_v2_agent_reload(route: V2ReloadRoute) {
         Op::InterAgentCommunication {
             communication,
             start_options: Default::default(),
+            work: None,
         },
     );
     let captured = harness
@@ -4760,6 +4769,7 @@ async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
                 /*trigger_turn*/ false,
             ),
             start_options: Default::default(),
+            work: None,
         },
     );
 

@@ -402,6 +402,7 @@ async fn enqueue_queue_only_agent_mail(codex: &CodexThread, text: &str) {
                 /*trigger_turn*/ false,
             ),
             start_options: Default::default(),
+            work: None,
         })
         .await
         .expect("submit queue-only agent mail");
@@ -673,6 +674,7 @@ async fn queue_only_agent_mail_wakes_sleeping_root_with_previous_turn_context(
                 root_turn_id: Some("new-root".to_string()),
                 ..Default::default()
             },
+            work: None,
         })
         .await?;
     wait_for_turn_complete(&test.codex).await;
@@ -2739,6 +2741,7 @@ async fn terminal_compaction_error_does_not_retry_pending_input(
                         /*trigger_turn*/ true,
                     ),
                     start_options: Default::default(),
+                    work: None,
                 })
                 .await?;
             codex.submit(Op::RealtimeConversationListVoices).await?;

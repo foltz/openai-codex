@@ -124,6 +124,7 @@ impl LocalAgentControl {
                 communication,
                 context,
                 TurnStartOptions::default(),
+                /*parent*/ None,
             )
             .await;
         if let Some(metrics) = codex_otel::global() {

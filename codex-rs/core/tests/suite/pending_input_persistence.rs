@@ -535,6 +535,7 @@ async fn preparation_and_first_sampling_do_not_wait_for_durable_metadata(
                         /*trigger_turn*/ true,
                     ),
                     start_options: Default::default(),
+                    work: None,
                 })
                 .await?;
         }

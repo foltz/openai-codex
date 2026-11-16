@@ -505,6 +505,7 @@ async fn spawned_child_has_independent_timing_and_parent_wait_is_tools(
                     /*trigger_turn*/ true,
                 ),
                 start_options: Default::default(),
+                work: None,
             })
             .await?;
         // The response fences the submission queue before the tool can finish.

@@ -949,10 +949,11 @@ pub(super) async fn submission_loop_with_dispatch(
                 Op::InterAgentCommunication {
                     communication,
                     start_options,
+                    work,
                 } => {
                     let communication =
                         crate::PendingAgentMessage::new(communication, sub.message_delivery);
-                    inter_agent_communication(&sess, sub.id.clone(), communication, start_options, None)
+                    inter_agent_communication(&sess, sub.id.clone(), communication, start_options, work)
                         .await;
                     false
                 }

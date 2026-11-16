@@ -3235,6 +3235,7 @@ async fn multi_agent_v2_peer_followup_completion_notifies_initiating_turn(
                     /*trigger_turn*/ false,
                 ),
                 start_options: TurnStartOptions::default(),
+                work: None,
             })
             .await?;
         worker_followup_turn_id =

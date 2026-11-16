@@ -604,6 +604,32 @@ impl CodexThread {
             .await
     }
 
+    /// Submit from opaque live-parent provenance, never fresh child admission.
+    pub(crate) async fn start_or_steer_turn_from_parent(
+        &self,
+        request: TurnInputRequest,
+        parent: &crate::ParentTurnAuthority,
+    ) -> CodexResult<TurnInputSubmission> {
+        let work = match parent.derive(self) {
+            Ok(work) => work,
+            Err(_) => {
+                return Ok(TurnInputSubmission::NotSubmitted {
+                    reason: codex_protocol::turn_input::NotSubmittedReason::ServerDraining,
+                });
+            }
+        };
+        self.ensure_execution_capacity_for_turn_start(self.session.services.agent_control.as_ref())
+            .await?;
+        self.io
+            .submit_turn_input(
+                request,
+                TurnInputMode::StartOrSteer,
+                work,
+                /*residency_guard*/ None,
+            )
+            .await
+    }
+
     /// Starts a regular turn only when the thread is idle.
     ///
     /// Core declines the input without recording or enqueueing it when idle

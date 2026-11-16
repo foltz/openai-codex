@@ -839,6 +839,8 @@ pub enum Op {
     InterAgentCommunication {
         communication: InterAgentCommunication,
         start_options: TurnStartOptions,
+        /// In-process finite custody; queue-only mail carries no turn work.
+        work: Option<Box<dyn crate::host_turn_work::HostTurnWork>>,
     },
 
     /// Approve a command execution

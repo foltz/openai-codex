@@ -185,6 +185,7 @@ async fn interrupt_during_wake_context_construction_does_not_start_turn() -> any
                 /*trigger_turn*/ false,
             ),
             start_options: Default::default(),
+            work: None,
         })
         .await?;
     codex.submit(Op::RealtimeConversationListVoices).await?;

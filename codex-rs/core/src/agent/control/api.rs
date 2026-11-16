@@ -122,7 +122,9 @@ impl AgentControl for LocalAgentControl {
                     } else {
                         None
                     };
-                    let submission_id = self.send_input(target, input, start_options).await?;
+                    let submission_id = self
+                        .send_input(target, input, start_options, parent_authority.as_ref())
+                        .await?;
                     (receiver.unwrap_or_default(), submission_id)
                 }
                 AgentInput::Message { message, mode } => {
@@ -176,6 +178,7 @@ impl AgentControl for LocalAgentControl {
                             communication,
                             AgentCommunicationContext::new(kind, caller),
                             start_options,
+                            parent_authority.as_ref(),
                         )
                         .await?;
                     (receiver, submission_id)

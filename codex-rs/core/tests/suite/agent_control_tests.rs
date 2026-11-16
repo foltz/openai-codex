@@ -1088,6 +1088,7 @@ async fn agent_mail_wakes_completed_root_when_enabled(
             .submit(Op::InterAgentCommunication {
                 communication: message,
                 start_options: Default::default(),
+                work: None,
             })
             .await?;
     }

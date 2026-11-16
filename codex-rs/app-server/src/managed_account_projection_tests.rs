@@ -260,12 +260,7 @@ async fn account_event_is_present_at_the_exact_reopen_point() {
     let permits = coordinator.account_work_permits.clone();
     let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let observed_at_reopen = Arc::clone(&observed);
-    *coordinator
-        .account_work_permits
-        .inner
-        .after_reopen
-        .lock()
-        .unwrap() = Some(Box::new(move || {
+    coordinator.account_work_permits.observe_next_reopen(Box::new(move || {
         let _work = permits.try_acquire().expect("account work is now admitted");
         let OutgoingEnvelope::Broadcast {
             message: OutgoingMessage::AppServerNotification(envelope),

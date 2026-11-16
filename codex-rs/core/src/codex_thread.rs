@@ -92,6 +92,7 @@ use uuid::Uuid;
 
 use codex_rollout::state_db::StateDbHandle;
 
+mod account_work;
 mod retirement;
 pub use retirement::ThreadCleanupOutcome;
 pub use retirement::ThreadLoopOutcome;

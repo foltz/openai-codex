@@ -151,6 +151,12 @@ impl AccountWorkPermits {
     /// is created before the caller checks any condition, so a release or a
     /// [`Self::wake_waiters`] call that happens between creation and the
     /// caller's `.await` is never lost.
+    /// Observe the actual reopening edge without exposing mutable count state.
+    #[cfg(test)]
+    pub(crate) fn observe_next_reopen(&self, observe: Box<dyn FnOnce() + Send>) {
+        *self.inner.after_reopen.lock().unwrap() = Some(observe);
+    }
+
     pub(crate) fn notified(&self) -> tokio::sync::futures::Notified<'_> {
         self.inner.signal.notified()
     }

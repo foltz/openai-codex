@@ -36,8 +36,6 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::Mutex;
-#[cfg(test)]
-use tokio::sync::Notify;
 use uuid::Uuid;
 
 #[cfg(test)]
@@ -3517,6 +3515,8 @@ mod tests {
                 access_token: "test-access-token".to_owned(),
                 refresh_token: "test-refresh-token".to_owned(),
                 account_id: Some(account_id.to_owned()),
+                login_owner_id: None,
+                oauth_provenance: None,
             }),
             last_refresh: Some(chrono::Utc::now()),
             agent_identity: None,

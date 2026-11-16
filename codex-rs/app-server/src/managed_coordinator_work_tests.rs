@@ -39,7 +39,8 @@ async fn detached_operation_constructs_and_starts_child_after_request_and_parent
     let test = test_codex()
         .with_extensions(Arc::new(extensions.build()))
         .build_with_auto_env(&server)
-        .await?;
+        .await
+        .inspect_err(|error| eprintln!("detached child fixture returned: {error:#}"))?;
     let operation = crate::account_turn_admission::within_request(permits.try_acquire(), async {
         test.thread_manager
             .derive_request_operation_work()
@@ -47,7 +48,11 @@ async fn detached_operation_constructs_and_starts_child_after_request_and_parent
             .unwrap()
     })
     .await;
-    let retry = test.codex.admit_mcp_event_stream_retry()?.unwrap();
+    let retry = test
+        .codex
+        .admit_mcp_event_stream_retry()
+        .inspect_err(|error| eprintln!("fresh retry fixture returned: {error:#}"))?
+        .unwrap();
     drop(retry);
     crate::account_turn_admission::within_request(permits.try_acquire(), async {
         permits.close();
@@ -74,7 +79,11 @@ async fn detached_operation_constructs_and_starts_child_after_request_and_parent
             .thread_extension_init
             .insert(codex_extension_api::SessionIsolation::Isolated);
     }
-    let child = test.thread_manager.start_thread(options).await?;
+    let child = test
+        .thread_manager
+        .start_thread(options)
+        .await
+        .inspect_err(|error| eprintln!("detached child fixture returned: {error:#}"))?;
     let input = || {
         codex_core::TurnInputRequest::user_input(vec![UserInput::Text {
             text: "consolidate".to_owned(),
@@ -82,14 +91,19 @@ async fn detached_operation_constructs_and_starts_child_after_request_and_parent
         }])
     };
     assert!(matches!(
-        child.thread.start_turn_if_idle(input()).await?,
+        child
+            .thread
+            .start_turn_if_idle(input())
+            .await
+            .inspect_err(|error| eprintln!("detached child fixture returned: {error:#}"))?,
         codex_core::StartIfIdleSubmission::NotSubmitted { .. }
     ));
     assert!(matches!(
         child
             .thread
             .start_turn_if_idle_from_operation(input(), operation.as_ref())
-            .await?,
+            .await
+            .inspect_err(|error| eprintln!("detached child fixture returned: {error:#}"))?,
         codex_core::StartIfIdleSubmission::Started { .. }
     ));
     wait_for_event(&child.thread, |event| {
@@ -106,7 +120,11 @@ async fn detached_operation_constructs_and_starts_child_after_request_and_parent
     assert_eq!(permits.admitted_count(), 0);
     permits.reopen();
     assert!(matches!(
-        child.thread.start_turn_if_idle(input()).await?,
+        child
+            .thread
+            .start_turn_if_idle(input())
+            .await
+            .inspect_err(|error| eprintln!("detached child fixture returned: {error:#}"))?,
         codex_core::StartIfIdleSubmission::Started { .. }
     ));
     wait_for_event(&child.thread, |event| {

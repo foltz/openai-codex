@@ -202,6 +202,7 @@ async fn idle_classifier_retains_the_owning_threads_workspace_binding() -> Resul
     )));
     let session_store = codex_extension_api::ExtensionData::new("session-1");
     let input = codex_extension_api::ThreadStartInput {
+        mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
         config: &config,
         session_source: &codex_protocol::protocol::SessionSource::Exec,
         persistent_thread_state_available: false,

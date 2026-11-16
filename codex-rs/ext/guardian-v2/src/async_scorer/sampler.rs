@@ -159,8 +159,16 @@ impl LunaSampler {
         }
     }
 
+    #[cfg(test)]
     pub(super) async fn prewarm(&self) {
-        self.connections.prewarm().await;
+        self.prewarm_with_work(None).await;
+    }
+
+    pub(super) async fn prewarm_with_work(
+        &self,
+        work: Option<Box<dyn codex_protocol::mcp_work::McpAttemptWork>>,
+    ) {
+        self.connections.prewarm_with_work(work).await;
     }
 
     fn auth_owner(&self) -> Option<AuthOwner> {

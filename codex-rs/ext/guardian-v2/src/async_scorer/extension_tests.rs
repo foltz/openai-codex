@@ -243,6 +243,7 @@ async fn installed_extension_warms_connections_without_blocking_thread_start() -
     thread_store.insert(config.clone());
     registry.thread_lifecycle_contributors()[0]
         .on_thread_start(ThreadStartInput {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             config: &config,
             session_source: &SessionSource::Exec,
             persistent_thread_state_available: false,
@@ -329,6 +330,7 @@ async fn installed_extension_keeps_parent_program_out_of_websocket_and_http_revi
     thread_store.insert(config.clone());
     registry.thread_lifecycle_contributors()[0]
         .on_thread_start(ThreadStartInput {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             config: &config,
             session_source: &SessionSource::Exec,
             persistent_thread_state_available: false,
@@ -1116,6 +1118,7 @@ async fn sample_configured_conversation_history_with_delivery(
     thread_store.insert(config.clone());
     registry.thread_lifecycle_contributors()[0]
         .on_thread_start(ThreadStartInput {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             config: &config,
             session_source: &SessionSource::Exec,
             persistent_thread_state_available: false,
@@ -1427,6 +1430,7 @@ async fn contributor_fails_closed_when_luna_classification_fails() -> Result<()>
     config.features.enable(Feature::GuardianV2)?;
     fixture.registry.thread_lifecycle_contributors()[0]
         .on_thread_start(ThreadStartInput {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             config: &config,
             session_source: &SessionSource::Exec,
             persistent_thread_state_available: false,
@@ -2575,6 +2579,7 @@ async fn contributor_skips_required_models_in_standard_scope() -> Result<()> {
     thread_store.insert(config.clone());
     registry.thread_lifecycle_contributors()[0]
         .on_thread_start(ThreadStartInput {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             config: &config,
             session_source: &SessionSource::Exec,
             persistent_thread_state_available: false,
@@ -3473,6 +3478,7 @@ async fn assert_parent_compaction_reuse(parent_context_for_review: bool) -> Resu
     thread_store.insert(config.clone());
     registry.thread_lifecycle_contributors()[0]
         .on_thread_start(ThreadStartInput {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             config: &config,
             session_source: &SessionSource::Exec,
             persistent_thread_state_available: false,
@@ -4022,3 +4028,123 @@ async fn cached_score_publication_rejects_delayed_results_without_changing_cover
 
 #[path = "decisions_lifecycle_tests.rs"]
 mod decisions_lifecycle_tests;
+
+#[derive(Default)]
+struct StartupWorkCounts {
+    live: std::sync::atomic::AtomicUsize,
+    derives: std::sync::atomic::AtomicUsize,
+    refuse: std::sync::atomic::AtomicBool,
+}
+struct StartupWork(Arc<StartupWorkCounts>);
+impl StartupWork {
+    fn new(c: &Arc<StartupWorkCounts>) -> Self {
+        c.live.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(Arc::clone(c))
+    }
+}
+impl Drop for StartupWork {
+    fn drop(&mut self) {
+        self.0
+            .live
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+impl codex_protocol::mcp_work::McpAttemptWork for StartupWork {
+    fn derive_attempt(
+        &self,
+    ) -> std::result::Result<
+        Box<dyn codex_protocol::mcp_work::McpAttemptWork>,
+        codex_protocol::mcp_work::McpAttemptRefused,
+    > {
+        self.0
+            .derives
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.0.refuse.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(codex_protocol::mcp_work::McpAttemptRefused);
+        }
+        Ok(Box::new(Self::new(&self.0)))
+    }
+}
+#[tokio::test]
+async fn classifier_startup_refuses_missing_or_expired_work_before_provider_lookup() -> Result<()> {
+    use std::sync::atomic::Ordering;
+    let home = tempfile::tempdir()?;
+    let mut config = core_test_support::load_default_config_for_test(&home).await;
+    config.features.enable(Feature::GuardianApproval)?;
+    let mut builder = ExtensionRegistryBuilder::new();
+    super::install(
+        &mut builder,
+        AuthManager::from_auth_for_testing(CodexAuth::from_api_key("fixture")),
+        std::sync::Weak::new(),
+    );
+    let registry = builder.build();
+    let session = ExtensionData::new("session");
+    let thread = ExtensionData::new("thread");
+    // No ProviderAuthContext is installed: reaching sampler_config would panic.
+    let counts = Arc::new(StartupWorkCounts::default());
+    counts.refuse.store(true, Ordering::SeqCst);
+    let root = StartupWork::new(&counts);
+    for access in [
+        Err(codex_extension_api::TurnWorkRefused::Unavailable),
+        Ok(codex_protocol::mcp_work::McpAttemptAccess::Admitted(&root)),
+    ] {
+        registry.thread_lifecycle_contributors()[0]
+            .on_thread_start(ThreadStartInput {
+                mcp_access: access,
+                config: &config,
+                session_source: &SessionSource::Exec,
+                persistent_thread_state_available: false,
+                environments: &[],
+                mcp_resource_client: None,
+                extension_metrics: None,
+                session_store: &session,
+                thread_store: &thread,
+            })
+            .await;
+    }
+    assert_eq!(counts.derives.load(Ordering::SeqCst), 1);
+    assert!(thread.get::<LunaSampler>().is_none());
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    drop(root);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+#[tokio::test]
+async fn classifier_startup_metadata_keeps_no_invocation_work() -> Result<()> {
+    use std::sync::atomic::Ordering;
+    let home = tempfile::tempdir()?;
+    let mut config = core_test_support::load_default_config_for_test(&home).await;
+    config.features.enable(Feature::GuardianApproval)?;
+    config.approvals_reviewer = ApprovalsReviewer::User;
+    let auth = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("fixture"));
+    let mut builder = ExtensionRegistryBuilder::new();
+    super::install(&mut builder, Arc::clone(&auth), std::sync::Weak::new());
+    let registry = builder.build();
+    let session = ExtensionData::new("session");
+    let thread = ExtensionData::new("thread");
+    thread.insert(codex_model_provider::ProviderAuthContext {
+        credentials: auth,
+        runtime_auth: None,
+    });
+    let counts = Arc::new(StartupWorkCounts::default());
+    let root = StartupWork::new(&counts);
+    registry.thread_lifecycle_contributors()[0]
+        .on_thread_start(ThreadStartInput {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Admitted(&root)),
+            config: &config,
+            session_source: &SessionSource::Exec,
+            persistent_thread_state_available: false,
+            environments: &[],
+            mcp_resource_client: None,
+            extension_metrics: None,
+            session_store: &session,
+            thread_store: &thread,
+        })
+        .await;
+    assert_eq!(counts.derives.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    drop(root);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    assert!(thread.get::<LunaSampler>().is_some());
+    Ok(())
+}

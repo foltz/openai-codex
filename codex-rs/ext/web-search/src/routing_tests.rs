@@ -69,6 +69,7 @@ async fn config_changes_preserve_the_threads_established_routing() {
     let extension = WebSearchExtension { auth_manager };
     extension
         .on_thread_start(ThreadStartInput {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             config: &config,
             session_source: &SessionSource::Exec,
             persistent_thread_state_available: false,

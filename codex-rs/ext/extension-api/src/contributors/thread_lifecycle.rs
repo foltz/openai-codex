@@ -18,6 +18,9 @@ pub struct ThreadOriginator(pub String);
 
 /// Input supplied when the host starts a runtime for a thread.
 pub struct ThreadStartInput<'a, C> {
+    /// Finite constructor authority for this callback. Derive before spawning;
+    /// never retain account work in the session's reusable extension state.
+    pub mcp_access: Result<codex_mcp::McpAttemptAccess<'a>, crate::TurnWorkRefused>,
     /// Host configuration visible at thread start.
     pub config: &'a C,
     /// Source that created the session for this thread.

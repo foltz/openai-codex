@@ -286,6 +286,7 @@ async fn render_catalogs_for_step(
     let thread_store = ExtensionData::new("thread");
     registry.thread_lifecycle_contributors()[0]
         .on_thread_start(ThreadStartInput {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             config,
             session_source: &SessionSource::Cli,
             persistent_thread_state_available: true,

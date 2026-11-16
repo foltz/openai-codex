@@ -48,6 +48,7 @@ async fn connect_loaded_task(
     let thread_store = ExtensionData::new(thread_id.to_string());
     manager
         .on_thread_start(ThreadStartInput {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             config: &(),
             session_source: &SessionSource::Exec,
             persistent_thread_state_available: false,

@@ -153,6 +153,7 @@ async fn task_context_recovers_prior_requests_and_explicit_intent_without_changi
         let thread_store = ExtensionData::new(thread_id);
         registry.thread_lifecycle_contributors()[0]
             .on_thread_start(ThreadStartInput {
+                mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
                 config: &config,
                 session_source: &SessionSource::Cli,
                 persistent_thread_state_available: true,

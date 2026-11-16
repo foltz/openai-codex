@@ -50,6 +50,25 @@ impl ThreadLifecycleContributor<Config> for GuardianV2Extension {
                 return;
             }
 
+            // Capture before configuration/provider waits, then move the owner
+            // into any actual prewarm job rather than storing it in the sampler.
+            let work = match &input.mcp_access {
+                Ok(codex_protocol::mcp_work::McpAttemptAccess::Admitted(work)) => {
+                    match work.derive_attempt() {
+                        Ok(work) => Some(work),
+                        Err(_) => {
+                            tracing::warn!("Guardian classifier startup work refused");
+                            return;
+                        }
+                    }
+                }
+                Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped) => None,
+                Err(_) => {
+                    tracing::warn!("Guardian classifier startup has no account authority");
+                    return;
+                }
+            };
+
             let model = input.thread_store.get::<ModelInfo>();
             let thread_id = input.thread_store.level_id().to_string();
             let guardian_config = match GuardianV2Config::resolve(input.config) {
@@ -126,7 +145,7 @@ impl ThreadLifecycleContributor<Config> for GuardianV2Extension {
                 )
             {
                 tokio::spawn(async move {
-                    sampler.prewarm().await;
+                    sampler.prewarm_with_work(work).await;
                 });
             }
         })

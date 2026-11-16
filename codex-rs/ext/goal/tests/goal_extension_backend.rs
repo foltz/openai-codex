@@ -1677,6 +1677,7 @@ async fn installed_tools_with_start(
     for contributor in registry.thread_lifecycle_contributors() {
         contributor
             .on_thread_start(ThreadStartInput {
+                mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
                 config: &(),
                 session_source: &session_source,
                 persistent_thread_state_available,
@@ -1741,6 +1742,7 @@ impl GoalExtensionHarness {
         for contributor in registry.thread_lifecycle_contributors() {
             contributor
                 .on_thread_start(ThreadStartInput {
+                    mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
                     config: &(),
                     session_source: &session_source,
                     persistent_thread_state_available: true,
@@ -1785,6 +1787,7 @@ impl GoalExtensionHarness {
         for contributor in self.registry.thread_lifecycle_contributors() {
             contributor
                 .on_thread_start(ThreadStartInput {
+                    mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
                     config: &(),
                     session_source: &session_source,
                     persistent_thread_state_available: true,

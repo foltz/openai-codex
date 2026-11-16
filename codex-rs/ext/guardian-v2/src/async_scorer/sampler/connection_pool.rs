@@ -148,18 +148,30 @@ impl ConnectionPool {
     /// Never waits for another opener or sleeps through the cooldown.
     pub(super) fn replenish(self: &Arc<Self>) -> Option<JoinHandle<()>> {
         let guard = Arc::clone(&self.replenishing).try_lock_owned().ok()?;
-        self.start_refill(guard)
+        self.start_refill(guard, None)
     }
 
+    #[cfg(test)]
     pub(super) async fn prewarm(self: &Arc<Self>) {
+        self.prewarm_with_work(None).await;
+    }
+
+    pub(super) async fn prewarm_with_work(
+        self: &Arc<Self>,
+        work: Option<Box<dyn codex_protocol::mcp_work::McpAttemptWork>>,
+    ) {
         // Explicit prewarming waits for any existing refill before checking readiness.
         let guard = Arc::clone(&self.replenishing).lock_owned().await;
-        if let Some(refill) = self.start_refill(guard) {
+        if let Some(refill) = self.start_refill(guard, work) {
             let _ = refill.await;
         }
     }
 
-    fn start_refill(self: &Arc<Self>, guard: OwnedMutexGuard<()>) -> Option<JoinHandle<()>> {
+    fn start_refill(
+        self: &Arc<Self>,
+        guard: OwnedMutexGuard<()>,
+        work: Option<Box<dyn codex_protocol::mcp_work::McpAttemptWork>>,
+    ) -> Option<JoinHandle<()>> {
         // Runtime sources must be reauthenticated when a classification is admitted.
         if self.config.provider.runtime_auth().is_some() {
             return None;
@@ -191,8 +203,22 @@ impl ConnectionPool {
                     let Ok(permit) = Arc::clone(&pool.sockets).try_acquire_owned() else {
                         break;
                     };
+                    let child_work = match work
+                        .as_deref()
+                        .map(|work| work.derive_attempt())
+                        .transpose()
+                    {
+                        Ok(work) => work,
+                        Err(_) => {
+                            failed = true;
+                            break;
+                        }
+                    };
                     let pool = Arc::clone(&pool);
-                    opening.spawn(async move { pool.open_connection(permit).await });
+                    opening.spawn(async move {
+                        let _work = child_work;
+                        pool.open_connection(permit).await
+                    });
                 }
                 let Some(result) = opening.join_next().await else {
                     break;

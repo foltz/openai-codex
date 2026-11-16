@@ -2131,6 +2131,24 @@ async fn explicit_empty_parent_capture_never_falls_back_to_required_manager_requ
     assert!(manager.state.threads.read().await.is_empty());
 }
 
+struct ManagedStartWitness(Arc<AtomicUsize>);
+impl codex_extension_api::ThreadLifecycleContributor<crate::config::Config>
+    for ManagedStartWitness
+{
+    fn on_thread_start<'a>(
+        &'a self,
+        input: codex_extension_api::ThreadStartInput<'a, crate::config::Config>,
+    ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+        Box::pin(async move {
+            let Ok(codex_mcp::McpAttemptAccess::Admitted(work)) = input.mcp_access else {
+                panic!("explicit Required constructor work")
+            };
+            let child = work.derive_attempt().expect("constructor callback child");
+            self.0.fetch_add(1, Ordering::SeqCst);
+            drop(child);
+        })
+    }
+}
 struct ManagedReadyWitness(Arc<AtomicUsize>);
 impl codex_extension_api::ThreadLifecycleContributor<crate::config::Config>
     for ManagedReadyWitness
@@ -2167,6 +2185,8 @@ async fn managed_constructor_carries_explicit_work_into_ready_callbacks_without_
     let inherited = Arc::new(extensions.build());
     Arc::get_mut(&mut manager.state).unwrap().extensions = Arc::clone(&inherited);
     let mut isolated = inherited.to_builder();
+    let started = Arc::new(AtomicUsize::new(0));
+    isolated.thread_lifecycle_contributor(Arc::new(ManagedStartWitness(Arc::clone(&started))));
     isolated.thread_lifecycle_contributor(Arc::new(ManagedReadyWitness(Arc::clone(&observed))));
     let isolated = Arc::new(isolated.build());
     let manager = Arc::new(manager);
@@ -2184,6 +2204,7 @@ async fn managed_constructor_carries_explicit_work_into_ready_callbacks_without_
         .await
         .unwrap();
     assert_eq!(observed.load(Ordering::SeqCst), 1);
+    assert_eq!(started.load(Ordering::SeqCst), 1);
     assert_eq!(host.lookups.load(Ordering::SeqCst), 0);
     if let Some(prewarm) = thread.thread.session.take_session_startup_prewarm().await {
         tokio::time::timeout(Duration::from_secs(5), prewarm.abort())

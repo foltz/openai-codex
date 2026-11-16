@@ -47,6 +47,7 @@ async fn catalog_budget_fixture(base_url: String, window: i64) -> Result<Guardia
         .insert(test.config.clone());
     registry.thread_lifecycle_contributors()[0]
         .on_thread_start(ThreadStartInput {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             config: &test.config,
             session_source: &SessionSource::Exec,
             persistent_thread_state_available: false,

@@ -208,6 +208,7 @@ async fn confirmed_root_delivery_invalidates_root_and_worker_cached_approvals() 
     worker.thread_extension_data().insert(config.clone());
     registry.thread_lifecycle_contributors()[0]
         .on_thread_start(ThreadStartInput {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             config: &config,
             session_source: &SessionSource::Exec,
             persistent_thread_state_available: false,

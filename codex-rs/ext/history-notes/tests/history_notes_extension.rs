@@ -107,6 +107,7 @@ async fn installed_extension_exposes_and_invokes_history_notes_tools() -> TestRe
     for contributor in registry.thread_lifecycle_contributors() {
         contributor
             .on_thread_start(ThreadStartInput {
+                mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
                 config: &config,
                 session_source: &session_source,
                 persistent_thread_state_available: true,
@@ -454,6 +455,7 @@ async fn history_notes_require_an_openai_provider_and_codex_backend_auth() -> Te
         for contributor in registry.thread_lifecycle_contributors() {
             contributor
                 .on_thread_start(ThreadStartInput {
+                    mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
                     config: &config,
                     session_source: &SessionSource::Cli,
                     persistent_thread_state_available: true,

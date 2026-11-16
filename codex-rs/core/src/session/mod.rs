@@ -299,6 +299,7 @@ mod step_activation;
 pub(crate) mod step_context;
 pub(crate) mod step_settings;
 mod thread_settings;
+mod thread_start_work;
 pub(crate) mod time_reminder;
 mod token_budget;
 pub(crate) mod turn;

@@ -47,6 +47,7 @@ async fn decisions_disagreement_failures_and_disabled_flag_preserve_baseline() -
         store.insert(initial_model);
         registry.thread_lifecycle_contributors()[0]
             .on_thread_start(ThreadStartInput {
+                mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
                 config: &config,
                 session_source: &SessionSource::Exec,
                 persistent_thread_state_available: false,
@@ -345,6 +346,7 @@ async fn decisions_startup_uses_thread_runtime_and_staging_destination() -> anyh
             store.insert(context.clone());
             fixture.registry.thread_lifecycle_contributors()[0]
                 .on_thread_start(ThreadStartInput {
+                    mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
                     config: &config,
                     session_source: &SessionSource::Exec,
                     persistent_thread_state_available: false,

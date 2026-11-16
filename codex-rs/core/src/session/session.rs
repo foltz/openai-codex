@@ -1925,20 +1925,26 @@ impl Session {
                 extension_metrics::from_session_telemetry(session_telemetry.clone());
             let workspace_routing =
                 thread_extension_data.get_or_init(|| config.workspace_routing_context());
-            for contributor in extensions.thread_lifecycle_contributors() {
-                contributor
-                    .on_thread_start(codex_extension_api::ThreadStartInput {
-                        config: config.as_ref(),
-                        session_source: &session_configuration.session_source,
-                        persistent_thread_state_available: state_db_ctx.is_some(),
-                        environments: environment_selections,
-                        mcp_resource_client: Some(Arc::clone(&mcp_resource_client)),
-                        extension_metrics: Some(Arc::clone(&extension_metrics)),
-                        session_store: &session_extension_data,
-                        thread_store: &thread_extension_data,
-                    })
-                    .await;
-            }
+            Box::pin(super::thread_start_work::emit_thread_start_lifecycle(
+                extensions.thread_lifecycle_contributors(),
+                codex_extension_api::ThreadStartInput {
+                    mcp_access: if initial_mcp_work.is_none()
+                        && host_admission.as_ref().is_some_and(|host| host.requires_account_work())
+                    {
+                        Err(codex_extension_api::TurnWorkRefused::Unavailable)
+                    } else {
+                        Ok(codex_mcp::McpAttemptAccess::from_work(initial_mcp_work.as_deref()))
+                    },
+                    config: config.as_ref(),
+                    session_source: &session_configuration.session_source,
+                    persistent_thread_state_available: state_db_ctx.is_some(),
+                    environments: environment_selections,
+                    mcp_resource_client: Some(Arc::clone(&mcp_resource_client)),
+                    extension_metrics: Some(Arc::clone(&extension_metrics)),
+                    session_store: &session_extension_data,
+                    thread_store: &thread_extension_data,
+                },
+            )).await;
 
             let outcome_reporting = thread_extension_data
                 .get::<Arc<dyn AgentTurnOutcomeReporter>>()

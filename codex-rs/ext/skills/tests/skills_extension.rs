@@ -363,6 +363,7 @@ async fn installed_extension_uses_host_service_snapshot() -> TestResult {
     let session_source = SessionSource::Cli;
     registry.thread_lifecycle_contributors()[0]
         .on_thread_start(ThreadStartInput {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             config: &config,
             session_source: &session_source,
             persistent_thread_state_available: true,
@@ -447,6 +448,7 @@ async fn host_world_state_records_catalog_metrics_on_publish_and_change() -> Tes
     let config = default_config();
     registry.thread_lifecycle_contributors()[0]
         .on_thread_start(ThreadStartInput {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             config: &config,
             session_source: &SessionSource::Cli,
             persistent_thread_state_available: true,
@@ -608,6 +610,7 @@ async fn persisted_host_snapshot_deduplicates_warning_after_reinitialization() -
     let thread_store = ExtensionData::new("thread");
     registry.thread_lifecycle_contributors()[0]
         .on_thread_start(ThreadStartInput {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             config: &config,
             session_source: &SessionSource::Cli,
             persistent_thread_state_available: true,
@@ -650,6 +653,7 @@ async fn persisted_host_snapshot_deduplicates_warning_after_reinitialization() -
     let resumed_thread_store = ExtensionData::new("thread");
     registry.thread_lifecycle_contributors()[0]
         .on_thread_start(ThreadStartInput {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             config: &config,
             session_source: &SessionSource::Cli,
             persistent_thread_state_available: true,
@@ -745,6 +749,7 @@ async fn executor_cloud_and_host_share_catalog_world_state_flow() -> TestResult 
     let thread_store = ExtensionData::new("thread");
     registry.thread_lifecycle_contributors()[0]
         .on_thread_start(ThreadStartInput {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             config: &default_config(),
             session_source: &SessionSource::Cli,
             persistent_thread_state_available: true,
@@ -861,6 +866,7 @@ async fn nonempty_executor_empty_host_records_catalog_metrics() -> TestResult {
     let config = default_config();
     registry.thread_lifecycle_contributors()[0]
         .on_thread_start(ThreadStartInput {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             config: &config,
             session_source: &SessionSource::Cli,
             persistent_thread_state_available: true,
@@ -953,6 +959,7 @@ async fn host_world_state_uses_provider_catalog_with_core_compatible_rendering()
     let config = default_config();
     registry.thread_lifecycle_contributors()[0]
         .on_thread_start(ThreadStartInput {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             config: &config,
             session_source: &SessionSource::Cli,
             persistent_thread_state_available: true,
@@ -1039,6 +1046,7 @@ async fn shadow_selection_uses_host_catalog_when_instructions_are_disabled() -> 
     config.shadow_selection_enabled = true;
     registry.thread_lifecycle_contributors()[0]
         .on_thread_start(ThreadStartInput {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             config: &config,
             session_source: &SessionSource::Cli,
             persistent_thread_state_available: true,
@@ -1166,6 +1174,7 @@ async fn shadow_lru_selector_recovers_a_skill_invoked_on_an_earlier_turn() -> Te
     config.shadow_selection_enabled = true;
     registry.thread_lifecycle_contributors()[0]
         .on_thread_start(ThreadStartInput {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             config: &config,
             session_source: &SessionSource::Cli,
             persistent_thread_state_available: true,
@@ -1332,6 +1341,7 @@ async fn selected_executor_catalog_caches_root_selections_per_turn_and_reuses_di
     let config = default_config();
     registry.thread_lifecycle_contributors()[0]
         .on_thread_start(ThreadStartInput {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             config: &config,
             session_source: &session_source,
             persistent_thread_state_available: true,
@@ -1792,6 +1802,7 @@ async fn overlapping_executor_catalogs_render_their_own_roots() -> TestResult {
     let thread_store = Arc::new(ExtensionData::new("thread"));
     registry.thread_lifecycle_contributors()[0]
         .on_thread_start(ThreadStartInput {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             config: &default_config(),
             session_source: &SessionSource::Cli,
             persistent_thread_state_available: true,
@@ -1915,6 +1926,7 @@ async fn default_context_truncates_catalog_descriptions() -> TestResult {
     let config = default_config();
     registry.thread_lifecycle_contributors()[0]
         .on_thread_start(ThreadStartInput {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             config: &config,
             session_source: &session_source,
             persistent_thread_state_available: true,
@@ -2068,6 +2080,7 @@ async fn catalog_rebalances_only_to_avoid_omissions_and_retains_the_allocation()
                     thread_store = ExtensionData::new("thread");
                     registry.thread_lifecycle_contributors()[0]
                         .on_thread_start(ThreadStartInput {
+                            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
                             config: &default_config(),
                             session_source: &SessionSource::Cli,
                             persistent_thread_state_available: true,
@@ -2265,6 +2278,7 @@ async fn extreme_budget_pressure_removes_descriptions_before_omitting_entries() 
     let config = default_config();
     registry.thread_lifecycle_contributors()[0]
         .on_thread_start(ThreadStartInput {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             config: &config,
             session_source: &session_source,
             persistent_thread_state_available: true,
@@ -2378,6 +2392,7 @@ async fn skills_list_only_returns_model_visible_bounded_metadata() -> TestResult
     let config = default_config();
     registry.thread_lifecycle_contributors()[0]
         .on_thread_start(ThreadStartInput {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             config: &config,
             session_source: &session_source,
             persistent_thread_state_available: true,
@@ -2636,6 +2651,7 @@ async fn cloud_discovery_is_gated_and_reports_failures() -> TestResult {
         };
         registry.thread_lifecycle_contributors()[0]
             .on_thread_start(ThreadStartInput {
+                mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
                 config: &config,
                 session_source: &session_source,
                 persistent_thread_state_available: true,
@@ -2764,6 +2780,7 @@ async fn v2_root_aliases_and_read_cache_use_the_captured_environment() -> TestRe
     let thread_store = ExtensionData::new("thread");
     registry.thread_lifecycle_contributors()[0]
         .on_thread_start(ThreadStartInput {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             config: &default_config(),
             session_source: &SessionSource::Cli,
             persistent_thread_state_available: true,
@@ -2981,6 +2998,7 @@ async fn root_qualified_locator_selects_only_the_matching_executor_skill() -> Te
     let config = default_config();
     registry.thread_lifecycle_contributors()[0]
         .on_thread_start(ThreadStartInput {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             config: &config,
             session_source: &session_source,
             persistent_thread_state_available: true,
@@ -3108,6 +3126,7 @@ async fn model_context_window_scales_executor_and_cloud_catalogs() -> TestResult
     config.bundled_skills_enabled = false;
     registry.thread_lifecycle_contributors()[0]
         .on_thread_start(ThreadStartInput {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             config: &config,
             session_source: &SessionSource::Cli,
             persistent_thread_state_available: true,
@@ -3249,6 +3268,7 @@ async fn executor_catalog_emits_at_most_four_warnings() -> TestResult {
     config.bundled_skills_enabled = false;
     registry.thread_lifecycle_contributors()[0]
         .on_thread_start(ThreadStartInput {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             config: &config,
             session_source: &SessionSource::Cli,
             persistent_thread_state_available: true,
@@ -3377,6 +3397,7 @@ async fn host_catalog_compacts_shared_paths_under_budget_pressure() -> TestResul
     config.bundled_skills_enabled = false;
     registry.thread_lifecycle_contributors()[0]
         .on_thread_start(ThreadStartInput {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             config: &config,
             session_source: &SessionSource::Cli,
             persistent_thread_state_available: true,
@@ -3469,6 +3490,7 @@ async fn prompt_hidden_skill_can_still_be_invoked() -> TestResult {
     let config = default_config();
     registry.thread_lifecycle_contributors()[0]
         .on_thread_start(ThreadStartInput {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             config: &config,
             session_source: &session_source,
             persistent_thread_state_available: true,
@@ -3834,6 +3856,7 @@ async fn shared_catalog_keeps_captured_executor_and_separates_bindings_in_one_tu
     let turn_store = ExtensionData::new("same-turn");
     registry.thread_lifecycle_contributors()[0]
         .on_thread_start(ThreadStartInput {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             config: &default_config(),
             session_source: &SessionSource::Cli,
             persistent_thread_state_available: true,

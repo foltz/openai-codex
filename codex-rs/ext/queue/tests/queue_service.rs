@@ -1275,9 +1275,147 @@ async fn refused_or_exhausted_idle_authority_preserves_queue_until_an_authorized
     })
     .await;
     assert!(service.list(thread_id).await?.is_empty());
-    assert_eq!(
-        response.single_request().message_input_texts("user"),
-        vec!["retain this exact queued item"]
+    let mut messages = response.single_request().message_input_texts("user");
+    assert_eq!(messages.len(), 2);
+    let environment = messages.remove(0);
+    assert!(environment.starts_with("<environment_context>\n"));
+    assert!(environment.ends_with("</environment_context>"));
+    assert_eq!(messages, vec!["retain this exact queued item"]);
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct QueueWorkState {
+    live: std::sync::atomic::AtomicUsize,
+    operations: std::sync::atomic::AtomicUsize,
+    turns: std::sync::atomic::AtomicUsize,
+    bound: Mutex<Vec<String>>,
+    joins: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+#[derive(Debug)]
+struct QueueOperationWork {
+    state: Arc<QueueWorkState>,
+    thread: ThreadId,
+}
+impl Drop for QueueOperationWork {
+    fn drop(&mut self) {
+        self.state.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+impl codex_extension_api::HostOperationWork for QueueOperationWork {
+    fn derive_operation(
+        &self,
+    ) -> Result<Box<dyn codex_extension_api::HostOperationWork>, codex_extension_api::TurnWorkRefused>
+    {
+        self.state.operations.fetch_add(1, Ordering::SeqCst);
+        self.state.live.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(Self {
+            state: self.state.clone(),
+            thread: self.thread,
+        }))
+    }
+    fn derive_turn_work(
+        &self,
+        store: &ExtensionData,
+        termination: ExtensionFuture<'static, ()>,
+    ) -> Result<
+        Box<dyn codex_protocol::host_turn_work::HostTurnWork>,
+        codex_extension_api::TurnWorkRefused,
+    > {
+        assert_eq!(store.level_id(), self.thread.to_string());
+        self.state.turns.fetch_add(1, Ordering::SeqCst);
+        self.state.live.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(QueueTurnCustody {
+            work: Self {
+                state: self.state.clone(),
+                thread: self.thread,
+            },
+            termination,
+        }))
+    }
+}
+struct QueueTurnCustody {
+    work: QueueOperationWork,
+    termination: ExtensionFuture<'static, ()>,
+}
+impl std::fmt::Debug for QueueTurnCustody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("QueueTurnCustody")
+    }
+}
+impl codex_protocol::host_turn_work::HostTurnWork for QueueTurnCustody {
+    fn bind_submission(&mut self, turn: &str) {
+        self.work.state.bound.lock().unwrap().push(turn.to_owned());
+    }
+    fn retain_until_terminal(self: Box<Self>) {
+        // This synthetic host deliberately uses the exact loop receipt. It does
+        // not pretend logical turn completion certifies physical loop cleanup.
+        let QueueTurnCustody { work, termination } = *self;
+        let state = work.state.clone();
+        let join = tokio::spawn(async move {
+            termination.await;
+            drop(work);
+        });
+        state.joins.lock().unwrap().push(join);
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admitted_idle_queue_dispatch_binds_derived_turn_to_the_actual_loop_receipt()
+-> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let response =
+        responses::mount_sse_once(&server, responses::sse_completed("derived-queued-turn")).await;
+    let test = test_codex().build_with_auto_env(&server).await?;
+    let thread_id = test.session_configured.thread_id;
+    let queue = loaded_thread_queue(&test)?;
+    QueuedItemService::new(queue.clone(), Weak::new(), Arc::new(NoopExtensionEventSink))
+        .enqueue(thread_id, user_input("dispatch with explicit custody"))
+        .await?;
+    let service = QueuedItemService::new(
+        queue,
+        Arc::downgrade(&test.thread_manager),
+        Arc::new(NoopExtensionEventSink),
     );
+    let state = Arc::new(QueueWorkState::default());
+    state.live.store(1, Ordering::SeqCst);
+    let work = QueueOperationWork {
+        state: state.clone(),
+        thread: thread_id,
+    };
+    emit_idle_with_work(
+        &service,
+        thread_id,
+        ThreadIdleCause::Completed,
+        Ok(Some(&work)),
+    )
+    .await;
+    let turn_id = wait_for_event_match(test.codex.as_ref(), |event| match event {
+        EventMsg::TurnComplete(event) => Some(event.turn_id.clone()),
+        _ => None,
+    })
+    .await;
+    assert!(service.list(thread_id).await?.is_empty());
+    assert_eq!(state.operations.load(Ordering::SeqCst), 1);
+    assert_eq!(state.turns.load(Ordering::SeqCst), 1);
+    assert_eq!(*state.bound.lock().unwrap(), vec![turn_id]);
+    assert_eq!(state.live.load(Ordering::SeqCst), 2);
+    assert_eq!(response.requests().len(), 1);
+    assert_eq!(
+        response
+            .single_request()
+            .message_input_texts("user")
+            .last()
+            .map(String::as_str),
+        Some("dispatch with explicit custody")
+    );
+    drop(work);
+    assert_eq!(state.live.load(Ordering::SeqCst), 1);
+    test.codex.shutdown_and_wait().await?;
+    let joins = std::mem::take(&mut *state.joins.lock().unwrap());
+    assert_eq!(joins.len(), 1);
+    for join in joins {
+        tokio::time::timeout(Duration::from_secs(5), join).await??;
+    }
+    assert_eq!(state.live.load(Ordering::SeqCst), 0);
     Ok(())
 }

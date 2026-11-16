@@ -240,11 +240,23 @@ async fn step_cloud_refresh_serializes_waiters_and_retries() {
         .find(|contributor| contributor.requires_mcp_runtime(&thread_store))
         .expect("cloud skills contributor should be registered");
     let refresh_input = CatalogRefreshInput {
+        mcp_access: Ok(codex_mcp::McpAttemptAccess::Unscoped),
         turn_id: "turn",
         session_store: &session_store,
         thread_store: &thread_store,
         turn_store: &turn_store,
     };
+
+    assert!(
+        !contributor
+            .refresh_catalog_for_step(CatalogRefreshInput {
+                mcp_access: Err(codex_mcp::McpAttemptRefused),
+                ..refresh_input
+            })
+            .await
+    );
+    assert_eq!(cloud.lists.load(Ordering::SeqCst), 0);
+    assert_eq!(warnings.0.load(Ordering::SeqCst), 0);
 
     for (index, delay) in [30, 60, 120, 240, 300, 300].into_iter().enumerate() {
         cloud.fail_list.store(true, Ordering::SeqCst);
@@ -292,6 +304,7 @@ async fn step_cloud_refresh_serializes_waiters_and_retries() {
         let mut turn_start = contributor.refresh_catalog_for_step(refresh_input);
         assert!(futures::poll!(&mut turn_start).is_pending());
         let prewarm_input = CatalogRefreshInput {
+            mcp_access: Ok(codex_mcp::McpAttemptAccess::Unscoped),
             turn_id: "prewarm",
             turn_store: &prewarm_store,
             ..refresh_input
@@ -353,6 +366,7 @@ async fn step_cloud_refresh_serializes_waiters_and_retries() {
         assert!(
             !contributor
                 .refresh_catalog_for_step(CatalogRefreshInput {
+                    mcp_access: Ok(codex_mcp::McpAttemptAccess::Unscoped),
                     turn_store,
                     ..refresh_input
                 })
@@ -362,6 +376,7 @@ async fn step_cloud_refresh_serializes_waiters_and_retries() {
     }
     assert_eq!(warnings.0.load(Ordering::SeqCst), 1);
     let next_input = CatalogRefreshInput {
+        mcp_access: Ok(codex_mcp::McpAttemptAccess::Unscoped),
         turn_id: "next turn",
         turn_store: &next_turn,
         ..refresh_input

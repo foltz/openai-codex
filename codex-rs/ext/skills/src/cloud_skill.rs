@@ -17,6 +17,9 @@ struct CloudDiscoveryWarningEmitted;
 
 impl<C: Send + Sync + 'static> SkillsExtension<C> {
     async fn refresh_cloud_catalog(&self, input: CatalogRefreshInput<'_>) {
+        if input.mcp_access.is_err() {
+            return;
+        }
         let Some(state) = input.thread_store.get::<SkillsThreadState>() else {
             return;
         };
@@ -77,6 +80,7 @@ impl<C: Send + Sync + 'static> TurnLifecycleContributor for SkillsExtension<C> {
         Box::pin(async move {
             input.turn_store.remove::<LatestCloudSkillsAuth>();
             self.refresh_cloud_catalog(CatalogRefreshInput {
+                mcp_access: input.mcp_access,
                 turn_id: input.turn_id,
                 session_store: input.session_store,
                 thread_store: input.thread_store,

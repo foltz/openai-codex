@@ -36,6 +36,9 @@ impl PluginContributor {
         reason = "cloud discovery must remain serialized through fetching and catalog publication"
     )]
     async fn refresh_cloud_catalog(&self, input: CatalogRefreshInput<'_>) -> bool {
+        if input.mcp_access.is_err() {
+            return false;
+        }
         let Some(provider) = &self.providers.cloud else {
             return false;
         };
@@ -196,6 +199,7 @@ impl TurnLifecycleContributor for PluginContributor {
         Box::pin(async move {
             input.turn_store.remove::<LatestCloudPluginAuth>();
             self.refresh_cloud_catalog(CatalogRefreshInput {
+                mcp_access: input.mcp_access,
                 turn_id: input.turn_id,
                 session_store: input.session_store,
                 thread_store: input.thread_store,

@@ -152,8 +152,23 @@ async fn disabling_plugins_clears_cloud_catalog_and_skips_discovery() -> anyhow:
             assert_eq!(state.cloud_catalog(), None);
         }
         for contributor in registry.turn_lifecycle_contributors() {
+            assert!(
+                !contributor
+                    .refresh_catalog_for_step(CatalogRefreshInput {
+                        mcp_access: Err(codex_mcp::McpAttemptRefused),
+                        turn_id,
+                        session_store: &session,
+                        thread_store: &thread,
+                        turn_store: &ExtensionData::new(turn_id),
+                    })
+                    .await
+            );
+        }
+        assert_eq!(provider.calls.load(Ordering::SeqCst), previous_discoveries);
+        for contributor in registry.turn_lifecycle_contributors() {
             contributor
                 .on_turn_start(TurnStartInput {
+                    mcp_access: Ok(codex_mcp::McpAttemptAccess::Unscoped),
                     turn_id,
                     collaboration_mode: &mode,
                     token_usage_at_turn_start: None,
@@ -274,6 +289,7 @@ async fn cloud_refresh_serializes_waiters_and_retries() {
         let turn = ExtensionData::new("turn");
         let prewarm_turn = ExtensionData::new("prewarm");
         let input = CatalogRefreshInput {
+            mcp_access: Ok(codex_mcp::McpAttemptAccess::Unscoped),
             turn_id: "turn",
             session_store: &session,
             thread_store: &thread,
@@ -287,6 +303,7 @@ async fn cloud_refresh_serializes_waiters_and_retries() {
         let mut turn_start = contributor.refresh_catalog_for_step(input);
         assert!(futures::poll!(&mut turn_start).is_pending());
         let prewarm_input = CatalogRefreshInput {
+            mcp_access: Ok(codex_mcp::McpAttemptAccess::Unscoped),
             turn_id: "prewarm",
             turn_store: &prewarm_turn,
             ..input

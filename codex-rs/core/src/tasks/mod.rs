@@ -490,12 +490,23 @@ impl Session {
         turn_context
             .extension_data
             .insert(preparation_resources.access());
-        self.emit_turn_start_lifecycle(
-            turn_context.as_ref(),
-            Some(&token_usage_at_turn_start),
-            codex_extension_api::TurnStartPhase::BeforeTaskRegistration,
-        )
-        .await;
+        if let Err(error) = self
+            .emit_turn_start_lifecycle(
+                turn_context.as_ref(),
+                Some(&token_usage_at_turn_start),
+                codex_extension_api::TurnStartPhase::BeforeTaskRegistration,
+            )
+            .await
+        {
+            // This phase currently has no fallible MCP work. Preserve rollback
+            // if future preparation adds a refusal before exact task commitment.
+            tracing::error!(%error, "turn preparation refused before task registration");
+            drop(mailbox);
+            if self.clear_task_reservation(&turn_state).await {
+                self.input_queue.completion_wake.notify_one();
+            }
+            return false;
+        }
 
         let mut active = self.active_turn.lock().await;
         if self

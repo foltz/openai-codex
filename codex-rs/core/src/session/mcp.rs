@@ -192,7 +192,6 @@ impl Session {
     }
 
     /// Publishes changed MCP state, waiting for any refresh already in progress.
-    #[tracing::instrument(name = "mcp.runtime.refresh_if_dirty", skip_all)]
     pub(crate) async fn refresh_mcp_if_dirty(self: &Arc<Self>) {
         if let Err(error) = self
             .refresh_mcp_if_dirty_with_authority(codex_mcp::McpAttemptAccess::Unscoped)
@@ -204,6 +203,7 @@ impl Session {
 
     /// Caller custody precedes the permit, auth and environment discovery.
     /// Retained startup drivers derive their own work before publication.
+    #[tracing::instrument(name = "mcp.runtime.refresh_if_dirty", skip_all)]
     pub(crate) async fn refresh_mcp_if_dirty_with_authority(
         self: &Arc<Self>,
         access: codex_mcp::McpAttemptAccess<'_>,
@@ -480,7 +480,12 @@ impl Session {
         selected_capability_roots: &[ResolvedSelectedCapabilityRoot],
         required_servers: &[String],
         required_plugins: &HashSet<String>,
-    ) -> Arc<codex_mcp::McpBinding> {
+        access: codex_mcp::McpAttemptAccess<'_>,
+    ) -> CodexResult<Arc<codex_mcp::McpBinding>> {
+        let work = self
+            .derive_mcp_attempt_work(access)
+            .map_err(|err| CodexErr::Fatal(err.to_string()))?;
+        let access = codex_mcp::McpAttemptAccess::from_work(work.as_deref());
         let ready_selected_capability_roots =
             Self::ready_selected_capability_roots(selected_capability_roots);
         if self
@@ -510,7 +515,9 @@ impl Session {
         {
             self.mark_mcp_runtime_dirty(McpRefreshReason::OAuthCredentialsRecovered);
         }
-        self.refresh_mcp_if_dirty().await;
+        self.refresh_mcp_if_dirty_with_authority(access)
+            .await
+            .map_err(|err| CodexErr::Fatal(err.to_string()))?;
         // Prewarm and other context-only captures must not start cloud discovery.
         let is_active_regular_turn = {
             let active_turn = self.active_turn.lock().await;
@@ -527,6 +534,7 @@ impl Session {
             for contributor in self.services.extensions.turn_lifecycle_contributors() {
                 if contributor
                     .refresh_catalog_for_step(codex_extension_api::CatalogRefreshInput {
+                        mcp_access: Ok(access),
                         turn_id: &turn_context.sub_id,
                         session_store: &self.services.session_extension_data,
                         thread_store: &self.services.thread_extension_data,
@@ -538,7 +546,9 @@ impl Session {
                     self.mark_mcp_runtime_dirty(McpRefreshReason::ExtensionCatalogChanged);
                 }
             }
-            self.refresh_mcp_if_dirty().await;
+            self.refresh_mcp_if_dirty_with_authority(access)
+                .await
+                .map_err(|err| CodexErr::Fatal(err.to_string()))?;
         }
         let required_servers = required_servers
             .iter()
@@ -549,13 +559,17 @@ impl Session {
         if let Some(binding) = self
             .services
             .mcp_runtime
-            .current_binding_with_requirements(&required_servers, required_plugins)
+            .current_binding_with_requirements_and_authority(
+                &required_servers,
+                required_plugins,
+                access,
+            )
             .await
         {
-            return binding;
+            return Ok(binding);
         }
         let config = Arc::new(self.runtime_mcp_config(&turn_context.config).await);
-        Arc::new(codex_mcp::McpBinding::empty(config))
+        Ok(Arc::new(codex_mcp::McpBinding::empty(config)))
     }
 
     fn discovery_sandbox(

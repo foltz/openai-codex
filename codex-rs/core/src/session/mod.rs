@@ -4499,12 +4499,42 @@ impl Session {
         required_servers: &[String],
         required_plugins: &HashSet<String>,
     ) -> CodexResult<Arc<StepContext>> {
+        let work = self
+            .turn_mcp_work(&turn_context)
+            .map_err(|err| CodexErr::Fatal(err.to_string()))?;
+        let access = codex_mcp::McpAttemptAccess::from_work(work.as_deref());
         let step_context = self
             .capture_step_context_inner(
                 turn_context,
                 cancellation_token,
                 required_servers,
                 required_plugins,
+                access,
+            )
+            .await?;
+        self.set_last_known_step_context(&step_context).await;
+        Ok(step_context)
+    }
+
+    /// Standalone callers supply finite request, constructor or parent authority;
+    /// an uninstalled turn ID cannot substitute for a live turn entry.
+    pub(crate) async fn capture_step_context_with_authority(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        cancellation_token: &CancellationToken,
+        access: codex_mcp::McpAttemptAccess<'_>,
+    ) -> CodexResult<Arc<StepContext>> {
+        let work = self
+            .derive_mcp_attempt_work(access)
+            .map_err(|err| CodexErr::Fatal(err.to_string()))?;
+        let access = codex_mcp::McpAttemptAccess::from_work(work.as_deref());
+        let step_context = self
+            .capture_step_context_inner(
+                turn_context,
+                cancellation_token,
+                &[],
+                &HashSet::new(),
+                access,
             )
             .await?;
         self.set_last_known_step_context(&step_context).await;
@@ -4518,11 +4548,16 @@ impl Session {
         turn_context: Arc<TurnContext>,
         cancellation_token: &CancellationToken,
     ) -> CodexResult<Arc<StepContext>> {
+        let work = self
+            .turn_mcp_work(&turn_context)
+            .map_err(|err| CodexErr::Fatal(err.to_string()))?;
+        let access = codex_mcp::McpAttemptAccess::from_work(work.as_deref());
         self.capture_step_context_inner(
             turn_context,
             cancellation_token,
             /*required_servers*/ &[],
             /*required_plugins*/ &HashSet::new(),
+            access,
         )
         .await
     }
@@ -4550,6 +4585,7 @@ impl Session {
         cancellation_token: &CancellationToken,
         required_servers: &[String],
         required_plugins: &HashSet<String>,
+        access: codex_mcp::McpAttemptAccess<'_>,
     ) -> CodexResult<Arc<StepContext>> {
         // Read the step's model and record its environments together so an update cannot split them.
         // Match apply_turn_settings and activate_turn_environments: active_turn before state.
@@ -4718,9 +4754,11 @@ impl Session {
                     &selected_capability_roots,
                     &required_servers,
                     required_plugins,
+                    access,
                 )),
                 turn::prepare_tool_recommendations(self.as_ref(), turn_context.as_ref()),
             );
+            let mcp = mcp?;
             let search = crate::model_search::resolve(
                 turn_context.as_ref(),
                 &settings,

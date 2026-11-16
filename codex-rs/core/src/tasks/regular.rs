@@ -89,11 +89,12 @@ impl SessionTask for RegularTask {
                     /*token_usage_at_turn_start*/ None,
                     TurnStartPhase::RegularTaskStart,
                 )
-                .await;
+                .await?;
                 if prepares_mcp {
                     // Resource discovery can overlap the fetch. Wait before reprojection.
                     sess.wait_for_apps_tool_refresh().await;
                 }
+                Ok::<(), codex_protocol::error::CodexErr>(())
             }
             .or_cancel(&cancellation_token)
             .await;
@@ -103,14 +104,27 @@ impl SessionTask for RegularTask {
                     McpRefreshReason::TurnStartContributorPreparedMcp,
                 );
             }
-            if preparation.is_err() {
-                return SessionStartupPrewarmResolution::Cancelled;
+            match preparation {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    let _ = run_hooks_and_record_inputs(
+                        &sess,
+                        &ctx,
+                        &ctx.capture_current_model_info(),
+                        &input,
+                        PersistContext::Standard,
+                    )
+                    .await;
+                    return Err(error);
+                }
+                Err(_) => return Ok(SessionStartupPrewarmResolution::Cancelled),
             }
-            sess.consume_startup_prewarm_for_regular_turn(&cancellation_token)
-                .await
+            Ok(sess
+                .consume_startup_prewarm_for_regular_turn(&cancellation_token)
+                .await)
         }
         .instrument(trace_span!("regular_task.prepare_run_turn"))
-        .await;
+        .await?;
         let prewarmed_client_session = match prewarmed_client_session {
             SessionStartupPrewarmResolution::Cancelled => {
                 let _ = run_hooks_and_record_inputs(

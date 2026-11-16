@@ -9685,8 +9685,10 @@ async fn refresh_mcp_servers_uses_latest_state_for_existing_turns() {
             &[],
             /*required_servers*/ &[],
             /*required_plugins*/ &HashSet::new(),
+            codex_mcp::McpAttemptAccess::Unscoped,
         )
-        .await;
+        .await
+        .unwrap();
 
     let configured_servers = codex_mcp::configured_mcp_servers(new_step.mcp.config());
     assert_eq!(

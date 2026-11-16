@@ -253,3 +253,187 @@ async fn readiness_prepare_and_hard_refresh_refuse_the_wrong_turn_before_the_per
     assert_eq!(counts.live.load(Ordering::SeqCst), 0);
     assert!(session.mcp_refresh.is_pending());
 }
+
+#[tokio::test]
+async fn step_capture_refuses_missing_turn_and_unscoped_standalone_before_state_wait() {
+    let (session, mut turn, counts) = fixture().await;
+    turn.sub_id = "uninstalled".into();
+    let turn = Arc::new(turn);
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let _state = session.state.lock().await;
+    let mut capture = Box::pin(session.capture_step_context(turn.clone(), &cancellation));
+    assert!(matches!(
+        futures::poll!(&mut capture),
+        std::task::Poll::Ready(Err(_))
+    ));
+    let mut standalone = Box::pin(session.capture_step_context_with_authority(
+        turn,
+        &cancellation,
+        McpAttemptAccess::Unscoped,
+    ));
+    assert!(matches!(
+        futures::poll!(&mut standalone),
+        std::task::Poll::Ready(Err(_))
+    ));
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    assert_eq!(counts.turns.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn cancelled_step_capture_releases_work_despite_retained_turn_context() {
+    let (session, turn, counts) = fixture().await;
+    let turn = Arc::new(turn);
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let _state = session.state.lock().await;
+    {
+        let mut capture = Box::pin(session.capture_step_context(turn.clone(), &cancellation));
+        assert!(futures::poll!(&mut capture).is_pending());
+        assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    }
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        Arc::strong_count(&turn),
+        1,
+        "only the test retains the context"
+    );
+}
+
+#[tokio::test]
+async fn captured_step_does_not_retain_invocation_work_when_kept_alive() {
+    let (session, turn, counts) = fixture().await;
+    let step = session
+        .capture_step_context(Arc::new(turn), &tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while counts.live.load(Ordering::SeqCst) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(counts.turns.load(Ordering::SeqCst), 1);
+    assert!(counts.derives.load(Ordering::SeqCst) > 0);
+    assert!(Arc::strong_count(&step) >= 1);
+}
+
+#[tokio::test]
+async fn standalone_capture_uses_explicit_work_without_a_live_turn_lookup() {
+    let (session, mut turn, counts) = fixture().await;
+    turn.sub_id = "standalone-uninstalled".into();
+    let root = Work::new(&counts);
+    let step = session
+        .capture_step_context_with_authority(
+            Arc::new(turn),
+            &tokio_util::sync::CancellationToken::new(),
+            McpAttemptAccess::Admitted(&root),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while counts.live.load(Ordering::SeqCst) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(counts.turns.load(Ordering::SeqCst), 0);
+    assert_eq!(step.turn.sub_id, "standalone-uninstalled");
+    drop(root);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn required_step_binding_refuses_before_invalidating_or_waiting_on_state() {
+    let (session, turn, counts) = fixture().await;
+    let _prior = session.mcp_refresh.take_pending();
+    let _state = session.state.lock().await;
+    let required_plugins = std::collections::HashSet::new();
+    let mut binding = Box::pin(session.mcp_runtime_for_step(
+        &turn,
+        &[],
+        &[],
+        &required_plugins,
+        McpAttemptAccess::Unscoped,
+    ));
+    assert!(matches!(
+        futures::poll!(&mut binding),
+        std::task::Poll::Ready(Err(_))
+    ));
+    assert!(!session.mcp_refresh.is_pending());
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+}
+
+#[derive(Default)]
+struct NeedsMcp(std::sync::atomic::AtomicUsize);
+impl codex_extension_api::TurnLifecycleContributor for NeedsMcp {
+    fn turn_start_phase(&self, _: &ExtensionData) -> codex_extension_api::TurnStartPhase {
+        codex_extension_api::TurnStartPhase::RegularTaskStart
+    }
+    fn requires_mcp_runtime(&self, _: &ExtensionData) -> bool {
+        true
+    }
+    fn on_turn_start<'a>(
+        &'a self,
+        _: codex_extension_api::TurnStartInput<'a>,
+    ) -> ExtensionFuture<'a, ()> {
+        Box::pin(async move {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        })
+    }
+}
+#[tokio::test]
+async fn regular_task_reports_lifecycle_admission_failure_without_running_contributor() {
+    let (session, turn, counts) = fixture().await;
+    let mut session = Arc::try_unwrap(session).ok().unwrap();
+    let (events_tx, events_rx) = async_channel::unbounded();
+    session.tx_event = events_tx;
+    let recorder = Arc::new(NeedsMcp::default());
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
+    builder.turn_start_admission(session.services.host_admission.as_ref().unwrap().clone());
+    builder.turn_lifecycle_contributor(recorder.clone());
+    session.services.extensions = Arc::new(builder.build());
+    counts.refuse.store(true, Ordering::SeqCst);
+    let session = Arc::new(session);
+    assert!(
+        session
+            .spawn_task(Arc::new(turn), Vec::new(), crate::tasks::RegularTask::new())
+            .await
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut started = false;
+        loop {
+            let event = events_rx.recv().await.unwrap();
+            match event.msg {
+                EventMsg::TurnStarted(_) => started = true,
+                EventMsg::Error(error) => {
+                    assert!(
+                        started,
+                        "regular task was really committed before its callback refused"
+                    );
+                    assert!(
+                        error
+                            .message
+                            .contains("MCP turn account work is unavailable")
+                    );
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(recorder.0.load(Ordering::SeqCst), 0);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    assert_eq!(counts.turns.load(Ordering::SeqCst), 1);
+    session.close_task_admission().await;
+    let joined = session
+        .task_joins
+        .shutdown_until(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+        .await;
+    assert!(matches!(
+        joined,
+        crate::tasks::TaskJoinOutcome::Complete { panicked: false }
+    ));
+}

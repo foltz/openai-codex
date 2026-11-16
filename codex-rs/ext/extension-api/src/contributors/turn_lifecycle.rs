@@ -29,6 +29,8 @@ pub struct TurnCommittedInput<'a> {
 
 /// Input supplied when the host starts a turn.
 pub struct TurnStartInput<'a> {
+    /// Invocation-only MCP authority; refusal never means unscoped permission.
+    pub mcp_access: Result<codex_mcp::McpAttemptAccess<'a>, codex_mcp::McpAttemptRefused>,
     /// Stable host-owned turn identifier.
     pub turn_id: &'a str,
     /// Effective collaboration mode for this turn.
@@ -48,6 +50,8 @@ pub struct TurnStartInput<'a> {
 /// Inputs for refreshing catalogs before a model step.
 #[derive(Clone, Copy)]
 pub struct CatalogRefreshInput<'a> {
+    /// Invocation-only MCP authority; refusal never means unscoped permission.
+    pub mcp_access: Result<codex_mcp::McpAttemptAccess<'a>, codex_mcp::McpAttemptRefused>,
     pub turn_id: &'a str,
     pub session_store: &'a ExtensionData,
     pub thread_store: &'a ExtensionData,

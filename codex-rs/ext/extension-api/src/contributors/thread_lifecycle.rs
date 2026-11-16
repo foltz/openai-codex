@@ -38,6 +38,10 @@ pub struct ThreadStartInput<'a, C> {
 
 /// Input supplied after the host has registered a fully initialized thread.
 pub struct ThreadReadyInput<'a, C> {
+    /// Finite constructor authority for this notification. Derive a child before
+    /// spawning work; neither this borrow nor counted work belongs in a store.
+    /// Required missing/exhausted authority is a refusal, never an ungated input.
+    pub account_work: Result<Option<&'a dyn crate::HostOperationWork>, crate::TurnWorkRefused>,
     /// Host configuration visible after thread registration.
     pub config: &'a C,
     /// Source that created the session for this thread.

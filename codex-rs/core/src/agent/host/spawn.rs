@@ -109,6 +109,28 @@ pub(super) async fn create_spawn(
             .map_err(|_| {
                 CodexErr::Fatal("parent account work cannot admit agent construction".to_owned())
             })?;
+    // This path defers ready callbacks until cleanup ownership is installed.
+    // Carry a separate child of the captured parent across that constructor.
+    let ready_work = if parent
+        .session
+        .services
+        .extensions
+        .thread_lifecycle_contributors()
+        .is_empty()
+    {
+        None
+    } else {
+        captured_account_work
+            .as_ref()
+            .map(|work| work.derive())
+            .transpose()
+            .map_err(|_| {
+                CodexErr::Fatal(
+                    "parent account work cannot admit thread-ready callbacks".to_owned(),
+                )
+            })?
+            .and_then(|work| work.0)
+    };
     let (mut options, inheritance, client_metadata) =
         Box::pin(prepare_spawn_inputs(parent, request)).await?;
     let caller = parent.session.thread_id;
@@ -162,7 +184,11 @@ pub(super) async fn create_spawn(
         membership,
         SpawnOwner::Host,
     );
-    child.thread.emit_thread_ready_lifecycle().await;
+    child
+        .thread
+        .emit_thread_ready_lifecycle(ready_work.as_deref())
+        .await;
+    drop(ready_work);
     child
         .thread
         .emit_subagent_session_started(client_metadata, /*resumed_created_at*/ None)

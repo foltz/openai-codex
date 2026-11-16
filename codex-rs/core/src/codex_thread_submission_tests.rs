@@ -748,3 +748,150 @@ async fn public_guardian_preparation_refuses_request_work_before_configuration()
     assert_eq!(gate.0.load(Ordering::SeqCst), 1);
     assert!(queue.is_empty());
 }
+
+#[derive(Clone, Copy)]
+enum ReadyWorkMode {
+    Inline,
+    Detached,
+    Observe,
+}
+struct ReadyWorkContributor {
+    mode: ReadyWorkMode,
+    wait: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    join: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    entered: AtomicUsize,
+    refused: AtomicUsize,
+    unscoped: AtomicUsize,
+}
+impl codex_extension_api::ThreadLifecycleContributor<crate::config::Config>
+    for ReadyWorkContributor
+{
+    fn on_thread_ready<'a>(
+        &'a self,
+        input: codex_extension_api::ThreadReadyInput<'a, crate::config::Config>,
+    ) -> ExtensionFuture<'a, ()> {
+        Box::pin(async move {
+            let work = match input.account_work {
+                Ok(Some(work)) => match work.derive_operation() {
+                    Ok(work) => work,
+                    Err(_) => {
+                        self.refused.fetch_add(1, Ordering::SeqCst);
+                        return;
+                    }
+                },
+                Ok(None) => {
+                    self.unscoped.fetch_add(1, Ordering::SeqCst);
+                    return;
+                }
+                Err(_) => {
+                    self.refused.fetch_add(1, Ordering::SeqCst);
+                    return;
+                }
+            };
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            let wait = self.wait.lock().unwrap().take().unwrap();
+            match self.mode {
+                ReadyWorkMode::Inline => {
+                    let _work = work;
+                    wait.await.unwrap();
+                }
+                ReadyWorkMode::Detached => {
+                    *self.join.lock().unwrap() = Some(tokio::spawn(async move {
+                        let _work = work;
+                        wait.await.unwrap();
+                    }));
+                }
+                ReadyWorkMode::Observe => {
+                    panic!("observation-only fixture must not receive valid work")
+                }
+            }
+        })
+    }
+}
+fn ready_work_contributor(
+    thread: &mut CodexThread,
+    mode: ReadyWorkMode,
+) -> (Arc<ReadyWorkContributor>, tokio::sync::oneshot::Sender<()>) {
+    let (release, wait) = tokio::sync::oneshot::channel();
+    let callback = Arc::new(ReadyWorkContributor {
+        mode,
+        wait: std::sync::Mutex::new(Some(wait)),
+        join: std::sync::Mutex::new(None),
+        entered: AtomicUsize::new(0),
+        refused: AtomicUsize::new(0),
+        unscoped: AtomicUsize::new(0),
+    });
+    let mut registry = ExtensionRegistryBuilder::new();
+    registry.thread_lifecycle_contributor(callback.clone());
+    Arc::get_mut(&mut thread.session)
+        .unwrap()
+        .services
+        .extensions = Arc::new(registry.build());
+    (callback, release)
+}
+fn ready_root(counts: &Arc<HistoryWorkCounts>) -> HistoryWork {
+    counts.live.fetch_add(1, Ordering::SeqCst);
+    HistoryWork(Arc::clone(counts))
+}
+#[tokio::test(flavor = "current_thread")]
+async fn ready_callback_background_child_outlives_notification_without_idle_lease() {
+    let (mut thread, _, _) = fixture().await;
+    let (callback, release) = ready_work_contributor(&mut thread, ReadyWorkMode::Detached);
+    let counts = Arc::new(HistoryWorkCounts::default());
+    let root = ready_root(&counts);
+    thread.emit_thread_ready_lifecycle(Some(&root)).await;
+    assert_eq!(callback.entered.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 2);
+    drop(root);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    let join = callback.join.lock().unwrap().take().unwrap();
+    release.send(()).unwrap();
+    join.await.unwrap();
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+}
+#[tokio::test]
+async fn cancelled_ready_callback_releases_notification_and_callback_work() {
+    let (mut thread, _, _) = fixture().await;
+    let (callback, release) = ready_work_contributor(&mut thread, ReadyWorkMode::Inline);
+    let counts = Arc::new(HistoryWorkCounts::default());
+    let root = ready_root(&counts);
+    let mut ready = Box::pin(thread.emit_thread_ready_lifecycle(Some(&root)));
+    assert!(futures::poll!(&mut ready).is_pending());
+    assert_eq!(callback.entered.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 3);
+    drop(ready);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    assert!(release.send(()).is_err());
+    drop(root);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+}
+#[tokio::test]
+async fn ready_callback_required_missing_or_exhausted_work_never_becomes_unscoped() {
+    let (mut thread, _, _) = fixture().await;
+    let (callback, _) = ready_work_contributor(&mut thread, ReadyWorkMode::Observe);
+    let gate = Arc::new(RefusingMcpRequest::default());
+    Arc::get_mut(&mut thread.session)
+        .unwrap()
+        .services
+        .host_admission = Some(gate.clone());
+    thread.emit_thread_ready_lifecycle(None).await;
+    let counts = Arc::new(HistoryWorkCounts::default());
+    let root = ready_root(&counts);
+    counts.refuse_child.store(true, Ordering::SeqCst);
+    thread.emit_thread_ready_lifecycle(Some(&root)).await;
+    assert_eq!(callback.refused.load(Ordering::SeqCst), 2);
+    assert_eq!(callback.unscoped.load(Ordering::SeqCst), 0);
+    assert_eq!(callback.entered.load(Ordering::SeqCst), 0);
+    assert_eq!(gate.0.load(Ordering::SeqCst), 0, "no request rediscovery");
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    drop(root);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+}
+#[tokio::test]
+async fn ready_callback_ungated_missing_work_preserves_local_notification() {
+    let (mut thread, _, _) = fixture().await;
+    let (callback, _) = ready_work_contributor(&mut thread, ReadyWorkMode::Observe);
+    thread.emit_thread_ready_lifecycle(None).await;
+    assert_eq!(callback.unscoped.load(Ordering::SeqCst), 1);
+    assert_eq!(callback.refused.load(Ordering::SeqCst), 0);
+}

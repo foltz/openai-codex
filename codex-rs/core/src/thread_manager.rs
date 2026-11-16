@@ -2701,6 +2701,21 @@ impl ThreadManagerState {
                     })
             })
             .transpose()?;
+        let ready_work = if matches!(request.ready_notification, ThreadReadyNotification::Emit)
+            && !self.extensions.thread_lifecycle_contributors().is_empty()
+        {
+            account_work
+                .as_deref()
+                .map(|work| work.derive_operation())
+                .transpose()
+                .map_err(|_| {
+                    CodexErr::Fatal(
+                        "construction account work cannot admit thread-ready callbacks".to_owned(),
+                    )
+                })?
+        } else {
+            None
+        };
         let state = Arc::clone(self);
         self.constructions.register(account_work, move |custody, publication| async move {
             let mut request = request;
@@ -2735,7 +2750,7 @@ impl ThreadManagerState {
                 }
             });
             let result = {
-                let start = state.spawn_thread_owned_boxed(request, Arc::clone(&custody), publication, initial_mcp_work);
+                let start = state.spawn_thread_owned_boxed(request, Arc::clone(&custody), publication, initial_mcp_work, ready_work);
                 tokio::select! {
                     biased;
                     _ = stopped => Err(CodexErr::TurnAborted),
@@ -2779,8 +2794,15 @@ impl ThreadManagerState {
         custody: Arc<crate::session::startup_custody::SessionStartupCustody>,
         publication: retirement::ConstructionPublication,
         initial_mcp_work: Option<Box<dyn codex_mcp::McpAttemptWork>>,
+        ready_work: Option<Box<dyn codex_extension_api::HostOperationWork>>,
     ) -> std::pin::Pin<Box<impl std::future::Future<Output = CodexResult<NewThread>> + '_>> {
-        Box::pin(self.spawn_thread_owned(request, custody, publication, initial_mcp_work))
+        Box::pin(self.spawn_thread_owned(
+            request,
+            custody,
+            publication,
+            initial_mcp_work,
+            ready_work,
+        ))
     }
 
     async fn spawn_thread_owned(
@@ -2789,6 +2811,7 @@ impl ThreadManagerState {
         custody: Arc<crate::session::startup_custody::SessionStartupCustody>,
         publication: retirement::ConstructionPublication,
         initial_mcp_work: Option<Box<dyn codex_mcp::McpAttemptWork>>,
+        ready_work: Option<Box<dyn codex_extension_api::HostOperationWork>>,
     ) -> CodexResult<NewThread> {
         let cancellation = request
             .options
@@ -3290,8 +3313,12 @@ impl ThreadManagerState {
         publication.wait_after_publish_for_test().await;
         custody.published();
         if matches!(ready_notification, ThreadReadyNotification::Emit) {
-            new_thread.thread.emit_thread_ready_lifecycle().await;
+            new_thread
+                .thread
+                .emit_thread_ready_lifecycle(ready_work.as_deref())
+                .await;
         }
+        drop(ready_work);
         for reason in std::mem::take(
             &mut *startup_invalidations
                 .lock()

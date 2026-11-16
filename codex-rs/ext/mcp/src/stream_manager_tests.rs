@@ -60,6 +60,7 @@ async fn connect_loaded_task(
         .await;
     manager
         .on_thread_ready(ThreadReadyInput {
+            account_work: Ok(None),
             config: &(),
             session_source: &SessionSource::Exec,
             history_initialization: codex_extension_api::HistoryInitialization::New,

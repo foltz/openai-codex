@@ -2130,3 +2130,64 @@ async fn explicit_empty_parent_capture_never_falls_back_to_required_manager_requ
     assert_eq!(required_gate.live.load(Ordering::SeqCst), 0);
     assert!(manager.state.threads.read().await.is_empty());
 }
+
+struct ManagedReadyWitness(Arc<AtomicUsize>);
+impl codex_extension_api::ThreadLifecycleContributor<crate::config::Config>
+    for ManagedReadyWitness
+{
+    fn on_thread_ready<'a>(
+        &'a self,
+        input: codex_extension_api::ThreadReadyInput<'a, crate::config::Config>,
+    ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+        Box::pin(async move {
+            let work = input
+                .account_work
+                .expect("constructor authority")
+                .expect("required work");
+            let child = work.derive_operation().expect("derive callback work");
+            self.0.fetch_add(1, Ordering::SeqCst);
+            drop(child);
+        })
+    }
+}
+#[tokio::test]
+async fn managed_constructor_carries_explicit_work_into_ready_callbacks_without_rediscovery() {
+    use crate::thread_manager::StartThreadOptions;
+    let (_home, mut manager, config) = expiry_manager(true).await;
+    let host = Arc::new(ManagedRequestHost {
+        required: true,
+        produce_work: true,
+        refuse: false,
+        lookups: AtomicUsize::new(0),
+        operations: AtomicUsize::new(1),
+    });
+    let observed = Arc::new(AtomicUsize::new(0));
+    let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
+    extensions.turn_start_admission(Arc::new(ManagedRequestAdmission(Arc::clone(&host))));
+    extensions.thread_lifecycle_contributor(Arc::new(ManagedReadyWitness(Arc::clone(&observed))));
+    Arc::get_mut(&mut manager.state).unwrap().extensions = Arc::new(extensions.build());
+    let manager = Arc::new(manager);
+    let mut options = StartThreadOptions::new(config, None);
+    options.account_work = Some(Box::new(ManagedRequestWork(Arc::clone(&host))));
+    options
+        .thread_extension_init
+        .insert(codex_extension_api::SessionIsolation::Isolated);
+    let tasks = tokio_util::task::TaskTracker::new();
+    let thread = manager
+        .start_thread_until(options, std::future::pending(), &tasks)
+        .await
+        .unwrap();
+    assert_eq!(observed.load(Ordering::SeqCst), 1);
+    assert_eq!(host.lookups.load(Ordering::SeqCst), 0);
+    if let Some(prewarm) = thread.thread.session.take_session_startup_prewarm().await {
+        tokio::time::timeout(Duration::from_secs(5), prewarm.abort())
+            .await
+            .unwrap();
+    }
+    assert_eq!(host.operations.load(Ordering::SeqCst), 0);
+    thread.thread.shutdown_and_wait().await.unwrap();
+    tasks.close();
+    tokio::time::timeout(Duration::from_secs(20), tasks.wait())
+        .await
+        .unwrap();
+}

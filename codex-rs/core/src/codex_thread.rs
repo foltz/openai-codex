@@ -447,7 +447,10 @@ impl CodexThread {
         );
     }
 
-    pub(crate) async fn emit_thread_ready_lifecycle(&self) {
+    pub(crate) async fn emit_thread_ready_lifecycle(
+        &self,
+        constructor_work: Option<&dyn codex_extension_api::HostOperationWork>,
+    ) {
         let contributors = self
             .session
             .services
@@ -458,11 +461,35 @@ impl CodexThread {
         if contributors.is_empty() {
             return;
         }
+        // Capture once, before configuration waits, without any request lookup
+        // or fresh admission. A one-shot notification cannot await reacquisition.
+        let captured = match constructor_work {
+            Some(work) => work.derive_operation().map(Some),
+            None if self
+                .session
+                .services
+                .host_admission
+                .as_ref()
+                .is_some_and(|host| host.requires_account_work()) =>
+            {
+                Err(codex_extension_api::TurnWorkRefused::Unavailable)
+            }
+            None => Ok(None),
+        };
+        let (work, refused) = match captured {
+            Ok(work) => (work, false),
+            Err(_) => (None, true),
+        };
         let (config, history_initialization, history_mode) =
             self.session.thread_ready_config().await;
         for contributor in contributors {
             contributor
                 .on_thread_ready(codex_extension_api::ThreadReadyInput {
+                    account_work: if refused {
+                        Err(codex_extension_api::TurnWorkRefused::Unavailable)
+                    } else {
+                        Ok(work.as_deref())
+                    },
                     config: config.as_ref(),
                     session_source: &self.session_source,
                     history_initialization,

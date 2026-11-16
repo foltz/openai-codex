@@ -193,6 +193,13 @@ where
 
     fn on_thread_idle<'a>(&'a self, input: ThreadIdleInput<'a>) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
+            let work = input.account_work.and_then(|work| {
+                work.map(|work| {
+                    work.derive_operation()
+                        .map_err(|_| codex_protocol::mcp_work::McpAttemptRefused)
+                })
+                .transpose()
+            });
             let Some(runtime) = goal_runtime_handle(input.thread_store) else {
                 return;
             };
@@ -207,11 +214,15 @@ where
                 }
                 accounting.finish_turn(&turn_id);
             }
-            if let Err(err) = runtime.continue_if_idle().await {
-                tracing::warn!(
-                    "failed to continue active goal for idle thread {}: {err}",
-                    runtime.thread_id()
-                );
+            // Local interrupted-turn accounting above remains valid on refusal;
+            // automatic account-bound continuation does not.
+            if let Ok(work) = work {
+                if let Err(err) = runtime.continue_if_idle_with_work(work.as_deref()).await {
+                    tracing::warn!(
+                        "failed to continue active goal for idle thread {}: {err}",
+                        runtime.thread_id()
+                    );
+                }
             }
         })
     }

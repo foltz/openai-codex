@@ -1142,3 +1142,83 @@ async fn hook_free_resume_does_not_derive_or_suspend() {
     drop(root);
     assert_eq!(counts.live.load(Ordering::SeqCst), 0);
 }
+
+#[derive(Debug)]
+struct IdleTurnRoot {
+    thread: String,
+    refused: bool,
+    derived: AtomicUsize,
+    dropped: Arc<AtomicUsize>,
+}
+impl codex_extension_api::HostOperationWork for IdleTurnRoot {
+    fn derive_operation(
+        &self,
+    ) -> Result<Box<dyn codex_extension_api::HostOperationWork>, TurnWorkRefused> {
+        panic!("turn submission derives a turn directly")
+    }
+    fn derive_turn_work(
+        &self,
+        store: &ExtensionData,
+        _: ExtensionFuture<'static, ()>,
+    ) -> Result<Box<dyn HostTurnWork>, TurnWorkRefused> {
+        assert_eq!(store.level_id(), self.thread);
+        self.derived.fetch_add(1, Ordering::SeqCst);
+        if self.refused {
+            Err(TurnWorkRefused::Unavailable)
+        } else {
+            Ok(Box::new(Work(self.dropped.clone())))
+        }
+    }
+}
+#[tokio::test]
+async fn idle_turn_uses_explicit_work_and_queued_child_survives_reply_cancellation() {
+    let (thread, rx, gate) = fixture().await;
+    gate.closed.store(true, Ordering::SeqCst);
+    let root = IdleTurnRoot {
+        thread: thread.thread_extension_data().level_id().to_owned(),
+        refused: false,
+        derived: AtomicUsize::new(0),
+        dropped: gate.dropped.clone(),
+    };
+    let mut submission = Box::pin(thread.start_turn_if_idle_with_work(typed_request(), &root));
+    assert!(futures::poll!(&mut submission).is_pending());
+    let queued = rx.recv().await.unwrap();
+    assert_eq!(root.derived.load(Ordering::SeqCst), 1);
+    assert_eq!(gate.calls.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        &queued.op,
+        Op::TurnInput {
+            mode: TurnInputMode::StartIfIdle,
+            host_work: Some(_),
+            ..
+        }
+    ));
+    drop(submission);
+    assert_eq!(gate.dropped.load(Ordering::SeqCst), 0);
+    drop(queued);
+    assert_eq!(gate.dropped.load(Ordering::SeqCst), 1);
+}
+#[tokio::test]
+async fn idle_turn_exhausted_work_refuses_without_fresh_admission_or_submission() {
+    let (thread, rx, gate) = fixture().await;
+    let root = IdleTurnRoot {
+        thread: thread.thread_extension_data().level_id().to_owned(),
+        refused: true,
+        derived: AtomicUsize::new(0),
+        dropped: gate.dropped.clone(),
+    };
+    let result = thread
+        .start_turn_if_idle_with_work(typed_request(), &root)
+        .await
+        .unwrap();
+    assert!(matches!(
+        result,
+        StartIfIdleSubmission::NotSubmitted {
+            reason: codex_protocol::turn_input::NotSubmittedReason::ServerDraining
+        }
+    ));
+    assert!(rx.is_empty());
+    assert_eq!(root.derived.load(Ordering::SeqCst), 1);
+    assert_eq!(gate.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(gate.dropped.load(Ordering::SeqCst), 0);
+}

@@ -716,6 +716,48 @@ impl CodexThread {
         }
     }
 
+    /// Start automatic idle work from an explicit finite operation. Derive
+    /// custody for the queued turn before capacity waits, with no fresh account
+    /// admission or ambient request/turn lookup on refusal.
+    pub async fn start_turn_if_idle_with_work(
+        &self,
+        request: impl Into<WithTurnExtensionData<TurnInputRequest>>,
+        work: &dyn codex_extension_api::HostOperationWork,
+    ) -> CodexResult<StartIfIdleSubmission> {
+        let host_work = match work.derive_turn_work(
+            &self.session.services.thread_extension_data,
+            Box::pin(self.termination_receipt()),
+        ) {
+            Ok(work) => work,
+            Err(_) => {
+                return Ok(StartIfIdleSubmission::NotSubmitted {
+                    reason: codex_protocol::turn_input::NotSubmittedReason::ServerDraining,
+                });
+            }
+        };
+        self.ensure_execution_capacity_for_turn_start(self.session.services.agent_control.as_ref())
+            .await?;
+        match self
+            .io
+            .submit_turn_input(request, TurnInputMode::StartIfIdle, Some(host_work), None)
+            .await?
+        {
+            TurnInputSubmission::Started {
+                turn_id,
+                root_turn_id,
+            } => Ok(StartIfIdleSubmission::Started {
+                turn_id,
+                root_turn_id,
+            }),
+            TurnInputSubmission::NotSubmitted { reason } => {
+                Ok(StartIfIdleSubmission::NotSubmitted { reason })
+            }
+            TurnInputSubmission::Steered { .. } | TurnInputSubmission::Accepted => {
+                unreachable!("start-if-idle submission must start or decline")
+            }
+        }
+    }
+
     /// Starts a new internal continuation turn when idle, including in Plan mode.
     /// Rejects if a newer task has started, even if it has already finished.
     /// The input must be a response item; it is never treated as user authorization.

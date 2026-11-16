@@ -437,7 +437,11 @@ impl QueuedItemService {
         Ok(submission)
     }
 
-    async fn dispatch_if_idle(&self, thread_id: ThreadId) -> Result<(), QueueServiceError> {
+    async fn dispatch_if_idle(
+        &self,
+        thread_id: ThreadId,
+        work: Option<&dyn codex_extension_api::HostOperationWork>,
+    ) -> Result<(), QueueServiceError> {
         let Some(manager) = self.thread_manager.upgrade() else {
             return Ok(());
         };
@@ -471,17 +475,17 @@ impl QueuedItemService {
                 continue;
             }
 
-            match thread
-                .start_turn_if_idle(
-                    TurnInputRequest::new(item.input)
-                        .with_responses_metadata(item.responsesapi_client_metadata)
-                        .on_start(TurnStartOptions {
-                            turn_trigger: Some("queue".to_string()),
-                            ..Default::default()
-                        }),
-                )
-                .await
-            {
+            let request = TurnInputRequest::new(item.input)
+                .with_responses_metadata(item.responsesapi_client_metadata)
+                .on_start(TurnStartOptions {
+                    turn_trigger: Some("queue".to_string()),
+                    ..Default::default()
+                });
+            let submission = match work {
+                Some(work) => thread.start_turn_if_idle_with_work(request, work).await,
+                None => thread.start_turn_if_idle(request).await,
+            };
+            match submission {
                 Ok(StartIfIdleSubmission::Started { .. }) => {
                     self.delete_locked(thread_id, queued_item_id).await?;
                     return Ok(());
@@ -590,6 +594,14 @@ where
             if input.cause == ThreadIdleCause::Interrupted {
                 return;
             }
+            let work = match input.account_work {
+                Ok(Some(work)) => match work.derive_operation() {
+                    Ok(work) => Some(work),
+                    Err(_) => return,
+                },
+                Ok(None) => None,
+                Err(_) => return,
+            };
             let Ok(thread_id) = ThreadId::from_string(input.thread_store.level_id()) else {
                 tracing::warn!(
                     level_id = input.thread_store.level_id(),
@@ -598,7 +610,7 @@ where
                 return;
             };
             let _guard = self.dispatch_guard(thread_id).await;
-            if let Err(error) = self.dispatch_if_idle(thread_id).await {
+            if let Err(error) = self.dispatch_if_idle(thread_id, work.as_deref()).await {
                 tracing::warn!(%thread_id, %error, "failed to dispatch queued user input");
             }
         })

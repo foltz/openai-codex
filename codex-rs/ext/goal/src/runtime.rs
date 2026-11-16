@@ -433,6 +433,13 @@ impl GoalRuntimeHandle {
     }
 
     pub(crate) async fn continue_if_idle(&self) -> Result<(), String> {
+        self.continue_if_idle_with_work(None).await
+    }
+
+    pub(crate) async fn continue_if_idle_with_work(
+        &self,
+        work: Option<&dyn codex_extension_api::HostOperationWork>,
+    ) -> Result<(), String> {
         if !self.tools_available() {
             self.inner.accounting_state.clear_active_goal();
             return Ok(());
@@ -486,13 +493,15 @@ impl GoalRuntimeHandle {
             thread.config().await.update_plan_enabled,
         );
 
-        match thread
-            .start_turn_if_idle(request.on_start(TurnStartOptions {
-                turn_trigger: Some("goal".to_string()),
-                ..start_options
-            }))
-            .await
-        {
+        let request = request.on_start(TurnStartOptions {
+            turn_trigger: Some("goal".to_string()),
+            ..start_options
+        });
+        let submission = match work {
+            Some(work) => thread.start_turn_if_idle_with_work(request, work).await,
+            None => thread.start_turn_if_idle(request).await,
+        };
+        match submission {
             Ok(StartIfIdleSubmission::Started { turn_id, .. }) => {
                 // Turn-stop evaluation takes the same permit, so even a fast response
                 // cannot finish before this host-admitted continuation is identified.

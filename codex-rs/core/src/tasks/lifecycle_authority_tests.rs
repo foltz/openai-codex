@@ -178,3 +178,186 @@ async fn required_local_regular_callbacks_cannot_mistake_absent_work_for_unscope
     assert_eq!(gate.turn_derives.load(Ordering::SeqCst), 0);
     assert_eq!(gate.live.load(Ordering::SeqCst), 0);
 }
+
+#[derive(Debug)]
+struct IdleGate {
+    live: Arc<AtomicUsize>,
+    calls: AtomicUsize,
+    refusal: usize,
+}
+impl TurnStartAdmission for IdleGate {
+    fn admit_turn_start(&self) -> Option<Box<dyn Send>> {
+        panic!("not turn admission")
+    }
+    fn requires_account_work(&self) -> bool {
+        true
+    }
+    fn derive_request_operation_work(
+        &self,
+    ) -> Result<Option<Box<dyn HostOperationWork>>, TurnWorkRefused> {
+        panic!("idle is not an ambient request")
+    }
+    fn derive_operation_work(
+        &self,
+        _: &ExtensionData,
+        _: &str,
+    ) -> Result<Option<Box<dyn HostOperationWork>>, TurnWorkRefused> {
+        panic!("idle has no live turn")
+    }
+    fn admit_operation_work(&self) -> Result<Option<Box<dyn HostOperationWork>>, TurnWorkRefused> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        match self.refusal {
+            0 => {
+                self.live.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(Box::new(Work(self.live.clone()))))
+            }
+            1 => Ok(None),
+            2 => Err(TurnWorkRefused::Unavailable),
+            _ => Err(TurnWorkRefused::RetryAfter(
+                Box::pin(std::future::pending()),
+            )),
+        }
+    }
+}
+struct IdleObserver {
+    entered: AtomicUsize,
+    refused: AtomicUsize,
+    unscoped: AtomicUsize,
+    hold: bool,
+    detached: bool,
+    join: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+impl codex_extension_api::ThreadLifecycleContributor<crate::config::Config> for IdleObserver {
+    fn on_thread_idle<'a>(
+        &'a self,
+        input: codex_extension_api::ThreadIdleInput<'a>,
+    ) -> ExtensionFuture<'a, ()> {
+        Box::pin(async move {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            let child = match input.account_work {
+                Ok(Some(work)) => work.derive_operation().unwrap(),
+                Ok(None) => {
+                    self.unscoped.fetch_add(1, Ordering::SeqCst);
+                    return;
+                }
+                Err(_) => {
+                    self.refused.fetch_add(1, Ordering::SeqCst);
+                    return;
+                }
+            };
+            if self.detached {
+                *self.join.lock().unwrap() = Some(tokio::spawn(async move {
+                    let _child = child;
+                    std::future::pending::<()>().await;
+                }));
+            } else {
+                let _child = child;
+                if self.hold {
+                    std::future::pending::<()>().await;
+                }
+            }
+        })
+    }
+}
+fn idle_fixture(
+    session: &mut Session,
+    refusal: usize,
+    hold: bool,
+    detached: bool,
+) -> (Arc<IdleGate>, Arc<IdleObserver>) {
+    let gate = Arc::new(IdleGate {
+        live: Default::default(),
+        calls: AtomicUsize::new(0),
+        refusal,
+    });
+    let observer = Arc::new(IdleObserver {
+        entered: AtomicUsize::new(0),
+        refused: AtomicUsize::new(0),
+        unscoped: AtomicUsize::new(0),
+        hold,
+        detached,
+        join: Default::default(),
+    });
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
+    builder.turn_start_admission(gate.clone());
+    builder.thread_lifecycle_contributor(observer.clone());
+    session.services.extensions = Arc::new(builder.build());
+    session.services.host_admission = session.services.extensions.host_admission();
+    (gate, observer)
+}
+#[tokio::test]
+async fn idle_admission_precedes_active_turn_wait_and_cancel_releases_it() {
+    let (mut session, _) = make_session_and_context().await;
+    let (gate, observer) = idle_fixture(&mut session, 0, false, false);
+    let held = session.active_turn.lock().await;
+    let mut idle = Box::pin(session.emit_thread_idle_lifecycle_if_idle(ThreadIdleCause::Completed));
+    assert!(futures::poll!(&mut idle).is_pending());
+    assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(gate.live.load(Ordering::SeqCst), 1);
+    assert_eq!(observer.entered.load(Ordering::SeqCst), 0);
+    drop(idle);
+    assert_eq!(gate.live.load(Ordering::SeqCst), 0);
+    drop(held);
+}
+#[tokio::test]
+async fn cancelled_idle_callback_releases_group_and_derived_work() {
+    fn require_sync<T: Sync>() {}
+    require_sync::<codex_extension_api::ThreadIdleInput<'static>>();
+    let (mut session, _) = make_session_and_context().await;
+    let (gate, observer) = idle_fixture(&mut session, 0, true, false);
+    let mut idle = Box::pin(session.emit_thread_idle_lifecycle_if_idle(ThreadIdleCause::Completed));
+    assert!(futures::poll!(&mut idle).is_pending());
+    assert_eq!(observer.entered.load(Ordering::SeqCst), 1);
+    assert_eq!(gate.live.load(Ordering::SeqCst), 2);
+    drop(idle);
+    assert_eq!(gate.live.load(Ordering::SeqCst), 0);
+}
+#[tokio::test]
+async fn idle_required_missing_unavailable_or_retry_is_refused_not_unscoped() {
+    for refusal in [1, 2, 3] {
+        let (mut session, _) = make_session_and_context().await;
+        let (gate, observer) = idle_fixture(&mut session, refusal, false, false);
+        session
+            .emit_thread_idle_lifecycle_if_idle(ThreadIdleCause::Completed)
+            .await;
+        assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(observer.entered.load(Ordering::SeqCst), 1);
+        assert_eq!(observer.refused.load(Ordering::SeqCst), 1);
+        assert_eq!(observer.unscoped.load(Ordering::SeqCst), 0);
+        assert_eq!(gate.live.load(Ordering::SeqCst), 0);
+    }
+}
+#[tokio::test]
+async fn idle_detached_child_retains_its_own_work_until_abort_is_joined() {
+    let (mut session, _) = make_session_and_context().await;
+    let (gate, observer) = idle_fixture(&mut session, 0, false, true);
+    session
+        .emit_thread_idle_lifecycle_if_idle(ThreadIdleCause::Completed)
+        .await;
+    assert_eq!(gate.live.load(Ordering::SeqCst), 1);
+    let join = observer.join.lock().unwrap().take().unwrap();
+    join.abort();
+    assert!(join.await.unwrap_err().is_cancelled());
+    assert_eq!(gate.live.load(Ordering::SeqCst), 0);
+}
+#[tokio::test]
+async fn hook_free_idle_does_not_admit_or_wait_and_ungated_metadata_still_runs() {
+    let (mut session, _) = make_session_and_context().await;
+    let (gate, observer) = idle_fixture(&mut session, 2, false, false);
+    session.services.extensions =
+        Arc::new(codex_extension_api::ExtensionRegistryBuilder::new().build());
+    let held = session.active_turn.lock().await;
+    let mut idle = Box::pin(session.emit_thread_idle_lifecycle_if_idle(ThreadIdleCause::Completed));
+    assert!(futures::poll!(&mut idle).is_ready());
+    assert_eq!(gate.calls.load(Ordering::SeqCst), 0);
+    drop(idle);
+    drop(held);
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
+    builder.thread_lifecycle_contributor(observer.clone());
+    session.services.extensions = Arc::new(builder.build());
+    session.services.host_admission = None;
+    session
+        .emit_thread_idle_lifecycle_if_idle(ThreadIdleCause::Completed)
+        .await;
+    assert_eq!(observer.unscoped.load(Ordering::SeqCst), 1);
+}

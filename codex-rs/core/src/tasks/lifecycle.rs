@@ -104,6 +104,28 @@ impl Session {
     }
 
     pub(crate) async fn emit_thread_idle_lifecycle_if_idle(&self, cause: ThreadIdleCause) {
+        let contributors = self.services.extensions.thread_lifecycle_contributors();
+        if contributors.is_empty() {
+            return;
+        }
+        // An idle wake is new automatic work, not a surviving turn or request.
+        // Acquire once before any wait; a draining host can refuse the wake.
+        let captured = match &self.services.host_admission {
+            Some(host) => host.admit_operation_work().and_then(|work| {
+                if work.is_none() && host.requires_account_work() {
+                    Err(codex_extension_api::TurnWorkRefused::Unavailable)
+                } else {
+                    Ok(work)
+                }
+            }),
+            None => Ok(None),
+        };
+        // Never retain a retry future in a shared callback input or retry this
+        // wake after a generation change. Durable queued/Goal state remains.
+        let (work, refused) = match captured {
+            Ok(work) => (work, false),
+            Err(_) => (None, true),
+        };
         let cause = {
             let active_turn = self.active_turn.lock().await;
             if active_turn.is_some() {
@@ -119,9 +141,14 @@ impl Session {
             return;
         }
 
-        for contributor in self.services.extensions.thread_lifecycle_contributors() {
+        for contributor in contributors {
             contributor
                 .on_thread_idle(codex_extension_api::ThreadIdleInput {
+                    account_work: if refused {
+                        Err(codex_mcp::McpAttemptRefused)
+                    } else {
+                        Ok(work.as_deref())
+                    },
                     cause,
                     session_store: &self.services.session_extension_data,
                     thread_store: &self.services.thread_extension_data,

@@ -84,6 +84,11 @@ pub enum ThreadIdleCause {
 
 /// Input supplied when the host has no immediately pending thread work.
 pub struct ThreadIdleInput<'a> {
+    /// Finite admission for this automatic idle notification, acquired before
+    /// host waits. Derive before account work; refusal never authorizes a fresh
+    /// fallback. No counted work belongs in a reusable extension store.
+    pub account_work:
+        Result<Option<&'a dyn crate::HostOperationWork>, codex_mcp::McpAttemptRefused>,
     /// Why the thread became idle.
     pub cause: ThreadIdleCause,
     /// Store scoped to the host session runtime.

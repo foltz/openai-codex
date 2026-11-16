@@ -256,11 +256,24 @@ async fn emit_idle_with_cause(
     thread_id: ThreadId,
     cause: ThreadIdleCause,
 ) {
+    emit_idle_with_work(service, thread_id, cause, Ok(None)).await;
+}
+
+async fn emit_idle_with_work(
+    service: &QueuedItemService,
+    thread_id: ThreadId,
+    cause: ThreadIdleCause,
+    account_work: Result<
+        Option<&dyn codex_extension_api::HostOperationWork>,
+        codex_protocol::mcp_work::McpAttemptRefused,
+    >,
+) {
     let session_store = ExtensionData::new("session");
     let thread_store = ExtensionData::new(thread_id.to_string());
     <QueuedItemService as ThreadLifecycleContributor<()>>::on_thread_idle(
         service,
         ThreadIdleInput {
+            account_work,
             cause,
             session_store: &session_store,
             thread_store: &thread_store,
@@ -1202,5 +1215,69 @@ async fn resumed_idle_dispatches_input_without_a_loaded_manager() -> anyhow::Res
             .context("missing turn metadata")?,
     )?;
     assert_eq!(metadata["client_type"], "ios_app");
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct ExhaustedIdleWork(std::sync::atomic::AtomicUsize);
+impl codex_extension_api::HostOperationWork for ExhaustedIdleWork {
+    fn derive_operation(
+        &self,
+    ) -> Result<Box<dyn codex_extension_api::HostOperationWork>, codex_extension_api::TurnWorkRefused>
+    {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Err(codex_extension_api::TurnWorkRefused::Unavailable)
+    }
+    fn derive_turn_work(
+        &self,
+        _: &ExtensionData,
+        _: ExtensionFuture<'static, ()>,
+    ) -> Result<
+        Box<dyn codex_protocol::host_turn_work::HostTurnWork>,
+        codex_extension_api::TurnWorkRefused,
+    > {
+        panic!("exhausted callback must never submit a turn")
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_or_exhausted_idle_authority_preserves_queue_until_an_authorized_wake()
+-> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let response =
+        responses::mount_sse_once(&server, responses::sse_completed("authorized-queued-turn"))
+            .await;
+    let test = test_codex().build_with_auto_env(&server).await?;
+    let thread_id = test.session_configured.thread_id;
+    let queue = loaded_thread_queue(&test)?;
+    let item = QueuedItemService::new(queue.clone(), Weak::new(), Arc::new(NoopExtensionEventSink))
+        .enqueue(thread_id, user_input("retain this exact queued item"))
+        .await?;
+    let service = QueuedItemService::new(
+        queue,
+        Arc::downgrade(&test.thread_manager),
+        Arc::new(NoopExtensionEventSink),
+    );
+    let exhausted = ExhaustedIdleWork::default();
+    for access in [
+        Err(codex_protocol::mcp_work::McpAttemptRefused),
+        Ok(Some(
+            &exhausted as &dyn codex_extension_api::HostOperationWork,
+        )),
+    ] {
+        emit_idle_with_work(&service, thread_id, ThreadIdleCause::Completed, access).await;
+        assert_eq!(vec![item.clone()], service.list(thread_id).await?);
+        assert!(response.requests().is_empty());
+    }
+    assert_eq!(exhausted.0.load(Ordering::SeqCst), 1);
+    emit_idle(&service, thread_id).await;
+    wait_for_event_match(test.codex.as_ref(), |event| {
+        matches!(event, EventMsg::TurnComplete(_)).then_some(())
+    })
+    .await;
+    assert!(service.list(thread_id).await?.is_empty());
+    assert_eq!(
+        response.single_request().message_input_texts("user"),
+        vec!["retain this exact queued item"]
+    );
     Ok(())
 }

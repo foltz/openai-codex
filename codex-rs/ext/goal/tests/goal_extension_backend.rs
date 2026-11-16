@@ -1441,7 +1441,10 @@ async fn thread_resume_refused_account_work_preserves_local_goal_accounting() ->
 }
 
 async fn check_resume_accounting(
-    access: Result<codex_protocol::mcp_work::McpAttemptAccess<'_>, codex_protocol::mcp_work::McpAttemptRefused>,
+    access: Result<
+        codex_protocol::mcp_work::McpAttemptAccess<'_>,
+        codex_protocol::mcp_work::McpAttemptRefused,
+    >,
 ) -> anyhow::Result<()> {
     let runtime = test_runtime().await?;
     let thread_id = test_thread_id()?;
@@ -1950,7 +1953,10 @@ impl GoalExtensionHarness {
 
     async fn resume_thread_with_access(
         &self,
-        access: Result<codex_protocol::mcp_work::McpAttemptAccess<'_>, codex_protocol::mcp_work::McpAttemptRefused>,
+        access: Result<
+            codex_protocol::mcp_work::McpAttemptAccess<'_>,
+            codex_protocol::mcp_work::McpAttemptRefused,
+        >,
     ) {
         for contributor in self.registry.thread_lifecycle_contributors() {
             contributor
@@ -2451,5 +2457,168 @@ async fn retained_goal_snapshot_cannot_commit_through_a_new_preparation_with_the
             .expect("goal")
             .tokens_used
     );
+    Ok(())
+}
+
+#[derive(Debug)]
+struct GoalIdleWork {
+    live: Arc<std::sync::atomic::AtomicUsize>,
+    derives: Arc<std::sync::atomic::AtomicUsize>,
+    refuse: bool,
+}
+impl Drop for GoalIdleWork {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+impl codex_extension_api::HostOperationWork for GoalIdleWork {
+    fn derive_operation(
+        &self,
+    ) -> Result<Box<dyn codex_extension_api::HostOperationWork>, codex_extension_api::TurnWorkRefused>
+    {
+        self.derives
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.refuse {
+            return Err(codex_extension_api::TurnWorkRefused::Unavailable);
+        }
+        self.live.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Box::new(Self {
+            live: self.live.clone(),
+            derives: self.derives.clone(),
+            refuse: false,
+        }))
+    }
+    fn derive_turn_work(
+        &self,
+        _: &ExtensionData,
+        _: codex_extension_api::ExtensionFuture<'static, ()>,
+    ) -> Result<
+        Box<dyn codex_protocol::host_turn_work::HostTurnWork>,
+        codex_extension_api::TurnWorkRefused,
+    > {
+        panic!("this backend fixture has no loaded manager")
+    }
+}
+impl GoalExtensionHarness {
+    async fn idle_with_work(
+        &self,
+        account_work: Result<
+            Option<&dyn codex_extension_api::HostOperationWork>,
+            codex_protocol::mcp_work::McpAttemptRefused,
+        >,
+    ) {
+        for contributor in self.registry.thread_lifecycle_contributors() {
+            contributor
+                .on_thread_idle(codex_extension_api::ThreadIdleInput {
+                    account_work,
+                    cause: codex_extension_api::ThreadIdleCause::Completed,
+                    session_store: &self.session_store,
+                    thread_store: &self.thread_store,
+                })
+                .await;
+        }
+    }
+}
+#[tokio::test]
+async fn refused_or_exhausted_idle_goal_work_does_not_wait_for_preparation_or_mutate_goal()
+-> anyhow::Result<()> {
+    let runtime = test_runtime().await?;
+    let thread_id = test_thread_id()?;
+    seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+    let goal = runtime
+        .thread_goals()
+        .replace_thread_goal(
+            thread_id,
+            "retain active goal",
+            codex_state::ThreadGoalStatus::Active,
+            None,
+        )
+        .await?;
+    let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
+    let prepared = harness
+        .prepare_turn(
+            "held-preparation",
+            ModeKind::Default,
+            &TokenUsage::default(),
+        )
+        .await;
+    let work = GoalIdleWork {
+        live: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+        derives: Default::default(),
+        refuse: true,
+    };
+    for access in [
+        Err(codex_protocol::mcp_work::McpAttemptRefused),
+        Ok(Some(&work as &dyn codex_extension_api::HostOperationWork)),
+    ] {
+        let mut idle = Box::pin(harness.idle_with_work(access));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                std::future::Future::poll(idle.as_mut(), cx).is_ready()
+            ))
+            .await,
+            "refused account work must not enter Goal continuation's held preparation permit"
+        );
+    }
+    assert_eq!(work.derives.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(work.live.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let current = runtime
+        .thread_goals()
+        .get_thread_goal(thread_id)
+        .await?
+        .unwrap();
+    assert_eq!(current.goal_id, goal.goal_id);
+    assert_eq!(current.status, codex_state::ThreadGoalStatus::Active);
+    assert_eq!(current.tokens_used, goal.tokens_used);
+    assert!(harness.sink.goal_events().is_empty());
+    drop(prepared);
+    Ok(())
+}
+#[tokio::test]
+async fn idle_goal_work_is_derived_before_preparation_wait_and_released_on_cancellation()
+-> anyhow::Result<()> {
+    let runtime = test_runtime().await?;
+    let thread_id = test_thread_id()?;
+    seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+    runtime
+        .thread_goals()
+        .replace_thread_goal(
+            thread_id,
+            "held goal continuation",
+            codex_state::ThreadGoalStatus::Active,
+            None,
+        )
+        .await?;
+    let harness = GoalExtensionHarness::new(runtime, thread_id).await?;
+    let prepared = harness
+        .prepare_turn(
+            "held-preparation",
+            ModeKind::Default,
+            &TokenUsage::default(),
+        )
+        .await;
+    let work = GoalIdleWork {
+        live: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+        derives: Default::default(),
+        refuse: false,
+    };
+    let live = work.live.clone();
+    let mut idle = Box::pin(harness.idle_with_work(Ok(Some(&work))));
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(
+            std::future::Future::poll(idle.as_mut(), cx).is_pending()
+        ))
+        .await
+    );
+    assert_eq!(work.derives.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(live.load(std::sync::atomic::Ordering::SeqCst), 2);
+    drop(idle);
+    assert_eq!(live.load(std::sync::atomic::Ordering::SeqCst), 1);
+    drop(prepared);
+    harness.idle_with_work(Ok(Some(&work))).await;
+    assert_eq!(work.derives.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(live.load(std::sync::atomic::Ordering::SeqCst), 1);
+    drop(work);
+    assert_eq!(live.load(std::sync::atomic::Ordering::SeqCst), 0);
     Ok(())
 }

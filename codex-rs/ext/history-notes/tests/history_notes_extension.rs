@@ -486,6 +486,7 @@ fn exposed_tools(
 
 fn tool_call(tool_name: ToolName, arguments: serde_json::Value) -> ToolCall<'static> {
     ToolCall {
+        mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
         turn_id: "turn-1".to_string(),
         call_id: "call-read-file".to_string(),
         tool_name,

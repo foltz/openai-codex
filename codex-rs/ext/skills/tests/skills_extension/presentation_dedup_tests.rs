@@ -222,6 +222,7 @@ async fn cloud_preference_preserves_aliases_reads_and_executor_fallback() -> Tes
                 };
                 let output = tool
                     .handle(ToolCall {
+                        mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
                         turn_id: stage.to_string(),
                         call_id: "call".to_string(),
                         tool_name: tool.tool_name(),

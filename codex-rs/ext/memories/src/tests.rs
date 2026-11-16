@@ -222,6 +222,7 @@ async fn add_ad_hoc_note_tool_creates_note_file() {
 
     let output = tool
         .handle(ToolCall {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             turn_id: "turn-1".to_string(),
             call_id: "call-1".to_string(),
             tool_name: memory_tool_name(crate::ADD_AD_HOC_NOTE_TOOL_NAME),
@@ -270,6 +271,7 @@ async fn add_ad_hoc_note_tool_rejects_paths_as_filenames() {
 
     let result = tool
         .handle(ToolCall {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             turn_id: "turn-1".to_string(),
             call_id: "call-1".to_string(),
             tool_name: memory_tool_name(crate::ADD_AD_HOC_NOTE_TOOL_NAME),
@@ -319,6 +321,7 @@ async fn read_tool_reads_memory_file() {
 
     let output = tool
         .handle(ToolCall {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             turn_id: "turn-1".to_string(),
             call_id: "call-1".to_string(),
             tool_name: memory_tool_name(crate::READ_TOOL_NAME),
@@ -438,6 +441,7 @@ async fn search_tool_accepts_multiple_queries() {
 
     let output = tool
         .handle(ToolCall {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             turn_id: "turn-1".to_string(),
             call_id: "call-1".to_string(),
             tool_name: memory_tool_name(crate::SEARCH_TOOL_NAME),
@@ -516,6 +520,7 @@ async fn search_tool_accepts_windowed_all_match_mode() {
 
     let output = tool
         .handle(ToolCall {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             turn_id: "turn-1".to_string(),
             call_id: "call-1".to_string(),
             tool_name: memory_tool_name(crate::SEARCH_TOOL_NAME),
@@ -574,6 +579,7 @@ async fn search_tool_rejects_legacy_single_query() {
 
     let result = tool
         .handle(ToolCall {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             turn_id: "turn-1".to_string(),
             call_id: "call-1".to_string(),
             tool_name: memory_tool_name(crate::SEARCH_TOOL_NAME),

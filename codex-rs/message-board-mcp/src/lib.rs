@@ -109,6 +109,7 @@ impl ServerHandler for MessageBoardMcpServer {
             arguments: serde_json::Value::Object(request.arguments.unwrap_or_default()).to_string(),
         };
         let call = ToolCall {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             turn_id: self.invocation_scope.clone(),
             call_id,
             tool_name: executor.tool_name(),

@@ -415,6 +415,20 @@ impl SkillsThreadState {
             return providers.read(request).await;
         }
 
+        let access = request
+            .mcp_access
+            .map_err(|error| SkillProviderError::new(error.to_string()))?;
+        let work = match access {
+            codex_mcp::McpAttemptAccess::Admitted(work) => Some(
+                work.derive_attempt()
+                    .map_err(|error| SkillProviderError::new(error.to_string()))?,
+            ),
+            codex_mcp::McpAttemptAccess::Unscoped => None,
+        };
+        let request = SkillReadRequest {
+            mcp_access: Ok(codex_mcp::McpAttemptAccess::from_work(work.as_deref())),
+            ..request
+        };
         let SkillReadContext::Cloud { mcp_resources } = &request.context else {
             return Err(SkillProviderError::new(
                 "cloud skill reads require a cloud context",

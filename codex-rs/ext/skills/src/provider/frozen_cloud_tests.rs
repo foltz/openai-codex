@@ -18,6 +18,7 @@ fn snapshot() -> serde_json::Value {
 
 fn request() -> SkillReadRequest<'static> {
     SkillReadRequest {
+        mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
         authority: SkillAuthority::new(SkillSourceKind::Cloud, CODEX_APPS_MCP_SERVER_NAME),
         package: SkillPackageId("skill://demo/work".into()),
         resource: SkillResourceId::new("skill://demo/work/SKILL.md"),

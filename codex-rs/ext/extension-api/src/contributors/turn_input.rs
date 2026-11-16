@@ -19,6 +19,8 @@ pub struct TurnInputEnvironment<'a> {
 /// Turn facts supplied before the host records turn-local model input items.
 #[derive(Clone)]
 pub struct TurnInputContext<'a> {
+    /// Invocation authority, distinct from the retained step snapshot.
+    pub mcp_access: Result<codex_mcp::McpAttemptAccess<'a>, codex_mcp::McpAttemptRefused>,
     /// Prepared extension snapshots and read routes for the step processing this input.
     pub step_store: &'a crate::ExtensionData,
     /// Stable host-owned turn identifier.

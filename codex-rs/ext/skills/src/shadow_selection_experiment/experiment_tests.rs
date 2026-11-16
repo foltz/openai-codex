@@ -139,6 +139,7 @@ async fn turn_input_and_history_advance_while_ranking_is_blocked()
             Duration::from_secs(10),
             registry.turn_input_contributors()[0].contribute(
                 TurnInputContext {
+                    mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
                     step_store: &turn_store,
                     turn_id: turn_id.to_string(),
                     user_input: vec![UserInput::Skill {

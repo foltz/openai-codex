@@ -146,6 +146,11 @@ pub enum ToolCallSource {
 
 #[derive(Clone)]
 pub struct ToolCall<'call> {
+    /// Borrowed authority for this callback only; never store it with a retained tool.
+    pub mcp_access: Result<
+        codex_protocol::mcp_work::McpAttemptAccess<'call>,
+        codex_protocol::mcp_work::McpAttemptRefused,
+    >,
     pub turn_id: String,
     pub call_id: String,
     pub tool_name: ToolName,

@@ -375,6 +375,7 @@ async fn reads_use_callback_access_without_capability_roots() {
     );
     let result = provider
         .read(SkillReadRequest {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             authority: SkillAuthority::new(SkillSourceKind::Executor, "root"),
             package: SkillPackageId("skill://root/skill".to_string()),
             resource: resource.clone(),
@@ -416,6 +417,7 @@ async fn executor_skill_reads_reject_invalid_resource_handles() {
     ] {
         let result = provider
             .read(SkillReadRequest {
+                mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
                 authority: SkillAuthority::new(SkillSourceKind::Executor, "root"),
                 package: SkillPackageId("skill://root/package".to_string()),
                 resource: SkillResourceId::new(resource),
@@ -448,6 +450,7 @@ async fn windows_executor_skill_read_requires_a_requested_sandbox() -> io::Resul
     let access = FileSystemEnvironmentAccessor::unrestricted(&file_system);
     let read = provider
         .read(SkillReadRequest {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             authority: SkillAuthority::new(SkillSourceKind::Executor, "windows-root"),
             package: SkillPackageId("skill://windows-root/skill".into()),
             resource: resource.clone(),
@@ -474,6 +477,7 @@ async fn windows_executor_skill_read_requires_a_requested_sandbox() -> io::Resul
     let access = FileSystemEnvironmentAccessor::new(&file_system, sandbox);
     let error = provider
         .read(SkillReadRequest {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             authority: SkillAuthority::new(SkillSourceKind::Executor, "windows-root"),
             package: SkillPackageId("skill://windows-root/skill".into()),
             resource: resource.clone(),
@@ -1136,6 +1140,7 @@ async fn high_level_discovery_reuses_materialized_skill_contents_for_reads() {
     };
     let access = FileSystemEnvironmentAccessor::unrestricted(&LOCAL_FS);
     let request = SkillReadRequest {
+        mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
         authority: entry.authority.clone(),
         package: entry.id.clone(),
         resource: entry.main_prompt.clone(),

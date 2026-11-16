@@ -397,6 +397,7 @@ async fn installed_extension_uses_host_service_snapshot() -> TestResult {
     let fragments = prepared_turn_input(
         &registry,
         TurnInputContext {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             step_store: &ExtensionData::new("step"),
             turn_id: "turn-1".to_string(),
             user_input: vec![UserInput::Text {
@@ -1074,6 +1075,7 @@ async fn shadow_selection_uses_host_catalog_when_instructions_are_disabled() -> 
     let fragments = prepared_turn_input(
         &registry,
         TurnInputContext {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             step_store: &step_store,
             turn_id: "turn-1".to_string(),
             user_input: vec![UserInput::Text {
@@ -1180,6 +1182,7 @@ async fn shadow_lru_selector_recovers_a_skill_invoked_on_an_earlier_turn() -> Te
         let fragments = prepared_turn_input(
             &registry,
             TurnInputContext {
+                mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
                 step_store: &ExtensionData::new("step"),
                 turn_id: turn_id.to_string(),
                 user_input: vec![UserInput::Text {
@@ -1382,6 +1385,7 @@ async fn selected_executor_catalog_caches_root_selections_per_turn_and_reuses_di
     let fragments = prepared_turn_input(
         &registry,
         TurnInputContext {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             step_store: &step_store,
             turn_id: "turn-1".to_string(),
             user_input: vec![UserInput::Text {
@@ -2414,6 +2418,7 @@ async fn skills_list_only_returns_model_visible_bounded_metadata() -> TestResult
         arguments: serde_json::json!({"authority": {"kind": "cloud"}}).to_string(),
     };
     let call = ToolCall {
+        mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
         turn_id: "turn-1".to_string(),
         call_id: "call-1".to_string(),
         tool_name: list_tool.tool_name(),
@@ -2576,6 +2581,7 @@ async fn skills_list_only_returns_model_visible_bounded_metadata() -> TestResult
     };
     let error = read_tool
         .handle(ToolCall {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             turn_id: "turn-1".to_string(),
             call_id: "insufficient-read-budget".to_string(),
             tool_name: read_tool.tool_name(),
@@ -2865,6 +2871,7 @@ async fn v2_root_aliases_and_read_cache_use_the_captured_environment() -> TestRe
         };
         let result = read
             .handle(ToolCall {
+                mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
                 turn_id: "turn-1".to_string(),
                 call_id: "read".to_string(),
                 tool_name: read.tool_name(),
@@ -3012,6 +3019,7 @@ async fn root_qualified_locator_selects_only_the_matching_executor_skill() -> Te
     let fragments = prepared_turn_input(
         &registry,
         TurnInputContext {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             step_store: &step_store,
             turn_id: "turn-1".to_string(),
             user_input: vec![UserInput::Mention {
@@ -3280,6 +3288,7 @@ async fn executor_catalog_emits_at_most_four_warnings() -> TestResult {
     prepared_turn_input(
         &registry,
         TurnInputContext {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             step_store: &step_store,
             turn_id: "turn-1".to_string(),
             user_input: Vec::new(),
@@ -3387,6 +3396,7 @@ async fn host_catalog_compacts_shared_paths_under_budget_pressure() -> TestResul
     let fragments = prepared_turn_input(
         &registry,
         TurnInputContext {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             step_store: &ExtensionData::new("step"),
             turn_id: "turn-1".to_string(),
             user_input: vec![UserInput::Text {
@@ -3473,6 +3483,7 @@ async fn prompt_hidden_skill_can_still_be_invoked() -> TestResult {
     let fragments = prepared_turn_input(
         &registry,
         TurnInputContext {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             step_store: &ExtensionData::new("step"),
             turn_id: "turn-1".to_string(),
             user_input: vec![UserInput::Text {

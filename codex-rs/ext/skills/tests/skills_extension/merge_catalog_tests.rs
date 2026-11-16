@@ -259,6 +259,7 @@ async fn call_tool_with_budget(
         .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
     let result = tool
         .handle(ToolCall {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             turn_id: "turn-1".to_string(),
             call_id: "skill-test".to_string(),
             tool_name: tool.tool_name(),
@@ -1250,6 +1251,7 @@ async fn v2_implicit_and_explicit_invocations_retain_their_step_catalog() -> Tes
         let fragments = prepared_turn_input(
             &harness.registry,
             TurnInputContext {
+                mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
                 step_store,
                 turn_id: "turn-1".to_string(),
                 user_input: vec![UserInput::Mention {
@@ -1396,6 +1398,7 @@ async fn v2_shadow_observation_tracks_merged_skills_independently_of_read_route(
             let fragments = harness.registry.turn_input_contributors()[0]
                 .contribute(
                     TurnInputContext {
+                        mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
                         step_store: &harness.step_store,
                         turn_id: turn_id.to_string(),
                         user_input: vec![UserInput::Text {

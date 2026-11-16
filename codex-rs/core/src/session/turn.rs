@@ -1428,6 +1428,12 @@ async fn build_extension_turn_input_items(
         return Some(Vec::new());
     }
 
+    // Keep invocation work outside StepContext and release it with callback cancellation.
+    let work = sess.turn_mcp_work(turn_context);
+    let access = match &work {
+        Ok(work) => Ok(codex_mcp::McpAttemptAccess::from_work(work.as_deref())),
+        Err(_) => Err(codex_mcp::McpAttemptRefused),
+    };
     let environment_accessors = step_context.environments();
     let environments = environment_accessors
         .iter()
@@ -1441,6 +1447,7 @@ async fn build_extension_turn_input_items(
         .collect::<Vec<_>>();
 
     let input = TurnInputContext {
+        mcp_access: access,
         step_store: &step_context.extension_data,
         turn_id: turn_context.sub_id.to_string(),
         user_input: user_input.to_vec(),
@@ -3841,3 +3848,7 @@ pub(crate) fn get_last_assistant_message_from_turn<'a>(
 #[cfg(test)]
 #[path = "turn_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "turn_input_authority_tests.rs"]
+mod input_authority_tests;

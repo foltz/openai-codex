@@ -65,6 +65,11 @@ impl ToolExecutor<ToolInvocation> for ExtensionToolAdapter {
         ToolInvocation: 'a,
     {
         Box::pin(async move {
+            let work = invocation
+                .session
+                .turn_mcp_work(&invocation.turn)
+                .map_err(|err| codex_tools::FunctionCallError::RespondToModel(err.to_string()))?;
+            let access = codex_mcp::McpAttemptAccess::from_work(work.as_deref());
             let step = &invocation.step_context;
             let _native_search = if invocation.tool_name.namespace.as_deref() == Some("web")
                 && invocation.tool_name.name == "run"
@@ -98,7 +103,7 @@ impl ToolExecutor<ToolInvocation> for ExtensionToolAdapter {
                 })
                 .collect();
             self.0
-                .handle(to_extension_call(&invocation, environments).await)
+                .handle(to_extension_call(&invocation, environments, access).await)
                 .await
         })
     }
@@ -228,6 +233,7 @@ impl TurnItemEmitter for CoreTurnItemEmitter {
 async fn to_extension_call<'a>(
     invocation: &ToolInvocation,
     environments: Vec<ToolEnvironment<'a>>,
+    access: codex_mcp::McpAttemptAccess<'a>,
 ) -> ExtensionToolCall<'a> {
     let history = invocation
         .session
@@ -249,6 +255,7 @@ async fn to_extension_call<'a>(
         ))
         .and_then(|metadata| to_ascii_json_string(&metadata).ok());
     ExtensionToolCall {
+        mcp_access: Ok(access),
         turn_id: invocation.turn.sub_id.clone(),
         call_id: invocation.call_id.clone(),
         tool_name: invocation.tool_name.clone(),
@@ -406,6 +413,7 @@ mod tests {
                 .map(|environment| environment.cwd.clone())
                 .collect();
             let call = codex_tools::ToolCall {
+                mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
                 environments: Vec::new(),
                 ..call
             };

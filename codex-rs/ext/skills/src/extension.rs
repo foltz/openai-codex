@@ -570,6 +570,7 @@ impl<C> SkillsExtension<C> {
             .read_skill(
                 &self.providers,
                 SkillReadRequest {
+                    mcp_access: input.mcp_access,
                     authority: entry.authority.clone(),
                     package: entry.id.clone(),
                     resource: entry.main_prompt.clone(),

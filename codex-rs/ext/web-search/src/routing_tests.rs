@@ -86,6 +86,7 @@ async fn config_changes_preserve_the_threads_established_routing() {
     step_store.insert(config.web_search_mode.value());
     let tools = extension.tools_for_step(&session_store, &thread_store, &step_store);
     let call = ToolCall {
+        mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
         turn_id: "turn".into(),
         call_id: "search".into(),
         tool_name: ToolName::namespaced("web", "run"),

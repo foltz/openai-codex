@@ -437,3 +437,147 @@ async fn regular_task_reports_lifecycle_admission_failure_without_running_contri
         crate::tasks::TaskJoinOutcome::Complete { panicked: false }
     ));
 }
+
+#[derive(Default)]
+struct AdmittedExtensionExecutor {
+    calls: AtomicUsize,
+    pause: AtomicBool,
+    resume: tokio::sync::Notify,
+}
+impl<'call> codex_tools::ToolExecutor<codex_tools::ToolCall<'call>> for AdmittedExtensionExecutor {
+    fn tool_name(&self) -> codex_tools::ToolName {
+        codex_tools::ToolName::plain("authority_probe")
+    }
+    fn spec(&self) -> codex_tools::ToolSpec {
+        codex_tools::ToolSpec::Function(codex_tools::ResponsesApiTool {
+            name: "authority_probe".into(),
+            description: "Test invocation authority".into(),
+            strict: false,
+            parameters: codex_tools::JsonSchema::default(),
+            output_schema: None,
+            defer_loading: None,
+        })
+    }
+    fn handle<'a>(
+        &'a self,
+        call: codex_tools::ToolCall<'call>,
+    ) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        'call: 'a,
+    {
+        Box::pin(async move {
+            let McpAttemptAccess::Admitted(work) = call.mcp_access.map_err(|error| {
+                codex_tools::FunctionCallError::RespondToModel(error.to_string())
+            })?
+            else {
+                return Err(codex_tools::FunctionCallError::RespondToModel(
+                    "missing callback work".into(),
+                ));
+            };
+            let _child = work.derive_attempt().map_err(|error| {
+                codex_tools::FunctionCallError::RespondToModel(error.to_string())
+            })?;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.pause.swap(false, Ordering::SeqCst) {
+                self.resume.notified().await;
+            }
+            Ok(Box::new(codex_tools::JsonToolOutput::new(
+                serde_json::json!({"ok":true}),
+            )) as Box<dyn codex_tools::ToolOutput>)
+        })
+    }
+}
+fn extension_invocation(
+    session: Arc<Session>,
+    turn: Arc<TurnContext>,
+) -> crate::tools::context::ToolInvocation {
+    crate::tools::context::ToolInvocation {
+        session,
+        step_context: crate::session::step_context::StepContext::for_test(turn.clone()),
+        turn,
+        cancellation_token: CancellationToken::new(),
+        tracker: Arc::new(tokio::sync::Mutex::new(
+            crate::turn_diff_tracker::TurnDiffTracker::new(),
+        )),
+        call_id: "authority-call".into(),
+        tool_name: codex_tools::ToolName::plain("authority_probe"),
+        source: crate::tools::context::ToolCallSource::CodeMode {
+            cell_id: "cell".into(),
+            runtime_tool_call_id: "nested".into(),
+        },
+        payload: crate::tools::context::ToolPayload::Function {
+            arguments: "{}".into(),
+        },
+        native_call: None,
+        environments: Default::default(),
+    }
+}
+#[tokio::test]
+async fn extension_tool_refuses_exhausted_or_wrong_turn_before_history_wait() {
+    use codex_tools::ToolExecutor;
+    let executor = Arc::new(AdmittedExtensionExecutor::default());
+    let adapter =
+        crate::tools::handlers::extension_tools::ExtensionToolAdapter::new(executor.clone());
+    for wrong in [false, true] {
+        let (session, mut turn, counts) = fixture().await;
+        if wrong {
+            turn.sub_id = "wrong-turn".into();
+        } else {
+            counts.refuse.store(true, Ordering::SeqCst);
+        }
+        let _state = session.state.lock().await;
+        let mut call = adapter.handle(extension_invocation(session.clone(), Arc::new(turn)));
+        assert!(matches!(
+            futures::poll!(&mut call),
+            std::task::Poll::Ready(Err(_))
+        ));
+        assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.turns.load(Ordering::SeqCst), 1);
+    }
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn cancelled_extension_tool_history_wait_releases_work_without_calling_executor() {
+    use codex_tools::ToolExecutor;
+    let (session, turn, counts) = fixture().await;
+    let turn = Arc::new(turn);
+    let invocation = extension_invocation(session.clone(), turn.clone());
+    let retained_step = invocation.step_context.clone();
+    let executor = Arc::new(AdmittedExtensionExecutor::default());
+    let adapter =
+        crate::tools::handlers::extension_tools::ExtensionToolAdapter::new(executor.clone());
+    let _state = session.state.lock().await;
+    let mut call = adapter.handle(invocation);
+    assert!(futures::poll!(&mut call).is_pending());
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    drop(call);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+    drop((retained_step, turn));
+}
+#[tokio::test]
+async fn extension_callback_work_is_finite_on_cancellation_and_success() {
+    use codex_tools::ToolExecutor;
+    let (session, turn, counts) = fixture().await;
+    let invocation = extension_invocation(session.clone(), Arc::new(turn));
+    let retained_step = invocation.step_context.clone();
+    let executor = Arc::new(AdmittedExtensionExecutor::default());
+    executor.pause.store(true, Ordering::SeqCst);
+    let adapter =
+        crate::tools::handlers::extension_tools::ExtensionToolAdapter::new(executor.clone());
+    let mut call = adapter.handle(invocation.clone());
+    assert!(futures::poll!(&mut call).is_pending());
+    assert_eq!(counts.live.load(Ordering::SeqCst), 2);
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+    drop(call);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    assert!(adapter.handle(invocation).await.is_ok());
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        counts.live.load(Ordering::SeqCst),
+        0,
+        "retained tool/step must own no callback work"
+    );
+    drop(retained_step);
+}

@@ -168,6 +168,7 @@ async fn task_context_recovers_prior_requests_and_explicit_intent_without_changi
             let fragments = prepared_turn_input(
                 &registry,
                 TurnInputContext {
+                    mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
                     step_store: &ExtensionData::new("step"),
                     turn_id: turn_id.to_string(),
                     user_input,

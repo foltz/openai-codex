@@ -101,6 +101,7 @@ async fn host_catalog_resource_spellings_read_the_discovered_skill()
     ] {
         let result = HostSkillProvider::new()
             .read(SkillReadRequest {
+                mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
                 authority: entry.authority.clone(),
                 package: entry.id.clone(),
                 resource: resource.clone(),

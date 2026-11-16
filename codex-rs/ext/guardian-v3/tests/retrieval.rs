@@ -158,6 +158,7 @@ async fn searches_unsubscribed_guardian_posts_only_through_the_review_cutoff() -
         };
         let result = search
             .handle(ToolCall {
+                mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
                 turn_id: "review".into(),
                 call_id: "search".into(),
                 tool_name: tool_name.clone(),

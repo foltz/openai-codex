@@ -49,6 +49,8 @@ pub struct SkillListQuery<'a> {
 /// A skill read with the source access supplied by its callback.
 #[derive(Clone)]
 pub struct SkillReadRequest<'a> {
+    /// Cloud providers must use this invocation authority for MCP reads.
+    pub mcp_access: Result<codex_mcp::McpAttemptAccess<'a>, codex_mcp::McpAttemptRefused>,
     pub authority: SkillAuthority,
     pub package: SkillPackageId,
     pub resource: SkillResourceId,

@@ -145,6 +145,7 @@ async fn subscription_tools_only_change_the_caller_and_return_captured_post_ids(
             .find(|tool| tool.tool_name().name == name && tool.exposure().is_direct())
             .ok_or_else(|| anyhow::anyhow!("missing direct subscription tool {name}"))?;
         let call = ToolCall {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             turn_id: "review".into(),
             call_id: name.into(),
             tool_name: ToolName::namespaced("guardian", name),

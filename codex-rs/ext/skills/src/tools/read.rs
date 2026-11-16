@@ -286,6 +286,7 @@ impl<'call> ToolExecutor<ToolCall<'call>> for ReadTool {
                             .read_skill(
                                 &self.context.providers,
                                 SkillReadRequest {
+                                    mcp_access: call.mcp_access,
                                     authority: authority.clone(),
                                     package: package.clone(),
                                     resource: requested_resource.clone(),

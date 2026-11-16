@@ -129,6 +129,7 @@ fn query(client: Option<Arc<McpResourceClient>>) -> SkillListQuery<'static> {
 
 fn request(client: Option<Arc<McpResourceClient>>) -> SkillReadRequest<'static> {
     SkillReadRequest {
+        mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
         authority: SkillAuthority::new(SkillSourceKind::Cloud, "codex_apps"),
         package: SkillPackageId("skill://demo".into()),
         resource: SkillResourceId::new("skill://demo/SKILL.md"),
@@ -176,6 +177,7 @@ async fn frozen_cloud_catalog_and_reads_ignore_live_mcp_changes() {
         .expect("initial refresh should publish a cloud generation");
     for mcp_resources in [Some(client()), None, Some(client())] {
         let request = SkillReadRequest {
+            mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
             package: SkillPackageId("skill://demo/work".into()),
             resource: SkillResourceId::new("skill://demo/work/SKILL.md"),
             ..request(mcp_resources.clone())
@@ -764,5 +766,105 @@ async fn admitted_cloud_discovery_is_finite_and_refuses_before_serialization() {
         counts.live.load(Ordering::SeqCst),
         0,
         "retained catalog must not retain invocation work"
+    );
+}
+
+#[derive(Default)]
+struct AdmittedReadProvider {
+    reads: AtomicUsize,
+    pause: AtomicBool,
+    resume: Notify,
+}
+impl SkillProvider for AdmittedReadProvider {
+    fn list<'a>(&'a self, _query: SkillListQuery<'a>) -> SkillProviderFuture<'a, SkillCatalog> {
+        Box::pin(async { Err(SkillProviderError::new("not a discovery fixture")) })
+    }
+    fn read<'a>(
+        &'a self,
+        request: SkillReadRequest<'a>,
+    ) -> SkillProviderFuture<'a, SkillReadResult> {
+        Box::pin(async move {
+            let codex_mcp::McpAttemptAccess::Admitted(work) = request
+                .mcp_access
+                .map_err(|error| SkillProviderError::new(error.to_string()))?
+            else {
+                return Err(SkillProviderError::new("missing callback work"));
+            };
+            let _child = work
+                .derive_attempt()
+                .map_err(|error| SkillProviderError::new(error.to_string()))?;
+            let revision = self.reads.fetch_add(1, Ordering::SeqCst);
+            if self.pause.swap(false, Ordering::SeqCst) {
+                self.resume.notified().await;
+            }
+            Ok(SkillReadResult {
+                resource: request.resource,
+                contents: format!("admitted contents {revision}"),
+            })
+        })
+    }
+    fn search(&self, _request: SkillSearchRequest) -> SkillProviderFuture<'_, SkillSearchResult> {
+        Box::pin(async { Err(SkillProviderError::new("not a search fixture")) })
+    }
+}
+#[tokio::test]
+async fn cloud_reads_require_live_invocation_work_even_for_cached_contents() {
+    let state = state();
+    let counts = Arc::new(DiscoveryCounts::default());
+    let root = DiscoveryWork::new(&counts);
+    let provider = Arc::new(AdmittedReadProvider::default());
+    let providers = SkillProviders::new().with_cloud_provider(provider.clone());
+    let request = SkillReadRequest {
+        mcp_access: Ok(codex_mcp::McpAttemptAccess::Admitted(&root)),
+        ..request(None)
+    };
+    counts.refuse.store(true, Ordering::SeqCst);
+    {
+        let _catalog = state.catalog_state.lock().unwrap();
+        let mut read = Box::pin(state.read_skill(&providers, request.clone()));
+        assert!(matches!(
+            futures::poll!(&mut read),
+            std::task::Poll::Ready(Err(_))
+        ));
+        assert_eq!(provider.reads.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    }
+    counts.refuse.store(false, Ordering::SeqCst);
+    provider.pause.store(true, Ordering::SeqCst);
+    let mut read = Box::pin(state.read_skill(&providers, request.clone()));
+    assert!(futures::poll!(&mut read).is_pending());
+    assert_eq!(counts.live.load(Ordering::SeqCst), 3);
+    drop(read);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    let result = state.read_skill(&providers, request.clone()).await.unwrap();
+    assert_eq!(result.contents, "admitted contents 1");
+    assert_eq!(provider.reads.load(Ordering::SeqCst), 2);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        state.read_skill(&providers, request.clone()).await.unwrap(),
+        result
+    );
+    assert_eq!(provider.reads.load(Ordering::SeqCst), 2);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    counts.refuse.store(true, Ordering::SeqCst);
+    assert!(state.read_skill(&providers, request.clone()).await.is_err());
+    assert!(
+        state
+            .read_skill(
+                &providers,
+                SkillReadRequest {
+                    mcp_access: Err(codex_mcp::McpAttemptRefused),
+                    ..request
+                }
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(provider.reads.load(Ordering::SeqCst), 2);
+    drop(root);
+    assert_eq!(
+        counts.live.load(Ordering::SeqCst),
+        0,
+        "cached contents retain no account work"
     );
 }

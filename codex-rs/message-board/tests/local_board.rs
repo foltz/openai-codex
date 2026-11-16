@@ -886,6 +886,7 @@ async fn check_queries_page_discussions_and_search_unicode(backend: Backend) {
 
 fn board_tool_call(name: &str, args: serde_json::Value) -> codex_tools::ToolCall<'static> {
     codex_tools::ToolCall {
+        mcp_access: Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped),
         turn_id: "turn-1".into(),
         call_id: name.into(),
         tool_name: codex_tools::ToolName::namespaced("collaboration", name),

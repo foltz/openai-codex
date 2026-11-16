@@ -486,7 +486,7 @@ async fn standalone_router_keeps_exact_turn_work_through_callback_cancellation()
     assert_eq!(state.live.load(Ordering::SeqCst), 1);
     assert_eq!(state.requests.load(Ordering::SeqCst), 0);
     caller.abort();
-    assert!(caller.await.unwrap_err().is_cancelled());
+    assert!(matches!(caller.await, Err(error) if error.is_cancelled()));
     assert_eq!(state.live.load(Ordering::SeqCst), 0);
     assert!(state.min_live_on_payload_drop.load(Ordering::SeqCst) >= 1);
     assert!(state.outcomes.lock().unwrap().is_empty());

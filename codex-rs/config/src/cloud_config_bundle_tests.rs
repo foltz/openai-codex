@@ -328,3 +328,119 @@ allowed_sandbox_modes = ["read-only"]
         }
     );
 }
+
+#[tokio::test]
+async fn scoped_getter_preserves_source_metadata_and_snapshot_fallback() {
+    let count = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&count);
+    let server = crate::ConfigServer {
+        base_url: "https://policy.example/settings".into(),
+        oauth: None,
+    };
+    let loader = CloudConfigBundleLoader::new(async { Ok(None) })
+        .with_config_server(server.clone())
+        .with_load_scope(
+            move |work| {
+                let observed = Arc::clone(&observed);
+                async move {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    work.await
+                }
+                .boxed()
+            },
+            |_| panic!("a getter-only loader has no separate snapshot producer"),
+        );
+    assert_eq!(loader.config_server(), Some(&server));
+    assert_eq!(loader.get().await, Ok(None));
+    let snapshot = loader.get_snapshot().await;
+    assert_eq!(snapshot.bundle, Ok(None));
+    assert_eq!(snapshot.config_server, Some(server));
+    assert_eq!(count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn scoped_snapshot_keeps_the_actual_live_policy_binding() {
+    let policy = CloudConfigBundlePolicy::default();
+    let mut snapshot = CloudConfigBundleSnapshot {
+        bundle: Ok(None),
+        binding: None,
+        config_server: None,
+    };
+    policy.publish_snapshot(&mut snapshot);
+    let binding = snapshot.binding.clone().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&calls);
+    let loader = CloudConfigBundleLoader::from_snapshot(snapshot).with_load_scope(
+        |work| work,
+        move |work| {
+            let observed = Arc::clone(&observed);
+            async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                work.await
+            }
+            .boxed()
+        },
+    );
+    let snapshot = loader.get_snapshot().await;
+    assert_eq!(
+        snapshot.binding.unwrap().read().status,
+        CloudConfigBundleBindingStatus::Current
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(loader.ema_policy_changes().unwrap().is_active());
+    loader.retire_ema_policy();
+    assert_eq!(
+        binding.read().status,
+        CloudConfigBundleBindingStatus::Suspended
+    );
+}
+
+#[tokio::test]
+async fn refused_scope_does_not_invoke_either_original_getter() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let getter_calls = Arc::clone(&calls);
+    let snapshot_calls = Arc::clone(&calls);
+    let loader = CloudConfigBundleLoader::from_getter(move || {
+        getter_calls.fetch_add(1, Ordering::SeqCst);
+        async { Ok(None) }
+    })
+    .with_ema_policy_snapshots(CloudConfigBundlePolicy::default(), move || {
+        snapshot_calls.fetch_add(1, Ordering::SeqCst);
+        async {
+            CloudConfigBundleSnapshot {
+                bundle: Ok(None),
+                binding: None,
+                config_server: None,
+            }
+        }
+    })
+    .with_load_scope(
+        |_work| {
+            async {
+                Err(CloudConfigBundleLoadError::new(
+                    CloudConfigBundleLoadErrorCode::Internal,
+                    None,
+                    "scope refused",
+                ))
+            }
+            .boxed()
+        },
+        |_work| {
+            async {
+                CloudConfigBundleSnapshot {
+                    bundle: Err(CloudConfigBundleLoadError::new(
+                        CloudConfigBundleLoadErrorCode::Internal,
+                        None,
+                        "snapshot scope refused",
+                    )),
+                    binding: None,
+                    config_server: None,
+                }
+            }
+            .boxed()
+        },
+    );
+    assert!(loader.get().await.is_err());
+    assert!(loader.get_snapshot().await.bundle.is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}

@@ -439,6 +439,41 @@ impl CloudConfigBundleLoader {
         }
     }
 
+    /// Scope polling of both loader paths while preserving this loader's
+    /// live EMA policy and source metadata. Even invoking the original getter
+    /// is deferred into the scoped future, so refusal may precede constructor
+    /// effects as well as asynchronous I/O.
+    #[doc(hidden)]
+    pub fn with_load_scope<G, S>(mut self, getter_scope: G, snapshot_scope: S) -> Self
+    where
+        G: Fn(
+                BoxFuture<'static, Result<Option<CloudConfigBundle>, CloudConfigBundleLoadError>>,
+            )
+                -> BoxFuture<'static, Result<Option<CloudConfigBundle>, CloudConfigBundleLoadError>>
+            + Send
+            + Sync
+            + 'static,
+        S: Fn(
+                BoxFuture<'static, CloudConfigBundleSnapshot>,
+            ) -> BoxFuture<'static, CloudConfigBundleSnapshot>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let getter = Arc::clone(&self.getter);
+        self.getter = Arc::new(move || {
+            let getter = Arc::clone(&getter);
+            getter_scope(async move { getter().await }.boxed())
+        });
+        if let Some(getter) = self.snapshot_getter.take() {
+            self.snapshot_getter = Some(Arc::new(move || {
+                let getter = Arc::clone(&getter);
+                snapshot_scope(async move { getter().await }.boxed())
+            }));
+        }
+        self
+    }
+
     /// Freezes the delivered bundle while retaining its live policy revision binding.
     pub fn from_snapshot(snapshot: CloudConfigBundleSnapshot) -> Self {
         let bundle = snapshot.bundle.clone();

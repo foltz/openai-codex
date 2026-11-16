@@ -32,6 +32,7 @@ fn remote_loader(url: String, codex_home: PathBuf) -> CloudConfigBundleLoader {
         codex_home,
         CLOUD_CONFIG_BUNDLE_TIMEOUT,
     ))
+    .unwrap()
     .0
 }
 
@@ -206,4 +207,53 @@ async fn cached_policy_is_reused_only_for_the_same_endpoint() {
         home.path().to_path_buf(),
     );
     assert_eq!(different.get().await.unwrap_err().status_code(), Some(403));
+}
+
+#[tokio::test]
+async fn strict_config_server_replacement_retires_old_getters_and_keeps_source_namespace() {
+    let server = MockServer::start().await;
+    let first =
+        CloudConfigBundleFixture::enterprise_requirement("allowed_approval_policies = ['never']")
+            .into_bundle();
+    Mock::given(path("/settings/codex/config/bundle"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&first))
+        .mount(&server)
+        .await;
+    let home = tempdir().unwrap();
+    let old = remote_loader(format!("{}/settings", server.uri()), home.path().into());
+    assert_eq!(old.get().await.unwrap(), Some(first.clone()));
+    let factory = transport_default_auth_route_config()
+        .http_client_factory()
+        .clone();
+    let source = ConfigServerSource::new(
+        format!("{}/settings", server.uri()),
+        None,
+        home.path().into(),
+        factory,
+    )
+    .unwrap();
+    let service = CloudConfigBundleService::from_source(
+        source,
+        home.path().into(),
+        CLOUD_CONFIG_BUNDLE_TIMEOUT,
+    );
+    let selected = ConfigServer {
+        base_url: format!("{}/settings", server.uri()),
+        oauth: None,
+    };
+    let strict = crate::bundle_loader::strict_loader_for_service(service)
+        .await
+        .unwrap()
+        .with_config_server(selected.clone());
+    assert_eq!(strict.config_server(), Some(&selected));
+    assert_eq!(strict.get_snapshot().await.config_server, Some(selected));
+    assert_eq!(strict.get().await.unwrap(), Some(first));
+    assert!(old.get().await.is_err());
+    assert!(old.get_snapshot().await.bundle.is_err());
+    drop(strict);
+    crate::home_lifecycle::home_lifecycle(home.path())
+        .unwrap()
+        .retire_owners()
+        .await
+        .unwrap();
 }

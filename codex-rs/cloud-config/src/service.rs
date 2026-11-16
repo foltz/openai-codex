@@ -55,7 +55,11 @@ pub(crate) struct CloudConfigBundleService<S: BundleSource> {
     source: S,
     cache: CloudConfigBundleCache,
     cache_enabled: bool,
-    codex_home: AbsolutePathBuf,
+    pub(crate) codex_home: AbsolutePathBuf,
+    pub(crate) publication: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) generation: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) expected_generation: u64,
+    pub(crate) strict_cache_publication: bool,
     timeout: Duration,
     latest_bundle: OnceCell<Mutex<CloudConfigBundleSnapshot>>,
     pub(crate) policy: CloudConfigBundlePolicy,
@@ -93,6 +97,10 @@ impl<S: BundleSource + 'static> CloudConfigBundleService<S> {
             codex_home,
             timeout,
             latest_bundle: OnceCell::new(),
+            publication: Arc::new(tokio::sync::Mutex::new(())),
+            generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            expected_generation: 0,
+            strict_cache_publication: false,
             policy: CloudConfigBundlePolicy::default(),
         }
     }
@@ -378,20 +386,65 @@ impl<S: BundleSource + 'static> CloudConfigBundleService<S> {
             return Err(err);
         }
 
-        let (chatgpt_user_id, account_id) = self.source.identity(auth);
+        if self.cache_enabled && self.strict_cache_publication && revision.is_none() {
+            return Err(CloudConfigBundleLoadError::new(
+                CloudConfigBundleLoadErrorCode::Internal,
+                /*status_code*/ None,
+                "cloud cache publication policy is unavailable",
+            ));
+        }
         if self.cache_enabled
             && let Some(revision) = revision
         {
-            let result = match self
-                .cache
-                .prepare(chatgpt_user_id, account_id, bundle.clone())
-                .await
-            {
-                Ok(staged) => staged.publish_if_current(revision).await,
-                Err(err) => Err(err),
-            };
-            if let Err(err) = result {
-                tracing::warn!(error = %err, "Failed to write cloud config bundle cache");
+            let (chatgpt_user_id, account_id) = self.source.identity(auth);
+            let cache = self.cache.clone();
+            let publication = Arc::clone(&self.publication);
+            let generation = Arc::clone(&self.generation);
+            let expected_generation = self.expected_generation;
+            let saved_bundle = bundle.clone();
+            let strict = self.strict_cache_publication;
+            // The task owns the publication lease across real filesystem completion.
+            // Dropping this await (including the service timeout) cannot release it.
+            #[expect(
+                clippy::await_holding_invalid_type,
+                reason = "publication lease intentionally spans actual cache I/O so reset cannot acknowledge an unfinished write"
+            )]
+            let publication_result = tokio::spawn(async move {
+                let _lease = publication.lock().await;
+                if generation.load(std::sync::atomic::Ordering::Acquire) != expected_generation {
+                    return Err(());
+                }
+                let staged = cache
+                    .prepare(chatgpt_user_id, account_id, saved_bundle)
+                    .await
+                    .map_err(|_| ())?;
+                let committed = staged.publish_if_current(revision).await.map_err(|_| ())?;
+                if strict && !committed {
+                    Err(())
+                } else {
+                    Ok(())
+                }
+            })
+            .await
+            .map_err(|_| {
+                CloudConfigBundleLoadError::new(
+                    CloudConfigBundleLoadErrorCode::Internal,
+                    /*status_code*/ None,
+                    "cloud cache publication task failed",
+                )
+            })?;
+            if publication_result.is_err() {
+                if self.strict_cache_publication
+                    || self.generation.load(std::sync::atomic::Ordering::Acquire)
+                        != self.expected_generation
+                {
+                    return Err(CloudConfigBundleLoadError::new(
+                        CloudConfigBundleLoadErrorCode::Internal,
+                        /*status_code*/ None,
+                        "cloud cache publication refused or failed",
+                    ));
+                }
+                tracing::warn!("Failed to write cloud config bundle cache");
             }
         }
 

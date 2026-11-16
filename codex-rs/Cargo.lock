@@ -2712,6 +2712,7 @@ dependencies = [
  "codex-login",
  "codex-otel",
  "codex-protocol",
+ "futures",
  "hmac 0.12.1",
  "pretty_assertions",
  "serde",

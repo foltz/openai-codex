@@ -37,7 +37,10 @@ pub fn config_server_bundle_loader(
                 codex_home,
                 CLOUD_CONFIG_BUNDLE_TIMEOUT,
             );
-            crate::bundle_loader::managed_config_bundle_loader_for_service(service).0
+            match crate::bundle_loader::managed_config_bundle_loader_for_service(service) {
+                Ok((loader, _)) => loader,
+                Err(error) => CloudConfigBundleLoader::new(async move { Err(error) }),
+            }
         }
         Err(error) => CloudConfigBundleLoader::new(std::future::ready(Err(error))),
     }
@@ -77,7 +80,7 @@ pub(crate) fn config_server_http_client_factory(
     routes.http_client_factory_for_bootstrap(endpoints)
 }
 
-struct ConfigServerSource {
+pub(crate) struct ConfigServerSource {
     cache_namespace: String,
     client: BackendClient,
     auth: Option<OAuthSessionManager>,
@@ -102,7 +105,7 @@ fn oauth_session_manager(
 }
 
 impl ConfigServerSource {
-    fn from_config_server(
+    pub(crate) fn from_config_server(
         config: ConfigServer,
         codex_home: PathBuf,
         factory: HttpClientFactory,

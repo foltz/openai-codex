@@ -328,10 +328,7 @@ async fn actual_sampling_auth_has_finite_original_custody(
         held.release.add_permits(1);
     } else {
         held.release.add_permits(1);
-        core_test_support::wait_for_event(&test.codex, |e| {
-            matches!(e, codex_protocol::protocol::EventMsg::TurnComplete(_))
-        })
-        .await;
+        core_test_support::wait_for_successful_turn(&test.codex).await;
         assert_eq!(response.requests().len(), 1);
         assert!(
             test.codex
@@ -494,10 +491,7 @@ async fn actual_background_compaction_captures_work_before_originating_turn_ends
         .await?,
         codex_core::StartIfIdleSubmission::Started { .. }
     ));
-    core_test_support::wait_for_event(&test.codex, |e| {
-        matches!(e, codex_protocol::protocol::EventMsg::TurnComplete(_))
-    })
-    .await;
+    core_test_support::wait_for_successful_turn(&test.codex).await;
     tokio::time::timeout(DRAIN_DEADLINE, held.entered.acquire())
         .await??
         .forget();

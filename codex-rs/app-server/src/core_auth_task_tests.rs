@@ -2493,3 +2493,127 @@ async fn queued_auth_known_failed_origin_refuses_new_body_without_borrowing_othe
     assert!(b.shutdown_until(Instant::now()).await.is_clean());
     assert_eq!(pa.admitted_count(), 0);
 }
+
+#[tokio::test]
+async fn named_physical_original_keeps_auth_after_observer_drop_and_fresh_admission_close() {
+    let tasks = ProcessorTasks::default();
+    let permits = AccountWorkPermits::new();
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("actual-named-body");
+    let body_path = path.clone();
+    let entered = Arc::new(Semaphore::new(0));
+    let body_entered = entered.clone();
+    let child_entered = Arc::new(Semaphore::new(0));
+    let child_started = child_entered.clone();
+    let child_release = Arc::new(Semaphore::new(0));
+    let release_child = child_release.clone();
+    let (derive, derive_now) = std::sync::mpsc::channel::<()>();
+    let (finish, finish_now) = std::sync::mpsc::channel::<()>();
+    let runtime = tokio::runtime::Handle::current();
+    let original =
+        codex_model_provider::with_auth_task_scope(queued_auth_access(&tasks, &permits), async {
+            codex_model_provider::spawn_named_auth_thread(
+                "account-named-physical",
+                Box::new(move || {
+                    let _runtime = runtime.enter();
+                    assert_eq!(
+                        std::thread::current().name(),
+                        Some("account-named-physical")
+                    );
+                    std::fs::write(&body_path, b"owned physical body").unwrap();
+                    body_entered.add_permits(1);
+                    if derive_now.recv().is_err() {
+                        return;
+                    }
+                    let child = codex_model_provider::spawn_provider_task(Box::pin(async move {
+                        child_started.add_permits(1);
+                        release_child.acquire().await.unwrap().forget();
+                    }))
+                    .unwrap();
+                    assert!(
+                        child.is_some(),
+                        "the actual named body must inherit its finite host"
+                    );
+                    drop(child);
+                    let _ = finish_now.recv();
+                }),
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    drop(original); // The host must own the original physical join independently.
+    tokio::time::timeout(DRAIN_DEADLINE, entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    assert_eq!(std::fs::read(path).unwrap(), b"owned physical body");
+    permits.close();
+    assert!(!tasks.observe_until(Instant::now()).await.terminal);
+    assert!(permits.admitted_count() > 0);
+    derive.send(()).unwrap();
+    tokio::time::timeout(DRAIN_DEADLINE, child_entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    assert_eq!(
+        tasks.len(),
+        2,
+        "one actual physical original plus its actual descendant"
+    );
+    finish.send(()).unwrap();
+    tokio::time::timeout(DRAIN_DEADLINE, async {
+        while tasks.pending_len_for_test() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!tasks.observe_until(Instant::now()).await.terminal);
+    assert!(
+        permits.admitted_count() > 0,
+        "completed parent cannot retire its live descendant"
+    );
+    child_release.add_permits(1);
+    assert!(
+        tasks
+            .observe_until(Instant::now() + DRAIN_DEADLINE)
+            .await
+            .is_clean()
+    );
+    assert_eq!(permits.admitted_count(), 0);
+}
+
+#[tokio::test]
+async fn unused_named_thread_observation_does_not_hold_a_completed_auth_root() {
+    let tasks = ProcessorTasks::default();
+    let permits = AccountWorkPermits::new();
+    let access = queued_auth_access(&tasks, &permits);
+    let weak = match &access {
+        codex_model_provider::AuthTaskAccess::Admitted(spawner) => Arc::downgrade(spawner),
+        _ => panic!("actual account host required"),
+    };
+    let original = codex_model_provider::with_auth_task_scope(access, async {
+        codex_model_provider::spawn_named_auth_thread(
+            "account-original-root-release",
+            Box::new(|| {}),
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        tasks
+            .observe_until(Instant::now() + DRAIN_DEADLINE)
+            .await
+            .is_clean()
+    );
+    assert_eq!(permits.admitted_count(), 0);
+    assert!(
+        weak.upgrade().is_none(),
+        "unused observation must alias evidence only"
+    );
+    original.await.unwrap();
+}

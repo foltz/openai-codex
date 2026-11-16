@@ -95,6 +95,21 @@ fn dispatch_provider_task(
     context: Context,
     future: AuthTaskFuture,
 ) -> std::result::Result<AuthTaskObservation, AuthTaskFailure> {
+    let prior_failure = context
+        .failure
+        .lock()
+        .map(|failure| *failure)
+        .unwrap_or(Some(AuthTaskFailure::Unavailable));
+    if let Some(reason) = prior_failure {
+        // Captured destructors of an already-refused operation cannot borrow
+        // its caller's still-live spawner or fall back to unmanaged auth work.
+        let refusal = Context {
+            spawner: Arc::new(RefusedDeferredAuthTask),
+            failure: context.failure.clone(),
+        };
+        AUTH_TASK_CONTEXT.sync_scope(refusal, || drop(future));
+        return Err(reason);
+    }
     let child_context = context.clone();
     // The host derives work and retains the original join before dispatch.
     let observation = context.spawner.spawn(Box::pin(async move {
@@ -258,6 +273,145 @@ pub fn prepare_deferred_auth_task()
         }),
     )?;
     Ok(Some((DeferredAuthTask { commands, failure }, observation)))
+}
+
+/// The invoker and accepted physical original briefly share this work until
+/// dispatch returns. Rejection can therefore mark its precise failure before
+/// captured values are dropped. Observers never retain this root-bearing cell.
+struct NamedAuthThreadWork {
+    work: Mutex<Option<AuthTaskBlocking>>,
+    context: Option<Context>,
+    failure: Arc<Mutex<Option<AuthTaskFailure>>>,
+}
+impl NamedAuthThreadWork {
+    fn fail(&self, reason: AuthTaskFailure) {
+        if let Ok(mut failure) = self.failure.lock() {
+            failure.get_or_insert(reason);
+        }
+    }
+    fn known_failure(&self) -> Option<AuthTaskFailure> {
+        self.failure
+            .lock()
+            .map(|failure| *failure)
+            .unwrap_or(Some(AuthTaskFailure::Unavailable))
+    }
+    fn drop_refused(&self, work: AuthTaskBlocking) {
+        if self.context.is_some() {
+            let refusal = Context {
+                spawner: Arc::new(RefusedDeferredAuthTask),
+                failure: self.failure.clone(),
+            };
+            AUTH_TASK_CONTEXT.sync_scope(refusal, || drop(work));
+        } else {
+            drop(work);
+        }
+    }
+    fn run(&self) {
+        let work = match self.work.lock() {
+            Ok(mut work) => work.take(),
+            Err(_) => {
+                self.fail(AuthTaskFailure::Unavailable);
+                return;
+            }
+        };
+        let Some(work) = work else {
+            self.fail(AuthTaskFailure::Unavailable);
+            return;
+        };
+        if self.known_failure().is_some() {
+            self.drop_refused(work);
+            return;
+        }
+        match &self.context {
+            Some(context) => AUTH_TASK_CONTEXT.sync_scope(context.clone(), work),
+            None => work(),
+        }
+    }
+}
+impl Drop for NamedAuthThreadWork {
+    fn drop(&mut self) {
+        let work = self
+            .work
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(work) = work {
+            self.fail(AuthTaskFailure::Unavailable);
+            self.drop_refused(work);
+        }
+    }
+}
+
+/// Admit the actual physical original before it creates a named OS thread.
+/// That original joins the thread even when every result observer is dropped.
+/// Only the executing work carries the finite auth root; its observation holds
+/// failure evidence only. Independent callers keep the same physical/name/join
+/// behavior, with no auth context added to their body.
+pub fn spawn_named_auth_thread(
+    name: &'static str,
+    work: AuthTaskBlocking,
+) -> std::result::Result<AuthTaskObservation, AuthTaskFailure> {
+    let context = AUTH_TASK_CONTEXT.try_with(Clone::clone).ok();
+    let failure = context
+        .as_ref()
+        .map(|context| context.failure.clone())
+        .unwrap_or_else(|| Arc::new(Mutex::new(None)));
+    let work = Arc::new(NamedAuthThreadWork {
+        work: Mutex::new(Some(work)),
+        context: context.clone(),
+        failure: failure.clone(),
+    });
+    if let Some(reason) = work.known_failure() {
+        return Err(reason);
+    }
+    let original_work = work.clone();
+    let original: AuthTaskBlocking = Box::new(move || {
+        let named_work = original_work.clone();
+        match std::thread::Builder::new()
+            .name(name.to_owned())
+            .spawn(move || named_work.run())
+        {
+            Ok(thread) => {
+                if let Err(panic) = thread.join() {
+                    original_work.fail(AuthTaskFailure::Panicked);
+                    std::panic::resume_unwind(panic);
+                }
+            }
+            Err(_) => original_work.fail(AuthTaskFailure::Unavailable),
+        }
+    });
+    let dispatched = match &context {
+        Some(context) => context.spawner.spawn_blocking(original),
+        None => match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                let original = runtime.spawn_blocking(original);
+                Ok(Box::pin(async move {
+                    original.await.map_err(|error| {
+                        if error.is_cancelled() {
+                            AuthTaskFailure::Cancelled
+                        } else {
+                            AuthTaskFailure::Panicked
+                        }
+                    })
+                }) as AuthTaskObservation)
+            }
+            Err(_) => Err(AuthTaskFailure::Unavailable),
+        },
+    };
+    let observation = dispatched.inspect_err(|reason| work.fail(*reason))?;
+    // The local Arc drops on return; only accepted executing work owns the root.
+    Ok(Box::pin(async move {
+        observation.await.inspect_err(|reason| {
+            if let Ok(mut failure) = failure.lock() {
+                failure.get_or_insert(*reason);
+            }
+        })?;
+        let failure = *failure.lock().map_err(|_| AuthTaskFailure::Unavailable)?;
+        match failure {
+            Some(reason) => Err(reason),
+            None => Ok(()),
+        }
+    }))
 }
 
 /// Legacy unmanaged JoinError is preserved; custody failure is a distinct
@@ -459,5 +613,140 @@ mod tests {
         );
         assert!(!entered.load(Ordering::SeqCst));
         assert!(!polled.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod named_thread_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    #[tokio::test]
+    async fn independent_named_thread_keeps_name_and_no_auth_scope() {
+        let (send, receive) = oneshot::channel();
+        let original = spawn_named_auth_thread(
+            "provider-independent-original",
+            Box::new(move || {
+                let _ = send.send((
+                    std::thread::current().name().map(str::to_owned),
+                    AUTH_TASK_CONTEXT.try_with(|_| ()).is_err(),
+                ));
+            }),
+        )
+        .unwrap();
+        original.await.unwrap();
+        assert_eq!(
+            receive.await.unwrap(),
+            (Some("provider-independent-original".into()), true)
+        );
+    }
+    #[tokio::test]
+    async fn named_thread_panic_is_original_failure_not_a_successful_join() {
+        let original = spawn_named_auth_thread(
+            "provider-panicked-original",
+            Box::new(|| {
+                panic!("synthetic named original panic");
+            }),
+        )
+        .unwrap();
+        assert_eq!(original.await, Err(AuthTaskFailure::Panicked));
+    }
+    #[test]
+    fn independent_named_thread_without_runtime_refuses_before_birth() {
+        let polled = Arc::new(AtomicBool::new(false));
+        let body = polled.clone();
+        assert_eq!(
+            spawn_named_auth_thread(
+                "must-not-start",
+                Box::new(move || {
+                    body.store(true, Ordering::SeqCst);
+                })
+            )
+            .err(),
+            Some(AuthTaskFailure::Unavailable)
+        );
+        assert!(!polled.load(Ordering::SeqCst));
+    }
+    #[derive(Debug)]
+    struct NoPhysicalFallback;
+    impl AuthTaskSpawner for NoPhysicalFallback {
+        fn spawn(
+            &self,
+            _: AuthTaskFuture,
+        ) -> std::result::Result<AuthTaskObservation, AuthTaskFailure> {
+            panic!("must not fall back to async or borrow the rejected sender root");
+        }
+    }
+    struct RefusedCapture {
+        refused: Arc<AtomicBool>,
+        polled: Arc<AtomicBool>,
+    }
+    impl Drop for RefusedCapture {
+        fn drop(&mut self) {
+            let polled = self.polled.clone();
+            let result = spawn_provider_task(Box::pin(async move {
+                polled.store(true, Ordering::SeqCst);
+            }));
+            self.refused.store(result.is_err(), Ordering::SeqCst);
+        }
+    }
+    #[tokio::test]
+    async fn unsupported_named_physical_host_refuses_body_and_capture_birth() {
+        let refused = Arc::new(AtomicBool::new(false));
+        let nested = Arc::new(AtomicBool::new(false));
+        let polled = Arc::new(AtomicBool::new(false));
+        let body = polled.clone();
+        let capture = RefusedCapture {
+            refused: refused.clone(),
+            polled: nested.clone(),
+        };
+        let result = with_auth_task_scope(
+            AuthTaskAccess::Admitted(Arc::new(NoPhysicalFallback)),
+            async move {
+                assert_eq!(
+                    spawn_named_auth_thread(
+                        "must-not-start",
+                        Box::new(move || {
+                            std::hint::black_box(capture);
+                            body.store(true, Ordering::SeqCst);
+                        })
+                    )
+                    .err(),
+                    Some(AuthTaskFailure::Unavailable)
+                );
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(refused.load(Ordering::SeqCst));
+        assert!(!nested.load(Ordering::SeqCst) && !polled.load(Ordering::SeqCst));
+    }
+    #[tokio::test]
+    async fn known_failed_async_scope_refuses_body_and_captured_auth_birth() {
+        let refused = Arc::new(AtomicBool::new(false));
+        let nested = Arc::new(AtomicBool::new(false));
+        let polled = Arc::new(AtomicBool::new(false));
+        let body = polled.clone();
+        let capture = RefusedCapture {
+            refused: refused.clone(),
+            polled: nested.clone(),
+        };
+        let result = with_auth_task_scope(
+            AuthTaskAccess::Admitted(Arc::new(NoPhysicalFallback)),
+            async move {
+                record_auth_task_failure(AuthTaskFailure::Refused);
+                assert_eq!(
+                    spawn_provider_task(Box::pin(async move {
+                        std::hint::black_box(capture);
+                        body.store(true, Ordering::SeqCst);
+                    }))
+                    .err(),
+                    Some(AuthTaskFailure::Refused)
+                );
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(refused.load(Ordering::SeqCst));
+        assert!(!nested.load(Ordering::SeqCst) && !polled.load(Ordering::SeqCst));
     }
 }

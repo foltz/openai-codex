@@ -295,21 +295,35 @@ impl PluginTaskRegistry {
         }
     }
 
-    /// Reserve this family BEFORE a finite external host original can be born.
-    /// Its alias awaits the same original observation; there is no spawned
-    /// async supervisor and no second account-work counter. The state lock is
-    /// released before calling the host or dropping any external observation.
-    pub fn prepare_auth_request(
+    fn reserve_original(
         &self,
-    ) -> Result<Option<codex_model_provider::DeferredAuthTask>, ()> {
+    ) -> Result<
+        (
+            tokio::sync::oneshot::Sender<BoxFuture<'static, JoinOutcome>>,
+            Receipt,
+        ),
+        (),
+    > {
         self.poll_originals().map_err(|_| {
             codex_model_provider::record_auth_task_failure(
                 codex_model_provider::AuthTaskFailure::Unavailable,
             );
         })?;
         let (attach, receive) = tokio::sync::oneshot::channel::<BoxFuture<'static, JoinOutcome>>();
+        let receipt = async move {
+            match receive.await {
+                Ok(original) => original.await,
+                Err(_) => JoinOutcome::Unavailable,
+            }
+        }
+        .boxed()
+        .shared();
         {
-            let mut state = self.state.lock().map_err(|_| ())?;
+            let mut state = self.state.lock().map_err(|_| {
+                codex_model_provider::record_auth_task_failure(
+                    codex_model_provider::AuthTaskFailure::Unavailable,
+                );
+            })?;
             if state.closed {
                 drop(state);
                 codex_model_provider::record_auth_task_failure(
@@ -318,17 +332,19 @@ impl PluginTaskRegistry {
                 return Err(());
             }
             state.compact();
-            state.tasks.push(
-                async move {
-                    match receive.await {
-                        Ok(original) => original.await,
-                        Err(_) => JoinOutcome::Unavailable,
-                    }
-                }
-                .boxed()
-                .shared(),
-            );
+            state.tasks.push(receipt.clone());
         }
+        Ok((attach, receipt))
+    }
+
+    /// Reserve this family BEFORE a finite external host original can be born.
+    /// Its alias awaits the same original observation; there is no spawned
+    /// async supervisor and no second account-work counter. The state lock is
+    /// released before calling the host or dropping any external observation.
+    pub fn prepare_auth_request(
+        &self,
+    ) -> Result<Option<codex_model_provider::DeferredAuthTask>, ()> {
+        let (attach, _) = self.reserve_original()?;
         // A panic before attachment closes the sender and leaves the reserved
         // receipt explicitly Unavailable, never a false clean empty census.
         let (result, original): (_, BoxFuture<'static, JoinOutcome>) =
@@ -429,6 +445,63 @@ impl PluginTaskRegistry {
         .shared();
         state.tasks.push(receipt.clone());
         Ok(receipt)
+    }
+
+    /// One-shot work has an initiating auth scope. Queue coordinators keep
+    /// spawn_thread: the first caller must not own later unrelated requests.
+    pub(crate) fn spawn_request_thread<F>(
+        &self,
+        name: &'static str,
+        thread: F,
+    ) -> Result<Receipt, ()>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let runtime = Handle::try_current().map_err(|_| {
+            codex_model_provider::record_auth_task_failure(
+                codex_model_provider::AuthTaskFailure::Unavailable,
+            );
+        })?;
+        let (attach, receipt) = self.reserve_original()?;
+        let stop = self.worker_stop();
+        // No family lock is held during external admission, captures' Drop,
+        // actual thread creation, or polling the physical observation.
+        let result = codex_model_provider::spawn_named_auth_thread(
+            name,
+            Box::new(move || {
+                let _entered = runtime.enter();
+                let _scope = WorkerStopScope::enter(stop);
+                thread();
+            }),
+        );
+        let admitted = result.is_ok();
+        if let Err(failure) = &result {
+            codex_model_provider::record_auth_task_failure(*failure);
+        }
+        let original = async move {
+            match result {
+                Ok(observation) => match std::panic::AssertUnwindSafe(observation)
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(Ok(())) => JoinOutcome::Joined,
+                    Ok(Err(codex_model_provider::AuthTaskFailure::Cancelled)) => {
+                        JoinOutcome::Cancelled
+                    }
+                    Ok(Err(codex_model_provider::AuthTaskFailure::Panicked)) => {
+                        JoinOutcome::Panicked
+                    }
+                    Ok(Err(_)) | Err(_) => JoinOutcome::Unavailable,
+                },
+                Err(_) => JoinOutcome::Unavailable,
+            }
+        }
+        .boxed();
+        if attach.send(original).is_err() {
+            self.worker_stop().mark_unavailable();
+            return Err(());
+        }
+        if admitted { Ok(receipt) } else { Err(()) }
     }
 
     pub(crate) fn spawn_thread<F>(&self, name: &'static str, thread: F) -> Result<Receipt, ()>

@@ -9638,3 +9638,289 @@ mod remote_async_request_births_preserve_real_http_origin {
         super::remote_async_request_births_preserve_real_http_origin(true).await;
     }
 }
+
+struct OneShotRefusedCapture {
+    refused: Arc<AtomicBool>,
+    polled: Arc<AtomicBool>,
+}
+impl Drop for OneShotRefusedCapture {
+    fn drop(&mut self) {
+        let polled = self.polled.clone();
+        let result = codex_model_provider::spawn_provider_task(Box::pin(async move {
+            polled.store(true, Ordering::SeqCst);
+        }));
+        self.refused.store(result.is_err(), Ordering::SeqCst);
+    }
+}
+#[tokio::test(flavor = "current_thread")]
+async fn closed_family_refuses_one_shot_before_physical_or_destructor_birth() {
+    let home = TempDir::new().unwrap();
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    manager.task_registry.close();
+    let host = QueuedTestHost::new(12);
+    let refused = Arc::new(AtomicBool::new(false));
+    let polled = Arc::new(AtomicBool::new(false));
+    let capture = OneShotRefusedCapture {
+        refused: refused.clone(),
+        polled: polled.clone(),
+    };
+    let result = codex_model_provider::with_auth_task_scope(host.access(), async {
+        manager
+            .task_registry
+            .spawn_request_thread("must-not-start-one-shot", move || {
+                std::hint::black_box(capture);
+                panic!("closed family body must not execute");
+            })
+    })
+    .await;
+    assert!(
+        result.is_err(),
+        "closed family failure is sticky in the invoking scope"
+    );
+    assert!(refused.load(Ordering::SeqCst));
+    assert!(!polled.load(Ordering::SeqCst));
+    assert!(host.originals.lock().unwrap().is_empty());
+    assert!(host.physical.lock().unwrap().is_empty());
+    assert!(
+        manager
+            .shutdown_until(tokio::time::Instant::now())
+            .await
+            .is_clean()
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn curated_named_body_and_runtime_callback_keep_initiating_auth_originals() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    let home = TempDir::new().unwrap();
+    let source = curated_plugins_repo_path(home.path());
+    write_curated_plugin(&source, "gmail");
+    write_openai_curated_marketplace(&source, &["gmail"]);
+    write_file(
+        &home.path().join(CONFIG_TOML_FILE),
+        "[plugins.\"gmail@openai-curated\"]\nenabled = true\n",
+    );
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    let host = QueuedTestHost::new(13);
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let child_entered = entered.clone();
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let child_release = release.clone();
+    let origins = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let callback_origins = origins.clone();
+    let callback: EffectivePluginsChangedCallback = Arc::new(move |_| {
+        callback_origins
+            .lock()
+            .unwrap()
+            .push(QUEUED_TEST_ORIGIN.try_with(|origin| *origin).ok());
+        let (entered, release) = (child_entered.clone(), child_release.clone());
+        let child = codex_model_provider::spawn_provider_task(Box::pin(async move {
+            assert_eq!(QUEUED_TEST_ORIGIN.try_with(|origin| *origin).ok(), Some(13));
+            entered.add_permits(1);
+            release.acquire().await.unwrap().forget();
+        }))
+        .unwrap();
+        assert!(
+            child.is_some(),
+            "the real curated callback must derive its initiating original"
+        );
+        drop(child);
+    });
+    let proof = home.path().join("named-sync-body");
+    let written = proof.clone();
+    let receipt = codex_model_provider::with_auth_task_scope(host.access(), async {
+        manager.start_curated_repo_sync_with(
+            test_http_client_factory(),
+            Some(callback),
+            CuratedSyncStart::begin(&STARTED).unwrap(),
+            move |_, _, _| {
+                assert_eq!(
+                    std::thread::current().name(),
+                    Some("plugins-curated-repo-sync")
+                );
+                assert!(tokio::runtime::Handle::try_current().is_ok());
+                std::fs::write(written, b"actual named body").unwrap();
+                Ok(TEST_CURATED_PLUGIN_SHA.into())
+            },
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    drop(receipt);
+    queued_wait(&entered).await;
+    assert_eq!(std::fs::read(proof).unwrap(), b"actual named body");
+    assert_eq!(*origins.lock().unwrap(), vec![Some(13)]);
+    assert_eq!(*host.physical.lock().unwrap(), vec![13]);
+    assert!(
+        host.pending() > 0,
+        "common auth owner still owns the held descendant"
+    );
+    assert!(
+        manager
+            .store
+            .plugin_path(
+                "gmail",
+                OPENAI_CURATED_MARKETPLACE_NAME,
+                TEST_CURATED_PLUGIN_CACHE_VERSION
+            )
+            .is_dir()
+    );
+    release.add_permits(1);
+    host.joined().await;
+    assert!(
+        manager
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await
+            .is_clean()
+    );
+    assert!(STARTED.load(Ordering::SeqCst));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn startup_hop_and_configured_named_worker_use_the_invoking_auth_scope() {
+    let home = TempDir::new().unwrap();
+    write_file(
+        &home.path().join(CONFIG_TOML_FILE),
+        "[features]\nplugins = true\nremote_plugin = true\n",
+    );
+    let auth_manager = test_auth_manager(None);
+    set_test_auth(&auth_manager, Some(queued_auth("header.e30.startup"))).await;
+    let manager = Arc::new(test_plugins_manager_with_auth_manager(
+        home.path().to_owned(),
+        None,
+        auth_manager,
+    ));
+    let host = QueuedTestHost::new(14);
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/ps/plugins/installed"))
+        .and(header("authorization", "Bearer header.e30.startup"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"plugins":[],"pagination":{"next_page_token":null}}),
+            ),
+        )
+        .mount(&server)
+        .await;
+    let mut config = load_config(home.path(), home.path())
+        .await
+        .with_runtime_auth_mode(None);
+    config.chatgpt_base_url = server.uri();
+    let (recording, records) = queued_recording_config(&server.uri());
+    config.remote_http_clients = Arc::new(std::sync::OnceLock::from(recording.http_clients));
+    assert!(
+        manager.remote_global_catalog_active(&config),
+        "skip unrelated curated network startup"
+    );
+    let stack = config.config_layer_stack.clone();
+    let reload: ConfigLayerReload = Arc::new(move || Ok(stack.clone()));
+    let (warnings, _warning_rx) = mpsc::unbounded_channel();
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let (release, wait) = std::sync::mpsc::channel();
+    *host.gate.lock().unwrap() = Some((entered.clone(), wait));
+    codex_model_provider::with_auth_task_scope(host.access(), async {
+        manager.maybe_start_plugin_startup_tasks_for_config(&config, reload, None, warnings);
+    })
+    .await
+    .unwrap();
+    queued_wait(&entered).await;
+    assert_eq!(
+        *host.physical.lock().unwrap(),
+        vec![14],
+        "configured worker must use physical host admission"
+    );
+    assert!(host.pending() > 0);
+    release.send(()).unwrap();
+    host.joined().await;
+    assert!(
+        manager
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await
+            .is_clean()
+    );
+    assert!(
+        !manager
+            .configured_marketplace_upgrade_state
+            .read()
+            .unwrap()
+            .in_flight
+    );
+    let records = records.lock().unwrap();
+    assert!(!records.is_empty());
+    assert!(
+        records.iter().all(|(_, origin)| *origin == Some(14)),
+        "actual startup HTTP origin: {records:?}"
+    );
+    assert!(
+        records
+            .iter()
+            .any(|(url, _)| url.contains("/ps/plugins/installed"))
+    );
+}
+
+#[test]
+fn disarmed_configured_worker_cleanup_preserves_the_new_epoch_flag() {
+    let home = TempDir::new().unwrap();
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    let completion = BlockingPluginWorkerReset {
+        manager: manager.clone(),
+        kind: BlockingPluginWorkerKind::MarketplaceUpgrade,
+        armed: false,
+    };
+    manager
+        .configured_marketplace_upgrade_state
+        .write()
+        .unwrap()
+        .in_flight = true;
+    drop(completion);
+    assert!(
+        manager
+            .configured_marketplace_upgrade_state
+            .read()
+            .unwrap()
+            .in_flight
+    );
+    manager
+        .configured_marketplace_upgrade_state
+        .write()
+        .unwrap()
+        .in_flight = false;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn refused_one_shot_observation_does_not_poison_an_unrelated_drain_scope() {
+    #[derive(Debug)]
+    struct UnsupportedPhysical;
+    impl codex_model_provider::AuthTaskSpawner for UnsupportedPhysical {
+        fn spawn(
+            &self,
+            _: codex_model_provider::AuthTaskFuture,
+        ) -> Result<codex_model_provider::AuthTaskObservation, codex_model_provider::AuthTaskFailure>
+        {
+            panic!("no async fallback for a physical original");
+        }
+    }
+    let home = TempDir::new().unwrap();
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    let first = codex_model_provider::with_auth_task_scope(
+        codex_model_provider::AuthTaskAccess::Admitted(Arc::new(UnsupportedPhysical)),
+        async {
+            manager
+                .task_registry
+                .spawn_request_thread("unsupported-one-shot", || panic!("must not run"))
+        },
+    )
+    .await;
+    assert!(first.is_err());
+    let other = QueuedTestHost::new(15);
+    let report = codex_model_provider::with_auth_task_scope(other.access(), async {
+        manager
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await
+    })
+    .await
+    .expect("polling A's pure receipt must not mark B failed");
+    assert!(report.terminal && report.unavailable && !report.is_clean());
+    assert!(other.originals.lock().unwrap().is_empty());
+}

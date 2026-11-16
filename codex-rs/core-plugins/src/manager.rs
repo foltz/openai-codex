@@ -3358,55 +3358,51 @@ impl PluginsManager {
                         dispatch_on_runtime(self.task_registry.clone(), runtime, callback)
                     });
                 let task_warnings = upgrade_warnings.clone();
-                if let Err(()) =
-                    self.task_registry
-                        .spawn_thread("plugins-marketplace-auto-upgrade", move || {
-                            let _completion = completion;
-                            let outcome = manager
-                                .upgrade_configured_marketplaces_for_config_with_mode(
-                                    &config,
-                                    /*marketplace_name*/ None,
-                                    PluginGitMode::Automatic,
-                                    &reload_config,
-                                );
-                            match outcome {
-                                Ok(outcome) => {
-                                    if !outcome.upgraded_roots.is_empty()
-                                        && let Some(on_effective_plugins_changed) =
-                                            on_effective_plugins_changed
-                                    {
-                                        on_effective_plugins_changed(
-                                            EffectivePluginsChange::default(),
-                                        );
-                                    }
-                                    for error in outcome.errors {
-                                        warn!(
-                                            marketplace = error.marketplace_name,
-                                            error = %error.message,
-                                            "failed to auto-upgrade configured marketplace"
-                                        );
-                                        let _ = task_warnings.send(format!(
-                                            "Codex could not update marketplace `{}`: {}",
-                                            error.marketplace_name, error.message
-                                        ));
-                                    }
+                if let Err(()) = self.task_registry.spawn_request_thread(
+                    "plugins-marketplace-auto-upgrade",
+                    move || {
+                        let mut completion = completion;
+                        let outcome = manager.upgrade_configured_marketplaces_for_config_with_mode(
+                            &config,
+                            /*marketplace_name*/ None,
+                            PluginGitMode::Automatic,
+                            &reload_config,
+                        );
+                        match outcome {
+                            Ok(outcome) => {
+                                if !outcome.upgraded_roots.is_empty()
+                                    && let Some(on_effective_plugins_changed) =
+                                        on_effective_plugins_changed
+                                {
+                                    on_effective_plugins_changed(EffectivePluginsChange::default());
                                 }
-                                Err(err) => {
-                                    warn!("failed to auto-upgrade configured marketplaces: {err}");
+                                for error in outcome.errors {
+                                    warn!(
+                                        marketplace = error.marketplace_name,
+                                        error = %error.message,
+                                        "failed to auto-upgrade configured marketplace"
+                                    );
                                     let _ = task_warnings.send(format!(
-                                        "Codex could not update marketplaces: {err}"
+                                        "Codex could not update marketplace `{}`: {}",
+                                        error.marketplace_name, error.message
                                     ));
                                 }
                             }
+                            Err(err) => {
+                                warn!("failed to auto-upgrade configured marketplaces: {err}");
+                                let _ = task_warnings
+                                    .send(format!("Codex could not update marketplaces: {err}"));
+                            }
+                        }
 
-                            let mut state =
-                                match manager.configured_marketplace_upgrade_state.write() {
-                                    Ok(state) => state,
-                                    Err(err) => err.into_inner(),
-                                };
-                            state.in_flight = false;
-                        })
-                {
+                        let mut state = match manager.configured_marketplace_upgrade_state.write() {
+                            Ok(state) => state,
+                            Err(err) => err.into_inner(),
+                        };
+                        completion.armed = false;
+                        state.in_flight = false;
+                    },
+                ) {
                     warn!("failed to admit configured marketplace auto-upgrade task");
                     let _ = upgrade_warnings.send(
                         "Codex could not start marketplace updates: task owner unavailable"
@@ -3416,7 +3412,7 @@ impl PluginsManager {
             }
             let config_for_remote_sync = config.clone();
             let manager = Arc::clone(self);
-            let _ = self.task_registry.spawn(async move {
+            let _ = self.task_registry.spawn_callback(async move {
                 let auth = manager.auth_manager.auth().await;
                 manager.maybe_start_remote_installed_plugins_cache_refresh_with_notify(
                     &config_for_remote_sync,
@@ -3878,7 +3874,7 @@ impl PluginsManager {
         let stop = self.task_registry.worker_stop();
         match self
             .task_registry
-            .spawn_thread("plugins-curated-repo-sync", move || {
+            .spawn_request_thread("plugins-curated-repo-sync", move || {
                 let mut start = start;
                 if stop.is_stopped() {
                     warn!("curated plugins repo sync stopped before reading");

@@ -1238,7 +1238,7 @@ async fn lease_work_is_captured_before_waiting_for_classification_capacity() -> 
 }
 #[tokio::test]
 async fn automatic_refill_owns_descendants_after_origin_is_dropped() -> Result<()> {
-    let gateway = Gateway::new("http://127.0.0.1:9", "ws://127.0.0.1:9").await?;
+    let mut gateway = Gateway::new("http://127.0.0.1:9", "ws://127.0.0.1:9").await?;
     let mut config = sampler_config(gateway.url.clone());
     config.require_account_work = true;
     let sampler = LunaSampler::new(config);
@@ -1262,7 +1262,7 @@ async fn automatic_refill_owns_descendants_after_origin_is_dropped() -> Result<(
     assert_eq!(counts.live.load(Ordering::SeqCst), 0);
     assert_eq!(counts.derives.load(Ordering::SeqCst), opens + 1);
     gateway.task.abort();
-    assert!(gateway.task.await.unwrap_err().is_cancelled());
+    assert!((&mut gateway.task).await.unwrap_err().is_cancelled());
     Ok(())
 }
 #[tokio::test]

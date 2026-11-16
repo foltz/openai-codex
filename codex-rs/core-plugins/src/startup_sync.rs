@@ -235,7 +235,7 @@ fn lock_curated_plugins_startup_sync(codex_home: &Path) -> Result<File, String> 
         .truncate(false)
         .open(&lock_path)
         .map_err(|err| format!("failed to open curated plugins sync lock: {err}"))?;
-    let managed = SYNC_STOP.with(|stop| stop.borrow().is_managed());
+    let managed = crate::retirement::current_worker_stop().is_managed();
     if managed {
         loop {
             ensure_not_stopped("the curated plugins sync lock")?;

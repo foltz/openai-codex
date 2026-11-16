@@ -2189,3 +2189,120 @@ async fn queued_auth_unmanaged_preparation_creates_no_managed_endpoint() {
             .is_clean()
     );
 }
+
+struct CloseFamilyOnObservationDrop(codex_core_plugins::PluginTaskRegistry);
+impl Drop for CloseFamilyOnObservationDrop {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+struct ReentrantObservationSpawner {
+    family: codex_core_plugins::PluginTaskRegistry,
+    inner: Arc<dyn codex_model_provider::AuthTaskSpawner>,
+    panic_on_poll: bool,
+}
+impl std::fmt::Debug for ReentrantObservationSpawner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReentrantObservationSpawner")
+    }
+}
+impl codex_model_provider::AuthTaskSpawner for ReentrantObservationSpawner {
+    fn spawn(
+        &self,
+        future: codex_model_provider::AuthTaskFuture,
+    ) -> Result<codex_model_provider::AuthTaskObservation, codex_model_provider::AuthTaskFailure>
+    {
+        let original = self.inner.spawn(future)?;
+        let family = self.family.clone();
+        let panic_on_poll = self.panic_on_poll;
+        Ok(Box::pin(async move {
+            let _close = CloseFamilyOnObservationDrop(family);
+            assert!(!panic_on_poll, "synthetic external observation panic");
+            original.await
+        }))
+    }
+}
+
+#[tokio::test]
+async fn queued_auth_observation_completion_reenters_family_without_locked_poll() {
+    let tasks = ProcessorTasks::default();
+    let permits = AccountWorkPermits::new();
+    let family = codex_core_plugins::PluginTaskRegistry::default();
+    let codex_model_provider::AuthTaskAccess::Admitted(inner) =
+        queued_auth_access(&tasks, &permits)
+    else {
+        panic!("admitted fixture");
+    };
+    let access =
+        codex_model_provider::AuthTaskAccess::Admitted(Arc::new(ReentrantObservationSpawner {
+            family: family.clone(),
+            inner,
+            panic_on_poll: false,
+        }));
+    let request =
+        codex_model_provider::with_auth_task_scope(access, async { family.prepare_auth_request() })
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    drop(request);
+    assert!(
+        tasks
+            .shutdown_until(Instant::now() + DRAIN_DEADLINE)
+            .await
+            .is_clean()
+    );
+    // Completing the external observation closes this SAME family. Polling it
+    // under the state lock would deadlock rather than reach this refusal.
+    assert!(family.prepare_auth_request().is_err());
+    assert!(
+        family
+            .shutdown_until(Instant::now() + DRAIN_DEADLINE)
+            .await
+            .is_clean()
+    );
+    assert_eq!(permits.admitted_count(), 0);
+}
+
+#[tokio::test]
+async fn queued_auth_observation_panic_is_unavailable_while_actual_original_stays_owned() {
+    let tasks = ProcessorTasks::default();
+    let permits = AccountWorkPermits::new();
+    let family = codex_core_plugins::PluginTaskRegistry::default();
+    let codex_model_provider::AuthTaskAccess::Admitted(inner) =
+        queued_auth_access(&tasks, &permits)
+    else {
+        panic!("admitted fixture");
+    };
+    let access =
+        codex_model_provider::AuthTaskAccess::Admitted(Arc::new(ReentrantObservationSpawner {
+            family: family.clone(),
+            inner,
+            panic_on_poll: true,
+        }));
+    let request =
+        codex_model_provider::with_auth_task_scope(access, async { family.prepare_auth_request() })
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    let report = family.shutdown_until(Instant::now()).await;
+    assert!(
+        report.terminal && report.unavailable && !report.is_clean(),
+        "lost observation is never clean completion"
+    );
+    assert!(
+        !tasks.observe_until(Instant::now()).await.terminal,
+        "actual original is still independently retained"
+    );
+    assert!(permits.admitted_count() > 0);
+    drop(request);
+    assert!(
+        tasks
+            .shutdown_until(Instant::now() + DRAIN_DEADLINE)
+            .await
+            .is_clean()
+    );
+    assert_eq!(permits.admitted_count(), 0);
+    assert!(family.shutdown_until(Instant::now()).await.unavailable);
+}

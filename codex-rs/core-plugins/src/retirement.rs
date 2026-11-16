@@ -50,23 +50,22 @@ struct State {
 
 impl State {
     fn compact(&mut self) {
-        self.tasks
-            .retain(|receipt| match receipt.clone().now_or_never() {
-                Some(JoinOutcome::Joined) => false,
-                Some(JoinOutcome::Cancelled) => {
-                    self.cancelled = true;
-                    false
-                }
-                Some(JoinOutcome::Panicked) => {
-                    self.panicked = true;
-                    false
-                }
-                Some(JoinOutcome::Unavailable) => {
-                    self.unavailable = true;
-                    false
-                }
-                None => true,
-            });
+        self.tasks.retain(|receipt| match receipt.peek().copied() {
+            Some(JoinOutcome::Joined) => false,
+            Some(JoinOutcome::Cancelled) => {
+                self.cancelled = true;
+                false
+            }
+            Some(JoinOutcome::Panicked) => {
+                self.panicked = true;
+                false
+            }
+            Some(JoinOutcome::Unavailable) => {
+                self.unavailable = true;
+                false
+            }
+            None => true,
+        });
     }
 }
 
@@ -273,6 +272,16 @@ impl<R: std::io::Read> std::io::Read for WorkerRead<R> {
 }
 
 impl PluginTaskRegistry {
+    /// Drive aliases outside the state lock. Originals stay in the census
+    /// throughout polling; compaction only reads their completed Copy output.
+    fn poll_originals(&self) -> Result<(), ()> {
+        let receipts = self.state.lock().map_err(|_| ())?.tasks.clone();
+        for receipt in receipts {
+            let _ = receipt.now_or_never();
+        }
+        Ok(())
+    }
+
     /// The stop signal for workers admitted to this registry.
     pub fn worker_stop(&self) -> WorkerStop {
         WorkerStop {
@@ -293,6 +302,7 @@ impl PluginTaskRegistry {
     pub fn prepare_auth_request(
         &self,
     ) -> Result<Option<codex_model_provider::DeferredAuthTask>, ()> {
+        self.poll_originals()?;
         let (attach, receive) = tokio::sync::oneshot::channel::<BoxFuture<'static, JoinOutcome>>();
         {
             let mut state = self.state.lock().map_err(|_| ())?;
@@ -318,15 +328,18 @@ impl PluginTaskRegistry {
                 Ok(Some((request, observation))) => (
                     Ok(Some(request)),
                     async move {
-                        match observation.await {
-                            Ok(()) => JoinOutcome::Joined,
-                            Err(codex_model_provider::AuthTaskFailure::Cancelled) => {
+                        match std::panic::AssertUnwindSafe(observation)
+                            .catch_unwind()
+                            .await
+                        {
+                            Ok(Ok(())) => JoinOutcome::Joined,
+                            Ok(Err(codex_model_provider::AuthTaskFailure::Cancelled)) => {
                                 JoinOutcome::Cancelled
                             }
-                            Err(codex_model_provider::AuthTaskFailure::Panicked) => {
+                            Ok(Err(codex_model_provider::AuthTaskFailure::Panicked)) => {
                                 JoinOutcome::Panicked
                             }
-                            Err(_) => JoinOutcome::Unavailable,
+                            Ok(Err(_)) | Err(_) => JoinOutcome::Unavailable,
                         }
                     }
                     .boxed(),
@@ -366,6 +379,7 @@ impl PluginTaskRegistry {
         F: Future<Output = ()> + Send + 'static,
         S: FnOnce(F) -> tokio::task::JoinHandle<()>,
     {
+        self.poll_originals()?;
         let mut state = self.state.lock().map_err(|_| ())?;
         if state.closed {
             return Err(());
@@ -393,6 +407,7 @@ impl PluginTaskRegistry {
         // thread. The retained blocking original creates AND joins it; no
         // abortable async wrapper can drop a started thread's JoinHandle.
         let runtime = Handle::try_current().map_err(|_| ())?;
+        self.poll_originals()?;
         let mut state = self.state.lock().map_err(|_| ())?;
         if state.closed {
             return Err(());
@@ -429,6 +444,7 @@ impl PluginTaskRegistry {
     }
 
     pub async fn shutdown_until(&self, deadline: Instant) -> PluginTaskDrain {
+        let _ = self.poll_originals(); // A poisoned state is reported below.
         let (deadline, tasks) = {
             let Ok(mut state) = self.state.lock() else {
                 return PluginTaskDrain {

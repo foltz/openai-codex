@@ -14,6 +14,7 @@ use tokio::time::Instant;
 #[derive(Debug)]
 struct HeldAuth {
     tasks: Weak<ProcessorTasks>,
+    credential: CodexAuth,
     held: AtomicBool,
     armed: AtomicBool,
     entered: Semaphore,
@@ -48,7 +49,7 @@ impl ExternalAuth for HeldAuth {
                 }
                 self.finished.store(true, Ordering::SeqCst);
             }
-            Ok(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+            Ok(self.credential.clone())
         })
     }
 }
@@ -65,12 +66,12 @@ async fn held_auth(
     nested: bool,
 ) -> (tempfile::TempDir, Arc<AuthManager>, Arc<HeldAuth>) {
     let home = tempfile::tempdir().unwrap();
-    let auth = AuthManager::from_auth_for_testing_with_home(
-        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
-        home.path().to_path_buf(),
-    );
+    let credential = CodexAuth::create_dummy_chatgpt_auth_for_testing();
+    let auth =
+        AuthManager::from_auth_for_testing_with_home(credential.clone(), home.path().to_path_buf());
     let held = Arc::new(HeldAuth {
         tasks: Arc::downgrade(tasks),
+        credential,
         held: AtomicBool::new(false),
         armed: AtomicBool::new(true),
         entered: Semaphore::new(0),
@@ -527,4 +528,23 @@ async fn actual_background_compaction_captures_work_before_originating_turn_ends
     assert!(held.finished.load(Ordering::SeqCst));
     assert_eq!(permits.admitted_count(), 0);
     Ok(())
+}
+
+#[tokio::test]
+async fn fixed_external_fixture_preserves_owner_and_generation_across_resolutions() {
+    let tasks = Arc::new(ProcessorTasks::default());
+    let (_home, auth, held) = held_auth(&tasks, false).await;
+    let owner = auth.auth_owner();
+    let changes = auth.auth_change_state_receiver();
+    let before = *changes.borrow();
+    for _ in 0..2 {
+        assert!(auth.auth().await.is_some());
+        assert!(
+            owner.is_current(),
+            "unchanged synthetic credentials must not impersonate an account switch"
+        );
+        assert_eq!(*changes.borrow(), before);
+    }
+    assert!(!held.held.load(Ordering::SeqCst));
+    assert_eq!(tasks.len(), 0);
 }

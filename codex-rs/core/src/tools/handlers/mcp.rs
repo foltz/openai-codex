@@ -230,7 +230,7 @@ impl McpHandler {
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let prepared_mcp_call = invocation
             .session
-            .prepare_mcp_call(&self.definition.tool_info)
+            .prepare_mcp_call(&invocation.turn, &self.definition.tool_info)
             .await;
         let prepared = prepared_mcp_call.as_ref().ok();
         // Use the executed call's binding; a later catalog refresh must not change eligibility.
@@ -347,11 +347,18 @@ impl CoreToolRuntime for McpHandler {
         (*cached_budget == code_mode_input_schema_max_bytes).then_some(definitions.as_slice())
     }
 
-    fn wait_until_ready<'a>(&'a self, session: &'a Arc<Session>) -> Option<BoxFuture<'a, ()>> {
+    fn wait_until_ready<'a>(
+        &'a self,
+        session: &'a Arc<Session>,
+        turn: &'a crate::session::turn_context::TurnContext,
+    ) -> Option<BoxFuture<'a, ()>> {
         Some(Box::pin(async move {
-            session
-                .wait_for_mcp_server(&self.definition.tool_info.server_name)
-                .await;
+            if let Err(error) = session
+                .wait_for_mcp_server(turn, &self.definition.tool_info.server_name)
+                .await
+            {
+                tracing::warn!("MCP tool readiness failed: {error:#}");
+            }
         }))
     }
 

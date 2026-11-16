@@ -1469,7 +1469,10 @@ impl CodexThread {
     pub async fn refresh_codex_apps_tools(
         &self,
     ) -> anyhow::Result<codex_mcp::CodexAppsToolSnapshot> {
-        self.session.refresh_codex_apps_tools().await
+        let work = self.session.request_mcp_work()?;
+        self.session
+            .refresh_codex_apps_tools(codex_mcp::McpAttemptAccess::from_work(work.as_deref()))
+            .await
     }
 
     /// Returns the environments configured for future turns.
@@ -1505,12 +1508,16 @@ impl CodexThread {
         server: &str,
         params: ReadResourceRequestParams,
     ) -> anyhow::Result<serde_json::Value> {
-        self.session.refresh_mcp_if_dirty().await;
+        let work = self.session.request_mcp_work()?;
+        let access = codex_mcp::McpAttemptAccess::from_work(work.as_deref());
+        self.session
+            .refresh_mcp_if_dirty_with_authority(access)
+            .await?;
         let result = self
             .session
             .services
             .mcp_runtime
-            .latest_read_resource(server, params)
+            .latest_read_resource_with_authority(server, params, access)
             .await?;
 
         Ok(serde_json::to_value(result)?)
@@ -1541,12 +1548,16 @@ impl CodexThread {
         call_id: &str,
         params: ReadResourceRequestParams,
     ) -> anyhow::Result<serde_json::Value> {
-        self.session.refresh_mcp_if_dirty().await;
+        let work = self.session.request_mcp_work()?;
+        let access = codex_mcp::McpAttemptAccess::from_work(work.as_deref());
+        self.session
+            .refresh_mcp_if_dirty_with_authority(access)
+            .await?;
         let result = self
             .session
             .services
             .mcp_runtime
-            .read_resource_for_call(self.session.thread_id, call_id, params)
+            .read_resource_for_call_with_authority(self.session.thread_id, call_id, params, access)
             .await?;
 
         Ok(serde_json::to_value(result)?)
@@ -1558,6 +1569,24 @@ impl CodexThread {
         arguments: serde_json::Value,
         meta: Option<serde_json::Value>,
     ) -> anyhow::Result<codex_mcp::McpEventStream> {
+        let work = self.session.request_mcp_work()?;
+        self.start_mcp_event_stream_with_authority(
+            name,
+            arguments,
+            meta,
+            codex_mcp::McpAttemptAccess::from_work(work.as_deref()),
+        )
+        .await
+    }
+
+    /// Opening owns finite invocation work; the idle stream retains none.
+    pub async fn start_mcp_event_stream_with_authority(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+        meta: Option<serde_json::Value>,
+        access: codex_mcp::McpAttemptAccess<'_>,
+    ) -> anyhow::Result<codex_mcp::McpEventStream> {
         let meta = match meta.as_ref() {
             Some(serde_json::Value::Object(meta)) => Some(meta),
             Some(other) => {
@@ -1565,10 +1594,14 @@ impl CodexThread {
             }
             None => None,
         };
+        let work = self.session.derive_mcp_attempt_work(access)?;
+        let access = codex_mcp::McpAttemptAccess::from_work(work.as_deref());
         let _ = self.session.services.auth_manager.auth().await;
-        self.session.refresh_mcp_if_dirty().await;
+        self.session
+            .refresh_mcp_if_dirty_with_authority(access)
+            .await?;
         codex_mcp::McpResourceClient::new(Arc::clone(&self.session.services.mcp_runtime))
-            .open_event_stream(name, &arguments, meta)
+            .open_event_stream_with_authority(name, &arguments, meta, access)
             .await
     }
 
@@ -1579,11 +1612,17 @@ impl CodexThread {
         arguments: Option<serde_json::Value>,
         meta: Option<serde_json::Value>,
     ) -> anyhow::Result<CallToolResult> {
-        self.session.refresh_mcp_if_dirty().await;
+        let work = self.session.request_mcp_work()?;
+        let access = codex_mcp::McpAttemptAccess::from_work(work.as_deref());
+        self.session
+            .refresh_mcp_if_dirty_with_authority(access)
+            .await?;
         self.session
             .services
             .mcp_runtime
-            .latest_call_tool_without_attribution(server, tool, arguments, meta)
+            .latest_call_tool_without_attribution_with_authority(
+                server, tool, arguments, meta, access,
+            )
             .await
     }
 

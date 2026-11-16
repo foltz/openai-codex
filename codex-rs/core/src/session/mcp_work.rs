@@ -20,6 +20,28 @@ impl McpAttemptWork for McpOperationWork {
 }
 
 impl Session {
+    /// Derive before an await or account-bound discovery. This is invocation
+    /// custody only: no fresh admission and nothing retained on an idle runtime.
+    pub(crate) fn derive_mcp_attempt_work(
+        &self,
+        access: codex_mcp::McpAttemptAccess<'_>,
+    ) -> anyhow::Result<Option<Box<dyn McpAttemptWork>>> {
+        match access {
+            codex_mcp::McpAttemptAccess::Admitted(work) => Ok(Some(work.derive_attempt()?)),
+            codex_mcp::McpAttemptAccess::Unscoped => {
+                anyhow::ensure!(
+                    !self
+                        .services
+                        .host_admission
+                        .as_ref()
+                        .is_some_and(|host| host.requires_account_work()),
+                    "MCP account work is required"
+                );
+                Ok(None)
+            }
+        }
+    }
+
     /// Capture the exact live turn's authority, including from spawned tool
     /// tasks. A missing turn entry refuses; it never becomes fresh admission.
     pub(crate) fn turn_mcp_work(

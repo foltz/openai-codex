@@ -403,3 +403,89 @@ async fn queued_typed_delivery_owns_residency_after_reply_waiter_drop() {
     drop(queued);
     assert!(Arc::clone(&residency).try_write_owned().is_ok());
 }
+
+#[derive(Debug, Default)]
+struct RefusingMcpRequest(std::sync::atomic::AtomicUsize);
+impl codex_extension_api::TurnStartAdmission for RefusingMcpRequest {
+    fn admit_turn_start(&self) -> Option<Box<dyn Send>> {
+        panic!("no fresh fallback")
+    }
+    fn requires_account_work(&self) -> bool {
+        true
+    }
+    fn derive_request_operation_work(
+        &self,
+    ) -> Result<Option<Box<dyn codex_extension_api::HostOperationWork>>, TurnWorkRefused> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Err(TurnWorkRefused::Unavailable)
+    }
+}
+#[tokio::test]
+async fn public_mcp_requests_refuse_before_refresh_or_rpc_without_request_authority() {
+    let (mut thread, queue, _) = fixture().await;
+    let gate = Arc::new(RefusingMcpRequest::default());
+    Arc::get_mut(&mut thread.session)
+        .unwrap()
+        .services
+        .host_admission = Some(gate.clone());
+    assert!(
+        thread
+            .refresh_codex_apps_tools()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("request account work")
+    );
+    assert!(
+        thread
+            .read_mcp_resource("test", ReadResourceRequestParams::new("test://read"))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("request account work")
+    );
+    assert!(
+        thread
+            .read_mcp_resource_for_call("call", ReadResourceRequestParams::new("test://read"))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("request account work")
+    );
+    assert!(
+        thread
+            .start_mcp_event_stream("test", serde_json::json!({}), None)
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("request account work")
+    );
+    assert!(
+        thread
+            .call_mcp_tool("test", "tool", None, None)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("request account work")
+    );
+    assert_eq!(gate.0.load(Ordering::SeqCst), 5);
+    assert!(
+        thread
+            .start_mcp_event_stream_with_authority(
+                "test",
+                serde_json::json!({}),
+                None,
+                codex_mcp::McpAttemptAccess::Unscoped
+            )
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("account work is required")
+    );
+    assert!(
+        _queue.is_empty(),
+        "request refusal cannot become a queued turn"
+    );
+}

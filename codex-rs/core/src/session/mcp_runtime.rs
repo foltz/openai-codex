@@ -48,28 +48,37 @@ impl Session {
     }
 
     /// Waits on this session's refreshed server before tool execution is admitted.
-    pub(crate) async fn wait_for_mcp_server(self: &Arc<Self>, server: &str) {
-        self.refresh_mcp_if_dirty().await;
+    pub(crate) async fn wait_for_mcp_server(
+        self: &Arc<Self>,
+        turn: &TurnContext,
+        server: &str,
+    ) -> anyhow::Result<()> {
+        let work = self.turn_mcp_work(turn)?;
+        let access = codex_mcp::McpAttemptAccess::from_work(work.as_deref());
+        self.refresh_mcp_if_dirty_with_authority(access).await?;
         self.services
             .mcp_runtime
-            .wait_for_server_startup(server)
+            .wait_for_server_startup_with_authority(server, access)
             .await;
+        Ok(())
     }
 
-    /// Captures this session's current MCP client and catalog for one tool call.
+    /// Preserve the current advertised metadata while capturing execution from
+    /// this publication's live client under the exact calling turn's custody.
     pub(crate) async fn prepare_mcp_call(
         self: &Arc<Self>,
+        turn: &TurnContext,
         advertised_tool: &ToolInfo,
     ) -> anyhow::Result<PreparedMcpCall> {
-        self.refresh_mcp_if_dirty().await;
-        // Apps refreshes fetch tools outside the MCP runtime lock. Wait for any
-        // in-flight refresh before capturing the catalog for this call.
+        let work = self.turn_mcp_work(turn)?;
+        let access = codex_mcp::McpAttemptAccess::from_work(work.as_deref());
+        self.refresh_mcp_if_dirty_with_authority(access).await?;
         if advertised_tool.server_name == CODEX_APPS_MCP_SERVER_NAME {
             self.wait_for_apps_tool_refresh().await;
         }
         self.services
             .mcp_runtime
-            .prepare_call(advertised_tool)
+            .prepare_call_with_authority(advertised_tool, access)
             .await
     }
 

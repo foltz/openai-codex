@@ -511,7 +511,7 @@ async fn refresh_missing_requested_connectors(
         return Some(accessible_connectors);
     }
 
-    match session.hard_refresh_latest_codex_apps_tools().await {
+    match session.hard_refresh_latest_codex_apps_tools(turn).await {
         Ok(mcp_tools) => {
             let accessible_connectors =
                 connectors::accessible_connectors_from_mcp_tools(&mcp_tools);

@@ -281,7 +281,7 @@ impl ToolCallRuntime {
                 // Readiness and admission remain cancellable even when the handler must finish.
                 let (guard, admission_started) = async {
                     if let Some(tool_runtime) = tool_runtime
-                        && let Some(readiness) = tool_runtime.wait_until_ready(&session)
+                        && let Some(readiness) = tool_runtime.wait_until_ready(&session, &turn)
                     {
                         readiness
                             .instrument(trace_span!("tool_dispatch.wait_until_ready"))

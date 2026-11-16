@@ -27,7 +27,7 @@ pub(crate) async fn prepare_approval_action(
         .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
     let call = invocation
         .session
-        .prepare_mcp_call(advertised_tool)
+        .prepare_mcp_call(&invocation.turn, advertised_tool)
         .await
         .map_err(|err| FunctionCallError::RespondToModel(format!("{err:#}")))?;
     let mcp_invocation = McpInvocation {

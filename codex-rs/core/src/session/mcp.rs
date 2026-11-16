@@ -194,18 +194,38 @@ impl Session {
     /// Publishes changed MCP state, waiting for any refresh already in progress.
     #[tracing::instrument(name = "mcp.runtime.refresh_if_dirty", skip_all)]
     pub(crate) async fn refresh_mcp_if_dirty(self: &Arc<Self>) {
-        let Ok(_refresh) = self.mcp_refresh.acquire().await else {
-            error!("MCP runtime refresh semaphore closed");
-            return;
-        };
-        // Erase the auth/discovery future's type at this ownership boundary.
-        // Keep the same permit and inline cancellation lifetime; no task is spawned.
-        let reconcile: BoxFuture<'_, ()> = Box::pin(self.reconcile_mcp_runtime());
-        reconcile.await;
+        if let Err(error) = self
+            .refresh_mcp_if_dirty_with_authority(codex_mcp::McpAttemptAccess::Unscoped)
+            .await
+        {
+            warn!("MCP runtime refresh failed: {error:#}");
+        }
+    }
+
+    /// Caller custody precedes the permit, auth and environment discovery.
+    /// Retained startup drivers derive their own work before publication.
+    pub(crate) async fn refresh_mcp_if_dirty_with_authority(
+        self: &Arc<Self>,
+        access: codex_mcp::McpAttemptAccess<'_>,
+    ) -> anyhow::Result<()> {
+        let work = self.derive_mcp_attempt_work(access)?;
+        let access = codex_mcp::McpAttemptAccess::from_work(work.as_deref());
+        let _refresh = self
+            .mcp_refresh
+            .acquire()
+            .await
+            .context("MCP runtime refresh semaphore closed")?;
+        // Inline type erasure preserves permit and cancellation custody.
+        let reconcile: BoxFuture<'_, anyhow::Result<()>> =
+            Box::pin(self.reconcile_mcp_runtime(access));
+        reconcile.await
     }
 
     /// Reconcile pending state under the session permit.
-    async fn reconcile_mcp_runtime(self: &Arc<Self>) {
+    async fn reconcile_mcp_runtime(
+        self: &Arc<Self>,
+        access: codex_mcp::McpAttemptAccess<'_>,
+    ) -> anyhow::Result<()> {
         loop {
             // Compare and rebuild from current environments, not choices saved for a future turn.
             let environments = self.services.turn_environments.snapshot().await;
@@ -226,7 +246,7 @@ impl Session {
             }
 
             let Some(mut refresh_invalidation) = self.mcp_refresh.claim(self.thread_id) else {
-                return;
+                return Ok(());
             };
             let auth = self.services.auth_manager.auth().await;
             // Capture after claiming the refresh so a new invalidation cannot be consumed
@@ -277,13 +297,14 @@ impl Session {
                     executor_capability_discovery_v2.as_deref(),
                 )
                 .await;
-            self.publish_mcp_runtime(
+            self.publish_mcp_runtime_with_authority(
                 &desired,
                 mcp_projection,
                 &ready_selected_capability_roots,
                 Some(self.mcp_elicitation_reviewer()),
+                access,
             )
-            .await;
+            .await?;
             refresh_invalidation.published = true;
         }
     }
@@ -291,7 +312,10 @@ impl Session {
     /// Refreshes Apps tools on the published thread runtime and returns that client's snapshot.
     pub(crate) async fn refresh_codex_apps_tools(
         self: &Arc<Self>,
+        access: codex_mcp::McpAttemptAccess<'_>,
     ) -> anyhow::Result<codex_mcp::CodexAppsToolSnapshot> {
+        let work = self.derive_mcp_attempt_work(access)?;
+        let access = codex_mcp::McpAttemptAccess::from_work(work.as_deref());
         let permit = self
             .mcp_refresh
             .acquire()
@@ -302,7 +326,7 @@ impl Session {
         if self.mcp_refresh.apps_refreshes.len() == 1 {
             self.mark_mcp_runtime_dirty(McpRefreshReason::CodexAppsToolRefresh);
         }
-        if let Some(snapshot) = self.fetch_apps_catalog(permit).await? {
+        if let Some(snapshot) = self.fetch_apps_catalog(permit, access).await? {
             return Ok(snapshot);
         }
         let permit = self
@@ -310,7 +334,7 @@ impl Session {
             .acquire()
             .await
             .context("MCP runtime refresh semaphore closed")?;
-        self.fetch_apps_catalog(permit)
+        self.fetch_apps_catalog(permit, access)
             .await?
             .context("MCP runtime changed during both Apps tool refresh attempts")
     }
@@ -318,12 +342,17 @@ impl Session {
     async fn fetch_apps_catalog(
         self: &Arc<Self>,
         permit: SemaphorePermit<'_>,
+        access: codex_mcp::McpAttemptAccess<'_>,
     ) -> anyhow::Result<Option<codex_mcp::CodexAppsToolSnapshot>> {
         // Erase the auth/discovery future's type at this ownership boundary.
         // Keep the same permit and inline cancellation lifetime; no task is spawned.
-        let reconcile: BoxFuture<'_, ()> = Box::pin(self.reconcile_mcp_runtime());
-        reconcile.await;
-        let refresh = self.services.mcp_runtime.capture_apps_tool_refresh();
+        let reconcile: BoxFuture<'_, anyhow::Result<()>> =
+            Box::pin(self.reconcile_mcp_runtime(access));
+        reconcile.await?;
+        let refresh = self
+            .services
+            .mcp_runtime
+            .capture_apps_tool_refresh_with_authority(access);
         // An invalidation may arrive after reconciliation but before capture.
         if self.mcp_refresh.is_pending() {
             return Ok(None);
@@ -341,7 +370,10 @@ impl Session {
     /// Reconnects the runtime so refreshed Apps tools belong to their new exact client.
     pub(crate) async fn hard_refresh_latest_codex_apps_tools(
         self: &Arc<Self>,
+        turn: &TurnContext,
     ) -> anyhow::Result<Vec<codex_mcp::ToolInfo>> {
+        let work = self.turn_mcp_work(turn)?;
+        let access = codex_mcp::McpAttemptAccess::from_work(work.as_deref());
         let _refresh = self
             .mcp_refresh
             .acquire()
@@ -406,7 +438,7 @@ impl Session {
             )
             .await;
         let selected_plugins = mcp_projection.selected_plugins.clone();
-        let input = self.build_mcp_runtime_input(
+        let mut input = self.build_mcp_runtime_input(
             &desired,
             mcp_projection,
             &ready_selected_capability_roots,
@@ -416,8 +448,16 @@ impl Session {
             input.mcp_servers.contains_key(CODEX_APPS_MCP_SERVER_NAME),
             "unknown MCP server '{CODEX_APPS_MCP_SERVER_NAME}'"
         );
+        input.startup_work = match access {
+            codex_mcp::McpAttemptAccess::Unscoped => None,
+            codex_mcp::McpAttemptAccess::Admitted(work) => Some(work.derive_attempt()?),
+        };
         let refreshed = AuthStorageOriginator::from_client_name(&desired.originator)
-            .scope(self.services.mcp_runtime.replace_fresh(input))
+            .scope(
+                self.services
+                    .mcp_runtime
+                    .replace_fresh_with_authority(input, access),
+            )
             .await;
         self.services.thread_extension_data.insert(selected_plugins);
         refresh_invalidation.published = refreshed.is_ok();
@@ -1344,3 +1384,7 @@ fn plugin_install_elicitation_telemetry_metadata(
 #[cfg(test)]
 #[path = "mcp_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "mcp_authority_tests.rs"]
+mod authority_tests;

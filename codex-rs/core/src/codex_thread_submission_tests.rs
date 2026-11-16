@@ -624,9 +624,37 @@ async fn history_preparation_uses_request_work_for_initial_and_existing_context(
     );
     assert_eq!(counts.live.load(Ordering::SeqCst), 0);
     let history = thread.session.clone_history().await;
-    let items: Vec<_> = history.raw_items().collect();
-    assert!(items.contains(&&history_message("first")));
-    assert!(items.contains(&&history_message("second")));
+    let mut items: Vec<_> = history.raw_items().rev().take(2).cloned().collect();
+    items.reverse();
+    assert_eq!(items.len(), 2);
+    assert_ne!(items[0].id(), items[1].id());
+    for (mut item, expected) in items
+        .into_iter()
+        .zip([history_message("first"), history_message("second")])
+    {
+        assert!(item.id().is_some_and(|id| !id.as_str().is_empty()));
+        assert!(item.turn_id().is_some());
+        let ResponseItem::Message {
+            id,
+            internal_chat_message_metadata_passthrough,
+            ..
+        } = &mut item
+        else {
+            panic!("injected history must retain message shape");
+        };
+        assert!(
+            internal_chat_message_metadata_passthrough
+                .as_ref()
+                .unwrap()
+                .create_time
+                .is_some()
+        );
+        // Compare all input fields after checking the identity/history stamps
+        // which the unchanged durable recording boundary adds.
+        *id = None;
+        *internal_chat_message_metadata_passthrough = None;
+        assert_eq!(item, expected);
+    }
 }
 
 #[tokio::test]

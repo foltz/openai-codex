@@ -2263,7 +2263,7 @@ async fn resumed_constructor_keeps_explicit_work_with_emitted_or_deferred_ready(
         options.account_work = Some(Box::new(ManagedRequestWork(Arc::clone(&host))));
         options.initial_history =
             codex_history::InitialHistory::Resumed(codex_history::ResumedHistory {
-                conversation_id: ThreadId::new(),
+                conversation_id: codex_protocol::ThreadId::new(),
                 history: Arc::new(Vec::new()),
                 history_revision: None,
                 rollout_path: None,

@@ -124,6 +124,7 @@ pub(super) struct ConnectionLease {
     pool: Arc<ConnectionPool>,
     _permit: OwnedSemaphorePermit,
     // Last field: connection and permit destruction precede terminal cleanup.
+    work: Option<Box<dyn codex_protocol::mcp_work::McpAttemptWork>>,
     cleanup: Option<super::super::tasks::Continuation>,
 }
 
@@ -161,9 +162,18 @@ impl ConnectionPool {
     }
 
     /// Never waits for another opener or sleeps through the cooldown.
+    #[cfg(test)]
     pub(super) fn replenish(self: &Arc<Self>) -> Option<JoinHandle<()>> {
+        self.replenish_with_work(None)
+    }
+
+    fn replenish_with_work(
+        self: &Arc<Self>,
+        work: Option<&dyn codex_protocol::mcp_work::McpAttemptWork>,
+    ) -> Option<JoinHandle<()>> {
+        let work = super::super::work::derive(self.config.require_account_work, work).ok()?;
         let guard = Arc::clone(&self.replenishing).try_lock_owned().ok()?;
-        self.start_refill(guard, None)
+        self.start_refill(guard, work)
     }
 
     #[cfg(test)]
@@ -175,6 +185,9 @@ impl ConnectionPool {
         self: &Arc<Self>,
         work: Option<Box<dyn codex_protocol::mcp_work::McpAttemptWork>>,
     ) {
+        if self.config.require_account_work && work.is_none() {
+            return;
+        }
         // Explicit prewarming waits for any existing refill before checking readiness.
         let guard = Arc::clone(&self.replenishing).lock_owned().await;
         if let Some(refill) = self.start_refill(guard, work) {
@@ -276,17 +289,27 @@ impl ConnectionPool {
         })
     }
 
+    #[cfg(test)]
     pub(super) async fn lease(self: &Arc<Self>) -> Result<ConnectionLease, LunaSamplerError> {
+        self.lease_with_work(None).await
+    }
+
+    pub(super) async fn lease_with_work(
+        self: &Arc<Self>,
+        work: Option<&dyn codex_protocol::mcp_work::McpAttemptWork>,
+    ) -> Result<ConnectionLease, LunaSamplerError> {
+        let work = super::super::work::derive(self.config.require_account_work, work)?;
         // Reserve before the first semaphore, routing or transport await. A
         // dropped response transfers this exact token, even after stop closes.
-        let cleanup = self.workers.continuation().ok_or_else(|| {
-            LunaSamplerError::Api(ApiError::Stream("classifier task owner is closed".into()))
-        })?;
+        let cleanup = self
+            .workers
+            .continuation()
+            .ok_or(LunaSamplerError::Superseded)?;
         let started = Instant::now();
         let permit = Arc::clone(&self.classifications)
             .acquire_owned()
             .await
-            .map_err(|error| LunaSamplerError::Api(ApiError::Stream(error.to_string())))?;
+            .map_err(|_| LunaSamplerError::Superseded)?;
         let admitted = Instant::now();
         let setup = self.client_setup().await?;
         let fresh_connection = self.runtime_connection(&setup).await?;
@@ -339,14 +362,14 @@ impl ConnectionPool {
                     .len()
                     <= REFILL_LOW_WATERMARK
                 {
-                    self.replenish();
+                    self.replenish_with_work(work.as_deref());
                 }
                 let thread_id = connection.thread_id.clone();
                 let request_kind = connection.request_kind;
                 (Connection::Websocket(connection), thread_id, request_kind)
             }
             None => {
-                self.replenish();
+                self.replenish_with_work(work.as_deref());
                 // Sampling owns the retry budget across both transports.
                 provider.retry.max_attempts = 0;
                 let url = provider.url_for_path("/responses");
@@ -436,6 +459,7 @@ impl ConnectionPool {
             connection,
             pool: Arc::clone(self),
             _permit: permit,
+            work,
             cleanup: Some(cleanup),
         })
     }
@@ -692,6 +716,7 @@ impl ConnectionLease {
         &self,
         request: &ResponsesApiRequest,
     ) -> Result<ResponseStream, ApiError> {
+        let _work = &self.work;
         match &self.connection {
             Connection::Websocket(connection) => {
                 connection

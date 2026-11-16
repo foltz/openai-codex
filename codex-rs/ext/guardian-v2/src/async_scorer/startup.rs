@@ -140,6 +140,10 @@ pub(super) async fn sampler_config(
         .get::<codex_model_provider::ProviderAuthContext>()
         .expect("Core installs provider auth before starting Guardian");
     LunaSamplerConfig {
+        require_account_work: matches!(
+            input.mcp_access,
+            Ok(codex_protocol::mcp_work::McpAttemptAccess::Admitted(_))
+        ),
         api_key_cyber_access_programs: ApiKeyCyberAccessPrograms::from_config(input.config),
         inherit_parent_cyber_access_program,
         workspace_routing: input

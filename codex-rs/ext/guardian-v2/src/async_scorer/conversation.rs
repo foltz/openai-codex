@@ -212,6 +212,18 @@ impl Reservation {
 impl PreparedConversation {
     /// Publishes the first score, then drains and commits only valid completed history.
     pub(super) async fn run(mut self) {
+        // Independent from both the early-score observer and the transport's
+        // work: retained-history authorization/commit still runs after sampling.
+        let _work = match super::work::derive(
+            self.reservation.sampler.requires_account_work(),
+            self.sampling.account_work.as_deref(),
+        ) {
+            Ok(work) => work,
+            Err(error) => {
+                let _ = self.ready.send(Err(error));
+                return;
+            }
+        };
         // A caller can retain prepared input while authorization or admission expires.
         let authorization_is_current = self.key.authorization.is_current(&self.thread).await;
         let history_superseded = self

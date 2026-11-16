@@ -44,6 +44,10 @@ const MAX_RESPONSE_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, Error, PartialEq)]
 pub(super) enum DecisionsError {
+    #[error("Decisions account work is unavailable")]
+    AccountWorkRefused,
+    #[error("Decisions task owner is closed")]
+    TaskClosed,
     #[error("Decisions credentials are missing or empty")]
     Credentials,
     #[error("Decisions HTTP client setup failed")]
@@ -194,10 +198,25 @@ impl DecisionsSampler {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn start_conversation_comparison(
         self: &Arc<Self>,
         input: &[ResponseItemEnvelope],
     ) -> DecisionsTask {
+        self.start_conversation_comparison_with_work(input, false, None, Arc::default())
+            .expect("ungated test owner is open")
+    }
+
+    pub(super) fn start_conversation_comparison_with_work(
+        self: &Arc<Self>,
+        input: &[ResponseItemEnvelope],
+        required: bool,
+        work: Option<&dyn codex_protocol::mcp_work::McpAttemptWork>,
+        owner: Arc<super::tasks::ClassifierTasks>,
+    ) -> Result<DecisionsTask, DecisionsError> {
+        let work =
+            super::work::derive(required, work).map_err(|_| DecisionsError::AccountWorkRefused)?;
+        let cleanup = owner.continuation().ok_or(DecisionsError::TaskClosed)?;
         let started = Instant::now();
         let source_generation = self.credential.source_generation();
         let body = (|| {
@@ -222,7 +241,7 @@ impl DecisionsSampler {
             }
             request_body(rubric, evidence.iter().map(|item| &item.item))
         })();
-        self.spawn_request(body, started, source_generation)
+        self.spawn_request(body, started, source_generation, work, owner, cleanup)
     }
 
     fn spawn_request(
@@ -230,14 +249,20 @@ impl DecisionsSampler {
         body: Result<Value, DecisionsError>,
         started: Instant,
         source_generation: Option<u64>,
-    ) -> DecisionsTask {
+        work: Option<Box<dyn codex_protocol::mcp_work::McpAttemptWork>>,
+        owner: Arc<super::tasks::ClassifierTasks>,
+        cleanup: super::tasks::Continuation,
+    ) -> Result<DecisionsTask, DecisionsError> {
         let body = match body {
             Ok(body) => body,
             Err(error) => {
-                return DecisionsTask {
-                    handle: tokio::spawn(async move { (Err(error), started.elapsed()) }),
+                return Ok(DecisionsTask {
+                    handle: tokio::spawn(cleanup.track(async move {
+                        let _work = work;
+                        (Err(error), started.elapsed())
+                    })),
                     sampler: Weak::new(),
-                };
+                });
             }
         };
         let mut active = self
@@ -251,7 +276,11 @@ impl DecisionsSampler {
             oldest.abort();
         }
         let sampler = Arc::clone(self);
-        let handle = tokio::spawn(async move {
+        let handle = tokio::spawn(cleanup.track(async move {
+            let _work = work;
+            tokio::select! { biased;
+            () = owner.cancelled() => (Err(DecisionsError::TaskClosed), started.elapsed()),
+            outcome = async {
             let Ok(_permit) = sampler.slots.acquire().await else {
                 return (Err(DecisionsError::Transport), started.elapsed());
             };
@@ -259,12 +288,14 @@ impl DecisionsSampler {
                 .await
                 .unwrap_or(Err(DecisionsError::Timeout));
             (result, started.elapsed())
-        });
+            } => outcome,
+            }
+        }));
         active.push_back(handle.abort_handle());
-        DecisionsTask {
+        Ok(DecisionsTask {
             handle,
             sampler: Arc::downgrade(self),
-        }
+        })
     }
 
     async fn request(

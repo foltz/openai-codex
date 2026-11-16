@@ -45,6 +45,8 @@ const MAX_CONCURRENT_REQUESTS: usize = 16;
 
 /// Host-owned provider, authentication, and attribution for one Luna connection.
 pub struct LunaSamplerConfig {
+    /// Uncounted host policy; required callers must supply finite invocation work.
+    pub require_account_work: bool,
     /// Provider and credentials selected for the owning thread.
     pub provider: SharedModelProvider,
     /// Provider and feature policy shared with ordinary model requests.
@@ -77,6 +79,8 @@ pub struct LunaSamplerConfig {
 
 /// One tool-less Luna classification request.
 pub struct LunaSamplingRequest {
+    /// Finite request work, held through retained sampling and terminal cleanup.
+    pub account_work: Option<Box<dyn codex_protocol::mcp_work::McpAttemptWork>>,
     /// Generator selected by the owning session for response items.
     pub item_id_generator: codex_protocol::ItemIdGenerator,
     /// Cyber selection captured from the owning turn; Daybreak reviews use Blue.
@@ -109,6 +113,9 @@ pub(super) struct ConversationSample {
 /// Failures returned while connecting or sampling the Luna model.
 #[derive(Debug, Error)]
 pub enum LunaSamplerError {
+    /// Local admission refusal, never a remote transport failure or retry.
+    #[error("classifier account work is unavailable")]
+    AccountWorkRefused,
     /// The thread's provider or scoped credentials could not be resolved.
     #[error("could not resolve the Luna model provider: {0}")]
     Provider(#[source] CodexErr),
@@ -157,6 +164,19 @@ impl LunaSampler {
             connections: ConnectionPool::new(Arc::clone(&config)),
             config,
         }
+    }
+
+    pub(super) fn task_owner(&self) -> Arc<super::tasks::ClassifierTasks> {
+        Arc::clone(&self.connections.workers)
+    }
+    pub(super) fn requires_account_work(&self) -> bool {
+        self.config.require_account_work
+    }
+    pub(super) fn spawn_work<F: std::future::Future<Output = ()> + Send + 'static>(
+        &self,
+        future: F,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        self.connections.workers.spawn(future)
     }
 
     pub(super) fn spawn_prewarm(
@@ -248,7 +268,11 @@ impl LunaSampler {
         request: &LunaSamplingRequest,
         input: Vec<ResponseItem>,
         auth_owner: Option<AuthOwner>,
-    ) -> execution::SamplingExecution {
+    ) -> Result<execution::SamplingExecution, LunaSamplerError> {
+        let work = super::work::derive(
+            self.config.require_account_work,
+            request.account_work.as_deref(),
+        )?;
         let api_request = ResponsesApiRequest {
             model: MODEL.to_owned(),
             input,
@@ -271,7 +295,8 @@ impl LunaSampler {
             client_metadata: None,
             access_programs: None,
         };
-        execution::SamplingExecution {
+        Ok(execution::SamplingExecution {
+            work,
             auth_owner,
             cyber_access_program: codex_guardian_reviewer::guardian_cyber_access_program(
                 request
@@ -286,7 +311,7 @@ impl LunaSampler {
             parent_response_id: request.parent_response_id.clone(),
             parent_turn_id: request.parent_turn_id.clone(),
             root_turn_id: request.root_turn_id.clone(),
-        }
+        })
     }
 
     pub(super) fn max_input_tokens(&self) -> usize {
@@ -303,7 +328,6 @@ impl LunaSampler {
             input: review_request,
             sampling,
         } = sample;
-        let auth_owner = self.auth_owner();
         let mut completion = execution::RetainedCompletion {
             ready: Some(ready),
             output: Some(Vec::new()),
@@ -320,12 +344,20 @@ impl LunaSampler {
             .into_iter()
             .map(|envelope| (envelope.item, envelope.metadata))
             .unzip();
-        let mut execution = self.execution(&sampling, input, auth_owner);
-        execution.request.include = vec!["reasoning.encrypted_content".to_owned()];
         let mut telemetry = telemetry::SamplingTelemetry::new(
             self.config.metrics.clone(),
             sampling.pending_score.clone(),
         );
+        let mut execution = match self.execution(&sampling, input, None) {
+            Ok(execution) => execution,
+            Err(error) => {
+                completion.finish(Err(error), &mut telemetry);
+                return None;
+            }
+        };
+        // No account/provider read occurs before finite work validation.
+        execution.auth_owner = self.auth_owner();
+        execution.request.include = vec!["reasoning.encrypted_content".to_owned()];
         let result = execution.run(&mut completion, &mut telemetry).await;
         execution
             .request

@@ -38,6 +38,7 @@ const RESPONSES_LITE_METADATA_KEY: &str =
 const TURN_METADATA_KEY: &str = "x-codex-turn-metadata";
 
 pub(super) struct SamplingExecution {
+    pub(super) work: Option<Box<dyn codex_protocol::mcp_work::McpAttemptWork>>,
     pub(super) auth_owner: Option<AuthOwner>,
     pub(super) cyber_access_program: Option<CyberAccessProgram>,
     pub(super) config: Arc<LunaSamplerConfig>,
@@ -141,7 +142,8 @@ impl SamplingExecution {
                     status.is_server_error() || *status == StatusCode::TOO_MANY_REQUESTS
                 }
             }
-            LunaSamplerError::Provider(_)
+            LunaSamplerError::AccountWorkRefused
+            | LunaSamplerError::Provider(_)
             | LunaSamplerError::MissingOutput
             | LunaSamplerError::OutputTooLarge
             | LunaSamplerError::Superseded
@@ -227,7 +229,7 @@ impl SamplingExecution {
             let lease = match tokio::select! {
                 biased;
                 _ = &mut owner_changed => return Err(account_changed_error()),
-                lease = self.connections.lease() => lease,
+                lease = self.connections.lease_with_work(self.work.as_deref()) => lease,
             } {
                 Ok(lease) => lease,
                 Err(error) => {

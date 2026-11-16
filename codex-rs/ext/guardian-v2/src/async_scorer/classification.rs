@@ -56,6 +56,8 @@ use super::trusted_skills::TrustedSkillInvocations;
 use super::trusted_tools::trusted_tool_context;
 
 pub(super) struct Classification {
+    pub(super) work: Option<Box<dyn codex_protocol::mcp_work::McpAttemptWork>>,
+    pub(super) sampler: Arc<super::sampler::LunaSampler>,
     pub(super) reservation: Reservation,
     pub(super) classification_started_at: Instant,
     pub(super) decisions_sampler: Option<Arc<super::decisions::DecisionsSampler>>,
@@ -111,6 +113,8 @@ impl Classification {
     )]
     pub(super) async fn run(self) {
         let Self {
+            work,
+            sampler,
             reservation,
             classification_started_at,
             decisions_sampler,
@@ -302,6 +306,7 @@ impl Classification {
             let extra_policy = config.guardian_extra_policy.as_deref().unwrap_or_default();
             let instructions = guardian_config.render_classifier_instructions(policy, extra_policy);
             let sampling = LunaSamplingRequest {
+                account_work: super::work::derive(sampler.requires_account_work(), work.as_deref()).map_err(|_| {failure_reason = "account_work_refused"; "classifier account work is unavailable".to_owned()})?,
                 item_id_generator: Arc::clone(thread.item_id_generator()),
                 cyber_access_program,
                 parent_response_id,
@@ -329,9 +334,12 @@ impl Classification {
             let mut sampling_started = None;
             if let Some(prepared) = reservation.prepare(request).await {
                 if let Some(decisions_sampler) = decisions_sampler.as_ref() {
-                    decisions_task = Some(
-                        decisions_sampler.start_conversation_comparison(&prepared.request.input),
-                    );
+                    decisions_task = match decisions_sampler.start_conversation_comparison_with_work(
+                        &prepared.request.input, sampler.requires_account_work(), work.as_deref(), sampler.task_owner(),
+                    ) {
+                        Ok(task) => Some(task),
+                        Err(error) => { super::metrics::record_decisions_comparison_outcome(metrics.as_deref(), "skipped", super::metrics::decisions_failure_reason(error)); None }
+                    };
                 } else if decisions_comparison_enabled {
                     super::metrics::record_decisions_comparison_outcome(
                         metrics.as_deref(),
@@ -340,7 +348,7 @@ impl Classification {
                     );
                 }
                 sampling_started = Some(Instant::now());
-                tokio::spawn(prepared.run());
+                sampler.spawn_work(prepared.run());
             }
             let result = tokio::select! {
                 biased;

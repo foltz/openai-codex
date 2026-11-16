@@ -1,8 +1,8 @@
 //! Classifier cancellation preserves usage and reuses only unused or fully drained sockets.
 
 use super::*;
-use crate::async_scorer::sampler::LunaSampler;
 use crate::async_scorer::sampler::CLASSIFICATION_TOKEN_USAGE_METRIC;
+use crate::async_scorer::sampler::LunaSampler;
 use crate::async_scorer::sampler::response::PendingResponse;
 use crate::async_scorer::sampler::tests::RecordingMetrics;
 use crate::async_scorer::sampler::tests::connect_sampler;
@@ -155,7 +155,7 @@ async fn cancellation_preserves_unused_sockets_and_backpressured_completion() ->
             &sample_request("stale"),
             Vec::new(),
             /*auth_owner*/ None,
-        )
+        )?
         .request;
     // Cancel before this current-thread runtime can dispatch, then reuse its only socket.
     let stream = lease.stream_request(&request).await?;
@@ -202,8 +202,7 @@ async fn cancellation_preserves_unused_sockets_and_backpressured_completion() ->
 
 #[tokio::test]
 async fn shutdown_joins_response_drain_reserved_before_close() -> Result<()> {
-    let server =
-        responses::start_websocket_server_with_headers(vec![
+    let server = responses::start_websocket_server_with_headers(vec![
             responses::WebSocketConnectionConfig {
                 requests: Vec::new(),
                 response_headers: Vec::new(),
@@ -212,7 +211,7 @@ async fn shutdown_joins_response_drain_reserved_before_close() -> Result<()> {
             };
             INITIAL_WEBSOCKET_CONNECTIONS
         ])
-        .await;
+    .await;
     let sampler = LunaSampler::new(sampler_config(format!(
         "http://{}/v1",
         server.uri().trim_start_matches("ws://")

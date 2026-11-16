@@ -22,3 +22,5 @@ mod trusted_tools;
 mod wrapper_lag;
 
 pub(crate) use extension::install;
+
+mod work;

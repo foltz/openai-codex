@@ -815,3 +815,116 @@ async fn decisions_preserves_platform_wif_credentials() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[derive(Default)]
+struct DecisionWorkCounts {
+    live: std::sync::atomic::AtomicUsize,
+    refused: std::sync::atomic::AtomicBool,
+}
+struct DecisionWork(Arc<DecisionWorkCounts>);
+impl DecisionWork {
+    fn new(c: &Arc<DecisionWorkCounts>) -> Self {
+        c.live.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(Arc::clone(c))
+    }
+}
+impl Drop for DecisionWork {
+    fn drop(&mut self) {
+        self.0
+            .live
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+impl codex_protocol::mcp_work::McpAttemptWork for DecisionWork {
+    fn derive_attempt(
+        &self,
+    ) -> Result<
+        Box<dyn codex_protocol::mcp_work::McpAttemptWork>,
+        codex_protocol::mcp_work::McpAttemptRefused,
+    > {
+        if self.0.refused.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(codex_protocol::mcp_work::McpAttemptRefused);
+        }
+        Ok(Box::new(Self::new(&self.0)))
+    }
+}
+#[tokio::test]
+async fn decisions_required_or_closed_authority_refuses_before_preparation_and_network() {
+    let server = MockServer::start().await;
+    let sampler = Arc::new(
+        DecisionsSampler::new(
+            HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+            "synthetic".into(),
+            format!("{}/v1/decisions", server.uri()),
+            None,
+        )
+        .unwrap(),
+    );
+    let owner = Arc::new(super::super::tasks::ClassifierTasks::default());
+    assert!(matches!(
+        sampler.start_conversation_comparison_with_work(&[], true, None, Arc::clone(&owner)),
+        Err(DecisionsError::AccountWorkRefused)
+    ));
+    let counts = Arc::new(DecisionWorkCounts::default());
+    let root = DecisionWork::new(&counts);
+    counts
+        .refused
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(matches!(
+        sampler.start_conversation_comparison_with_work(&[], true, Some(&root), Arc::clone(&owner)),
+        Err(DecisionsError::AccountWorkRefused)
+    ));
+    counts
+        .refused
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    owner.shutdown().await;
+    assert!(matches!(
+        sampler.start_conversation_comparison_with_work(&[], true, Some(&root), owner),
+        Err(DecisionsError::TaskClosed)
+    ));
+    drop(root);
+    assert_eq!(counts.live.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+#[tokio::test]
+async fn decisions_queued_abort_keeps_work_until_original_task_is_destroyed() {
+    let server = MockServer::start().await;
+    let sampler = Arc::new(
+        DecisionsSampler::new(
+            HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+            "synthetic".into(),
+            format!("{}/v1/decisions", server.uri()),
+            None,
+        )
+        .unwrap(),
+    );
+    let permit = sampler
+        .slots
+        .acquire_many(u32::try_from(MAX_CONCURRENT_REQUESTS).unwrap())
+        .await
+        .unwrap();
+    let request = crate::async_scorer::sampler::tests::sample_request("decision-work");
+    let (input, _) = LunaSampler::prepare_input(
+        &request,
+        None,
+        request
+            .input
+            .iter()
+            .cloned()
+            .map(ResponseItemEnvelope::new)
+            .collect(),
+    );
+    let owner = Arc::new(super::super::tasks::ClassifierTasks::default());
+    let counts = Arc::new(DecisionWorkCounts::default());
+    let root = DecisionWork::new(&counts);
+    let task = sampler
+        .start_conversation_comparison_with_work(&input, true, Some(&root), Arc::clone(&owner))
+        .unwrap();
+    drop(root);
+    assert_eq!(counts.live.load(std::sync::atomic::Ordering::SeqCst), 1);
+    drop(task);
+    owner.shutdown().await;
+    assert_eq!(counts.live.load(std::sync::atomic::Ordering::SeqCst), 0);
+    drop(permit);
+    assert!(server.received_requests().await.unwrap().is_empty());
+}

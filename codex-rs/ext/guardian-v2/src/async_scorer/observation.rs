@@ -163,6 +163,31 @@ impl GuardianV2Extension {
         let context_mode = GuardianContextMode::from_history(input.conversation_history.as_ref());
         let analytics = input.session_store.get::<AnalyticsEventsClient>();
         let sampled_at = SystemTime::now();
+        let work = match input.mcp_access {
+            Ok(codex_protocol::mcp_work::McpAttemptAccess::Admitted(work)) => {
+                super::work::derive(true, Some(work))
+            }
+            Ok(codex_protocol::mcp_work::McpAttemptAccess::Unscoped) => {
+                super::work::derive(sampler.requires_account_work(), None)
+            }
+            Err(_) => Err(super::sampler::LunaSamplerError::AccountWorkRefused),
+        };
+        let work = match work {
+            Ok(work) => work,
+            Err(_) => {
+                let index = score_progress.observe(&input);
+                score_progress.invalidate(index);
+                score_progress.fail_closed(sampled_at);
+                record_classification(
+                    metrics.as_deref(),
+                    context_mode,
+                    classification_started_at.elapsed(),
+                    "failure",
+                    Some("account_work_refused"),
+                );
+                return;
+            }
+        };
         let Some(conversation) = input.thread_store.get::<ConversationBackend>() else {
             let index = score_progress.observe(&input);
             score_progress.invalidate(index);
@@ -404,7 +429,10 @@ impl GuardianV2Extension {
             return;
         };
         let score_authorization = ScoreAuthorization::current(&thread, &permissions).await;
+        let failure_progress = Arc::clone(&score_progress);
         let classification = Classification {
+            work,
+            sampler: Arc::clone(&sampler),
             reservation,
             classification_started_at,
             decisions_sampler: input
@@ -440,6 +468,9 @@ impl GuardianV2Extension {
             root_snapshot,
             score_authorization,
         };
-        tokio::spawn(classification.run());
+        if sampler.spawn_work(classification.run()).is_none() {
+            failure_progress.invalidate(tool_call_index);
+            failure_progress.fail_closed(sampled_at);
+        }
     }
 }

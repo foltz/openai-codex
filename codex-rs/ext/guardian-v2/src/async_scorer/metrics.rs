@@ -21,6 +21,7 @@ pub(super) const TOOL_CALL_LAG_METRIC: &str = "codex.guardian_v2.tool_call_lag";
 // Never use error messages as metric tags: they may contain server responses or credentials.
 pub(super) fn sampler_failure_reason(error: &LunaSamplerError) -> &'static str {
     match error {
+        LunaSamplerError::AccountWorkRefused => "account_work_refused",
         LunaSamplerError::Provider(_) => "provider_error",
         LunaSamplerError::ConnectionTimeout => "connection_timeout",
         LunaSamplerError::MissingOutput => "missing_output",
@@ -200,6 +201,8 @@ pub(super) fn record_decisions_comparison_outcome(
 pub(super) fn decisions_failure_reason(error: DecisionsError) -> &'static str {
     match error {
         DecisionsError::Credentials => "credentials_unavailable",
+        DecisionsError::AccountWorkRefused => "account_work_refused",
+        DecisionsError::TaskClosed => "task_closed",
         DecisionsError::ClientSetup => "request_build_error",
         DecisionsError::UnexpectedRequestSetup => "unexpected_request_setup",
         DecisionsError::UnsupportedInputItem => "unsupported_input_item",

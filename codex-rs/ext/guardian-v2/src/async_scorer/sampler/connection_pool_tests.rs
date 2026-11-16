@@ -1175,3 +1175,152 @@ async fn classifier_shutdown_clears_idle_and_refuses_late_connection_return() ->
     server.shutdown().await;
     Ok(())
 }
+
+#[tokio::test]
+async fn required_sampling_and_leases_refuse_missing_or_expired_work_without_requests() -> Result<()>
+{
+    let server = responses::start_mock_server().await;
+    let mut config = sampler_config(server.uri());
+    config.require_account_work = true;
+    let sampler = LunaSampler::new(config);
+    assert!(matches!(
+        sampler.sample(sample_request("missing")).await,
+        Err(LunaSamplerError::AccountWorkRefused)
+    ));
+    assert!(matches!(
+        sampler.connections.lease().await,
+        Err(LunaSamplerError::AccountWorkRefused)
+    ));
+    assert!(sampler.connections.replenish().is_none());
+    sampler.prewarm().await;
+    let counts = Arc::new(PrewarmCounts::default());
+    let mut request = sample_request("expired");
+    request.account_work = Some(Box::new(PrewarmWork::new(&counts)));
+    counts.refuse.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        sampler.sample(request).await,
+        Err(LunaSamplerError::AccountWorkRefused)
+    ));
+    assert_eq!(counts.derives.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    assert!(server.received_requests().await.unwrap().is_empty());
+    sampler.shutdown().await;
+    Ok(())
+}
+#[tokio::test]
+async fn lease_work_is_captured_before_waiting_for_classification_capacity() -> Result<()> {
+    let mut config = sampler_config("http://127.0.0.1:9".into());
+    config.require_account_work = true;
+    let sampler = LunaSampler::new(config);
+    let pool = Arc::clone(&sampler.connections);
+    let permits = Arc::clone(&pool.classifications)
+        .acquire_many_owned(u32::try_from(MAX_CONCURRENT_REQUESTS)?)
+        .await?;
+    let counts = Arc::new(PrewarmCounts::default());
+    let root = PrewarmWork::new(&counts);
+    let mut pending = Box::pin(async move {
+        let _lease = pool.lease_with_work(Some(&root)).await;
+    });
+    assert!(
+        std::future::Future::poll(
+            pending.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop())
+        )
+        .is_pending()
+    );
+    assert_eq!(counts.live.load(Ordering::SeqCst), 2);
+    assert_eq!(counts.derives.load(Ordering::SeqCst), 1);
+    drop(pending);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    drop(permits);
+    sampler.shutdown().await;
+    Ok(())
+}
+#[tokio::test]
+async fn automatic_refill_owns_descendants_after_origin_is_dropped() -> Result<()> {
+    let gateway = Gateway::new("http://127.0.0.1:9", "ws://127.0.0.1:9").await?;
+    let mut config = sampler_config(gateway.url.clone());
+    config.require_account_work = true;
+    let sampler = LunaSampler::new(config);
+    let counts = Arc::new(PrewarmCounts::default());
+    let root = PrewarmWork::new(&counts);
+    let refill = sampler
+        .connections
+        .replenish_with_work(Some(&root))
+        .expect("admitted automatic refill");
+    drop(root);
+    let opens = INITIAL_WEBSOCKET_CONNECTIONS.min(MAX_CONCURRENT_OPENS);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while gateway.opens.load(Ordering::SeqCst) < opens {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert_eq!(counts.live.load(Ordering::SeqCst), opens + 1);
+    sampler.shutdown().await;
+    refill.await?;
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    assert_eq!(counts.derives.load(Ordering::SeqCst), opens + 1);
+    gateway.task.abort();
+    assert!(gateway.task.await.unwrap_err().is_cancelled());
+    Ok(())
+}
+#[tokio::test]
+async fn response_drain_keeps_lease_account_work_after_score_owner_and_stop_waiter_drop()
+-> Result<()> {
+    let server =
+        responses::start_websocket_server_with_headers(vec![
+            responses::WebSocketConnectionConfig {
+                requests: Vec::new(),
+                response_headers: Vec::new(),
+                accept_delay: None,
+                close_after_requests: false
+            };
+            INITIAL_WEBSOCKET_CONNECTIONS
+        ])
+        .await;
+    let mut config = sampler_config(format!(
+        "http://{}/v1",
+        server.uri().trim_start_matches("ws://")
+    ));
+    config.require_account_work = true;
+    let sampler = LunaSampler::new(config);
+    let counts = Arc::new(PrewarmCounts::default());
+    sampler
+        .prewarm_with_work(Some(Box::new(PrewarmWork::new(&counts))))
+        .await;
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    *sampler.connections.retry_after.lock().unwrap() = Some(Instant::now() + CONNECT_COOLDOWN);
+    let root = PrewarmWork::new(&counts);
+    let lease = sampler.connections.lease_with_work(Some(&root)).await?;
+    drop(root);
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    assert!(matches!(lease.connection, Connection::Websocket(_)));
+    let (send, rx_event) = tokio::sync::mpsc::channel(1);
+    let (interrupt, cancelled) = tokio::sync::oneshot::channel();
+    let stream = codex_api::ResponseStream {
+        routing_affinity: None,
+        rx_event,
+        upstream_request_id: None,
+        interrupt: Some(interrupt),
+    };
+    let mut stop = Box::pin(sampler.shutdown());
+    assert!(
+        std::future::Future::poll(
+            stop.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop())
+        )
+        .is_pending()
+    );
+    drop(super::super::response::PendingResponse::new(
+        stream, lease, None,
+    ));
+    cancelled.await?;
+    assert_eq!(counts.live.load(Ordering::SeqCst), 1);
+    drop(stop);
+    drop(send);
+    tokio::time::timeout(Duration::from_secs(5), sampler.shutdown()).await?;
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+    server.shutdown().await;
+    Ok(())
+}

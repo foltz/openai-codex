@@ -8131,3 +8131,362 @@ async fn closed_plugin_owner_refuses_all_async_worker_births_and_clears_queue_fl
         "refused before any HTTP"
     );
 }
+
+#[test]
+fn curated_worker_missing_runtime_refuses_before_read_and_releases_start_gate() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    let home = tempfile::tempdir().unwrap();
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    let polled = Arc::new(AtomicBool::new(false));
+    let read_polled = polled.clone();
+    let start = CuratedSyncStart::begin(&STARTED).unwrap();
+    assert!(
+        manager
+            .start_curated_repo_sync_with(
+                test_http_client_factory(),
+                None,
+                start,
+                move |_, _, _| {
+                    read_polled.store(true, Ordering::SeqCst);
+                    Ok(TEST_CURATED_PLUGIN_SHA.into())
+                }
+            )
+            .is_none()
+    );
+    assert!(!polled.load(Ordering::SeqCst));
+    assert!(!STARTED.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn curated_worker_closed_owner_refuses_before_read_and_releases_start_gate() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    let home = tempfile::tempdir().unwrap();
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    assert!(
+        manager
+            .shutdown_until(tokio::time::Instant::now())
+            .await
+            .is_clean()
+    );
+    let polled = Arc::new(AtomicBool::new(false));
+    let read_polled = polled.clone();
+    let start = CuratedSyncStart::begin(&STARTED).unwrap();
+    assert!(
+        manager
+            .start_curated_repo_sync_with(
+                test_http_client_factory(),
+                None,
+                start,
+                move |_, _, _| {
+                    read_polled.store(true, Ordering::SeqCst);
+                    Ok(TEST_CURATED_PLUGIN_SHA.into())
+                }
+            )
+            .is_none()
+    );
+    assert!(!polled.load(Ordering::SeqCst));
+    assert!(!STARTED.load(Ordering::SeqCst));
+    assert!(
+        manager
+            .shutdown_until(tokio::time::Instant::now())
+            .await
+            .is_clean()
+    );
+}
+
+#[tokio::test]
+async fn curated_worker_panic_is_nonclean_and_releases_start_gate() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    let home = tempfile::tempdir().unwrap();
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    let receipt = manager
+        .start_curated_repo_sync_with(
+            test_http_client_factory(),
+            None,
+            CuratedSyncStart::begin(&STARTED).unwrap(),
+            |_, _, _| panic!("synthetic curated read panic"),
+        )
+        .unwrap();
+    assert_eq!(receipt.await, crate::retirement::JoinOutcome::Panicked);
+    let report = manager
+        .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await;
+    assert!(report.terminal && report.panicked && !report.is_clean());
+    assert!(!STARTED.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn curated_worker_survives_observer_cancel_and_keeps_its_exact_stop_owner() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    let home = tempfile::tempdir().unwrap();
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let stop_seen = Arc::new(AtomicBool::new(false));
+    let read_stop_seen = stop_seen.clone();
+    let receipt = manager
+        .start_curated_repo_sync_with(
+            test_http_client_factory(),
+            None,
+            CuratedSyncStart::begin(&STARTED).unwrap(),
+            move |_, _, stop| {
+                assert_eq!(
+                    std::thread::current().name(),
+                    Some("plugins-curated-repo-sync")
+                );
+                let _ = entered.send(());
+                released.recv().unwrap();
+                read_stop_seen.store(stop.is_stopped(), Ordering::SeqCst);
+                Err("synthetic owned read stopped".into())
+            },
+        )
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), started)
+        .await
+        .unwrap()
+        .unwrap();
+    let observer = tokio::spawn(receipt);
+    observer.abort();
+    assert!(observer.await.unwrap_err().is_cancelled());
+    assert!(
+        !manager
+            .shutdown_until(tokio::time::Instant::now())
+            .await
+            .terminal
+    );
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let report = manager
+                .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(30))
+                .await;
+            if report.terminal {
+                assert!(report.is_clean());
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        stop_seen.load(Ordering::SeqCst),
+        "worker received this registry's actual stop"
+    );
+    assert!(!STARTED.load(Ordering::SeqCst));
+}
+
+struct CallbackDropRuntimeProbe {
+    dropped: Arc<AtomicBool>,
+    runtime_present: Arc<AtomicBool>,
+}
+impl Drop for CallbackDropRuntimeProbe {
+    fn drop(&mut self) {
+        self.runtime_present.store(
+            tokio::runtime::Handle::try_current().is_ok(),
+            Ordering::SeqCst,
+        );
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+// This new synchronous callback fixture holds one runtime worker deliberately;
+// the second worker observes/releases it. Existing test settings are unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn curated_worker_join_cannot_hide_a_pending_runtime_callback_original() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    let home = tempfile::tempdir().unwrap();
+    let source = curated_plugins_repo_path(home.path());
+    write_curated_plugin(&source, "gmail");
+    write_openai_curated_marketplace(&source, &["gmail"]);
+    write_file(
+        &home.path().join(CONFIG_TOML_FILE),
+        "[plugins.\"gmail@openai-curated\"]\nenabled = true\n",
+    );
+    let manager = Arc::new(test_plugins_manager(home.path().to_owned()));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let callback_entered = entered.clone();
+    let (release, released) = std::sync::mpsc::channel();
+    let released = std::sync::Mutex::new(released);
+    let finished = Arc::new(AtomicBool::new(false));
+    let callback_finished = finished.clone();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let runtime_present = Arc::new(AtomicBool::new(false));
+    let probe = CallbackDropRuntimeProbe {
+        dropped: dropped.clone(),
+        runtime_present: runtime_present.clone(),
+    };
+    let callback: EffectivePluginsChangedCallback = Arc::new(move |_| {
+        let _probe_lifetime = &probe;
+        assert!(tokio::runtime::Handle::try_current().is_ok());
+        assert!(
+            tokio::task::try_id().is_some(),
+            "callback is a real Tokio task"
+        );
+        assert_ne!(
+            std::thread::current().name(),
+            Some("plugins-curated-repo-sync")
+        );
+        callback_entered.notify_one();
+        let _ = released.lock().unwrap().recv();
+        callback_finished.store(true, Ordering::SeqCst);
+    });
+    let receipt = manager
+        .start_curated_repo_sync_with(
+            test_http_client_factory(),
+            Some(callback),
+            CuratedSyncStart::begin(&STARTED).unwrap(),
+            |_, _, _| Ok(TEST_CURATED_PLUGIN_SHA.into()),
+        )
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(receipt.await, crate::retirement::JoinOutcome::Joined);
+    assert!(
+        STARTED.load(Ordering::SeqCst),
+        "successful sync preserves global deduplication"
+    );
+    assert!(!finished.load(Ordering::SeqCst));
+    assert!(
+        !manager
+            .shutdown_until(tokio::time::Instant::now())
+            .await
+            .terminal,
+        "the worker joined but its actual callback original is still running"
+    );
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let report = manager
+                .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(30))
+                .await;
+            if report.terminal {
+                assert!(report.is_clean());
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(finished.load(Ordering::SeqCst));
+    assert!(dropped.load(Ordering::SeqCst) && runtime_present.load(Ordering::SeqCst));
+}
+
+#[test]
+fn curated_callback_closed_owner_refuses_body_and_drops_captures_in_runtime_context() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let registry = crate::PluginTaskRegistry::default();
+    registry.close();
+    let called = Arc::new(AtomicBool::new(false));
+    let callback_called = called.clone();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let runtime_present = Arc::new(AtomicBool::new(false));
+    let probe = CallbackDropRuntimeProbe {
+        dropped: dropped.clone(),
+        runtime_present: runtime_present.clone(),
+    };
+    let callback: EffectivePluginsChangedCallback = Arc::new(move |_| {
+        let _probe_lifetime = &probe;
+        callback_called.store(true, Ordering::SeqCst);
+    });
+    let wrapped = dispatch_on_runtime(registry.clone(), runtime.handle().clone(), callback);
+    std::thread::spawn(move || wrapped(EffectivePluginsChange::default()))
+        .join()
+        .unwrap();
+    assert!(!called.load(Ordering::SeqCst));
+    assert!(dropped.load(Ordering::SeqCst) && runtime_present.load(Ordering::SeqCst));
+    assert!(
+        runtime
+            .block_on(registry.shutdown_until(tokio::time::Instant::now()))
+            .is_clean()
+    );
+}
+
+#[test]
+fn curated_callback_dead_runtime_is_cancelled_not_successful_delivery() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let handle = runtime.handle().clone();
+    let registry = crate::PluginTaskRegistry::default();
+    let called = Arc::new(AtomicBool::new(false));
+    let callback_called = called.clone();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let runtime_present = Arc::new(AtomicBool::new(false));
+    let probe = CallbackDropRuntimeProbe {
+        dropped: dropped.clone(),
+        runtime_present: runtime_present.clone(),
+    };
+    let callback: EffectivePluginsChangedCallback = Arc::new(move |_| {
+        let _probe_lifetime = &probe;
+        callback_called.store(true, Ordering::SeqCst);
+    });
+    let wrapped = dispatch_on_runtime(registry.clone(), handle, callback);
+    drop(runtime);
+    std::thread::spawn(move || wrapped(EffectivePluginsChange::default()))
+        .join()
+        .unwrap();
+    assert!(!called.load(Ordering::SeqCst));
+    assert!(dropped.load(Ordering::SeqCst) && runtime_present.load(Ordering::SeqCst));
+    let observer = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let report = observer
+        .block_on(registry.shutdown_until(tokio::time::Instant::now() + Duration::from_secs(2)));
+    assert!(report.terminal && report.cancelled && !report.is_clean());
+}
+
+#[test]
+fn curated_start_gate_duplicate_preserves_active_and_committed_deduplication() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    let start = CuratedSyncStart::begin(&STARTED).unwrap();
+    assert!(CuratedSyncStart::begin(&STARTED).is_none());
+    assert!(STARTED.load(Ordering::SeqCst));
+    drop(start);
+    assert!(!STARTED.load(Ordering::SeqCst));
+    let mut start = CuratedSyncStart::begin(&STARTED).unwrap();
+    start.committed = true;
+    drop(start);
+    assert!(CuratedSyncStart::begin(&STARTED).is_none());
+    assert!(STARTED.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn curated_runtime_callback_panic_is_sticky_nonclean() {
+    let registry = crate::PluginTaskRegistry::default();
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let entered = std::sync::Mutex::new(Some(entered));
+    let callback: EffectivePluginsChangedCallback = Arc::new(move |_| {
+        let _ = entered.lock().unwrap().take().unwrap().send(());
+        panic!("synthetic actual curated runtime callback panic");
+    });
+    let wrapped = dispatch_on_runtime(
+        registry.clone(),
+        tokio::runtime::Handle::current(),
+        callback,
+    );
+    std::thread::spawn(move || wrapped(EffectivePluginsChange::default()))
+        .join()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), started)
+        .await
+        .unwrap()
+        .unwrap();
+    let report = registry
+        .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await;
+    assert!(report.terminal && report.panicked && !report.is_clean());
+    assert!(
+        registry
+            .shutdown_until(tokio::time::Instant::now())
+            .await
+            .panicked
+    );
+}

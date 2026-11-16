@@ -90,7 +90,7 @@ use crate::startup_sync::OPENAI_PLUGINS_GIT_URL;
 use crate::startup_sync::curated_plugins_api_marketplace_path;
 use crate::startup_sync::curated_plugins_repo_path;
 use crate::startup_sync::read_curated_plugins_sha;
-use crate::startup_sync::sync_openai_plugins_repo;
+use crate::startup_sync::sync_openai_plugins_repo_until;
 use crate::store::PluginInstallResult as StorePluginInstallResult;
 use crate::store::PluginStore;
 use crate::store::PluginStoreError;
@@ -165,6 +165,72 @@ const REMOTE_INSTALLED_PLUGIN_SYNC_WAIT_TIMEOUT: Duration = Duration::from_secs(
 const LOADED_PLUGINS_CACHE_CAPACITY: usize = 8;
 
 type EffectivePluginsChangedCallback = Arc<dyn Fn(EffectivePluginsChange) + Send + Sync + 'static>;
+
+/// Existing once-per-process start flag, released on refusal, creation failure
+/// or panic as well as ordinary sync failure. Only successful sync commits it.
+struct CuratedSyncStart {
+    started: &'static AtomicBool,
+    committed: bool,
+}
+impl CuratedSyncStart {
+    fn begin(started: &'static AtomicBool) -> Option<Self> {
+        (!started.swap(true, Ordering::SeqCst)).then(|| Self {
+            started,
+            committed: false,
+        })
+    }
+}
+impl Drop for CuratedSyncStart {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.started.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+/// The callback and every invocation clone release their captured values with
+/// the selected runtime entered, including refusal/cancellation on an OS thread.
+#[derive(Clone)]
+struct RuntimePluginCallback {
+    runtime: tokio::runtime::Handle,
+    callback: Option<EffectivePluginsChangedCallback>,
+}
+impl RuntimePluginCallback {
+    fn call(&self, change: EffectivePluginsChange) {
+        self.callback.as_ref().expect("callback capture is live")(change);
+    }
+}
+
+impl Drop for RuntimePluginCallback {
+    fn drop(&mut self) {
+        let _entered = self.runtime.enter();
+        drop(self.callback.take());
+    }
+}
+
+fn dispatch_on_runtime(
+    registry: crate::PluginTaskRegistry,
+    runtime: tokio::runtime::Handle,
+    callback: EffectivePluginsChangedCallback,
+) -> EffectivePluginsChangedCallback {
+    let owned = RuntimePluginCallback {
+        runtime,
+        callback: Some(callback),
+    };
+    Arc::new(move |change| {
+        let invocation = owned.clone();
+        let runtime = invocation.runtime.clone();
+        let _entered = runtime.enter();
+        if registry
+            .spawn_on(&runtime, async move {
+                invocation.call(change);
+            })
+            .is_err()
+        {
+            warn!("effective-plugin change not delivered: plugin task registry is closed");
+        }
+    })
+}
 
 #[derive(Debug, Clone)]
 pub struct PluginsConfigInput {
@@ -3475,28 +3541,45 @@ impl PluginsManager {
         http_client_factory: HttpClientFactory,
         on_effective_plugins_changed: Option<EffectivePluginsChangedCallback>,
     ) {
-        if CURATED_REPO_SYNC_STARTED.swap(true, Ordering::SeqCst) {
+        let Some(start) = CuratedSyncStart::begin(&CURATED_REPO_SYNC_STARTED) else {
             return;
-        }
-        let on_effective_plugins_changed =
-            on_effective_plugins_changed.map(|on_effective_plugins_changed| {
-                let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-                    return on_effective_plugins_changed;
-                };
-                let callback: EffectivePluginsChangedCallback = Arc::new(move |change| {
-                    let on_effective_plugins_changed = Arc::clone(&on_effective_plugins_changed);
-                    runtime.spawn(async move {
-                        on_effective_plugins_changed(change);
-                    });
-                });
-                callback
-            });
+        };
+        drop(self.start_curated_repo_sync_with(
+            http_client_factory,
+            on_effective_plugins_changed,
+            start,
+            sync_openai_plugins_repo_until,
+        ));
+    }
+
+    /// The same admission/thread/cache/callback path is used with a controlled
+    /// read engine in tests. Production supplies only the stop-aware sync above.
+    fn start_curated_repo_sync_with<F>(
+        self: &Arc<Self>,
+        http_client_factory: HttpClientFactory,
+        on_effective_plugins_changed: Option<EffectivePluginsChangedCallback>,
+        start: CuratedSyncStart,
+        sync: F,
+    ) -> Option<crate::retirement::Receipt>
+    where
+        F: FnOnce(&Path, HttpClientFactory, crate::WorkerStop) -> Result<String, String>
+            + Send
+            + 'static,
+    {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            warn!("curated plugins repo sync requires a Tokio runtime; not started");
+            return None;
+        };
+        let on_effective_plugins_changed = on_effective_plugins_changed
+            .map(|callback| dispatch_on_runtime(self.task_registry.clone(), runtime, callback));
         let manager = Arc::clone(self);
         let codex_home = self.codex_home.clone();
-        if let Err(err) = std::thread::Builder::new()
-            .name("plugins-curated-repo-sync".to_string())
-            .spawn(move || {
-                match sync_openai_plugins_repo(codex_home.as_path(), http_client_factory) {
+        let stop = self.task_registry.worker_stop();
+        match self
+            .task_registry
+            .spawn_thread("plugins-curated-repo-sync", move || {
+                let mut start = start;
+                match sync(codex_home.as_path(), http_client_factory, stop) {
                     Ok(curated_plugin_version) => {
                         let configured_curated_plugin_ids =
                             configured_curated_plugin_ids_from_codex_home(codex_home.as_path());
@@ -3510,23 +3593,24 @@ impl PluginsManager {
                                     cache_refreshed,
                                     on_effective_plugins_changed.as_ref(),
                                 );
+                                start.committed = true;
                             }
                             Err(err) => {
                                 manager.clear_cache();
-                                CURATED_REPO_SYNC_STARTED.store(false, Ordering::SeqCst);
                                 warn!("failed to refresh curated plugin cache after sync: {err}");
                             }
                         }
                     }
                     Err(err) => {
-                        CURATED_REPO_SYNC_STARTED.store(false, Ordering::SeqCst);
                         warn!("failed to sync curated plugins repo: {err}");
                     }
                 }
-            })
-        {
-            CURATED_REPO_SYNC_STARTED.store(false, Ordering::SeqCst);
-            warn!("failed to start curated plugins repo sync task: {err}");
+            }) {
+            Ok(receipt) => Some(receipt),
+            Err(()) => {
+                warn!("failed to admit curated plugins repo sync task");
+                None
+            }
         }
     }
 

@@ -548,3 +548,174 @@ async fn fixed_external_fixture_preserves_owner_and_generation_across_resolution
     assert!(!held.held.load(Ordering::SeqCst));
     assert_eq!(tasks.len(), 0);
 }
+
+#[tokio::test]
+async fn provider_parent_keeps_original_and_nested_auth_after_observer_drop() {
+    let tasks = Arc::new(ProcessorTasks::default());
+    let permits = AccountWorkPermits::new();
+    let (_home, auth, held) = held_auth(&tasks, true).await;
+    let operation = host(&permits, Some(tasks.ticket()))
+        .admit_operation_work()
+        .unwrap()
+        .unwrap();
+    let spawner = operation.auth_task_spawner().unwrap();
+    drop(operation);
+    let provider = codex_model_provider::create_model_provider(
+        codex_model_provider_info::ModelProviderInfo::create_openai_provider(None),
+        Some(auth),
+    );
+    let observation = codex_model_provider::with_auth_task_scope(
+        codex_model_provider::AuthTaskAccess::Admitted(spawner),
+        async move {
+            // Ungated must preserve the inherited managed context, not detach.
+            codex_model_provider::spawn_provider_task_with_access(
+                codex_model_provider::AuthTaskAccess::Ungated,
+                Box::pin(async move {
+                    provider.request_auth(None).await.unwrap();
+                }),
+            )
+            .unwrap()
+            .expect("managed original observation")
+        },
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(DRAIN_DEADLINE, held.entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    permits.close();
+    assert_eq!(tasks.len(), 2, "original parent and original auth child");
+    assert_eq!(
+        permits.admitted_count(),
+        3,
+        "finite factory, parent and auth child"
+    );
+    drop(observation);
+    assert!(!tasks.observe_until(Instant::now()).await.terminal);
+    assert!(!held.finished.load(Ordering::SeqCst));
+    held.release.add_permits(1);
+    assert!(
+        tasks
+            .observe_until(Instant::now() + DRAIN_DEADLINE)
+            .await
+            .is_clean()
+    );
+    assert!(held.finished.load(Ordering::SeqCst));
+    assert_eq!(permits.admitted_count(), 0);
+}
+
+#[tokio::test]
+async fn provider_parent_required_and_retired_owner_refuse_before_polling() {
+    let polled = Arc::new(AtomicBool::new(false));
+    let child_polled = polled.clone();
+    assert!(matches!(
+        codex_model_provider::spawn_provider_task_with_access(
+            codex_model_provider::AuthTaskAccess::Required,
+            Box::pin(async move {
+                child_polled.store(true, Ordering::SeqCst);
+            }),
+        ),
+        Err(codex_model_provider::AuthTaskFailure::Refused)
+    ));
+    assert!(!polled.load(Ordering::SeqCst));
+    let tasks = ProcessorTasks::default();
+    let permits = AccountWorkPermits::new();
+    let operation = host(&permits, Some(tasks.ticket()))
+        .admit_operation_work()
+        .unwrap()
+        .unwrap();
+    let spawner = operation.auth_task_spawner().unwrap();
+    drop(operation);
+    drop(tasks);
+    permits.close();
+    let child_polled = polled.clone();
+    assert!(matches!(
+        codex_model_provider::spawn_provider_task_with_access(
+            codex_model_provider::AuthTaskAccess::Admitted(spawner),
+            Box::pin(async move {
+                child_polled.store(true, Ordering::SeqCst);
+            }),
+        ),
+        Err(codex_model_provider::AuthTaskFailure::Unavailable)
+    ));
+    assert!(!polled.load(Ordering::SeqCst));
+    assert_eq!(permits.admitted_count(), 0);
+}
+
+#[tokio::test]
+async fn provider_parent_closed_registration_is_sticky_without_polling() {
+    let tasks = ProcessorTasks::default();
+    let permits = AccountWorkPermits::new();
+    let operation = host(&permits, Some(tasks.ticket()))
+        .admit_operation_work()
+        .unwrap()
+        .unwrap();
+    let spawner = operation.auth_task_spawner().unwrap();
+    drop(operation);
+    tasks.close_registration().unwrap();
+    let polled = Arc::new(AtomicBool::new(false));
+    let child_polled = polled.clone();
+    let result = codex_model_provider::with_auth_task_scope(
+        codex_model_provider::AuthTaskAccess::Admitted(spawner),
+        async move {
+            // Deliberately discard the dispatch error: the enclosing scope must refuse.
+            let _ = codex_model_provider::spawn_provider_task(Box::pin(async move {
+                child_polled.store(true, Ordering::SeqCst);
+            }));
+        },
+    )
+    .await;
+    assert!(result.is_err());
+    assert!(!polled.load(Ordering::SeqCst));
+    assert!(tasks.observe_until(Instant::now()).await.is_clean());
+    assert_eq!(permits.admitted_count(), 0);
+}
+
+#[tokio::test]
+async fn provider_parent_panic_is_original_sticky_failure() {
+    let tasks = ProcessorTasks::default();
+    let permits = AccountWorkPermits::new();
+    let operation = host(&permits, Some(tasks.ticket()))
+        .admit_operation_work()
+        .unwrap()
+        .unwrap();
+    let spawner = operation.auth_task_spawner().unwrap();
+    drop(operation);
+    let observation = codex_model_provider::spawn_provider_task_with_access(
+        codex_model_provider::AuthTaskAccess::Admitted(spawner),
+        Box::pin(async {
+            panic!("synthetic provider parent panic");
+        }),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        observation.await,
+        Err(codex_model_provider::AuthTaskFailure::Panicked)
+    );
+    let receipt = tasks.observe_until(Instant::now() + DRAIN_DEADLINE).await;
+    assert!(receipt.terminal && receipt.panicked && !receipt.is_clean());
+    assert!(tasks.observe_until(Instant::now()).await.panicked);
+    assert_eq!(permits.admitted_count(), 0);
+}
+
+#[tokio::test]
+async fn unmanaged_provider_parent_preserves_detached_execution() {
+    let (send, receive) = tokio::sync::oneshot::channel();
+    assert!(
+        codex_model_provider::spawn_provider_task_with_access(
+            codex_model_provider::AuthTaskAccess::Ungated,
+            Box::pin(async move {
+                send.send(()).unwrap();
+            }),
+        )
+        .unwrap()
+        .is_none()
+    );
+    tokio::time::timeout(DRAIN_DEADLINE, receive)
+        .await
+        .unwrap()
+        .unwrap();
+}

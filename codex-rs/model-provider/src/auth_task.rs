@@ -56,6 +56,58 @@ pub async fn with_auth_task_scope<T>(
     }
 }
 
+/// Register finite provider work in its caller's original host task owner.
+/// The returned observer may be dropped without cancelling that original task.
+/// Unmanaged callers retain the existing detached Tokio behavior.
+pub fn spawn_provider_task(
+    future: AuthTaskFuture,
+) -> std::result::Result<Option<AuthTaskObservation>, AuthTaskFailure> {
+    let Some(context) = AUTH_TASK_CONTEXT.try_with(Clone::clone).ok() else {
+        drop(tokio::spawn(future));
+        return Ok(None);
+    };
+    dispatch_provider_task(context, future).map(Some)
+}
+
+/// Transfer an already admitted finite root across a task boundary. Required
+/// absence refuses before polling; Ungated preserves any inherited context.
+pub fn spawn_provider_task_with_access(
+    access: AuthTaskAccess,
+    future: AuthTaskFuture,
+) -> std::result::Result<Option<AuthTaskObservation>, AuthTaskFailure> {
+    match access {
+        AuthTaskAccess::Ungated => spawn_provider_task(future),
+        AuthTaskAccess::Required => Err(AuthTaskFailure::Refused),
+        AuthTaskAccess::Admitted(spawner) => dispatch_provider_task(
+            Context {
+                spawner,
+                failure: Arc::new(Mutex::new(None)),
+            },
+            future,
+        )
+        .map(Some),
+    }
+}
+
+fn dispatch_provider_task(
+    context: Context,
+    future: AuthTaskFuture,
+) -> std::result::Result<AuthTaskObservation, AuthTaskFailure> {
+    let child_context = context.clone();
+    // The host derives work and retains the original join before dispatch.
+    let observation = context.spawner.spawn(Box::pin(async move {
+        AUTH_TASK_CONTEXT.scope(child_context, future).await;
+    }));
+    let observation = observation.inspect_err(|reason| {
+        let _ = context.fail(*reason);
+    })?;
+    Ok(Box::pin(async move {
+        observation.await.inspect_err(|reason| {
+            let _ = context.fail(*reason);
+        })
+    }))
+}
+
 pub(crate) async fn spawn<T: Send + 'static>(
     future: impl Future<Output = T> + Send + 'static,
 ) -> Result<T> {

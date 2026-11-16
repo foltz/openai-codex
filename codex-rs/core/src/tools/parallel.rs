@@ -42,7 +42,7 @@ pub(super) struct ToolWorkFuture<F> {
     _work: Option<Box<dyn codex_extension_api::HostOperationWork>>,
 }
 impl<F> ToolWorkFuture<F> {
-    fn new(future: F, work: Option<Box<dyn codex_extension_api::HostOperationWork>>) -> Self {
+    pub(super) fn new(future: F, work: Option<Box<dyn codex_extension_api::HostOperationWork>>) -> Self {
         Self {
             future: Box::pin(future),
             _work: work,

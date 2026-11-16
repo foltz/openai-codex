@@ -3532,3 +3532,6 @@ async fn missing_plan_type_maps_to_unknown() {
 
 #[path = "authoritative_cache_tests.rs"]
 mod authoritative_cache;
+
+#[path = "managed_adoption_tests.rs"]
+mod managed_adoption;

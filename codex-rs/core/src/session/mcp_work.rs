@@ -48,6 +48,15 @@ impl Session {
         &self,
         turn: &TurnContext,
     ) -> anyhow::Result<Option<Box<dyn McpAttemptWork>>> {
+        self.turn_operation_work(turn).map(|work| {
+            work.map(|work| Box::new(McpOperationWork(work)) as Box<dyn McpAttemptWork>)
+        })
+    }
+
+    pub(crate) fn turn_operation_work(
+        &self,
+        turn: &TurnContext,
+    ) -> anyhow::Result<Option<Box<dyn HostOperationWork>>> {
         let Some(host) = &self.services.host_admission else {
             return Ok(None);
         };
@@ -56,7 +65,7 @@ impl Session {
                 if work.is_none() && host.requires_account_work() {
                     return Err(codex_extension_api::TurnWorkRefused::Unavailable);
                 }
-                Ok(work.map(|work| Box::new(McpOperationWork(work)) as Box<dyn McpAttemptWork>))
+                Ok(work)
             })
             .map_err(|_| anyhow::anyhow!("MCP turn account work is unavailable"))
     }

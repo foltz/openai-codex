@@ -4,9 +4,11 @@
 
 #[path = "review_session_setup.rs"]
 mod setup;
+pub use setup::GuardianInvocationSetup;
 pub use setup::PreparedGuardianContext;
 pub(super) use setup::prepare_review;
 pub use setup::prepare_review_prewarm;
+pub use setup::prepare_review_prewarm_invocation;
 pub(crate) use setup::run_guardian_review_session;
 
 #[path = "review_session_prompt.rs"]
@@ -872,7 +874,7 @@ impl codex_guardian_reviewer::ReviewerRuntime for GuardianReviewSession {
 mod tests;
 
 impl codex_guardian_reviewer::ReviewerSession for GuardianReviewSession {
-    type Setup = PreparedGuardianContext;
+    type Setup = GuardianInvocationSetup;
     type Context = GuardianReviewSessionReuseKey;
     type Snapshot = GuardianReviewForkSnapshot;
 

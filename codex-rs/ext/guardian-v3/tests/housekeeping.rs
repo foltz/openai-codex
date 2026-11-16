@@ -152,7 +152,7 @@ async fn routes_captured_originals_and_updates_descriptions(
     let key = prepared.reuse_key(/*previous*/ None);
     let (mut options, state) = prepared
         .thread_options(GuardianReviewSessionKind::TrunkNew, /*snapshot*/ None)
-        .await;
+        .await?;
     options.config.base_instructions = Some(HOUSEKEEPER_INSTRUCTIONS.into());
     options.session_source = Some(SessionSource::Internal(InternalSessionSource::Guardian));
     options

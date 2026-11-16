@@ -226,7 +226,7 @@ async fn preparation_commits_only_valid_selections_from_the_captured_catalog() -
     let key = prepared.reuse_key(/*previous*/ None);
     let (mut options, state) = prepared
         .thread_options(GuardianReviewSessionKind::TrunkNew, /*snapshot*/ None)
-        .await;
+        .await?;
     options.config.base_instructions = Some(CHANNEL_SELECTION_INSTRUCTIONS.into());
     options.session_source = Some(SessionSource::Internal(InternalSessionSource::Guardian));
     options

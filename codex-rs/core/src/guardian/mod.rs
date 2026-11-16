@@ -65,11 +65,13 @@ pub(crate) use decision::spawn_approval_decision;
 pub(crate) use review::GuardianReviewOptions;
 pub(crate) use review::new_guardian_review_id;
 pub(crate) use review::routes_approval_policy_to_guardian;
+pub use review_session::GuardianInvocationSetup;
 pub use review_session::GuardianReviewSession;
 pub(crate) use review_session::GuardianReviewSessionManager;
 pub use review_session::GuardianReviewState;
 pub use review_session::PreparedGuardianContext;
 pub use review_session::prepare_review_prewarm;
+pub use review_session::prepare_review_prewarm_invocation;
 
 pub(crate) use codex_guardian_reviewer::prompt_cache_key_override_for_review_session;
 pub(crate) use runtime::ReviewAction;

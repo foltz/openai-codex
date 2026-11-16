@@ -28,6 +28,72 @@ pub struct PreparedGuardianContext {
     pub history_reset: CancellationToken,
 }
 
+/// Finite setup for one active review/prewarm. The pool caches only the
+/// resulting session, never this operation owner or the reusable projection.
+#[derive(Clone)]
+pub struct GuardianInvocationSetup {
+    context: Arc<PreparedGuardianContext>,
+    work: Option<Arc<dyn codex_extension_api::HostOperationWork>>,
+}
+
+impl std::ops::Deref for GuardianInvocationSetup {
+    type Target = PreparedGuardianContext;
+    fn deref(&self) -> &Self::Target {
+        &self.context
+    }
+}
+impl std::ops::DerefMut for GuardianInvocationSetup {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Arc::make_mut(&mut self.context)
+    }
+}
+impl GuardianInvocationSetup {
+    /// Retain metadata without extending this finite invocation's work.
+    pub fn projection(&self) -> Arc<PreparedGuardianContext> {
+        Arc::clone(&self.context)
+    }
+
+    pub fn new(
+        context: PreparedGuardianContext,
+        work: Option<Box<dyn codex_extension_api::HostOperationWork>>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            work.is_some()
+                || !context
+                    .parent
+                    .services
+                    .host_admission
+                    .as_ref()
+                    .is_some_and(|host| host.requires_account_work()),
+            "Guardian invocation requires account work"
+        );
+        Ok(Self {
+            context: Arc::new(context),
+            work: work.map(Arc::from),
+        })
+    }
+
+    /// Derive before constructing options; the retained ThreadManager constructor
+    /// consumes this child instead of looking up an unrelated request task.
+    pub async fn thread_options(
+        &self,
+        kind: GuardianReviewSessionKind,
+        snapshot: Option<GuardianReviewForkSnapshot>,
+    ) -> anyhow::Result<(crate::StartThreadOptions, GuardianReviewState)> {
+        let work = self
+            .work
+            .as_deref()
+            .map(|work| work.derive_operation())
+            .transpose()
+            .map_err(|_| {
+                anyhow::anyhow!("Guardian invocation cannot admit reviewer construction")
+            })?;
+        let (mut options, state) = self.context.thread_options_inner(kind, snapshot).await;
+        options.account_work = work;
+        Ok((options, state))
+    }
+}
+
 impl PreparedGuardianContext {
     async fn prepare(
         parent: Arc<Session>,
@@ -96,6 +162,16 @@ impl PreparedGuardianContext {
     /// Moves fork history into startup options; only reusable reviewers retain a rollback checkpoint.
     /// Guardian selects the agent's identity and lifecycle.
     pub async fn thread_options(
+        &self,
+        kind: GuardianReviewSessionKind,
+        snapshot: Option<GuardianReviewForkSnapshot>,
+    ) -> anyhow::Result<(crate::StartThreadOptions, GuardianReviewState)> {
+        self.parent
+            .derive_mcp_attempt_work(codex_mcp::McpAttemptAccess::Unscoped)?;
+        Ok(self.thread_options_inner(kind, snapshot).await)
+    }
+
+    async fn thread_options_inner(
         &self,
         kind: GuardianReviewSessionKind,
         snapshot: Option<GuardianReviewForkSnapshot>,
@@ -207,7 +283,7 @@ impl PreparedGuardianContext {
 
 #[derive(Clone)]
 pub(in crate::guardian) struct PreparedReview {
-    context: Arc<PreparedGuardianContext>,
+    context: Arc<GuardianInvocationSetup>,
     params: Arc<GuardianReviewSessionParams>,
     recovery_requested: Arc<AtomicBool>,
 }
@@ -215,7 +291,7 @@ pub(in crate::guardian) struct PreparedReview {
 impl ReviewerRequest for PreparedReview {
     type Session = GuardianReviewSession;
 
-    fn setup(&self) -> Arc<PreparedGuardianContext> {
+    fn setup(&self) -> Arc<GuardianInvocationSetup> {
         Arc::clone(&self.context)
     }
     fn context(&self, previous: Option<&GuardianReviewSession>) -> GuardianReviewSessionReuseKey {
@@ -366,18 +442,26 @@ pub(in crate::guardian) async fn prepare_review(
 ) -> anyhow::Result<PreparedReview> {
     let work = params
         .parent_session
-        .turn_mcp_work(params.parent_context.turn())?;
+        .turn_operation_work(params.parent_context.turn())?;
+    let preparation_work = work
+        .as_deref()
+        .map(|work| work.derive_operation())
+        .transpose()
+        .map_err(|_| anyhow::anyhow!("Guardian preparation work refused"))?
+        .map(|work| {
+            Box::new(crate::session::McpOperationWork(work)) as Box<dyn codex_mcp::McpAttemptWork>
+        });
     let context = PreparedGuardianContext::prepare(
         Arc::clone(&params.parent_session),
         params.parent_context.clone(),
         params.spawn_config.clone(),
         &params.parent_history,
         &params.node_repl_policy,
-        codex_mcp::McpAttemptAccess::from_work(work.as_deref()),
+        codex_mcp::McpAttemptAccess::from_work(preparation_work.as_deref()),
     )
     .await?;
     Ok(PreparedReview {
-        context: Arc::new(context),
+        context: Arc::new(GuardianInvocationSetup::new(context, work)?),
         params: Arc::new(params),
         recovery_requested: Arc::default(),
     })
@@ -399,6 +483,43 @@ pub async fn prepare_review_prewarm(
         codex_mcp::McpAttemptAccess::from_work(work.as_deref()),
     )
     .await
+}
+
+/// Prepare a finite reviewer invocation using authority captured by the caller
+/// before it spawned this job. No ambient request lookup occurs here.
+pub async fn prepare_review_prewarm_invocation(
+    parent: &crate::CodexThread,
+    work: Option<Box<dyn codex_extension_api::HostOperationWork>>,
+) -> anyhow::Result<GuardianInvocationSetup> {
+    anyhow::ensure!(
+        work.is_some()
+            || !parent
+                .session
+                .services
+                .host_admission
+                .as_ref()
+                .is_some_and(|host| host.requires_account_work()),
+        "Guardian prewarm requires account work"
+    );
+    let preparation_work = work
+        .as_deref()
+        .map(|work| work.derive_operation())
+        .transpose()
+        .map_err(|_| anyhow::anyhow!("Guardian prewarm work refused"))?
+        .map(|work| {
+            Box::new(crate::session::McpOperationWork(work)) as Box<dyn codex_mcp::McpAttemptWork>
+        });
+    let turn = parent
+        .session
+        .new_startup_prewarm_turn_with_sub_id(crate::session::INITIAL_SUBMIT_ID.to_owned())
+        .await;
+    let context = prepare_prewarm(
+        Arc::clone(&parent.session),
+        turn,
+        codex_mcp::McpAttemptAccess::from_work(preparation_work.as_deref()),
+    )
+    .await?;
+    GuardianInvocationSetup::new(context, work)
 }
 
 pub(super) fn prepare_prewarm<'a>(

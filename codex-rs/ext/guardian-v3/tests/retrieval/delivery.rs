@@ -49,7 +49,7 @@ async fn delivers_ordered_originals_once_after_admission_and_keeps_older_channel
     let prepared = prepare_review_prewarm(&test.codex).await?;
     let (mut options, _state) = prepared
         .thread_options(GuardianReviewSessionKind::TrunkNew, /*snapshot*/ None)
-        .await;
+        .await?;
     options.config.base_instructions = Some("Inspect the supplied original evidence.".into());
     options.session_source = Some(SessionSource::Internal(InternalSessionSource::Guardian));
     options

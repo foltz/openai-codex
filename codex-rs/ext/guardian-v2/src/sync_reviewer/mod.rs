@@ -82,7 +82,8 @@ impl ThreadLifecycleContributor<Config> for GuardianExtension {
                             let manager = manager.upgrade().ok_or_else(|| {
                                 anyhow::anyhow!("thread manager is no longer available")
                             })?;
-                            let (mut options, state) = context.thread_options(kind, snapshot).await;
+                            let (mut options, state) =
+                                context.thread_options(kind, snapshot).await?;
                             if matches!(
                                 kind,
                                 codex_analytics::GuardianReviewSessionKind::EphemeralForked
@@ -174,6 +175,20 @@ impl ThreadLifecycleContributor<Config> for GuardianExtension {
             {
                 return;
             }
+            let work = match input.account_work {
+                Ok(Some(work)) => match work.derive_operation() {
+                    Ok(work) => Some(work),
+                    Err(_) => {
+                        tracing::warn!("Guardian prewarm account work refused");
+                        return;
+                    }
+                },
+                Ok(None) => None,
+                Err(_) => {
+                    tracing::warn!("Guardian prewarm has no account authority");
+                    return;
+                }
+            };
             let Some(runtime) = input.thread_store.get::<ReviewerTasks>() else {
                 return;
             };
@@ -200,8 +215,10 @@ impl ThreadLifecycleContributor<Config> for GuardianExtension {
             tokio::spawn(async move {
                 let _task = task;
                 let prepare = async {
-                    let context =
-                        codex_core::guardian_review::prepare_review_prewarm(&parent).await?;
+                    let context = codex_core::guardian_review::prepare_review_prewarm_invocation(
+                        &parent, work,
+                    )
+                    .await?;
                     let key = context.reuse_key(/*previous*/ None);
                     pool.prewarm(Arc::new(context), key).await
                 };

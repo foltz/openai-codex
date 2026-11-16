@@ -1077,7 +1077,12 @@ async fn prewarm_test_session(
     )
     .await
     .unwrap();
-    pool.prewarm(Arc::new(context), key).await.unwrap();
+    pool.prewarm(
+        Arc::new(GuardianInvocationSetup::new(context, None).unwrap()),
+        key,
+    )
+    .await
+    .unwrap();
     pool
 }
 
@@ -1352,16 +1357,24 @@ async fn guardian_preparation_refuses_ended_parent_before_context_capture() {
 }
 
 #[tokio::test]
-async fn prepared_guardian_context_retains_no_parent_work() {
+async fn prepared_guardian_projection_is_uncounted_after_invocation_drop() {
     let (params, gate) = required_guardian_params().await;
     let prepared = setup::prepare_review(params).await.unwrap();
     assert_eq!(gate.counts.turns.load(Ordering::SeqCst), 1);
     assert!(gate.counts.derives.load(Ordering::SeqCst) > 0);
-    assert_eq!(gate.counts.live.load(Ordering::SeqCst), 0);
-    let context = prepared.setup();
+    assert_eq!(
+        gate.counts.live.load(Ordering::SeqCst),
+        1,
+        "active invocation owns its root"
+    );
+    let context = prepared.setup().projection();
     let _key = context.reuse_key(None);
     drop(prepared);
-    assert_eq!(gate.counts.live.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        gate.counts.live.load(Ordering::SeqCst),
+        0,
+        "retained projection is uncounted"
+    );
 }
 
 #[tokio::test]
@@ -1458,4 +1471,154 @@ async fn node_policy_refuses_ended_parent_without_recording_history() {
         after.raw_items().collect::<Vec<_>>()
     );
     assert!(reviewer.session.reference_context_item().await.is_none());
+}
+
+#[tokio::test]
+async fn guardian_invocation_options_transfer_a_child_without_ambient_lookup() {
+    let (params, gate) = required_guardian_params().await;
+    let prepared = setup::prepare_review(params).await.unwrap();
+    let invocation = prepared.setup();
+    let projection = invocation.projection();
+    let (options, _) = invocation
+        .thread_options(GuardianReviewSessionKind::TrunkNew, None)
+        .await
+        .unwrap();
+    assert!(options.account_work.is_some());
+    assert_eq!(gate.counts.live.load(Ordering::SeqCst), 2);
+    assert_eq!(gate.counts.turns.load(Ordering::SeqCst), 1);
+    drop(prepared);
+    drop(invocation);
+    assert_eq!(
+        gate.counts.live.load(Ordering::SeqCst),
+        1,
+        "constructor options own the remaining child"
+    );
+    drop(options);
+    assert_eq!(gate.counts.live.load(Ordering::SeqCst), 0);
+    let _key = projection.reuse_key(None);
+}
+
+#[tokio::test]
+async fn guardian_invocation_exhaustion_refuses_before_constructor_options() {
+    let (params, gate) = required_guardian_params().await;
+    let prepared = setup::prepare_review(params).await.unwrap();
+    gate.counts.refuse.store(true, Ordering::SeqCst);
+    let invocation = prepared.setup();
+    let mut options =
+        Box::pin(invocation.thread_options(GuardianReviewSessionKind::TrunkNew, None));
+    assert!(matches!(
+        futures::poll!(&mut options),
+        std::task::Poll::Ready(Err(_))
+    ));
+    drop(options);
+    assert_eq!(gate.counts.turns.load(Ordering::SeqCst), 1);
+    assert_eq!(gate.counts.live.load(Ordering::SeqCst), 1);
+    drop(invocation);
+    drop(prepared);
+    assert_eq!(gate.counts.live.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn guardian_projection_cannot_authorize_required_construction_without_work() {
+    let (params, gate) = required_guardian_params().await;
+    params.parent_session.services.thread_extension_data.insert(
+        codex_guardian_reviewer::ReviewerConfig::<Config>(
+            crate::guardian::test_host::build_reviewer_config,
+        ),
+    );
+    let root = GuardianWork::new(&gate.counts);
+    let projection = setup::prepare_prewarm(
+        Arc::clone(&params.parent_session),
+        Arc::clone(params.parent_context.turn()),
+        codex_mcp::McpAttemptAccess::Admitted(&root),
+    )
+    .await
+    .unwrap();
+    drop(root);
+    let mut options =
+        Box::pin(projection.thread_options(GuardianReviewSessionKind::TrunkNew, None));
+    assert!(matches!(
+        futures::poll!(&mut options),
+        std::task::Poll::Ready(Err(_))
+    ));
+    drop(options);
+    assert!(GuardianInvocationSetup::new(projection, None).is_err());
+    assert_eq!(gate.counts.turns.load(Ordering::SeqCst), 0);
+    assert_eq!(gate.counts.live.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn cached_guardian_pool_session_keeps_no_invocation_work() {
+    let (params, gate) = required_guardian_params().await;
+    let prepared = setup::prepare_review(params).await.unwrap();
+    let invocation = prepared.setup();
+    let pool = GuardianReviewSessionManager::new(
+        Arc::new(codex_guardian_reviewer::ReviewerTasks::default()),
+        |setup, key, kind, snapshot, _| {
+            Box::pin(async move {
+                let (options, _) = setup.thread_options(kind, snapshot).await?;
+                assert!(options.account_work.is_some());
+                let (mut reviewer, _, _) = test_review_session().await;
+                reviewer.reuse_key = key;
+                drop(options);
+                Ok(reviewer)
+            })
+        },
+    );
+    let key = invocation.reuse_key(None);
+    pool.prewarm(Arc::clone(&invocation), key).await.unwrap();
+    drop(prepared);
+    drop(invocation);
+    assert!(pool.trunk().await.is_some());
+    assert_eq!(gate.counts.live.load(Ordering::SeqCst), 0);
+    pool.shutdown().await;
+}
+
+#[tokio::test]
+async fn cancelled_guardian_pool_creation_releases_invocation_children() {
+    let (params, gate) = required_guardian_params().await;
+    let prepared = setup::prepare_review(params).await.unwrap();
+    let invocation = prepared.setup();
+    let (release, wait) = tokio::sync::oneshot::channel::<()>();
+    let wait = Arc::new(std::sync::Mutex::new(Some(wait)));
+    let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&entered);
+    let pool = GuardianReviewSessionManager::new(
+        Arc::new(codex_guardian_reviewer::ReviewerTasks::default()),
+        move |setup, _, kind, snapshot, _| {
+            let wait = wait.lock().unwrap().take().unwrap();
+            let flag = Arc::clone(&flag);
+            Box::pin(async move {
+                let (options, _) = setup.thread_options(kind, snapshot).await?;
+                assert!(options.account_work.is_some());
+                flag.store(true, Ordering::SeqCst);
+                wait.await?;
+                let (reviewer, _, _) = test_review_session().await;
+                drop(options);
+                Ok(reviewer)
+            })
+        },
+    );
+    let key = invocation.reuse_key(None);
+    let mut prewarm = Box::pin(pool.prewarm(Arc::clone(&invocation), key));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            assert!(futures::poll!(&mut prewarm).is_pending());
+            if entered.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(gate.counts.live.load(Ordering::SeqCst), 2);
+    drop(prewarm);
+    assert!(release.send(()).is_err());
+    assert!(pool.trunk().await.is_none());
+    assert_eq!(gate.counts.live.load(Ordering::SeqCst), 1);
+    drop(prepared);
+    drop(invocation);
+    assert_eq!(gate.counts.live.load(Ordering::SeqCst), 0);
+    pool.shutdown().await;
 }

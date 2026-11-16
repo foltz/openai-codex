@@ -123,3 +123,125 @@ async fn terminal_turn_clears_extension_owned_denials() -> anyhow::Result<()> {
     streaming.shutdown().await;
     Ok(())
 }
+
+#[derive(Debug, Default)]
+struct ReadyCounts {
+    live: std::sync::atomic::AtomicUsize,
+    derives: std::sync::atomic::AtomicUsize,
+    refuse: std::sync::atomic::AtomicBool,
+}
+#[derive(Debug)]
+struct ReadyWork(Arc<ReadyCounts>);
+impl Drop for ReadyWork {
+    fn drop(&mut self) {
+        self.0
+            .live
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+impl codex_extension_api::HostOperationWork for ReadyWork {
+    fn derive_operation(
+        &self,
+    ) -> Result<Box<dyn codex_extension_api::HostOperationWork>, codex_extension_api::TurnWorkRefused>
+    {
+        self.0
+            .derives
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.0.refuse.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(codex_extension_api::TurnWorkRefused::Unavailable);
+        }
+        self.0
+            .live
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Box::new(Self(Arc::clone(&self.0))))
+    }
+    fn derive_turn_work(
+        &self,
+        _: &codex_extension_api::ExtensionData,
+        _: ExtensionFuture<'static, ()>,
+    ) -> Result<
+        Box<dyn codex_protocol::host_turn_work::HostTurnWork>,
+        codex_extension_api::TurnWorkRefused,
+    > {
+        panic!("ready callback must not create a turn")
+    }
+}
+#[tokio::test]
+async fn ready_hook_derives_before_runtime_lookup_and_releases_unused_child() {
+    let home = tempfile::tempdir().unwrap();
+    let mut config = core_test_support::load_default_config_for_test(&home).await;
+    config
+        .permissions
+        .approval_policy
+        .set(AskForApproval::OnRequest)
+        .unwrap();
+    config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+    let counts = Arc::new(ReadyCounts::default());
+    counts.live.store(1, std::sync::atomic::Ordering::SeqCst);
+    let work = ReadyWork(Arc::clone(&counts));
+    let extension = GuardianExtension {
+        thread_manager: Weak::new(),
+    };
+    let session = codex_extension_api::ExtensionData::new("session");
+    let thread = codex_extension_api::ExtensionData::new("thread-without-runtime");
+    let mut ready = extension.on_thread_ready(ThreadReadyInput {
+        account_work: Ok(Some(&work)),
+        config: &config,
+        session_source: &SessionSource::Exec,
+        history_initialization: codex_extension_api::HistoryInitialization::New,
+        history_mode: codex_protocol::protocol::ThreadHistoryMode::Legacy,
+        session_store: &session,
+        thread_store: &thread,
+    });
+    assert!(matches!(
+        futures::poll!(&mut ready),
+        std::task::Poll::Ready(())
+    ));
+    drop(ready);
+    assert_eq!(counts.derives.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(counts.live.load(std::sync::atomic::Ordering::SeqCst), 1);
+    drop(work);
+    assert_eq!(counts.live.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+#[tokio::test]
+async fn ready_hook_refuses_expired_or_missing_constructor_work() {
+    let home = tempfile::tempdir().unwrap();
+    let mut config = core_test_support::load_default_config_for_test(&home).await;
+    config
+        .permissions
+        .approval_policy
+        .set(AskForApproval::OnRequest)
+        .unwrap();
+    config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+    let counts = Arc::new(ReadyCounts::default());
+    counts.live.store(1, std::sync::atomic::Ordering::SeqCst);
+    counts
+        .refuse
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let work = ReadyWork(Arc::clone(&counts));
+    let extension = GuardianExtension {
+        thread_manager: Weak::new(),
+    };
+    let session = codex_extension_api::ExtensionData::new("session");
+    let thread = codex_extension_api::ExtensionData::new("thread-without-runtime");
+    for access in [
+        Err(codex_extension_api::TurnWorkRefused::Unavailable),
+        Ok(Some(&work as &dyn codex_extension_api::HostOperationWork)),
+    ] {
+        extension
+            .on_thread_ready(ThreadReadyInput {
+                account_work: access,
+                config: &config,
+                session_source: &SessionSource::Exec,
+                history_initialization: codex_extension_api::HistoryInitialization::New,
+                history_mode: codex_protocol::protocol::ThreadHistoryMode::Legacy,
+                session_store: &session,
+                thread_store: &thread,
+            })
+            .await;
+    }
+    assert_eq!(counts.derives.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(counts.live.load(std::sync::atomic::Ordering::SeqCst), 1);
+    drop(work);
+    assert_eq!(counts.live.load(std::sync::atomic::Ordering::SeqCst), 0);
+}

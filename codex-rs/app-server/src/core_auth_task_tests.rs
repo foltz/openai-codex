@@ -1233,7 +1233,11 @@ impl HeldRecommendation {
                             let serve = async {
                                 let mut header = Vec::new();
                                 loop {
-                                    let byte = socket.read_u8().await.unwrap();
+                                    let byte = match socket.read_u8().await {
+                                        Ok(byte) => byte,
+                                        Err(error) if header.is_empty() && error.kind() == std::io::ErrorKind::UnexpectedEof => return,
+                                        Err(error) => panic!("recommendation fixture truncated request header: {error}"),
+                                    };
                                     header.push(byte);
                                     assert!(header.len() <= 1024 * 1024, "fixture request headers oversized");
                                     if header.ends_with(b"\r\n\r\n") { break; }
@@ -1801,4 +1805,49 @@ async fn actual_retained_operation_runs_its_tail_after_blocking_caller_cancellat
     .unwrap();
     assert!(tail.load(Ordering::SeqCst));
     assert_eq!(permits.admitted_count(), 0);
+}
+
+#[tokio::test]
+async fn recommendation_fixture_idle_connection_cannot_drop_held_request() -> anyhow::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let fixture = HeldRecommendation::start().await?;
+    let address = fixture.base.strip_prefix("http://").unwrap();
+    let idle = tokio::net::TcpStream::connect(address).await?;
+    drop(idle);
+    let mut client = tokio::net::TcpStream::connect(address).await?;
+    client.write_all(b"GET /ps/plugins/suggested/codex?scope=GLOBAL HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer access token\r\nChatGPT-Account-ID: account_id\r\n\r\n").await?;
+    tokio::time::timeout(DRAIN_DEADLINE, fixture.entered.acquire())
+        .await??
+        .forget();
+    assert_eq!(
+        fixture.requests.load(Ordering::SeqCst),
+        1,
+        "idle socket is not a request"
+    );
+    assert!(!fixture.task.as_ref().unwrap().is_finished());
+    fixture.release.add_permits(1);
+    let mut response = String::new();
+    tokio::time::timeout(DRAIN_DEADLINE, client.read_to_string(&mut response)).await??;
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(response.ends_with(r#"{"enabled":true,"plugins":[]}"#));
+    assert_eq!(fixture.requests.load(Ordering::SeqCst), 1);
+    fixture.finish().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn recommendation_fixture_partial_header_eof_still_fails() -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut fixture = HeldRecommendation::start().await?;
+    let address = fixture.base.strip_prefix("http://").unwrap();
+    let mut client = tokio::net::TcpStream::connect(address).await?;
+    client.write_all(b"GET /ps/plugins/suggested/").await?;
+    client.shutdown().await?;
+    let result = tokio::time::timeout(DRAIN_DEADLINE, fixture.task.take().unwrap()).await?;
+    assert!(
+        matches!(result, Err(error) if error.is_panic()),
+        "partial request must not be accepted as idle EOF"
+    );
+    assert_eq!(fixture.requests.load(Ordering::SeqCst), 0);
+    Ok(())
 }

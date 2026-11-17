@@ -35,7 +35,6 @@ use crate::auth::auth_manager_for_provider;
 use crate::auth::resolve_provider_auth;
 use crate::auth::resolve_provider_auth_for_scope;
 use crate::auth::uses_fedramp_api_key;
-use crate::combined_auth::compose_auth;
 use crate::gcp::GcpModelProvider;
 use crate::models_endpoint::OpenAiModelsEndpoint;
 use crate::request_setup::resolve_request_auth;
@@ -638,10 +637,13 @@ impl ModelProvider for ConfiguredModelProvider {
         &self,
         resolved: ResolvedProviderAuth,
     ) -> ModelProviderFuture<'_, codex_protocol::error::Result<ResolvedProviderAuth>> {
-        Box::pin(compose_auth(
+        Box::pin(crate::combined_auth::compose_auth_for(
             &self.info,
             self.gateway_auth_manager.as_ref(),
             resolved,
+            self.auth_manager
+                .as_ref()
+                .and_then(|manager| manager.owner_pin_gateway()),
         ))
     }
 

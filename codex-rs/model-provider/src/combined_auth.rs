@@ -21,7 +21,16 @@ use http::HeaderValue;
 pub(crate) async fn compose_auth(
     provider: &ModelProviderInfo,
     manager: Option<&std::result::Result<Arc<GatewayAuthManager>, String>>,
+    resolved: ResolvedProviderAuth,
+) -> Result<ResolvedProviderAuth> {
+    compose_auth_for(provider, manager, resolved, None).await
+}
+
+pub(crate) async fn compose_auth_for(
+    provider: &ModelProviderInfo,
+    manager: Option<&std::result::Result<Arc<GatewayAuthManager>, String>>,
     mut resolved: ResolvedProviderAuth,
+    admitted: Option<crate::GatewayAdmission>,
 ) -> Result<ResolvedProviderAuth> {
     let Some(config) = provider.gateway_oauth.as_ref() else {
         return Ok(resolved);
@@ -33,7 +42,13 @@ pub(crate) async fn compose_auth(
     let manager = manager
         .as_ref()
         .map_err(|error| CodexErr::InvalidRequest(error.clone()))?;
-    let (token, admission) = manager.resolve_access_token_observed().await?;
+    let (token, admission) = match admitted {
+        Some(admission) => (
+            manager.resolve_access_token_for(&admission).await?,
+            admission,
+        ),
+        None => manager.resolve_access_token_observed().await?,
+    };
     resolved.gateway_admission = admission;
     let (name, value) = gateway_header(config.delivery(), &token)?;
     resolved.auth = Arc::new(CombinedAuth {

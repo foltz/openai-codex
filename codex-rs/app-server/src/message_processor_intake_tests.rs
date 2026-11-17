@@ -109,3 +109,85 @@ async fn published_intake_deadline_without_binding_receipt_is_not_clean() {
     );
     processor.clear_runtime_references();
 }
+
+#[tokio::test]
+async fn connection_drain_timeout_remains_unclean_after_original_finishes() {
+    let home = TempDir::new().unwrap();
+    let config = Arc::new(
+        codex_core::config::ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .build()
+            .await
+            .unwrap(),
+    );
+    let auth = codex_login::AuthManager::shared_from_config(config.as_ref(), false)
+        .await
+        .expect("initialize fixture auth manager");
+    let (processor, _outgoing) =
+        super::message_processor_tracing_tests::build_test_processor(config, auth).await;
+    let session = super::ConnectionSessionState::new(crate::transport::ConnectionOrigin::Stdio);
+    let gate = Arc::clone(&session.rpc_gate);
+    let ticket = crate::connection_rpc_gate::ConnectionRpcGate::ticket(&gate);
+    let (started, running) = tokio::sync::oneshot::channel();
+    let (release, blocked) = tokio::sync::oneshot::channel();
+    let original = tokio::spawn(async move {
+        gate.run_admitted(ticket, async move {
+            started.send(()).unwrap();
+            blocked.await.unwrap();
+        })
+        .await;
+    });
+    running.await.unwrap();
+    processor
+        .connection_closed_until(
+            crate::outgoing_message::ConnectionId(7),
+            &session,
+            Some(tokio::time::Instant::now()),
+        )
+        .await;
+    assert!(!processor.connection_rpc_drains_complete());
+    assert!(!original.is_finished());
+    release.send(()).unwrap();
+    original.await.unwrap();
+    processor
+        .connection_closed(crate::outgoing_message::ConnectionId(7), &session)
+        .await;
+    assert!(!processor.connection_rpc_drains_complete());
+    processor.clear_runtime_references();
+}
+
+#[tokio::test]
+async fn connection_drain_preserves_handler_panic_and_half_close_unanswered() {
+    let home = TempDir::new().unwrap();
+    let config = Arc::new(
+        codex_core::config::ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .build()
+            .await
+            .unwrap(),
+    );
+    let auth = codex_login::AuthManager::shared_from_config(config.as_ref(), false)
+        .await
+        .expect("initialize fixture auth manager");
+    let (processor, _outgoing) =
+        super::message_processor_tracing_tests::build_test_processor(config, auth).await;
+    let session = super::ConnectionSessionState::new(crate::transport::ConnectionOrigin::Stdio);
+    let ticket = crate::connection_rpc_gate::ConnectionRpcGate::ticket(&session.rpc_gate);
+    session
+        .rpc_gate
+        .run_admitted(ticket, async { panic!("handler failure witness") })
+        .await;
+    // A frame read but never admitted/refused is still owed a reply at EOF.
+    let unanswered = crate::connection_rpc_gate::ConnectionRpcGate::ticket(&session.rpc_gate);
+    drop(unanswered);
+    processor
+        .connection_half_closed_until(
+            crate::outgoing_message::ConnectionId(7),
+            &session,
+            Some(tokio::time::Instant::now() + Duration::from_secs(1)),
+        )
+        .await;
+    assert!(!processor.connection_rpc_drains_complete());
+    assert_eq!(processor.unanswered_after_half_close(), 1);
+    processor.clear_runtime_references();
+}

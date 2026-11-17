@@ -110,7 +110,6 @@ use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio::time::Duration;
-use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
@@ -156,6 +155,8 @@ pub(crate) struct MessageProcessor {
     pub(crate) turn_admission: TurnAdmission,
     intake_shutdown_deadline: OnceLock<tokio::time::Instant>,
     intake_thread_binding: OnceLock<codex_core::ShutdownDeadlineBinding>,
+    connection_rpc_drain_incomplete: AtomicBool,
+    unanswered_after_half_close: std::sync::atomic::AtomicU64,
     user_verification: Arc<crate::user_verification::Service>,
     outgoing: Arc<OutgoingMessageSender>,
     startup_warnings: StartupWarnings,
@@ -712,6 +713,8 @@ impl MessageProcessor {
             turn_admission,
             intake_shutdown_deadline: OnceLock::new(),
             intake_thread_binding: OnceLock::new(),
+            connection_rpc_drain_incomplete: AtomicBool::new(false),
+            unanswered_after_half_close: std::sync::atomic::AtomicU64::new(0),
             user_verification,
             outgoing,
             startup_warnings: StartupWarnings {
@@ -1109,6 +1112,70 @@ impl MessageProcessor {
         connection_id: ConnectionId,
         session_state: &ConnectionSessionState,
     ) {
+        self.connection_closed_until(connection_id, session_state, None)
+            .await;
+    }
+
+    pub(crate) fn connection_rpc_drains_complete(&self) -> bool {
+        !self
+            .connection_rpc_drain_incomplete
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn unanswered_after_half_close(&self) -> u64 {
+        self.unanswered_after_half_close
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// EOF closes admission, not the client's reply recipient. Keep queued
+    /// refusal settlement and admitted work within the same original bound.
+    pub(crate) async fn connection_half_closed_until(
+        &self,
+        connection_id: ConnectionId,
+        session_state: &ConnectionSessionState,
+        owner_deadline: Option<tokio::time::Instant>,
+    ) {
+        let deadline = self.connection_drain_deadline(owner_deadline);
+        self.connection_closed_until(connection_id, session_state, Some(deadline))
+            .await;
+        if tokio::time::timeout_at(deadline, session_state.rpc_gate.queued_settled())
+            .await
+            .is_err()
+        {
+            self.connection_rpc_drain_incomplete
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        let unanswered = session_state.rpc_gate.unanswered();
+        if unanswered != 0 {
+            let _ = self.unanswered_after_half_close.fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |count| Some(count.saturating_add(unanswered)),
+            );
+        }
+    }
+
+    fn connection_drain_deadline(
+        &self,
+        owner_deadline: Option<tokio::time::Instant>,
+    ) -> tokio::time::Instant {
+        let mut deadline = tokio::time::Instant::now() + CONNECTION_RPC_DRAIN_TIMEOUT;
+        for bound in [owner_deadline, self.intake_shutdown_deadline.get().copied()]
+            .into_iter()
+            .flatten()
+        {
+            deadline = deadline.min(bound);
+        }
+        deadline
+    }
+
+    pub(crate) async fn connection_closed_until(
+        &self,
+        connection_id: ConnectionId,
+        session_state: &ConnectionSessionState,
+        owner_deadline: Option<tokio::time::Instant>,
+    ) {
+        let deadline = self.connection_drain_deadline(owner_deadline);
         session_state.disconnect.cancel();
         session_state.rpc_gate.close().await;
         self.account_processor
@@ -1118,18 +1185,15 @@ impl MessageProcessor {
             .disconnect_user_verification_connection(connection_id)
             .await;
         session_state.mcp_event_streams.clear().await;
-        if timeout(
-            CONNECTION_RPC_DRAIN_TIMEOUT,
-            session_state.rpc_gate.shutdown(),
-        )
-        .await
-        .is_err()
+        match tokio::time::timeout_at(deadline, session_state.rpc_gate.shutdown_with_evidence())
+            .await
         {
-            tracing::warn!(
-                ?connection_id,
-                timeout_seconds = CONNECTION_RPC_DRAIN_TIMEOUT.as_secs(),
-                "timed out waiting for connection RPCs to drain"
-            );
+            Ok(report) if report.is_clean() => {}
+            outcome => {
+                self.connection_rpc_drain_incomplete
+                    .store(true, std::sync::atomic::Ordering::Release);
+                tracing::warn!(?connection_id, ?outcome, "connection RPC drain incomplete");
+            }
         }
         self.outgoing.connection_closed(connection_id).await;
         self.fs_processor.connection_closed(connection_id).await;

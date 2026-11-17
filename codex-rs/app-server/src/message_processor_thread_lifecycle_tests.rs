@@ -110,6 +110,16 @@ MCP_TEST_PID_FILE = {}
             "MCP process should be running before releasing startup"
         );
 
+        let permits = processor
+            .managed_transition_coordinator
+            .account_work_permits();
+        assert!(
+            permits.admitted_count() > 0,
+            "live construction must own account work"
+        );
+        permits.close();
+        assert!(permits.try_acquire().is_none());
+
         // Advance only connection cleanup's clock. Startup and idle unloading keep
         // using the original runtime's real clock while the MCP barrier stays closed.
         let cleanup = tokio::task::spawn_blocking({
@@ -133,6 +143,10 @@ MCP_TEST_PID_FILE = {}
         cleanup
             .await
             .context("connection cleanup task panicked")??;
+        assert!(
+            permits.admitted_count() > 0,
+            "connection drain cannot release the original blocked construction's work"
+        );
         std::fs::write(&barrier_file, "ready")?;
 
         // The harness receives the completed handler's output even though its transport is gone.
@@ -178,6 +192,14 @@ MCP_TEST_PID_FILE = {}
                 }),
             "unexpected thread/closed notification: {closed:?}"
         );
+
+        timeout(Duration::from_secs(5), async {
+            while permits.admitted_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("completed original construction still holds account work")?;
 
         let observer_id = ConnectionId(2);
         let observer = Arc::new(ConnectionSessionState::new(ConnectionOrigin::WebSocket));

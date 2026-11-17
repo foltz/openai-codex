@@ -1389,6 +1389,25 @@ impl ThreadRequestProcessor {
         let control_endpoint = self.control_endpoint.clone();
         let outgoing = Arc::clone(&listener_task_context.outgoing);
         let error_request_id = request_id.clone();
+        // Capture both authorities while executing the admitted request.
+        // Neither task-local scope is inherited by ProcessorTasks::spawn.
+        let construction_work = crate::account_turn_admission::derive_request_work()
+            .map_err(|_| internal_error("thread construction account work unavailable"))?;
+        let auth_work = self
+            .thread_manager
+            .capture_request_operation_work()
+            .map_err(|_| internal_error("thread construction auth work unavailable"))?;
+        let auth_access = match auth_work {
+            Some(work) => codex_model_provider::AuthTaskAccess::Admitted(
+                work.auth_task_spawner()
+                    .map_err(|_| internal_error("thread construction auth owner unavailable"))?,
+            ),
+            None => codex_model_provider::AuthTaskAccess::Ungated,
+        };
+        let originator = codex_otel::auth_storage::AuthStorageOriginator::current();
+        let custody_ticket = self.background_tasks.ticket();
+        let custody_error_outgoing = Arc::clone(&outgoing);
+        let custody_error_request = error_request_id.clone();
         let thread_start_task = async move {
             if let Err(error) = Self::thread_start_task(
                 listener_task_context,
@@ -1423,7 +1442,32 @@ impl ThreadRequestProcessor {
         };
         let receipt = self
             .background_tasks
-            .spawn(thread_start_task.instrument(request_context.span()))
+            .spawn(
+                originator
+                    .scope(crate::account_turn_admission::within_request(
+                        construction_work,
+                        async move {
+                            if codex_model_provider::with_auth_task_scope(
+                                auth_access,
+                                thread_start_task,
+                            )
+                            .await
+                            .is_err()
+                            {
+                                let _ = custody_ticket.mark_unverified();
+                                custody_error_outgoing
+                                    .send_error(
+                                        custody_error_request,
+                                        internal_error(
+                                            "thread construction auth custody unavailable",
+                                        ),
+                                    )
+                                    .await;
+                            }
+                        },
+                    ))
+                    .instrument(request_context.span()),
+            )
             .map_err(|_| internal_error("background thread-start admission unavailable"))?;
         match receipt.await {
             ProcessorTaskJoin::Joined => {}

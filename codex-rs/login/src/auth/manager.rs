@@ -2215,10 +2215,28 @@ enum UnauthorizedRecoveryMode {
 // For external auth sources, UnauthorizedRecovery retries once by asking the
 // configured provider to refresh and caching the returned auth through the same
 // path used by other auth sources.
+/// Request-local identity of a rejected bearer credential. Not serialized,
+/// logged, or usable as credential material.
+#[derive(Clone)]
+pub struct AuthCredentialFingerprint(String);
+impl AuthCredentialFingerprint {
+    fn from_token(token: &str) -> Self {
+        use sha2::Digest;
+        Self(format!("{:x}", sha2::Sha256::digest(token.as_bytes())))
+    }
+    pub fn from_bearer_header(value: &str) -> Option<Self> {
+        value
+            .strip_prefix("Bearer ")
+            .filter(|token| !token.trim().is_empty())
+            .map(Self::from_token)
+    }
+}
+
 pub struct UnauthorizedRecovery {
     manager: Arc<AuthManager>,
     step: UnauthorizedRecoveryStep,
     expected_account_id: Option<String>,
+    expected_credential_fingerprint: Option<String>,
     mode: UnauthorizedRecoveryMode,
 }
 
@@ -2250,7 +2268,33 @@ impl UnauthorizedRecovery {
             manager,
             step,
             expected_account_id,
+            // Mutable cache state is not proof of what a request sent.
+            expected_credential_fingerprint: None,
             mode,
+        }
+    }
+
+    /// Bind only the command source to the actual rejected request snapshot.
+    /// A missing, foreign-owner or non-command credential clears prior proof.
+    pub fn record_failed_auth(&mut self, auth: Option<&CodexAuth>) {
+        if let Some(source) = &self.manager.command_source {
+            self.expected_credential_fingerprint = auth
+                .filter(|auth| auth.is_external_chatgpt_tokens())
+                .filter(
+                    |auth| match (FixedPrincipal::carried_by(auth), source.fixed_principal()) {
+                        (Some(carried), Some(selected)) => carried == selected,
+                        _ => false,
+                    },
+                )
+                .and_then(|auth| auth.get_token_data().ok())
+                .map(|tokens| AuthCredentialFingerprint::from_token(&tokens.access_token).0);
+        }
+    }
+
+    /// Use the frozen on-wire bearer when a caller does not retain CodexAuth.
+    pub fn record_failed_credential(&mut self, value: Option<AuthCredentialFingerprint>) {
+        if self.manager.command_source.is_some() {
+            self.expected_credential_fingerprint = value.map(|value| value.0);
         }
     }
 
@@ -2375,9 +2419,27 @@ impl UnauthorizedRecovery {
                 });
             }
             UnauthorizedRecoveryStep::ExternalRefresh => {
-                self.manager
-                    .refresh_token_from_authority_with_reason(RefreshReason::UnauthorizedRecovery)
-                    .await?;
+                if let Some(source) = &self.manager.command_source {
+                    self.manager.require_command_mode_allowed()?;
+                    let Some(fingerprint) = self.expected_credential_fingerprint.clone() else {
+                        self.step = UnauthorizedRecoveryStep::Done;
+                        return Err(permanent_external_auth_error(
+                            "rejected command credential was not recorded",
+                        ));
+                    };
+                    let auth = source
+                        .obtain(Some(fingerprint))
+                        .await
+                        .map_err(RefreshTokenError::Transient)?;
+                    self.manager.validate_external_auth(&auth, source)?;
+                    self.manager.commit_external_auth(auth)?;
+                } else {
+                    self.manager
+                        .refresh_token_from_authority_with_reason(
+                            RefreshReason::UnauthorizedRecovery,
+                        )
+                        .await?;
+                }
                 self.step = UnauthorizedRecoveryStep::Done;
                 return Ok(UnauthorizedRecoveryStepResult {
                     auth_state_changed: Some(true),
@@ -4836,3 +4898,7 @@ mod command_cache_publication_tests;
 #[cfg(test)]
 #[path = "command_source_fence_tests.rs"]
 mod command_source_fence_tests;
+
+#[cfg(test)]
+#[path = "command_recovery_tests.rs"]
+mod command_recovery_tests;

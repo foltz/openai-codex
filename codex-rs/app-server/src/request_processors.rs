@@ -729,6 +729,7 @@ fn resolve_runtime_workspace_roots(workspace_roots: Vec<AbsolutePathBuf>) -> Vec
 
 pub(crate) mod config_errors;
 mod request_errors;
+mod thread_clear_recovery;
 mod thread_delete;
 mod thread_goal_processor;
 mod thread_lifecycle;

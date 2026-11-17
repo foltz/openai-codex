@@ -2222,6 +2222,11 @@ impl MessageProcessor {
                     .thread_search_occurrences(params)
                     .await
             }
+            ClientRequest::ThreadClearRecoveryRead { params, .. } => self
+                .thread_processor
+                .thread_clear_recovery_read(params)
+                .await
+                .map(|response| Some(response.into())),
             ClientRequest::ThreadInteractiveSubscriptionList { .. } => Ok(Some(
                 self.thread_state_manager
                     .thread_interactive_subscription_list()

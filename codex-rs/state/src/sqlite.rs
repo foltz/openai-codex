@@ -11,10 +11,12 @@
 )]
 
 use crate::DbTelemetry;
+use crate::kcf_migrations::KCF_STATE_MIGRATOR;
 use crate::migrations::repair_legacy_recency_migration_version;
 use crate::runtime::recovery::RuntimeDbInitError;
 use crate::telemetry;
 use crate::telemetry::DbKind;
+use anyhow::Context;
 use codex_file_system::LocalLogsDir;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use log::LevelFilter;
@@ -428,7 +430,26 @@ impl SqliteConfig {
                 }
                 transaction.commit().await.map_err(anyhow::Error::from)
             })
-            .await
+            .await?;
+            if matches!(spec.kind, DbKind::State) {
+                // Preserve upstream's transaction/retry discipline for this
+                // separate ledger too. The two histories are sequential, not
+                // one atomic migration: publish no pool if either fails.
+                retry_on_busy(|| async {
+                    let mut transaction = pool.begin().await?;
+                    if let Err(error) = KCF_STATE_MIGRATOR
+                        .run_direct(/*target*/ None, &mut *transaction, /*skip*/ false)
+                        .await
+                    {
+                        transaction.rollback().await?;
+                        return Err(error.into());
+                    }
+                    transaction.commit().await.map_err(anyhow::Error::from)
+                })
+                .await
+                .context("failed to migrate KCF state schema")?;
+            }
+            Ok::<(), anyhow::Error>(())
         }
         .await;
         telemetry::record_init_result(

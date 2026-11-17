@@ -1,4 +1,5 @@
 mod backfill_state;
+mod clear_transition;
 mod graph;
 mod log;
 mod memories;
@@ -12,6 +13,12 @@ mod thread_metadata_builder;
 
 pub use backfill_state::BackfillState;
 pub use backfill_state::BackfillStatus;
+pub use clear_transition::ClearTransitionEvidenceKind;
+pub use clear_transition::ClearTransitionEvidenceState;
+pub use clear_transition::ClearTransitionId;
+pub use clear_transition::ClearTransitionPhase;
+pub use clear_transition::ClearTransitionRecord;
+pub use clear_transition::ClearTransitionReserveOutcome;
 pub use graph::DirectionalThreadSpawnEdgeStatus;
 pub use log::LogEntry;
 pub use log::LogQuery;

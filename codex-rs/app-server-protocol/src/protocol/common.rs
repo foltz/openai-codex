@@ -618,6 +618,12 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::ThreadUnsubscribeResponse,
     },
+    #[experimental("thread/clear/recovery/read")]
+    ThreadClearRecoveryRead => "thread/clear/recovery/read" {
+        params: v2::ThreadClearRecoveryReadParams,
+        serialization: None,
+        response: v2::ThreadClearRecoveryReadResponse,
+    },
     #[experimental("kcf/thread/interactiveSubscription/list")]
     ThreadInteractiveSubscriptionList => "kcf/thread/interactiveSubscription/list" {
         params: v2::ThreadInteractiveSubscriptionListParams,

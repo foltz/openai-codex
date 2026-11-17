@@ -219,7 +219,8 @@ async fn run_foreground_remote_control(
         WebsocketAuthSettings::default(),
         runtime_options,
     );
-    let mut app_server_task = tokio::spawn(async move { app_server.await.map(|_| ()) });
+    let mut app_server_task =
+        tokio::spawn(async move { foreground_app_server_result(app_server.await) });
 
     let summary = match wait_for_foreground_remote_control_start(
         &mut app_server_task,
@@ -855,5 +856,39 @@ mod tests {
             error.to_string(),
             "foreground app-server exited before remote control became ready"
         );
+    }
+}
+
+/// An unproven shutdown surfaces as an error, never as a clean stop.
+fn foreground_app_server_result(
+    result: std::io::Result<codex_app_server::AppServerExit>,
+) -> std::io::Result<()> {
+    result.and_then(codex_app_server::AppServerExit::into_shutdown_result)
+}
+
+#[cfg(test)]
+mod shutdown_outcome_tests {
+    use super::foreground_app_server_result;
+    use codex_app_server::AppServerExit;
+    #[test]
+    fn normal_and_explicit_forced_outcomes_keep_their_existing_mapping() {
+        assert!(foreground_app_server_result(Ok(AppServerExit::Graceful)).is_ok());
+        assert!(foreground_app_server_result(Ok(AppServerExit::Forced)).is_ok());
+    }
+    #[test]
+    fn incomplete_outcome_is_not_clean_foreground_completion() {
+        let error =
+            foreground_app_server_result(Ok(AppServerExit::ShutdownIncomplete)).unwrap_err();
+        assert!(error.to_string().contains("shutdown incomplete"));
+    }
+    #[test]
+    fn original_io_error_is_preserved() {
+        let error = foreground_app_server_result(Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "original sentinel",
+        )))
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "original sentinel");
     }
 }

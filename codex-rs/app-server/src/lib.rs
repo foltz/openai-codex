@@ -478,16 +478,38 @@ pub async fn run_main(
         WebsocketAuthSettings::default(),
         AppServerRuntimeOptions::default(),
     )
-    .await
-    .map(|_| ())
+    .await?
+    .into_shutdown_result()
 }
 
 /// Reports whether shutdown finished or the managed daemon must exit without waiting for I/O.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppServerExit {
+    /// Every shutdown stage was positively proven complete within the owner deadline.
     Graceful,
     /// Executables should exit before dropping their runtime; libraries must not exit their host.
     Forced,
+    /// Shutdown ran to its owner deadline without proving cleanup finished: a
+    /// stage timed out or stayed incomplete, a task handed back its owner, or
+    /// a blocking worker was still running. Details are in the
+    /// `codex.app_server.standalone_shutdown` report. Never a clean exit:
+    /// executables should exit non-zero after a normal runtime drop (which may
+    /// still wait on that work); this is not a request to force-exit.
+    ShutdownIncomplete,
+}
+
+impl AppServerExit {
+    /// Shared consumer mapping (CLI, binaries, `run_main`, remote control).
+    /// `ShutdownIncomplete` becomes an error so it can never pass for a clean
+    /// exit. `Forced` is `Ok`, because the executable has already handled it.
+    pub fn into_shutdown_result(self) -> IoResult<()> {
+        match self {
+            AppServerExit::Graceful | AppServerExit::Forced => Ok(()),
+            AppServerExit::ShutdownIncomplete => Err(std::io::Error::other(
+                "app-server shutdown incomplete: cleanup was not proven within its deadline",
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1630,3 +1652,17 @@ fn mcp_control_endpoint_uri(transport: &AppServerTransport) -> Option<String> {
 #[cfg(test)]
 #[path = "lib_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod shutdown_outcome_tests {
+    use super::AppServerExit;
+    #[test]
+    fn incomplete_shutdown_is_an_error_without_forcing_the_host() {
+        assert!(AppServerExit::Graceful.into_shutdown_result().is_ok());
+        assert!(AppServerExit::Forced.into_shutdown_result().is_ok());
+        let error = AppServerExit::ShutdownIncomplete
+            .into_shutdown_result()
+            .unwrap_err();
+        assert!(error.to_string().contains("shutdown incomplete"));
+    }
+}

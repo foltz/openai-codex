@@ -1285,6 +1285,7 @@ async fn dispatch_cli(
                         // Runtime teardown can wait forever for blocked rollout I/O.
                         std::process::exit(0);
                     }
+                    exit.into_shutdown_result()?;
                 }
                 Some(AppServerSubcommand::Daemon(daemon_cli)) => match daemon_cli.subcommand {
                     AppServerDaemonSubcommand::Bootstrap(bootstrap_cli) => {

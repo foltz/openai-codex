@@ -90,3 +90,25 @@ pub(crate) async fn scope<T>(
     )
     .await
 }
+
+/// Scope a retained finite producer using only its weak registration ticket.
+/// Failed descendant custody stays visible after the producer itself joins.
+pub(crate) async fn scope_with_ticket<T>(
+    ticket: ProcessorTaskTicket,
+    work: Option<Box<dyn HostOperationWork>>,
+    future: impl Future<Output = T>,
+) -> codex_protocol::error::Result<T> {
+    let result = codex_model_provider::with_auth_task_scope(
+        AuthTaskAccess::Admitted(spawner(ticket.clone(), work)),
+        future,
+    )
+    .await;
+    if result.is_err() {
+        let _ = ticket.mark_unverified();
+    }
+    result
+}
+
+#[cfg(test)]
+#[path = "auth_task_work_tests.rs"]
+mod tests;

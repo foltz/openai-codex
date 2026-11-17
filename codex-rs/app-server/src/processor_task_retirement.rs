@@ -96,6 +96,19 @@ impl ProcessorTaskTicket {
         ProcessorTasks { state }.spawn(future)
     }
 
+    /// A joined wrapper must not erase a failed subordinate auth observation.
+    pub(crate) fn mark_unverified(&self) -> Result<(), ProcessorTaskAdmissionError> {
+        let state = self
+            .state
+            .upgrade()
+            .ok_or(ProcessorTaskAdmissionError::Unavailable)?;
+        state
+            .lock()
+            .map_err(|_| ProcessorTaskAdmissionError::Unavailable)?
+            .unverified = true;
+        Ok(())
+    }
+
     pub(crate) fn spawn_blocking(
         &self,
         task: impl FnOnce() + Send + 'static,

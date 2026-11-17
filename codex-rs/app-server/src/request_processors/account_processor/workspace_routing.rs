@@ -232,7 +232,7 @@ impl AccountRequestProcessor {
         let processor = self.clone();
         let auth_changes = self.auth_manager.auth_change_state_receiver();
         let owner_generation = auth_changes.borrow().owner_generation;
-        tokio::spawn(async move {
+        self.spawn_workspace_routing_task(async move {
             if auth_changes.borrow().owner_generation != owner_generation {
                 return;
             }

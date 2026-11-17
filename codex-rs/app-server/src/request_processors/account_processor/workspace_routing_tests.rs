@@ -104,6 +104,7 @@ async fn background_routing_skips_config_until_chatgpt_sign_in(
         Arc::clone(&config),
         Arc::clone(&threads),
     ));
+    let routing_tasks = crate::processor_task_retirement::ProcessorTasks::default();
     let processor = AccountRequestProcessor::new(
         Arc::clone(&auth_manager),
         threads,
@@ -111,6 +112,7 @@ async fn background_routing_skips_config_until_chatgpt_sign_in(
         config,
         manager,
         model_catalog,
+        routing_tasks.ticket(),
     );
     let initial_loads = loads.load(Ordering::SeqCst);
     for _ in 0..3 {

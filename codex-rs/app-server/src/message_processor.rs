@@ -167,6 +167,7 @@ pub(crate) struct MessageProcessor {
     turn_cost_worker: Option<TurnCostWorker>,
     skills_watcher: Arc<SkillsWatcher>,
     account_processor: Arc<AccountRequestProcessor>,
+    workspace_routing_tasks: crate::processor_task_retirement::ProcessorTasks,
     apps_processor: AppsRequestProcessor,
     catalog_processor: CatalogRequestProcessor,
     command_exec_processor: CommandExecRequestProcessor,
@@ -203,6 +204,7 @@ pub(crate) struct ProcessorBackgroundShutdown {
     pub plugins: codex_core_plugins::PluginTaskDrain,
     pub command_exec: crate::command_exec::CommandExecSandboxShutdown,
     pub model_auth: crate::processor_task_retirement::ProcessorTaskDrain,
+    pub workspace_routing: crate::processor_task_retirement::ProcessorTaskDrain,
 }
 
 impl ProcessorBackgroundShutdown {
@@ -228,6 +230,7 @@ impl ProcessorBackgroundShutdown {
             && self.plugins.is_clean()
             && self.command_exec.is_clean()
             && self.model_auth.is_clean()
+            && self.workspace_routing.is_clean()
     }
 }
 
@@ -557,6 +560,7 @@ impl MessageProcessor {
                 config_processor.clone(),
                 request_serialization_queues.clone(),
             );
+        let workspace_routing_tasks = crate::processor_task_retirement::ProcessorTasks::default();
         let account_processor = AccountRequestProcessor::new(
             auth_manager.clone(),
             Arc::clone(&thread_manager),
@@ -564,6 +568,7 @@ impl MessageProcessor {
             Arc::clone(&config),
             config_manager.clone(),
             Arc::clone(&model_catalog),
+            workspace_routing_tasks.ticket(),
         );
         let apps_processor = AppsRequestProcessor::new(
             Arc::clone(&thread_manager),
@@ -744,6 +749,7 @@ impl MessageProcessor {
             turn_cost_worker,
             skills_watcher,
             account_processor,
+            workspace_routing_tasks,
             apps_processor,
             catalog_processor,
             command_exec_processor,
@@ -771,6 +777,7 @@ impl MessageProcessor {
     }
 
     pub(crate) fn clear_runtime_references(&self) {
+        let _ = self.workspace_routing_tasks.close_registration();
         self.account_processor.clear_external_auth();
         self.apps_processor.shutdown();
         if let Ok(worker) = self.models_refresh_worker.try_lock() {
@@ -1088,7 +1095,16 @@ impl MessageProcessor {
             worker.shutdown();
         }
         let plugins = self.thread_manager.plugins_manager();
-        let (models, turn_cost, thread_starts, apps, skills, plugins, command_exec) = tokio::join!(
+        let (
+            models,
+            turn_cost,
+            thread_starts,
+            apps,
+            skills,
+            plugins,
+            command_exec,
+            workspace_routing,
+        ) = tokio::join!(
             self.shutdown_models_refresh_worker_until(deadline),
             async {
                 match &self.turn_cost_worker {
@@ -1102,6 +1118,7 @@ impl MessageProcessor {
             plugins.shutdown_until(deadline),
             self.command_exec_processor
                 .sandbox_cleanup_shutdown_until(deadline),
+            self.workspace_routing_tasks.shutdown_until(deadline),
         );
         // The periodic model producer must finish before taking this auth-task
         // observation. A timeout/panic above remains unclean even if this is zero.
@@ -1115,6 +1132,7 @@ impl MessageProcessor {
             plugins,
             command_exec,
             model_auth,
+            workspace_routing,
         }
     }
 

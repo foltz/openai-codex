@@ -114,6 +114,7 @@ pub(crate) struct AccountRequestProcessor {
     config: Arc<Config>,
     config_manager: ConfigManager,
     model_catalog: Arc<ModelCatalog>,
+    workspace_routing_tasks: crate::processor_task_retirement::ProcessorTaskTicket,
     active_login: Arc<Mutex<Option<ActiveLogin>>>,
     workspace_routing: Arc<Mutex<Option<workspace_routing::CachedWorkspaceRouting>>>,
     workspace_routing_fetches: Arc<Mutex<workspace_routing::WorkspaceRoutingFetches>>,
@@ -133,6 +134,7 @@ impl AccountRequestProcessor {
         config: Arc<Config>,
         config_manager: ConfigManager,
         model_catalog: Arc<ModelCatalog>,
+        workspace_routing_tasks: crate::processor_task_retirement::ProcessorTaskTicket,
     ) -> Arc<Self> {
         let gateway_notifications = crate::gateway_oauth_notifications::spawn(
             Arc::clone(&auth_manager),
@@ -152,6 +154,7 @@ impl AccountRequestProcessor {
             config,
             config_manager,
             model_catalog,
+            workspace_routing_tasks,
             active_login: Arc::new(Mutex::new(None)),
             gateway_login: Arc::new(std::sync::Mutex::new(/*t*/ None)),
             gateway_clients: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -165,12 +168,46 @@ impl AccountRequestProcessor {
             .auth_manager
             .set_workspace_routing_resolver(Arc::downgrade(&resolver));
         let startup = processor.clone();
-        tokio::spawn(async move {
+        processor.spawn_workspace_routing_task(async move {
             let _ = startup
                 .read_account_for_background_workspace_routing()
                 .await;
         });
         processor
+    }
+
+    /// Capture fresh finite background authority before this original can poll.
+    /// Only weak task tickets live in account-processor clones, avoiding a
+    /// registry -> original -> processor -> registry ownership cycle.
+    fn spawn_workspace_routing_task(
+        &self,
+        future: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        if !self
+            .auth_manager
+            .auth_cached()
+            .as_ref()
+            .is_some_and(CodexAuth::is_chatgpt_auth)
+        {
+            return;
+        }
+        let Ok(work) = self.thread_manager.admit_background_operation_work() else {
+            tracing::debug!("workspace routing background work admission refused");
+            return;
+        };
+        let ticket = self.workspace_routing_tasks.clone();
+        let originator = AuthStorageOriginator::current();
+        let result = self.workspace_routing_tasks.spawn(async move {
+            let result =
+                crate::auth_task_work::scope_with_ticket(ticket, work, originator.scope(future))
+                    .await;
+            if result.is_err() {
+                tracing::warn!("workspace routing auth retirement unverified");
+            }
+        });
+        if result.is_err() {
+            tracing::debug!("workspace routing task registration refused");
+        }
     }
 
     pub(crate) async fn login_account(

@@ -139,16 +139,21 @@ pub(crate) async fn run_pending_session_start_hooks(
         // the turn's admitted executor/network authority, without replaying local
         // handlers. Preserve upstream's started batch then completed batch.
         let mut request = codex_hooks::SessionStartRequest {
+            clear_context: outcome.clear_context.clone(),
             session_id: sess.session_id().into(),
             #[allow(deprecated)]
             cwd: turn_context.cwd.clone(),
             transcript_path: None,
             model: turn_context.model_info().slug.clone(),
             permission_mode: hook_permission_mode(turn_context.approval_policy()),
-            target: StartHookTarget::SessionStart { source: outcome.source },
+            target: StartHookTarget::SessionStart {
+                source: outcome.source,
+            },
         };
         let hooks = with_only_environment_hooks(
-            sess, turn_context, &turn_context.initial_environments.refresh_readiness(),
+            sess,
+            turn_context,
+            &turn_context.initial_environments.refresh_readiness(),
         );
         let preview_runs = hooks.preview_session_start(&request);
         let has_environment_hooks = !preview_runs.is_empty();
@@ -156,9 +161,13 @@ pub(crate) async fn run_pending_session_start_hooks(
         emit_hook_started_events(sess, turn_context, outcome.preview_runs).await;
         if has_environment_hooks {
             request.transcript_path = sess.hook_transcript_path().await;
-            let environment = hooks.run_session_start(request, Some(turn_context.sub_id.clone())).await;
+            let environment = hooks
+                .run_session_start(request, Some(turn_context.sub_id.clone()))
+                .await;
             outcome.hook_events.extend(environment.hook_events);
-            outcome.additional_contexts.extend(environment.additional_contexts);
+            outcome
+                .additional_contexts
+                .extend(environment.additional_contexts);
             // A local stop must not skip matching required environment hooks.
             outcome.should_stop |= environment.should_stop;
         }
@@ -166,7 +175,9 @@ pub(crate) async fn run_pending_session_start_hooks(
             .hook_events
             .into_iter()
             .map(|mut event| {
-                event.turn_id.get_or_insert_with(|| turn_context.sub_id.clone());
+                event
+                    .turn_id
+                    .get_or_insert_with(|| turn_context.sub_id.clone());
                 event
             })
             .collect();
@@ -200,6 +211,7 @@ pub(crate) async fn run_pending_session_start_hooks(
             },
         };
         let request = codex_hooks::SessionStartRequest {
+            clear_context: None,
             session_id: sess.session_id().into(),
             #[allow(deprecated)]
             cwd: turn_context.cwd.clone(),
@@ -243,8 +255,25 @@ pub(crate) async fn run_pending_session_start_hooks_eager(sess: &Arc<Session>) -
     let Some(source) = sess.take_pending_session_start_source().await else {
         return false;
     };
+    run_session_start_hooks_eager(sess, source, None).await
+}
+
+pub(crate) async fn run_deferred_clear_session_start_hooks_eager(sess: &Arc<Session>) -> bool {
+    let Some(context) = sess.take_deferred_clear_session_start().await else {
+        return false;
+    };
+    run_session_start_hooks_eager(sess, codex_hooks::SessionStartSource::Clear, Some(context)).await
+}
+
+async fn run_session_start_hooks_eager(
+    sess: &Arc<Session>,
+    source: codex_hooks::SessionStartSource,
+    clear_context: Option<codex_hooks::ClearSessionStartContext>,
+) -> bool {
+    let config_snapshot = sess.thread_config_snapshot().await;
     let config = sess.get_config().await;
     let mut request = codex_hooks::SessionStartRequest {
+        clear_context: clear_context.clone(),
         session_id: sess.session_id().into(),
         #[allow(deprecated)]
         cwd: config.cwd.clone(),
@@ -258,13 +287,22 @@ pub(crate) async fn run_pending_session_start_hooks_eager(sess: &Arc<Session>) -
     if preview_runs.is_empty() {
         // Preserve the source for environment-owned hooks discovered at a turn,
         // without materializing an otherwise empty local rollout.
-        sess.queue_eager_session_start_hook_outcome(source, Vec::new(), Vec::new(), false, Vec::new()).await;
+        sess.queue_eager_session_start_hook_outcome(
+            source,
+            clear_context,
+            Vec::new(),
+            Vec::new(),
+            false,
+            Vec::new(),
+        )
+        .await;
         return true;
     }
     request.transcript_path = sess.hook_transcript_path().await;
     let outcome = hooks.run_session_start(request, None).await;
     sess.queue_eager_session_start_hook_outcome(
         source,
+        clear_context,
         preview_runs,
         outcome.hook_events,
         outcome.should_stop,
@@ -539,6 +577,26 @@ pub(crate) async fn run_turn_stop_hooks(
 
 #[instrument(level = "trace", skip_all)]
 pub(crate) async fn run_session_end_hooks(sess: &Arc<Session>) {
+    run_session_end_hooks_for_reason(sess, codex_hooks::SessionEndReason::Other, None).await;
+}
+
+pub(crate) async fn run_clear_session_end_hooks(
+    sess: &Arc<Session>,
+    transition_id: codex_state::ClearTransitionId,
+) {
+    run_session_end_hooks_for_reason(
+        sess,
+        codex_hooks::SessionEndReason::Clear,
+        Some(transition_id.to_string()),
+    )
+    .await;
+}
+
+async fn run_session_end_hooks_for_reason(
+    sess: &Arc<Session>,
+    reason: codex_hooks::SessionEndReason,
+    clear_transition_id: Option<String>,
+) {
     // Building a turn can read plugins and skills from a remote executor. Check
     // the captured hook declarations before spending any of the shutdown deadline.
     let environments = sess.services.turn_environments.snapshot_now();
@@ -549,13 +607,13 @@ pub(crate) async fn run_session_end_hooks(sess: &Arc<Session>) {
             .session_end
             .is_empty()
     });
-    if !has_environment_end_hooks && sess.hooks().preview_session_end().is_empty() {
+    if !has_environment_end_hooks && sess.hooks().preview_session_end(reason).is_empty() {
         return;
     }
 
     let turn_context = sess.new_default_turn().await;
     let hooks = with_environment_hooks(sess, &turn_context, &environments);
-    let preview_runs = hooks.preview_session_end();
+    let preview_runs = hooks.preview_session_end(reason);
     if preview_runs.is_empty() {
         return;
     }
@@ -567,6 +625,8 @@ pub(crate) async fn run_session_end_hooks(sess: &Arc<Session>) {
     }
 
     let request = codex_hooks::SessionEndRequest {
+        reason,
+        clear_transition_id,
         session_id: sess.session_id().into(),
         turn_id: turn_context.sub_id.clone(),
         #[allow(deprecated)]

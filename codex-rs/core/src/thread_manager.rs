@@ -537,6 +537,7 @@ struct PreparedChildOrigin {
 }
 
 struct ThreadSpawnRequest {
+    deferred_clear_session_start: Option<crate::session::DeferredClearSessionStart>,
     captured_account_work: Option<account_work::CapturedConstructionWork>,
     ready_notification: ThreadReadyNotification,
     startup: Option<Arc<crate::session::startup::SessionStartup>>,
@@ -562,6 +563,7 @@ impl ThreadSpawnRequest {
         agent_control: impl Into<AgentControlInit>,
     ) -> Self {
         Self {
+            deferred_clear_session_start: None,
             captured_account_work: None,
             ready_notification: ThreadReadyNotification::Emit,
             startup: None,
@@ -1470,7 +1472,7 @@ impl ThreadManager {
     pub async fn start_thread(&self, options: StartThreadOptions) -> CodexResult<NewThread> {
         Box::pin(self.start_thread_inner(
             options, /*forked_from_thread_id*/ None, /*startup*/ None,
-            /*captured_account_work*/ None,
+            /*captured_account_work*/ None, /*deferred_clear_session_start*/ None,
         ))
         .await
     }
@@ -1541,12 +1543,50 @@ impl ThreadManager {
         self.state.thread_id_generator.as_ref()()
     }
 
+    /// Construct the exact clear successor under ordinary constructor custody,
+    /// with durable lineage and a start hook only the ordered dispatcher can take.
+    pub async fn start_thread_for_clear(
+        &self,
+        mut options: StartThreadOptions,
+        predecessor_thread_id: ThreadId,
+        successor_thread_id: ThreadId,
+        transition_id: codex_state::ClearTransitionId,
+    ) -> CodexResult<NewThread> {
+        if !matches!(options.initial_history, InitialHistory::Cleared) {
+            return Err(CodexErr::InvalidRequest(
+                "deferred clear start requires cleared initial history".to_owned(),
+            ));
+        }
+        if options
+            .reserved_thread_id
+            .is_some_and(|id| id != successor_thread_id)
+        {
+            return Err(CodexErr::InvalidRequest(
+                "clear successor differs from reserved thread identity".to_owned(),
+            ));
+        }
+        options.reserved_thread_id = Some(successor_thread_id);
+        Box::pin(self.start_thread_inner(
+            options,
+            None,
+            None,
+            None,
+            Some(crate::session::DeferredClearSessionStart {
+                predecessor_thread_id,
+                successor_thread_id,
+                transition_id,
+            }),
+        ))
+        .await
+    }
+
     async fn start_thread_inner(
         &self,
         mut options: StartThreadOptions,
         forked_from_thread_id: Option<ThreadId>,
         startup: Option<Arc<crate::session::startup::SessionStartup>>,
         captured_account_work: Option<account_work::CapturedConstructionWork>,
+        deferred_clear_session_start: Option<crate::session::DeferredClearSessionStart>,
     ) -> CodexResult<NewThread> {
         let (session_source, thread_source) = options.effective_sources(&self.state.session_source);
         options.session_source = Some(session_source);
@@ -1578,6 +1618,7 @@ impl ThreadManager {
             request.forked_from_thread_id = forked_from_thread_id;
             request
         };
+        request.deferred_clear_session_start = deferred_clear_session_start;
         request.startup = startup;
         request.captured_account_work = captured_account_work;
         Box::pin(self.state.spawn_thread(request)).await
@@ -1624,6 +1665,7 @@ impl ThreadManager {
             Some(forked_from_thread_id),
             /*startup*/ None,
             /*captured_account_work*/ None,
+            /*deferred_clear_session_start*/ None,
         )
         .await
     }
@@ -2875,6 +2917,7 @@ impl ThreadManagerState {
             .config_layer_stack
             .with_mcp_ema_cancellation(cancellation);
         let ThreadSpawnRequest {
+            deferred_clear_session_start,
             captured_account_work: _, // Consumed before the retained handoff.
             ready_notification,
             startup,
@@ -3257,6 +3300,7 @@ impl ThreadManagerState {
         };
         let spawn_result = Session::spawn_with_custody(
             SessionSpawnArgs {
+                deferred_clear_session_start,
                 host_admission: self.extensions.host_admission(),
                 initial_mcp_work,
                 control_endpoint,

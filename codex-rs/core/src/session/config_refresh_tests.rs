@@ -157,6 +157,7 @@ async fn hook_refresh_retries_current_plugin_policy_after_owner_replacement() ->
         .original_config_do_not_use = Arc::clone(&initial);
     session.refresh_hooks(Arc::clone(&initial)).await;
     let request = codex_hooks::SessionStartRequest {
+        clear_context: None,
         session_id: session.thread_id,
         cwd: initial.cwd.clone(),
         transcript_path: None,

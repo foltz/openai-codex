@@ -120,6 +120,8 @@ pub(crate) struct SessionState {
     pub(crate) current_time_reminder: CurrentTimeReminderState,
     pub(crate) active_connector_selection: HashSet<String>,
     pub(crate) pending_session_start_sources: VecDeque<codex_hooks::SessionStartSource>,
+    /// Kept outside the ordinary turn queue until ordered clear dispatch.
+    deferred_clear_session_start: Option<codex_hooks::ClearSessionStartContext>,
     /// Lifecycle records and context from an eagerly completed start hook.
     /// Replayed once when the first turn supplies its persistence context.
     pending_eager_session_start_outcomes: VecDeque<EagerSessionStartOutcome>,
@@ -175,6 +177,7 @@ impl SessionState {
             current_time_reminder: CurrentTimeReminderState::default(),
             active_connector_selection: HashSet::new(),
             pending_session_start_sources: VecDeque::new(),
+            deferred_clear_session_start: None,
             pending_eager_session_start_outcomes: VecDeque::new(),
             next_turn_is_first: true,
             initial_settings_pending: true,
@@ -472,6 +475,24 @@ impl SessionState {
         self.pending_session_start_sources.push_back(value);
     }
 
+    pub(crate) fn queue_deferred_clear_session_start(
+        &mut self,
+        predecessor_thread_id: String,
+        transition_id: String,
+    ) {
+        debug_assert!(self.deferred_clear_session_start.is_none());
+        self.deferred_clear_session_start = Some(codex_hooks::ClearSessionStartContext {
+            predecessor_thread_id,
+            transition_id,
+        });
+    }
+
+    pub(crate) fn take_deferred_clear_session_start(
+        &mut self,
+    ) -> Option<codex_hooks::ClearSessionStartContext> {
+        self.deferred_clear_session_start.take()
+    }
+
     pub(crate) fn take_pending_session_start_source(
         &mut self,
     ) -> Option<codex_hooks::SessionStartSource> {
@@ -481,6 +502,7 @@ impl SessionState {
     pub(crate) fn queue_eager_session_start_outcome(
         &mut self,
         source: codex_hooks::SessionStartSource,
+        clear_context: Option<codex_hooks::ClearSessionStartContext>,
         preview_runs: Vec<HookRunSummary>,
         hook_events: Vec<HookCompletedEvent>,
         should_stop: bool,
@@ -489,6 +511,7 @@ impl SessionState {
         self.pending_eager_session_start_outcomes
             .push_back(EagerSessionStartOutcome {
                 source,
+                clear_context,
                 preview_runs,
                 hook_events,
                 should_stop,
@@ -503,6 +526,7 @@ impl SessionState {
 
 pub(crate) struct EagerSessionStartOutcome {
     pub(crate) source: codex_hooks::SessionStartSource,
+    pub(crate) clear_context: Option<codex_hooks::ClearSessionStartContext>,
     pub(crate) preview_runs: Vec<HookRunSummary>,
     pub(crate) hook_events: Vec<HookCompletedEvent>,
     pub(crate) should_stop: bool,

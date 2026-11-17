@@ -155,6 +155,15 @@ pub(crate) fn matches_matcher(
     matcher.is_none_or(|matcher| matcher.matches(input))
 }
 
+/// Match one explicit token without accepting omitted, wildcard, or regex matchers.
+pub(crate) fn matches_exact_token(
+    matcher: Option<&crate::engine::HookMatcher>,
+    input: &str,
+) -> bool {
+    matches!(matcher, Some(crate::engine::HookMatcher::Exact(pattern))
+        if pattern.split('|').any(|candidate| candidate == input))
+}
+
 pub(crate) fn matcher_inputs<'a>(
     tool_name: &'a str,
     matcher_aliases: &'a [String],
@@ -172,6 +181,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::matcher_pattern_for_event;
+    use super::matches_exact_token;
     use super::matches_matcher;
     use crate::engine::HookMatcher;
 
@@ -192,6 +202,32 @@ mod tests {
             Some("Edit")
         ));
         assert_eq!(HookMatcher::new("*").map(|_| ()), Ok(()));
+    }
+
+    #[test]
+    fn exact_token_match_excludes_permissive_and_regex_matchers() {
+        assert!(matches_exact_token(
+            Some(&HookMatcher::new("clear").expect("valid matcher")),
+            "clear"
+        ));
+        assert!(matches_exact_token(
+            Some(&HookMatcher::new("other|clear").expect("valid matcher")),
+            "clear"
+        ));
+        for matcher in [
+            None,
+            Some(""),
+            Some("*"),
+            Some("^clear$"),
+            Some(".*"),
+            Some("other"),
+        ] {
+            let compiled = matcher.map(|pattern| HookMatcher::new(pattern).expect("valid matcher"));
+            assert!(
+                !matches_exact_token(compiled.as_ref(), "clear"),
+                "matcher: {matcher:?}"
+            );
+        }
     }
 
     #[test]

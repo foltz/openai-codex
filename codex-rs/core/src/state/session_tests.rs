@@ -273,3 +273,22 @@ async fn set_rate_limits_carries_account_metadata_from_codex_to_codex_other() {
         Some(false)
     );
 }
+
+#[tokio::test]
+async fn deferred_clear_start_is_not_consumed_by_an_ordinary_turn_queue() {
+    let mut state = SessionState::new(make_session_configuration_for_tests().await);
+    state.queue_deferred_clear_session_start("predecessor".to_owned(), "transition".to_owned());
+    assert!(state.take_pending_session_start_source().is_none());
+    state.queue_pending_session_start_source(codex_hooks::SessionStartSource::Resume);
+    assert_eq!(
+        state.take_pending_session_start_source(),
+        Some(codex_hooks::SessionStartSource::Resume)
+    );
+    let clear = state
+        .take_deferred_clear_session_start()
+        .expect("explicit dispatcher owns clear start");
+    assert_eq!(clear.predecessor_thread_id, "predecessor");
+    assert_eq!(clear.transition_id, "transition");
+    assert!(state.take_deferred_clear_session_start().is_none());
+    assert!(state.take_pending_session_start_source().is_none());
+}

@@ -1018,6 +1018,7 @@ async fn preview_session_start_hooks(
 
     Ok(
         hooks.preview_session_start(&codex_hooks::SessionStartRequest {
+            clear_context: None,
             session_id: thread_id,
             cwd: config.cwd.clone(),
             transcript_path: None,
@@ -1898,6 +1899,7 @@ async fn reload_user_config_layer_refreshes_hooks() -> anyhow::Result<()> {
     }))?;
 
     let request = codex_hooks::SessionStartRequest {
+        clear_context: None,
         session_id: session.thread_id,
         cwd: session.get_config().await.cwd.clone(),
         transcript_path: None,
@@ -2007,6 +2009,7 @@ async fn refresh_runtime_config_refreshes_hooks() -> anyhow::Result<()> {
     std::fs::write(&config_toml_path, toml::to_string(&trusted_user_config)?)?;
 
     let request = codex_hooks::SessionStartRequest {
+        clear_context: None,
         session_id: session.thread_id,
         cwd: session.get_config().await.cwd.clone(),
         transcript_path: None,

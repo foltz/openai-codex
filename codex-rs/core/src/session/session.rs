@@ -948,6 +948,7 @@ impl Session {
         multi_agent_version: Option<MultiAgentVersion>,
         git_enrichment_policy: GitEnrichmentPolicy,
         windows_sandbox_proxy_settings_mode: codex_sandboxing::WindowsSandboxProxySettingsMode,
+        deferred_clear_session_start: Option<super::DeferredClearSessionStart>,
         startup_custody: Option<&super::startup_custody::SessionStartupCustody>,
         startup_resources: Option<&super::startup_resources::StartupResources>,
     ) -> anyhow::Result<Arc<Self>> {
@@ -1276,7 +1277,12 @@ impl Session {
                             extra_config: config.extra_config.clone(),
                             forked_from_id,
                             parent_thread_id,
-                            clear_lineage: None,
+                            clear_lineage: deferred_clear_session_start.as_ref().map(|deferred| {
+                                codex_thread_store::ClearThreadLineage {
+                                    predecessor_thread_id: deferred.predecessor_thread_id,
+                                    transition_id: deferred.transition_id.to_string(),
+                                }
+                            }),
                             source: session_source,
                             thread_source: session_configuration.thread_source.clone(),
                             originator: session_configuration.originator.clone(),
@@ -2381,7 +2387,11 @@ impl Session {
             }
             {
                 let mut state = sess.state.lock().await;
-                state.queue_pending_session_start_source(session_start_source);
+                if let Some(deferred) = deferred_clear_session_start.as_ref() {
+                    state.queue_deferred_clear_session_start(deferred.predecessor_thread_id.to_string(), deferred.transition_id.to_string());
+                } else {
+                    state.queue_pending_session_start_source(session_start_source);
+                }
             }
             Ok(sess)
         }
@@ -2389,7 +2399,9 @@ impl Session {
         match session_result {
             Ok(sess) => {
                 live_thread_init.commit();
-                crate::hook_runtime::run_pending_session_start_hooks_eager(&sess).await;
+                if deferred_clear_session_start.is_none() {
+                    crate::hook_runtime::run_pending_session_start_hooks_eager(&sess).await;
+                }
                 Ok(sess)
             }
             Err(err) => {

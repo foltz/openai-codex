@@ -622,6 +622,7 @@ impl From<CompactedHistoryMetadata> for CompactedHistoryInstallation<'_> {
 }
 
 pub(crate) struct SessionSpawnArgs {
+    pub(crate) deferred_clear_session_start: Option<DeferredClearSessionStart>,
     pub(crate) host_admission: Option<Arc<dyn codex_extension_api::TurnStartAdmission>>,
     pub(crate) initial_mcp_work: Option<Box<dyn codex_mcp::McpAttemptWork>>,
     pub(crate) control_endpoint: Option<String>,
@@ -679,6 +680,13 @@ pub(crate) struct SessionSpawnArgs {
     pub(crate) git_enrichment_policy: GitEnrichmentPolicy,
     pub(crate) windows_sandbox_proxy_settings_mode:
         codex_sandboxing::WindowsSandboxProxySettingsMode,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DeferredClearSessionStart {
+    pub(crate) predecessor_thread_id: ThreadId,
+    pub(crate) successor_thread_id: ThreadId,
+    pub(crate) transition_id: codex_state::ClearTransitionId,
 }
 
 pub(crate) fn resolve_multi_agent_version(
@@ -854,6 +862,7 @@ impl Session {
             .ensure_config_server_applied()?;
         args.config.validate_windows_mxc_requirement()?;
         let SessionSpawnArgs {
+            deferred_clear_session_start,
             host_admission,
             initial_mcp_work,
             control_endpoint,
@@ -1277,6 +1286,7 @@ impl Session {
             multi_agent_version,
             git_enrichment_policy,
             windows_sandbox_proxy_settings_mode,
+            deferred_clear_session_start,
             custody.as_deref(),
             resources.as_deref(),
         ))
@@ -6339,6 +6349,12 @@ impl Session {
         Some(rollout_path)
     }
 
+    pub(crate) async fn take_deferred_clear_session_start(
+        &self,
+    ) -> Option<codex_hooks::ClearSessionStartContext> {
+        self.state.lock().await.take_deferred_clear_session_start()
+    }
+
     pub(crate) async fn take_pending_session_start_source(
         &self,
     ) -> Option<codex_hooks::SessionStartSource> {
@@ -6349,6 +6365,7 @@ impl Session {
     pub(crate) async fn queue_eager_session_start_hook_outcome(
         &self,
         source: codex_hooks::SessionStartSource,
+        clear_context: Option<codex_hooks::ClearSessionStartContext>,
         preview_runs: Vec<HookRunSummary>,
         hook_events: Vec<HookCompletedEvent>,
         should_stop: bool,
@@ -6357,6 +6374,7 @@ impl Session {
         let mut state = self.state.lock().await;
         state.queue_eager_session_start_outcome(
             source,
+            clear_context,
             preview_runs,
             hook_events,
             should_stop,

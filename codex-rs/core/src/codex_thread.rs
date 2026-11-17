@@ -405,6 +405,15 @@ impl CodexThread {
         Some(task.turn_context.capture_current_model_info().slug.clone())
     }
 
+    pub async fn dispatch_clear_session_end(&self, transition_id: codex_state::ClearTransitionId) {
+        crate::hook_runtime::run_clear_session_end_hooks(&self.session, transition_id).await;
+    }
+
+    /// Dispatches a server-authorized clear successor's deferred start hook.
+    pub async fn dispatch_deferred_clear_session_start(&self) -> bool {
+        crate::hook_runtime::run_deferred_clear_session_start_hooks_eager(&self.session).await
+    }
+
     pub async fn shutdown_and_wait(&self) -> CodexResult<()> {
         self.io.shutdown_and_wait().await
     }

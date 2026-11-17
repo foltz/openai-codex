@@ -3846,3 +3846,185 @@ fn native_refresh_guarded_callback_commits_exact_validated_candidate() -> anyhow
     assert_eq!(storage.load()?, Some(updated));
     Ok(())
 }
+
+#[derive(Debug, Default)]
+struct NativePersistenceHost {
+    originals: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+impl codex_protocol::host_auth_work::AuthTaskSpawner for NativePersistenceHost {
+    fn spawn(
+        &self,
+        _: codex_protocol::host_auth_work::AuthTaskFuture,
+    ) -> Result<
+        codex_protocol::host_auth_work::AuthTaskObservation,
+        codex_protocol::host_auth_work::AuthTaskFailure,
+    > {
+        Err(codex_protocol::host_auth_work::AuthTaskFailure::Refused)
+    }
+    fn spawn_blocking(
+        &self,
+        task: codex_protocol::host_auth_work::AuthTaskBlocking,
+    ) -> Result<
+        codex_protocol::host_auth_work::AuthTaskObservation,
+        codex_protocol::host_auth_work::AuthTaskFailure,
+    > {
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        self.originals
+            .lock()
+            .unwrap()
+            .push(tokio::task::spawn_blocking(move || {
+                task();
+                let _ = completed_tx.send(());
+            }));
+        Ok(Box::pin(async move {
+            completed_rx
+                .await
+                .map_err(|_| codex_protocol::host_auth_work::AuthTaskFailure::Panicked)
+        }))
+    }
+}
+
+#[derive(Debug)]
+struct NativePersistenceGate {
+    file: FileAuthStorage,
+    entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+impl AuthStorageBackend for NativePersistenceGate {
+    fn load(&self) -> std::io::Result<Option<AuthDotJson>> {
+        self.file.load()
+    }
+    fn save(&self, auth: &AuthDotJson) -> std::io::Result<()> {
+        self.file.save(auth)
+    }
+    fn delete(&self) -> std::io::Result<bool> {
+        self.file.delete()
+    }
+    fn lock_for_write(
+        &self,
+    ) -> std::io::Result<(std::sync::MutexGuard<'static, ()>, Option<std::fs::File>)> {
+        let guard = self.file.lock_for_write()?;
+        if let Some(entered) = self.entered.lock().unwrap().take() {
+            let _ = entered.send(());
+        }
+        self.release
+            .lock()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .map_err(std::io::Error::other)?;
+        Ok(guard)
+    }
+}
+
+#[tokio::test]
+async fn native_persistence_original_keeps_refresh_permit_after_observer_cancellation()
+-> anyhow::Result<()> {
+    let home = tempdir()?;
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".into()),
+            chatgpt_account_id: Some("account".into()),
+        },
+        home.path(),
+    )?;
+    let file = FileAuthStorage::new(home.path().to_path_buf());
+    let tokens = file
+        .load()?
+        .context("native auth")?
+        .tokens
+        .context("tokens")?;
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let storage: Arc<dyn AuthStorageBackend> = Arc::new(NativePersistenceGate {
+        file,
+        entered: std::sync::Mutex::new(Some(entered_tx)),
+        release: std::sync::Mutex::new(release_rx),
+    });
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    let guard = Arc::new(Arc::clone(&semaphore).acquire_owned().await?);
+    let host = Arc::new(NativePersistenceHost::default());
+    let owner: Arc<dyn codex_protocol::host_auth_work::AuthTaskSpawner> = host.clone();
+    let observer = tokio::spawn(async move {
+        codex_protocol::host_auth_task::with_auth_task_scope(
+            codex_protocol::host_auth_task::AuthTaskAccess::Admitted(owner),
+            super::persist_native_refresh(
+                storage,
+                tokens,
+                None,
+                RefreshResponse {
+                    id_token: None,
+                    access_token: Some("renewed-native-access".into()),
+                    refresh_token: Some("renewed-native-refresh".into()),
+                },
+                guard,
+            ),
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx).await??;
+    observer.abort();
+    assert!(observer.await.unwrap_err().is_cancelled());
+    assert!(
+        Arc::clone(&semaphore).try_acquire_owned().is_err(),
+        "physical persistence still owns the refresh exclusion"
+    );
+    release_tx.send(())?;
+    let originals = std::mem::take(&mut *host.originals.lock().unwrap());
+    assert_eq!(originals.len(), 1);
+    for original in originals {
+        tokio::time::timeout(std::time::Duration::from_secs(5), original).await??;
+    }
+    assert_eq!(semaphore.available_permits(), 1);
+    let updated = FileAuthStorage::new(home.path().to_path_buf())
+        .load()?
+        .context("committed native auth")?
+        .tokens
+        .context("committed tokens")?;
+    assert_eq!(updated.access_token, "renewed-native-access");
+    assert_eq!(updated.refresh_token, "renewed-native-refresh");
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_persistence_required_custody_refusal_preserves_storage_and_permit()
+-> anyhow::Result<()> {
+    let home = tempdir()?;
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".into()),
+            chatgpt_account_id: Some("account".into()),
+        },
+        home.path(),
+    )?;
+    let original = std::fs::read(home.path().join("auth.json"))?;
+    let storage: Arc<dyn AuthStorageBackend> =
+        Arc::new(FileAuthStorage::new(home.path().to_path_buf()));
+    let tokens = storage
+        .load()?
+        .context("native auth")?
+        .tokens
+        .context("tokens")?;
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    let guard = Arc::new(Arc::clone(&semaphore).acquire_owned().await?);
+    let result = codex_protocol::host_auth_task::with_auth_task_scope(
+        codex_protocol::host_auth_task::AuthTaskAccess::Required,
+        super::persist_native_refresh(
+            storage,
+            tokens,
+            None,
+            RefreshResponse {
+                id_token: None,
+                access_token: Some("must-not-save".into()),
+                refresh_token: None,
+            },
+            guard,
+        ),
+    )
+    .await;
+    assert!(result.is_err());
+    assert_eq!(std::fs::read(home.path().join("auth.json"))?, original);
+    assert_eq!(semaphore.available_permits(), 1);
+    Ok(())
+}

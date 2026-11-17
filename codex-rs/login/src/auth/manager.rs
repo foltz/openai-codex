@@ -4704,12 +4704,14 @@ impl AuthManager {
         reason: RefreshReason,
         expected_auth: Option<&CodexAuth>,
     ) -> Result<(), RefreshTokenError> {
-        let _refresh_guard = self.refresh_lock.acquire().await.map_err(|_| {
-            RefreshTokenError::Permanent(RefreshTokenFailedError::new(
-                RefreshTokenFailedReason::Other,
-                REFRESH_TOKEN_UNKNOWN_MESSAGE.to_string(),
-            ))
-        })?;
+        let _refresh_guard = Arc::new(self.refresh_lock.clone().acquire_owned().await.map_err(
+            |_| {
+                RefreshTokenError::Permanent(RefreshTokenFailedError::new(
+                    RefreshTokenFailedReason::Other,
+                    REFRESH_TOKEN_UNKNOWN_MESSAGE.to_string(),
+                ))
+            },
+        )?);
         let auth_before_reload = self.auth_cached();
         if let Some(expected_auth) = expected_auth
             && !Self::auths_equal_for_refresh(auth_before_reload.as_ref(), Some(expected_auth))
@@ -4717,7 +4719,9 @@ impl AuthManager {
             return Ok(());
         }
         if self.has_external_auth() {
-            return self.refresh_token_from_authority_impl(reason).await;
+            return self
+                .refresh_token_from_authority_impl(reason, &_refresh_guard)
+                .await;
         }
         if auth_before_reload
             .as_ref()
@@ -4737,7 +4741,10 @@ impl AuthManager {
                 tracing::info!("Skipping token refresh because auth changed after guarded reload.");
                 Ok(())
             }
-            ReloadOutcome::ReloadedNoChange => self.refresh_token_from_authority_impl(reason).await,
+            ReloadOutcome::ReloadedNoChange => {
+                self.refresh_token_from_authority_impl(reason, &_refresh_guard)
+                    .await
+            }
             ReloadOutcome::Skipped => {
                 Err(RefreshTokenError::Permanent(RefreshTokenFailedError::new(
                     RefreshTokenFailedReason::Other,
@@ -4759,18 +4766,22 @@ impl AuthManager {
         &self,
         reason: RefreshReason,
     ) -> Result<(), RefreshTokenError> {
-        let _refresh_guard = self.refresh_lock.acquire().await.map_err(|_| {
-            RefreshTokenError::Permanent(RefreshTokenFailedError::new(
-                RefreshTokenFailedReason::Other,
-                REFRESH_TOKEN_UNKNOWN_MESSAGE.to_string(),
-            ))
-        })?;
-        self.refresh_token_from_authority_impl(reason).await
+        let _refresh_guard = Arc::new(self.refresh_lock.clone().acquire_owned().await.map_err(
+            |_| {
+                RefreshTokenError::Permanent(RefreshTokenFailedError::new(
+                    RefreshTokenFailedReason::Other,
+                    REFRESH_TOKEN_UNKNOWN_MESSAGE.to_string(),
+                ))
+            },
+        )?);
+        self.refresh_token_from_authority_impl(reason, &_refresh_guard)
+            .await
     }
 
     async fn refresh_token_from_authority_impl(
         &self,
         reason: RefreshReason,
+        refresh_guard: &Arc<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<(), RefreshTokenError> {
         tracing::info!("Refreshing token");
 
@@ -4797,6 +4808,7 @@ impl AuthManager {
                         chatgpt_auth,
                         token_data,
                         reason,
+                        Arc::clone(refresh_guard),
                     ))
                     .await
                 }
@@ -4984,6 +4996,7 @@ impl AuthManager {
         auth: &ChatgptAuth,
         tokens: TokenData,
         reason: RefreshReason,
+        refresh_guard: Arc<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<(), RefreshTokenError> {
         let endpoint = refresh_token_endpoint(tokens.oauth_provenance.as_ref());
         let client_id = tokens
@@ -5012,27 +5025,14 @@ impl AuthManager {
                 endpoint == format!("{}/oauth/token", provenance.issuer.trim_end_matches('/'))
             });
 
-            let storage = Arc::clone(auth.storage());
-            let originator = codex_otel::auth_storage::AuthStorageOriginator::current();
-            tokio::task::spawn_blocking(move || {
-                originator.sync_scope(|| {
-                    persist_tokens(
-                        &storage,
-                        &tokens,
-                        provenance,
-                        refresh_response.id_token,
-                        refresh_response.access_token,
-                        refresh_response.refresh_token,
-                    )
-                })
-            })
-            .await
-            .map_err(|_| {
-                RefreshTokenError::Transient(std::io::Error::other(
-                    "credential persistence task failed",
-                ))
-            })?
-            .map_err(RefreshTokenError::from)?;
+            persist_native_refresh(
+                Arc::clone(auth.storage()),
+                tokens,
+                provenance,
+                refresh_response,
+                refresh_guard,
+            )
+            .await?;
             Ok(())
         }
         .await;
@@ -5053,6 +5053,36 @@ impl AuthManager {
 
         Ok(())
     }
+}
+
+async fn persist_native_refresh(
+    storage: Arc<dyn AuthStorageBackend>,
+    tokens: TokenData,
+    provenance: Option<AccountOAuthProvenance>,
+    response: RefreshResponse,
+    refresh_guard: Arc<tokio::sync::OwnedSemaphorePermit>,
+) -> Result<(), RefreshTokenError> {
+    let originator = codex_otel::auth_storage::AuthStorageOriginator::current();
+    codex_protocol::host_auth_task::run_blocking_call(move || {
+        // This share survives cancellation of the async result observer.
+        let _refresh_guard = refresh_guard;
+        originator.sync_scope(|| {
+            persist_tokens(
+                &storage,
+                &tokens,
+                provenance,
+                response.id_token,
+                response.access_token,
+                response.refresh_token,
+            )
+        })
+    })
+    .await
+    .map_err(|_| {
+        RefreshTokenError::Transient(std::io::Error::other("credential persistence task failed"))
+    })?
+    .map_err(RefreshTokenError::from)?;
+    Ok(())
 }
 
 fn auth_config_from(config: &impl AuthManagerConfig) -> AuthConfig {

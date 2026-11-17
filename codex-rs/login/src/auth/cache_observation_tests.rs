@@ -1,4 +1,5 @@
 use super::*;
+use pretty_assertions::assert_eq;
 
 #[test]
 fn cache_observation_distinguishes_known_logout_failure_and_poison() {

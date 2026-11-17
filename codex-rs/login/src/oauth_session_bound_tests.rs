@@ -4,6 +4,7 @@ use pretty_assertions::assert_eq;
 fn grant(client: &OAuthSessionManager, id: &str, access: &str, expiry: i64) {
     client
         .save_token(&StoredToken {
+            observation_epoch: None,
             authorization_id: Some(id.into()),
             access_token: access.into(),
             refresh_token: Some("synthetic-refresh".into()),
@@ -475,4 +476,47 @@ fn actual_blocked_load_does_not_block_save_or_publish_stale_epoch() {
     assert!(stale.binding().is_none());
     let current = super::super::OAuthRequestCredentials::from_resolved(&client, current);
     assert!(current.binding().is_some());
+}
+
+#[tokio::test]
+async fn resolved_token_cannot_acquire_a_new_binding_after_sign_in_aba() {
+    let server = MockServer::start().await;
+    let mut settings = config(&server);
+    settings.credentials_store = codex_model_provider_info::OAuthCredentialsStore::File;
+    let (manager, _home) = client(settings, Arc::new(MockKeyringStore::default()));
+    grant(&manager, "origin", "original-access", i64::MAX);
+    let original = manager.load_token().unwrap().unwrap();
+    let encoded = serde_json::to_value(&original).unwrap();
+    assert!(encoded.get("observation_epoch").is_none());
+    let unobserved = serde_json::from_value(encoded).unwrap();
+    assert!(
+        OAuthRequestCredentials::from_resolved(&manager, unobserved)
+            .binding()
+            .is_none()
+    );
+    let first = OAuthRequestCredentials::from_resolved(&manager, original.clone());
+    let first_binding = first.binding().unwrap().clone();
+    assert!(manager.begin_admitted_request(&first_binding).is_ok());
+
+    let cached = manager.resolve_access_token_observed().await.unwrap();
+    assert_eq!(cached.binding(), Some(&first_binding));
+    // Same-grant renewal keeps continuity; a sign-in ABA must not.
+    grant(&manager, "origin", "renewed-access", i64::MAX);
+    assert!(manager.begin_admitted_request(&first_binding).is_ok());
+    grant(&manager, "replacement", "replacement-access", i64::MAX);
+    grant(&manager, "origin", "original-access", i64::MAX);
+    assert!(manager.begin_admitted_request(&first_binding).is_err());
+    assert!(
+        OAuthRequestCredentials::from_resolved(&manager, original)
+            .binding()
+            .is_none()
+    );
+    let current = manager.resolve_access_token_observed().await.unwrap();
+    assert_eq!(current.access_token, "original-access");
+    assert_ne!(current.binding(), Some(&first_binding));
+    assert!(
+        manager
+            .begin_admitted_request(current.binding().unwrap())
+            .is_ok()
+    );
 }

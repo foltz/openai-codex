@@ -13,8 +13,11 @@ use serde::Serialize;
 
 use super::OAuthSessionConfig;
 
-#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Deserialize, Serialize)]
 pub(super) struct StoredToken {
+    /// Runtime-only stamp from the locked read/commit, never disk authority.
+    #[serde(skip)]
+    pub observation_epoch: Option<u64>,
     pub access_token: String,
     /// Stable across refreshes, replaced by a new authorization grant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -24,6 +27,18 @@ pub(super) struct StoredToken {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<i64>,
 }
+
+// Credential equality retains its existing disk/cache meaning. Observation
+// continuity is compared explicitly where cached credentials are replaced.
+impl PartialEq for StoredToken {
+    fn eq(&self, other: &Self) -> bool {
+        self.access_token == other.access_token
+            && self.authorization_id == other.authorization_id
+            && self.refresh_token == other.refresh_token
+            && self.expires_at == other.expires_at
+    }
+}
+impl Eq for StoredToken {}
 
 #[derive(Deserialize)]
 pub(super) struct TokenResponse {
@@ -83,6 +98,7 @@ impl TokenResponse {
             })
             .transpose()?;
         Ok(StoredToken {
+            observation_epoch: None,
             access_token: self.access_token,
             authorization_id: match previous_token {
                 Some(previous) => previous.authorization_id.clone(),

@@ -11,6 +11,7 @@ async fn device_login_presents_prompt_and_persists_grant() {
     let (client, _home) = client(device_config(&server), Default::default());
     client
         .save_token(&StoredToken {
+            observation_epoch: None,
             authorization_id: Some("previous-grant".into()),
             access_token: "previous-access".into(),
             refresh_token: None,

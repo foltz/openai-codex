@@ -98,6 +98,7 @@ fn save_token(
     expires_at: i64,
 ) {
     let token = StoredToken {
+        observation_epoch: None,
         authorization_id: None,
         access_token: access_token.to_string(),
         refresh_token: refresh_token.map(str::to_string),
@@ -517,6 +518,7 @@ async fn gateway_credentials_use_a_dedicated_encrypted_file_and_reload_large_tok
     .expect("gateway auth manager");
     client
         .save_token(&StoredToken {
+            observation_epoch: None,
             authorization_id: None,
             access_token: access_token.clone(),
             refresh_token: None,
@@ -933,6 +935,7 @@ async fn invalid_grant_recovers_external_credentials_with_a_bounded_retry() {
             .respond_with(move |_: &wiremock::Request| {
                 writer
                     .save_token(&StoredToken {
+                        observation_epoch: None,
                         authorization_id: None,
                         access_token: "external-access".to_string(),
                         refresh_token: Some("external-refresh".to_string()),
@@ -1129,6 +1132,7 @@ async fn failed_save_retains_rotation_without_overwriting_a_new_external_login()
         if recovery == Recovery::ExternalLogin {
             manager
                 .save_token(&StoredToken {
+                    observation_epoch: None,
                     authorization_id: None,
                     access_token: "external-access".to_string(),
                     refresh_token: Some("external-refresh".to_string()),

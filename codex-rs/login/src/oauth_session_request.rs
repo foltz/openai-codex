@@ -80,7 +80,10 @@ impl OAuthRequestCredentials {
             .as_ref()
             .filter(|id| !id.trim().is_empty())
             .and_then(|id| {
-                let epoch = manager.state.domain.binding(&identity)?;
+                let epoch = token.observation_epoch?;
+                if !manager.state.domain.is_current(&identity, epoch) {
+                    return None;
+                }
                 Some(OAuthSessionBinding {
                     credential_id: manager.credential_id(),
                     authorization_id: id.clone(),

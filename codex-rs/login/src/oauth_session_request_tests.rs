@@ -9,6 +9,7 @@ async fn request_refresh_retry_keeps_the_same_sign_in() {
     let (manager, _home) = client(config(&server), Arc::new(MockKeyringStore::default()));
     manager
         .save_token(&StoredToken {
+            observation_epoch: None,
             access_token: "rejected".into(),
             authorization_id: Some("grant".into()),
             refresh_token: Some("refresh".into()),

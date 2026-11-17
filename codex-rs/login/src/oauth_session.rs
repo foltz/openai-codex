@@ -320,7 +320,14 @@ impl OAuthSessionManager {
         });
         // A cached token may predate the failed login. Only persisted replacements can clear it.
         if cached.pending.is_none()
-            && (cached.token.is_none() || terminal_status || cached.login_required.is_some())
+            && (cached.token.is_none()
+                || terminal_status
+                || cached.login_required.is_some()
+                || cached.token.as_ref().is_some_and(|token| {
+                    token.observation_epoch.is_some_and(|epoch| {
+                        !self.state.domain.is_current(&grant_identity(token), epoch)
+                    })
+                }))
         {
             cached.token = self.load_token_async().await?;
         }
@@ -400,7 +407,7 @@ impl OAuthSessionManager {
         let manager = self.clone();
         let saved = token.clone();
         let credential_lock = Arc::clone(credential_lock);
-        tokio::task::spawn_blocking(move || {
+        let epoch = tokio::task::spawn_blocking(move || {
             // A canceled login may drop its async guard while this write is still running.
             // Keep the cross-process lock until encryption and the atomic write finish.
             let _credential_lock = credential_lock;
@@ -408,8 +415,10 @@ impl OAuthSessionManager {
         })
         .await
         .map_err(|_| io::Error::other("provider OAuth credential save task failed"))??;
-        let token = token.clone();
-        cached.token = cached.pending.take();
+        let mut token = token.clone();
+        token.observation_epoch = Some(epoch);
+        cached.pending = None;
+        cached.token = Some(token.clone());
         cached.login_required = None;
         Ok(token)
     }
@@ -424,7 +433,13 @@ impl OAuthSessionManager {
         // Even a replacement from storage must differ from the token rejected by this request.
         for _ in 0..2 {
             let stored = self.load_token_async().await?;
-            if stored != cached.token {
+            if stored != cached.token
+                || stored.as_ref().and_then(|token| token.observation_epoch)
+                    != cached
+                        .token
+                        .as_ref()
+                        .and_then(|token| token.observation_epoch)
+            {
                 cached.token = stored;
                 cached.pending = None;
             }
@@ -460,7 +475,13 @@ impl OAuthSessionManager {
                         // lock. Do not overwrite its replacement sign-in.
                         let stored = self.load_token_async().await?;
                         policy.check_admission(stored.as_ref())?;
-                        if stored != cached.token {
+                        if stored != cached.token
+                            || stored.as_ref().and_then(|token| token.observation_epoch)
+                                != cached
+                                    .token
+                                    .as_ref()
+                                    .and_then(|token| token.observation_epoch)
+                        {
                             return Err(io::Error::new(
                                 io::ErrorKind::PermissionDenied,
                                 "provider OAuth credential changed during bound refresh",
@@ -501,7 +522,13 @@ impl OAuthSessionManager {
             }
         }
         let stored = self.load_token_async().await?;
-        if stored != cached.token {
+        if stored != cached.token
+            || stored.as_ref().and_then(|token| token.observation_epoch)
+                != cached
+                    .token
+                    .as_ref()
+                    .and_then(|token| token.observation_epoch)
+        {
             cached.token = stored;
             cached.pending = None;
             if let Some(token) = cached.token.as_ref()
@@ -530,7 +557,7 @@ impl OAuthSessionManager {
         // running. It must not hold the sign-in domain hostage to that read.
         for _ in 0..2 {
             let epoch = self.state.domain.lock()?.epoch();
-            let token = self.state.storage.load(&self.credential_id())?;
+            let mut token = self.state.storage.load(&self.credential_id())?;
             #[cfg(test)]
             if let Some(hook) = self.state.load_hook.lock().unwrap().take() {
                 hook();
@@ -542,6 +569,9 @@ impl OAuthSessionManager {
                 continue;
             }
             domain.observe(token.as_ref().map(grant_identity))?;
+            if let Some(token) = token.as_mut() {
+                token.observation_epoch = Some(domain.epoch());
+            }
             return Ok(token);
         }
         Err(io::Error::new(
@@ -550,12 +580,13 @@ impl OAuthSessionManager {
         ))
     }
 
-    fn save_token(&self, token: &StoredToken) -> io::Result<()> {
+    fn save_token(&self, token: &StoredToken) -> io::Result<u64> {
         let identity = Some(grant_identity(token));
         let mut domain = self.state.domain.lock()?;
         domain.prepare(&identity)?;
         self.state.storage.save(&self.credential_id(), token)?;
-        domain.observe(identity)
+        domain.observe(identity)?;
+        Ok(domain.epoch())
     }
 
     fn delete_token(&self) -> io::Result<bool> {
@@ -597,7 +628,13 @@ impl OAuthSessionManager {
         // persistence with refreshes. Use the current stored token as the failed-save baseline.
         let credential_lock = Arc::new(storage::lock_credentials(&self.state.codex_home).await?);
         let stored = self.load_token_async().await?;
-        if stored != cached.token {
+        if stored != cached.token
+            || stored.as_ref().and_then(|token| token.observation_epoch)
+                != cached
+                    .token
+                    .as_ref()
+                    .and_then(|token| token.observation_epoch)
+        {
             cached.token = stored;
             cached.pending = None;
         }

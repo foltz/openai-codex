@@ -316,6 +316,7 @@ async fn expired_readiness_stays_not_ready_while_refresh_is_blocked() {
         let server = MockServer::start().await;
         let (manager, home) = client(config(&server), Arc::new(MockKeyringStore::default()));
         let expired = StoredToken {
+            observation_epoch: None,
             authorization_id: None,
             access_token: "expired".into(),
             refresh_token: Some("refresh".into()),

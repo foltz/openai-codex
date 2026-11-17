@@ -98,23 +98,51 @@ async fn concurrent_direct_replacement_is_not_overwritten_by_refresh_completion(
     let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
     let responder = tokio::spawn(async move {
-        tokio::time::timeout(Duration::from_secs(2),async move {
-            let (mut socket,_)=listener.accept().await.unwrap();
-            let mut bytes=Vec::new();let mut chunk=[0u8;1024];
+        let mut socket = tokio::time::timeout(Duration::from_secs(2), async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 1024];
             loop {
-                let n=socket.read(&mut chunk).await.unwrap();assert!(n>0);bytes.extend_from_slice(&chunk[..n]);assert!(bytes.len()<65536);
-                if let Some(head)=bytes.windows(4).position(|w|w==b"\r\n\r\n") {
-                    let headers=std::str::from_utf8(&bytes[..head]).unwrap();
+                let n = socket.read(&mut chunk).await.unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&chunk[..n]);
+                assert!(bytes.len() < 65536);
+                if let Some(head) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = std::str::from_utf8(&bytes[..head]).unwrap();
                     assert!(headers.starts_with("POST /token "));
-                    let length=headers.lines().find_map(|line| {let (name,value)=line.split_once(':')?;name.eq_ignore_ascii_case("content-length").then(||value.trim().parse::<usize>().unwrap())}).expect("bounded content length");
-                    if bytes.len()>=head+4+length {break;}
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .expect("bounded content length");
+                    if bytes.len() >= head + 4 + length {
+                        break;
+                    }
                 }
             }
-            arrived_tx.send(()).unwrap();release_rx.await.unwrap();
-            let body=r#"{"access_token":"late-old-grant","token_type":"Bearer","expires_in":3600}"#;
-            let response=format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body);
-            socket.write_all(response.as_bytes()).await.unwrap();socket.shutdown().await.unwrap();
-        }).await.expect("bounded controlled token response");
+            socket
+        })
+        .await
+        .expect("bounded controlled token request");
+        arrived_tx.send(()).unwrap();
+        // Deliberate response hold spans real encrypted-store I/O. The existing
+        // HTTP deadline and nextest case bound apply, not the handshake timer.
+        release_rx.await.unwrap();
+        let body = r#"{"access_token":"late-old-grant","token_type":"Bearer","expires_in":3600}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+        })
+        .await
+        .expect("bounded controlled token response write");
     });
     let mut settings = loopback_config();
     settings.token_url = endpoint;
@@ -122,7 +150,7 @@ async fn concurrent_direct_replacement_is_not_overwritten_by_refresh_completion(
     let (client, home) = client(settings.clone(), keyring.clone());
     grant(&client, "origin", "expired", Utc::now().timestamp() - 10);
     let mut request = client.begin_bound_request("origin").unwrap();
-    let task = tokio::spawn(async move { credentials(&mut request).await });
+    let task = tokio::spawn(async move { request.credentials().await });
     tokio::time::timeout(Duration::from_secs(2), arrived_rx)
         .await
         .unwrap()
@@ -134,20 +162,20 @@ async fn concurrent_direct_replacement_is_not_overwritten_by_refresh_completion(
         keyring,
     )
     .unwrap();
-    grant(
-        &replacement,
-        "replacement",
-        "must-survive",
-        Utc::now().timestamp() + 3600,
-    );
+    let writer = replacement.clone();
+    tokio::task::spawn_blocking(move || {
+        grant(
+            &writer,
+            "replacement",
+            "must-survive",
+            Utc::now().timestamp() + 3600,
+        );
+    })
+    .await
+    .unwrap();
     release_tx.send(()).unwrap();
-    assert!(
-        tokio::time::timeout(Duration::from_secs(2), task)
-            .await
-            .unwrap()
-            .unwrap()
-            .is_err()
-    );
+    let error = task.await.unwrap().unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
     tokio::time::timeout(Duration::from_secs(2), responder)
         .await
         .unwrap()
@@ -348,10 +376,10 @@ async fn actual_logout_invalidates_other_managers_admission() {
     let selected = client.resolve_access_token_observed().await.unwrap();
     let binding = selected.binding().unwrap().clone();
     let other = another(&client, home.path(), keyring);
-    tokio::time::timeout(Duration::from_secs(2), other.logout())
-        .await
-        .unwrap()
-        .unwrap();
+    // Native encrypted removal is bounded by the existing nextest case policy;
+    // it is not a two-second transport-handshake operation.
+    assert!(other.logout().await.unwrap());
+    assert!(other.load_token().unwrap().is_none());
     assert!(client.begin_admitted_request(&binding).is_err());
 }
 #[tokio::test]

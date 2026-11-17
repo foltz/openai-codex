@@ -51,7 +51,6 @@ pub(crate) type PendingThreadUnloads = Arc<Mutex<HashMap<ThreadId, watch::Sender
 
 pub(crate) mod recovery;
 mod retirement;
-#[cfg(test)]
 pub(crate) use retirement::RetentionRetirementClaim;
 pub(crate) use retirement::RetentionRetirementRefusal;
 pub(crate) use retirement::RetentionSnapshot;

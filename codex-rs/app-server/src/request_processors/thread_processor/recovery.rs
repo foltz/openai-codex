@@ -1,0 +1,364 @@
+//! Recovery preserves the original failed transaction and every exact retired incarnation.
+use super::ThreadRequestProcessor;
+use super::invalid_request;
+use codex_app_server_protocol::JSONRPCErrorError;
+use codex_app_server_protocol::ServerNotification;
+use codex_app_server_protocol::ThreadClosedNotification;
+use codex_core::ThreadRecoveryOutcome;
+use codex_protocol::ThreadId;
+use std::time::Duration;
+use tokio::time::Instant;
+
+impl ThreadRequestProcessor {
+    /// Claim bounded custody before shutdown can start. The request's owner keeps
+    /// exclusion through retirement observation, including cancellation of this wait.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the pending reservation excludes idle claims while exact authority is checked"
+    )]
+    pub(super) async fn retire_cached_thread_for_resume(
+        &self,
+        id: ThreadId,
+        old: &std::sync::Arc<codex_core::CodexThread>,
+    ) -> Result<bool, JSONRPCErrorError> {
+        use crate::thread_state::RetentionRetirementRefusal;
+
+        let _resume = self.thread_state_manager.lock_goal_resume(id).await;
+        let reservation =
+            UnloadReservation::acquire(self.pending_thread_unloads.clone(), id).await?;
+        let current =
+            self.thread_manager.get_thread(id).await.map_err(|_| {
+                invalid_request(format!("thread {id} changed during resume; retry"))
+            })?;
+        if !std::sync::Arc::ptr_eq(old, &current) {
+            return Err(invalid_request(format!(
+                "thread {id} runtime changed during resume; retry"
+            )));
+        }
+        let retention = self
+            .thread_state_manager
+            .subscribe_to_retention(id)
+            .await
+            .ok_or_else(|| {
+                invalid_request(format!("thread {id} retirement authority unavailable"))
+            })?;
+        let expected = *retention.borrow();
+        if expected.retiring {
+            return self
+                .recover_reserved_retiring_thread(
+                    id,
+                    reservation,
+                    Instant::now() + Duration::from_secs(10),
+                )
+                .await;
+        }
+        let state = self.thread_state_manager.thread_state(id).await;
+        let generation = state.try_lock().map(|state| state.listener_generation);
+        let claim = match generation {
+            Ok(generation) => {
+                self.thread_state_manager
+                    .claim_thread_retirement(
+                        id,
+                        expected,
+                        old,
+                        generation,
+                        Instant::now() + Duration::from_secs(10),
+                    )
+                    .await
+            }
+            Err(_) => Err(RetentionRetirementRefusal::Busy),
+        };
+        match claim {
+            Ok((claim, ticket)) => {
+                let report = ticket.wait().await;
+                if !self
+                    .thread_state_manager
+                    .record_retirement_report(claim, report)
+                    .await
+                {
+                    return Err(invalid_request(format!(
+                        "thread {id} retirement authority changed"
+                    )));
+                }
+                if !report.is_complete() {
+                    tracing::warn!(thread_id = %id, ?report, "resume override retirement remains incomplete");
+                }
+                // Both complete and incomplete observations retain the original
+                // ticket and join the exact listener before removing this runtime.
+                self.recover_reserved_retiring_thread(
+                    id,
+                    reservation,
+                    Instant::now() + Duration::from_secs(10),
+                )
+                .await
+            }
+            Err(RetentionRetirementRefusal::AlreadyRetiring) => {
+                self.recover_reserved_retiring_thread(
+                    id,
+                    reservation,
+                    Instant::now() + Duration::from_secs(10),
+                )
+                .await
+            }
+            Err(
+                reason @ (RetentionRetirementRefusal::Retained
+                | RetentionRetirementRefusal::Busy
+                | RetentionRetirementRefusal::ActiveWork
+                | RetentionRetirementRefusal::Changed
+                | RetentionRetirementRefusal::DeadlineExpired),
+            ) => {
+                // A refused claim supplies no shutdown proof. Rejoin only the
+                // same still-open incarnation, revalidated under exclusion.
+                let current = self.thread_manager.get_thread(id).await.ok();
+                let snapshot = self.thread_state_manager.subscribe_to_retention(id).await;
+                if current
+                    .as_ref()
+                    .is_some_and(|current| std::sync::Arc::ptr_eq(old, current))
+                    && !old.is_closing()
+                    && snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| !snapshot.borrow().retiring)
+                {
+                    // The existing listener handles a warm response outside
+                    // this task's owner context. No shutdown was committed;
+                    // restore ordinary final-attach admission, which rechecks
+                    // pending claims and exact retiring authority itself.
+                    reservation.release().await;
+                    Ok(false)
+                } else {
+                    Err(invalid_request(format!(
+                        "thread {id} resume claim refused: {reason:?}; runtime is not usable"
+                    )))
+                }
+            }
+            Err(
+                reason @ (RetentionRetirementRefusal::UnknownThread
+                | RetentionRetirementRefusal::AuthorityUnavailable),
+            ) => Err(invalid_request(format!(
+                "thread {id} resume retirement unavailable: {reason:?}"
+            ))),
+        }
+    }
+
+    pub(super) async fn recover_retiring_thread(
+        &self,
+        id: ThreadId,
+    ) -> Result<bool, JSONRPCErrorError> {
+        self.recover_retiring_thread_until(id, Instant::now() + Duration::from_secs(10))
+            .await
+    }
+
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the pending reservation lock excludes idle claims during exact lifecycle lookup"
+    )]
+    pub(crate) async fn recover_retiring_thread_until(
+        &self,
+        id: ThreadId,
+        deadline: Instant,
+    ) -> Result<bool, JSONRPCErrorError> {
+        let _resume = self.thread_state_manager.lock_goal_resume(id).await;
+        let reservation =
+            UnloadReservation::acquire(self.pending_thread_unloads.clone(), id).await?;
+        self.recover_reserved_retiring_thread(id, reservation, deadline)
+            .await
+    }
+
+    async fn recover_reserved_retiring_thread(
+        &self,
+        id: ThreadId,
+        reservation: UnloadReservation,
+        deadline: Instant,
+    ) -> Result<bool, JSONRPCErrorError> {
+        let candidate = self
+            .thread_state_manager
+            .retirement_candidate(id)
+            .await
+            .map_err(|reason| {
+                invalid_request(format!("thread {id} recovery unavailable: {reason}"))
+            })?;
+        let Some(candidate) = candidate else {
+            if let Ok(current) = self.thread_manager.get_thread(id).await
+                && current.is_closing()
+            {
+                return Err(invalid_request(format!(
+                    "thread {id} recovery blocked: original retirement custody unavailable"
+                )));
+            }
+            reservation.release().await;
+            return Ok(false);
+        };
+        let claim = candidate.claim;
+        let old = candidate.runtime;
+
+        // A cancelled request may leave the original retained observer unpolled.
+        // Finish observing that exact transaction only within its existing bound.
+        let report = tokio::time::timeout_at(deadline, candidate.ticket.wait())
+            .await
+            .map_err(|_| {
+                invalid_request(format!(
+                    "thread {id} recovery blocked: original retirement observation timed out"
+                ))
+            })?;
+        self.thread_state_manager
+            .record_retirement_report(claim, report)
+            .await;
+
+        if !old.retirement_is_quiescent() {
+            return Err(invalid_request(format!(
+                "thread {id} recovery blocked: task, loop or persistence cleanup is unproven"
+            )));
+        }
+        if let Some(state) = candidate.listener {
+            let mut state = state.lock().await;
+            if let Some(cancel) = state.cancel_tx.take() {
+                let _ = cancel.send(());
+            }
+        }
+        let Some(completion) = candidate.completion else {
+            return Err(invalid_request(format!(
+                "thread {id} recovery blocked: listener join custody unavailable"
+            )));
+        };
+        {
+            if tokio::time::timeout_at(deadline, completion).await != Ok(true) {
+                return Err(invalid_request(format!(
+                    "thread {id} recovery blocked: old listener has not joined"
+                )));
+            }
+        }
+        let outcome = old.reconcile_retirement_until(deadline).await;
+        if outcome == ThreadRecoveryOutcome::Ineligible {
+            return Err(invalid_request(format!(
+                "thread {id} recovery evidence changed"
+            )));
+        }
+        if !self
+            .thread_state_manager
+            .archive_retirement(claim, &old)
+            .await
+        {
+            return Err(invalid_request(format!(
+                "thread {id} recovery authority changed"
+            )));
+        }
+        // Archived custody persists even if this observer is cancelled after exact-map removal.
+        if self
+            .thread_manager
+            .remove_thread_if_same(&id, &old)
+            .await
+            .is_none()
+            && self.thread_manager.get_thread(id).await.is_ok()
+        {
+            return Err(invalid_request(format!(
+                "thread {id} recovery runtime changed"
+            )));
+        }
+        self.finalize_thread_teardown(id).await;
+        self.outgoing
+            .send_server_notification(ServerNotification::ThreadClosed(ThreadClosedNotification {
+                thread_id: id.to_string(),
+            }))
+            .await;
+        reservation.release().await;
+        Ok(true)
+    }
+}
+
+/// Owns exactly one 0.169 unload watch. Cancellation releases only this watch,
+/// never a replacement. Until cleanup runs, resume/listener attach fail closed.
+struct UnloadReservation {
+    table: crate::thread_state::PendingThreadUnloads,
+    id: ThreadId,
+    sender: tokio::sync::watch::Sender<()>,
+    released: bool,
+}
+impl UnloadReservation {
+    async fn acquire(
+        table: crate::thread_state::PendingThreadUnloads,
+        id: ThreadId,
+    ) -> Result<Self, JSONRPCErrorError> {
+        let mut pending = table.lock().await;
+        if pending.contains_key(&id) {
+            return Err(invalid_request(format!(
+                "thread {id} is closing; retry after the transition completes"
+            )));
+        }
+        let sender = tokio::sync::watch::channel(()).0;
+        pending.insert(id, sender.clone());
+        drop(pending);
+        Ok(Self {
+            table,
+            id,
+            sender,
+            released: false,
+        })
+    }
+    async fn release(mut self) {
+        Self::remove_exact(&self.table, self.id, &self.sender).await;
+        self.released = true;
+    }
+    async fn remove_exact(
+        table: &crate::thread_state::PendingThreadUnloads,
+        id: ThreadId,
+        sender: &tokio::sync::watch::Sender<()>,
+    ) {
+        let mut pending = table.lock().await;
+        if pending
+            .get(&id)
+            .is_some_and(|current| current.same_channel(sender))
+        {
+            pending.remove(&id);
+        }
+    }
+}
+impl Drop for UnloadReservation {
+    fn drop(&mut self) {
+        if !self.released {
+            let table = self.table.clone();
+            let id = self.id;
+            let sender = self.sender.clone();
+            tokio::spawn(async move {
+                Self::remove_exact(&table, id, &sender).await;
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn watch_reservation_refuses_overlap_and_cannot_remove_replacement() {
+        let table = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let id = ThreadId::new();
+        let first = UnloadReservation::acquire(table.clone(), id).await.unwrap();
+        assert!(UnloadReservation::acquire(table.clone(), id).await.is_err());
+        let replacement = tokio::sync::watch::channel(()).0;
+        table.lock().await.insert(id, replacement.clone());
+        first.release().await;
+        assert!(
+            table
+                .lock()
+                .await
+                .get(&id)
+                .unwrap()
+                .same_channel(&replacement)
+        );
+    }
+    #[tokio::test]
+    async fn cancellation_releases_original_unload_watch() {
+        let table = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let id = ThreadId::new();
+        let reservation = UnloadReservation::acquire(table.clone(), id).await.unwrap();
+        let mut completion = table.lock().await.get(&id).unwrap().subscribe();
+        drop(reservation);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), completion.changed())
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert!(!table.lock().await.contains_key(&id));
+    }
+}

@@ -1,3 +1,4 @@
+mod recovery;
 mod shutdown;
 pub(crate) use shutdown::ProcessorThreadRetirement;
 pub(crate) use shutdown::ProcessorThreadShutdown;
@@ -4286,6 +4287,9 @@ impl ThreadRequestProcessor {
     ) -> Result<ControlFlow<()>, JSONRPCErrorError> {
         let params = &request.params;
         let retention = request.retention;
+        if let Ok(id) = ThreadId::from_string(&params.thread_id) {
+            self.recover_retiring_thread(id).await?;
+        }
         if let Ok(thread_id) = ThreadId::from_string(&params.thread_id)
             && self
                 .pending_thread_unloads
@@ -5040,6 +5044,9 @@ impl ThreadRequestProcessor {
         };
 
         if let Some((existing_thread_id, existing_thread, mut source_thread)) = running_thread {
+            if self.recover_retiring_thread(existing_thread_id).await? {
+                return Ok(RunningThreadResumeResult::NotRunning(None));
+            }
             thread_resume_account::check(
                 &self.config.features,
                 app_server_client_name.as_deref(),
@@ -5089,23 +5096,12 @@ impl ThreadRequestProcessor {
                     && matches!(loaded_status, ThreadStatus::Idle)
                     && !is_running
                 {
-                    // A loaded idle thread is only a cache entry. Shut it down
-                    // before removing it so cold resume cannot duplicate a
-                    // thread that timed out during shutdown.
-                    match wait_for_thread_shutdown(&existing_thread).await {
-                        ThreadShutdownResult::Complete => {
-                            self.thread_manager.remove_thread(&existing_thread_id).await;
-                            self.finalize_thread_teardown(existing_thread_id).await;
-                            // Shutdown can flush newer rollout items, so reload the
-                            // stored thread before starting the replacement session.
-                            return Ok(RunningThreadResumeResult::NotRunning(None));
-                        }
-                        ThreadShutdownResult::SubmitFailed => {
-                            warn!("failed to submit Shutdown to thread {existing_thread_id}");
-                        }
-                        ThreadShutdownResult::TimedOut => {
-                            warn!("thread {existing_thread_id} shutdown timed out");
-                        }
+                    if self
+                        .retire_cached_thread_for_resume(existing_thread_id, &existing_thread)
+                        .await?
+                    {
+                        // Retirement can flush newer history; reread it for cold resume.
+                        return Ok(RunningThreadResumeResult::NotRunning(None));
                     }
                 }
 

@@ -105,14 +105,54 @@ impl OwnerPin {
     }
 }
 impl AuthManager {
-    // Kept crate-private until all consumers and entry fences have been qualified.
-    pub(crate) fn owner_pinned(
+    /// Capture identity, upstream revisions and renewal authority under the same
+    /// source cache custody. Pinned callers retain the original source revisions.
+    pub fn owner_admission_snapshot(&self) -> Option<(AuthOwnerSnapshot, AuthRenewalBinding)> {
+        if let Some(pin) = &self.owner_pin {
+            let (_, snapshot) = pin.snapshot().ok()?;
+            return Some((snapshot, pin.renewal.clone()));
+        }
+        let (auth, revisions, renewal) = self.renewal_snapshot()?;
+        Some((
+            AuthOwnerSnapshot {
+                auth_mode: auth.as_ref().map(CodexAuth::api_auth_mode),
+                chatgpt_user_id: auth.as_ref().and_then(CodexAuth::get_chatgpt_user_id),
+                account_id: auth.as_ref().and_then(CodexAuth::get_account_id),
+                revisions,
+            },
+            renewal,
+        ))
+    }
+
+    /// Recheck the admitted owner without reloading or resolving credentials.
+    /// Credential-only revision changes are allowed; source/login/owner changes are not.
+    pub fn verify_owner_binding(
+        self: &Arc<Self>,
+        expected: &AuthOwnerSnapshot,
+        renewal: &AuthRenewalBinding,
+    ) -> Result<(), AuthOwnerChanged> {
+        if let Some(pin) = &self.owner_pin {
+            pin.cached_auth()?;
+        }
+        let source = self.owner_pin_source().unwrap_or_else(|| Arc::clone(self));
+        OwnerPin {
+            source,
+            expected: expected.clone(),
+            renewal: renewal.clone(),
+            gateway: GatewayAdmission::NotConfigured,
+        }
+        .cached_auth()?;
+        Ok(())
+    }
+
+    /// Retain one admitted source owner; credential renewal cannot select a new login.
+    pub fn owner_pinned(
         source: &Arc<Self>,
         expected: &AuthOwnerSnapshot,
         renewal: &AuthRenewalBinding,
         gateway: GatewayAdmission,
     ) -> Result<Arc<Self>, AuthOwnerChanged> {
-        if source.owner_pin.is_some() || source.owner_snapshot().as_ref() != Some(expected) {
+        if source.owner_pin.is_some() {
             return Err(AuthOwnerChanged);
         }
         let pin = Arc::new(OwnerPin {
@@ -153,9 +193,7 @@ impl AuthManager {
         }
         m.owner_pin = Some(pin.clone());
         pin.capture()?;
-        if source.owner_snapshot().as_ref() != Some(expected) {
-            return Err(AuthOwnerChanged);
-        }
+        pin.capture()?;
         Ok(manager)
     }
     pub fn owner_pin_gateway(&self) -> Option<GatewayAdmission> {

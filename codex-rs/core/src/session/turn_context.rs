@@ -331,6 +331,183 @@ impl std::fmt::Debug for TurnEnvironment {
     }
 }
 
+/// Refusal reason shared by review admission and the reviewer request fence.
+pub(crate) const ACCOUNT_CHANGED_SINCE_ORIGIN: &str = "account changed since the originating turn";
+
+/// Refusal reason when the verifying auth manager is not the recorded one.
+pub(crate) const AUTH_MANAGER_CHANGED_SINCE_ORIGIN: &str =
+    "auth manager changed since the originating turn";
+
+/// Account owner snapshot recorded once, when a turn context is constructed
+/// (after its submission was admitted and bound to account custody). It is
+/// inserted only by the two constructors below and only read afterwards;
+/// background cells and processes retain the turn context and so read A's
+/// admission-time record. Evidence only: it never admits or derives work.
+#[derive(Debug)]
+pub(crate) struct OriginatingAccountRecord {
+    manager: std::sync::Weak<AuthManager>,
+    snapshot: Option<codex_login::AuthOwnerSnapshot>,
+    /// The renewal authority admitted with this owner (source, fixed
+    /// principal, auth mode); a detached reviewer renews only through it.
+    renewal: Option<codex_login::AuthRenewalBinding>,
+    /// The provider gateway sign-in observed at admission; a detached reviewer
+    /// resolves gateway credentials only against it, non-interactively.
+    gateway: codex_login::GatewayAdmission,
+    /// When no sign-in was observed at admission (`Unbound`): the sign-in this
+    /// turn's own first gateway resolution used. Set once; never replaced.
+    gateway_observed: std::sync::OnceLock<codex_login::OAuthSessionBinding>,
+}
+
+impl OriginatingAccountRecord {
+    pub(crate) fn capture(manager: &Arc<AuthManager>) -> Self {
+        let admission = manager.owner_admission_snapshot();
+        let source = manager
+            .owner_pin_source()
+            .unwrap_or_else(|| Arc::clone(manager));
+        Self {
+            manager: Arc::downgrade(&source),
+            snapshot: admission.as_ref().map(|(snapshot, _)| snapshot.clone()),
+            renewal: admission.map(|(_, renewal)| renewal),
+            gateway: codex_login::GatewayAdmission::NotConfigured,
+            gateway_observed: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn record_on(
+        store: &codex_extension_api::ExtensionData,
+        manager: Option<&Arc<AuthManager>>,
+        provider: &SharedModelProvider,
+    ) {
+        if let Some(manager) = manager {
+            store.insert(Self::capture_with_provider(manager, provider));
+        }
+    }
+
+    /// The admission record of a turn using `provider`, including the gateway
+    /// sign-in observed (without I/O) at this point.
+    pub(crate) fn capture_with_provider(
+        manager: &Arc<AuthManager>,
+        provider: &SharedModelProvider,
+    ) -> Self {
+        let gateway = match provider.gateway_auth_manager() {
+            Ok(Some(gateway)) => gateway.observed_admission(),
+            Ok(None) => codex_login::GatewayAdmission::NotConfigured,
+            Err(_) => codex_login::GatewayAdmission::Unbound,
+        };
+        Self {
+            gateway,
+            ..Self::capture(manager)
+        }
+    }
+
+    /// This turn's own model request resolved the gateway from `binding`. If
+    /// no sign-in was observed at admission, the first such observation becomes
+    /// the turn's origin binding (a one-time Missing -> Bound transition). A
+    /// binding recorded at admission, or already observed, is never replaced.
+    pub(crate) fn observe_gateway(&self, binding: &codex_login::OAuthSessionBinding) {
+        if matches!(self.gateway, codex_login::GatewayAdmission::Unbound) {
+            let _ = self.gateway_observed.set(binding.clone());
+        }
+    }
+
+    /// The gateway admission as of now: the binding captured at admission, or
+    /// the one this turn's own request observed, or still missing.
+    pub(crate) fn gateway_admission(&self) -> codex_login::GatewayAdmission {
+        match (&self.gateway, self.gateway_observed.get()) {
+            (codex_login::GatewayAdmission::Unbound, Some(observed)) => {
+                codex_login::GatewayAdmission::Bound(observed.clone())
+            }
+            (admission, _) => admission.clone(),
+        }
+    }
+
+    /// The renewal authority recorded with the owner at admission.
+    pub(crate) fn renewal_binding(&self) -> Option<&codex_login::AuthRenewalBinding> {
+        self.renewal.as_ref()
+    }
+
+    /// The recorded owner revision, when a snapshot was recorded.
+    pub(crate) fn owner_generation(&self) -> Option<u64> {
+        self.snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.revisions.owner_generation)
+    }
+
+    /// Exact proof against `current`: the same auth manager and an equal
+    /// admitted source/login/owner identity. Credential-only renewal is allowed.
+    pub(crate) fn verify_current(&self, current: &Arc<AuthManager>) -> Result<(), &'static str> {
+        let source = current
+            .owner_pin_source()
+            .unwrap_or_else(|| Arc::clone(current));
+        if !std::ptr::eq(self.manager.as_ptr(), Arc::as_ptr(&source)) {
+            return Err(AUTH_MANAGER_CHANGED_SINCE_ORIGIN);
+        }
+        let Some(recorded) = self.snapshot.as_ref() else {
+            return Err("originating account snapshot unavailable");
+        };
+        let renewal = self
+            .renewal
+            .as_ref()
+            .ok_or("originating renewal authority unavailable")?;
+        current
+            .verify_owner_binding(recorded, renewal)
+            .map_err(|_| ACCOUNT_CHANGED_SINCE_ORIGIN)
+    }
+
+    /// Request-time fence: the owner revision observed before credentials
+    /// were resolved and the snapshot observed after both equal the record.
+    /// `owner_generation` is monotonic, so no owner change happened in between
+    /// and the resolved credentials belong to the originating owner.
+    pub(crate) fn verify_request(
+        &self,
+        current: &Arc<AuthManager>,
+        owner_generation_before_resolution: Option<u64>,
+    ) -> Result<(), &'static str> {
+        if owner_generation_before_resolution
+            != self
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.revisions.owner_generation)
+        {
+            return Err(ACCOUNT_CHANGED_SINCE_ORIGIN);
+        }
+        self.verify_current(current)
+    }
+}
+
+impl OriginatingAccountRecord {
+    /// The originating owner's credentials for a detached review's reviewer:
+    /// an owner-pinned manager captured atomically with the owner proof,
+    /// renewed only for that owner and empty once the owner changes.
+    /// `gateway` is the review context's gateway admission, snapshotted when
+    /// that context was captured from the turn.
+    pub(crate) fn pinned_manager(
+        &self,
+        current: &Arc<AuthManager>,
+        gateway: codex_login::GatewayAdmission,
+    ) -> Result<Arc<AuthManager>, &'static str> {
+        let source = current
+            .owner_pin_source()
+            .unwrap_or_else(|| Arc::clone(current));
+        if !std::ptr::eq(self.manager.as_ptr(), Arc::as_ptr(&source)) {
+            return Err(AUTH_MANAGER_CHANGED_SINCE_ORIGIN);
+        }
+        let (Some(recorded), Some(renewal)) = (self.snapshot.as_ref(), self.renewal.as_ref())
+        else {
+            return Err("originating account snapshot unavailable");
+        };
+        self.verify_current(current)?;
+        AuthManager::owner_pinned(&source, recorded, renewal, gateway)
+            .map_err(|_| ACCOUNT_CHANGED_SINCE_ORIGIN)
+    }
+}
+
+/// A detached review's fence, carried to the reviewer through its
+/// `thread_extension_init` so the reviewer's `ModelClient` is constructed
+/// already fenced: no request made during reviewer startup (including the
+/// startup prewarm) can resolve another owner's credentials.
+pub(crate) struct ReviewerAccountFence(pub(crate) Arc<OriginatingAccountRecord>);
+
 /// Request options for one turn, separate from persistent thread settings.
 #[derive(Default)]
 pub(crate) struct NewTurnContextOptions {
@@ -445,6 +622,11 @@ impl TurnContext {
         let session_telemetry = step_settings.telemetry(&self.session_telemetry);
         let extension_data = Arc::new(codex_extension_api::ExtensionData::new(sub_id.clone()));
         extension_data.insert_arc(self.skills_snapshot());
+        OriginatingAccountRecord::record_on(
+            &extension_data,
+            self.auth_manager.as_ref(),
+            &self.provider,
+        );
         if let Some(discovery) = self.extension_data.get::<HostSkillDiscovery>() {
             extension_data.insert_arc(discovery);
         }
@@ -1160,6 +1342,7 @@ impl Session {
             session_configuration.turn_extension_init.clone(),
         ));
         extension_data.insert(skills_snapshot);
+        OriginatingAccountRecord::record_on(&extension_data, auth_manager.as_ref(), &provider);
         TurnContext {
             sub_id,
             trace_id: current_span_trace_id(),

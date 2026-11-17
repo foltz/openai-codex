@@ -4557,3 +4557,53 @@ async fn owner_pin_waiting_for_source_grant_lease_rechecks_owner_before_reading(
     assert_eq!(source.refresh_lock.available_permits(), 1);
     Ok(())
 }
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn owner_admission_allows_credential_revision_but_refuses_source_login_or_owner_change()
+-> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    for changed in ["source", "login", "owner"] {
+        let home = tempdir()?;
+        let source = native_owner_fixture(home.path(), "http://127.0.0.1:1").await?;
+        let (expected, renewal) = source.owner_admission_snapshot().unwrap();
+        // Revision-only unit witness: a token rotation does not create a new owner.
+        source
+            .auth_change_state_tx
+            .send_modify(|state| state.generation += 1);
+        assert!(source.verify_owner_binding(&expected, &renewal).is_ok());
+        let pinned = AuthManager::owner_pinned(
+            &source,
+            &expected,
+            &renewal,
+            crate::GatewayAdmission::NotConfigured,
+        )?;
+        let (captured, captured_renewal) = pinned.owner_admission_snapshot().unwrap();
+        assert_eq!(captured, source.owner_admission_snapshot().unwrap().0);
+        assert_eq!(captured_renewal, renewal);
+        assert!(pinned.verify_owner_binding(&expected, &renewal).is_ok());
+        source
+            .auth_change_state_tx
+            .send_modify(|state| match changed {
+                "source" => state.source_generation += 1,
+                "login" => state.login_generation += 1,
+                _ => state.owner_generation += 1,
+            });
+        assert!(source.verify_owner_binding(&expected, &renewal).is_err());
+        assert!(pinned.verify_owner_binding(&expected, &renewal).is_err());
+        assert!(
+            pinned.owner_admission_snapshot().is_none(),
+            "a retired pin cannot capture the replacement"
+        );
+        assert!(
+            AuthManager::owner_pinned(
+                &source,
+                &expected,
+                &renewal,
+                crate::GatewayAdmission::NotConfigured
+            )
+            .is_err()
+        );
+    }
+    Ok(())
+}

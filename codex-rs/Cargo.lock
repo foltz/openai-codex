@@ -4091,6 +4091,7 @@ dependencies = [
  "http 1.4.0",
  "jsonwebtoken",
  "keyring",
+ "libc",
  "oauth2",
  "once_cell",
  "opentelemetry_sdk",

@@ -2,6 +2,8 @@ use super::SandboxPolicy;
 use crate::JsonSchema;
 use crate::TS;
 use codex_experimental_api_macros::ExperimentalApi;
+use codex_protocol::exec_output::SandboxCleanupState as CoreSandboxCleanupState;
+use codex_protocol::exec_output::SandboxCleanupSummary as CoreSandboxCleanupSummary;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -123,6 +125,89 @@ pub struct CommandExecResponse {
     ///
     /// Empty when stderr was streamed via `command/exec/outputDelta`.
     pub stderr: String,
+    /// Owner-side cleanup report for a Linux sandbox launch.
+    ///
+    /// Present only when the command ran through the Linux sandbox launcher;
+    /// absent for unsandboxed and non-Linux commands. Independent of the
+    /// command timeout: `exitCode` 124 reports a command timeout, while
+    /// `sandboxCleanup.state == "timed_out"` reports that cleanup of the
+    /// sandbox's synthetic mount targets was not proven before the cleanup
+    /// deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub sandbox_cleanup: Option<CommandExecSandboxCleanup>,
+}
+
+/// Final state of a sandbox launch's cleanup of its synthetic mount targets:
+/// `complete` (every target removed, or never codex's), `incomplete` (a
+/// target was preserved because its removal could not be proven safe),
+/// `timed_out` (the cleanup deadline, not the command timeout, passed first;
+/// never relabelled), or `unreported` (the launcher ended without a report).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export_to = "v2/")]
+pub enum CommandExecSandboxCleanupState {
+    Complete,
+    Incomplete,
+    TimedOut,
+    Unreported,
+}
+
+impl From<CoreSandboxCleanupState> for CommandExecSandboxCleanupState {
+    fn from(value: CoreSandboxCleanupState) -> Self {
+        match value {
+            CoreSandboxCleanupState::Complete => Self::Complete,
+            CoreSandboxCleanupState::Incomplete => Self::Incomplete,
+            CoreSandboxCleanupState::TimedOut => Self::TimedOut,
+            CoreSandboxCleanupState::Unreported => Self::Unreported,
+        }
+    }
+}
+
+/// Structured cleanup summary for one Linux sandbox launch, collected by the
+/// launch owner. Carries only a state and counts: no paths or handles.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct CommandExecSandboxCleanup {
+    /// Overall cleanup outcome.
+    pub state: CommandExecSandboxCleanupState,
+    /// Targets this launch installed and removed (or found already gone).
+    pub reaped: u32,
+    /// Targets preserved as unproven (incomplete or still pending).
+    pub preserved_unproven: u32,
+    /// Targets that were never codex's and were left untouched.
+    pub host_owned: u32,
+    /// Targets still held by another live launch, which releases them.
+    pub handed_off: u32,
+    /// Targets retained because the cleanup deadline passed.
+    pub timed_out: u32,
+    /// Every cleanup helper of the launch was observed to exit before the
+    /// owner's deadline.
+    pub joined: bool,
+}
+
+impl From<CoreSandboxCleanupSummary> for CommandExecSandboxCleanup {
+    fn from(value: CoreSandboxCleanupSummary) -> Self {
+        let CoreSandboxCleanupSummary {
+            state,
+            reaped,
+            preserved_unproven,
+            host_owned,
+            handed_off,
+            timed_out,
+            joined,
+        } = value;
+        Self {
+            state: state.into(),
+            reaped,
+            preserved_unproven,
+            host_owned,
+            handed_off,
+            timed_out,
+            joined,
+        }
+    }
 }
 
 /// Write stdin bytes to a running `command/exec` session, close stdin, or

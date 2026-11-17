@@ -207,6 +207,17 @@ fn test_bundle() -> CloudConfigBundle {
     }
 }
 
+fn bundle_with_model(model: &str) -> CloudConfigBundle {
+    let mut bundle = test_bundle();
+    bundle
+        .config_toml
+        .enterprise_managed
+        .first_mut()
+        .expect("model fixture fragment")
+        .contents = format!("model = {model:?}");
+    bundle
+}
+
 fn test_config_fragment() -> CloudConfigFragment {
     CloudConfigFragment {
         id: "cfg_1".to_string(),
@@ -272,10 +283,13 @@ async fn superseded_staged_cache_write_cannot_replace_newer_service_bundle() {
             .expect("stage older cache");
         staged.send(()).expect("announce staging");
         resumed.await.expect("resume older writer");
-        output
-            .publish_if_current(revision)
-            .await
-            .expect("discard older cache");
+        assert!(
+            !output
+                .publish_if_current(revision)
+                .await
+                .expect("discard older cache"),
+            "a superseded revision must report no commit"
+        );
     });
     staging.await.expect("older cache is staged");
     service
@@ -340,10 +354,13 @@ async fn retired_policy_discards_staged_cache_and_retains_previous_payload() {
             }
         });
     loader.retire_ema_policy();
-    output
-        .publish_if_current(revision)
-        .await
-        .expect("discard retired cache");
+    assert!(
+        !output
+            .publish_if_current(revision)
+            .await
+            .expect("discard retired cache"),
+        "a retired revision must report no commit"
+    );
     assert_eq!(
         service
             .cache

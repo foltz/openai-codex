@@ -189,17 +189,23 @@ pub(super) struct StagedCloudConfigBundleCache {
 }
 
 impl StagedCloudConfigBundleCache {
+    /// True only if the guarded persistence closure actually committed. Legacy
+    /// policy callers may discard a stale revision without an error; strict
+    /// service callers must distinguish that from a successful publication.
     pub(super) async fn publish_if_current(
         self,
         revision: CloudConfigBundlePolicyRevision,
-    ) -> Result<(), CloudConfigBundleCacheError> {
+    ) -> Result<bool, CloudConfigBundleCacheError> {
         tokio::task::spawn_blocking(move || {
+            let mut committed = false;
             revision.commit_if_current(|| {
                 self.temporary
                     .persist(self.destination)
-                    .map(|_| ())
-                    .map_err(|_| CloudConfigBundleCacheError)
-            })
+                    .map_err(|_| CloudConfigBundleCacheError)?;
+                committed = true;
+                Ok(())
+            })?;
+            Ok::<bool, CloudConfigBundleCacheError>(committed)
         })
         .await
         .map_err(|_| CloudConfigBundleCacheError)?

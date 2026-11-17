@@ -176,8 +176,9 @@ async fn product_streams_send_concurrently_and_preserve_event_order() {
             &products,
             Some(
                 manager
-                    .auth_change_state_receiver()
-                    .borrow()
+                    .owner_snapshot()
+                    .expect("fixture owner")
+                    .revisions
                     .owner_generation,
             ),
             /*runtime_auth*/ None,

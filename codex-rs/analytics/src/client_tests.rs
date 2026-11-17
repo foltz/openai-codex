@@ -539,8 +539,9 @@ async fn api_key_auth_sends_only_plugin_events_to_codex_backend() {
         &ThreadProducts::default(),
         Some(
             auth_manager
-                .auth_change_state_receiver()
-                .borrow()
+                .owner_snapshot()
+                .expect("fixture owner")
+                .revisions
                 .owner_generation,
         ),
         /*runtime_auth*/ None,
@@ -1279,8 +1280,9 @@ async fn account_switch_between_batches_does_not_send_old_credentials() {
         &ThreadProducts::default(),
         Some(
             manager
-                .auth_change_state_receiver()
-                .borrow()
+                .owner_snapshot()
+                .expect("fixture owner")
+                .revisions
                 .owner_generation,
         ),
         /*runtime_auth*/ None,

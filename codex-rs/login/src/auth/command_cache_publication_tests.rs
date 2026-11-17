@@ -3,7 +3,7 @@ use super::super::command_store;
 use super::*;
 use base64::Engine;
 
-fn record(generation: u64) -> Envelope {
+pub(super) fn record(generation: u64) -> Envelope {
     use sha2::Digest;
     let expires_at = chrono::Utc::now().timestamp() + 3600;
     let body = serde_json::json!({"exp": expires_at, "jti": generation, "https://api.openai.com/auth": {
@@ -27,7 +27,10 @@ fn record(generation: u64) -> Envelope {
 }
 
 #[cfg(unix)]
-fn selected_fixture(home: &Path, record: Envelope) -> (Arc<CommandSource>, Arc<AuthManager>) {
+pub(super) fn selected_fixture(
+    home: &Path,
+    record: Envelope,
+) -> (Arc<CommandSource>, Arc<AuthManager>) {
     let auth = record.auth().unwrap();
     command_store::commit(home, &record, &auth).unwrap();
     let source = Arc::new(CommandSource::for_owner_tests(home, record));

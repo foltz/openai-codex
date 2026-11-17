@@ -2864,8 +2864,8 @@ impl AuthManager {
             "mode": auth.as_ref().map(CodexAuth::api_auth_mode),
             "accountId": auth.as_ref().and_then(CodexAuth::get_account_id),
             "principal": auth.as_ref().and_then(CodexAuth::get_chatgpt_user_id),
-            // Command-provider receipt integration is a separate required port.
-            "provider": null,
+            "provider": self.command_source.as_ref()
+                .map_or(serde_json::Value::Null, |source| source.receipt(auth.as_ref())),
             "stateKnown": state_known,
         })
     }
@@ -2996,6 +2996,14 @@ impl AuthManager {
     /// a guarded reload and then refreshes only if the on-disk auth is unchanged.
     #[instrument(level = "trace", skip_all)]
     pub async fn auth(&self) -> Option<CodexAuth> {
+        if let Some(source) = &self.command_source {
+            self.reload_inner().await.ok()?;
+            let auth = self.auth_cached()?;
+            self.require_command_mode_allowed().ok()?;
+            let external = self.external_auth_provider()?;
+            self.validate_external_auth(&auth, external.as_ref()).ok()?;
+            return source.usable_auth(Some(&auth)).then_some(auth);
+        }
         if self.has_external_auth() {
             self.reload_inner().await.ok()?;
             return self.auth_cached();
@@ -3373,6 +3381,16 @@ impl AuthManager {
         &self,
         cached_auth: Option<&CodexAuth>,
     ) -> Result<Option<CodexAuth>, RefreshTokenError> {
+        if self.command_source.is_some() {
+            self.require_command_mode_allowed()?;
+            let external = self.external_auth_provider().ok_or_else(|| {
+                permanent_external_auth_error("selected command auth provider unavailable")
+            })?;
+            return self
+                .resolve_external_auth(external.as_ref())
+                .await
+                .map(Some);
+        }
         if let Some(external_auth) = self.external_auth_provider() {
             let cached_auth = self.auth_cached();
             if cached_auth
@@ -4156,6 +4174,11 @@ impl AuthManager {
         &self,
         external_auth: Arc<dyn ExternalAuth>,
     ) -> Result<(), RefreshTokenError> {
+        if self.command_source.is_some() {
+            return Err(permanent_external_auth_error(
+                "command auth cannot be replaced at runtime",
+            ));
+        }
         if self.workload_identity_selected {
             return Err(permanent_external_auth_error(
                 "workload identity auth cannot be replaced at runtime",
@@ -4181,7 +4204,7 @@ impl AuthManager {
     }
 
     pub fn clear_external_auth(&self) {
-        if self.workload_identity_selected {
+        if self.workload_identity_selected || self.command_source.is_some() {
             return;
         }
         if let Ok(mut external_auth) = self.external_auth.write()
@@ -4353,6 +4376,23 @@ impl AuthManager {
 
     pub fn unauthorized_recovery(self: &Arc<Self>) -> UnauthorizedRecovery {
         UnauthorizedRecovery::new(Arc::clone(self))
+    }
+
+    fn require_command_mode_allowed(&self) -> Result<(), RefreshTokenError> {
+        if self.command_source.is_none() {
+            return Ok(());
+        }
+        let modes = self
+            .allowed_auth_modes
+            .read()
+            .map_err(|_| std::io::Error::other("credential policy unavailable"))?;
+        if modes
+            .as_ref()
+            .is_some_and(|modes| !modes.contains(&AuthMode::ChatgptAuthTokens))
+        {
+            return Err(permanent_external_auth_error("command auth mode forbidden"));
+        }
+        Ok(())
     }
 
     fn external_auth_provider(&self) -> Option<Arc<dyn ExternalAuth>> {
@@ -4561,6 +4601,12 @@ impl AuthManager {
     }
 
     fn ensure_logout_allowed(&self) -> std::io::Result<()> {
+        if self.command_source.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "command auth is managed by the host and cannot be logged out",
+            ));
+        }
         if self.workload_identity_selected {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -4633,6 +4679,11 @@ impl AuthManager {
     }
 
     fn commit_external_auth(&self, auth: CodexAuth) -> Result<(), RefreshTokenError> {
+        if self.command_source.is_some() {
+            self.try_set_cached_auth(Some(auth))
+                .map_err(RefreshTokenError::Transient)?;
+            return Ok(());
+        }
         if auth.is_external_chatgpt_tokens() {
             let auth_dot_json = auth.get_current_auth_json().ok_or_else(|| {
                 RefreshTokenError::Transient(std::io::Error::other(
@@ -4781,3 +4832,7 @@ mod command_authority_tests;
 #[cfg(test)]
 #[path = "command_cache_publication_tests.rs"]
 mod command_cache_publication_tests;
+
+#[cfg(test)]
+#[path = "command_source_fence_tests.rs"]
+mod command_source_fence_tests;

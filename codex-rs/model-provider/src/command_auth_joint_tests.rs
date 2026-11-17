@@ -61,7 +61,7 @@ async fn selected_command_live_callback_uses_actual_rejection_and_refuses_missin
         "e30.{}.signature",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string())
     );
-    let envelope = serde_json::json!({"version":1,"source":"source","binding":"fixture#example","account":"account","principal":"principal","generation":1,"access_token":token,"expires_at":expiration,"fingerprint":format!("{:x}",sha2::Sha256::digest(token.as_bytes()))});
+    let envelope = serde_json::json!({"version":1,"source":"source","binding":"fixture#example","account":"account","principal":"principal","generation":1,"accessToken":token,"expiresAt":expiration,"fingerprint":format!("{:x}",sha2::Sha256::digest(token.as_bytes()))});
     // This is a versioned on-disk compatibility fixture, validated by the real
     // command selector; no private test authority or mocked provider is used.
     let record = serde_json::json!({"auth_mode":"chatgptAuthTokens","tokens":{"id_token":token,"access_token":token,"refresh_token":"","account_id":"account"},"external_auth_owner":envelope});

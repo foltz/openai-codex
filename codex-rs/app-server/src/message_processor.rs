@@ -1693,7 +1693,9 @@ impl MessageProcessor {
                             | ClientRequest::ManagedTransitionRead { .. }
                             | ClientRequest::ManagedTransitionCancel { .. }
                     );
-                // Keep queued requests small to avoid large stack temporaries during construction.
+                // Box the dispatch future before wrapping it in account/auth scopes.
+                // Otherwise each generic wrapper embeds the full RPC enum future
+                // and creates large nested stack temporaries during polling.
                 let result = originator
                     .scope(Box::pin(crate::account_turn_admission::within_request(
                         account_work_permit,
@@ -1702,15 +1704,15 @@ impl MessageProcessor {
                                 .thread_manager
                                 .derive_request_operation_work()
                                 .map_err(|_| account_transition_in_progress())?;
-                            let operation = processor_for_request
-                                .handle_initialized_client_request(
+                            let operation =
+                                Box::pin(processor_for_request.handle_initialized_client_request(
                                     connection_request_id,
                                     codex_request,
                                     request_context,
                                     session,
                                     event_stream_ready,
                                     managed_transition_caller_authorized,
-                                );
+                                ));
                             let result = if transition_auth {
                                 crate::auth_task_work::scope_with_ticket(
                                     auth_ticket,

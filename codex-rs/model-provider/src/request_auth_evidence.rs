@@ -1,12 +1,16 @@
 //! Request-local evidence from authenticated output, never telemetry or a cache.
-use codex_api::{
-    AuthError, AuthHeaderTelemetry, AuthHeadersFuture, AuthProvider, AuthProviderFuture,
-    AuthRefreshFuture, SharedAuthProvider,
-};
+use codex_api::AuthError;
+use codex_api::AuthHeaderTelemetry;
+use codex_api::AuthHeadersFuture;
+use codex_api::AuthProvider;
+use codex_api::AuthProviderFuture;
+use codex_api::AuthRefreshFuture;
+use codex_api::SharedAuthProvider;
 use codex_http_client::Request;
 use codex_login::AuthCredentialFingerprint;
 use http::HeaderMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
 
 /// Evidence only; retains no auth provider, credentials or finite account root.
 /// Create a fresh pair per API attempt. Never share one recorder between

@@ -31,8 +31,10 @@ async fn failed_or_panicked_workers_never_become_clean_on_retry() {
 
 #[tokio::test]
 async fn compaction_drops_join_panic_payload_outside_owner_lock() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Weak};
+    use std::sync::Arc;
+    use std::sync::Weak;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
     struct Payload {
         owner: Weak<Retirement>,
         outside: Arc<AtomicBool>,

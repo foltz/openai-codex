@@ -260,22 +260,24 @@ async fn account_event_is_present_at_the_exact_reopen_point() {
     let permits = coordinator.account_work_permits.clone();
     let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let observed_at_reopen = Arc::clone(&observed);
-    coordinator.account_work_permits.observe_next_reopen(Box::new(move || {
-        let _work = permits.try_acquire().expect("account work is now admitted");
-        let OutgoingEnvelope::Broadcast {
-            message: OutgoingMessage::AppServerNotification(envelope),
-        } = rx
-            .try_recv()
-            .expect("publication must precede reopened admission")
-        else {
-            panic!("expected account notification");
-        };
-        assert!(matches!(
-            envelope.notification,
-            ServerNotification::AccountUpdated(_)
-        ));
-        observed_at_reopen.store(true, Ordering::Release);
-    }));
+    coordinator
+        .account_work_permits
+        .observe_next_reopen(Box::new(move || {
+            let _work = permits.try_acquire().expect("account work is now admitted");
+            let OutgoingEnvelope::Broadcast {
+                message: OutgoingMessage::AppServerNotification(envelope),
+            } = rx
+                .try_recv()
+                .expect("publication must precede reopened admission")
+            else {
+                panic!("expected account notification");
+            };
+            assert!(matches!(
+                envelope.notification,
+                ServerNotification::AccountUpdated(_)
+            ));
+            observed_at_reopen.store(true, Ordering::Release);
+        }));
     assert!(matches!(
         coordinator.start_dispatch(start, true).await,
         StartManagedTransitionResponse::Accepted { .. }

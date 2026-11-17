@@ -1,20 +1,29 @@
 use super::DeferredWorkerTransport;
+use crate::InProcessTransportFactory;
+use crate::PhysicalRetirementOutcome;
+use crate::RmcpClient;
+use crate::RmcpClientRetirement;
 use crate::retirement::AcknowledgedTransport;
-use crate::{
-    InProcessTransportFactory, PhysicalRetirementOutcome, RmcpClient, RmcpClientRetirement,
-};
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use pretty_assertions::assert_eq;
 use rmcp::model::ClientJsonRpcMessage;
 use rmcp::service::RoleClient;
-use rmcp::transport::worker::{Worker, WorkerContext, WorkerQuitReason};
-use rmcp::transport::{Transport, WorkerTransport};
+use rmcp::transport::Transport;
+use rmcp::transport::WorkerTransport;
+use rmcp::transport::worker::Worker;
+use rmcp::transport::worker::WorkerContext;
+use rmcp::transport::worker::WorkerQuitReason;
 use std::io;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader, DuplexStream};
+use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncReadExt;
+use tokio::io::BufReader;
+use tokio::io::DuplexStream;
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
 

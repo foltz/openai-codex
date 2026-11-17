@@ -744,10 +744,12 @@ mod tests {
     use super::helper_read_roots;
     use super::sandbox_cwd;
 
-    use super::{
-        SandboxCleanupState, SandboxCleanupSummary, SandboxLaunch, record_fs_helper_cleanup,
-        record_fs_helper_launch, with_fs_helper_cleanup_receipt,
-    };
+    use super::SandboxCleanupState;
+    use super::SandboxCleanupSummary;
+    use super::SandboxLaunch;
+    use super::record_fs_helper_cleanup;
+    use super::record_fs_helper_launch;
+    use super::with_fs_helper_cleanup_receipt;
 
     fn cleanup_complete() -> SandboxCleanupSummary {
         SandboxCleanupSummary {

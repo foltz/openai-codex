@@ -4,7 +4,8 @@
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use tokio::task::AbortHandle;
 
 use futures::FutureExt;

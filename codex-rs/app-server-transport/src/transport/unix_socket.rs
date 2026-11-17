@@ -5,8 +5,10 @@ use std::io::ErrorKind;
 use std::io::Result as IoResult;
 use std::path::Path;
 
+use super::ConnectionProvenance;
+use super::PeerExecutableIdentity;
+use super::TransportEvent;
 use super::provenance::identities_match;
-use super::{ConnectionProvenance, PeerExecutableIdentity, TransportEvent};
 use crate::transport::websocket::run_websocket_connection;
 use crate::websocket_compression::WEBSOCKET_COMPRESSION_HEADER;
 use crate::websocket_compression::WebSocketCompression;

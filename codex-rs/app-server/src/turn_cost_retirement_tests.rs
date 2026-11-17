@@ -1,6 +1,8 @@
 use super::*;
-use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::time::{Duration, Instant};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use tokio::time::Duration;
+use tokio::time::Instant;
 
 #[tokio::test(start_paused = true)]
 async fn timeout_retains_the_original_until_later_positive_join() {

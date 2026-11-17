@@ -1,5 +1,6 @@
 #![cfg(unix)]
-use super::command_cache_publication_tests::{record, selected_fixture};
+use super::command_cache_publication_tests::record;
+use super::command_cache_publication_tests::selected_fixture;
 use super::*;
 use std::sync::atomic::AtomicUsize;
 

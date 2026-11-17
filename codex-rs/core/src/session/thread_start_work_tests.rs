@@ -1,9 +1,13 @@
 //! Real callback dispatch with synthetic finite account owners; no provider execution.
 use super::*;
-use codex_extension_api::{ExtensionData, ExtensionFuture};
-use codex_mcp::{McpAttemptRefused, McpAttemptWork};
+use codex_extension_api::ExtensionData;
+use codex_extension_api::ExtensionFuture;
+use codex_mcp::McpAttemptRefused;
+use codex_mcp::McpAttemptWork;
 use codex_protocol::protocol::SessionSource;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 #[derive(Default)]
 struct Counts {

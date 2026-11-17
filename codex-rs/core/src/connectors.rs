@@ -1,5 +1,6 @@
 mod private_discovery;
-pub use private_discovery::{AppDiscoveryRetirement, AppDiscoveryTerminationReport};
+pub use private_discovery::AppDiscoveryRetirement;
+pub use private_discovery::AppDiscoveryTerminationReport;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::LazyLock;

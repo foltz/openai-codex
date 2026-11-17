@@ -1,10 +1,14 @@
 //! Original auth-task custody supplied by a finite host invocation, never a provider factory.
-use crate::error::{CodexErr, Result};
-pub use crate::host_auth_work::{
-    AuthTaskBlocking, AuthTaskFailure, AuthTaskFuture, AuthTaskObservation, AuthTaskSpawner,
-};
+use crate::error::CodexErr;
+use crate::error::Result;
+pub use crate::host_auth_work::AuthTaskBlocking;
+pub use crate::host_auth_work::AuthTaskFailure;
+pub use crate::host_auth_work::AuthTaskFuture;
+pub use crate::host_auth_work::AuthTaskObservation;
+pub use crate::host_auth_work::AuthTaskSpawner;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
 use tokio::sync::oneshot;
 
 /// Cloning shares the same finite admitted root; it does not reopen admission.
@@ -529,7 +533,8 @@ pub async fn spawn<T: Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
 
     #[tokio::test]
     async fn unmanaged_blocking_call_keeps_legacy_thread_and_does_not_enter_managed_scope() {
@@ -629,7 +634,8 @@ mod tests {
 #[cfg(test)]
 mod named_thread_tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
     #[tokio::test]
     async fn independent_named_thread_keeps_name_and_no_auth_scope() {
         let (send, receive) = oneshot::channel();
@@ -764,7 +770,9 @@ mod named_thread_tests {
 #[cfg(test)]
 mod blocking_refusal_tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
 
     #[derive(Debug, Default)]
     struct Host {

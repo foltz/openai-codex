@@ -1,5 +1,7 @@
 #[cfg(unix)]
-use super::command_cache_publication_tests::{record, selected_fixture};
+use super::command_cache_publication_tests::record;
+#[cfg(unix)]
+use super::command_cache_publication_tests::selected_fixture;
 use super::*;
 
 #[test]

@@ -1606,11 +1606,17 @@ async fn eager_session_start_preserves_environment_hooks(
     let response = if stopped {
         None
     } else {
-        Some(mount_sse_once(&server, sse(vec![
-            ev_response_created("environment-start"),
-            ev_assistant_message("environment-message", "after environment start"),
-            ev_completed("environment-start"),
-        ])).await)
+        Some(
+            mount_sse_once(
+                &server,
+                sse(vec![
+                    ev_response_created("environment-start"),
+                    ev_assistant_message("environment-message", "after environment start"),
+                    ev_completed("environment-start"),
+                ]),
+            )
+            .await,
+        )
     };
     let test = test_codex()
         .with_pre_build_hook(move |home| {
@@ -1623,12 +1629,19 @@ async fn eager_session_start_preserves_environment_hooks(
             if local {
                 trust_discovered_hooks(config);
             } else {
-                config.features.enable(Feature::CodexHooks).expect("enable hooks");
+                config
+                    .features
+                    .enable(Feature::CodexHooks)
+                    .expect("enable hooks");
             }
         })
-        .build(&server).await?;
+        .build(&server)
+        .await?;
     if local {
-        assert_eq!(read_session_start_hook_inputs(test.codex_home_path())?.len(), 1);
+        assert_eq!(
+            read_session_start_hook_inputs(test.codex_home_path())?.len(),
+            1
+        );
     }
     let environment_log = test.codex_home_path().join("environment_start_log.jsonl");
     let environment_script = test.codex_home_path().join("environment_start.py");
@@ -1637,14 +1650,23 @@ async fn eager_session_start_preserves_environment_hooks(
     } else {
         r#"print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "owned environment startup context"}}))"#
     };
-    fs::write(&environment_script, format!(
-        "import json, sys\nfrom pathlib import Path\npayload = json.load(sys.stdin)\nwith Path({:?}).open('a') as f: f.write(json.dumps(payload) + '\\n')\n{stop_output}\n",
-        environment_log.to_string_lossy(),
-    ))?;
+    fs::write(
+        &environment_script,
+        format!(
+            "import json, sys\nfrom pathlib import Path\npayload = json.load(sys.stdin)\nwith Path({:?}).open('a') as f: f.write(json.dumps(payload) + '\\n')\n{stop_output}\n",
+            environment_log.to_string_lossy(),
+        ),
+    )?;
     assert!(!environment_log.exists());
-    let selection = test.codex.environment_selections().await.into_iter().next()
+    let selection = test
+        .codex
+        .environment_selections()
+        .await
+        .into_iter()
+        .next()
         .context("selected environment")?;
-    let mut config = core_test_support::test_codex::environment_config_for_selection(&test.config, &selection);
+    let mut config =
+        core_test_support::test_codex::environment_config_for_selection(&test.config, &selection);
     config.environment_hooks = serde_json::from_value(json!({
         "SessionStart": [{"hooks": [{
             "type": "command",
@@ -1652,27 +1674,59 @@ async fn eager_session_start_preserves_environment_hooks(
         }]}]
     }))?;
     test.codex.environment_ready(&selection, config).await?;
-    test.codex.start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
-        text: "first prompt after eager start".to_string(), text_elements: Vec::new(),
-    }])).await?;
-    wait_for_event(&test.codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
-    let inputs = fs::read_to_string(&environment_log)?.lines()
-        .map(serde_json::from_str::<Value>).collect::<std::result::Result<Vec<_>, _>>()?;
-    assert_eq!(inputs.len(), 1, "environment SessionStart runs once on the first turn");
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "first prompt after eager start".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    let inputs = fs::read_to_string(&environment_log)?
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    assert_eq!(
+        inputs.len(),
+        1,
+        "environment SessionStart runs once on the first turn"
+    );
     assert_eq!(inputs[0]["hook_event_name"], "SessionStart");
     assert_eq!(inputs[0]["source"], "startup");
-    assert!(inputs[0]["transcript_path"].is_null(), "controller transcript path stays private");
+    assert!(
+        inputs[0]["transcript_path"].is_null(),
+        "controller transcript path stays private"
+    );
     if local {
-        assert_eq!(read_session_start_hook_inputs(test.codex_home_path())?.len(), 1,
-            "the first turn must not rerun an eager local hook");
+        assert_eq!(
+            read_session_start_hook_inputs(test.codex_home_path())?.len(),
+            1,
+            "the first turn must not rerun an eager local hook"
+        );
     }
     if stopped {
-        assert!(server.received_requests().await.unwrap_or_default().is_empty(),
-            "either SessionStart stop prevents sampling");
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "either SessionStart stop prevents sampling"
+        );
     } else {
-        let body = response.as_ref().expect("response mock").single_request().body_json();
-        assert!(body["input"].to_string().contains("owned environment startup context"),
-            "environment context must reach the first model request");
+        let body = response
+            .as_ref()
+            .expect("response mock")
+            .single_request()
+            .body_json();
+        assert!(
+            body["input"]
+                .to_string()
+                .contains("owned environment startup context"),
+            "environment context must reach the first model request"
+        );
     }
     Ok(())
 }

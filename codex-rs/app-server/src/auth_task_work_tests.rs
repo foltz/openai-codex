@@ -1,6 +1,8 @@
 use super::*;
-use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::time::{Duration, Instant};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use tokio::time::Duration;
+use tokio::time::Instant;
 
 #[tokio::test]
 async fn refused_auth_descendant_cannot_be_compacted_into_clean_producer_join() {

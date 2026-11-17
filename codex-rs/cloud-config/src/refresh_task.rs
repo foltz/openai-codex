@@ -1,11 +1,16 @@
 //! Share observation of one original refresh join; no detached reaper.
 use futures::FutureExt;
-use futures::future::{BoxFuture, Shared};
+use futures::future::BoxFuture;
+use futures::future::Shared;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
-use tokio::task::{AbortHandle, JoinError, JoinHandle};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::task::Context;
+use std::task::Poll;
+use tokio::task::AbortHandle;
+use tokio::task::JoinError;
+use tokio::task::JoinHandle;
 
 /// Fixed terminal causes; no retained backend text or opaque panic payload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

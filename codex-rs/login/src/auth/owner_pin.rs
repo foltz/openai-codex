@@ -1,5 +1,6 @@
 //! A detached caller retains one source owner; it cannot select or mutate another.
-use super::super::{AuthOwnerChanged, AuthOwnerSnapshot};
+use super::super::AuthOwnerChanged;
+use super::super::AuthOwnerSnapshot;
 use super::*;
 use crate::GatewayAdmission;
 

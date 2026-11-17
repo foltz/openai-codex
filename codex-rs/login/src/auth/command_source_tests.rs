@@ -137,9 +137,9 @@ fn command_source_accepts_only_its_selected_complete_principal() {
 #[cfg(unix)]
 #[test]
 fn cache_guard_retains_source_state_and_the_actual_native_writer_domain() {
-    use super::super::storage::{
-        ManagedAuthStorageError, ManagedAuthStorageFailure, acquire_command_auth_source,
-    };
+    use super::super::storage::ManagedAuthStorageError;
+    use super::super::storage::ManagedAuthStorageFailure;
+    use super::super::storage::acquire_command_auth_source;
     let home = TempDir::new().unwrap();
     let record = envelope(1);
     let auth = record.auth().unwrap();

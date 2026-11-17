@@ -1,7 +1,8 @@
 #![recursion_limit = "256"]
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
-use crate::standalone_shutdown::{STANDALONE_STAGE_CAPS, StandaloneShutdownOwner};
+use crate::standalone_shutdown::STANDALONE_STAGE_CAPS;
+use crate::standalone_shutdown::StandaloneShutdownOwner;
 use codex_arg0::Arg0DispatchPaths;
 use codex_code_mode::CodeModeSessionProvider;
 use codex_code_mode::GrpcCodeModeSessionProvider;

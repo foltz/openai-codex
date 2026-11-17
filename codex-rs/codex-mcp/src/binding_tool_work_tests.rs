@@ -1,14 +1,23 @@
 //! Prepared-call invocation custody. Local wire peer, no account/provider/OS sandbox.
 use super::*;
+use crate::McpAttemptAccess;
+use crate::McpAttemptRefused;
+use crate::McpAttemptRequirement;
+use crate::McpAttemptWork;
 use pretty_assertions::assert_eq;
-use crate::{McpAttemptAccess, McpAttemptRefused, McpAttemptRequirement, McpAttemptWork};
-use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, ClientCapabilities, Implementation,
-    InitializeRequestParams, ServerCapabilities, ServerConfig,
-};
+use rmcp::RoleServer;
+use rmcp::ServerHandler;
+use rmcp::ServiceExt;
+use rmcp::model::CallToolRequestParams;
+use rmcp::model::CallToolResponse;
+use rmcp::model::ClientCapabilities;
+use rmcp::model::Implementation;
+use rmcp::model::InitializeRequestParams;
+use rmcp::model::ServerCapabilities;
+use rmcp::model::ServerConfig;
 use rmcp::service::RequestContext;
-use rmcp::{RoleServer, ServerHandler, ServiceExt};
-use std::sync::{Mutex, atomic::AtomicUsize};
+use std::sync::Mutex;
+use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 #[derive(Default)]
 struct Counts {

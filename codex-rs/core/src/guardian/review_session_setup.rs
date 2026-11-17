@@ -10,7 +10,8 @@ use std::sync::atomic::AtomicBool;
 
 use super::*;
 use crate::guardian::input_budget::CheckpointRecovery;
-use crate::session::turn_context::{OriginatingAccountRecord, ReviewerAccountFence};
+use crate::session::turn_context::OriginatingAccountRecord;
+use crate::session::turn_context::ReviewerAccountFence;
 use codex_features::Feature;
 use codex_guardian_reviewer::ReviewerPool;
 use codex_guardian_reviewer::ReviewerRequest;

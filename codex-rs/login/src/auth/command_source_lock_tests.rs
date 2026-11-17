@@ -76,7 +76,8 @@ fn command_and_managed_guards_share_immediate_contention_without_reading_auth() 
 #[cfg(unix)]
 #[test]
 fn command_guard_refuses_symlink_hardlink_and_nonprivate_lock_files() -> anyhow::Result<()> {
-    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::symlink;
     let home = tempdir()?;
     let target = home.path().join("unrelated");
     std::fs::write(&target, "unrelated-sentinel")?;

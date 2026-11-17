@@ -77,11 +77,12 @@ fn admit_retry_from_host(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codex_extension_api::{HostOperationWork, TurnStartAdmission, TurnWorkRefused};
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
+    use codex_extension_api::HostOperationWork;
+    use codex_extension_api::TurnStartAdmission;
+    use codex_extension_api::TurnWorkRefused;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
     #[derive(Debug)]
     struct Work(Arc<AtomicUsize>);
     impl Drop for Work {

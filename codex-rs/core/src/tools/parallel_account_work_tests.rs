@@ -1,19 +1,25 @@
 //! Actual spawned tool dispatch and callback custody with synthetic account work.
 use super::*;
 use crate::session::step_context::StepContext;
-use crate::tools::context::{FunctionToolOutput, ToolInvocation};
-use crate::tools::registry::{CoreToolRuntime, ToolExecutor, ToolRegistry};
+use crate::tools::context::FunctionToolOutput;
+use crate::tools::context::ToolInvocation;
+use crate::tools::registry::CoreToolRuntime;
+use crate::tools::registry::ToolExecutor;
+use crate::tools::registry::ToolRegistry;
 use crate::tools::router::ToolRouter;
 use crate::turn_diff_tracker::TurnDiffTracker;
-use codex_extension_api::{
-    ExtensionData, ExtensionFuture, HostOperationWork, ToolCallOutcome, TurnStartAdmission,
-    TurnWorkRefused,
-};
+use codex_extension_api::ExtensionData;
+use codex_extension_api::ExtensionFuture;
+use codex_extension_api::HostOperationWork;
+use codex_extension_api::ToolCallOutcome;
+use codex_extension_api::TurnStartAdmission;
+use codex_extension_api::TurnWorkRefused;
 use codex_protocol::host_turn_work::HostTurnWork;
 use codex_protocol::openai_models::ToolMode;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 use tokio::sync::Notify;
 

@@ -1,6 +1,7 @@
 //! Installation refuses before persistence or OAuth; no credentials or peer.
 use super::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 struct Refused(AtomicUsize);
 impl codex_mcp::McpAttemptWork for Refused {
     fn derive_attempt(

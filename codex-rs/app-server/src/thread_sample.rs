@@ -520,7 +520,8 @@ mod child_tests {
 
     #[tokio::test]
     async fn closed_task_owner_refuses_sample_birth_without_polling_child() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
         let tasks = ProcessorTasks::default();
         tasks.close_registration().unwrap();
         let gate = Arc::new(ConnectionRpcGate::new());
@@ -547,7 +548,8 @@ mod child_tests {
 
     #[tokio::test]
     async fn dropped_sample_reply_observer_does_not_discard_owned_original() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
         let tasks = ProcessorTasks::default();
         let gate = Arc::new(ConnectionRpcGate::new());
         let entered = Arc::new(tokio::sync::Notify::new());

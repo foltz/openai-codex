@@ -1,4 +1,5 @@
-pub use codex_protocol::exec_output::{SandboxCleanupState, SandboxCleanupSummary};
+pub use codex_protocol::exec_output::SandboxCleanupState;
+pub use codex_protocol::exec_output::SandboxCleanupSummary;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -1469,7 +1470,8 @@ mod base64_bytes {
 
 #[cfg(test)]
 mod tests {
-    use super::{SandboxCleanupState, SandboxCleanupSummary};
+    use super::SandboxCleanupState;
+    use super::SandboxCleanupSummary;
     fn timed_out_cleanup_summary() -> SandboxCleanupSummary {
         SandboxCleanupSummary {
             state: SandboxCleanupState::TimedOut,

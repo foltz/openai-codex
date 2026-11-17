@@ -177,7 +177,8 @@ async fn reusable_callback_takes_each_invoking_root_not_its_factory_root() {
 async fn callback_closed_ticket_refuses_body_and_records_sticky_failure() {
     use crate::account_work_permits::AccountWorkPermits;
     use crate::processor_task_retirement::ProcessorTasks;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
     let tasks = ProcessorTasks::default();
     let permits = AccountWorkPermits::new();
     let access = callback_access(&tasks, &permits);
@@ -343,7 +344,8 @@ async fn retained_queued_callback_keeps_account_work_until_body_completion() {
 #[tokio::test]
 async fn retained_callback_refuses_missing_auth_custody_before_polling_effects() {
     use codex_extension_api::TurnStartAdmission;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
     let tasks = crate::processor_task_retirement::ProcessorTasks::default();
     let work = crate::account_turn_admission::AccountTurnAdmission {
         shutdown: Default::default(),

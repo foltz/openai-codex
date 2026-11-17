@@ -5,8 +5,8 @@
 //! history-facing `/status` surface.
 
 use super::*;
-use crate::bottom_pane::footer_content::FooterContent;
 use crate::bottom_pane::StatusLineConfigEntry;
+use crate::bottom_pane::footer_content::FooterContent;
 use crate::status::thread_cost_micros;
 
 impl ChatWidget {
@@ -122,11 +122,18 @@ impl ChatWidget {
     /// Applies status-line item selection from the setup view to in-memory config.
     ///
     /// An empty selection persists as an explicit empty list.
-    pub(crate) fn setup_status_line(&mut self, items: Vec<StatusLineConfigEntry>, use_theme_colors: bool) {
+    pub(crate) fn setup_status_line(
+        &mut self,
+        items: Vec<StatusLineConfigEntry>,
+        use_theme_colors: bool,
+    ) {
         tracing::info!(
             "status line setup confirmed with items: {items:#?}, use_theme_colors: {use_theme_colors}"
         );
-        let ids = items.iter().map(StatusLineConfigEntry::raw_config).collect::<Vec<_>>();
+        let ids = items
+            .iter()
+            .map(StatusLineConfigEntry::raw_config)
+            .collect::<Vec<_>>();
         self.config_panel_tui.status_line = Some(ids.clone());
         self.config_panel_tui.status_line_use_colors = use_theme_colors;
         self.local_settings.tui.status_line = Some(ids);

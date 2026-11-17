@@ -1,13 +1,20 @@
 //! Actual Core startup -> provider -> counted original auth join, not a counter-only substitute.
-use crate::account_turn_admission::{AccountTurnAdmission, within_request};
+use crate::account_turn_admission::AccountTurnAdmission;
+use crate::account_turn_admission::within_request;
 use crate::account_turn_work::AccountTurnWork;
 use crate::account_work_permits::AccountWorkPermits;
 use crate::managed_transition::DRAIN_DEADLINE;
-use crate::processor_task_retirement::{ProcessorTaskTicket, ProcessorTasks};
-use codex_extension_api::{ExtensionRegistryBuilder, TurnStartAdmission};
-use codex_login::{AuthManager, CodexAuth, ExternalAuth};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Weak};
+use crate::processor_task_retirement::ProcessorTaskTicket;
+use crate::processor_task_retirement::ProcessorTasks;
+use codex_extension_api::ExtensionRegistryBuilder;
+use codex_extension_api::TurnStartAdmission;
+use codex_login::AuthManager;
+use codex_login::CodexAuth;
+use codex_login::ExternalAuth;
+use std::sync::Arc;
+use std::sync::Weak;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
@@ -1203,7 +1210,8 @@ struct HeldRecommendation {
 }
 impl HeldRecommendation {
     async fn start() -> anyhow::Result<Self> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let base = format!("http://{}", listener.local_addr()?);
         let entered = Arc::new(Semaphore::new(0));
@@ -1809,7 +1817,8 @@ async fn actual_retained_operation_runs_its_tail_after_blocking_caller_cancellat
 
 #[tokio::test]
 async fn recommendation_fixture_idle_connection_cannot_drop_held_request() -> anyhow::Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
     let fixture = HeldRecommendation::start().await?;
     let address = fixture.base.strip_prefix("http://").unwrap();
     let idle = tokio::net::TcpStream::connect(address).await?;

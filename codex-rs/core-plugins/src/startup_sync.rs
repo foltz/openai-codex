@@ -1199,7 +1199,8 @@ fn extract_zipball_to_dir(bytes: &[u8], destination: &Path) -> Result<(), String
                 output_path.display()
             )
         })?;
-        use std::io::{Read, Write};
+        use std::io::Read;
+        use std::io::Write;
         let mut buffer = [0_u8; 64 * 1024];
         loop {
             ensure_not_stopped("the next curated archive data chunk")?;

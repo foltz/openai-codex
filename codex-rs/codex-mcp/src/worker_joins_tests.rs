@@ -1,7 +1,9 @@
 use super::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::Notify;
+use tokio::sync::Semaphore;
 
 fn count(snapshot: &McpWorkerSnapshot, kind: McpWorkerKind) -> &McpWorkerCounts {
     snapshot.counts.iter().find(|c| c.kind == kind).unwrap()

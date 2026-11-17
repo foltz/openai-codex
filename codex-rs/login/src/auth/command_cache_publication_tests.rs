@@ -1,4 +1,5 @@
-use super::super::command_source::{CommandSource, Envelope};
+use super::super::command_source::CommandSource;
+use super::super::command_source::Envelope;
 use super::super::command_store;
 use super::*;
 use base64::Engine;

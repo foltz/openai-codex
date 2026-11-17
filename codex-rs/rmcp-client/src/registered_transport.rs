@@ -1,23 +1,31 @@
 //! Reserve and retain physical attempts without replacing upstream handshake policy.
-use super::{RawPendingTransport, RmcpClient, TransportRecipe};
+use super::RawPendingTransport;
+use super::RmcpClient;
+use super::TransportRecipe;
 use crate::elicitation_client_service::ElicitationClientService;
 use crate::http_client_adapter::StreamableHttpClientAdapter;
 use crate::oauth::OAuthRuntime;
-use crate::retirement::{
-    AcknowledgedTransport, ManagedRunningService, PhysicalAttemptTicket, RmcpClientRetirement,
-    TransportCloseReceipt,
-};
+use crate::retirement::AcknowledgedTransport;
+use crate::retirement::ManagedRunningService;
+use crate::retirement::PhysicalAttemptTicket;
+use crate::retirement::RmcpClientRetirement;
+use crate::retirement::TransportCloseReceipt;
 use crate::stdio_server_launcher::StdioServerTransport;
-use anyhow::{Result, anyhow};
-use rmcp::service::{
-    ClientCacheConfig, RoleClient, RunningService, RxJsonRpcMessage, TxJsonRpcMessage,
-};
+use anyhow::Result;
+use anyhow::anyhow;
+use rmcp::service::ClientCacheConfig;
+use rmcp::service::RoleClient;
+use rmcp::service::RunningService;
+use rmcp::service::RxJsonRpcMessage;
+use rmcp::service::TxJsonRpcMessage;
+use rmcp::transport::Transport;
+use rmcp::transport::WorkerTransport;
 use rmcp::transport::auth::AuthClient;
-use rmcp::transport::streamable_http_client::{
-    StreamableHttpClient, StreamableHttpClientTransportConfig, StreamableHttpClientWorker,
-};
-use rmcp::transport::worker::{CloseDeadline, Worker};
-use rmcp::transport::{Transport, WorkerTransport};
+use rmcp::transport::streamable_http_client::StreamableHttpClient;
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+use rmcp::transport::streamable_http_client::StreamableHttpClientWorker;
+use rmcp::transport::worker::CloseDeadline;
+use rmcp::transport::worker::Worker;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio_util::sync::CancellationToken;

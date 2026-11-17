@@ -1565,5 +1565,4 @@ mod tests {
 
         assert_eq!(error.to_string(), super::MANAGED_UPDATE_DISABLED_MESSAGE);
     }
-
 }

@@ -2174,7 +2174,9 @@ async fn managed_constructor_exhausted_request_refuses_before_task_birth() {
 
 #[tokio::test]
 async fn agent_constructor_retains_exact_parent_work_across_held_mcp_and_caller_loss() {
-    use crate::agent::api::{AgentControl, AgentInput, SpawnRequest};
+    use crate::agent::api::AgentControl;
+    use crate::agent::api::AgentInput;
+    use crate::agent::api::SpawnRequest;
     use crate::agent::types::SpawnAgentOptions;
     let (_home, manager, mut config) = expiry_manager(/*ephemeral*/ true).await;
     let mut mcp = HeldRequiredMcp::install(&mut config).await;
@@ -2230,7 +2232,9 @@ async fn agent_constructor_retains_exact_parent_work_across_held_mcp_and_caller_
 
 #[tokio::test]
 async fn expired_parent_refuses_real_agent_constructor_before_mcp_or_publication() {
-    use crate::agent::api::{AgentControl, AgentInput, SpawnRequest};
+    use crate::agent::api::AgentControl;
+    use crate::agent::api::AgentInput;
+    use crate::agent::api::SpawnRequest;
     use crate::agent::types::SpawnAgentOptions;
     let (_home, manager, mut config) = expiry_manager(/*ephemeral*/ true).await;
     let mcp = HeldRequiredMcp::install(&mut config).await;
@@ -2264,7 +2268,9 @@ async fn expired_parent_refuses_real_agent_constructor_before_mcp_or_publication
 
 #[tokio::test]
 async fn explicit_empty_parent_capture_never_falls_back_to_required_manager_request() {
-    use crate::agent::api::{AgentControl, AgentInput, SpawnRequest};
+    use crate::agent::api::AgentControl;
+    use crate::agent::api::AgentInput;
+    use crate::agent::api::SpawnRequest;
     use crate::agent::types::SpawnAgentOptions;
     let (_home, mut manager, config) = expiry_manager(/*ephemeral*/ true).await;
     let (mut parent, _) = crate::session::tests::make_session_and_context().await;

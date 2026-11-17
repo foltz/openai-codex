@@ -386,7 +386,8 @@ mod auth_custody_tests {
     use crate::account_turn_work::AccountTurnWork;
     use crate::account_work_permits::AccountWorkPermits;
     use crate::processor_task_retirement::ProcessorTasks;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
 
     #[tokio::test]
     async fn unsupported_attempt_refuses_before_startup_is_polled() {

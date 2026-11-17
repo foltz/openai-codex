@@ -14,15 +14,20 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
-use self::registered_transport::{
-    DeferredHttpTransport, PendingTransport, RegisteredTransport, bind_service,
-    create_registered_transport, deferred_http_transport, retain_phase,
-};
+use self::registered_transport::DeferredHttpTransport;
+use self::registered_transport::PendingTransport;
+use self::registered_transport::RegisteredTransport;
+use self::registered_transport::bind_service;
+use self::registered_transport::create_registered_transport;
+use self::registered_transport::deferred_http_transport;
+use self::registered_transport::retain_phase;
 use crate::AuthProviderResolver;
-use crate::retirement::{
-    DEFAULT_RETIREMENT_TIMEOUT, ManagedRunningService, PhysicalRetirementReport,
-    RmcpClientRetirement, ServiceOperationLease, WeakRmcpClientRetirement,
-};
+use crate::retirement::DEFAULT_RETIREMENT_TIMEOUT;
+use crate::retirement::ManagedRunningService;
+use crate::retirement::PhysicalRetirementReport;
+use crate::retirement::RmcpClientRetirement;
+use crate::retirement::ServiceOperationLease;
+use crate::retirement::WeakRmcpClientRetirement;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;

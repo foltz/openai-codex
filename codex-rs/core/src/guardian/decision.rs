@@ -238,7 +238,8 @@ pub(crate) fn terminal_owner_fence(
 mod owner_fence_tests {
     use super::*;
     use crate::session::turn_context::OriginatingAccountRecord;
-    use codex_login::{AuthManager, CodexAuth};
+    use codex_login::AuthManager;
+    use codex_login::CodexAuth;
 
     #[tokio::test]
     async fn detached_approval_is_withdrawn_after_source_logout_but_denials_are_preserved() {

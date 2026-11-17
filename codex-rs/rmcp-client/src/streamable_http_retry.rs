@@ -16,8 +16,10 @@ use crate::http_client_adapter::StreamableHttpClientAdapterError;
 use crate::oauth::OAuthRuntime;
 
 use super::InitializeContext;
+use super::PendingTransport;
+use super::RegisteredTransport;
 use super::RmcpClient;
-use super::{PendingTransport, RegisteredTransport, create_registered_transport};
+use super::create_registered_transport;
 
 const JSON_RPC_INTERNAL_ERROR_CODE: i64 = -32603;
 pub(super) const STREAMABLE_HTTP_RETRY_DELAYS_MS: [u64; 2] = [250, 1_000];

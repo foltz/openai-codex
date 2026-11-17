@@ -1,11 +1,14 @@
 //! Phase-level authority forwarding; all account work is synthetic.
 use super::*;
 use crate::session::tests::make_session_and_context;
-use codex_extension_api::{
-    ExtensionData, ExtensionFuture, HostOperationWork, TurnStartAdmission, TurnWorkRefused,
-};
+use codex_extension_api::ExtensionData;
+use codex_extension_api::ExtensionFuture;
+use codex_extension_api::HostOperationWork;
+use codex_extension_api::TurnStartAdmission;
+use codex_extension_api::TurnWorkRefused;
 use codex_protocol::host_turn_work::HostTurnWork;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 #[derive(Debug, Default)]
 struct Gate {

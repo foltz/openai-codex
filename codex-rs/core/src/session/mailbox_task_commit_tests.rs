@@ -2,8 +2,11 @@
 
 use super::*;
 use crate::state::TaskKind;
-use crate::tasks::{SessionTask, SessionTaskResult};
-use codex_extension_api::{ExtensionFuture, TurnLifecycleContributor, TurnStartInput};
+use crate::tasks::SessionTask;
+use crate::tasks::SessionTaskResult;
+use codex_extension_api::ExtensionFuture;
+use codex_extension_api::TurnLifecycleContributor;
+use codex_extension_api::TurnStartInput;
 use codex_protocol::host_turn_work::HostTurnWork;
 use codex_protocol::protocol::InterAgentCommunication;
 use std::sync::Mutex as SyncMutex;

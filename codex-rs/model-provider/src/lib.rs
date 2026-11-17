@@ -1,13 +1,23 @@
 mod amazon_bedrock;
 mod auth;
 mod auth_task;
-pub use auth_task::{
-    AuthBlockingCallError, AuthTaskAccess, AuthTaskBlocking, AuthTaskFailure, AuthTaskFuture,
-    AuthTaskObservation, AuthTaskSpawner, DeferredAuthTask, prepare_deferred_auth_task,
-    record_auth_task_failure, run_auth_call, run_blocking_call, run_blocking_call_with_scope,
-    spawn_named_auth_thread, spawn_provider_task, spawn_provider_task_with_access,
-    with_auth_task_scope,
-};
+pub use auth_task::AuthBlockingCallError;
+pub use auth_task::AuthTaskAccess;
+pub use auth_task::AuthTaskBlocking;
+pub use auth_task::AuthTaskFailure;
+pub use auth_task::AuthTaskFuture;
+pub use auth_task::AuthTaskObservation;
+pub use auth_task::AuthTaskSpawner;
+pub use auth_task::DeferredAuthTask;
+pub use auth_task::prepare_deferred_auth_task;
+pub use auth_task::record_auth_task_failure;
+pub use auth_task::run_auth_call;
+pub use auth_task::run_blocking_call;
+pub use auth_task::run_blocking_call_with_scope;
+pub use auth_task::spawn_named_auth_thread;
+pub use auth_task::spawn_provider_task;
+pub use auth_task::spawn_provider_task_with_access;
+pub use auth_task::with_auth_task_scope;
 mod bearer_auth_provider;
 mod capabilities;
 mod catalog_factory;
@@ -21,7 +31,8 @@ mod models_endpoint;
 mod models_identity;
 mod provider;
 mod request_auth_evidence;
-pub use request_auth_evidence::{RequestAuthEvidence, observe_request_auth};
+pub use request_auth_evidence::RequestAuthEvidence;
+pub use request_auth_evidence::observe_request_auth;
 mod request_preparation;
 mod request_setup;
 mod runtime_auth;

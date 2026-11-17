@@ -130,7 +130,9 @@ pub use recommended_plugin_install::hydrate_selected_recommended_plugin_install_
 pub use remote::RecommendedPlugin;
 pub use remote::RecommendedPluginsMode;
 pub use remote_metadata::remote_catalog_metadata_eq;
-pub use retirement::{PluginTaskDrain, PluginTaskRegistry, WorkerStop};
+pub use retirement::PluginTaskDrain;
+pub use retirement::PluginTaskRegistry;
+pub use retirement::WorkerStop;
 pub use script_attribution::PluginCommandAttribution;
 pub use script_attribution::PluginMeasurementTarget;
 pub use script_attribution::TrustedPluginRoots;

@@ -94,7 +94,8 @@ async fn rejection_keeps_original_grant_when_another_manager_replaces_sign_in() 
 }
 #[tokio::test]
 async fn concurrent_direct_replacement_is_not_overwritten_by_refresh_completion() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
     let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();

@@ -1,11 +1,14 @@
-use crate::thread_state::{
-    RetentionAcquireOutcome, RetentionAuthorityError, RetentionGrantId, RetentionPrincipalId,
-    RetentionPrincipalOwner, RetentionReleaseOutcome,
-};
-use codex_app_server_protocol::{
-    ThreadRetentionAcquireParams, ThreadRetentionAcquireResponse, ThreadRetentionRefusalReason,
-    ThreadRetentionReleaseParams, ThreadRetentionReleaseResponse,
-};
+use crate::thread_state::RetentionAcquireOutcome;
+use crate::thread_state::RetentionAuthorityError;
+use crate::thread_state::RetentionGrantId;
+use crate::thread_state::RetentionPrincipalId;
+use crate::thread_state::RetentionPrincipalOwner;
+use crate::thread_state::RetentionReleaseOutcome;
+use codex_app_server_protocol::ThreadRetentionAcquireParams;
+use codex_app_server_protocol::ThreadRetentionAcquireResponse;
+use codex_app_server_protocol::ThreadRetentionRefusalReason;
+use codex_app_server_protocol::ThreadRetentionReleaseParams;
+use codex_app_server_protocol::ThreadRetentionReleaseResponse;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::future::Future;
@@ -13,7 +16,8 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 
-use crate::account_dependency::{AccountDependency, classify};
+use crate::account_dependency::AccountDependency;
+use crate::account_dependency::classify;
 use crate::attestation::app_server_attestation_provider;
 use crate::config_manager::ConfigManager;
 use crate::connection_rpc_gate::ConnectionRpcGate;
@@ -2861,7 +2865,8 @@ mod intake_binding_tests;
 #[cfg(test)]
 mod managed_caller_session_tests {
     use super::*;
-    use crate::transport::{ConnectionOrigin, ConnectionProvenance};
+    use crate::transport::ConnectionOrigin;
+    use crate::transport::ConnectionProvenance;
     use codex_app_server_transport::PeerExecutableIdentity;
 
     #[test]

@@ -1,13 +1,18 @@
 use super::*;
 use crate::account_work_permits::AccountWorkPermits;
 use crate::processor_task_retirement::ProcessorTasks;
-use codex_extension_api::{
-    ExtensionRegistryBuilder, HostOperationWork, TurnStartAdmission, TurnWorkRefused,
-};
-use codex_login::{AuthManager, CodexAuth, ExternalAuth};
+use codex_extension_api::ExtensionRegistryBuilder;
+use codex_extension_api::HostOperationWork;
+use codex_extension_api::TurnStartAdmission;
+use codex_extension_api::TurnWorkRefused;
+use codex_login::AuthManager;
+use codex_login::CodexAuth;
+use codex_login::ExternalAuth;
 use codex_models_manager::manager::RefreshStrategy;
 use pretty_assertions::assert_eq;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio::time::Instant;

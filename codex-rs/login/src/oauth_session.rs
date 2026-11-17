@@ -33,7 +33,8 @@ use url::Url;
 
 #[path = "oauth_session_domain.rs"]
 mod domain;
-use domain::{CredentialDomain, GrantIdentity};
+use domain::CredentialDomain;
+use domain::GrantIdentity;
 
 #[path = "oauth_session_callback.rs"]
 mod callback;

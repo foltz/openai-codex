@@ -1,7 +1,11 @@
 //! Shared token-free sign-in continuity with short read-observation guards.
 use std::collections::HashMap;
 use std::io;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
+use std::sync::OnceLock;
+use std::sync::Weak;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct GrantIdentity {

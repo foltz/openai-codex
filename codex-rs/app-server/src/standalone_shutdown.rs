@@ -64,7 +64,9 @@ pub(crate) const STANDALONE_STAGE_CAPS: StageCaps = StageCaps {
 
 pub(crate) use crate::shutdown_intake::OwnerLatch;
 #[cfg(test)]
-use crate::shutdown_intake::{install_intake_latch, spawn_signal_intake};
+use crate::shutdown_intake::install_intake_latch;
+#[cfg(test)]
+use crate::shutdown_intake::spawn_signal_intake;
 
 /// Processor-side shutdown and control-queue submissions. Each is bounded by
 /// the ORIGINAL latched deadline (expiry checked first; before the edge is

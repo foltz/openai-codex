@@ -78,7 +78,8 @@ fn decode_shell_output(bytes: &[u8]) -> String {
 
 #[test]
 fn sandbox_cleanup_summary_roundtrips_only_typed_counts_and_join_evidence() {
-    use super::{SandboxCleanupState, SandboxCleanupSummary};
+    use super::SandboxCleanupState;
+    use super::SandboxCleanupSummary;
     for (state, wire) in [
         (SandboxCleanupState::Complete, "complete"),
         (SandboxCleanupState::Incomplete, "incomplete"),

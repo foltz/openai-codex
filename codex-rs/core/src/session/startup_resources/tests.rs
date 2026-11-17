@@ -1,6 +1,7 @@
 use super::*;
 use pretty_assertions::assert_eq;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 #[tokio::test]

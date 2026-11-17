@@ -1354,8 +1354,12 @@ fn evidence_request() -> ResponsesApiRequest {
 
 #[tokio::test]
 async fn http_rejection_evidence_is_actual_auth_not_lease_setup() -> Result<()> {
-    use wiremock::matchers::{header, method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::header;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/responses"))
@@ -1437,8 +1441,11 @@ async fn reused_websocket_retains_original_handshake_evidence() -> Result<()> {
 
 #[tokio::test]
 async fn failed_websocket_open_preserves_actual_rejected_auth() -> Result<()> {
-    use wiremock::matchers::{header, method};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::header;
+    use wiremock::matchers::method;
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(header("authorization", "Bearer test-api-key"))

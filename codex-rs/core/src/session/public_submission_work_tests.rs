@@ -4,12 +4,19 @@
 use super::*;
 use crate::CodexThread;
 use crate::session::tests::make_session_and_context;
-use codex_extension_api::{ExtensionData, ExtensionFuture, TurnStartAdmission, TurnWorkRefused};
+use codex_extension_api::ExtensionData;
+use codex_extension_api::ExtensionFuture;
+use codex_extension_api::TurnStartAdmission;
+use codex_extension_api::TurnWorkRefused;
 use codex_protocol::host_turn_work::HostTurnWork;
-use codex_protocol::turn_input::{NotSubmittedReason, StartIfIdleSubmission, SteerSubmission};
+use codex_protocol::turn_input::NotSubmittedReason;
+use codex_protocol::turn_input::StartIfIdleSubmission;
+use codex_protocol::turn_input::SteerSubmission;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 #[derive(Debug)]

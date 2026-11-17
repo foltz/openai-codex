@@ -184,7 +184,8 @@ fn guard_observes_lock_file_replacement_without_claiming_validity() -> anyhow::R
 #[cfg(unix)]
 #[test]
 fn guard_refuses_symlink_hardlink_and_nonprivate_lock_files() -> anyhow::Result<()> {
-    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::symlink;
     let home = tempdir()?;
     let target = home.path().join("unrelated");
     std::fs::write(&target, "unrelated-sentinel")?;

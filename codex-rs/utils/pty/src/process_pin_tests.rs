@@ -1,6 +1,8 @@
 //! Spawn identity custody; pidfd claims are Linux-only.
 #[cfg(unix)]
-use crate::{SpawnedProcess, TerminalSize};
+use crate::SpawnedProcess;
+#[cfg(unix)]
+use crate::TerminalSize;
 #[cfg(unix)]
 use std::collections::HashMap;
 #[cfg(unix)]

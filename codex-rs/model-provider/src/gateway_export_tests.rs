@@ -1,6 +1,7 @@
 //! Actual exporter-process/cache boundaries with synthetic owners and owned files.
 use super::*;
-use codex_login::{AuthManager, CodexAuth};
+use codex_login::AuthManager;
+use codex_login::CodexAuth;
 use std::num::NonZeroU64;
 use std::path::Path;
 use std::time::Duration;

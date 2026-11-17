@@ -292,10 +292,13 @@ impl StatusSurfacePreviewData {
             }
         });
         status_line_from_segments(
-            segments, use_theme_colors, self.thread_id,
+            segments,
+            use_theme_colors,
+            self.thread_id,
             self.live_value_for(StatusSurfacePreviewItem::PullRequestNumber)
                 .and(self.pull_request_url.as_deref()),
-        ).map(FooterContent::HyperlinkLine)
+        )
+        .map(FooterContent::HyperlinkLine)
     }
 }
 

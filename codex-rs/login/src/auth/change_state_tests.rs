@@ -403,7 +403,8 @@ fn owner_snapshot_keeps_upstream_source_and_login_revisions() {
 #[cfg(unix)]
 #[test]
 fn owner_checked_command_read_refuses_stale_durable_record() {
-    use super::command_cache_publication_tests::{record, selected_fixture};
+    use super::command_cache_publication_tests::record;
+    use super::command_cache_publication_tests::selected_fixture;
     let home = tempfile::tempdir().unwrap();
     let (_, manager) = selected_fixture(home.path(), record(1));
     let admitted = manager.owner_snapshot().unwrap();

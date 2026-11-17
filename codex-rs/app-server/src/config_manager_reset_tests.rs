@@ -1,9 +1,11 @@
 //! Real configuration/reset participant controls; no whole-inventory claim.
 use super::*;
 use crate::managed_transition::ResetInventoryError;
-use codex_config::{CloudConfigBundleLoadError, CloudConfigBundleLoadErrorCode};
+use codex_config::CloudConfigBundleLoadError;
+use codex_config::CloudConfigBundleLoadErrorCode;
 use codex_features::Feature;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::AssertUnwindSafe;
+use std::panic::catch_unwind;
 
 #[tokio::test]
 async fn reset_refuses_invalid_configuration_instead_of_startup_defaults() {

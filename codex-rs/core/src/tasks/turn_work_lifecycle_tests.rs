@@ -1,8 +1,10 @@
 //! Logical terminal forwarding without widening private lifecycle methods.
 use crate::session::tests::make_session_and_context;
-use codex_extension_api::{ExtensionFuture, TurnStartAdmission};
+use codex_extension_api::ExtensionFuture;
+use codex_extension_api::TurnStartAdmission;
 use futures::FutureExt;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
 
 #[derive(Debug)]
 struct TerminalHost(Arc<Mutex<Vec<String>>>);

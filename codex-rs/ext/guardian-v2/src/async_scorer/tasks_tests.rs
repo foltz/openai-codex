@@ -1,7 +1,9 @@
 //! Physical future destruction and admission fencing, with no provider or helper.
 use super::*;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 struct Payload {

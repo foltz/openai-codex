@@ -1,6 +1,8 @@
 //! Auth-child scope derived from the caller's existing finite operation.
 use codex_mcp::McpAttemptWork;
-use codex_model_provider::{AuthTaskAccess, AuthTaskFailure, with_auth_task_scope};
+use codex_model_provider::AuthTaskAccess;
+use codex_model_provider::AuthTaskFailure;
+use codex_model_provider::with_auth_task_scope;
 use codex_protocol::error::Result;
 use std::future::Future;
 
@@ -57,7 +59,8 @@ pub(crate) async fn scope<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
     struct Unsupported;
     impl McpAttemptWork for Unsupported {
         fn derive_attempt(

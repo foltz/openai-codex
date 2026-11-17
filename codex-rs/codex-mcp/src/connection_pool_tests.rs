@@ -2169,7 +2169,10 @@ async fn account_required_and_ungated_clients_cannot_share_a_pool_key() {
 
 #[tokio::test]
 async fn physical_continuation_keeps_admitted_account_work_after_chat_cancellation() {
-    use crate::{McpAttemptAccess, McpAttemptRefused, McpAttemptRequirement, McpAttemptWork};
+    use crate::McpAttemptAccess;
+    use crate::McpAttemptRefused;
+    use crate::McpAttemptRequirement;
+    use crate::McpAttemptWork;
     struct Work(Arc<AtomicUsize>, Arc<AtomicBool>);
     impl McpAttemptWork for Work {
         fn derive_attempt(&self) -> Result<Box<dyn McpAttemptWork>, McpAttemptRefused> {

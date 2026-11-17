@@ -516,7 +516,8 @@ mod tests {
         use codex_file_system::FileSystemReadStream;
         use codex_file_system::ReadStreamOutcome;
         use codex_file_system::SandboxLaunch;
-        use codex_protocol::exec_output::{SandboxCleanupState, SandboxCleanupSummary};
+        use codex_protocol::exec_output::SandboxCleanupState;
+        use codex_protocol::exec_output::SandboxCleanupSummary;
         let census = Arc::new(SandboxCleanupCensus::default());
         let receipts = PendingStreamReceipts::new(Arc::clone(&census), true);
         let complete = SandboxCleanupSummary {

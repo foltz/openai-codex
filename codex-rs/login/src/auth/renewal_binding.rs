@@ -114,7 +114,8 @@ impl AuthManager {
 
 #[cfg(test)]
 mod tests {
-    use super::super::command_cache_publication_tests::{record, selected_fixture};
+    use super::super::command_cache_publication_tests::record;
+    use super::super::command_cache_publication_tests::selected_fixture;
     use super::*;
     #[test]
     fn native_binding_is_stable_without_inventing_external_authority() {
@@ -672,7 +673,8 @@ mod invocation_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn command_bound_invocation_refuses_missing_proof_without_mutation() {
-        use super::super::command_cache_publication_tests::{record, selected_fixture};
+        use super::super::command_cache_publication_tests::record;
+        use super::super::command_cache_publication_tests::selected_fixture;
         let home = tempfile::tempdir().unwrap();
         let (_, manager) = selected_fixture(home.path(), record(1));
         let before = manager.owner_snapshot().unwrap();
@@ -690,7 +692,8 @@ mod invocation_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn command_old_request_proof_accepts_already_published_current_record() {
-        use super::super::command_cache_publication_tests::{record, selected_fixture};
+        use super::super::command_cache_publication_tests::record;
+        use super::super::command_cache_publication_tests::selected_fixture;
         let home = tempfile::tempdir().unwrap();
         let (_, manager) = selected_fixture(home.path(), record(1));
         let before = manager.owner_snapshot().unwrap();
@@ -705,7 +708,8 @@ mod invocation_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn command_current_rejection_cannot_claim_same_cache_recovery() {
-        use super::super::command_cache_publication_tests::{record, selected_fixture};
+        use super::super::command_cache_publication_tests::record;
+        use super::super::command_cache_publication_tests::selected_fixture;
         let home = tempfile::tempdir().unwrap();
         let (source, manager) = selected_fixture(home.path(), record(1));
         let before = manager.owner_snapshot().unwrap();

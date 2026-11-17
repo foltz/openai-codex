@@ -4,10 +4,14 @@
 use crate::store::PLUGINS_CACHE_DIR;
 use std::collections::HashMap;
 use std::io;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::OnceLock;
 use tokio::sync::watch;
-use tokio::time::{Instant, timeout_at};
+use tokio::time::Instant;
+use tokio::time::timeout_at;
 
 type Authority = Arc<Mutex<ResetAuthority>>;
 static AUTHORITIES: OnceLock<Mutex<HashMap<PathBuf, Authority>>> = OnceLock::new();

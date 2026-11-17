@@ -1,10 +1,14 @@
 //! Adapter to the existing original-join ledger and shared account work, not another registry.
-use crate::processor_task_retirement::{ProcessorTaskJoin, ProcessorTaskTicket, ProcessorTasks};
+use crate::processor_task_retirement::ProcessorTaskJoin;
+use crate::processor_task_retirement::ProcessorTaskTicket;
+use crate::processor_task_retirement::ProcessorTasks;
 use codex_extension_api::HostOperationWork;
-use codex_model_provider::{
-    AuthTaskAccess, AuthTaskBlocking, AuthTaskFailure, AuthTaskFuture, AuthTaskObservation,
-    AuthTaskSpawner,
-};
+use codex_model_provider::AuthTaskAccess;
+use codex_model_provider::AuthTaskBlocking;
+use codex_model_provider::AuthTaskFailure;
+use codex_model_provider::AuthTaskFuture;
+use codex_model_provider::AuthTaskObservation;
+use codex_model_provider::AuthTaskSpawner;
 use std::future::Future;
 use std::sync::Arc;
 

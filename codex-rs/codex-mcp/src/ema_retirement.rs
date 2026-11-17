@@ -3,7 +3,8 @@
 
 use codex_rmcp_client::EmaRequestAuthority;
 use futures::FutureExt;
-use futures::future::{BoxFuture, Shared};
+use futures::future::BoxFuture;
+use futures::future::Shared;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::OnceLock;

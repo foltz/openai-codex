@@ -1,8 +1,11 @@
 //! Retirement for the private app-list routine, not general MCP termination.
 //! Only connectors.rs can construct through this control. Its local runtime
 //! uses a fresh context without a shared pool and never opens event streams.
-use codex_mcp::{McpRuntime, McpRuntimeRetirement, RuntimeWorkerDrainReport};
-use std::sync::{Arc, Mutex};
+use codex_mcp::McpRuntime;
+use codex_mcp::McpRuntimeRetirement;
+use codex_mcp::RuntimeWorkerDrainReport;
+use std::sync::Arc;
+use std::sync::Mutex;
 use tokio::time::Instant;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

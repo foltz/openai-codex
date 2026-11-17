@@ -1,7 +1,9 @@
 //! Synchronous resources retained by the host's cancellable preparation future.
 
 use std::any::Any;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::Weak;
 
 struct State {
     open: bool,
@@ -82,7 +84,8 @@ impl Drop for TurnPreparationOwner {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
 
     struct Resource(Arc<AtomicUsize>);
     impl Drop for Resource {

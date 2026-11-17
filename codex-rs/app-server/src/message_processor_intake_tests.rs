@@ -206,7 +206,9 @@ async fn connection_drain_preserves_handler_panic_and_half_close_unanswered() {
 
 #[tokio::test]
 async fn not_admitted_refusal_reports_exact_recipient_and_router_loss() {
-    use crate::outgoing_message::{ConnectionId, OutgoingEnvelope, OutgoingMessage};
+    use crate::outgoing_message::ConnectionId;
+    use crate::outgoing_message::OutgoingEnvelope;
+    use crate::outgoing_message::OutgoingMessage;
     use codex_app_server_protocol::RequestId;
 
     let home = TempDir::new().unwrap();

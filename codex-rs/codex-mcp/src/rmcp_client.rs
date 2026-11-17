@@ -13,7 +13,8 @@
 mod managed_client;
 #[path = "rmcp_client/startup_work.rs"]
 mod startup_work;
-use crate::{McpAttemptAccess, McpAttemptRequirement};
+use crate::McpAttemptAccess;
+use crate::McpAttemptRequirement;
 pub(crate) use startup_work::ClientStartup;
 pub(crate) use startup_work::physical_continuation;
 

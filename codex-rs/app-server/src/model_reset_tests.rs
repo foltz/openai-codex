@@ -1,7 +1,11 @@
 use super::*;
-use codex_models_manager::manager::{ModelsManager, ModelsManagerFuture, StaticModelsManager};
-use codex_models_manager::{CatalogModel, ModelsManagerConfig};
-use codex_protocol::openai_models::{ModelInfo, ModelsResponse};
+use codex_models_manager::CatalogModel;
+use codex_models_manager::ModelsManagerConfig;
+use codex_models_manager::manager::ModelsManager;
+use codex_models_manager::manager::ModelsManagerFuture;
+use codex_models_manager::manager::StaticModelsManager;
+use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::openai_models::ModelsResponse;
 use std::sync::Mutex as StdMutex;
 
 #[derive(Debug)]

@@ -1,7 +1,8 @@
 use super::*;
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::Semaphore;
 

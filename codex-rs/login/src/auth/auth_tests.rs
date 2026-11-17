@@ -4388,7 +4388,8 @@ async fn owner_pin_retains_native_source_and_login_revision_fences() -> anyhow::
 #[cfg(unix)]
 #[tokio::test]
 async fn owner_pin_host_authority_is_exact_and_recovery_requires_wire_proof() {
-    use super::command_cache_publication_tests::{record, selected_fixture};
+    use super::command_cache_publication_tests::record;
+    use super::command_cache_publication_tests::selected_fixture;
     let home = tempdir().unwrap();
     let (_, source) = selected_fixture(home.path(), record(1));
     let pinned = pin_current_owner(&source);

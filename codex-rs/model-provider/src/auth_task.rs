@@ -1,18 +1,30 @@
 //! Compatibility entrypoints for the single protocol-owned auth custody context.
+pub use codex_protocol::host_auth_task::AuthBlockingCallError;
+pub use codex_protocol::host_auth_task::AuthTaskAccess;
+pub use codex_protocol::host_auth_task::AuthTaskBlocking;
+pub use codex_protocol::host_auth_task::AuthTaskFailure;
+pub use codex_protocol::host_auth_task::AuthTaskFuture;
+pub use codex_protocol::host_auth_task::AuthTaskObservation;
+pub use codex_protocol::host_auth_task::AuthTaskSpawner;
+pub use codex_protocol::host_auth_task::DeferredAuthTask;
+pub use codex_protocol::host_auth_task::prepare_deferred_auth_task;
+pub use codex_protocol::host_auth_task::record_auth_task_failure;
+pub use codex_protocol::host_auth_task::run_auth_call;
+pub use codex_protocol::host_auth_task::run_blocking_call;
+pub use codex_protocol::host_auth_task::run_blocking_call_with_scope;
 pub(crate) use codex_protocol::host_auth_task::spawn;
-pub use codex_protocol::host_auth_task::{
-    AuthBlockingCallError, AuthTaskAccess, AuthTaskBlocking, AuthTaskFailure, AuthTaskFuture,
-    AuthTaskObservation, AuthTaskSpawner, DeferredAuthTask, prepare_deferred_auth_task,
-    record_auth_task_failure, run_auth_call, run_blocking_call, run_blocking_call_with_scope,
-    spawn_named_auth_thread, spawn_provider_task, spawn_provider_task_with_access,
-    with_auth_task_scope,
-};
+pub use codex_protocol::host_auth_task::spawn_named_auth_thread;
+pub use codex_protocol::host_auth_task::spawn_provider_task;
+pub use codex_protocol::host_auth_task::spawn_provider_task_with_access;
+pub use codex_protocol::host_auth_task::with_auth_task_scope;
 
 #[cfg(test)]
 mod shared_context_tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
     use tokio::sync::oneshot;
 
     #[derive(Debug, Default)]

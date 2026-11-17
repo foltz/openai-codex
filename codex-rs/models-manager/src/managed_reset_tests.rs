@@ -431,7 +431,8 @@ async fn poll_pending<T>(future: Pin<&mut (impl Future<Output = T> + ?Sized)>) {
 
 #[tokio::test]
 async fn managed_reset_covers_retained_originator_descendants_and_partitioned_cache() {
-    use crate::ModelCatalogOriginator::{Work, WorkWeb};
+    use crate::ModelCatalogOriginator::Work;
+    use crate::ModelCatalogOriginator::WorkWeb;
     let root = PartitionEndpoint::new(false);
     let work = PartitionEndpoint::new(false);
     let grandchild = PartitionEndpoint::new(false);

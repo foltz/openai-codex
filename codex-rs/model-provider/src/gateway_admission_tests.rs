@@ -1,14 +1,17 @@
 //! Real gateway composition and admitted resolution, synthetic file-store only.
 use super::*;
-use crate::auth::{ResolvedProviderAuth, auth_provider_from_auth};
+use crate::auth::ResolvedProviderAuth;
+use crate::auth::auth_provider_from_auth;
 use codex_login::CodexAuth;
-use codex_model_provider_info::{
-    GatewayOAuthDelivery, GatewayOAuthSettings, OAuthCredentialsStore,
-};
+use codex_model_provider_info::GatewayOAuthDelivery;
+use codex_model_provider_info::GatewayOAuthSettings;
+use codex_model_provider_info::OAuthCredentialsStore;
 use serde_json::json;
 use std::time::Duration;
+use wiremock::Mock;
+use wiremock::MockServer;
+use wiremock::ResponseTemplate;
 use wiremock::matchers::any;
-use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn info(server: &MockServer) -> ModelProviderInfo {
     ModelProviderInfo {

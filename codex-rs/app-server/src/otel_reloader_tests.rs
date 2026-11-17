@@ -115,14 +115,10 @@ async fn managed_generation_supersedes_inflight_watcher_before_publication() {
             false,
             cancel.clone(),
         );
-        // Missing file auth resolves synchronously. Assert the scheduling
-        // precondition instead of assuming an await did not run the actor.
-        let reload = auth.reload();
-        tokio::pin!(reload);
-        assert_eq!(
-            futures::poll!(reload.as_mut()),
-            std::task::Poll::Ready(true)
-        );
+        // Reload now performs asynchronous storage reads. On this current-thread
+        // runtime, publication is synchronous at the end of reload: queue the
+        // managed command below before yielding to the actor again.
+        assert!(auth.reload().await);
         let generation = *auth.auth_change_receiver().borrow();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         let reset = control.reset_until(generation, config, deadline);

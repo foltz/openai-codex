@@ -107,19 +107,18 @@ async fn background_routing_call_sites_skip_config(api_key: Option<&str>) -> any
     let session = Arc::new(ConnectionSessionState::new(
         crate::transport::ConnectionOrigin::Stdio,
     ));
-    processor
-        .process_request(
-            TEST_CONNECTION_ID,
-            serde_json::from_value(json!({
-                "id": 1, "method": "initialize", "params": {
-                    "clientInfo": {"name": "workspace-routing-test", "version": "1"},
-                    "capabilities": {"experimentalApi": true, "interactiveClient": true}
-                }
-            }))?,
-            &crate::transport::AppServerTransport::Stdio,
-            Arc::clone(&session),
-        )
-        .await;
+    Box::pin(processor.process_request(
+        TEST_CONNECTION_ID,
+        serde_json::from_value(json!({
+            "id": 1, "method": "initialize", "params": {
+                "clientInfo": {"name": "workspace-routing-test", "version": "1"},
+                "capabilities": {"experimentalApi": true, "interactiveClient": true}
+            }
+        }))?,
+        &crate::transport::AppServerTransport::Stdio,
+        Arc::clone(&session),
+    ))
+    .await;
     let _: InitializeResponse = read_response(&mut outgoing_rx, /*request_id*/ 1).await;
     // Complete the same post-initialize hook used by the real transports.
     processor
@@ -170,16 +169,15 @@ async fn background_routing_call_sites_skip_config(api_key: Option<&str>) -> any
         "cache-only account/read entered configuration loading",
     );
 
-    processor
-        .process_request(
-            TEST_CONNECTION_ID,
-            serde_json::from_value(json!({
-                "id": 2, "method": "account/read", "params": {"refreshToken": false}
-            }))?,
-            &crate::transport::AppServerTransport::Stdio,
-            Arc::clone(&session),
-        )
-        .await;
+    Box::pin(processor.process_request(
+        TEST_CONNECTION_ID,
+        serde_json::from_value(json!({
+            "id": 2, "method": "account/read", "params": {"refreshToken": false}
+        }))?,
+        &crate::transport::AppServerTransport::Stdio,
+        Arc::clone(&session),
+    ))
+    .await;
     let response: GetAccountResponse = read_response(&mut outgoing_rx, /*request_id*/ 2).await;
     assert_eq!(
         response,
@@ -211,18 +209,17 @@ async fn background_routing_call_sites_skip_config(api_key: Option<&str>) -> any
                     .is_err()
             );
         }
-        processor
-            .process_request(
-                TEST_CONNECTION_ID,
-                serde_json::from_value(json!({
-                    "id": id, "method": "account/managedAuthTransition/read", "params": {
-                        "contractVersion": 1, "transitionId": "", "processInstanceId": "untrusted"
-                    }
-                }))?,
-                &crate::transport::AppServerTransport::Stdio,
-                Arc::clone(&session),
-            )
-            .await;
+        Box::pin(processor.process_request(
+            TEST_CONNECTION_ID,
+            serde_json::from_value(json!({
+                "id": id, "method": "account/managedAuthTransition/read", "params": {
+                    "contractVersion": 1, "transitionId": "", "processInstanceId": "untrusted"
+                }
+            }))?,
+            &crate::transport::AppServerTransport::Stdio,
+            Arc::clone(&session),
+        ))
+        .await;
         let response: codex_app_server_protocol::ReadManagedTransitionResponse =
             read_response(&mut outgoing_rx, id).await;
         let codex_app_server_protocol::ReadManagedTransitionResponse::Refused { refusal } =
@@ -243,16 +240,15 @@ async fn background_routing_call_sites_skip_config(api_key: Option<&str>) -> any
             );
         }
     }
-    processor
-        .process_request(
-            TEST_CONNECTION_ID,
-            serde_json::from_value(json!({
-                "id": 7, "method": "account/read", "params": {"refreshToken":false}
-            }))?,
-            &crate::transport::AppServerTransport::Stdio,
-            Arc::clone(&session),
-        )
-        .await;
+    Box::pin(processor.process_request(
+        TEST_CONNECTION_ID,
+        serde_json::from_value(json!({
+            "id": 7, "method": "account/read", "params": {"refreshToken":false}
+        }))?,
+        &crate::transport::AppServerTransport::Stdio,
+        Arc::clone(&session),
+    ))
+    .await;
     loop {
         let envelope = tokio::time::timeout(Duration::from_secs(5), outgoing_rx.recv())
             .await?
@@ -270,16 +266,15 @@ async fn background_routing_call_sites_skip_config(api_key: Option<&str>) -> any
             break;
         }
     }
-    processor
-        .process_request(
-            TEST_CONNECTION_ID,
-            serde_json::from_value(json!({
-                "id": 8, "method": "account/read", "params": {"cacheOnly":true}
-            }))?,
-            &crate::transport::AppServerTransport::Stdio,
-            Arc::clone(&session),
-        )
-        .await;
+    Box::pin(processor.process_request(
+        TEST_CONNECTION_ID,
+        serde_json::from_value(json!({
+            "id": 8, "method": "account/read", "params": {"cacheOnly":true}
+        }))?,
+        &crate::transport::AppServerTransport::Stdio,
+        Arc::clone(&session),
+    ))
+    .await;
     let cached: GetAccountResponse = read_response(&mut outgoing_rx, 8).await;
     assert!(cached.auth_observation.is_some());
     assert!(

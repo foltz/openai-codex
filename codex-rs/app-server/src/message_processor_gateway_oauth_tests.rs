@@ -424,15 +424,24 @@ delivery = {{ kind = "header", name = "X-Gateway-Authorization" }}
     );
     let (processor, _outgoing) = build_test_processor(config, auth).await;
     let session = ConnectionSessionState::new(crate::transport::ConnectionOrigin::Stdio);
+    // The real host requires admitted account custody. A direct handler test
+    // must enter the same permit scope as the dispatcher, rather than bypass it.
+    let work = processor
+        .managed_transition_coordinator
+        .try_acquire_account_work_permit()
+        .expect("account work admitted");
     let response = timeout(
         Duration::from_secs(5),
-        processor.account_processor.gateway_oauth_login(
-            codex_app_server_protocol::GatewayOAuthLoginParams {
-                model_provider: None,
-                device_auth: true,
-            },
-            TEST_CONNECTION_ID,
-            &session.rpc_gate,
+        crate::account_turn_admission::within_request(
+            Some(work),
+            processor.account_processor.gateway_oauth_login(
+                codex_app_server_protocol::GatewayOAuthLoginParams {
+                    model_provider: None,
+                    device_auth: true,
+                },
+                TEST_CONNECTION_ID,
+                &session.rpc_gate,
+            ),
         ),
     )
     .await?

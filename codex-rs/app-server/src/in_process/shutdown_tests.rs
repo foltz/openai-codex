@@ -7,6 +7,73 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 
 #[tokio::test]
+async fn cancelling_public_start_after_runtime_birth_compacts_after_evidence() {
+    let (args, _home) =
+        super::super::tests::test_start_args(codex_protocol::protocol::SessionSource::Cli, 1).await;
+    let host = InProcessHost::default();
+    let mut startup = Box::pin(super::super::start_in_host(&host, args));
+    // On this current-thread runtime, inspect after each explicit poll and
+    // before yielding. Once spawn has registered its handle, cancellation
+    // happens before the runtime gets its next scheduler turn.
+    let runtime = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            assert!(futures::poll!(startup.as_mut()).is_pending());
+            let registered = {
+                let state = host.state.lock().unwrap();
+                state
+                    .runtimes
+                    .first()
+                    .and_then(|slot| slot.owners.lock().unwrap().runtime.as_ref().map(Arc::clone))
+            };
+            if let Some(runtime) = registered {
+                break runtime;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("public startup must register its real runtime");
+    drop(startup);
+
+    assert_eq!(
+        runtime
+            .observe_until(Instant::now() + Duration::from_secs(10))
+            .await,
+        TaskObservation::Terminated(TaskTermination::Normal)
+    );
+    // Capture resource identities before host compaction. The host must retain
+    // these roots while startup is being cancelled; once the complete report
+    // is proven, it may release the slot and the resources.
+    let (weak_processor, weak_session) = {
+        let state = host.state.lock().unwrap();
+        let owners = state.runtimes[0].owners.lock().unwrap();
+        let cleanup = owners.cleanup.as_ref().expect("real cleanup was retained");
+        let (processor, session) = cleanup.custody.as_ref().unwrap();
+        (Arc::downgrade(processor), Arc::downgrade(session))
+    };
+    assert!(weak_processor.upgrade().is_some());
+    assert!(weak_session.upgrade().is_some());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let reports = host.observe_until(deadline).await;
+    assert_eq!(reports.len(), 1);
+    assert!(
+        matches!(
+            reports[0].cleanup,
+            Some((
+                TaskObservation::Terminated(TaskTermination::Normal),
+                ProcessorCleanupProgress::Observed(
+                    ProcessorCleanupExecution::ReturnedWithEvidence { .. }
+                ),
+            ))
+        ),
+        "cleanup evidence was incomplete: {reports:#?}"
+    );
+    assert!(host.state.lock().unwrap().runtimes.is_empty());
+    assert!(weak_processor.upgrade().is_none());
+    assert!(weak_session.upgrade().is_none());
+}
+
+#[tokio::test]
 async fn poisoned_host_refuses_success_but_still_closes_existing_task_gates() {
     let host = InProcessHost::default();
     let custody = host.reserve().unwrap();

@@ -391,6 +391,7 @@ pub(super) async fn start_app_server_for_session_command(
     let mut state_db = super::init_state_db_for_app_server_target(&config, &app_server_target)
         .await
         .wrap_err("failed to initialize state database")?;
+    let embedded_host = Arc::new(codex_app_server_client::InProcessHost::default());
     let app_server = super::start_app_server(
         &mut app_server_target,
         arg0_paths,
@@ -404,6 +405,7 @@ pub(super) async fn start_app_server_for_session_command(
         &mut state_db,
         environment_manager,
         embedded_network_policy,
+        Arc::clone(&embedded_host),
     )
     .await?;
     Ok(AppServerSession::new(

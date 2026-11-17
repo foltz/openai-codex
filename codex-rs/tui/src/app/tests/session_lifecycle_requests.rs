@@ -1360,6 +1360,7 @@ pub(super) async fn start_recording_app_server_with_realtime_speech(
         state_db,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
         Default::default(),
+        std::sync::Arc::new(codex_app_server_client::InProcessHost::default()),
     )
     .await?;
     let codex_home = config.codex_home.display().to_string();

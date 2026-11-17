@@ -421,6 +421,7 @@ pub(crate) async fn start_test_embedded_app_server(
         state_db,
         Arc::new(EnvironmentManager::default_for_tests()),
         Default::default(),
+        std::sync::Arc::new(codex_app_server_client::InProcessHost::default()),
     )
     .await
 }

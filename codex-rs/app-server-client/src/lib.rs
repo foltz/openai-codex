@@ -78,6 +78,7 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio::time::Instant;
+#[cfg(test)]
 use tokio::time::timeout;
 use tokio::time::timeout_at;
 use toml::Value as TomlValue;

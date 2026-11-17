@@ -21,6 +21,7 @@ use codex_app_server_client::EnvironmentManager;
 use codex_app_server_client::ExecServerRuntimeOptions;
 use codex_app_server_client::InProcessAppServerClient;
 use codex_app_server_client::InProcessClientStartArgs;
+use codex_app_server_client::InProcessHost;
 use codex_app_server_client::InProcessServerEvent;
 use codex_app_server_client::TypedRequestError;
 use codex_app_server_protocol::ClientRequest;
@@ -1094,11 +1095,14 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         .transpose()?;
 
     let mut request_ids = RequestIdSequencer::new();
-    let mut client = InProcessAppServerClient::start(in_process_start_args)
-        .await
-        .map_err(|err| {
-            anyhow::anyhow!("failed to initialize in-process app-server client: {err}")
-        })?;
+    // Keep custody outside the cancellable startup future.
+    let embedded_host = Arc::new(InProcessHost::default());
+    let mut client =
+        InProcessAppServerClient::start_in_host(Arc::clone(&embedded_host), in_process_start_args)
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!("failed to initialize in-process app-server client: {err}")
+            })?;
 
     let mut daybreak_enabled = config.daybreak_enabled;
     // Resolve resume and fork through existing app-server thread lifecycle APIs.

@@ -151,6 +151,7 @@ async fn startup_fallback_requires_no_established_backend() -> Result<()> {
             &mut state_db,
             Arc::clone(&app.environment_manager),
             policy,
+            std::sync::Arc::new(codex_app_server_client::InProcessHost::default()),
         )
         .await;
         if matches!(selection, SessionSelection::StartFresh) {

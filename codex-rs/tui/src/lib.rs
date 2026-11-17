@@ -35,6 +35,7 @@ use codex_app_server_client::AppServerClient;
 use codex_app_server_client::DEFAULT_IN_PROCESS_CHANNEL_CAPACITY;
 use codex_app_server_client::InProcessAppServerClient;
 use codex_app_server_client::InProcessClientStartArgs;
+use codex_app_server_client::InProcessHost;
 use codex_app_server_client::RemoteAppServerClient;
 use codex_app_server_client::RemoteAppServerConnectArgs;
 pub use codex_app_server_client::RemoteAppServerEndpoint;
@@ -313,6 +314,7 @@ async fn start_embedded_app_server(
     state_db: Option<StateDbHandle>,
     environment_manager: Arc<EnvironmentManager>,
     embedded_network_policy: codex_app_server_client::EmbeddedNetworkPolicy,
+    embedded_host: Arc<InProcessHost>,
 ) -> color_eyre::Result<InProcessAppServerClient> {
     // Keep embedded startup state off the caller's stack during session transitions.
     Box::pin(start_embedded_app_server_with(
@@ -327,7 +329,7 @@ async fn start_embedded_app_server(
         state_db,
         environment_manager,
         embedded_network_policy,
-        InProcessAppServerClient::start,
+        move |args| InProcessAppServerClient::start_in_host(Arc::clone(&embedded_host), args),
     ))
     .await
 }
@@ -595,6 +597,7 @@ async fn start_app_server(
     state_db: &mut Option<StateDbHandle>,
     environment_manager: Arc<EnvironmentManager>,
     embedded_network_policy: codex_app_server_client::EmbeddedNetworkPolicy,
+    embedded_host: Arc<InProcessHost>,
 ) -> color_eyre::Result<AppServerClient> {
     let connection = if matches!(target, AppServerTarget::Embedded) {
         None
@@ -638,6 +641,7 @@ async fn start_app_server(
         state_db.clone(),
         environment_manager,
         embedded_network_policy,
+        embedded_host,
     )
     .await
     .map(AppServerClient::InProcess)
@@ -665,6 +669,7 @@ pub(crate) async fn start_app_server_for_picker(
     let mut state_db = state_db;
     let embedded_network_policy =
         codex_app_server_client::EmbeddedNetworkPolicy::load(&loader_overrides).await;
+    let embedded_host = Arc::new(InProcessHost::default());
     let app_server = start_app_server(
         &mut target,
         Arg0DispatchPaths::default(),
@@ -678,6 +683,7 @@ pub(crate) async fn start_app_server_for_picker(
         &mut state_db,
         environment_manager,
         embedded_network_policy,
+        Arc::clone(&embedded_host),
     )
     .await?;
     Ok(
@@ -693,6 +699,7 @@ pub(crate) async fn start_embedded_app_server_for_picker(
     let mut target = AppServerTarget::Embedded;
     let mut state_db = init_state_db_for_app_server_target(config, &target).await?;
     // Keep the shared test fixture's frame independent of embedded startup size.
+    let embedded_host = Arc::new(InProcessHost::default());
     let app_server = Box::pin(start_app_server(
         &mut target,
         Arg0DispatchPaths::default(),
@@ -706,6 +713,7 @@ pub(crate) async fn start_embedded_app_server_for_picker(
         &mut state_db,
         Arc::new(EnvironmentManager::default_for_tests()),
         Default::default(),
+        Arc::clone(&embedded_host),
     ))
     .await?;
     Ok(AppServerSession::new(
@@ -1302,7 +1310,8 @@ async fn run_ratatui_app(
     let connect = async |target: &mut AppServerTarget,
                          config: &Config,
                          bundle: &CloudConfigBundleLoader,
-                         state_db: &mut Option<StateDbHandle>| {
+                         state_db: &mut Option<StateDbHandle>,
+                         embedded_host: Arc<InProcessHost>| {
         start_app_server(
             target,
             arg0_paths.clone(),
@@ -1316,9 +1325,11 @@ async fn run_ratatui_app(
             state_db,
             environment_manager.clone(),
             embedded_network_policy.clone(),
+            Arc::clone(&embedded_host),
         )
         .await
     };
+    let embedded_host = Arc::new(InProcessHost::default());
     let startup_app_server = startup_draft
         .run_until(
             &mut tui,
@@ -1327,6 +1338,7 @@ async fn run_ratatui_app(
                 &initial_config,
                 &cloud_config_bundle,
                 &mut state_db,
+                Arc::clone(&embedded_host),
             ),
         )
         .await;
@@ -1508,6 +1520,7 @@ async fn run_ratatui_app(
             );
             embedded_network_policy.bind_config(&mut selected);
             shutdown_app_server_if_present(app_server.take()).await;
+            let embedded_host = Arc::new(InProcessHost::default());
             let client = startup_draft
                 .run_until(
                     &mut tui,
@@ -1516,6 +1529,7 @@ async fn run_ratatui_app(
                         &selected,
                         &cloud_config_bundle,
                         &mut state_db,
+                        Arc::clone(&embedded_host),
                     ),
                 )
                 .await??;
@@ -1963,6 +1977,7 @@ async fn run_ratatui_app(
     let uses_embedded_network_policy = app_server_target.uses_embedded_network_policy();
     // A startup picker may consume its connection, but its selection keeps that backend.
     app_server_target.preserve_selected_backend(&session_selection);
+    let embedded_host = Arc::new(InProcessHost::default());
     let mut app_server = match app_server {
         Some(app_server) => app_server,
         None => match startup_draft
@@ -1973,6 +1988,7 @@ async fn run_ratatui_app(
                     &config,
                     &cloud_config_bundle,
                     &mut state_db,
+                    Arc::clone(&embedded_host),
                 ),
             )
             .await
@@ -2079,6 +2095,7 @@ async fn run_ratatui_app(
                 && matches!(app_server_target, AppServerTarget::Embedded)
             {
                 app_server.shutdown().await?;
+                let embedded_host = Arc::new(InProcessHost::default());
                 let client = start_app_server(
                     &mut app_server_target,
                     arg0_paths.clone(),
@@ -2092,6 +2109,7 @@ async fn run_ratatui_app(
                     &mut state_db,
                     environment_manager.clone(),
                     embedded_network_policy.clone(),
+                    Arc::clone(&embedded_host),
                 )
                 .await?;
                 app_server = AppServerSession::new(

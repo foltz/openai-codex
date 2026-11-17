@@ -1009,11 +1009,10 @@ mod tests {
         }
     }
 
-    async fn start_test_client_with_options(
+    pub(super) async fn test_start_args(
         session_source: SessionSource,
         channel_capacity: usize,
-        capabilities: Option<codex_app_server_protocol::InitializeCapabilities>,
-    ) -> InProcessClientHandle {
+    ) -> (InProcessStartArgs, TempDir) {
         let codex_home = TempDir::new().expect("temp dir");
         let config = Arc::new(build_test_config(codex_home.path()).await);
         let state_db = codex_rollout::state_db::try_init(config.as_ref())
@@ -1041,10 +1040,21 @@ mod tests {
                     title: None,
                     version: "0.0.0".to_string(),
                 },
-                capabilities,
+                capabilities: None,
             },
             channel_capacity,
         };
+        (args, codex_home)
+    }
+
+    #[allow(deprecated)]
+    async fn start_test_client_with_options(
+        session_source: SessionSource,
+        channel_capacity: usize,
+        capabilities: Option<codex_app_server_protocol::InitializeCapabilities>,
+    ) -> InProcessClientHandle {
+        let (mut args, codex_home) = test_start_args(session_source, channel_capacity).await;
+        args.initialize.capabilities = capabilities;
         let mut client = start(args).await.expect("in-process runtime should start");
         client._test_codex_home = Some(codex_home);
         client

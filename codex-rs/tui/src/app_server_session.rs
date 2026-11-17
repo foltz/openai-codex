@@ -2287,10 +2287,19 @@ impl AppServerSession {
     }
 
     pub(crate) async fn shutdown(self) -> std::io::Result<()> {
-        match self.connection_owner {
+        // Keep the TUI-hosted tools server serving while embedded thread/MCP
+        // cleanup observes its original resources. Request-only views own no connection.
+        let Self {
+            connection_owner,
+            dynamic_tool_mcp,
+            ..
+        } = self;
+        let result = match connection_owner {
             Some(client) => client.shutdown().await,
             None => Ok(()),
-        }
+        };
+        drop(dynamic_tool_mcp);
+        result
     }
 
     pub(crate) fn request_handle(&self) -> AppServerRequestHandle {

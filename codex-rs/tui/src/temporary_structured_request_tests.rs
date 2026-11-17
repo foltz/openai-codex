@@ -105,6 +105,7 @@ async fn managed_workspace_default_respects_read_only_availability() -> color_ey
             /*state_db*/ None,
             Arc::new(EnvironmentManager::default_for_tests()),
             Default::default(),
+            std::sync::Arc::new(codex_app_server_client::InProcessHost::default()),
         )
         .await?;
         let mut app_server = AppServerClient::InProcess(client);

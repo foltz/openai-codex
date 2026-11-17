@@ -27,32 +27,36 @@ pub(super) async fn fork_source(
         network.policy.bind(config.http_client_factory()),
     )
     .await?;
-    let client = InProcessAppServerClient::start(InProcessClientStartArgs {
-        required_human_approval: false,
-        arg0_paths: arg0_paths.clone(),
-        config: std::sync::Arc::new(config.clone()),
-        cli_overrides: cli_overrides.to_vec(),
-        loader_overrides: LoaderOverrides {
-            ignore_project_config: true,
-            ..loader_overrides.clone()
+    let embedded_host = Arc::new(InProcessHost::default());
+    let client = InProcessAppServerClient::start_in_host(
+        Arc::clone(&embedded_host),
+        InProcessClientStartArgs {
+            required_human_approval: false,
+            arg0_paths: arg0_paths.clone(),
+            config: std::sync::Arc::new(config.clone()),
+            cli_overrides: cli_overrides.to_vec(),
+            loader_overrides: LoaderOverrides {
+                ignore_project_config: true,
+                ..loader_overrides.clone()
+            },
+            strict_config,
+            cloud_config_bundle: network.cloud_config_bundle,
+            embedded_network_policy: network.policy,
+            feedback: CodexFeedback::new(),
+            log_db: None,
+            state_db: state_db.clone(),
+            environment_manager: std::sync::Arc::new(environment_manager),
+            config_warnings: Vec::new(),
+            session_source: SessionSource::Exec,
+            enable_codex_api_key_env: true,
+            client_name: "codex_exec".to_string(),
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
+            experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
         },
-        strict_config,
-        cloud_config_bundle: network.cloud_config_bundle,
-        embedded_network_policy: network.policy,
-        feedback: CodexFeedback::new(),
-        log_db: None,
-        state_db: state_db.clone(),
-        environment_manager: std::sync::Arc::new(environment_manager),
-        config_warnings: Vec::new(),
-        session_source: SessionSource::Exec,
-        enable_codex_api_key_env: true,
-        client_name: "codex_exec".to_string(),
-        client_version: env!("CARGO_PKG_VERSION").to_string(),
-        experimental_api: true,
-        mcp_server_openai_form_elicitation: false,
-        opt_out_notification_methods: Vec::new(),
-        channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
-    })
+    )
     .await?;
     let result = async {
         let lookup = crate::cli::ResumeArgs {

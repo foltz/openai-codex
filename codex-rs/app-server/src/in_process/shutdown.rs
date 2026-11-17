@@ -73,9 +73,9 @@ impl InProcessHost {
     }
 
     /// Freeze admission and observe every runtime retained by this host under
-    /// one caller-owned absolute deadline. A report is evidence only: the
-    /// current legacy processor cleanup is deliberately reported as
-    /// `ReturnedUnverified` and therefore cannot be promoted to host Complete.
+    /// one caller-owned absolute deadline. Only positive original-task and
+    /// processor-resource cleanup evidence can release a runtime slot; a joined
+    /// driver or legacy unverified cleanup alone cannot prove completion.
     pub async fn observe_until(&self, deadline: Instant) -> Vec<RuntimeShutdownReport> {
         // Registration closure is synchronous and idempotent. Do it here as
         // well as at explicit shutdown call sites so a direct observer cannot

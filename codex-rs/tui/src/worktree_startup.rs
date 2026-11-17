@@ -153,6 +153,7 @@ pub(super) async fn prepare(
             init_state_db_for_app_server_target(&source, &AppServerTarget::Embedded).await?;
         let mut lookup_config = source.clone();
         lookup_config.analytics_enabled = Some(false);
+        let embedded_host = Arc::new(codex_app_server_client::InProcessHost::default());
         let client = start_embedded_app_server(
             arg0_paths.clone(),
             lookup_config,
@@ -165,6 +166,7 @@ pub(super) async fn prepare(
             state,
             Arc::new(environment),
             embedded_network_policy.clone(),
+            Arc::clone(&embedded_host),
         )
         .await?;
         let mut lookup = AppServerSession::new(

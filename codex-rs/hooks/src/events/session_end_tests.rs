@@ -183,7 +183,7 @@ impl crate::mcp::HookMcpExecutor for UnexpectedMcpExecutor {
     fn execute(
         &self,
         _call: crate::mcp::HookMcpCall,
-    ) -> futures::future::BoxFuture<'_, anyhow::Result<String>> {
+    ) -> futures::future::BoxFuture<'_, anyhow::Result<crate::mcp::HookMcpOutput>> {
         panic!("command hook fixture must not invoke MCP");
     }
 }
@@ -205,7 +205,7 @@ fn engine(handler: ConfiguredHandler, shell: CommandShell) -> ClaudeHooksEngine 
         runtime,
         Arc::new(UnexpectedMcpExecutor),
     );
-    engine.handlers = vec![handler];
+    engine.handlers = vec![handler].into();
     engine
 }
 

@@ -585,3 +585,7 @@ mod auth_refresh_tests;
 #[cfg(test)]
 #[path = "auth_tests.rs"]
 mod tests;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "command_auth_joint_tests.rs"]
+mod command_auth_joint_tests;

@@ -199,6 +199,7 @@ pub(crate) struct ConnectionSessionState {
 
 #[derive(Debug)]
 pub(crate) struct InitializedConnectionSessionState {
+    pub(crate) auth_observation_only: bool,
     pub(crate) experimental_api_enabled: bool,
     pub(crate) opted_out_notification_methods: HashSet<String>,
     pub(crate) app_server_client_name: String,
@@ -228,6 +229,12 @@ impl ConnectionSessionState {
 
     pub(crate) fn initialized(&self) -> bool {
         self.initialized.get().is_some()
+    }
+
+    pub(crate) fn auth_observation_only(&self) -> bool {
+        self.initialized
+            .get()
+            .is_some_and(|session| session.auth_observation_only)
     }
 
     pub(crate) fn experimental_api_enabled(&self) -> bool {
@@ -895,9 +902,12 @@ impl MessageProcessor {
         &self,
         connection_id: ConnectionId,
         request_attestation: bool,
+        auth_observation_only: bool,
     ) {
-        self.account_processor
-            .notify_workspace_routing_to_connection(connection_id);
+        if !auth_observation_only {
+            self.account_processor
+                .notify_workspace_routing_to_connection(connection_id);
+        }
         self.thread_processor
             .connection_initialized(
                 connection_id,
@@ -1086,8 +1096,12 @@ impl MessageProcessor {
                 )
                 .await?;
             if connection_initialized {
-                self.connection_initialized(connection_id, session.request_attestation())
-                    .await;
+                self.connection_initialized(
+                    connection_id,
+                    session.request_attestation(),
+                    session.auth_observation_only(),
+                )
+                .await;
             }
             return Ok(());
         }

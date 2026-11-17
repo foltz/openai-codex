@@ -1283,6 +1283,7 @@ async fn background_turn_program(
         request::<GetAccountResponse>(handle, |request_id| ClientRequest::GetAccount {
             request_id,
             params: GetAccountParams {
+                cache_only: false,
                 refresh_token: false
             },
         }),

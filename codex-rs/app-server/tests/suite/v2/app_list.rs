@@ -1126,6 +1126,7 @@ async fn list_apps_force_refetch_preserves_previous_cache_on_failure() -> Result
 
     let account_request = mcp
         .send_get_account_request(GetAccountParams {
+            cache_only: false,
             refresh_token: false,
         })
         .await?;
@@ -1151,6 +1152,7 @@ async fn list_apps_force_refetch_preserves_previous_cache_on_failure() -> Result
 
     let account_request = mcp
         .send_get_account_request(GetAccountParams {
+            cache_only: false,
             refresh_token: false,
         })
         .await?;

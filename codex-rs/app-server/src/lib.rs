@@ -1342,6 +1342,7 @@ pub async fn run_main_with_transport_options(
                                                     connection_state
                                                         .session
                                                         .request_attestation(),
+                                                    connection_state.session.auth_observation_only(),
                                                 )
                                                 .await;
                                             connection_state

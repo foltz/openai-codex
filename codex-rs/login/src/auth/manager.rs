@@ -2803,6 +2803,26 @@ impl AuthManager {
             .and_then(|cached| cached.auth.clone())
     }
 
+    /// Token-free observation of one cached state. This does not load storage,
+    /// resolve a provider, or attempt a credential refresh.
+    pub fn auth_observation(&self) -> serde_json::Value {
+        // Keep availability and the selected auth in one read. In particular,
+        // unavailable is not confirmed logout, and poison is never known state.
+        let (auth, state_known) = match self.inner.read() {
+            Ok(cached) => (cached.auth.clone(), !cached.initial_load_failed),
+            Err(_) => (None, false),
+        };
+        serde_json::json!({
+            "version": 1,
+            "mode": auth.as_ref().map(CodexAuth::api_auth_mode),
+            "accountId": auth.as_ref().and_then(CodexAuth::get_account_id),
+            "principal": auth.as_ref().and_then(CodexAuth::get_chatgpt_user_id),
+            // Command-provider receipt integration is a separate required port.
+            "provider": null,
+            "stateKnown": state_known,
+        })
+    }
+
     /// Returns the cached startup authority without collapsing an unavailable
     /// source into a logged-out state. This is intentionally separate from
     /// [`Self::auth_cached`], whose established callers treat unavailable auth

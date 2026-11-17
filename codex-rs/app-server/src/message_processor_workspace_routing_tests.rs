@@ -119,13 +119,55 @@ async fn background_routing_call_sites_skip_config(api_key: Option<&str>) -> any
     let _: InitializeResponse = read_response(&mut outgoing_rx, /*request_id*/ 1).await;
     // Complete the same post-initialize hook used by the real transports.
     processor
-        .connection_initialized(TEST_CONNECTION_ID, /*request_attestation*/ false)
+        .connection_initialized(
+            TEST_CONNECTION_ID,
+            /*request_attestation*/ false,
+            session.auth_observation_only(),
+        )
         .await;
     assert!(
         tokio::time::timeout(Duration::from_secs(/*secs*/ 1), loads_rx.recv())
             .await
             .is_err(),
         "connection initialization routing entered configuration loading"
+    );
+
+    // The real account handler must bypass the observed configuration loader.
+    let cached = processor
+        .account_processor
+        .get_account(codex_app_server_protocol::GetAccountParams {
+            cache_only: true,
+            refresh_token: false,
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!(error.message))?
+        .expect("cache-only response");
+    let cached: GetAccountResponse = serde_json::from_value(serde_json::to_value(cached)?)?;
+    assert_eq!(cached.account, None);
+    assert_eq!(cached.user_id, None);
+    assert_eq!(cached.workspace_routing, None);
+    let observation = cached.auth_observation.expect("cache observation");
+    assert_eq!(observation.version, 1);
+    assert!(observation.state_known);
+    assert_eq!(
+        observation.mode,
+        api_key.map(|_| codex_app_server_protocol::AuthMode::ApiKey)
+    );
+    assert_eq!(observation.provider, None);
+    let conflicting = processor
+        .account_processor
+        .get_account(codex_app_server_protocol::GetAccountParams {
+            cache_only: true,
+            refresh_token: true,
+        })
+        .await
+        .expect_err("cache plus refresh is contradictory");
+    assert_eq!(conflicting.code, -32600);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), loads_rx.recv())
+            .await
+            .is_err(),
+        "cache-only account/read entered configuration loading",
     );
 
     processor
@@ -142,6 +184,7 @@ async fn background_routing_call_sites_skip_config(api_key: Option<&str>) -> any
     assert_eq!(
         response,
         GetAccountResponse {
+            auth_observation: None,
             user_id: None,
             account: api_key.map(|_| codex_app_server_protocol::Account::ApiKey {}),
             requires_openai_auth: true,

@@ -796,6 +796,7 @@ async fn account_requests_share_runtime_and_rotate_on_restart(mode: &str) -> Res
                 .await?;
             let id = app
                 .send_get_account_request(GetAccountParams {
+                    cache_only: false,
                     refresh_token: false,
                 })
                 .await?;

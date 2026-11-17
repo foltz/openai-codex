@@ -101,6 +101,7 @@ async fn read_account(
         .request_typed::<GetAccountResponse>(ClientRequest::GetAccount {
             request_id: request_ids.next(),
             params: GetAccountParams {
+                cache_only: false,
                 refresh_token: false,
             },
         })

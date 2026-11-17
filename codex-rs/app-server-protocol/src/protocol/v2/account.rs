@@ -572,6 +572,9 @@ pub enum AddCreditsNudgeEmailStatus {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct GetAccountParams {
+    /// Observe only the existing auth cache, without refresh or configuration discovery.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cache_only: bool,
     /// When `true`, requests a proactive token refresh before returning.
     ///
     /// In managed auth mode this triggers the normal refresh-token flow. In
@@ -585,6 +588,8 @@ pub struct GetAccountParams {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct GetAccountResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_observation: Option<AuthObservation>,
     pub account: Option<Account>,
     /// ChatGPT user ID belonging to this account response, when available.
     #[serde(default)]
@@ -592,6 +597,30 @@ pub struct GetAccountResponse {
     pub requires_openai_auth: bool,
     #[experimental("account/read.workspaceRouting")]
     pub workspace_routing: Option<WorkspaceRouting>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AuthObservation {
+    pub version: u32,
+    pub mode: Option<crate::protocol::common::AuthMode>,
+    pub account_id: Option<String>,
+    pub principal: Option<String>,
+    pub state_known: bool,
+    pub provider: Option<ExternalAuthReceipt>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ExternalAuthReceipt {
+    pub source: String,
+    #[ts(type = "number")]
+    pub generation: u64,
+    pub expires_at: i64,
+    pub coherent: bool,
+    pub protection_mode: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

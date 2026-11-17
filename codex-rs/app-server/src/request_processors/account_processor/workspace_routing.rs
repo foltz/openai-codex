@@ -260,6 +260,23 @@ impl AccountRequestProcessor {
         &self,
         params: GetAccountParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        if params.cache_only {
+            if params.refresh_token {
+                return Err(invalid_request("cache-only reads cannot request refresh"));
+            }
+            let observation = serde_json::from_value(self.auth_manager.auth_observation())
+                .map_err(|_| internal_error("auth observation unavailable"))?;
+            return Ok(Some(
+                GetAccountResponse {
+                    auth_observation: Some(observation),
+                    account: None,
+                    user_id: None,
+                    requires_openai_auth: true,
+                    workspace_routing: None,
+                }
+                .into(),
+            ));
+        }
         self.refresh_token_if_requested(params.refresh_token).await;
         let read = self
             .read_account(/*request*/ None)
@@ -274,6 +291,7 @@ impl AccountRequestProcessor {
         }
         Ok(Some(
             GetAccountResponse {
+                auth_observation: None,
                 account,
                 user_id: read.user_id,
                 requires_openai_auth: read.account_state.requires_openai_auth,

@@ -1505,6 +1505,7 @@ mod tests {
                 JSONRPCMessage::Response(JSONRPCResponse {
                     id: request.id,
                     result: serde_json::to_value(GetAccountResponse {
+                        auth_observation: None,
                         user_id: None,
                         workspace_routing: None,
                         account: None,
@@ -1528,6 +1529,7 @@ mod tests {
             .request_typed(ClientRequest::GetAccount {
                 request_id: RequestId::Integer(1),
                 params: codex_app_server_protocol::GetAccountParams {
+                    cache_only: false,
                     refresh_token: false,
                 },
             })
@@ -1562,6 +1564,7 @@ mod tests {
                 JSONRPCMessage::Response(JSONRPCResponse {
                     id: request.id,
                     result: serde_json::to_value(GetAccountResponse {
+                        auth_observation: None,
                         user_id: None,
                         workspace_routing: None,
                         account: None,
@@ -1590,6 +1593,7 @@ mod tests {
             .request_typed(ClientRequest::GetAccount {
                 request_id: RequestId::Integer(1),
                 params: codex_app_server_protocol::GetAccountParams {
+                    cache_only: false,
                     refresh_token: false,
                 },
             })
@@ -1633,6 +1637,7 @@ mod tests {
             .request_typed(ClientRequest::GetAccount {
                 request_id: RequestId::Integer(1),
                 params: codex_app_server_protocol::GetAccountParams {
+                    cache_only: false,
                     refresh_token: false,
                 },
             })
@@ -1641,6 +1646,7 @@ mod tests {
         assert_eq!(
             response,
             GetAccountResponse {
+                auth_observation: None,
                 user_id: None,
                 workspace_routing: None,
                 account: None,
@@ -1748,6 +1754,7 @@ mod tests {
                 JSONRPCMessage::Response(JSONRPCResponse {
                     id: request.id,
                     result: serde_json::to_value(GetAccountResponse {
+                        auth_observation: None,
                         user_id: None,
                         workspace_routing: None,
                         account: None,
@@ -1771,6 +1778,7 @@ mod tests {
                 .request_typed::<GetAccountResponse>(ClientRequest::GetAccount {
                     request_id: RequestId::Integer(1),
                     params: codex_app_server_protocol::GetAccountParams {
+                        cache_only: false,
                         refresh_token: false,
                     },
                 })
@@ -1786,6 +1794,7 @@ mod tests {
             .request_typed::<GetAccountResponse>(ClientRequest::GetAccount {
                 request_id: RequestId::Integer(1),
                 params: codex_app_server_protocol::GetAccountParams {
+                    cache_only: false,
                     refresh_token: false,
                 },
             })
@@ -1803,6 +1812,7 @@ mod tests {
         assert_eq!(
             first_response,
             GetAccountResponse {
+                auth_observation: None,
                 user_id: None,
                 workspace_routing: None,
                 account: None,

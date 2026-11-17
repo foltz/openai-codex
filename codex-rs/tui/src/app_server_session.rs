@@ -1072,6 +1072,7 @@ impl AppServerSession {
             .request_typed(ClientRequest::GetAccount {
                 request_id: account_request_id,
                 params: GetAccountParams {
+                    cache_only: false,
                     refresh_token: false,
                 },
             })
@@ -3278,6 +3279,7 @@ mod tests {
         let mut app_server = crate::start_embedded_app_server_for_picker(&config).await?;
         let next_request_id = app_server.next_request_id;
         let account = GetAccountResponse {
+            auth_observation: None,
             user_id: None,
             workspace_routing: None,
             account: Some(Account::Chatgpt {
@@ -3341,6 +3343,7 @@ mod tests {
                 .bootstrap_with_account(
                     &client_config,
                     GetAccountResponse {
+                        auth_observation: None,
                         user_id: None,
                         account: Some(Account::ApiKey {}),
                         requires_openai_auth: true,
@@ -3397,6 +3400,7 @@ mod tests {
             ThreadParamsMode::Cloud,
         );
         let account = GetAccountResponse {
+            auth_observation: None,
             user_id: None,
             account: Some(Account::Chatgpt {
                 email: Some("teammate@openai.com".to_string()),

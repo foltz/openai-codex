@@ -24,6 +24,7 @@ impl App {
                 request_handle.request_typed::<GetAccountResponse>(ClientRequest::GetAccount {
                     request_id: RequestId::String(format!("account-status-{request_id}")),
                     params: GetAccountParams {
+                        cache_only: false,
                         refresh_token: false,
                     },
                 }),

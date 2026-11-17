@@ -3535,3 +3535,6 @@ mod authoritative_cache;
 
 #[path = "managed_adoption_tests.rs"]
 mod managed_adoption;
+
+#[path = "cache_observation_tests.rs"]
+mod cache_observation;

@@ -41,6 +41,7 @@ async fn failed_archive_loaded_list_tracks_attachment_not_cached_metadata() -> R
             cloud::Credentials::new("synthetic-bearer", "synthetic-account")?,
         )?,
         account: protocol::GetAccountResponse {
+            auth_observation: None,
             user_id: None,
             account: None,
             requires_openai_auth: true,

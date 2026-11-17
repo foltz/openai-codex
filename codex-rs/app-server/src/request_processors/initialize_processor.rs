@@ -80,6 +80,10 @@ impl InitializeRequestProcessor {
         let experimental_api_enabled = capabilities.experimental_api;
         let request_attestation = capabilities.request_attestation;
         let extensions = capabilities.extensions.as_ref();
+        let auth_observation_only = extensions
+            .and_then(|map| map.get("codex/auth-observation"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
         let mut client_mcp_extensions = codex_mcp::client_mcp_extensions(
             extensions,
             capabilities.mcp_server_openai_form_elicitation,
@@ -126,10 +130,12 @@ impl InitializeRequestProcessor {
         }
         let originator = name.clone();
         let user_agent_suffix = format!("{name}; {version}");
-        let mutates_global_identity = !NON_ORIGINATING_CLIENT_NAMES.contains(&name.as_str());
+        let mutates_global_identity =
+            !auth_observation_only && !NON_ORIGINATING_CLIENT_NAMES.contains(&name.as_str());
         let codex_home = self.config.codex_home.clone();
         if session
             .initialize(InitializedConnectionSessionState {
+                auth_observation_only,
                 experimental_api_enabled,
                 opted_out_notification_methods: opt_out_notification_methods.into_iter().collect(),
                 app_server_client_name: name.clone(),
@@ -241,3 +247,7 @@ impl InitializeRequestProcessor {
             .track_request(connection_id.0, request_id, request);
     }
 }
+
+#[cfg(test)]
+#[path = "initialize_observation_tests.rs"]
+mod observation_tests;

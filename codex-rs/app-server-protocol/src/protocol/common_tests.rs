@@ -55,6 +55,7 @@ fn client_response_jsonrpc_parts_preserve_payloads_and_request_ids() -> Result<(
         ),
         (
             ClientResponsePayload::GetAccount(v2::GetAccountResponse {
+                auth_observation: None,
                 user_id: None,
                 account: Some(v2::Account::ApiKey {}),
                 requires_openai_auth: false,
@@ -142,4 +143,39 @@ fn client_response_jsonrpc_parts_preserve_serialization_errors() {
         describe(payload.into_jsonrpc_parts(request_id).unwrap_err()),
         expected
     );
+}
+
+#[test]
+fn cache_observation_wire_preserves_default_reads_and_all_auth_modes() {
+    let ordinary: v2::GetAccountParams = serde_json::from_value(serde_json::json!({})).unwrap();
+    assert!(!ordinary.cache_only);
+    assert!(!ordinary.refresh_token);
+    assert_eq!(
+        serde_json::to_value(ordinary).unwrap(),
+        serde_json::json!({})
+    );
+    for mode in [
+        "apikey",
+        "chatgpt",
+        "chatgptAuthTokens",
+        "headers",
+        "agentIdentity",
+        "personalAccessToken",
+        "bedrockApiKey",
+        "bedrockAccessKeys",
+    ] {
+        let observation: v2::AuthObservation = serde_json::from_value(serde_json::json!({
+            "version": 1, "mode": mode, "accountId": null, "principal": null,
+            "stateKnown": true, "provider": null,
+        }))
+        .unwrap();
+        assert_eq!(serde_json::to_value(observation).unwrap()["mode"], mode);
+    }
+    let response: v2::GetAccountResponse = serde_json::from_value(serde_json::json!({
+        "account": null, "userId": "retained-user", "requiresOpenaiAuth": true, "workspaceRouting": null,
+    })).unwrap();
+    assert!(response.auth_observation.is_none());
+    let serialized = serde_json::to_value(response).unwrap();
+    assert!(serialized.get("authObservation").is_none());
+    assert_eq!(serialized["userId"], "retained-user");
 }

@@ -22,6 +22,7 @@ async fn sealed_writer_clones_cannot_mutate_or_discard_a_same_id_successor() {
                 }),
                 started_at_ms: Some(0),
                 completed_at_ms: 1,
+                content_token_count: None,
             }))
         };
         let mut params = create_thread_params(id);

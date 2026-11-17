@@ -280,10 +280,10 @@ async fn deferred_clear_start_is_not_consumed_by_an_ordinary_turn_queue() {
     state.queue_deferred_clear_session_start("predecessor".to_owned(), "transition".to_owned());
     assert!(state.take_pending_session_start_source().is_none());
     state.queue_pending_session_start_source(codex_hooks::SessionStartSource::Resume);
-    assert_eq!(
+    assert!(matches!(
         state.take_pending_session_start_source(),
         Some(codex_hooks::SessionStartSource::Resume)
-    );
+    ));
     let clear = state
         .take_deferred_clear_session_start()
         .expect("explicit dispatcher owns clear start");

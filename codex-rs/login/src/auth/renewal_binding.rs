@@ -9,6 +9,12 @@ pub struct AuthRenewalBinding {
     fixed_principal: Option<FixedPrincipal>,
     auth_mode: Option<AuthMode>,
 }
+impl AuthRenewalBinding {
+    pub(super) fn is_host(&self) -> bool {
+        self.source.is_some()
+    }
+}
+
 impl PartialEq for AuthRenewalBinding {
     fn eq(&self, other: &Self) -> bool {
         same_provider(&self.source, &other.source)

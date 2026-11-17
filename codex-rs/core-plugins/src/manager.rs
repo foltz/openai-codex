@@ -2261,14 +2261,15 @@ impl PluginsManager {
             .flat_map(HashMap::keys)
             .cloned()
             .collect::<Vec<_>>();
-        let result = crate::remote::remote_installed_plugin_sync::sync_remote_installed_plugin_bundles_once_with_snapshot_and_generation(
-            self.codex_home.clone(),
-            &self.remote_plugin_service_config(config),
-            auth,
-            &previous_plugin_ids,
-            publication_generation,
-        )
-        .await?;
+        let result =
+            crate::remote::sync_remote_installed_plugin_bundles_once_with_snapshot_and_generation(
+                self.codex_home.clone(),
+                &self.remote_plugin_service_config(config),
+                auth,
+                &previous_plugin_ids,
+                publication_generation,
+            )
+            .await?;
         let mut outcome = result.outcome;
         // The generation fence keeps this comparison on the snapshot replaced by this pass.
         // In a known snapshot, absence means inactive: cached reinstalls need the same hints

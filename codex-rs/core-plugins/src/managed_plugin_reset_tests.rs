@@ -114,3 +114,65 @@ async fn poisoned_metadata_refuses_and_leaves_physical_admission_closed() {
     assert!(manager.reset_remote_installed_plugins().await.is_err());
     assert!(RemotePluginBundleSyncGeneration::capture(home.path()).is_err());
 }
+
+#[tokio::test]
+async fn strict_reset_drops_queued_callback_outside_cache_locks() {
+    struct LockProbe {
+        manager: std::sync::Weak<PluginsManager>,
+        observed_unlocked: Arc<AtomicBool>,
+    }
+    impl Drop for LockProbe {
+        fn drop(&mut self) {
+            let manager = self.manager.upgrade().expect("manager still owned by test");
+            let unlocked = manager
+                .remote_installed_plugins_cache_refresh_state
+                .try_write()
+                .is_ok()
+                && manager.remote_installed_plugins_cache.try_write().is_ok()
+                && manager.loaded_plugins_cache.try_lock().is_ok();
+            self.observed_unlocked.store(unlocked, Ordering::SeqCst);
+        }
+    }
+    let home = tempfile::tempdir().unwrap();
+    let manager = Arc::new(test_plugins_manager(home.path().to_path_buf()));
+    let observed = Arc::new(AtomicBool::new(false));
+    let probe = LockProbe {
+        manager: Arc::downgrade(&manager),
+        observed_unlocked: observed.clone(),
+    };
+    let (service_config, _) = crate::test_support::recording_remote_plugin_service_config(
+        "https://example.invalid/backend-api".to_string(),
+    );
+    let request = RemoteInstalledPluginsCacheRefreshRequest {
+        generation: manager
+            .remote_installed_plugins_cache
+            .read()
+            .unwrap()
+            .generation,
+        service_config,
+        auth: None,
+        notify: RemoteInstalledPluginsCacheRefreshNotify::IfCacheChanged,
+        on_effective_plugins_changed: Some(Arc::new(move |_| {
+            let _retained_until_callback_destroyed = &probe;
+        })),
+        change: EffectivePluginsChange::default(),
+    };
+    let queued = QueuedPluginRequest::prepare(&manager.task_registry, request).unwrap();
+    {
+        let mut refresh = manager
+            .remote_installed_plugins_cache_refresh_state
+            .write()
+            .unwrap();
+        refresh.requested = Some(queued);
+        refresh.in_flight = true;
+    }
+    manager.reset_remote_installed_plugins().await.unwrap();
+    assert!(observed.load(Ordering::SeqCst));
+    let refresh = manager
+        .remote_installed_plugins_cache_refresh_state
+        .read()
+        .unwrap();
+    assert!(refresh.requested.is_none());
+    // Strict cache reset must not forge terminal evidence for a registered worker.
+    assert!(refresh.in_flight);
+}

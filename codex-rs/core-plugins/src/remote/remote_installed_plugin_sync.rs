@@ -422,6 +422,7 @@ impl Drop for RemotePluginCacheMutationGuard {
     }
 }
 
+#[cfg(test)]
 async fn remove_stale_remote_plugin_caches(
     store: &PluginStore,
     installed_plugin_names_by_marketplace: &BTreeMap<String, BTreeSet<String>>,

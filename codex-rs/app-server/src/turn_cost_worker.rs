@@ -34,7 +34,69 @@ const MAX_STALLED_POLL_ATTEMPTS: u8 = 5;
 pub(crate) struct TurnCostWorker {
     handle: TurnCostWorkerHandle,
     shutdown: CancellationToken,
-    _task: JoinHandle<()>,
+    completion: TurnCostCompletion,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TurnCostShutdown {
+    Joined,
+    Cancelled,
+    Panicked,
+    TimedOut,
+}
+
+struct TurnCostCompletion {
+    state: tokio::sync::Mutex<TurnCostOriginal>,
+}
+enum TurnCostOriginal {
+    Running(JoinHandle<()>),
+    Finished(TurnCostShutdown),
+}
+impl TurnCostCompletion {
+    fn new(task: JoinHandle<()>) -> Self {
+        Self {
+            state: tokio::sync::Mutex::new(TurnCostOriginal::Running(task)),
+        }
+    }
+
+    /// The mutex owns the sole poll right. Timeout/cancelled observers never
+    /// remove, abort or forget the original handle. The worker never takes it.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "exclusive original join polling custody"
+    )]
+    async fn observe_until(&self, deadline: tokio::time::Instant) -> TurnCostShutdown {
+        if let Ok(state) = self.state.try_lock()
+            && let TurnCostOriginal::Finished(outcome) = &*state
+        {
+            return *outcome;
+        }
+        let mut state = tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline) => return TurnCostShutdown::TimedOut,
+            state = self.state.lock() => state,
+        };
+        let original = match &mut *state {
+            TurnCostOriginal::Finished(outcome) => return *outcome,
+            TurnCostOriginal::Running(task) => task,
+        };
+        let joined = tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline) => return TurnCostShutdown::TimedOut,
+            joined = original => joined,
+        };
+        let outcome = match &joined {
+            Ok(()) => TurnCostShutdown::Joined,
+            Err(error) if error.is_cancelled() => TurnCostShutdown::Cancelled,
+            Err(_) => TurnCostShutdown::Panicked,
+        };
+        *state = TurnCostOriginal::Finished(outcome);
+        drop(state);
+        // JoinError may own an arbitrary panic payload. Never destroy it while
+        // holding the completion mutex, including on a sticky failure outcome.
+        drop(joined);
+        outcome
+    }
 }
 
 #[derive(Clone)]
@@ -149,7 +211,7 @@ impl TurnCostWorker {
                 config,
             },
             shutdown,
-            _task: task,
+            completion: TurnCostCompletion::new(task),
         })
     }
 
@@ -159,6 +221,11 @@ impl TurnCostWorker {
 
     pub(crate) fn shutdown(&self) {
         self.shutdown.cancel();
+    }
+
+    pub(crate) async fn shutdown_until(&self, deadline: tokio::time::Instant) -> TurnCostShutdown {
+        self.shutdown();
+        self.completion.observe_until(deadline).await
     }
 }
 
@@ -553,3 +620,7 @@ mod chatgpt;
 #[cfg(test)]
 #[path = "turn_cost_worker_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "turn_cost_retirement_tests.rs"]
+mod retirement_tests;

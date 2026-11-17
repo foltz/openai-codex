@@ -190,3 +190,217 @@ mod tests {
         assert!(manager.external_auth.try_write().is_ok());
     }
 }
+
+impl AuthManager {
+    /// Guarded host-only publication; invocation and durable commit are separate.
+    pub(super) fn publish_auth_for_owner(
+        &self,
+        expected: &super::super::AuthOwnerSnapshot,
+        renewal: &AuthRenewalBinding,
+        auth: CodexAuth,
+    ) -> Result<bool, RefreshTokenError> {
+        let refused =
+            || permanent_external_auth_error("owner renewal authority changed or unproven");
+        let observed = self.external_auth.read().map_err(|_| refused())?.clone();
+        let fixed = observed
+            .as_ref()
+            .and_then(|source| source.fixed_principal());
+        if observed.is_none()
+            || !same_provider(&observed, &renewal.source)
+            || fixed != renewal.fixed_principal
+            || renewal.auth_mode != expected.auth_mode
+            || renewal.auth_mode != Some(auth.api_auth_mode())
+        {
+            return Err(refused());
+        }
+        let carried_owner = match (&expected.chatgpt_user_id, &expected.account_id) {
+            (Some(user), Some(account))
+                if !user.trim().is_empty() && !account.trim().is_empty() =>
+            {
+                Some(FixedPrincipal {
+                    chatgpt_user_id: user.clone(),
+                    account_id: account.clone(),
+                })
+            }
+            _ => None,
+        };
+        let principal = match (&renewal.fixed_principal, carried_owner) {
+            (Some(fixed), Some(owner)) if fixed == &owner => owner,
+            (Some(_), Some(_)) => return Err(refused()),
+            (Some(fixed), None)
+                if !fixed.chatgpt_user_id.trim().is_empty()
+                    && !fixed.account_id.trim().is_empty() =>
+            {
+                fixed.clone()
+            }
+            (None, Some(owner)) => owner,
+            _ => return Err(refused()),
+        };
+        match FixedPrincipal::carried_by(&auth) {
+            Some(carried) if carried != principal => return Err(refused()),
+            None if renewal.fixed_principal.is_none() => return Err(refused()),
+            _ => (),
+        }
+        let slot = self.external_auth.read().map_err(|_| refused())?;
+        if !same_provider(&observed, &slot) {
+            return Err(refused());
+        }
+        let mut publication = self
+            .cache_publication(Some(&auth))
+            .map_err(RefreshTokenError::Transient)?;
+        if self.owner_snapshot_locked(&publication.cache) != *expected {
+            return Err(refused());
+        }
+        publication
+            .revalidate()
+            .map_err(RefreshTokenError::Transient)?;
+        Ok(self.set_cached_auth_locked_with_owner_proof(&mut publication.cache, Some(auth), true))
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+    struct FixedAuthority(Option<FixedPrincipal>);
+    impl ExternalAuth for FixedAuthority {
+        fn resolve(&self) -> ExternalAuthFuture<'_, CodexAuth> {
+            Box::pin(async {
+                Err(std::io::Error::other(
+                    "publication must not invoke authority",
+                ))
+            })
+        }
+        fn refresh(&self, _: ExternalAuthRefreshContext) -> ExternalAuthFuture<'_, CodexAuth> {
+            self.resolve()
+        }
+        fn fixed_principal(&self) -> Option<FixedPrincipal> {
+            self.0.clone()
+        }
+    }
+    fn principal() -> FixedPrincipal {
+        FixedPrincipal {
+            chatgpt_user_id: "principal".into(),
+            account_id: "account".into(),
+        }
+    }
+    fn manager(auth: CodexAuth, fixed: Option<FixedPrincipal>) -> Arc<AuthManager> {
+        let manager = AuthManager::from_auth_for_testing(auth);
+        *manager.external_auth.write().unwrap() = Some(Arc::new(FixedAuthority(fixed)));
+        manager
+    }
+    #[test]
+    fn proven_opaque_publication_preserves_owner_but_keeps_other_revision_updates() {
+        let manager = manager(CodexAuth::from_api_key("old"), Some(principal()));
+        let snapshot = manager.owner_snapshot().unwrap();
+        let binding = manager.renewal_binding().unwrap();
+        assert!(
+            manager
+                .publish_auth_for_owner(&snapshot, &binding, CodexAuth::from_api_key("renewed"))
+                .unwrap()
+        );
+        let after = manager.owner_snapshot().unwrap();
+        assert_eq!(
+            after.revisions.owner_generation,
+            snapshot.revisions.owner_generation
+        );
+        assert_eq!(
+            after.revisions.generation,
+            snapshot.revisions.generation + 1
+        );
+        assert_eq!(
+            after.revisions.source_generation,
+            snapshot.revisions.source_generation + 1
+        );
+        assert_eq!(
+            after.revisions.login_generation,
+            snapshot.revisions.login_generation + 1
+        );
+    }
+    #[test]
+    fn late_result_cannot_overwrite_newer_cached_credential() {
+        let manager = manager(CodexAuth::from_api_key("old"), Some(principal()));
+        let snapshot = manager.owner_snapshot().unwrap();
+        let binding = manager.renewal_binding().unwrap();
+        manager.set_cached_auth(Some(CodexAuth::from_api_key("newer")));
+        let before = manager.auth_cached().unwrap().get_token().unwrap();
+        let revisions = manager.owner_snapshot().unwrap();
+        assert!(
+            manager
+                .publish_auth_for_owner(&snapshot, &binding, CodexAuth::from_api_key("late"))
+                .is_err()
+        );
+        assert_eq!(manager.auth_cached().unwrap().get_token().unwrap(), before);
+        assert_eq!(manager.owner_snapshot().unwrap(), revisions);
+    }
+    #[test]
+    fn replaced_authority_refuses_even_same_principal_and_mode() {
+        let manager = manager(CodexAuth::from_api_key("old"), Some(principal()));
+        let snapshot = manager.owner_snapshot().unwrap();
+        let binding = manager.renewal_binding().unwrap();
+        *manager.external_auth.write().unwrap() = Some(Arc::new(FixedAuthority(Some(principal()))));
+        assert!(
+            manager
+                .publish_auth_for_owner(&snapshot, &binding, CodexAuth::from_api_key("new"))
+                .is_err()
+        );
+        assert_eq!(manager.owner_snapshot().unwrap(), snapshot);
+    }
+    #[test]
+    fn opaque_credential_without_fixed_principal_is_not_owner_proven() {
+        let manager = manager(CodexAuth::from_api_key("old"), None);
+        let snapshot = manager.owner_snapshot().unwrap();
+        let binding = manager.renewal_binding().unwrap();
+        assert!(
+            manager
+                .publish_auth_for_owner(&snapshot, &binding, CodexAuth::from_api_key("new"))
+                .is_err()
+        );
+        assert_eq!(manager.owner_snapshot().unwrap(), snapshot);
+    }
+    #[test]
+    fn renewal_must_keep_captured_credential_mode() {
+        let manager = manager(CodexAuth::from_api_key("old"), Some(principal()));
+        let snapshot = manager.owner_snapshot().unwrap();
+        let binding = manager.renewal_binding().unwrap();
+        let auth = super::super::command_cache_publication_tests::record(1)
+            .auth()
+            .unwrap();
+        assert!(
+            manager
+                .publish_auth_for_owner(&snapshot, &binding, auth)
+                .is_err()
+        );
+        assert_eq!(manager.owner_snapshot().unwrap(), snapshot);
+    }
+    #[test]
+    fn carried_principal_mismatch_refuses_without_revision_change() {
+        let auth = super::super::command_cache_publication_tests::record(1)
+            .auth()
+            .unwrap();
+        let manager = manager(
+            auth.clone(),
+            Some(FixedPrincipal {
+                chatgpt_user_id: "wrong".into(),
+                account_id: "account".into(),
+            }),
+        );
+        let snapshot = manager.owner_snapshot().unwrap();
+        let binding = manager.renewal_binding().unwrap();
+        assert!(
+            manager
+                .publish_auth_for_owner(&snapshot, &binding, auth)
+                .is_err()
+        );
+        assert_eq!(manager.owner_snapshot().unwrap(), snapshot);
+    }
+    #[test]
+    fn ordinary_identity_free_replacement_still_advances_owner() {
+        let manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("old"));
+        let before = manager.owner_snapshot().unwrap();
+        manager.set_cached_auth(Some(CodexAuth::from_api_key("new")));
+        assert_eq!(
+            manager.owner_snapshot().unwrap().revisions.owner_generation,
+            before.revisions.owner_generation + 1
+        );
+    }
+}

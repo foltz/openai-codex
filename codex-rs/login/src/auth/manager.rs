@@ -3712,10 +3712,20 @@ impl AuthManager {
     }
 
     fn set_cached_auth_locked(&self, guard: &mut CachedAuth, new_auth: Option<CodexAuth>) -> bool {
+        self.set_cached_auth_locked_with_owner_proof(guard, new_auth, false)
+    }
+
+    fn set_cached_auth_locked_with_owner_proof(
+        &self,
+        guard: &mut CachedAuth,
+        new_auth: Option<CodexAuth>,
+        owner_proven: bool,
+    ) -> bool {
         let previous = guard.auth.as_ref();
         let changed = !AuthManager::auths_equal(previous, new_auth.as_ref());
         let auth_changed_for_refresh = !Self::auths_equal_for_refresh(previous, new_auth.as_ref());
-        let owner_changed = auth_changed_for_refresh && !same_owner(previous, new_auth.as_ref());
+        let owner_changed =
+            auth_changed_for_refresh && !owner_proven && !same_owner(previous, new_auth.as_ref());
         let source_changed =
             auth_changed_for_refresh && !super::source::same_source(previous, new_auth.as_ref());
         let login_changed = auth_changed_for_refresh && !same_login(previous, new_auth.as_ref());

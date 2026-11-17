@@ -428,6 +428,7 @@ impl ChatWidget {
             | ServerNotification::ThreadRealtimeOutputAudioDelta(_)
             | ServerNotification::WindowsWorldWritableWarning(_)
             | ServerNotification::WindowsSandboxSetupCompleted(_)
+            | ServerNotification::ThreadInteractiveSubscriptionChanged(_)
             | ServerNotification::ManagedTransitionStatusUpdated(_)
             | ServerNotification::AccountLoginCompleted(_)
             | ServerNotification::ProjectChanged(_)

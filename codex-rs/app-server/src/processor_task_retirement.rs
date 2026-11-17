@@ -54,19 +54,18 @@ struct State {
 
 impl State {
     fn compact(&mut self) {
-        self.tasks
-            .retain(|receipt| match receipt.clone().now_or_never() {
-                Some(ProcessorTaskJoin::Joined) => false,
-                Some(ProcessorTaskJoin::Cancelled) => {
-                    self.cancelled = true;
-                    false
-                }
-                Some(ProcessorTaskJoin::Panicked) => {
-                    self.panicked = true;
-                    false
-                }
-                None => true,
-            });
+        self.tasks.retain(|receipt| match receipt.peek() {
+            Some(ProcessorTaskJoin::Joined) => false,
+            Some(ProcessorTaskJoin::Cancelled) => {
+                self.cancelled = true;
+                false
+            }
+            Some(ProcessorTaskJoin::Panicked) => {
+                self.panicked = true;
+                false
+            }
+            None => true,
+        });
     }
 }
 
@@ -110,6 +109,25 @@ impl ProcessorTaskTicket {
 }
 
 impl ProcessorTasks {
+    /// Poll only snapshots outside the registry lock. Completing a JoinHandle
+    /// can destroy an arbitrary panic payload which re-enters this registry.
+    fn compact_finished(&self) -> Result<(), ProcessorTaskAdmissionError> {
+        let snapshot = self
+            .state
+            .lock()
+            .map_err(|_| ProcessorTaskAdmissionError::Unavailable)?
+            .tasks
+            .clone();
+        for receipt in snapshot {
+            let _ = receipt.now_or_never();
+        }
+        self.state
+            .lock()
+            .map_err(|_| ProcessorTaskAdmissionError::Unavailable)?
+            .compact();
+        Ok(())
+    }
+
     pub(crate) fn ticket(&self) -> ProcessorTaskTicket {
         ProcessorTaskTicket {
             state: Arc::downgrade(&self.state),
@@ -139,6 +157,7 @@ impl ProcessorTasks {
     ) -> Result<Receipt, ProcessorTaskAdmissionError> {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| ProcessorTaskAdmissionError::Unavailable)?;
+        self.compact_finished()?;
         let mut state = self
             .state
             .lock()
@@ -173,6 +192,7 @@ impl ProcessorTasks {
         future: impl Future<Output = ()> + Send + 'static,
         unverified: bool,
     ) -> Result<Receipt, ProcessorTaskAdmissionError> {
+        self.compact_finished()?;
         let mut state = self
             .state
             .lock()
@@ -208,6 +228,11 @@ impl ProcessorTasks {
             };
             state.tasks.clone()
         };
+        // One nonblocking poll outside the census lock also preserves observation
+        // of already-completed originals when the caller's deadline has elapsed.
+        for receipt in tasks.iter().cloned() {
+            let _ = receipt.now_or_never();
+        }
         if !tasks.is_empty() && Instant::now() < deadline {
             tokio::select! {
                 biased;
@@ -259,6 +284,11 @@ impl ProcessorTasks {
             state.compact();
             (deadline, state.tasks.clone())
         };
+        // One nonblocking poll outside the census lock also preserves observation
+        // of already-completed originals when the caller's deadline has elapsed.
+        for receipt in tasks.iter().cloned() {
+            let _ = receipt.now_or_never();
+        }
         if !tasks.is_empty() && Instant::now() < deadline {
             tokio::select! {
                 biased;
@@ -272,7 +302,7 @@ impl ProcessorTasks {
                 ..Default::default()
             };
         };
-        // Only polls pure JoinHandle observers, never the spawned task body.
+        // Inspect already-polled fixed outcomes only; do not poll under this lock.
         state.compact();
         ProcessorTaskDrain {
             terminal: state.tasks.is_empty(),
@@ -287,6 +317,7 @@ impl ProcessorTasks {
     /// spawning replacement work, or discarding a pending/failure receipt.
     #[cfg(test)]
     pub(crate) fn pending_len_for_test(&self) -> usize {
+        self.compact_finished().unwrap();
         let mut state = self.state.lock().unwrap();
         state.compact();
         state.tasks.len()

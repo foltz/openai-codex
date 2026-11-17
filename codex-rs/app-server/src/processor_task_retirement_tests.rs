@@ -252,3 +252,58 @@ async fn blocking_panic_is_sticky_after_original_join() {
         assert!(report.terminal && report.panicked && !report.is_clean());
     }
 }
+
+#[tokio::test]
+async fn panic_payload_compaction_reenters_registry_outside_its_lock() {
+    struct Payload {
+        ticket: ProcessorTaskTicket,
+        unlocked: Arc<std::sync::atomic::AtomicBool>,
+        child_finished: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl Drop for Payload {
+        fn drop(&mut self) {
+            let registry = self.ticket.state.upgrade().unwrap();
+            let unlocked = registry.try_lock().is_ok();
+            self.unlocked
+                .store(unlocked, std::sync::atomic::Ordering::SeqCst);
+            // Fail the old lock-holding implementation without deadlocking the
+            // test. The fixed implementation also exercises real re-entry.
+            if unlocked {
+                let finished = self.child_finished.clone();
+                self.ticket
+                    .spawn(async move {
+                        finished.store(true, std::sync::atomic::Ordering::SeqCst);
+                    })
+                    .unwrap();
+            }
+        }
+    }
+    let tasks = ProcessorTasks::default();
+    let unlocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let child_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let payload = Payload {
+        ticket: tasks.ticket(),
+        unlocked: unlocked.clone(),
+        child_finished: child_finished.clone(),
+    };
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let receipt = tasks
+        .spawn(async move {
+            entered.send(()).unwrap();
+            std::panic::panic_any(payload);
+        })
+        .unwrap();
+    started.await.unwrap();
+    tokio::task::yield_now().await;
+    let _ = tasks.pending_len_for_test();
+    assert!(unlocked.load(std::sync::atomic::Ordering::SeqCst));
+    // The unused observation must not retain the already-disposed payload.
+    assert_eq!(receipt.peek(), Some(&ProcessorTaskJoin::Panicked));
+    let drain = tasks
+        .observe_until(Instant::now() + std::time::Duration::from_secs(1))
+        .await;
+    assert!(drain.terminal);
+    assert!(drain.panicked);
+    assert!(!drain.is_clean());
+    assert!(child_finished.load(std::sync::atomic::Ordering::SeqCst));
+}

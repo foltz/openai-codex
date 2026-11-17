@@ -1,3 +1,5 @@
+mod private_discovery;
+pub use private_discovery::{AppDiscoveryRetirement, AppDiscoveryTerminationReport};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -201,6 +203,51 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
     environment_manager: Arc<EnvironmentManager>,
     mcp_manager: Arc<McpManager>,
 ) -> anyhow::Result<AccessibleConnectorsStatus> {
+    list_accessible_connectors_with_authority(
+        config,
+        force_refetch,
+        environment_manager,
+        mcp_manager,
+        /*retirement*/ None,
+        codex_mcp::McpAttemptAccess::Unscoped,
+    )
+    .await
+}
+
+/// Managed callers retain this control before polling discovery, so cancellation
+/// or a failed ordinary shutdown cannot discard the temporary runtime's owners.
+pub async fn list_accessible_connectors_in_retirement(
+    config: &Config,
+    force_refetch: bool,
+    environment_manager: Arc<EnvironmentManager>,
+    mcp_manager: Arc<McpManager>,
+    retirement: AppDiscoveryRetirement,
+) -> anyhow::Result<AccessibleConnectorsStatus> {
+    list_accessible_connectors_with_authority(
+        config,
+        force_refetch,
+        environment_manager,
+        mcp_manager,
+        Some(retirement),
+        codex_mcp::McpAttemptAccess::Unscoped,
+    )
+    .await
+}
+
+/// Threadless discovery with invocation-owned account authority. Retained MCP
+/// startup attempts derive their own work; no authority is cached with apps.
+pub async fn list_accessible_connectors_with_authority(
+    config: &Config,
+    force_refetch: bool,
+    environment_manager: Arc<EnvironmentManager>,
+    mcp_manager: Arc<McpManager>,
+    retirement: Option<AppDiscoveryRetirement>,
+    access: codex_mcp::McpAttemptAccess<'_>,
+) -> anyhow::Result<AccessibleConnectorsStatus> {
+    let _discovery_scope = retirement
+        .as_ref()
+        .map(AppDiscoveryRetirement::scope)
+        .transpose()?;
     let auth_manager = mcp_manager.auth_manager();
     let auth = auth_manager.auth().await;
     if !config
@@ -241,9 +288,15 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
     let codex_apps_auth_manager =
         codex_mcp::host_owned_codex_apps_enabled(&mcp_config, auth.as_ref())
             .then(|| Arc::clone(&auth_manager));
-    let mcp_runtime = McpRuntime::new(McpRuntimeInput {
-        attempt_requirement: codex_mcp::McpAttemptRequirement::Ungated,
-        startup_work: None,
+    let input = McpRuntimeInput {
+        attempt_requirement: match access {
+            codex_mcp::McpAttemptAccess::Unscoped => codex_mcp::McpAttemptRequirement::Ungated,
+            codex_mcp::McpAttemptAccess::Admitted(_) => codex_mcp::McpAttemptRequirement::Required,
+        },
+        startup_work: match access {
+            codex_mcp::McpAttemptAccess::Unscoped => None,
+            codex_mcp::McpAttemptAccess::Admitted(work) => Some(work.derive_attempt()?),
+        },
         network_policy_metadata: None,
         runtime_auth: mcp_manager.runtime_auth_for_config(config),
         startup_policy: McpStartupPolicy::Eager,
@@ -265,12 +318,19 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
         auth_manager: codex_apps_auth_manager,
         elicitation_reviewer: None,
         elicitation_lifecycle: None,
-    })
-    .await;
+    };
+    let mcp_runtime = match retirement {
+        Some(ref retirement) => {
+            let runtime = retirement.begin(input.config.prefix_mcp_tool_names)?;
+            runtime.replace(input).await;
+            runtime
+        }
+        None => McpRuntime::new(input).await,
+    };
 
     let refreshed_tools = if force_refetch {
         match mcp_runtime
-            .latest_hard_refresh_codex_apps_tools_cache()
+            .latest_hard_refresh_codex_apps_tools_cache_with_authority(access)
             .await
         {
             Ok(tools) => Some(tools),
@@ -289,14 +349,20 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
     let mut tools = if let Some(tools) = refreshed_tools {
         tools
     } else {
-        mcp_runtime.latest_list_all_tools().await
+        mcp_runtime
+            .latest_list_all_tools_with_authority(access)
+            .await
     };
     let mut should_reload_tools = false;
     let codex_apps_ready = if refreshed_tools_succeeded {
         true
     } else if let Some(cfg) = mcp_servers.get(CODEX_APPS_MCP_SERVER_NAME) {
         let immediate_ready = mcp_runtime
-            .latest_wait_for_server_ready(CODEX_APPS_MCP_SERVER_NAME, Duration::ZERO)
+            .latest_wait_for_server_ready_with_authority(
+                CODEX_APPS_MCP_SERVER_NAME,
+                Duration::ZERO,
+                access,
+            )
             .await;
         if immediate_ready {
             true
@@ -306,7 +372,11 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
                 .startup_timeout_sec
                 .unwrap_or(CONNECTORS_READY_TIMEOUT_ON_EMPTY_TOOLS);
             let ready = mcp_runtime
-                .latest_wait_for_server_ready(CODEX_APPS_MCP_SERVER_NAME, timeout)
+                .latest_wait_for_server_ready_with_authority(
+                    CODEX_APPS_MCP_SERVER_NAME,
+                    timeout,
+                    access,
+                )
                 .await;
             should_reload_tools = ready;
             ready
@@ -317,7 +387,9 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
         false
     };
     if should_reload_tools {
-        tools = mcp_runtime.latest_list_all_tools().await;
+        tools = mcp_runtime
+            .latest_list_all_tools_with_authority(access)
+            .await;
     }
     if codex_apps_ready {
         cancel_token.cancel();
@@ -330,6 +402,14 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
     let accessible_connectors =
         with_app_plugin_sources(accessible_connectors, &tool_plugin_context);
     mcp_runtime.shutdown().await;
+    if let Some(retirement) = retirement {
+        let report = retirement
+            .shutdown_until(
+                tokio::time::Instant::now() + codex_rmcp_client::DEFAULT_RETIREMENT_TIMEOUT,
+            )
+            .await;
+        anyhow::ensure!(report.is_complete(), "app discovery retirement incomplete");
+    }
     Ok(AccessibleConnectorsStatus {
         connectors: accessible_connectors,
         codex_apps_ready,

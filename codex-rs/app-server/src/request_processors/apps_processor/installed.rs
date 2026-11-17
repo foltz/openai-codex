@@ -99,10 +99,24 @@ impl AppsRequestProcessor {
                     let codex_apps_auth_manager =
                         host_owned_codex_apps_enabled(&mcp_config, auth.as_ref())
                             .then(|| Arc::clone(&auth_manager));
+                    // Capture in the request task; retained MCP drivers do not
+                    // inherit REQUEST_WORK. Exhaustion must not become ungated.
+                    let request_work = crate::account_turn_admission::derive_request_work()
+                        .map_err(|_| anyhow::anyhow!("MCP startup account work is unavailable"))?;
+                    let attempt_requirement = if request_work.is_some() {
+                        codex_mcp::McpAttemptRequirement::Required
+                    } else {
+                        codex_mcp::McpAttemptRequirement::Ungated
+                    };
+                    let startup_work = request_work.as_ref()
+                        .map(codex_mcp::McpAttemptWork::derive_attempt)
+                        .transpose()?;
+                    let access = codex_mcp::McpAttemptAccess::from_work(request_work.as_ref()
+                        .map(|work| work as &dyn codex_mcp::McpAttemptWork));
                     self.thread_manager.runtime_auth_for_mcp_manager(&config, &mcp_manager)?;
                     let runtime = McpRuntime::new(McpRuntimeInput {
-                        attempt_requirement: codex_mcp::McpAttemptRequirement::Ungated,
-                        startup_work: None,
+                        attempt_requirement,
+                        startup_work,
                         network_policy_metadata: None,
                         runtime_auth: mcp_manager.runtime_auth_for_config(&config),
                         startup_policy: McpStartupPolicy::Eager,
@@ -126,9 +140,10 @@ impl AppsRequestProcessor {
                     .await;
 
                     let result = if runtime
-                        .latest_wait_for_server_ready(
+                        .latest_wait_for_server_ready_with_authority(
                             CODEX_APPS_MCP_SERVER_NAME,
                             startup_timeout,
+                            access,
                         )
                         .await
                     {

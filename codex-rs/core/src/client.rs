@@ -1759,10 +1759,13 @@ impl ModelClientSession {
         let mut provider_auth_recovery_attempted = false;
         let mut pending_retry = PendingUnauthorizedRetry::default();
         loop {
-            let client_setup = self
+            let mut client_setup = self
                 .client
                 .current_client_setup(ClientRouting::Workspace)
                 .await?;
+            let (observed_auth, rejected_credential) =
+                codex_model_provider::observe_request_auth(Arc::clone(&client_setup.api_auth));
+            client_setup.api_auth = observed_auth;
             let auth_context = AuthRequestTelemetryContext::new(
                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
                 client_setup.api_auth.as_ref(),
@@ -1808,6 +1811,11 @@ impl ModelClientSession {
                 Err(ApiError::Transport(unauthorized_transport))
                     if provider.is_recoverable_auth_error(&unauthorized_transport) =>
                 {
+                    // Bind only this completed attempt, before recovery can
+                    // mutate caches; absent evidence clears any earlier proof.
+                    if let Some(recovery) = auth_recovery.as_mut() {
+                        recovery.record_failed_credential(rejected_credential.fingerprint());
+                    }
                     pending_retry = PendingUnauthorizedRetry::from_recovery(
                         handle_unauthorized(
                             unauthorized_transport,
@@ -1983,10 +1991,13 @@ impl ResponsesHttpExecutor<'_> {
         let mut provider_auth_recovery_attempted = false;
         let mut pending_retry = PendingUnauthorizedRetry::default();
         loop {
-            let client_setup = self
+            let mut client_setup = self
                 .client
                 .current_client_setup(ClientRouting::Workspace)
                 .await?;
+            let (observed_auth, rejected_credential) =
+                codex_model_provider::observe_request_auth(Arc::clone(&client_setup.api_auth));
+            client_setup.api_auth = observed_auth;
             if expected_auth_owner.as_ref().is_some_and(|owner| {
                 Some(owner) != client_setup.auth_owner.as_ref() || !owner.is_current()
             }) {
@@ -2126,6 +2137,11 @@ impl ResponsesHttpExecutor<'_> {
                         response_debug_context.request_id.as_deref(),
                         /*output_items*/ &[],
                     );
+                    // Bind only this completed attempt, before recovery can
+                    // mutate caches; absent evidence clears any earlier proof.
+                    if let Some(recovery) = auth_recovery.as_mut() {
+                        recovery.record_failed_credential(rejected_credential.fingerprint());
+                    }
                     pending_retry = PendingUnauthorizedRetry::from_recovery(
                         handle_unauthorized(
                             unauthorized_transport,
@@ -2203,10 +2219,13 @@ impl ModelClientSession {
         loop {
             crate::model_request::check_budget(&self.client.request_contributors, &thread_id, kind)
                 .await?;
-            let client_setup = self
+            let mut client_setup = self
                 .client
                 .current_client_setup(ClientRouting::Workspace)
                 .await?;
+            let (observed_auth, rejected_credential) =
+                codex_model_provider::observe_request_auth(Arc::clone(&client_setup.api_auth));
+            client_setup.api_auth = observed_auth;
             let include_internal = self
                 .client
                 .state
@@ -2280,6 +2299,11 @@ impl ModelClientSession {
                 Err(ApiError::Transport(unauthorized_transport))
                     if provider.is_recoverable_auth_error(&unauthorized_transport) =>
                 {
+                    // Bind only this completed attempt, before recovery can
+                    // mutate caches; absent evidence clears any earlier proof.
+                    if let Some(recovery) = auth_recovery.as_mut() {
+                        recovery.record_failed_credential(rejected_credential.fingerprint());
+                    }
                     pending_retry = PendingUnauthorizedRetry::from_recovery(
                         handle_unauthorized(
                             unauthorized_transport,

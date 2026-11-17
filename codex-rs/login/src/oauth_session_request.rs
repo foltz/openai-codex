@@ -40,6 +40,22 @@ impl fmt::Debug for OAuthSessionBinding {
 }
 
 impl OAuthSessionManager {
+    /// Token-free admission from an already observed sign-in. Never loads storage,
+    /// renews credentials, or starts interactive login. Requests revalidate the epoch.
+    pub fn observed_session_binding(&self) -> Option<OAuthSessionBinding> {
+        let (identity, epoch) = self.state.domain.observed_binding()?;
+        let authorization_id = identity
+            .authorization_id
+            .filter(|id| !id.trim().is_empty())?;
+        Some(OAuthSessionBinding {
+            credential_id: self.credential_id(),
+            authorization_id,
+            principal: identity.principal,
+            domain: std::sync::Arc::clone(&self.state.domain),
+            epoch,
+        })
+    }
+
     /// Reuse only the actual origin's store/config and sign-in, noninteractively.
     pub fn begin_admitted_request(
         &self,

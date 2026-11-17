@@ -59,6 +59,18 @@ impl GatewayAuthManager {
         }
     }
 
+    /// Capture configured gateway continuity without resolving credentials.
+    /// Exporters and OAuth sessions not yet observed remain explicitly unbound.
+    pub fn observed_admission(&self) -> GatewayAdmission {
+        match &self.0 {
+            GatewayCredentialSource::OAuth(session) => session
+                .observed_session_binding()
+                .map(GatewayAdmission::Bound)
+                .unwrap_or(GatewayAdmission::Unbound),
+            GatewayCredentialSource::Export(_) => GatewayAdmission::Unbound,
+        }
+    }
+
     /// The session used for explicit sign-in and OAuth status, when configured.
     pub fn oauth_session(&self) -> Option<Arc<OAuthSessionManager>> {
         match &self.0 {

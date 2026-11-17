@@ -71,6 +71,11 @@ impl CredentialDomain {
         }
         Ok(guard)
     }
+    /// Snapshot only identity already observed by this process. No storage or refresh.
+    pub fn observed_binding(&self) -> Option<(GrantIdentity, u64)> {
+        let state = self.lock().ok()?;
+        Some((state.identity.clone()?, state.epoch))
+    }
     pub fn binding(&self, expected: &GrantIdentity) -> Option<u64> {
         let state = self.lock().ok()?;
         (state.identity.as_ref() == Some(expected)).then_some(state.epoch)
@@ -116,6 +121,28 @@ mod tests {
             .observe(Some(origin.clone()))
             .unwrap();
         assert!(!domain.is_current(&origin, epoch));
+    }
+    #[test]
+    fn observed_binding_is_empty_until_observed_and_tracks_retirement() {
+        let domain = CredentialDomain::default();
+        assert_eq!(domain.observed_binding(), None);
+        let origin = identity("origin");
+        domain
+            .lock()
+            .unwrap()
+            .observe(Some(origin.clone()))
+            .unwrap();
+        let (captured, epoch) = domain.observed_binding().unwrap();
+        assert_eq!(captured, origin);
+        assert!(domain.is_current(&captured, epoch));
+        domain
+            .lock()
+            .unwrap()
+            .observe(Some(identity("replacement")))
+            .unwrap();
+        assert!(!domain.is_current(&captured, epoch));
+        domain.lock().unwrap().observe(None).unwrap();
+        assert_eq!(domain.observed_binding(), None);
     }
     #[test]
     fn principal_change_and_logout_retire_original_binding() {

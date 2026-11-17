@@ -957,6 +957,28 @@ impl OutgoingMessageSender {
         }
     }
 
+    /// A normal reply succeeds on router handoff; a process reply uses its
+    /// dedicated channel and existing write acknowledgement. The router must
+    /// separately account for a normal reply it later cannot write.
+    pub(crate) async fn send_error_delivered(
+        &self,
+        request_id: ConnectionRequestId,
+        error: impl Into<JSONRPCErrorError>,
+    ) -> bool {
+        let context = self.take_request_context(&request_id).await;
+        let message = OutgoingMessage::Error(OutgoingError {
+            id: request_id.request_id,
+            error: error.into(),
+        });
+        self.send_outgoing_message_to_connection(
+            context,
+            request_id.connection_id,
+            message,
+            "not-admitted refusal",
+        )
+        .await
+    }
+
     async fn send_error_inner(
         &self,
         request_context: Option<RequestContext>,
@@ -982,7 +1004,7 @@ impl OutgoingMessageSender {
         connection_id: ConnectionId,
         message: OutgoingMessage,
         message_kind: &'static str,
-    ) {
+    ) -> bool {
         // Process requests serialize by handle. A blocked resize reply would also block the next kill.
         let sender = if request_context
             .as_ref()
@@ -1007,10 +1029,15 @@ impl OutgoingMessageSender {
             send_fut.await
         };
 
-        if let Err(err) = send_result {
-            warn!("failed to send {message_kind} to client: {err:?}");
-        } else if let Some(written_rx) = written_rx {
-            let _ = written_rx.await;
+        match send_result {
+            Err(err) => {
+                warn!("failed to send {message_kind} to client: {err:?}");
+                false
+            }
+            Ok(()) => match written_rx {
+                Some(written_rx) => written_rx.await.is_ok(),
+                None => true,
+            },
         }
     }
 }
@@ -1790,3 +1817,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "outgoing_refusal_tests.rs"]
+mod refusal_tests;

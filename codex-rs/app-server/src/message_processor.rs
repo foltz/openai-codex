@@ -149,6 +149,8 @@ fn reject_removed_permission_profile(request: &JSONRPCRequest) -> Result<(), JSO
     Ok(())
 }
 
+pub(crate) const NOT_ADMITTED_MESSAGE: &str = "Server is shutting down; request was not admitted.";
+
 pub(crate) struct MessageProcessor {
     pub(crate) turn_admission: TurnAdmission,
     user_verification: Arc<crate::user_verification::Service>,
@@ -1096,6 +1098,7 @@ impl MessageProcessor {
         };
         let serialization_scope = codex_request.serialization_scope();
         let error_request_id = connection_request_id.clone();
+        let refused_request_id = connection_request_id.clone();
         let rpc_gate = Arc::clone(&session.rpc_gate);
         let processor = Arc::clone(self);
         let span = request_context.span();
@@ -1130,7 +1133,15 @@ impl MessageProcessor {
                 }
             }
             .instrument(span),
-        );
+        )
+        .with_refusal({
+            let outgoing = Arc::clone(&self.outgoing);
+            async move {
+                outgoing
+                    .send_error_delivered(refused_request_id, internal_error(NOT_ADMITTED_MESSAGE))
+                    .await
+            }
+        });
 
         if let Some(scope) = serialization_scope {
             let (key, access) = RequestSerializationQueueKey::from_scope(connection_id, scope);

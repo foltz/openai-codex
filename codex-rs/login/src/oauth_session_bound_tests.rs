@@ -269,3 +269,32 @@ async fn legacy_token_without_grant_id_does_not_mint_typed_binding() {
     assert_eq!(selected.access_token, "legacy-token");
     assert!(selected.binding().is_none());
 }
+
+#[tokio::test]
+async fn ordinary_observed_resolution_captures_actual_credential_binding() {
+    let server = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let (client, _home) = client(config(&server), Arc::new(MockKeyringStore::default()));
+    grant(&client, "origin", "selected", Utc::now().timestamp() + 3600);
+    let observed = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.resolve_access_token_observed(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(observed.access_token, "selected");
+    assert_eq!(observed.authorization_id.as_deref(), Some("origin"));
+    let mut admitted = client
+        .begin_admitted_request(observed.binding().unwrap())
+        .unwrap();
+    assert_eq!(
+        credentials(&mut admitted).await.unwrap().access_token,
+        "selected"
+    );
+    server.verify().await;
+}

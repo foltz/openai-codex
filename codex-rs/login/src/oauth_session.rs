@@ -239,6 +239,15 @@ impl OAuthSessionManager {
             .await
     }
 
+    /// Ordinary resolution and coherent token-free binding, without a second
+    /// store read or changing the original reuse/interactive policy.
+    pub async fn resolve_access_token_observed(&self) -> io::Result<OAuthRequestCredentials> {
+        let token = self
+            .resolve_credentials_with_browser(RefreshPolicy::WhenExpired, login::open_browser)
+            .await?;
+        Ok(OAuthRequestCredentials::from_resolved(self, token))
+    }
+
     /// Recovers after a request rejects `rejected_access_token`, reusing a usable replacement
     /// from storage or refreshing/authorizing according to the host policy.
     /// Pass the token used by the failed request; callers must bound retries and decide

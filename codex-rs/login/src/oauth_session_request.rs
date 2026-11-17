@@ -40,6 +40,22 @@ pub struct OAuthRequestCredentials {
 }
 
 impl OAuthRequestCredentials {
+    pub(super) fn from_resolved(manager: &OAuthSessionManager, token: super::StoredToken) -> Self {
+        let binding = token
+            .authorization_id
+            .as_ref()
+            .filter(|id| !id.trim().is_empty())
+            .map(|id| OAuthSessionBinding {
+                credential_id: manager.credential_id(),
+                authorization_id: id.clone(),
+            });
+        Self {
+            access_token: token.access_token,
+            authorization_id: token.authorization_id,
+            binding,
+        }
+    }
+
     pub fn binding(&self) -> Option<&OAuthSessionBinding> {
         self.binding.as_ref()
     }
@@ -88,19 +104,7 @@ impl OAuthSessionRequest {
             .resolve_credentials_with_browser(self.policy.clone(), login::open_browser)
             .await?;
         self.sent_token = Some(token.access_token.clone());
-        let binding = token
-            .authorization_id
-            .as_ref()
-            .filter(|id| !id.trim().is_empty())
-            .map(|id| OAuthSessionBinding {
-                credential_id: self.manager.credential_id(),
-                authorization_id: id.clone(),
-            });
-        Ok(OAuthRequestCredentials {
-            access_token: token.access_token,
-            authorization_id: token.authorization_id,
-            binding,
-        })
+        Ok(OAuthRequestCredentials::from_resolved(&self.manager, token))
     }
 
     /// Marks the sent credential as rejected. Callers bound unauthorized replays;

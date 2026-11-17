@@ -730,7 +730,7 @@ mod thread_processor_behavior_tests {
             personality: None,
             exclude_turns: false,
             initial_turns_page: None,
-            retain_for_connection: None,
+            retain_for_connection: false,
         };
         let config_snapshot = ThreadConfigSnapshot {
             turn_extension_init: Default::default(),

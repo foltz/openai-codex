@@ -101,7 +101,7 @@ async fn fixture_with_extensions(
         )),
         /*analytics_events_client*/ None,
         codex_core::passthrough_image_store(),
-        codex_thread_store::ThreadStoreBuilder::from_config(&config, None).build(),
+        codex_core::ThreadStoreBuilder::from_config(&config, None).build(),
         /*agent_graph_store*/ None,
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,

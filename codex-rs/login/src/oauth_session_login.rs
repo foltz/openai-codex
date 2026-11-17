@@ -146,7 +146,7 @@ impl OAuthSessionManager {
         let manager = self.clone();
         tokio::task::spawn_blocking(move || {
             let _credential_lock = credential_lock;
-            let removed = manager.state.storage.delete(&manager.credential_id())?;
+            let removed = manager.delete_token()?;
             *cached = OAuthSessionCache::default();
             manager.publish_status(OAuthSessionStatus::NotReady, /*credential*/ None);
             Ok(removed)

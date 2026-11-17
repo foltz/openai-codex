@@ -298,3 +298,147 @@ async fn ordinary_observed_resolution_captures_actual_credential_binding() {
     );
     server.verify().await;
 }
+
+fn another(
+    client: &OAuthSessionManager,
+    home: &std::path::Path,
+    keyring: Arc<MockKeyringStore>,
+) -> OAuthSessionManager {
+    OAuthSessionManager::new(
+        client.config().clone(),
+        home.to_path_buf(),
+        transport_default_auth_route_config().http_client_factory(),
+        keyring,
+    )
+    .unwrap()
+}
+#[tokio::test]
+async fn actual_second_manager_aba_retires_old_epoch_even_with_restored_grant_id() {
+    let keyring = Arc::new(MockKeyringStore::default());
+    let (client, home) = client(loopback_config(), keyring.clone());
+    grant(
+        &client,
+        "origin",
+        "original-token",
+        Utc::now().timestamp() + 3600,
+    );
+    let selected = client.resolve_access_token_observed().await.unwrap();
+    let binding = selected.binding().unwrap().clone();
+    let other = another(&client, home.path(), keyring);
+    grant(
+        &other,
+        "replacement",
+        "second-token",
+        Utc::now().timestamp() + 3600,
+    );
+    grant(
+        &other,
+        "origin",
+        "original-token",
+        Utc::now().timestamp() + 3600,
+    );
+    assert!(client.begin_admitted_request(&binding).is_err());
+}
+#[tokio::test]
+async fn actual_logout_invalidates_other_managers_admission() {
+    let keyring = Arc::new(MockKeyringStore::default());
+    let (client, home) = client(loopback_config(), keyring.clone());
+    grant(&client, "origin", "token", Utc::now().timestamp() + 3600);
+    let selected = client.resolve_access_token_observed().await.unwrap();
+    let binding = selected.binding().unwrap().clone();
+    let other = another(&client, home.path(), keyring);
+    tokio::time::timeout(Duration::from_secs(2), other.logout())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(client.begin_admitted_request(&binding).is_err());
+}
+#[tokio::test]
+async fn principal_replacement_with_same_grant_id_retires_binding() {
+    use base64::Engine;
+    let (client, _home) = client(loopback_config(), Arc::new(MockKeyringStore::default()));
+    let token = |sub: &str| {
+        format!(
+            "e30.{}.signature",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json!({"sub":sub}).to_string())
+        )
+    };
+    grant(
+        &client,
+        "grant",
+        &token("original"),
+        Utc::now().timestamp() + 3600,
+    );
+    let selected = client.resolve_access_token_observed().await.unwrap();
+    let binding = selected.binding().unwrap().clone();
+    grant(
+        &client,
+        "grant",
+        &token("replacement"),
+        Utc::now().timestamp() + 3600,
+    );
+    assert!(client.begin_admitted_request(&binding).is_err());
+}
+#[tokio::test]
+async fn legacy_credential_id_does_not_authorize_another_storage_backend() {
+    let keyring = Arc::new(MockKeyringStore::default());
+    let (client, home) = client(loopback_config(), keyring.clone());
+    grant(&client, "grant", "token", Utc::now().timestamp() + 3600);
+    let selected = client.resolve_access_token_observed().await.unwrap();
+    let binding = selected.binding().unwrap().clone();
+    let mut settings = client.config().clone();
+    settings.credentials_store = codex_model_provider_info::OAuthCredentialsStore::File;
+    let other = OAuthSessionManager::new(
+        settings,
+        home.path().to_path_buf(),
+        transport_default_auth_route_config().http_client_factory(),
+        keyring,
+    )
+    .unwrap();
+    assert_eq!(other.credential_id(), client.credential_id());
+    assert!(other.begin_admitted_request(&binding).is_err());
+}
+#[test]
+fn actual_load_and_save_are_serialized_and_old_load_cannot_gain_new_epoch() {
+    let (client, _home) = client(loopback_config(), Arc::new(MockKeyringStore::default()));
+    grant(
+        &client,
+        "origin",
+        "old-token",
+        Utc::now().timestamp() + 3600,
+    );
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    *client.state.load_hook.lock().unwrap() = Some(Box::new(move || {
+        entered_tx.send(()).unwrap();
+        release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    }));
+    let reader = client.clone();
+    let (loaded_tx, loaded_rx) = std::sync::mpsc::channel();
+    let read = std::thread::spawn(move || {
+        loaded_tx
+            .send(reader.load_token().unwrap().unwrap())
+            .unwrap();
+    });
+    entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(client.state.domain.is_locked());
+    let writer = client.clone();
+    let (saved_tx, saved_rx) = std::sync::mpsc::channel();
+    let write = std::thread::spawn(move || {
+        grant(
+            &writer,
+            "replacement",
+            "new-token",
+            Utc::now().timestamp() + 3600,
+        );
+        saved_tx.send(()).unwrap();
+    });
+    release_tx.send(()).unwrap();
+    let old = loaded_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    saved_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    read.join().unwrap();
+    write.join().unwrap();
+    assert_eq!(old.access_token, "old-token");
+    let stale = super::super::OAuthRequestCredentials::from_resolved(&client, old);
+    assert!(stale.binding().is_none());
+}

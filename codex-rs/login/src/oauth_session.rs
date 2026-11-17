@@ -31,6 +31,10 @@ use sha2::Sha256;
 use tokio::sync::Mutex;
 use url::Url;
 
+#[path = "oauth_session_domain.rs"]
+mod domain;
+use domain::{CredentialDomain, GrantIdentity};
+
 #[path = "oauth_session_callback.rs"]
 mod callback;
 #[path = "oauth_session_login.rs"]
@@ -87,6 +91,8 @@ enum RefreshPolicy {
     AfterRejection(String),
     Bound {
         authorization_id: String,
+        principal: Option<String>,
+        domain: Option<(Arc<CredentialDomain>, u64)>,
         rejected_access_token: Option<String>,
     },
 }
@@ -94,7 +100,10 @@ enum RefreshPolicy {
 impl RefreshPolicy {
     fn check_admission(&self, token: Option<&StoredToken>) -> io::Result<()> {
         if let Self::Bound {
-            authorization_id, ..
+            authorization_id,
+            principal,
+            domain,
+            ..
         } = self
         {
             if authorization_id.trim().is_empty()
@@ -104,6 +113,20 @@ impl RefreshPolicy {
                     io::ErrorKind::PermissionDenied,
                     "provider OAuth sign-in changed since admission",
                 ));
+            }
+            if let Some((domain, epoch)) = domain {
+                let expected = GrantIdentity {
+                    authorization_id: Some(authorization_id.clone()),
+                    principal: principal.clone(),
+                };
+                if token.map(grant_identity).as_ref() != Some(&expected)
+                    || !domain.is_current(&expected, *epoch)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "provider OAuth sign-in epoch or principal changed since admission",
+                    ));
+                }
             }
         }
         Ok(())
@@ -119,6 +142,7 @@ impl RefreshPolicy {
                 Self::Bound {
                     authorization_id,
                     rejected_access_token,
+                    ..
                 } => {
                     token.authorization_id.as_ref() == Some(authorization_id)
                         && rejected_access_token
@@ -141,6 +165,9 @@ struct OAuthSessionState {
     http_client: HttpClient,
     http_client_factory: HttpClientFactory,
     cached_token: Arc<Mutex<OAuthSessionCache>>,
+    domain: Arc<CredentialDomain>,
+    #[cfg(test)]
+    load_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     // Reserve explicit login independently of background credential reads and refreshes.
     login_attempt: Arc<Mutex<()>>,
     status: tokio::sync::watch::Sender<Option<login::OAuthSessionStatusSnapshot>>,
@@ -175,10 +202,18 @@ impl OAuthSessionManager {
                 ClientRouteClass::Auth,
             )
             .map_err(|_| io::Error::other("failed to create provider OAuth HTTP client"))?;
+        let domain = CredentialDomain::shared(format!(
+            "{}|{:?}",
+            credential_id_for(&config, &codex_home),
+            config.credentials_store
+        ))?;
         Ok(Self {
             control: OAuthLoginControl::for_host(&codex_home, http_client_factory),
             allow_interactive_login: true,
             state: Arc::new(OAuthSessionState {
+                domain,
+                #[cfg(test)]
+                load_hook: std::sync::Mutex::new(None),
                 storage: OAuthSessionStorage::new(
                     codex_home.clone(),
                     config.credentials_store,
@@ -480,24 +515,7 @@ impl OAuthSessionManager {
 
     /// Stable, opaque identity of the issuer, client, audience, and scopes.
     pub fn credential_id(&self) -> String {
-        let config = &self.state.config;
-        let mut digest = Sha256::new();
-        digest.update(self.state.codex_home.to_string_lossy().as_bytes());
-        digest.update([0]);
-        for value in [
-            config.authorization_url.as_str(),
-            config.token_url.as_str(),
-            config.client_id.as_str(),
-            config.resource.as_deref().unwrap_or_default(),
-        ] {
-            digest.update(value.as_bytes());
-            digest.update([0]);
-        }
-        for scope in &config.scopes {
-            digest.update(scope.as_bytes());
-            digest.update([0]);
-        }
-        format!("provider-oauth|{:x}", digest.finalize())
+        credential_id_for(&self.state.config, &self.state.codex_home)
     }
 
     async fn load_token_async(&self) -> io::Result<Option<StoredToken>> {
@@ -508,11 +526,30 @@ impl OAuthSessionManager {
     }
 
     fn load_token(&self) -> io::Result<Option<StoredToken>> {
-        self.state.storage.load(&self.credential_id())
+        let mut domain = self.state.domain.lock()?;
+        #[cfg(test)]
+        if let Some(hook) = self.state.load_hook.lock().unwrap().take() {
+            hook();
+        }
+        let token = self.state.storage.load(&self.credential_id())?;
+        domain.observe(token.as_ref().map(grant_identity))?;
+        Ok(token)
     }
 
     fn save_token(&self, token: &StoredToken) -> io::Result<()> {
-        self.state.storage.save(&self.credential_id(), token)
+        let identity = Some(grant_identity(token));
+        let mut domain = self.state.domain.lock()?;
+        domain.prepare(&identity)?;
+        self.state.storage.save(&self.credential_id(), token)?;
+        domain.observe(identity)
+    }
+
+    fn delete_token(&self) -> io::Result<bool> {
+        let mut domain = self.state.domain.lock()?;
+        domain.prepare(&None)?;
+        let removed = self.state.storage.delete(&self.credential_id())?;
+        domain.observe(None)?;
+        Ok(removed)
     }
 
     async fn authorize_with_browser(
@@ -646,3 +683,40 @@ fn validate_oauth_url(value: &str, description: &str) -> io::Result<Url> {
 #[cfg(test)]
 #[path = "oauth_session_tests.rs"]
 mod tests;
+
+fn credential_id_for(config: &OAuthSessionConfig, codex_home: &std::path::Path) -> String {
+    let mut digest = Sha256::new();
+    digest.update(codex_home.to_string_lossy().as_bytes());
+    digest.update([0]);
+    for value in [
+        config.authorization_url.as_str(),
+        config.token_url.as_str(),
+        config.client_id.as_str(),
+        config.resource.as_deref().unwrap_or_default(),
+    ] {
+        digest.update(value.as_bytes());
+        digest.update([0]);
+    }
+    for scope in &config.scopes {
+        digest.update(scope.as_bytes());
+        digest.update([0]);
+    }
+    format!("provider-oauth|{:x}", digest.finalize())
+}
+
+fn grant_identity(token: &StoredToken) -> GrantIdentity {
+    // Continuity only, never local issuer authentication or authorization.
+    let principal = crate::token_data::decode_jwt_payload::<serde_json::Value>(&token.access_token)
+        .ok()
+        .and_then(|claims| {
+            claims
+                .get("sub")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+        });
+    GrantIdentity {
+        authorization_id: token.authorization_id.clone(),
+        principal,
+    }
+}

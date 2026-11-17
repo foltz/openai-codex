@@ -12,6 +12,7 @@ use crate::remote::RemoteInstalledPluginBundleSyncError;
 use crate::remote::RemotePluginCacheMutationGuard;
 use crate::remote::RemotePluginCatalogError;
 use crate::remote::RemotePluginDetail;
+use crate::remote::reset_authority::RemotePluginBundleSyncGeneration;
 use crate::remote_bundle;
 use crate::remote_bundle::RemotePluginBundleInstallError;
 use codex_app_server_protocol::PluginAuthPolicy;
@@ -106,6 +107,12 @@ impl PluginsManager {
         }
         remote::validate_remote_plugin_id(&remote_plugin_id)
             .map_err(|err| unresolved(Error::InvalidRequest(err.message)))?;
+        let publication_generation = RemotePluginBundleSyncGeneration::capture(&self.codex_home)
+            .map_err(|_| {
+                unresolved(Error::Internal(
+                    "remote plugin publication authority unavailable".to_string(),
+                ))
+            })?;
         let service = self
             .remote_plugin_service_config(config)
             .for_current_account();
@@ -162,10 +169,11 @@ impl PluginsManager {
             &detail.summary.name,
         );
         // Materialize first: a failed download must never leave a backend installation behind.
-        let installed = remote_bundle::download_and_install_remote_plugin_bundle(
+        let installed = remote_bundle::download_and_install_remote_plugin_bundle_with_generation(
             &service,
             self.codex_home.clone(),
             bundle,
+            &publication_generation,
         )
         .await
         .map_err(|err| resolved(Error::Bundle(err)))?;
@@ -234,6 +242,12 @@ impl PluginsManager {
         }
         remote::validate_remote_plugin_id(remote_plugin_id)
             .map_err(|err| unresolved(Error::InvalidRequest(err.message)))?;
+        let publication_generation = RemotePluginBundleSyncGeneration::capture(&self.codex_home)
+            .map_err(|_| {
+                unresolved(Error::Internal(
+                    "remote plugin publication authority unavailable".to_string(),
+                ))
+            })?;
         let service = self.remote_plugin_service_config(config);
         let target =
             remote::resolve_remote_plugin_uninstall_target(&service, auth, remote_plugin_id)
@@ -272,19 +286,24 @@ impl PluginsManager {
             &plugin_id.marketplace_name,
             &plugin_id.plugin_name,
         );
-        let cache_removal_error =
-            match remote::uninstall_remote_plugin(&service, auth, self.codex_home.clone(), target)
-                .await
-            {
-                Ok(()) => None,
-                Err(err @ RemotePluginCatalogError::CacheRemove(_)) => Some(err),
-                Err(source) => {
-                    return Err(resolved(Error::Catalog {
-                        context: "uninstall remote plugin",
-                        source,
-                    }));
-                }
-            };
+        let cache_removal_error = match remote::uninstall_remote_plugin_with_generation(
+            &service,
+            auth,
+            self.codex_home.clone(),
+            target,
+            &publication_generation,
+        )
+        .await
+        {
+            Ok(()) => None,
+            Err(err @ RemotePluginCatalogError::CacheRemove(_)) => Some(err),
+            Err(source) => {
+                return Err(resolved(Error::Catalog {
+                    context: "uninstall remote plugin",
+                    source,
+                }));
+            }
+        };
         let effective_plugins_changed = self.clear_remote_installed_plugins_cache();
         self.maybe_start_remote_installed_plugins_cache_refresh_after_mutation(
             config,

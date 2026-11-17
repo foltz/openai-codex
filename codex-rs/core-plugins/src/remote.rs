@@ -1,3 +1,5 @@
+pub(crate) mod reset_authority;
+
 #[path = "plugin_measurement_catalog.rs"]
 mod measurement_catalog;
 pub(crate) use measurement_catalog::fetch_measurement_reference_bundle;
@@ -55,7 +57,7 @@ use url::Url;
 
 mod catalog_cache;
 mod plugin_capabilities;
-mod remote_installed_plugin_sync;
+pub(crate) mod remote_installed_plugin_sync;
 mod search;
 mod share;
 
@@ -1820,6 +1822,22 @@ pub async fn uninstall_remote_plugin(
     codex_home: PathBuf,
     target: RemotePluginUninstallTarget,
 ) -> Result<(), RemotePluginCatalogError> {
+    let generation = reset_authority::RemotePluginBundleSyncGeneration::capture(&codex_home)
+        .map_err(|_| {
+            RemotePluginCatalogError::CacheRemove(
+                "remote plugin publication authority unavailable".to_string(),
+            )
+        })?;
+    uninstall_remote_plugin_with_generation(config, auth, codex_home, target, &generation).await
+}
+
+pub(crate) async fn uninstall_remote_plugin_with_generation(
+    config: &RemotePluginServiceConfig,
+    auth: Option<&CodexAuth>,
+    codex_home: PathBuf,
+    target: RemotePluginUninstallTarget,
+    generation: &reset_authority::RemotePluginBundleSyncGeneration,
+) -> Result<(), RemotePluginCatalogError> {
     let auth = ensure_chatgpt_auth(auth)?;
     let RemotePluginUninstallTarget {
         plugin_id,
@@ -1848,16 +1866,22 @@ pub async fn uninstall_remote_plugin(
     }
 
     let legacy_plugin_id = response.id;
-    tokio::task::spawn_blocking(move || {
-        remove_remote_plugin_cache(codex_home, marketplace_name, plugin_name, legacy_plugin_id)
-    })
-    .await
-    .map_err(|err| {
-        RemotePluginCatalogError::CacheRemove(format!(
-            "failed to join remote plugin cache removal task: {err}"
-        ))
-    })?
-    .map_err(RemotePluginCatalogError::CacheRemove)?;
+    let lease = generation.begin_commit().map_err(|_| {
+        RemotePluginCatalogError::CacheRemove(
+            "remote plugin publication authority unavailable".to_string(),
+        )
+    })?;
+    let (result, _physical_lease) = lease
+        .run_blocking(move || {
+            remove_remote_plugin_cache(codex_home, marketplace_name, plugin_name, legacy_plugin_id)
+        })
+        .await
+        .map_err(|_| {
+            RemotePluginCatalogError::CacheRemove(
+                "failed to join remote plugin cache removal task".to_string(),
+            )
+        })?;
+    result.map_err(RemotePluginCatalogError::CacheRemove)?;
 
     Ok(())
 }

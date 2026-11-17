@@ -3,6 +3,8 @@ use crate::plugin_bundle_archive::PluginBundleUnpackError;
 use crate::plugin_bundle_archive::unpack_plugin_bundle_tar_gz;
 use crate::remote::REMOTE_GLOBAL_MARKETPLACE_NAME;
 use crate::remote::RemotePluginServiceConfig;
+use crate::remote::reset_authority::RemotePluginBundleCommitLease;
+use crate::remote::reset_authority::RemotePluginBundleSyncGeneration;
 use crate::store::PluginInstallResult;
 use crate::store::PluginStore;
 use crate::store::PluginStoreError;
@@ -265,38 +267,61 @@ fn is_loopback_url(url: &Url) -> bool {
     }
 }
 
+fn publication_error(source: io::Error) -> RemotePluginBundleInstallError {
+    RemotePluginBundleInstallError::Io {
+        context: "remote plugin publication authority unavailable",
+        source,
+    }
+}
+
 pub async fn download_and_install_remote_plugin_bundle(
     config: &RemotePluginServiceConfig,
     codex_home: PathBuf,
     bundle: ValidatedRemotePluginBundle,
 ) -> Result<PluginInstallResult, RemotePluginBundleInstallError> {
-    let bundle_bytes = download_remote_plugin_bundle(config, &bundle).await?;
-    tokio::task::spawn_blocking(move || {
-        install_remote_plugin_bundle(codex_home, bundle, bundle_bytes)
-    })
+    let generation =
+        RemotePluginBundleSyncGeneration::capture(&codex_home).map_err(publication_error)?;
+    download_and_install_remote_plugin_bundle_with_generation(
+        config,
+        codex_home,
+        bundle,
+        &generation,
+    )
     .await
-    .map_err(|err| {
-        RemotePluginBundleInstallError::InvalidBundle(format!(
-            "failed to join remote plugin bundle install task: {err}"
-        ))
-    })?
+}
+
+pub(crate) async fn download_and_install_remote_plugin_bundle_with_generation(
+    config: &RemotePluginServiceConfig,
+    codex_home: PathBuf,
+    bundle: ValidatedRemotePluginBundle,
+    generation: &RemotePluginBundleSyncGeneration,
+) -> Result<PluginInstallResult, RemotePluginBundleInstallError> {
+    let bundle_bytes = download_remote_plugin_bundle(config, &bundle).await?;
+    let lease = generation.begin_commit().map_err(publication_error)?;
+    let (result, _physical_lease) = lease
+        .run_blocking(move || install_remote_plugin_bundle(codex_home, bundle, bundle_bytes))
+        .await
+        .map_err(publication_error)?;
+    result
 }
 
 pub(crate) async fn download_and_extract_remote_plugin_bundle_to_path(
     config: &RemotePluginServiceConfig,
     bundle: ValidatedRemotePluginBundle,
     destination: AbsolutePathBuf,
-) -> Result<AbsolutePathBuf, RemotePluginBundleInstallError> {
+    generation: &RemotePluginBundleSyncGeneration,
+) -> Result<(AbsolutePathBuf, RemotePluginBundleCommitLease), RemotePluginBundleInstallError> {
     let bundle_bytes = download_remote_plugin_bundle(config, &bundle).await?;
-    tokio::task::spawn_blocking(move || {
-        extract_remote_plugin_bundle_to_path(bundle, bundle_bytes, destination)
-    })
-    .await
-    .map_err(|err| {
-        RemotePluginBundleInstallError::InvalidBundle(format!(
-            "failed to join remote plugin bundle extraction task: {err}"
-        ))
-    })?
+    let lease = generation.begin_commit().map_err(publication_error)?;
+    let (result, physical_lease) = lease
+        .run_blocking(move || {
+            extract_remote_plugin_bundle_to_path(bundle, bundle_bytes, destination)
+        })
+        .await
+        .map_err(publication_error)?;
+    // Transfer the original physical lease with the extracted path. The share
+    // caller retains it through synchronous marketplace publication/rollback.
+    Ok((result?, physical_lease))
 }
 
 pub(crate) async fn download_remote_plugin_bundle(

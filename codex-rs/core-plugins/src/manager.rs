@@ -1,3 +1,4 @@
+use crate::remote::reset_authority::RemotePluginBundleSyncGeneration;
 #[path = "manager_errors.rs"]
 mod errors;
 pub use errors::PluginInstallError;
@@ -1957,6 +1958,48 @@ impl PluginsManager {
         .is_some()
     }
 
+    /// Strict managed reset is separate from ordinary best-effort cache clear.
+    /// Retire physical publication first; any error/cancellation keeps it closed.
+    pub async fn reset_remote_installed_plugins(&self) -> std::io::Result<()> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let retirement =
+            crate::remote::reset_authority::retire_remote_plugin_bundle_sync(&self.codex_home)?;
+        let unavailable = || std::io::Error::other("plugin reset cache authority unavailable");
+        let retired = {
+            // Match the scheduler's state -> cache lock order. Never drop queued
+            // callback/auth owners or plugin payloads while these locks are held.
+            let mut refresh = self
+                .remote_installed_plugins_cache_refresh_state
+                .write()
+                .map_err(|_| unavailable())?;
+            let mut cache = self
+                .remote_installed_plugins_cache
+                .write()
+                .map_err(|_| unavailable())?;
+            let mut loaded = self
+                .loaded_plugins_cache
+                .lock()
+                .map_err(|_| unavailable())?;
+            let next_cache = cache.generation.checked_add(1).ok_or_else(unavailable)?;
+            let next_loaded = loaded.generation.checked_add(1).ok_or_else(unavailable)?;
+            cache.generation = next_cache;
+            loaded.generation = next_loaded;
+            cache.reconciliation_generation = None;
+            cache.needs_effective_plugins_refresh = false;
+            (
+                refresh.requested.take(),
+                cache.plugins.take(),
+                cache.auth_identity.take(),
+                std::mem::take(&mut loaded.entries),
+            )
+            // Keep the real running worker registered. Its old numeric generation
+            // cannot publish, and its original task join is owned separately.
+        };
+        drop(retired);
+        self.tool_suggest_metadata_cache.clear_for_managed_reset()?;
+        retirement.wait_until(deadline).await
+    }
+
     pub fn clear_remote_installed_plugins_cache(&self) -> bool {
         let mut cache = match self.remote_installed_plugins_cache.write() {
             Ok(cache) => cache,
@@ -2084,12 +2127,20 @@ impl PluginsManager {
         else {
             return;
         };
+        let Ok(publication_generation) =
+            RemotePluginBundleSyncGeneration::capture(&self.codex_home)
+        else {
+            warn!("remote plugin publication authority unavailable");
+            return;
+        };
         let manager = Arc::clone(self);
         let config = config.clone();
         let admitted = self.task_registry.spawn_callback(async move {
             let _permit = permit;
             let result = manager
-                .reconcile_remote_installed_plugins_after_acquiring_gate(&config, Some(&auth))
+                .reconcile_remote_installed_plugins_after_acquiring_gate(
+                    &config, Some(&auth), &publication_generation,
+                )
                 .await;
             match result {
                 Ok((outcome, update)) => {
@@ -2156,9 +2207,15 @@ impl PluginsManager {
         config: &PluginsConfigInput,
         auth: Option<&CodexAuth>,
     ) -> Result<RemoteInstalledPluginBundleSyncOutcome, RemoteInstalledPluginBundleSyncError> {
+        let publication_generation = RemotePluginBundleSyncGeneration::capture(&self.codex_home)
+            .map_err(|_| RemoteInstalledPluginBundleSyncError::Superseded)?;
         let _guard = self.acquire_remote_installed_plugin_sync_guard().await?;
         let (outcome, _) = self
-            .reconcile_remote_installed_plugins_after_acquiring_gate(config, auth)
+            .reconcile_remote_installed_plugins_after_acquiring_gate(
+                config,
+                auth,
+                &publication_generation,
+            )
             .await?;
         Ok(outcome)
     }
@@ -2167,6 +2224,7 @@ impl PluginsManager {
         &self,
         config: &PluginsConfigInput,
         auth: Option<&CodexAuth>,
+        publication_generation: &RemotePluginBundleSyncGeneration,
     ) -> Result<
         (
             RemoteInstalledPluginBundleSyncOutcome,
@@ -2203,11 +2261,12 @@ impl PluginsManager {
             .flat_map(HashMap::keys)
             .cloned()
             .collect::<Vec<_>>();
-        let result = crate::remote::sync_remote_installed_plugin_bundles_once_with_snapshot(
+        let result = crate::remote::remote_installed_plugin_sync::sync_remote_installed_plugin_bundles_once_with_snapshot_and_generation(
             self.codex_home.clone(),
             &self.remote_plugin_service_config(config),
             auth,
             &previous_plugin_ids,
+            publication_generation,
         )
         .await?;
         let mut outcome = result.outcome;
@@ -4411,3 +4470,7 @@ mod tests;
 #[cfg(test)]
 #[path = "plugins_config_input_tests.rs"]
 mod plugins_config_input_tests;
+
+#[cfg(test)]
+#[path = "managed_plugin_reset_tests.rs"]
+mod managed_plugin_reset_tests;

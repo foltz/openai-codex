@@ -13,6 +13,7 @@ use super::RemotePluginServiceConfig;
 use super::RemotePluginShareDiscoverability;
 use super::ensure_chatgpt_auth;
 use super::fetch_installed_plugins;
+use super::reset_authority::RemotePluginBundleSyncGeneration;
 use crate::remote::InstalledPluginDisplayAssets;
 use crate::store::PLUGINS_CACHE_DIR;
 use crate::store::PluginStore;
@@ -135,6 +136,25 @@ pub(crate) async fn sync_remote_installed_plugin_bundles_once_with_snapshot(
     auth: Option<&CodexAuth>,
     previous_plugin_ids: &[PluginId],
 ) -> Result<RemoteInstalledPluginBundleSyncResult, RemoteInstalledPluginBundleSyncError> {
+    let generation = RemotePluginBundleSyncGeneration::capture(&codex_home)
+        .map_err(|_| RemoteInstalledPluginBundleSyncError::Superseded)?;
+    sync_remote_installed_plugin_bundles_once_with_snapshot_and_generation(
+        codex_home,
+        config,
+        auth,
+        previous_plugin_ids,
+        &generation,
+    )
+    .await
+}
+
+pub(crate) async fn sync_remote_installed_plugin_bundles_once_with_snapshot_and_generation(
+    codex_home: PathBuf,
+    config: &RemotePluginServiceConfig,
+    auth: Option<&CodexAuth>,
+    previous_plugin_ids: &[PluginId],
+    generation: &RemotePluginBundleSyncGeneration,
+) -> Result<RemoteInstalledPluginBundleSyncResult, RemoteInstalledPluginBundleSyncError> {
     let auth = ensure_chatgpt_auth(auth)?;
     let config = &config.for_current_account();
     let authenticated_account_id = auth.get_account_id();
@@ -236,6 +256,9 @@ pub(crate) async fn sync_remote_installed_plugin_bundles_once_with_snapshot(
         if let Some(release_version) = release_version
             && store.active_plugin_version(&plugin_id).as_deref() == Some(release_version)
         {
+            let _physical_lease = generation
+                .begin_commit()
+                .map_err(|_| RemoteInstalledPluginBundleSyncError::Superseded)?;
             if let Err(err) = store.write_remote_plugin_id(&plugin_id, &plugin.id) {
                 warn!(
                     remote_plugin_id = %plugin.id,
@@ -278,10 +301,11 @@ pub(crate) async fn sync_remote_installed_plugin_bundles_once_with_snapshot(
         // by the new version. Unchanged bundles never reach this metadata-loading path.
         let mut capabilities = RemotePluginCapabilities::default();
         capabilities.include_active_bundle(&store, &plugin_id).await;
-        match crate::remote_bundle::download_and_install_remote_plugin_bundle(
+        match crate::remote_bundle::download_and_install_remote_plugin_bundle_with_generation(
             config,
             codex_home.clone(),
             bundle,
+            generation,
         )
         .await
         {
@@ -326,10 +350,11 @@ pub(crate) async fn sync_remote_installed_plugin_bundles_once_with_snapshot(
             .then_with(|| left.id.cmp(&right.id))
     });
     let mut removed_cache_plugins = Vec::new();
-    if let Err(err) = remove_stale_remote_plugin_caches(
+    if let Err(err) = remove_stale_remote_plugin_caches_with_generation(
         &store,
         &installed_plugin_names_by_marketplace,
         &mut removed_cache_plugins,
+        generation,
     )
     .await
     {
@@ -341,6 +366,11 @@ pub(crate) async fn sync_remote_installed_plugin_bundles_once_with_snapshot(
             .or_insert(plugin);
     }
 
+    // Best-effort ordinary download/cleanup failures are not reset success.
+    // Refuse an epoch retired while any of those awaited operations ran.
+    let _publication_check = generation
+        .begin_commit()
+        .map_err(|_| RemoteInstalledPluginBundleSyncError::Superseded)?;
     Ok(RemoteInstalledPluginBundleSyncResult {
         outcome: RemoteInstalledPluginBundleSyncOutcome {
             materialized_remote_plugins: materialized_remote_plugins.into_values().collect(),
@@ -397,6 +427,23 @@ async fn remove_stale_remote_plugin_caches(
     installed_plugin_names_by_marketplace: &BTreeMap<String, BTreeSet<String>>,
     removed_plugins: &mut Vec<RemotePluginChange>,
 ) -> Result<(), String> {
+    let generation = RemotePluginBundleSyncGeneration::capture(store.codex_home().as_path())
+        .map_err(|_| "remote plugin publication authority unavailable".to_string())?;
+    remove_stale_remote_plugin_caches_with_generation(
+        store,
+        installed_plugin_names_by_marketplace,
+        removed_plugins,
+        &generation,
+    )
+    .await
+}
+
+async fn remove_stale_remote_plugin_caches_with_generation(
+    store: &PluginStore,
+    installed_plugin_names_by_marketplace: &BTreeMap<String, BTreeSet<String>>,
+    removed_plugins: &mut Vec<RemotePluginChange>,
+    generation: &RemotePluginBundleSyncGeneration,
+) -> Result<(), String> {
     let codex_home = store.codex_home().as_path();
     for marketplace_name in [
         REMOTE_GLOBAL_MARKETPLACE_NAME,
@@ -447,21 +494,26 @@ async fn remove_stale_remote_plugin_caches(
             if let Ok(plugin_id) = &plugin_id {
                 capabilities.include_active_bundle(store, plugin_id).await;
             }
-            if cache_path.is_dir() {
-                fs::remove_dir_all(&cache_path).await.map_err(|err| {
-                    format!(
-                        "failed to remove stale remote plugin cache entry {}: {err}",
-                        cache_path.display()
-                    )
-                })?;
-            } else {
-                fs::remove_file(&cache_path).await.map_err(|err| {
-                    format!(
-                        "failed to remove stale remote plugin cache entry {}: {err}",
-                        cache_path.display()
-                    )
-                })?;
-            }
+            let lease = generation
+                .begin_commit()
+                .map_err(|_| "remote plugin publication authority unavailable".to_string())?;
+            let removal_path = cache_path.clone();
+            let (result, _physical_lease) = lease
+                .run_blocking(move || {
+                    if removal_path.is_dir() {
+                        std::fs::remove_dir_all(&removal_path)
+                    } else {
+                        std::fs::remove_file(&removal_path)
+                    }
+                })
+                .await
+                .map_err(|_| "failed to join stale plugin cache removal".to_string())?;
+            result.map_err(|err| {
+                format!(
+                    "failed to remove stale remote plugin cache entry {}: {err}",
+                    cache_path.display(),
+                )
+            })?;
             let plugin_key = plugin_id
                 .map(|plugin_id| plugin_id.as_key())
                 .unwrap_or_else(|_| format!("{plugin_name}@{marketplace_name}"));

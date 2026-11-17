@@ -4,6 +4,7 @@ use super::super::REMOTE_WORKSPACE_SHARED_WITH_ME_UNLISTED_MARKETPLACE_NAME;
 use super::super::RemotePluginCatalogError;
 use super::super::RemotePluginServiceConfig;
 use super::local_paths;
+use crate::remote::reset_authority::RemotePluginBundleSyncGeneration;
 use codex_app_server_protocol::PluginAuthPolicy;
 use codex_app_server_protocol::PluginInstallPolicy;
 use codex_login::CodexAuth;
@@ -40,6 +41,8 @@ pub async fn checkout_remote_plugin_share(
     codex_home: &Path,
     remote_plugin_id: &str,
 ) -> Result<RemotePluginShareCheckoutResult, RemotePluginCatalogError> {
+    let generation = RemotePluginBundleSyncGeneration::capture(codex_home)
+        .map_err(checkout_publication_error)?;
     let config = &config.for_current_account();
     let detail = super::super::fetch_remote_plugin_detail_with_download_urls(
         config,
@@ -79,7 +82,7 @@ pub async fn checkout_remote_plugin_share(
         editable_plugin_path_for_checkout(&home, &plugin_name, remote_plugin_id, &local_paths)?;
 
     let mut created_checkout_path = false;
-    if !already_checked_out {
+    let _publication_lease = if !already_checked_out {
         let bundle = crate::remote_bundle::validate_remote_plugin_bundle(
             remote_plugin_id,
             &detail.marketplace_name,
@@ -93,10 +96,11 @@ pub async fn checkout_remote_plugin_share(
                 "failed to prepare remote plugin bundle checkout: {err}"
             ))
         })?;
-        crate::remote_bundle::download_and_extract_remote_plugin_bundle_to_path(
+        let (_, lease) = crate::remote_bundle::download_and_extract_remote_plugin_bundle_to_path(
             config,
             bundle,
             local_plugin_path.clone(),
+            &generation,
         )
         .await
         .map_err(|err| {
@@ -105,7 +109,12 @@ pub async fn checkout_remote_plugin_share(
             ))
         })?;
         created_checkout_path = true;
-    }
+        lease
+    } else {
+        generation
+            .begin_commit()
+            .map_err(checkout_publication_error)?
+    };
 
     let marketplace = match update_personal_marketplace(
         &home,
@@ -161,6 +170,12 @@ pub async fn checkout_remote_plugin_share(
         marketplace_path: marketplace.path,
         remote_version,
     })
+}
+
+fn checkout_publication_error(_: io::Error) -> RemotePluginCatalogError {
+    RemotePluginCatalogError::UnexpectedResponse(
+        "remote plugin publication authority unavailable".to_string(),
+    )
 }
 
 fn is_checkout_supported_share_marketplace(marketplace_name: &str) -> bool {

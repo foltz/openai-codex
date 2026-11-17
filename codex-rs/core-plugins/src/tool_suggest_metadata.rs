@@ -112,6 +112,21 @@ impl ToolSuggestMetadataCache {
         }
     }
 
+    pub(crate) fn clear_for_managed_reset(&self) -> std::io::Result<()> {
+        let retired = {
+            let mut state = self.state.write().map_err(|_| {
+                std::io::Error::other("plugin metadata cache authority unavailable")
+            })?;
+            let next = state.generation.checked_add(1).ok_or_else(|| {
+                std::io::Error::other("plugin metadata cache generation exhausted")
+            })?;
+            state.generation = next;
+            std::mem::take(&mut state.entries)
+        };
+        drop(retired);
+        Ok(())
+    }
+
     pub(crate) fn clear(&self) {
         let mut state = match self.state.write() {
             Ok(state) => state,
@@ -272,4 +287,32 @@ async fn load_plugin_metadata(
         app_declarations,
         skill_inventory: Some(skill_inventory),
     }))
+}
+
+#[cfg(test)]
+mod managed_reset_tests {
+    use super::*;
+
+    #[test]
+    fn strict_metadata_clear_advances_without_ordinary_wrap() {
+        let cache = ToolSuggestMetadataCache::new(Arc::new(ManifestCache::default()));
+        cache.clear_for_managed_reset().unwrap();
+        assert_eq!(cache.state.read().unwrap().generation, 1);
+        cache.state.write().unwrap().generation = u64::MAX;
+        assert!(cache.clear_for_managed_reset().is_err());
+        assert_eq!(cache.state.read().unwrap().generation, u64::MAX);
+    }
+
+    #[test]
+    fn strict_metadata_clear_refuses_poison() {
+        let cache = ToolSuggestMetadataCache::new(Arc::new(ManifestCache::default()));
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _state = cache.state.write().unwrap();
+                panic!("poison synthetic tool metadata authority");
+            }))
+            .is_err()
+        );
+        assert!(cache.clear_for_managed_reset().is_err());
+    }
 }

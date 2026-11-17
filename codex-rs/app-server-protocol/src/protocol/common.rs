@@ -618,6 +618,24 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::ThreadUnsubscribeResponse,
     },
+    #[experimental("kcf/thread/interactiveSubscription/list")]
+    ThreadInteractiveSubscriptionList => "kcf/thread/interactiveSubscription/list" {
+        params: v2::ThreadInteractiveSubscriptionListParams,
+        serialization: global_shared_read("thread-attachment"),
+        response: v2::ThreadInteractiveSubscriptionListResponse,
+    },
+    #[experimental("thread/retention/acquire")]
+    ThreadRetentionAcquire => "thread/retention/acquire" {
+        params: v2::ThreadRetentionAcquireParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadRetentionAcquireResponse,
+    },
+    #[experimental("thread/retention/release")]
+    ThreadRetentionRelease => "thread/retention/release" {
+        params: v2::ThreadRetentionReleaseParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadRetentionReleaseResponse,
+    },
     #[experimental("thread/increment_elicitation")]
     /// Increment the thread-local out-of-band elicitation counter.
     ///
@@ -2082,8 +2100,8 @@ server_notification_definitions! {
     /// NEW NOTIFICATIONS
     Error => "error" (v2::ErrorNotification),
     ThreadStarted => "thread/started" (v2::ThreadStartedNotification),
-    #[experimental("thread/interactiveSubscriptions")]
-    ThreadInteractiveSubscriptionChanged => "thread/interactiveSubscriptions/changed" (v2::ThreadInteractiveSubscriptionChangedNotification),
+    #[experimental("kcf/thread/interactiveSubscription/changed")]
+    ThreadInteractiveSubscriptionChanged => "kcf/thread/interactiveSubscription/changed" (v2::ThreadInteractiveSubscriptionChangedNotification),
     ThreadStatusChanged => "thread/status/changed" (v2::ThreadStatusChangedNotification),
     #[experimental("thread/readState/changed")]
     ThreadReadStateChanged => "thread/readState/changed" (v2::ThreadReadStateChangedNotification),
@@ -4785,3 +4803,28 @@ mod tests {
 #[cfg(test)]
 #[path = "common_tests.rs"]
 mod common_tests;
+
+#[cfg(test)]
+mod retained_subscription_wire_tests {
+    use super::*;
+    use crate::ExperimentalApi;
+
+    #[test]
+    fn subscription_change_preserves_the_retained_kcf_wire_contract() {
+        let notification = ServerNotification::ThreadInteractiveSubscriptionChanged(
+            v2::ThreadInteractiveSubscriptionChangedNotification {
+                generation: "generation".into(),
+                revision: 1,
+                changes: Vec::new(),
+            },
+        );
+        assert_eq!(
+            notification.experimental_reason(),
+            Some("kcf/thread/interactiveSubscription/changed")
+        );
+        assert_eq!(
+            serde_json::to_value(notification).unwrap()["method"],
+            "kcf/thread/interactiveSubscription/changed"
+        );
+    }
+}

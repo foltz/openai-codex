@@ -123,11 +123,7 @@ async fn background_routing_call_sites_skip_config(api_key: Option<&str>) -> any
     let _: InitializeResponse = read_response(&mut outgoing_rx, /*request_id*/ 1).await;
     // Complete the same post-initialize hook used by the real transports.
     processor
-        .connection_initialized(
-            TEST_CONNECTION_ID,
-            /*request_attestation*/ false,
-            session.auth_observation_only(),
-        )
+        .connection_initialized(TEST_CONNECTION_ID, &session)
         .await;
     assert!(
         tokio::time::timeout(Duration::from_secs(/*secs*/ 1), loads_rx.recv())
@@ -291,6 +287,40 @@ async fn background_routing_call_sites_skip_config(api_key: Option<&str>) -> any
         "barrier refusal/cache observation must not load config"
     );
 
+    // Role/client claims over unproven stdio cannot mint retention. These
+    // local lifecycle controls still respond while the account barrier is closed.
+    processor
+        .process_request(
+            TEST_CONNECTION_ID,
+            serde_json::from_value(json!({
+                "id": 9, "method":"thread/retention/acquire",
+                "params":{"threadId": ThreadId::new().to_string()}
+            }))?,
+            &crate::transport::AppServerTransport::Stdio,
+            Arc::clone(&session),
+        )
+        .await;
+    let retained: codex_app_server_protocol::ThreadRetentionAcquireResponse =
+        read_response(&mut outgoing_rx, 9).await;
+    assert!(matches!(
+        retained,
+        codex_app_server_protocol::ThreadRetentionAcquireResponse::Refused {
+            reason: codex_app_server_protocol::ThreadRetentionRefusalReason::IneligiblePrincipal
+        }
+    ));
+    processor
+        .process_request(
+            TEST_CONNECTION_ID,
+            serde_json::from_value(json!({
+                "id": 10, "method":"kcf/thread/interactiveSubscription/list", "params":{}
+            }))?,
+            &crate::transport::AppServerTransport::Stdio,
+            Arc::clone(&session),
+        )
+        .await;
+    let subscriptions: codex_app_server_protocol::ThreadInteractiveSubscriptionListResponse =
+        read_response(&mut outgoing_rx, 10).await;
+    assert!(subscriptions.entries.is_empty());
     processor.shutdown_threads().await;
     Ok(())
 }

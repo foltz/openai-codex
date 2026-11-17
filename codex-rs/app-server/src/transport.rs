@@ -54,7 +54,11 @@ impl ConnectionState {
         outbound_experimental_api_enabled: Arc<AtomicBool>,
         outbound_opted_out_notification_methods: Arc<RwLock<HashSet<String>>>,
     ) -> Self {
-        let mut session = ConnectionSessionState::with_provenance(origin, provenance);
+        let mut session = ConnectionSessionState::with_provenance(
+            origin,
+            provenance,
+            crate::thread_state::RetentionPrincipalId::connection_owned(),
+        );
         let mut rpc_gate = crate::connection_rpc_gate::ConnectionRpcGate::new();
         rpc_gate.auth = auth;
         session.rpc_gate = Arc::new(rpc_gate);
@@ -66,6 +70,26 @@ impl ConnectionState {
             session: Arc::new(session),
         }
     }
+}
+
+/// Evaluates the server-owned entitlement half of D001. The caller must still
+/// require the explicit client role request before granting interactive subscription state.
+pub(crate) fn trusted_interactive_provenance(provenance: ConnectionProvenance) -> bool {
+    match provenance {
+        ConnectionProvenance::InProcess => true,
+        // `unix_peer_provenance` verifies the identity while accepting the
+        // socket, before any client input is read. This is deliberately a
+        // server-established result, not a client-side claim.
+        ConnectionProvenance::UnixPeerExecutable(_) => true,
+        ConnectionProvenance::Unproven => false,
+    }
+}
+
+pub(crate) fn trusted_interactive(
+    interactive_client_requested: bool,
+    provenance: ConnectionProvenance,
+) -> bool {
+    interactive_client_requested && trusted_interactive_provenance(provenance)
 }
 
 /// Evaluates the server-owned entitlement half of Issue 05's managed-transition

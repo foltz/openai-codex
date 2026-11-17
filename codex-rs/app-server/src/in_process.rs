@@ -551,6 +551,7 @@ async fn start_uninitialized(mut args: InProcessStartArgs) -> IoResult<InProcess
             let session = Arc::new(ConnectionSessionState::with_provenance(
                 crate::transport::ConnectionOrigin::InProcess,
                 crate::transport::ConnectionProvenance::InProcess,
+                crate::thread_state::RetentionPrincipalId::connection_owned(),
             ));
             let mut listen_for_threads = true;
 

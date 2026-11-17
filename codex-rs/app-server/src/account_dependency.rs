@@ -190,6 +190,9 @@ pub(crate) fn classify(request: &ClientRequest) -> AccountDependency {
         | ClientRequest::ThreadItemsList { .. }
         | ClientRequest::ThreadItemsRead { .. }
         | ClientRequest::ThreadList { .. }
+        | ClientRequest::ThreadInteractiveSubscriptionList { .. }
+        | ClientRequest::ThreadRetentionAcquire { .. }
+        | ClientRequest::ThreadRetentionRelease { .. }
         | ClientRequest::ThreadLoadedList { .. }
         | ClientRequest::ThreadMemoryModeSet { .. }
         | ClientRequest::ThreadMemoryRead { .. }

@@ -1,3 +1,11 @@
+use crate::thread_state::{
+    RetentionAcquireOutcome, RetentionAuthorityError, RetentionGrantId, RetentionPrincipalId,
+    RetentionPrincipalOwner, RetentionReleaseOutcome,
+};
+use codex_app_server_protocol::{
+    ThreadRetentionAcquireParams, ThreadRetentionAcquireResponse, ThreadRetentionRefusalReason,
+    ThreadRetentionReleaseParams, ThreadRetentionReleaseResponse,
+};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::future::Future;
@@ -153,6 +161,64 @@ fn reject_removed_permission_profile(request: &JSONRPCRequest) -> Result<(), JSO
 
 pub(crate) const NOT_ADMITTED_MESSAGE: &str = "Server is shutting down; request was not admitted.";
 
+#[derive(Clone, Copy, Debug)]
+enum RetentionAcquireAuthority {
+    Ineligible,
+    Unavailable,
+    Eligible(RetentionPrincipalId),
+}
+
+fn retention_principal_or_refusal(
+    authority: RetentionAcquireAuthority,
+) -> Result<RetentionPrincipalId, ThreadRetentionRefusalReason> {
+    match authority {
+        RetentionAcquireAuthority::Ineligible => {
+            Err(ThreadRetentionRefusalReason::IneligiblePrincipal)
+        }
+        RetentionAcquireAuthority::Unavailable => {
+            Err(ThreadRetentionRefusalReason::AuthorityUnavailable)
+        }
+        RetentionAcquireAuthority::Eligible(principal) => Ok(principal),
+    }
+}
+
+pub(crate) fn retention_acquire_response(
+    outcome: Result<RetentionAcquireOutcome, RetentionAuthorityError>,
+) -> ThreadRetentionAcquireResponse {
+    match outcome {
+        Ok(RetentionAcquireOutcome::Acquired { grant_id }) => {
+            ThreadRetentionAcquireResponse::Acquired {
+                grant_id: grant_id.into_wire(),
+            }
+        }
+        Ok(RetentionAcquireOutcome::AlreadyHeld { grant_id }) => {
+            ThreadRetentionAcquireResponse::AlreadyHeld {
+                grant_id: grant_id.into_wire(),
+            }
+        }
+        Err(error) => ThreadRetentionAcquireResponse::Refused {
+            reason: retention_refusal_reason(error),
+        },
+    }
+}
+
+fn retention_refusal_reason(error: RetentionAuthorityError) -> ThreadRetentionRefusalReason {
+    match error {
+        RetentionAuthorityError::IneligiblePrincipal => {
+            ThreadRetentionRefusalReason::IneligiblePrincipal
+        }
+        RetentionAuthorityError::AuthorityUnavailable
+        | RetentionAuthorityError::LifecycleClosed => {
+            ThreadRetentionRefusalReason::AuthorityUnavailable
+        }
+        // Self-retention is an ineligible authorization shape, not a separate
+        // client capability. Keep the wire refusal closed while the authority
+        // kernel makes the structural invariant explicit.
+        RetentionAuthorityError::SelfRetention => ThreadRetentionRefusalReason::IneligiblePrincipal,
+        RetentionAuthorityError::UnknownThread => ThreadRetentionRefusalReason::UnknownThread,
+    }
+}
+
 pub(crate) struct MessageProcessor {
     pub(crate) turn_admission: TurnAdmission,
     intake_shutdown_deadline: OnceLock<tokio::time::Instant>,
@@ -168,6 +234,7 @@ pub(crate) struct MessageProcessor {
     managed_transition_coordinator: crate::managed_transition::ManagedTransitionCoordinator,
     request_auth_tasks: crate::processor_task_retirement::ProcessorTasks,
     thread_manager: Arc<ThreadManager>,
+    thread_state_manager: ThreadStateManager,
     turn_cost_worker: Option<TurnCostWorker>,
     skills_watcher: Arc<SkillsWatcher>,
     account_processor: Arc<AccountRequestProcessor>,
@@ -249,6 +316,7 @@ pub(crate) struct ConnectionSessionState {
     pub(crate) rpc_gate: Arc<ConnectionRpcGate>,
     pub(crate) origin: crate::transport::ConnectionOrigin,
     pub(crate) provenance: crate::transport::ConnectionProvenance,
+    retention_principal: RetentionPrincipalId,
     pub(crate) mcp_event_streams: McpEventStreams,
     initialized: OnceLock<InitializedConnectionSessionState>,
 }
@@ -266,17 +334,24 @@ pub(crate) struct InitializedConnectionSessionState {
 }
 
 impl ConnectionSessionState {
+    #[cfg(test)]
     pub(crate) fn new(origin: crate::transport::ConnectionOrigin) -> Self {
-        Self::with_provenance(origin, crate::transport::ConnectionProvenance::Unproven)
+        Self::with_provenance(
+            origin,
+            crate::transport::ConnectionProvenance::Unproven,
+            RetentionPrincipalId::unclassified(),
+        )
     }
 
     pub(crate) fn with_provenance(
         origin: crate::transport::ConnectionOrigin,
         provenance: crate::transport::ConnectionProvenance,
+        retention_principal: RetentionPrincipalId,
     ) -> Self {
         Self {
             origin,
             provenance,
+            retention_principal,
             disconnect: CancellationToken::new(),
             rpc_gate: Arc::new(ConnectionRpcGate::new()),
             mcp_event_streams: McpEventStreams::default(),
@@ -298,6 +373,31 @@ impl ConnectionSessionState {
         self.initialized
             .get()
             .is_some_and(|session| session.interactive_client_requested)
+    }
+
+    pub(crate) fn trusted_interactive(&self) -> bool {
+        crate::transport::trusted_interactive(self.interactive_client_requested(), self.provenance)
+    }
+
+    pub(crate) fn retention_principal(&self) -> Option<RetentionPrincipalId> {
+        matches!(
+            self.retention_acquire_authority(),
+            RetentionAcquireAuthority::Eligible(_)
+        )
+        .then_some(self.retention_principal)
+    }
+
+    fn retention_acquire_authority(&self) -> RetentionAcquireAuthority {
+        if !self.initialized() || !crate::transport::trusted_interactive_provenance(self.provenance)
+        {
+            return RetentionAcquireAuthority::Ineligible;
+        }
+        match self.retention_principal.owner() {
+            RetentionPrincipalOwner::ConnectionOwned | RetentionPrincipalOwner::ThreadOwned(_) => {
+                RetentionAcquireAuthority::Eligible(self.retention_principal)
+            }
+            RetentionPrincipalOwner::Unclassified => RetentionAcquireAuthority::Unavailable,
+        }
     }
 
     pub(crate) fn managed_transition_caller_authorized(&self) -> bool {
@@ -417,6 +517,8 @@ impl MessageProcessor {
             codex_login::GatewayLoginControl::for_runtime(&auth_manager.runtime_config());
         gateway_login_control.require_explicit_login();
         let thread_state_manager = ThreadStateManager::new();
+        thread_state_manager
+            .set_interactive_subscription_notification_outgoing(Arc::clone(&outgoing));
         outgoing.watch_user_verification_auth(Arc::clone(&auth_manager));
         // The thread store is intentionally process-scoped. Config reloads can
         // affect per-thread behavior, but they must not move newly started,
@@ -733,7 +835,7 @@ impl MessageProcessor {
             Arc::clone(&config),
             config_manager.clone(),
             pending_thread_unloads,
-            thread_state_manager,
+            thread_state_manager.clone(),
             thread_watch_manager,
             Arc::clone(&skills_watcher),
             turn_cost_worker.as_ref().map(TurnCostWorker::handle),
@@ -807,6 +909,7 @@ impl MessageProcessor {
             managed_transition_coordinator,
             request_auth_tasks,
             thread_manager,
+            thread_state_manager,
             turn_cost_worker,
             skills_watcher,
             account_processor,
@@ -1038,10 +1141,9 @@ impl MessageProcessor {
     pub(crate) async fn connection_initialized(
         &self,
         connection_id: ConnectionId,
-        request_attestation: bool,
-        auth_observation_only: bool,
+        session: &ConnectionSessionState,
     ) {
-        if !auth_observation_only {
+        if !session.auth_observation_only() {
             self.account_processor
                 .notify_workspace_routing_to_connection(connection_id);
         }
@@ -1049,11 +1151,68 @@ impl MessageProcessor {
             .connection_initialized(
                 connection_id,
                 ConnectionCapabilities {
-                    request_attestation,
-                    ..Default::default()
+                    request_attestation: session.request_attestation(),
+                    trusted_interactive: session.trusted_interactive(),
+                    retention_principal: session.retention_principal(),
                 },
             )
             .await;
+    }
+
+    async fn thread_retention_acquire(
+        &self,
+        params: ThreadRetentionAcquireParams,
+        authority: RetentionAcquireAuthority,
+    ) -> Result<ThreadRetentionAcquireResponse, JSONRPCErrorError> {
+        let principal = match retention_principal_or_refusal(authority) {
+            Ok(principal) => principal,
+            Err(reason) => return Ok(ThreadRetentionAcquireResponse::Refused { reason }),
+        };
+        let Ok(thread_id) = ThreadId::from_string(&params.thread_id) else {
+            return Ok(ThreadRetentionAcquireResponse::Refused {
+                reason: ThreadRetentionRefusalReason::InvalidThreadId,
+            });
+        };
+        Ok(retention_acquire_response(
+            self.thread_state_manager
+                .acquire_retention(thread_id, principal)
+                .await,
+        ))
+    }
+
+    async fn thread_retention_release(
+        &self,
+        params: ThreadRetentionReleaseParams,
+        authority: RetentionAcquireAuthority,
+    ) -> Result<ThreadRetentionReleaseResponse, JSONRPCErrorError> {
+        let principal = match retention_principal_or_refusal(authority) {
+            Ok(principal) => principal,
+            Err(reason) => return Ok(ThreadRetentionReleaseResponse::Refused { reason }),
+        };
+        let Ok(thread_id) = ThreadId::from_string(&params.thread_id) else {
+            return Ok(ThreadRetentionReleaseResponse::Refused {
+                reason: ThreadRetentionRefusalReason::InvalidThreadId,
+            });
+        };
+        // Preserve the opaque-handle outcome matrix: an unrecognized handle
+        // is not distinguishable from any other nonmatching handle.
+        let grant_id = RetentionGrantId::from_wire(&params.grant_id);
+        match self
+            .thread_state_manager
+            .release_retention(thread_id, principal, &grant_id)
+            .await
+        {
+            Ok(RetentionReleaseOutcome::Released) => {
+                Ok(ThreadRetentionReleaseResponse::Released {})
+            }
+            Ok(RetentionReleaseOutcome::NotHeld) => Ok(ThreadRetentionReleaseResponse::NotHeld {}),
+            Ok(RetentionReleaseOutcome::GrantMismatch) => {
+                Ok(ThreadRetentionReleaseResponse::GrantMismatch {})
+            }
+            Err(error) => Ok(ThreadRetentionReleaseResponse::Refused {
+                reason: retention_refusal_reason(error),
+            }),
+        }
     }
 
     pub(crate) async fn send_initialize_notifications(&self) {
@@ -1389,12 +1548,7 @@ impl MessageProcessor {
                 )
                 .await?;
             if connection_initialized {
-                self.connection_initialized(
-                    connection_id,
-                    session.request_attestation(),
-                    session.auth_observation_only(),
-                )
-                .await;
+                self.connection_initialized(connection_id, &session).await;
             }
             return Ok(());
         }
@@ -2068,6 +2222,20 @@ impl MessageProcessor {
                     .thread_search_occurrences(params)
                     .await
             }
+            ClientRequest::ThreadInteractiveSubscriptionList { .. } => Ok(Some(
+                self.thread_state_manager
+                    .thread_interactive_subscription_list()
+                    .await
+                    .into(),
+            )),
+            ClientRequest::ThreadRetentionAcquire { params, .. } => self
+                .thread_retention_acquire(params, session.retention_acquire_authority())
+                .await
+                .map(|response| Some(response.into())),
+            ClientRequest::ThreadRetentionRelease { params, .. } => self
+                .thread_retention_release(params, session.retention_acquire_authority())
+                .await
+                .map(|response| Some(response.into())),
             ClientRequest::ThreadLoadedList { params, .. } => {
                 self.thread_processor.thread_loaded_list(params).await
             }
@@ -2578,8 +2746,11 @@ mod managed_caller_session_tests {
             (ConnectionProvenance::Unproven, true, false),
             (ConnectionProvenance::InProcess, true, false),
         ] {
-            let session =
-                ConnectionSessionState::with_provenance(ConnectionOrigin::InProcess, provenance);
+            let session = ConnectionSessionState::with_provenance(
+                ConnectionOrigin::InProcess,
+                provenance,
+                RetentionPrincipalId::connection_owned(),
+            );
             assert!(!session.managed_transition_caller_authorized());
             session
                 .initialize(InitializedConnectionSessionState {
@@ -2595,5 +2766,42 @@ mod managed_caller_session_tests {
                 .unwrap();
             assert_eq!(session.managed_transition_caller_authorized(), expected);
         }
+    }
+}
+
+#[cfg(test)]
+mod retention_authority_tests {
+    use super::*;
+    use crate::transport::ConnectionProvenance;
+
+    #[test]
+    fn initialized_provenanced_connection_without_owner_classification_refuses() {
+        let session = ConnectionSessionState::with_provenance(
+            crate::transport::ConnectionOrigin::InProcess,
+            ConnectionProvenance::InProcess,
+            RetentionPrincipalId::unclassified(),
+        );
+        session
+            .initialize(InitializedConnectionSessionState {
+                auth_observation_only: false,
+                experimental_api_enabled: true,
+                opted_out_notification_methods: HashSet::new(),
+                app_server_client_name: "test".to_string(),
+                client_version: "0.0.0".to_string(),
+                request_attestation: true,
+                interactive_client_requested: true,
+                client_mcp_extensions: ClientMcpExtensions::default(),
+            })
+            .expect("test session initializes once");
+
+        assert!(matches!(
+            session.retention_acquire_authority(),
+            RetentionAcquireAuthority::Unavailable
+        ));
+        assert_eq!(session.retention_principal(), None);
+        assert_eq!(
+            retention_principal_or_refusal(session.retention_acquire_authority()),
+            Err(ThreadRetentionRefusalReason::AuthorityUnavailable)
+        );
     }
 }

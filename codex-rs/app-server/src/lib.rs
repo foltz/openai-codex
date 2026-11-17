@@ -1380,13 +1380,7 @@ pub async fn run_main_with_transport_options(
                                                 )
                                                 .await;
                                             processor
-                                                .connection_initialized(
-                                                    connection_id,
-                                                    connection_state
-                                                        .session
-                                                        .request_attestation(),
-                                                    connection_state.session.auth_observation_only(),
-                                                )
+                                                .connection_initialized(connection_id, &connection_state.session)
                                                 .await;
                                             connection_state
                                                 .outbound_initialized

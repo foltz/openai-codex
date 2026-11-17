@@ -331,13 +331,7 @@ async fn disconnected_v2_child_lifecycle(unload_delay_secs: u64, ephemeral: bool
         .await;
         let _: InitializeResponse =
             read_response_from(&mut outgoing, owner_id, /*request_id*/ 1).await;
-        processor
-            .connection_initialized(
-                owner_id,
-                owner.request_attestation(),
-                owner.auth_observation_only(),
-            )
-            .await;
+        processor.connection_initialized(owner_id, &owner).await;
         send_request(
             &processor,
             owner_id,
@@ -611,13 +605,7 @@ decision = "prompt-user"
             .await;
             let _: InitializeResponse =
                 read_response_from(&mut outgoing, id, /*request_id*/ 1).await;
-            processor
-                .connection_initialized(
-                    id,
-                    session.request_attestation(),
-                    session.auth_observation_only(),
-                )
-                .await;
+            processor.connection_initialized(id, &session).await;
         }
         send_request(
             &processor,
@@ -688,11 +676,7 @@ decision = "prompt-user"
         let _: InitializeResponse =
             read_response_from(&mut outgoing, unrelated_id, /*request_id*/ 1).await;
         processor
-            .connection_initialized(
-                unrelated_id,
-                unrelated.request_attestation(),
-                unrelated.auth_observation_only(),
-            )
+            .connection_initialized(unrelated_id, &unrelated)
             .await;
         for connection_id in [incompatible_id, unrelated_id] {
             processor

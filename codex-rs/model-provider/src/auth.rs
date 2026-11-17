@@ -150,6 +150,7 @@ impl ResolvedProviderAuth {
             auth: Arc::new(AgentIdentityAuthProvider { auth }),
             agent_identity_telemetry: Some(agent_identity_telemetry),
             runtime: None,
+            gateway_admission: crate::GatewayAdmission::NotConfigured,
         }
     }
 }

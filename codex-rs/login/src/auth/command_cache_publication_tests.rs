@@ -225,3 +225,54 @@ fn ordinary_cache_poison_keeps_the_existing_reload_none_and_bool_false_contract(
     assert!(manager.publish_reloaded_auth(0, None).unwrap().is_none());
     assert!(!manager.set_cached_auth(None));
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn command_factory_snapshot_preserves_actual_owned_credential() {
+    let home = tempfile::tempdir().unwrap();
+    let (_, manager) = selected_fixture(home.path(), record(1));
+    let expected = manager.auth_cached().unwrap().get_token().unwrap();
+    let (auth, _factory) = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        manager.auth_with_http_client_factory(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(auth.get_token().unwrap(), expected);
+}
+
+#[cfg(unix)]
+#[test]
+fn command_factory_snapshot_refuses_durable_supersession_after_resolution() {
+    let home = tempfile::tempdir().unwrap();
+    let (_, manager) = selected_fixture(home.path(), record(1));
+    let resolved = manager.auth_cached().unwrap();
+    let newer = record(2);
+    command_store::commit(home.path(), &newer, &newer.auth().unwrap()).unwrap();
+    assert!(manager.command_auth_with_factory(resolved).is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn command_factory_snapshot_refuses_policy_change_after_resolution() {
+    let home = tempfile::tempdir().unwrap();
+    let (_, manager) = selected_fixture(home.path(), record(1));
+    let resolved = manager.auth_cached().unwrap();
+    *manager.allowed_auth_modes.write().unwrap() = Some(vec![AuthMode::ApiKey]);
+    assert!(manager.command_auth_with_factory(resolved).is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn command_factory_snapshot_refuses_cache_uncertainty_and_releases_source() {
+    let home = tempfile::tempdir().unwrap();
+    let (source, manager) = selected_fixture(home.path(), record(1));
+    let resolved = manager.auth_cached().unwrap();
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = manager.inner.write().unwrap();
+        panic!("synthetic cache poison");
+    }));
+    assert!(manager.command_auth_with_factory(resolved).is_none());
+    assert!(source.state.try_lock().is_ok());
+}

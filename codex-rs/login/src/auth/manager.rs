@@ -3098,9 +3098,28 @@ impl AuthManager {
     /// Refreshes auth, then captures credentials and their account-bound factory together.
     /// The auth read lock prevents an identity change between the two snapshots.
     pub async fn auth_with_http_client_factory(&self) -> Option<(CodexAuth, HttpClientFactory)> {
-        self.auth().await?;
+        let resolved = self.auth().await?;
+        if self.command_source.is_some() {
+            return self.command_auth_with_factory(resolved);
+        }
         let cached = self.inner.read().ok()?;
         Some((cached.auth.clone()?, self.http_client_factory()))
+    }
+
+    fn command_auth_with_factory(
+        &self,
+        resolved: CodexAuth,
+    ) -> Option<(CodexAuth, HttpClientFactory)> {
+        // Preserve policy -> source -> native file -> cache ordering. Never
+        // acquire source custody while holding an earlier cache read lock.
+        let publication = self.cache_publication(Some(&resolved)).ok()?;
+        if !Self::auths_equal_for_refresh(publication.cache.auth.as_ref(), Some(&resolved)) {
+            return None;
+        }
+        publication.revalidate().ok()?;
+        let result = (publication.cache.auth.clone()?, self.http_client_factory());
+        publication.revalidate().ok()?;
+        Some(result)
     }
 
     pub async fn agent_identity_auth(

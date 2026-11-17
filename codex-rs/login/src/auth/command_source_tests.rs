@@ -228,7 +228,9 @@ async fn newer_expired_durable_ownership_is_imported_only_for_renewal() {
         source.obtain(None).await.is_err(),
         "deferred renewal cannot return expired auth"
     );
-    assert_eq!(source.state.lock().unwrap().as_ref(), Some(&expired));
+    // Envelope intentionally has no Debug implementation: never print tokens
+    // just to report an equality failure.
+    assert!(source.state.lock().unwrap().as_ref() == Some(&expired));
     assert!(!source.usable_auth(Some(&auth)));
     assert_eq!(std::fs::read(home.path().join("auth.json")).unwrap(), bytes);
 }

@@ -1835,6 +1835,7 @@ async fn workspace_policy_change_rejects_pending_transient_auth_fallback() {
     assert!(
         manager
             .publish_reloaded_auth(generation, fallback)
+            .expect("native publication remains available")
             .is_none()
     );
 

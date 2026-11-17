@@ -269,6 +269,7 @@ async fn auth_owner_generation_preserves_logout_and_switches_when_coalesced() {
     assert!(
         manager
             .publish_reloaded_auth(generation, Some(initial.clone()))
+            .expect("native publication remains available")
             .is_none()
     );
     assert!(manager.auth_cached().is_none());
@@ -278,6 +279,7 @@ async fn auth_owner_generation_preserves_logout_and_switches_when_coalesced() {
     assert!(
         manager
             .publish_reloaded_auth(generation, Some(initial.clone()))
+            .expect("native publication remains available")
             .is_none()
     );
     manager.set_cached_auth(Some(initial.clone()));

@@ -2422,10 +2422,26 @@ pub struct AuthManager {
     agent_identity_bootstrap_cooldown: Mutex<AgentIdentityBootstrapCooldown>,
     external_auth: RwLock<Option<Arc<dyn ExternalAuth>>>,
     workload_identity_selected: bool,
+    command_source: Option<Arc<super::command_source::CommandSource>>,
     auth_route_config: AuthRouteConfig,
     // Provider credentials follow the primary account's policy without owning its lifecycle.
     owns_network_policy: bool,
     allowed_auth_modes: RwLock<Option<Vec<AuthMode>>>,
+}
+
+/// Locks are released cache -> command disk/state -> mode policy.
+struct AuthCachePublication<'a> {
+    cache: std::sync::RwLockWriteGuard<'a, CachedAuth>,
+    command: Option<super::command_source::CommandRecordGuard<'a>>,
+    _modes: Option<std::sync::RwLockReadGuard<'a, Option<Vec<AuthMode>>>>,
+}
+impl AuthCachePublication<'_> {
+    fn revalidate(&self) -> std::io::Result<()> {
+        if let Some(command) = &self.command {
+            command.require_current_domain()?;
+        }
+        Ok(())
+    }
 }
 
 /// Configuration view required to construct a shared [`AuthManager`].
@@ -2593,6 +2609,7 @@ impl AuthManager {
             agent_identity_bootstrap_cooldown: Mutex::default(),
             external_auth: RwLock::new(None),
             workload_identity_selected: false,
+            command_source: None,
             auth_route_config,
             owns_network_policy: true,
             allowed_auth_modes: RwLock::new(allowed_auth_modes),
@@ -2682,6 +2699,7 @@ impl AuthManager {
             agent_identity_bootstrap_cooldown: Mutex::default(),
             external_auth: RwLock::new(external_auth),
             workload_identity_selected: false,
+            command_source: None,
             allowed_auth_modes: RwLock::new(None),
             auth_route_config: runtime.auth_route_config,
             owns_network_policy,
@@ -2720,6 +2738,7 @@ impl AuthManager {
             agent_identity_bootstrap_cooldown: Mutex::default(),
             external_auth: RwLock::new(None),
             workload_identity_selected: false,
+            command_source: None,
             allowed_auth_modes: RwLock::new(None),
             auth_route_config: crate::test_support::transport_default_auth_route_config(),
             owns_network_policy: true,
@@ -2766,6 +2785,7 @@ impl AuthManager {
             agent_identity_bootstrap_cooldown: Mutex::default(),
             external_auth: RwLock::new(None),
             workload_identity_selected: false,
+            command_source: None,
             allowed_auth_modes: RwLock::new(None),
             auth_route_config: crate::test_support::transport_default_auth_route_config(),
             owns_network_policy: true,
@@ -2811,6 +2831,7 @@ impl AuthManager {
             agent_identity_bootstrap_cooldown: Mutex::default(),
             external_auth: RwLock::new(Some(Arc::new(BearerTokenRefresher::new(config, env)))),
             workload_identity_selected: false,
+            command_source: None,
             allowed_auth_modes: RwLock::new(None),
             owns_network_policy: false,
             // External bearer auth refreshes by running the provider's command and never makes
@@ -3202,7 +3223,7 @@ impl AuthManager {
         loop {
             let generation = self.auth_change_state_tx.borrow().generation;
             let new_auth = self.load_auth(/*cached_auth*/ None).await?;
-            if let Some(publication) = self.publish_reloaded_auth(generation, new_auth) {
+            if let Some(publication) = self.publish_reloaded_auth(generation, new_auth)? {
                 return Ok(publication.changed);
             }
             if self.inner.is_poisoned() {
@@ -3243,7 +3264,7 @@ impl AuthManager {
             }
             let cached = self.auth_cached();
             let new_auth = self.try_load_managed_auth(cached.as_ref()).await?;
-            if let Some(publication) = self.publish_reloaded_auth(generation, new_auth) {
+            if let Some(publication) = self.publish_reloaded_auth(generation, new_auth)? {
                 return Ok(publication.changed);
             }
             if self.inner.is_poisoned() {
@@ -3278,7 +3299,7 @@ impl AuthManager {
             }
 
             tracing::info!("Reloading auth for account {expected_account_id}");
-            if let Some(publication) = self.publish_reloaded_auth(generation, new_auth) {
+            if let Some(publication) = self.publish_reloaded_auth(generation, new_auth)? {
                 return Ok(if publication.changed_for_refresh {
                     ReloadOutcome::ReloadedChanged
                 } else {
@@ -3431,32 +3452,91 @@ impl AuthManager {
         self.try_set_cached_auth(new_auth).unwrap_or(false)
     }
 
-    /// Distinguish failed publication from a successful unchanged cache for
-    /// command-provider fan-out. Native bool callers retain their old contract.
-    pub(super) fn try_set_cached_auth(&self, new_auth: Option<CodexAuth>) -> std::io::Result<bool> {
-        let mut guard = self
+    /// Acquire optional command authority before the cache; native callers
+    /// retain their original cache-only locking and policy behavior.
+    fn cache_publication<'a>(
+        &'a self,
+        auth: Option<&CodexAuth>,
+    ) -> std::io::Result<AuthCachePublication<'a>> {
+        let modes = if self.command_source.is_some() {
+            Some(
+                self.allowed_auth_modes
+                    .read()
+                    .map_err(|_| std::io::Error::other("credential policy unavailable"))?,
+            )
+        } else {
+            None
+        };
+        if let Some(modes) = &modes {
+            let auth =
+                auth.ok_or_else(|| std::io::Error::other("command auth cannot be cleared"))?;
+            if modes
+                .as_ref()
+                .is_some_and(|modes| !modes.contains(&auth.api_auth_mode()))
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "command auth mode forbidden",
+                ));
+            }
+        }
+        let command = self
+            .command_source
+            .as_ref()
+            .map(|source| source.cache_guard(auth))
+            .transpose()?;
+        let cache = self
             .inner
             .write()
             .map_err(|_| std::io::Error::other("auth cache publication unavailable"))?;
-        Ok(self.set_cached_auth_locked(&mut guard, new_auth))
+        if command.is_some() {
+            let auth =
+                auth.ok_or_else(|| std::io::Error::other("command auth cannot be cleared"))?;
+            // Match the policy setter's cache -> workspace order. This check
+            // cannot race its generation invalidation before publication.
+            validate_auth_restrictions(
+                Some(&self.allowed_login_methods()),
+                self.effective_chatgpt_workspaces().as_deref(),
+                auth,
+            )
+            .map_err(std::io::Error::other)?;
+        }
+        Ok(AuthCachePublication {
+            cache,
+            command,
+            _modes: modes,
+        })
+    }
+
+    /// Distinguish failed publication from a successful unchanged cache for
+    /// command-provider fan-out. Native bool callers retain their old contract.
+    pub(super) fn try_set_cached_auth(&self, new_auth: Option<CodexAuth>) -> std::io::Result<bool> {
+        let mut publication = self.cache_publication(new_auth.as_ref())?;
+        publication.revalidate()?;
+        Ok(self.set_cached_auth_locked(&mut publication.cache, new_auth))
     }
 
     fn publish_reloaded_auth(
         &self,
         generation: u64,
         auth: Option<CodexAuth>,
-    ) -> Option<AuthReload> {
-        let mut guard = self.inner.write().ok()?;
+    ) -> std::io::Result<Option<AuthReload>> {
+        let mut publication = match self.cache_publication(auth.as_ref()) {
+            Ok(publication) => publication,
+            Err(_) if self.command_source.is_none() && self.inner.is_poisoned() => return Ok(None),
+            Err(error) => return Err(error),
+        };
         if self.auth_change_state_tx.borrow().generation != generation {
-            return None;
+            return Ok(None);
         }
         let changed_for_refresh =
-            !Self::auths_equal_for_refresh(guard.auth.as_ref(), auth.as_ref());
-        let changed = self.set_cached_auth_locked(&mut guard, auth);
-        Some(AuthReload {
+            !Self::auths_equal_for_refresh(publication.cache.auth.as_ref(), auth.as_ref());
+        publication.revalidate()?;
+        let changed = self.set_cached_auth_locked(&mut publication.cache, auth);
+        Ok(Some(AuthReload {
             changed,
             changed_for_refresh,
-        })
+        }))
     }
 
     fn invalidate_pending_auth_reads(&self) {
@@ -4697,3 +4777,7 @@ mod source_tests;
 #[cfg(test)]
 #[path = "command_authority_tests.rs"]
 mod command_authority_tests;
+
+#[cfg(test)]
+#[path = "command_cache_publication_tests.rs"]
+mod command_cache_publication_tests;

@@ -13,13 +13,7 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result;
 
-/// Token-free gateway state captured with the actual selected credential.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum GatewayAdmission {
-    NotConfigured,
-    Unbound,
-    Bound(codex_login::OAuthSessionBinding),
-}
+pub use codex_login::GatewayAdmission;
 
 /// Resolves gateway request credentials and exposes the optional interactive OAuth session.
 #[derive(Debug)]

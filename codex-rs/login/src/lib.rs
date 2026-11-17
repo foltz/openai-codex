@@ -9,6 +9,8 @@ pub use auth::WorkspaceRoutingSession;
 
 mod callback_params;
 mod credential_export;
+mod gateway_admission;
+pub use gateway_admission::GatewayAdmission;
 mod device_code_auth;
 mod oauth;
 mod oauth_session;

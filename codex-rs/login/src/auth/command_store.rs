@@ -61,6 +61,9 @@ pub(super) fn read(home: &Path) -> io::Result<Option<Envelope>> {
             "external owner and credential state diverge",
         ));
     }
+    // Absence can be recovered explicitly; a present but invalid marker is
+    // unavailable authority, never a coherent credential observation.
+    validate_existing_marker(home, &record)?;
     Ok(Some(record))
 }
 
@@ -221,27 +224,39 @@ fn atomic_record(_home: &Path, _name: &str, _bytes: &[u8]) -> io::Result<()> {
     Err(io::Error::other("command auth requires macOS File storage"))
 }
 
-fn owner_marker(home: &Path, envelope: &Envelope) -> io::Result<()> {
-    let expected = serde_json::json!({"version":1,"source":envelope.source,"binding":envelope.binding,"account":envelope.account,"principal":envelope.principal});
+fn marker_identity(envelope: &Envelope) -> Value {
+    serde_json::json!({"version":1,"source":envelope.source,"binding":envelope.binding,"account":envelope.account,"principal":envelope.principal})
+}
+
+/// Read-only: a missing marker is not created by an observation.
+fn validate_existing_marker(home: &Path, envelope: &Envelope) -> io::Result<bool> {
+    if !marker_present(home)? {
+        return Ok(false);
+    }
     let path = home.join(".external-auth-owner.json");
-    if marker_present(home)? {
-        let metadata = std::fs::symlink_metadata(&path)?;
-        if !metadata.file_type().is_file() {
-            return Err(io::Error::other("invalid ownership marker type"));
-        }
-        let current: Value = serde_json::from_slice(&std::fs::read(path)?)
-            .map_err(|_| io::Error::other("invalid ownership marker"))?;
-        if current != expected {
-            return Err(io::Error::other("ownership marker conflict"));
-        }
+    let metadata = std::fs::symlink_metadata(&path)?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::other("invalid ownership marker type"));
+    }
+    let current: Value = serde_json::from_slice(&std::fs::read(path)?)
+        .map_err(|_| io::Error::other("invalid ownership marker"))?;
+    if current != marker_identity(envelope) {
+        return Err(io::Error::other("ownership marker conflict"));
+    }
+    Ok(true)
+}
+
+fn owner_marker(home: &Path, envelope: &Envelope) -> io::Result<()> {
+    if validate_existing_marker(home, envelope)? {
         return Ok(());
     }
-    // This marker is not a second credential/generation record. It makes loss
-    // of an acknowledged owned auth file distinguishable from a fresh home.
+    // The marker is not a second credential/generation record. Only an explicit
+    // locked commit/recovery creates it; read() above never repairs authority.
     atomic_record(
         home,
         ".external-auth-owner.json",
-        &serde_json::to_vec(&expected).map_err(|_| io::Error::other("invalid ownership marker"))?,
+        &serde_json::to_vec(&marker_identity(envelope))
+            .map_err(|_| io::Error::other("invalid ownership marker"))?,
     )
 }
 

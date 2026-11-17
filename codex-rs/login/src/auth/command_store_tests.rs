@@ -324,3 +324,48 @@ fn missing_owner_marker_recovers_only_for_the_exact_locked_generation() -> anyho
     assert!(read(home.path())? == Some(record));
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn present_corrupt_or_foreign_marker_refuses_read_and_cache_install() -> anyhow::Result<()> {
+    let home = TempDir::new()?;
+    let record = envelope(1);
+    commit(home.path(), &record, &record.auth()?)?;
+    let auth_before = std::fs::read(home.path().join("auth.json"))?;
+    for bytes in [
+        b"invalid-marker".as_slice(),
+        br#"{"version":1,"source":"foreign"}"#.as_slice(),
+    ] {
+        // Deliberate uncooperative fixture mutation of an existing read-only
+        // marker, without invoking any production repair path.
+        let staged = home.path().join("fixture-marker");
+        std::fs::write(&staged, bytes)?;
+        std::fs::rename(staged, home.path().join(".external-auth-owner.json"))?;
+        assert!(read(home.path()).is_err());
+        assert!(locked_current(home.path(), &record).is_err());
+        assert!(recover_marker(home.path(), &record).is_err());
+        assert_eq!(std::fs::read(home.path().join("auth.json"))?, auth_before);
+        assert_eq!(
+            std::fs::read(home.path().join(".external-auth-owner.json"))?,
+            bytes
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn reading_owned_payload_does_not_recreate_a_missing_marker() -> anyhow::Result<()> {
+    let home = TempDir::new()?;
+    let record = envelope(1);
+    commit(home.path(), &record, &record.auth()?)?;
+    let marker = home.path().join(".external-auth-owner.json");
+    std::fs::remove_file(&marker)?;
+    let before = std::fs::read(home.path().join("auth.json"))?;
+    assert!(read(home.path())? == Some(record.clone()));
+    assert!(!marker.exists(), "observation must not repair ownership");
+    assert_eq!(std::fs::read(home.path().join("auth.json"))?, before);
+    recover_marker(home.path(), &record)?;
+    assert!(marker.is_file());
+    Ok(())
+}

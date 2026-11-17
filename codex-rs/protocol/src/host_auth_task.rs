@@ -452,23 +452,32 @@ where
             .map_err(AuthBlockingCallError::Join);
     };
     let (send, receive) = oneshot::channel();
-    let child_context = context.clone();
+    // Reuse the physical-work capsule: a refused or abandoned captured body
+    // must be destroyed under a refusing context, never its caller's root.
+    let work = Arc::new(NamedAuthThreadWork {
+        work: Mutex::new(Some(Box::new(move || {
+            let _scope = scope();
+            let value = work();
+            // A cancelled observer drops its result in the physical scope.
+            let _ = send.send(value);
+        }))),
+        context: Some(context.clone()),
+        failure: context.failure.clone(),
+    });
+    if let Some(reason) = work.known_failure() {
+        return Err(AuthBlockingCallError::Custody(reason));
+    }
+    let original_work = work.clone();
     let observation = context
         .spawner
-        .spawn_blocking(Box::new(move || {
-            // sync_scope restores on panic and permits nested auth/provider births
-            // from this exact finite root, not from an idle worker/factory.
-            AUTH_TASK_CONTEXT.sync_scope(child_context, || {
-                let _scope = scope();
-                let value = work();
-                // A cancelled observer drops its result inside the same owned scope.
-                let _ = send.send(value);
-            });
-        }))
+        .spawn_blocking(Box::new(move || original_work.run()))
         .map_err(|failure| {
-            let _ = context.fail(failure);
+            work.fail(failure);
             AuthBlockingCallError::Custody(failure)
         })?;
+    // Only the accepted physical original retains the capsule across await.
+    // If a host abandons it, Drop records failure and releases the result sender.
+    drop(work);
     observation.await.map_err(|failure| {
         let _ = context.fail(failure);
         AuthBlockingCallError::Custody(failure)
@@ -749,5 +758,104 @@ mod named_thread_tests {
         assert!(result.is_err());
         assert!(refused.load(Ordering::SeqCst));
         assert!(!nested.load(Ordering::SeqCst) && !polled.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod blocking_refusal_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[derive(Debug, Default)]
+    struct Host {
+        births: AtomicUsize,
+        abandon: bool,
+    }
+    impl AuthTaskSpawner for Host {
+        fn spawn(
+            &self,
+            _: AuthTaskFuture,
+        ) -> std::result::Result<AuthTaskObservation, AuthTaskFailure> {
+            panic!("refused captures must not borrow the positive caller root");
+        }
+        fn spawn_blocking(
+            &self,
+            task: AuthTaskBlocking,
+        ) -> std::result::Result<AuthTaskObservation, AuthTaskFailure> {
+            self.births.fetch_add(1, Ordering::SeqCst);
+            drop(task);
+            if self.abandon {
+                Ok(Box::pin(async { Ok(()) }))
+            } else {
+                Err(AuthTaskFailure::Unavailable)
+            }
+        }
+    }
+    struct Reenter {
+        refused: Arc<AtomicBool>,
+        polled: Arc<AtomicBool>,
+    }
+    impl Drop for Reenter {
+        fn drop(&mut self) {
+            let polled = self.polled.clone();
+            let result = spawn_provider_task(Box::pin(async move {
+                polled.store(true, Ordering::SeqCst);
+            }));
+            self.refused.store(result.is_err(), Ordering::SeqCst);
+        }
+    }
+    async fn check_refusal(prior_failure: bool, abandon: bool) {
+        let host = Arc::new(Host {
+            abandon,
+            ..Host::default()
+        });
+        let refused = Arc::new(AtomicBool::new(false));
+        let polled = Arc::new(AtomicBool::new(false));
+        let invoked = Arc::new(AtomicBool::new(false));
+        let scoped = Arc::new(AtomicBool::new(false));
+        let capture = Reenter {
+            refused: refused.clone(),
+            polled: polled.clone(),
+        };
+        let body = invoked.clone();
+        let enter = scoped.clone();
+        let result = with_auth_task_scope(AuthTaskAccess::Admitted(host.clone()), async {
+            if prior_failure {
+                record_auth_task_failure(AuthTaskFailure::Refused);
+            }
+            let inner = run_blocking_call_with_scope(
+                move || {
+                    enter.store(true, Ordering::SeqCst);
+                },
+                move || {
+                    std::hint::black_box(capture);
+                    body.store(true, Ordering::SeqCst);
+                },
+            )
+            .await;
+            assert!(matches!(inner, Err(AuthBlockingCallError::Custody(_))));
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(refused.load(Ordering::SeqCst));
+        assert!(!polled.load(Ordering::SeqCst));
+        assert!(!invoked.load(Ordering::SeqCst));
+        assert!(!scoped.load(Ordering::SeqCst));
+        assert_eq!(
+            host.births.load(Ordering::SeqCst),
+            usize::from(!prior_failure)
+        );
+    }
+    #[tokio::test]
+    async fn blocking_dispatch_refusal_destroys_capture_without_borrowing_caller_root() {
+        check_refusal(false, false).await;
+    }
+    #[tokio::test]
+    async fn already_failed_context_refuses_blocking_birth_and_capture_reentry() {
+        check_refusal(true, false).await;
+    }
+    #[tokio::test]
+    async fn abandoned_blocking_body_is_failure_not_success_or_a_pending_result() {
+        check_refusal(false, true).await;
     }
 }

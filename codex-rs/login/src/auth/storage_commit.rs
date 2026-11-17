@@ -115,6 +115,62 @@ fn open_managed_lock(path: &Path, home: &Path) -> Result<File, ManagedAuthStorag
     Ok(file)
 }
 
+/// Owned synchronous guard for command-provider durable/cache commits.
+/// Uses the ordinary File writer's exact resolved lock, never a second domain.
+/// Advisory locking does not exclude uncooperative filesystem mutations.
+#[must_use]
+pub(in crate::auth) struct CommandAuthSourceGuard {
+    file: File,
+    home: PathBuf,
+    lock_path: PathBuf,
+}
+
+impl Debug for CommandAuthSourceGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CommandAuthSourceGuard([locked])")
+    }
+}
+
+impl CommandAuthSourceGuard {
+    /// Revalidate the selected physical domain and the held descriptor before
+    /// each synchronous publication. No credential or provider is resolved here.
+    pub(in crate::auth) fn require_current_domain(&self) -> Result<(), ManagedAuthStorageError> {
+        let current = managed_lock_path(&self.home, AuthCredentialsStoreMode::File)
+            .map_err(managed_coordination_error)?;
+        if current != self.lock_path {
+            return Err(managed_coordination_error(
+                std::io::ErrorKind::InvalidData.into(),
+            ));
+        }
+        validate_managed_lock(&self.lock_path, &self.file, &self.home)
+    }
+}
+
+/// An immediate contention refusal. A bounded caller may retry acquisition;
+/// it must never hold this synchronous guard across external command work.
+pub(in crate::auth) fn acquire_command_auth_source(
+    home: &Path,
+) -> Result<CommandAuthSourceGuard, ManagedAuthStorageError> {
+    // Do not turn an unavailable home into a new empty auth authority.
+    home.canonicalize().map_err(managed_coordination_error)?;
+    let path = managed_lock_path(home, AuthCredentialsStoreMode::File)
+        .map_err(managed_coordination_error)?;
+    let file = open_managed_lock(&path, home)?;
+    file.try_lock().map_err(|error| match error {
+        TryLockError::WouldBlock => {
+            ManagedAuthStorageError::ReadFailed(ManagedAuthStorageFailure::CoordinationContended)
+        }
+        TryLockError::Error(error) => managed_coordination_error(error),
+    })?;
+    let guard = CommandAuthSourceGuard {
+        file,
+        home: home.to_path_buf(),
+        lock_path: path,
+    };
+    guard.require_current_domain()?;
+    Ok(guard)
+}
+
 impl AuthStorageBackend for CommittedStorage {
     fn persistent_home(&self) -> Option<&Path> {
         self.inner.persistent_home()
@@ -200,3 +256,7 @@ mod tests;
 #[cfg(test)]
 #[path = "storage_guard_tests.rs"]
 mod guard_tests;
+
+#[cfg(test)]
+#[path = "command_source_lock_tests.rs"]
+mod command_source_lock_tests;

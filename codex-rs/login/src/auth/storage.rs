@@ -26,6 +26,8 @@ mod storage_file;
 
 #[path = "storage_commit.rs"]
 mod storage_commit;
+pub(super) use storage_commit::CommandAuthSourceGuard;
+pub(super) use storage_commit::acquire_command_auth_source;
 
 #[path = "storage_telemetry.rs"]
 mod storage_telemetry;

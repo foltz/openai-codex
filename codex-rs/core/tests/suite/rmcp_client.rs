@@ -385,6 +385,9 @@ fn insert_mcp_server(
     servers.insert(
         server_name.to_string(),
         McpServerConfig {
+            // This fixture models an ordinary provider, not negotiated disclosure.
+            thread_identity_eligible: false,
+            control_endpoint_eligible: false,
             transport,
             auth: options.auth,
             environment_id: options.environment_id,

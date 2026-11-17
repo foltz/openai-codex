@@ -74,6 +74,15 @@ impl UnixStream {
     }
 }
 
+// Expose the accepted Unix socket itself for platform peer-credential queries.
+// This borrows its descriptor; ownership and lifetime stay with this stream.
+#[cfg(unix)]
+impl std::os::fd::AsRawFd for UnixStream {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        std::os::fd::AsRawFd::as_raw_fd(&self.inner)
+    }
+}
+
 impl AsyncRead for UnixStream {
     fn poll_read(
         self: Pin<&mut Self>,

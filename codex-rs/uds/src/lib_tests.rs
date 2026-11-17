@@ -305,3 +305,34 @@ async fn implicit_peer_validation_rejects_elevated_listener() {
         expected
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn connected_stream_raw_fd_is_the_owned_live_unix_socket() {
+    use std::os::fd::AsRawFd;
+    let temp = tempfile::TempDir::new().expect("socket directory");
+    let path = temp.path().join("peer.sock");
+    let mut listener = UnixListener::bind(&path).await.expect("bind");
+    let mut client = UnixStream::connect(&path).await.expect("connect");
+    let mut server = listener.accept().await.expect("accept");
+    for stream in [&client, &server] {
+        let mut socket_type: libc::c_int = 0;
+        let mut length = std::mem::size_of_val(&socket_type) as libc::socklen_t;
+        let result = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_TYPE,
+                std::ptr::from_mut(&mut socket_type).cast(),
+                &mut length,
+            )
+        };
+        assert_eq!(result, 0, "query actual stream descriptor");
+        assert_eq!(socket_type, libc::SOCK_STREAM);
+        assert_eq!(length as usize, std::mem::size_of_val(&socket_type));
+    }
+    client.write_all(b"p").await.expect("send");
+    let mut byte = [0];
+    server.read_exact(&mut byte).await.expect("receive");
+    assert_eq!(byte, *b"p");
+}

@@ -97,7 +97,7 @@ fn hosting_control_endpoint_uses_the_bound_absolute_listener_path() {
         }),
         None
     );
-    assert!(AbsolutePathBuf::from_absolute_path("relative.sock").is_err());
+    assert!(AbsolutePathBuf::from_absolute_path_checked("relative.sock").is_err());
     assert_eq!(
         mcp_control_endpoint_uri(&AppServerTransport::UnixSocket {
             socket_path: AbsolutePathBuf::from_absolute_path("/tmp/host socket?#.sock").unwrap(),

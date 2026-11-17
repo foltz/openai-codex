@@ -1508,12 +1508,17 @@ async fn fresh_session_carries_only_the_displayed_clear_predecessor() -> Result<
         )
         .await?;
         let mut tui = crate::tui::test_support::make_test_tui()?;
-        let displayed = server.start_thread(&app.config).await?.session.thread_id;
-        app.select_agents_overview_thread(&mut tui, &mut server, displayed)
+        let started = server.start_thread(&app.config).await?;
+        let displayed = started.session.thread_id;
+        // A blank session is already loaded: adopt its actual state instead of
+        // asking the picker to resume a transcript that is not yet persisted.
+        app.enqueue_primary_thread_session(started.session, started.turns)
             .await?;
+        assert_eq!(app.current_displayed_thread_id(), Some(displayed));
         // A later same-workspace thread is not lifecycle authority for this client.
         let bystander = server.start_thread(&app.config).await?.session.thread_id;
         assert_ne!(displayed, bystander);
+        assert_eq!(app.current_displayed_thread_id(), Some(displayed));
         requests.lock().expect("request recorder lock").clear();
         app.start_fresh_session(
             &mut tui,

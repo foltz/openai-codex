@@ -1420,7 +1420,7 @@ impl ThreadRequestProcessor {
 
     pub(crate) async fn drain_background_tasks(&self) {
         self.background_tasks.close();
-        if tokio::time::timeout(Duration::from_secs(10), self.background_tasks.wait())
+        if tokio::time::timeout(BACKGROUND_TASK_DRAIN_CAP, self.background_tasks.wait())
             .await
             .is_err()
         {
@@ -1435,7 +1435,7 @@ impl ThreadRequestProcessor {
     pub(crate) async fn shutdown_threads(&self) {
         let report = self
             .thread_manager
-            .shutdown_all_threads_bounded(Duration::from_secs(10))
+            .shutdown_all_threads_bounded(THREAD_SHUTDOWN_CAP)
             .await;
         for thread_id in report.submit_failed {
             warn!("failed to submit Shutdown to thread {thread_id}");
@@ -7061,3 +7061,6 @@ fn build_thread_from_loaded_snapshot(
 #[cfg(test)]
 #[path = "thread_processor_tests.rs"]
 mod thread_processor_tests;
+
+pub(crate) const BACKGROUND_TASK_DRAIN_CAP: Duration = Duration::from_secs(10);
+pub(crate) const THREAD_SHUTDOWN_CAP: Duration = Duration::from_secs(10);

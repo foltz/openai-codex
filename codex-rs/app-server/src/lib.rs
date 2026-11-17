@@ -158,6 +158,7 @@ mod request_serialization;
 mod server_request_error;
 mod shutdown_intake;
 mod skills_watcher;
+mod standalone_shutdown;
 mod startup_warnings;
 mod thread_sample;
 mod thread_state;

@@ -1,8 +1,10 @@
 //! First shutdown-edge deadline and callback admission. Production host wiring
 //! is separate; a signal cancellation alone does not prove task retirement.
 use crate::in_process::SHUTDOWN_ACK_TIMEOUT;
+use crate::standalone_shutdown::{StandaloneShutdownOwner, poll_before};
 use codex_app_server_transport::{OwnerCustody, OwnerExpiry};
 use std::future::Future;
+use std::pin::Pin;
 use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -127,7 +129,7 @@ impl OwnerLatch {
     /// latched, until that ORIGINAL deadline (clock checked before every
     /// poll; no fresh cap). `None`: still pending at the deadline, unpolled
     /// since, and not aborted.
-    async fn observe_until_deadline<J>(&self, join: &mut J) -> Option<J::Output>
+    pub(crate) async fn observe_until_deadline<J>(&self, join: &mut J) -> Option<J::Output>
     where
         J: Future + Unpin,
     {

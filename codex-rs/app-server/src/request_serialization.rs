@@ -232,6 +232,23 @@ impl RequestSerializationQueues {
         .await;
     }
 
+    /// Observe actual completion, not merely admission to the background queue.
+    /// A discarded or panicked original closes the receipt and is not success.
+    pub(crate) async fn enqueue_background_and_wait(
+        &self,
+        key: RequestSerializationQueueKey,
+        access: RequestSerializationAccess,
+        future: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<(), tokio::sync::oneshot::error::RecvError> {
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        self.enqueue_background(key, access, async move {
+            future.await;
+            let _ = completed_tx.send(());
+        })
+        .await;
+        completed_rx.await
+    }
+
     pub(crate) async fn enqueue(
         &self,
         key: RequestSerializationQueueKey,
@@ -362,6 +379,57 @@ mod tests {
     use tokio::sync::oneshot;
     use tokio::time::Duration;
     use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn background_completion_receipt_waits_for_the_actual_queued_body() {
+        let queues = RequestSerializationQueues::default();
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            queues
+                .enqueue_background_and_wait(
+                    RequestSerializationQueueKey::Global("completion-receipt"),
+                    RequestSerializationAccess::Exclusive,
+                    async move {
+                        entered_tx.send(()).unwrap();
+                        release_rx.await.unwrap();
+                    },
+                )
+                .await
+        });
+        timeout(queue_drain_timeout(), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!waiter.is_finished(), "enqueue is not execution completion");
+        release_tx.send(()).unwrap();
+        timeout(queue_drain_timeout(), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn background_completion_receipt_refuses_a_panicked_original() {
+        let queues = RequestSerializationQueues::default();
+        let result = timeout(
+            queue_drain_timeout(),
+            queues.enqueue_background_and_wait(
+                RequestSerializationQueueKey::Global("panicked-completion-receipt"),
+                RequestSerializationAccess::Exclusive,
+                async {
+                    panic!("deliberate queued body failure");
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.is_err(),
+            "a dropped completion sender is not a clean join"
+        );
+    }
 
     const FIRST_REQUEST_VALUE: i32 = 1;
     const SECOND_REQUEST_VALUE: i32 = 2;

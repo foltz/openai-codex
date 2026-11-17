@@ -97,6 +97,7 @@ pub use oauth_session::subscribe_oauth_session_status as subscribe_gateway_auth_
 
 pub use oauth_session::OAuthLoginControl;
 pub use oauth_session::OAuthRequestCredentials;
+pub use oauth_session::OAuthSessionBinding;
 pub use oauth_session::OAuthSessionConfig;
 pub use oauth_session::OAuthSessionError;
 pub use oauth_session::OAuthSessionManager;

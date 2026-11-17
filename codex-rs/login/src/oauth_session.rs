@@ -49,6 +49,7 @@ pub use login::OAuthSessionStatus;
 pub use login::OAuthSessionStatusChange;
 pub use login::subscribe_oauth_session_status;
 pub use request::OAuthRequestCredentials;
+pub use request::OAuthSessionBinding;
 pub use request::OAuthSessionRequest;
 
 use callback::CallbackListener;
@@ -216,7 +217,10 @@ impl OAuthSessionManager {
         OAuthSessionRequest::new(self.clone())
     }
     /// Restrict noninteractive work to its actual origin credential's grant ID.
-    pub fn begin_bound_request(&self, authorization_id: &str) -> io::Result<OAuthSessionRequest> {
+    pub(super) fn begin_bound_request(
+        &self,
+        authorization_id: &str,
+    ) -> io::Result<OAuthSessionRequest> {
         if authorization_id.trim().is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,

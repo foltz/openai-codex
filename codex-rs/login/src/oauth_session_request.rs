@@ -8,10 +8,41 @@ use super::login;
 use std::fmt;
 use std::io;
 
+/// Token-free identity captured with an actual OAuth credential. Includes the
+/// credential store/config domain; this is not a standalone renewal authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OAuthSessionBinding {
+    credential_id: String,
+    authorization_id: String,
+}
+
+impl OAuthSessionManager {
+    /// Reuse only the actual origin's store/config and sign-in, noninteractively.
+    pub fn begin_admitted_request(
+        &self,
+        binding: &OAuthSessionBinding,
+    ) -> io::Result<OAuthSessionRequest> {
+        if self.credential_id() != binding.credential_id {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "provider OAuth credential domain changed since admission",
+            ));
+        }
+        self.begin_bound_request(&binding.authorization_id)
+    }
+}
+
 /// A token and the identity of the exact grant that supplied it.
 pub struct OAuthRequestCredentials {
     pub access_token: String,
     pub authorization_id: Option<String>,
+    binding: Option<OAuthSessionBinding>,
+}
+
+impl OAuthRequestCredentials {
+    pub fn binding(&self) -> Option<&OAuthSessionBinding> {
+        self.binding.as_ref()
+    }
 }
 
 impl fmt::Debug for OAuthRequestCredentials {
@@ -57,9 +88,18 @@ impl OAuthSessionRequest {
             .resolve_credentials_with_browser(self.policy.clone(), login::open_browser)
             .await?;
         self.sent_token = Some(token.access_token.clone());
+        let binding = token
+            .authorization_id
+            .as_ref()
+            .filter(|id| !id.trim().is_empty())
+            .map(|id| OAuthSessionBinding {
+                credential_id: self.manager.credential_id(),
+                authorization_id: id.clone(),
+            });
         Ok(OAuthRequestCredentials {
             access_token: token.access_token,
             authorization_id: token.authorization_id,
+            binding,
         })
     }
 

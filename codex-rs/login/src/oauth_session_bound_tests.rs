@@ -199,3 +199,73 @@ fn blank_admission_is_refused_without_token_resolution() {
     let (client, _home) = client(loopback_config(), Arc::new(MockKeyringStore::default()));
     assert!(client.begin_bound_request(" ").is_err());
 }
+
+#[tokio::test]
+async fn typed_origin_binding_is_captured_with_token_and_reused_without_login() {
+    let server = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let (client, _home) = client(config(&server), Arc::new(MockKeyringStore::default()));
+    grant(
+        &client,
+        "origin",
+        "actual-origin-token",
+        Utc::now().timestamp() + 3600,
+    );
+    let mut origin = client.begin_request();
+    let selected = credentials(&mut origin).await.unwrap();
+    assert_eq!(selected.access_token, "actual-origin-token");
+    let binding = selected.binding().unwrap().clone();
+    let mut admitted = client.begin_admitted_request(&binding).unwrap();
+    let current = credentials(&mut admitted).await.unwrap();
+    assert_eq!(current.binding(), Some(&binding));
+    assert_eq!(current.access_token, selected.access_token);
+    server.verify().await;
+}
+#[tokio::test]
+async fn typed_binding_refuses_other_home_or_provider_configuration() {
+    let server = MockServer::start().await;
+    let keyring = Arc::new(MockKeyringStore::default());
+    let (origin, home) = client(config(&server), keyring.clone());
+    grant(&origin, "origin", "token", Utc::now().timestamp() + 3600);
+    let mut request = origin.begin_request();
+    let selected = credentials(&mut request).await.unwrap();
+    let binding = selected.binding().unwrap();
+    let other_home = tempfile::tempdir().unwrap();
+    let other = OAuthSessionManager::new(
+        config(&server),
+        other_home.path().to_path_buf(),
+        transport_default_auth_route_config().http_client_factory(),
+        keyring.clone(),
+    )
+    .unwrap();
+    assert!(other.begin_admitted_request(binding).is_err());
+    let mut changed = config(&server);
+    changed.client_id = "another-client".into();
+    let changed = OAuthSessionManager::new(
+        changed,
+        home.path().to_path_buf(),
+        transport_default_auth_route_config().http_client_factory(),
+        keyring,
+    )
+    .unwrap();
+    assert!(changed.begin_admitted_request(binding).is_err());
+}
+#[tokio::test]
+async fn legacy_token_without_grant_id_does_not_mint_typed_binding() {
+    let server = MockServer::start().await;
+    let (client, _home) = client(config(&server), Arc::new(MockKeyringStore::default()));
+    save_token(
+        &client,
+        "legacy-token",
+        Some("legacy-refresh"),
+        Utc::now().timestamp() + 3600,
+    );
+    let mut request = client.begin_request();
+    let selected = credentials(&mut request).await.unwrap();
+    assert_eq!(selected.access_token, "legacy-token");
+    assert!(selected.binding().is_none());
+}

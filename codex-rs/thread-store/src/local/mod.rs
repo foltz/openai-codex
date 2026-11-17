@@ -896,6 +896,8 @@ mod tests {
     mod clear_lineage_tests;
     #[path = "delegated_preview_tests.rs"]
     mod delegated_preview_tests;
+    #[path = "recovery_tests.rs"]
+    mod recovery_tests;
     use std::sync::Arc;
 
     use codex_protocol::ThreadId;

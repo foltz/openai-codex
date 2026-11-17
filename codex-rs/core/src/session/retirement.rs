@@ -505,3 +505,7 @@ impl Session {
 #[cfg(test)]
 #[path = "retirement_tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(test)]
+#[path = "retirement_recovery_tests.rs"]
+pub(crate) mod recovery_tests;

@@ -93,6 +93,8 @@ use uuid::Uuid;
 use codex_rollout::state_db::StateDbHandle;
 
 mod account_work;
+mod recovery;
+pub use recovery::ThreadRecoveryOutcome;
 mod retirement;
 pub use retirement::ThreadCleanupOutcome;
 pub use retirement::ThreadLoopOutcome;
@@ -574,6 +576,13 @@ impl CodexThread {
         self.session
             .ensure_rollout_materialized(PersistContext::Standard)
             .await;
+    }
+
+    /// Materialize creation metadata before publishing a successor.
+    pub async fn try_ensure_rollout_materialized(&self) -> std::io::Result<()> {
+        self.session
+            .try_ensure_rollout_materialized(PersistContext::Standard)
+            .await
     }
 
     #[doc(hidden)]

@@ -19,6 +19,7 @@ use crate::extensions::thread_extensions;
 use crate::external_agent_migration::ExternalAgentConfigRequestProcessor;
 use crate::external_agent_migration::ExternalAgentConfigRequestProcessorArgs;
 use crate::fs_watch::FsWatchManager;
+use crate::model_catalog::ModelCatalog;
 use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::ConnectionRequestId;
 use crate::outgoing_message::OutgoingMessageSender;
@@ -159,6 +160,8 @@ pub(crate) struct MessageProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     startup_warnings: StartupWarnings,
     models_refresh_worker: ModelsRefreshWorker,
+    model_catalog: Arc<ModelCatalog>,
+    thread_manager: Arc<ThreadManager>,
     turn_cost_worker: Option<TurnCostWorker>,
     skills_watcher: Arc<SkillsWatcher>,
     account_processor: Arc<AccountRequestProcessor>,
@@ -185,6 +188,45 @@ pub(crate) struct MessageProcessor {
     turn_processor: TurnRequestProcessor,
     windows_sandbox_processor: WindowsSandboxRequestProcessor,
     request_serialization_queues: RequestSerializationQueues,
+}
+
+/// Evidence only for the named background families, never whole-host completion.
+#[derive(Debug)]
+pub(crate) struct ProcessorBackgroundShutdown {
+    pub models: crate::models_refresh_worker::ModelsRefreshShutdown,
+    pub turn_cost: Option<crate::turn_cost_worker::TurnCostShutdown>,
+    pub thread_starts: crate::processor_task_retirement::ProcessorTaskDrain,
+    pub apps: crate::request_processors::AppsShutdown,
+    pub skills: crate::skills_watcher::SkillsWatcherShutdown,
+    pub plugins: codex_core_plugins::PluginTaskDrain,
+    pub command_exec: crate::command_exec::CommandExecSandboxShutdown,
+    pub model_auth: crate::processor_task_retirement::ProcessorTaskDrain,
+}
+
+impl ProcessorBackgroundShutdown {
+    pub(crate) fn is_clean(&self) -> bool {
+        self.models == crate::models_refresh_worker::ModelsRefreshShutdown::Joined
+            && self
+                .turn_cost
+                .is_none_or(|outcome| outcome == crate::turn_cost_worker::TurnCostShutdown::Joined)
+            && self.thread_starts.is_clean()
+            && self.apps.tasks.is_clean()
+            && !self.apps.runtimes.unavailable
+            && self
+                .apps
+                .runtimes
+                .reports
+                .iter()
+                .all(|report| report.is_complete())
+            && matches!(
+                self.skills,
+                crate::skills_watcher::SkillsWatcherShutdown::Joined
+                    | crate::skills_watcher::SkillsWatcherShutdown::NotStarted
+            )
+            && self.plugins.is_clean()
+            && self.command_exec.is_clean()
+            && self.model_auth.is_clean()
+    }
 }
 
 #[derive(Debug)]
@@ -517,7 +559,7 @@ impl MessageProcessor {
             Arc::clone(&thread_manager),
             Arc::clone(&config),
             config_manager.clone(),
-            model_catalog,
+            Arc::clone(&model_catalog),
         );
         let command_exec_processor = CommandExecRequestProcessor::new(
             arg0_paths.clone(),
@@ -676,6 +718,8 @@ impl MessageProcessor {
                 config: config_warnings,
             },
             models_refresh_worker,
+            model_catalog,
+            thread_manager,
             turn_cost_worker,
             skills_watcher,
             account_processor,
@@ -990,12 +1034,62 @@ impl MessageProcessor {
         self.command_exec_processor.retire_sandbox_cleanup(deadline);
     }
 
-    pub(crate) async fn drain_background_tasks(&self) {
+    /// Join the actual background owners under the original host bound. RPC,
+    /// login, connection, thread and telemetry retirement are separate stages;
+    /// callers must stop request producers before interpreting this census.
+    pub(crate) async fn drain_background_tasks_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> ProcessorBackgroundShutdown {
+        let deadline = self
+            .intake_shutdown_deadline
+            .get()
+            .copied()
+            .map_or(deadline, |intake| intake.min(deadline));
         self.models_refresh_worker.shutdown();
         if let Some(worker) = &self.turn_cost_worker {
             worker.shutdown();
         }
-        self.thread_processor.drain_background_tasks().await;
+        let plugins = self.thread_manager.plugins_manager();
+        let (models, turn_cost, thread_starts, apps, skills, plugins, command_exec) = tokio::join!(
+            self.models_refresh_worker.shutdown_until(deadline),
+            async {
+                match &self.turn_cost_worker {
+                    Some(worker) => Some(worker.shutdown_until(deadline).await),
+                    None => None,
+                }
+            },
+            self.thread_processor.drain_background_tasks_until(deadline),
+            self.apps_processor.shutdown_until(deadline),
+            self.skills_watcher.shutdown_until(deadline),
+            plugins.shutdown_until(deadline),
+            self.command_exec_processor
+                .sandbox_cleanup_shutdown_until(deadline),
+        );
+        // The periodic model producer must finish before taking this auth-task
+        // observation. A timeout/panic above remains unclean even if this is zero.
+        let model_auth = self.model_catalog.observe_auth_tasks_until(deadline).await;
+        ProcessorBackgroundShutdown {
+            models,
+            turn_cost,
+            thread_starts,
+            apps,
+            skills,
+            plugins,
+            command_exec,
+            model_auth,
+        }
+    }
+
+    pub(crate) async fn drain_background_tasks(&self) {
+        let report = self
+            .drain_background_tasks_until(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            )
+            .await;
+        if !report.is_clean() {
+            tracing::warn!(?report, "processor background retirement incomplete");
+        }
     }
 
     pub(crate) async fn cancel_active_login(&self) {

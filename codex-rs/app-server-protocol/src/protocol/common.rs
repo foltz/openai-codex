@@ -2152,7 +2152,7 @@ server_notification_definitions! {
     #[experimental("mcpServer/event/stream/notification")]
     McpServerEventStream => "mcpServer/event/stream/notification" (v2::McpServerEventStreamNotification),
     #[experimental("account/managedAuthTransition")]
-    ManagedTransitionStatus => "account/managedAuthTransition/updated" (v2::ManagedTransitionStatusNotification),
+    ManagedTransitionStatusUpdated => "account/managedAuthTransition/updated" (v2::ManagedTransitionStatusNotification),
 
     AccountUpdated => "account/updated" (v2::AccountUpdatedNotification),
     GatewayOAuthChanged => "account/gatewayOAuth/changed" (v2::GatewayOAuthChangedNotification),

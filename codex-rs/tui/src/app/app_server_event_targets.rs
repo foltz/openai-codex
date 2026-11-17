@@ -225,6 +225,7 @@ pub(super) fn server_notification_thread_target(
         | ServerNotification::FsChanged(_)
         | ServerNotification::WindowsWorldWritableWarning(_)
         | ServerNotification::WindowsSandboxSetupCompleted(_)
+        | ServerNotification::ManagedTransitionStatusUpdated(_)
         | ServerNotification::AccountLoginCompleted(_) => None,
     };
 

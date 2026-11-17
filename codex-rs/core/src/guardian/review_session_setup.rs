@@ -335,6 +335,8 @@ pub(in crate::guardian) struct PreparedReview {
     context: Arc<GuardianInvocationSetup>,
     params: Arc<GuardianReviewSessionParams>,
     recovery_requested: Arc<AtomicBool>,
+    // One replacement under the original deadline; never retry a served request.
+    reviewer_replaced: Arc<AtomicBool>,
 }
 
 struct ReviewerFenceScope<'a> {
@@ -390,6 +392,7 @@ impl ReviewerRequest for PreparedReview {
                 };
             }
             if !self.context.reviewer_binding_matches(session) {
+                self.reviewer_replaced.store(true, Ordering::Release);
                 return ReviewSessionResult {
                     outcome: GuardianReviewSessionOutcome::PromptBuildFailed(refused_review(
                         "reviewer authentication binding changed",
@@ -514,7 +517,12 @@ pub(crate) async fn run_guardian_review_session(
     );
     let (outcome, mut analytics) = match prepare_review(params).await {
         Ok(mut prepared) => {
-            let result = pool.review(prepared.clone()).await;
+            let mut result = Box::pin(pool.review(prepared.clone())).await;
+            if prepared.reviewer_replaced.swap(false, Ordering::AcqRel) {
+                // The old reviewer ran no request. Its replacement consumes the
+                // same finite invocation and the same original deadline.
+                result = Box::pin(pool.review(prepared.clone())).await;
+            }
             if prepared.recovery_requested.load(Ordering::Acquire) {
                 // One restart only, under the original deadline. An oversized parent
                 // checkpoint must fail rather than repeatedly compact and recreate.
@@ -667,6 +675,7 @@ async fn prepare_review_with_authority(
         context: Arc::new(GuardianInvocationSetup::new(context, work)?),
         params: Arc::new(params),
         recovery_requested: Arc::default(),
+        reviewer_replaced: Arc::default(),
     })
 }
 

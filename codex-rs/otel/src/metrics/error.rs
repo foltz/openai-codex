@@ -20,6 +20,9 @@ pub enum MetricsError {
     #[error("metrics exporter is disabled")]
     ExporterDisabled,
 
+    #[error("metrics routing state unavailable")]
+    RoutingUnavailable,
+
     #[error("counter increment must be non-negative for {name}: {inc}")]
     NegativeCounterIncrement { name: String, inc: i64 },
 

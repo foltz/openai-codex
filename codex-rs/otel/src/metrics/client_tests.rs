@@ -14,15 +14,20 @@ fn counter_consent_uses_the_active_exporter() -> Result<()> {
     )?;
     // Use the existing in-memory exporter to observe the built-in consent policy without
     // contacting Statsig (the real Statsig exporter is disabled in debug builds).
-    Arc::get_mut(&mut builtin.inner)
+    let MetricsOriginal::Standalone(inner) = &mut builtin.inner else {
+        panic!("fresh client must own its standalone exporter");
+    };
+    Arc::get_mut(inner)
         .expect("unique provider")
         .requires_analytics_consent = true;
     let custom = MetricsClient::new(
         MetricsConfig::in_memory("test", "test", "1", Default::default()).with_runtime_reader(),
     )?;
-    let active = Arc::new(RwLock::new(Arc::clone(&builtin.inner)));
+    let active = Arc::new(super::super::route::MetricsRoute::new(
+        builtin.original_inner()?,
+    ));
     let metrics = MetricsClient {
-        inner: Arc::clone(&builtin.inner),
+        inner: builtin.inner.clone(),
         active: Some(Arc::clone(&active)),
     };
 
@@ -35,7 +40,7 @@ fn counter_consent_uses_the_active_exporter() -> Result<()> {
             analytics_enabled,
         )?;
     }
-    *active.write().unwrap() = Arc::clone(&custom.inner);
+    let _retired = active.replace(custom.original_inner()?)?;
     metrics.counter_with_analytics_consent(
         "test.observations",
         /*inc*/ 1,

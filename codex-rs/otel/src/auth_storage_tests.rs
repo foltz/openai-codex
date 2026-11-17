@@ -71,7 +71,7 @@ fn startup_fallback_exports_one_logical_operation_without_error_contents() -> cr
     let metrics = crate::install_global_metrics(MetricsClient::new(
         MetricsConfig::in_memory("test", "test", "1", InMemoryMetricExporter::default())
             .with_runtime_reader(),
-    )?);
+    )?)?;
     let snapshot = metrics.snapshot()?;
     let mut counts = Vec::new();
     let mut durations = Vec::new();

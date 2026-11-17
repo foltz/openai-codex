@@ -104,7 +104,7 @@ async fn recovery_without_a_snapshot_keeps_each_threads_originator() -> Result<(
         .set([("reauth".into(), server_config)].into())?;
     let metrics = codex_otel::install_global_metrics(MetricsClient::new(
         MetricsConfig::in_memory("test", "test", "1", Default::default()).with_runtime_reader(),
-    )?);
+    )?)?;
     let originators = ["codex_desktop", "codex_vscode"];
     let mut threads = Vec::new();
     for originator in originators {

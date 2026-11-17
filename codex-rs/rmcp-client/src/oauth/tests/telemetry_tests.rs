@@ -197,7 +197,7 @@ fn test_metrics() -> Result<codex_otel::MetricsClient> {
             codex_otel::MetricsConfig::in_memory("test", "test", "1", Default::default())
                 .with_runtime_reader(),
         )?,
-    ))
+    )?)
 }
 
 #[test]

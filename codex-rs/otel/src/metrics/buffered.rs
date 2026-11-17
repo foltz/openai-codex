@@ -1,10 +1,20 @@
 //! Buffers bounded operation counts and durations until process metrics are configured.
 //! Each pair is admitted together; lifecycle transitions serialize with local SDK recording.
 //! Shutting down the active installation resumes buffering until its replacement is ready.
+//!
+//! Every publication (managed or legacy) allocates a strictly increasing generation while
+//! it holds the global metrics lock, and returns a `BufferedReceipt` carrying it. Receipts
+//! are applied only after every publication guard is released. The buffer accepts a
+//! receipt only if its generation exceeds the bound generation, so a late transition
+//! for an older publication can never bind, flush, or disable over a newer one.
+//! Lock order: no publication lock (metrics slot, route, trace, tracestate, logger) is
+//! ever held while acquiring the buffer lock, and the buffer lock never acquires one;
+//! beneath it only a standalone client's SDK-internal instrument locks are taken.
 
 use super::MetricsClient;
 use super::MetricsError;
 use super::Result;
+use super::client::MetricsClientInner;
 use super::validation::validate_metric_name;
 use super::validation::validate_tag_key;
 use super::validation::validate_tag_value;
@@ -29,8 +39,56 @@ enum State {
     Disabled,
 }
 
+struct Binding {
+    // Generation of the last accepted receipt; 0 before any publication.
+    generation: u64,
+    // Highest generation whose provider shut down before its receipt applied.
+    // A receipt for such a generation binds as Startup, never to the dead provider.
+    suspended: u64,
+    state: State,
+}
+
 pub(crate) struct BufferedMetrics {
-    state: Mutex<State>,
+    state: Mutex<Binding>,
+}
+
+enum Transition {
+    Enable(Arc<MetricsClientInner>),
+    Disable,
+}
+
+/// Outcome of one publication for buffered operation metrics. It holds no lock
+/// and performs no SDK work until applied, after all publication guards drop.
+#[must_use = "apply the receipt after releasing every publication guard"]
+pub(crate) struct BufferedReceipt {
+    generation: u64,
+    transition: Transition,
+}
+
+impl BufferedReceipt {
+    pub(super) fn enable(generation: u64, inner: Arc<MetricsClientInner>) -> Self {
+        Self {
+            generation,
+            transition: Transition::Enable(inner),
+        }
+    }
+
+    pub(super) fn disable(generation: u64) -> Self {
+        Self {
+            generation,
+            transition: Transition::Disable,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Apply to the process buffer. Call with no publication guard held.
+    pub(crate) fn apply(self) {
+        GLOBAL.apply(self);
+    }
 }
 
 pub(crate) static GLOBAL: BufferedMetrics = BufferedMetrics::new();
@@ -52,7 +110,11 @@ pub fn record_global_operation(
 impl BufferedMetrics {
     const fn new() -> Self {
         Self {
-            state: Mutex::new(State::Startup(Vec::new())),
+            state: Mutex::new(Binding {
+                generation: 0,
+                suspended: 0,
+                state: State::Startup(Vec::new()),
+            }),
         }
     }
 
@@ -89,7 +151,7 @@ impl BufferedMetrics {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match &mut *state {
+        match &mut state.state {
             State::Startup(pending) => {
                 if pending.len() < MAX_PENDING_OPERATIONS {
                     pending.push(PendingOperation {
@@ -109,55 +171,113 @@ impl BufferedMetrics {
         }
     }
 
-    pub(crate) fn enable(&self, metrics: &MetricsClient) {
-        let mut state = self
+    /// Accept the receipt only if it is newer than the bound generation. The
+    /// winning enable flushes pending pairs exactly once; a stale receipt
+    /// changes nothing and is released after the buffer lock drops.
+    pub(super) fn apply(&self, receipt: BufferedReceipt) {
+        #[cfg(test)]
+        assert_eq!(
+            super::publication_guards_held(),
+            0,
+            "buffered transitions must run outside every publication guard"
+        );
+        let BufferedReceipt {
+            generation,
+            transition,
+        } = receipt;
+        let mut binding = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Bind to this installation so a provider replacement cannot split a pair
-        // between exporters through the redirectable global MetricsClient handle.
-        let metrics = MetricsClient {
-            inner: Arc::clone(&metrics.inner),
-            active: None,
-        };
-        if let State::Startup(pending) = &mut *state {
-            for operation in pending.drain(..) {
-                let tags: Vec<_> = operation
-                    .tags
-                    .iter()
-                    .map(|(key, value)| (key.as_ref(), value.as_ref()))
-                    .collect();
-                let _ = record(
-                    &metrics,
-                    &operation.count_name,
-                    &operation.duration_name,
-                    operation.duration,
-                    &tags,
-                );
+        if generation <= binding.generation {
+            drop(binding);
+            drop(transition);
+            return;
+        }
+        binding.generation = generation;
+        let mut shut_down = None;
+        let next = match transition {
+            Transition::Enable(inner) if generation <= binding.suspended => {
+                // Its provider already shut down: keep buffering for a successor.
+                shut_down = Some(inner);
+                match &mut binding.state {
+                    State::Startup(pending) => State::Startup(std::mem::take(pending)),
+                    State::Ready(_) | State::Disabled => State::Startup(Vec::new()),
+                }
             }
-        }
-        *state = State::Ready(metrics);
+            Transition::Enable(inner) => {
+                // Bind to this installation so a provider replacement cannot split a
+                // pair between exporters through the redirectable global handle.
+                let metrics = MetricsClient {
+                    inner: super::client::MetricsOriginal::Standalone(inner),
+                    active: None,
+                };
+                if let State::Startup(pending) = &mut binding.state {
+                    for operation in pending.drain(..) {
+                        let tags: Vec<_> = operation
+                            .tags
+                            .iter()
+                            .map(|(key, value)| (key.as_ref(), value.as_ref()))
+                            .collect();
+                        let _ = record(
+                            &metrics,
+                            &operation.count_name,
+                            &operation.duration_name,
+                            operation.duration,
+                            &tags,
+                        );
+                    }
+                }
+                State::Ready(metrics)
+            }
+            Transition::Disable => State::Disabled,
+        };
+        let previous = std::mem::replace(&mut binding.state, next);
+        drop(binding);
+        // A replaced binding may hold the last provider reference.
+        drop(previous);
+        drop(shut_down);
     }
 
-    pub(crate) fn disable(&self) {
-        *self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = State::Disabled;
-    }
-
-    pub(super) fn suspend(&self, metrics: &MetricsClient) {
-        let mut state = self
+    /// A provider published as `generation` is shutting down. Only that exact
+    /// bound generation returns to buffering; the bound generation is never
+    /// raised, so any already-issued receipt with a higher generation still
+    /// applies afterwards. A suspend for an older generation, or after
+    /// opt-out, has no effect.
+    pub(super) fn suspend(&self, generation: u64) {
+        let mut binding = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // A replaced provider may shut down after its successor is installed.
-        // It must neither detach that successor nor undo an explicit opt-out.
-        if let State::Ready(current) = &*state
-            && Arc::ptr_eq(&current.inner, &metrics.inner)
-        {
-            *state = State::Startup(Vec::new());
+        if generation > binding.generation {
+            // Shut down before its own receipt applied: that receipt must not
+            // bind a dead provider. Newer receipts are unaffected.
+            binding.suspended = binding.suspended.max(generation);
+            return;
         }
+        if generation == binding.generation && matches!(binding.state, State::Ready(_)) {
+            let previous = std::mem::replace(&mut binding.state, State::Startup(Vec::new()));
+            drop(binding);
+            drop(previous);
+        }
+    }
+
+    #[cfg(test)]
+    fn enable(&self, metrics: &MetricsClient) {
+        let Ok(inner) = metrics.original_inner() else {
+            return;
+        };
+        self.apply(BufferedReceipt::enable(
+            super::next_publication_generation(),
+            inner,
+        ));
+    }
+
+    #[cfg(test)]
+    fn disable(&self) {
+        self.apply(BufferedReceipt::disable(
+            super::next_publication_generation(),
+        ));
     }
 }
 

@@ -47,7 +47,7 @@ async fn recovery_retains_originator_without_initial_credentials() -> anyhow::Re
     }
     let metrics = codex_otel::install_global_metrics(MetricsClient::new(
         MetricsConfig::in_memory("test", "test", "1", Default::default()).with_runtime_reader(),
-    )?);
+    )?)?;
     let (_server, base_url) = spawn_streamable_http_server().await?;
     let url = format!("{base_url}/mcp");
     let client = AuthStorageOriginator::from_client_name("codex_vscode")

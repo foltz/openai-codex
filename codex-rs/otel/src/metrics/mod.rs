@@ -3,7 +3,10 @@ mod client;
 mod config;
 mod error;
 pub(crate) mod names;
+mod owner;
 mod process;
+mod retirement;
+mod route;
 pub(crate) mod runtime_metrics;
 pub(crate) mod tags;
 pub(crate) mod timer;
@@ -19,43 +22,304 @@ pub use crate::metrics::error::Result;
 pub use crate::metrics::process::record_process_start_once;
 pub use names::*;
 use std::sync::Arc;
-use std::sync::OnceLock;
-use std::sync::RwLock;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 pub use tags::ORIGINATOR_TAG;
 pub use tags::SessionMetricTagValues;
 pub use tags::bounded_originator_tag_value;
 
-static GLOBAL_METRICS: OnceLock<MetricsClient> = OnceLock::new();
-static GLOBAL_STATSIG_METRICS_SETTINGS: OnceLock<StatsigMetricsSettings> = OnceLock::new();
+#[derive(Default)]
+struct GlobalMetrics {
+    current: Option<MetricsClient>,
+    statsig: Option<StatsigMetricsSettings>,
+    // Cached handles must follow re-enablement even while current is absent.
+    route: Option<Arc<route::MetricsRoute>>,
+    // Failed/unobserved retirement must outlive incidental public handle clones.
+    retired: Vec<Arc<retirement::RetiredMetrics>>,
+}
 
-pub(crate) fn install_global(mut metrics: MetricsClient) -> MetricsClient {
-    let active = GLOBAL_METRICS
-        .get()
-        .and_then(|current| current.active.clone())
-        .unwrap_or_else(|| Arc::new(RwLock::new(Arc::clone(&metrics.inner))));
-    *active
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::clone(&metrics.inner);
+static GLOBAL_METRICS: Mutex<GlobalMetrics> = Mutex::new(GlobalMetrics {
+    current: None,
+    statsig: None,
+    route: None,
+    retired: Vec::new(),
+});
+
+// Buffered-metrics publication generations. Allocated only while holding the
+// metrics slot lock, so allocation order equals publication commit order. A
+// process-wide counter (rather than a per-slot field) keeps generations unique
+// across test slots that all report to the single process buffer.
+static PUBLICATION_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+fn next_publication_generation() -> u64 {
+    // The slot mutex orders allocations; the atomic only needs uniqueness.
+    PUBLICATION_GENERATION.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+#[cfg(test)]
+thread_local! {
+    static PUBLICATION_GUARDS_HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only witness that a publication lock is held on this thread. Field
+/// order in holders drops the lock before this marker.
+struct PublicationMark(());
+
+impl PublicationMark {
+    fn new() -> Self {
+        #[cfg(test)]
+        PUBLICATION_GUARDS_HELD.with(|held| held.set(held.get() + 1));
+        Self(())
+    }
+}
+
+impl Drop for PublicationMark {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        PUBLICATION_GUARDS_HELD.with(|held| held.set(held.get() - 1));
+    }
+}
+
+#[cfg(test)]
+fn publication_guards_held() -> usize {
+    PUBLICATION_GUARDS_HELD.with(std::cell::Cell::get)
+}
+
+/// Excludes global handle acquisition until a coordinated route commit ends.
+pub(crate) struct GlobalMetricsPublication<'a>(MutexGuard<'a, GlobalMetrics>, PublicationMark);
+
+impl<'a> GlobalMetricsPublication<'a> {
+    fn new(global: MutexGuard<'a, GlobalMetrics>) -> Self {
+        Self(global, PublicationMark::new())
+    }
+}
+
+pub(crate) fn publication_guard() -> Result<GlobalMetricsPublication<'static>> {
+    GLOBAL_METRICS
+        .lock()
+        .map(GlobalMetricsPublication::new)
+        .map_err(|_| MetricsError::RoutingUnavailable)
+}
+
+impl GlobalMetricsPublication<'_> {
+    /// Acquire the other publication guards before calling this method. The
+    /// finalizer may only perform infallible route writes, never callbacks,
+    /// logging, SDK destruction, or lock acquisition. It runs while metrics
+    /// operations and global handle acquisition are still excluded.
+    ///
+    /// On an acquisition error the borrowed candidate remains unpublished and
+    /// owned by the caller; no SDK owner is destroyed under publication locks.
+    ///
+    /// The returned receipt must be applied only after every publication guard
+    /// (including the caller's) is released. Its generation orders it against
+    /// all other publications, so applying it late can never override a newer one.
+    pub(crate) fn publish_with(
+        &mut self,
+        candidate: &mut Option<MetricsClient>,
+        settings: Option<StatsigMetricsSettings>,
+        finish: impl FnOnce(),
+    ) -> Result<buffered::BufferedReceipt> {
+        let next = candidate
+            .as_ref()
+            .map(|client| match &client.inner {
+                client::MetricsOriginal::Standalone(inner) => Ok(Arc::clone(inner)),
+                client::MetricsOriginal::Routed(_) => Err(MetricsError::RoutingUnavailable),
+            })
+            .transpose()?;
+        // An empty initial route is private until commit, and therefore cannot
+        // create a spurious retired generation for the first installation.
+        let active = self
+            .0
+            .route
+            .clone()
+            .unwrap_or_else(|| Arc::new(route::MetricsRoute::default()));
+        let mut route = active.publication_guard()?;
+        // Every fallible step is behind us; this publication now commits.
+        let generation = next_publication_generation();
+        let receipt = match &next {
+            Some(inner) => buffered::BufferedReceipt::enable(generation, Arc::clone(inner)),
+            None => buffered::BufferedReceipt::disable(generation),
+        };
+        let next_owner = next.as_ref().map(|inner| {
+            let owner = owner::MetricsOwner::new(Arc::clone(inner));
+            owner.bind_publication_generation(generation);
+            owner
+        });
+        let retired = route.replace(next);
+        if let Some(MetricsClient {
+            inner: client::MetricsOriginal::Routed(previous),
+            ..
+        }) = self.0.current.take()
+        {
+            self.0
+                .retired
+                .push(Arc::new(retirement::RetiredMetrics::new(previous, retired)));
+        }
+        if let Some(client) = candidate
+            && let Some(owner) = next_owner
+        {
+            client.inner = client::MetricsOriginal::Routed(owner);
+            client.active = Some(Arc::clone(&active));
+        }
+        self.0.route = Some(Arc::clone(&active));
+        self.0.current = candidate.clone();
+        self.0.statsig = candidate.as_ref().and(settings);
+        finish();
+        Ok(receipt)
+    }
+}
+
+#[cfg(test)]
+#[path = "settings_tests.rs"]
+mod settings_tests;
+
+pub(crate) fn install_global(metrics: MetricsClient) -> Result<MetricsClient> {
+    install_global_with_settings(metrics, None)
+}
+
+pub(crate) fn install_global_with_settings(
+    metrics: MetricsClient,
+    settings: Option<StatsigMetricsSettings>,
+) -> Result<MetricsClient> {
+    install_in(&GLOBAL_METRICS, metrics, settings)
+}
+
+fn install_in(
+    slot: &Mutex<GlobalMetrics>,
+    metrics: MetricsClient,
+    settings: Option<StatsigMetricsSettings>,
+) -> Result<MetricsClient> {
+    let (metrics, receipt) = install_in_with_receipt(slot, metrics, settings)?;
+    receipt.apply();
+    Ok(metrics)
+}
+
+/// Legacy installation. The receipt is returned with no lock held; callers
+/// apply it after the slot lock and the previous epoch release are dropped.
+fn install_in_with_receipt(
+    slot: &Mutex<GlobalMetrics>,
+    mut metrics: MetricsClient,
+    settings: Option<StatsigMetricsSettings>,
+) -> Result<(MetricsClient, buffered::BufferedReceipt)> {
+    if matches!(&metrics.inner, client::MetricsOriginal::Routed(_)) {
+        // Re-publishing a handle must not manufacture a second shutdown owner
+        // for the same SDK provider.
+        return Err(MetricsError::RoutingUnavailable);
+    }
+    let inner = metrics.original_inner()?;
+    let owner = owner::MetricsOwner::new(Arc::clone(&inner));
+    let mut global = slot.lock().map_err(|_| MetricsError::RoutingUnavailable)?;
+    let mark = PublicationMark::new();
+    let mut release = None;
+    let active = match global.route.clone() {
+        Some(active) => {
+            // Legacy callers do not drive managed retirement. Keep count proof
+            // but release route custody outside locks; active leases and the
+            // original owner independently retain resources while needed.
+            let (retired, previous_epoch) = active.replace_legacy(Some(Arc::clone(&inner)))?;
+            release = Some(previous_epoch);
+            if let Some(MetricsClient {
+                inner: client::MetricsOriginal::Routed(previous),
+                ..
+            }) = &global.current
+            {
+                let previous = Arc::clone(previous);
+                global
+                    .retired
+                    .push(Arc::new(retirement::RetiredMetrics::new(previous, retired)));
+            }
+            active
+        }
+        None => Arc::new(route::MetricsRoute::new(Arc::clone(&inner))),
+    };
+    let generation = next_publication_generation();
+    owner.bind_publication_generation(generation);
+    let receipt = buffered::BufferedReceipt::enable(generation, inner);
+    global.route = Some(Arc::clone(&active));
     metrics.active = Some(active);
-    let _ = GLOBAL_METRICS.set(metrics.clone());
-    buffered::GLOBAL.enable(&metrics);
-    metrics
+    metrics.inner = client::MetricsOriginal::Routed(owner);
+    global.current = Some(metrics.clone());
+    global.statsig = settings;
+    drop(global);
+    drop(mark);
+    drop(release);
+    Ok((metrics, receipt))
+}
+
+pub(crate) fn disable_global() -> Result<()> {
+    disable_in_with_receipt(&GLOBAL_METRICS)?.apply();
+    Ok(())
+}
+
+fn disable_in_with_receipt(slot: &Mutex<GlobalMetrics>) -> Result<buffered::BufferedReceipt> {
+    let mut global = slot.lock().map_err(|_| MetricsError::RoutingUnavailable)?;
+    let mark = PublicationMark::new();
+    let mut release = None;
+    if let Some(active) = &global.route {
+        let (ticket, previous_epoch) = active.replace_legacy(None)?;
+        release = Some(previous_epoch);
+        if let Some(MetricsClient {
+            inner: client::MetricsOriginal::Routed(owner),
+            ..
+        }) = global.current.take()
+        {
+            global
+                .retired
+                .push(Arc::new(retirement::RetiredMetrics::new(owner, ticket)));
+        }
+    }
+    global.statsig = None;
+    let receipt = buffered::BufferedReceipt::disable(next_publication_generation());
+    drop(global);
+    drop(mark);
+    drop(release);
+    Ok(receipt)
 }
 
 pub fn global() -> Option<MetricsClient> {
-    GLOBAL_METRICS.get().cloned()
+    GLOBAL_METRICS.lock().ok()?.current.clone()
 }
 
-pub(crate) fn install_global_statsig_settings(settings: StatsigMetricsSettings) {
-    let _ = GLOBAL_STATSIG_METRICS_SETTINGS.set(settings);
+pub(crate) async fn retire_for(
+    metrics: &MetricsClient,
+    deadline: tokio::time::Instant,
+) -> std::result::Result<(), crate::OtelRetirementError> {
+    use crate::OtelRetirementError;
+    use crate::OtelShutdownError;
+    let unavailable = OtelRetirementError::Exporter(OtelShutdownError::Metrics);
+    let client::MetricsOriginal::Routed(owner) = &metrics.inner else {
+        return Err(unavailable);
+    };
+    let retired = {
+        let global = GLOBAL_METRICS.lock().map_err(|_| unavailable)?;
+        global
+            .retired
+            .iter()
+            .find(|entry| entry.belongs_to(owner))
+            .cloned()
+            .ok_or(unavailable)?
+    };
+    retired
+        .wait_until(deadline)
+        .await
+        .map_err(|error| match error {
+            retirement::MetricsRetirementError::TimedOut => OtelRetirementError::TimedOut,
+            retirement::MetricsRetirementError::WorkerFailed => OtelRetirementError::WorkerFailed,
+            retirement::MetricsRetirementError::DrainUnavailable
+            | retirement::MetricsRetirementError::Owner(_) => unavailable,
+        })
 }
 
 pub(crate) fn global_statsig_settings() -> Option<StatsigMetricsSettings> {
-    if GLOBAL_METRICS
-        .get()
-        .is_some_and(|metrics| metrics.active_inner().network_policy.is_managed())
-    {
+    let global = GLOBAL_METRICS.lock().ok()?;
+    if global.current.as_ref().is_some_and(|metrics| {
+        metrics
+            .original_inner()
+            .is_ok_and(|inner| inner.network_policy.is_managed())
+    }) {
         return None;
     }
-    GLOBAL_STATSIG_METRICS_SETTINGS.get().cloned()
+    global.statsig.clone()
 }

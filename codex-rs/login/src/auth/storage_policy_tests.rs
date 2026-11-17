@@ -28,7 +28,7 @@ fn storage_metrics_distinguish_explicit_file_from_secure_failure_fallback() -> a
     let metrics = codex_otel::install_global_metrics(codex_otel::MetricsClient::new(
         codex_otel::MetricsConfig::in_memory("test", "test", "1", Default::default())
             .with_runtime_reader(),
-    )?);
+    )?)?;
     let mut expected = BTreeMap::new();
     for kind in [
         AuthKeyringBackendKind::Direct,

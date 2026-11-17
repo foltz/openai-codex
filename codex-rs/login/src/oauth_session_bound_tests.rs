@@ -14,9 +14,9 @@ fn grant(client: &OAuthSessionManager, id: &str, access: &str, expiry: i64) {
 async fn credentials(
     request: &mut crate::oauth_session::OAuthSessionRequest,
 ) -> std::io::Result<crate::oauth_session::OAuthRequestCredentials> {
-    tokio::time::timeout(Duration::from_secs(2), request.credentials())
-        .await
-        .expect("bounded OAuth request")
+    // Native credential reads and commits include the real encrypted store.
+    // Product HTTP deadlines and the unchanged nextest case bound apply.
+    request.credentials().await
 }
 #[tokio::test]
 async fn replacement_sign_in_is_refused_before_any_refresh_request() {

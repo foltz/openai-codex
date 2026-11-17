@@ -4616,3 +4616,33 @@ async fn owner_admission_allows_credential_revision_but_refuses_source_login_or_
     }
     Ok(())
 }
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn queued_event_factory_refuses_retired_owner_without_reselecting_credentials()
+-> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    let home = tempdir()?;
+    let source = native_owner_fixture(home.path(), "http://127.0.0.1:1").await?;
+    let expected = source.owner_snapshot().unwrap().revisions.owner_generation;
+    assert!(
+        source
+            .auth_with_http_client_factory_for_owner(expected)
+            .await
+            .is_some()
+    );
+    let before = std::fs::read(home.path().join("auth.json"))?;
+    source.try_set_cached_auth(None)?;
+    assert!(
+        source
+            .auth_with_http_client_factory_for_owner(expected)
+            .await
+            .is_none()
+    );
+    assert!(
+        source.auth_cached().is_none(),
+        "old events cannot reload a durable credential"
+    );
+    assert_eq!(std::fs::read(home.path().join("auth.json"))?, before);
+    Ok(())
+}

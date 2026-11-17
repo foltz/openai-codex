@@ -1,3 +1,4 @@
+use crate::client::AnalyticsOwner;
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -459,6 +460,7 @@ pub struct GuardianReviewTrackContext {
     reviewed_action: GuardianReviewedAction,
     review_timeout_ms: u64,
     pub started_at_ms: u64,
+    originating_owner: Option<AnalyticsOwner>,
 }
 
 impl GuardianReviewTrackContext {
@@ -480,7 +482,16 @@ impl GuardianReviewTrackContext {
             reviewed_action,
             review_timeout_ms,
             started_at_ms: now_unix_millis(),
+            originating_owner: None,
         }
+    }
+
+    pub fn with_originating_owner(mut self, owner: Option<AnalyticsOwner>) -> Self {
+        self.originating_owner = owner;
+        self
+    }
+    pub(crate) fn originating_owner(&self) -> Option<&AnalyticsOwner> {
+        self.originating_owner.as_ref()
     }
 
     pub(crate) fn event_params(

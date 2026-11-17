@@ -15,6 +15,7 @@ use std::time::UNIX_EPOCH;
 
 pub use accepted_lines::fingerprint_hash;
 pub use client::AnalyticsEventsClient;
+pub use client::AnalyticsOwner;
 pub use events::AppServerRpcTransport;
 pub use events::GuardianAdditionalPermissions;
 pub use events::GuardianApprovalRequestSource;

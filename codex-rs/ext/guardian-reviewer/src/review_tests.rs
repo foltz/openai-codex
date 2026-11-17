@@ -56,6 +56,7 @@ impl ReviewHost for GatedHost {
         Ok((
             (),
             ReviewReport::new(ReviewMetadata {
+                originating_owner: None,
                 thread_id: "thread".into(),
                 turn_id: "turn".into(),
                 review_id: approval_id.into(),

@@ -32,6 +32,7 @@ use crate::ReviewCompletion;
 
 /// Captured action attribution used for both the started and terminal report.
 pub struct ReviewMetadata {
+    pub originating_owner: Option<codex_analytics::AnalyticsOwner>,
     pub thread_id: String,
     pub turn_id: String,
     pub review_id: String,
@@ -69,7 +70,8 @@ impl ReviewReport {
             metadata
                 .timeout
                 .map_or(0, |timeout| timeout.as_millis() as u64),
-        );
+        )
+        .with_originating_owner(metadata.originating_owner);
         let started = metadata.action.map(|action| GuardianAssessmentEvent {
             review_reason: Some(metadata.review_reason),
             model_context: Some(metadata.model_context),

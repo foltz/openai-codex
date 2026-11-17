@@ -426,6 +426,14 @@ impl OriginatingAccountRecord {
         self.renewal.as_ref()
     }
 
+    pub(crate) fn analytics_owner(&self) -> Option<codex_analytics::AnalyticsOwner> {
+        let manager = self.manager.upgrade()?;
+        Some(codex_analytics::AnalyticsOwner::new(
+            &manager,
+            self.owner_generation()?,
+        ))
+    }
+
     pub(crate) fn source_login_revisions(&self) -> Option<(u64, u64)> {
         self.snapshot.as_ref().map(|snapshot| {
             (

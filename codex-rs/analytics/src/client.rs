@@ -66,6 +66,7 @@ use codex_app_server_protocol::item_event_to_server_notification;
 use codex_features::RuntimeAuthMode;
 use codex_http_client::OPENAI_ORGANIZATION_HEADER;
 use codex_http_client::OPENAI_PROJECT_HEADER;
+use codex_login::AuthChangeState;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_model_provider::ChatgptBaseUrl;
@@ -84,11 +85,13 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::Weak;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio::sync::watch;
 
 const ANALYTICS_EVENTS_QUEUE_SIZE: usize = 256;
 const ANALYTICS_EVENTS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -97,7 +100,7 @@ const ANALYTICS_EVENTS_FLUSH_TIMEOUT: Duration = Duration::from_secs(25);
 const ANALYTICS_EVENT_DEDUPE_MAX_KEYS: usize = 4096;
 
 pub(crate) enum AnalyticsEventsQueueMessage {
-    Fact(Box<AnalyticsFact>),
+    Fact(Box<AnalyticsFact>, u64),
     ThreadProduct {
         thread_id: String,
         product_sku: Option<String>,
@@ -112,7 +115,37 @@ pub(crate) struct AnalyticsEventsQueue {
     pub(crate) product_generation: Arc<AtomicU64>,
     pub(crate) app_used_emitted_keys: Arc<Mutex<HashSet<(String, String)>>>,
     pub(crate) plugin_used_emitted_keys: Arc<Mutex<HashSet<(String, String)>>>,
+    pub(crate) auth_changes: watch::Receiver<AuthChangeState>,
+    pub(crate) owner_manager: Weak<AuthManager>,
 }
+
+/// The account owner an event belongs to, captured where the event's subject was
+/// admitted (for example a Guardian review's originating turn) rather than when the
+/// event is recorded. Only meaningful for the queue built on the same `AuthManager`.
+#[derive(Clone, Debug)]
+pub struct AnalyticsOwner {
+    manager: Weak<AuthManager>,
+    owner_generation: u64,
+}
+
+impl AnalyticsOwner {
+    pub fn new(manager: &Arc<AuthManager>, owner_generation: u64) -> Self {
+        Self {
+            manager: Arc::downgrade(manager),
+            owner_generation,
+        }
+    }
+}
+
+/// The same manager instance and the same owner revision.
+impl PartialEq for AnalyticsOwner {
+    fn eq(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.manager, &other.manager)
+            && self.owner_generation == other.owner_generation
+    }
+}
+
+impl Eq for AnalyticsOwner {}
 
 #[derive(Clone)]
 pub struct AnalyticsEventsClient {
@@ -211,10 +244,13 @@ impl AnalyticsEventsQueue {
         let (sender, mut receiver) = mpsc::channel(ANALYTICS_EVENTS_QUEUE_SIZE);
         let product_generation = Arc::new(AtomicU64::new(0));
         let worker_product_generation = Arc::clone(&product_generation);
+        let auth_changes = auth_manager.auth_change_state_receiver();
+        let owner_manager = Arc::downgrade(&auth_manager);
         tokio::spawn(async move {
             let mut reducer = AnalyticsReducer::default();
             let mut thread_products = ThreadProducts::default();
             let mut registered_generation = 0;
+            let mut ingest_owner = None;
             while let Some(input) = receiver.recv().await {
                 let generation = worker_product_generation.load(Ordering::Acquire);
                 if generation != registered_generation {
@@ -223,7 +259,23 @@ impl AnalyticsEventsQueue {
                     registered_generation = generation;
                 }
                 let input = match input {
-                    AnalyticsEventsQueueMessage::Fact(input) => *input,
+                    AnalyticsEventsQueueMessage::Fact(input, owner_generation) => {
+                        if ingest_owner.is_some_and(|owner| owner != owner_generation) {
+                            let mut events = Vec::new();
+                            reducer.flush(&mut events);
+                            send_track_events(
+                                &auth_manager,
+                                &destination,
+                                events,
+                                &thread_products,
+                                ingest_owner,
+                                runtime_auth.as_ref(),
+                            )
+                            .await;
+                        }
+                        ingest_owner = Some(owner_generation);
+                        *input
+                    }
                     AnalyticsEventsQueueMessage::ThreadProduct {
                         thread_id,
                         product_sku,
@@ -249,6 +301,7 @@ impl AnalyticsEventsQueue {
                             &destination,
                             events,
                             &thread_products,
+                            ingest_owner,
                             runtime_auth.as_ref(),
                         )
                         .await;
@@ -263,6 +316,7 @@ impl AnalyticsEventsQueue {
                             &destination,
                             events,
                             &thread_products,
+                            ingest_owner,
                             runtime_auth.as_ref(),
                         )
                         .await;
@@ -277,6 +331,7 @@ impl AnalyticsEventsQueue {
                     &destination,
                     events,
                     &thread_products,
+                    ingest_owner,
                     runtime_auth.as_ref(),
                 )
                 .await;
@@ -287,13 +342,40 @@ impl AnalyticsEventsQueue {
             product_generation,
             app_used_emitted_keys: Arc::new(Mutex::new(HashSet::new())),
             plugin_used_emitted_keys: Arc::new(Mutex::new(HashSet::new())),
+            auth_changes,
+            owner_manager,
+        }
+    }
+
+    /// Enqueues `input` as belonging to `owner`. An owner of another manager cannot be
+    /// verified by this queue's sends, so its events are dropped instead of being sent
+    /// with whichever account this queue's manager holds.
+    fn try_send_for_owner(&self, input: AnalyticsFact, owner: &AnalyticsOwner) {
+        if !Weak::ptr_eq(&owner.manager, &self.owner_manager) {
+            tracing::debug!("dropping analytics event whose owner belongs to another manager");
+            return;
+        }
+        if self
+            .sender
+            .try_send(AnalyticsEventsQueueMessage::Fact(
+                Box::new(input),
+                owner.owner_generation,
+            ))
+            .is_err()
+        {
+            tracing::warn!("dropping analytics events: queue is full");
         }
     }
 
     fn try_send(&self, input: AnalyticsFact) {
+        // Capture the owner now: the worker may send after a login, switch, or logout.
+        let owner_generation = self.auth_changes.borrow().owner_generation;
         if self
             .sender
-            .try_send(AnalyticsEventsQueueMessage::Fact(Box::new(input)))
+            .try_send(AnalyticsEventsQueueMessage::Fact(
+                Box::new(input),
+                owner_generation,
+            ))
             .is_err()
         {
             //TODO: add a metric for this
@@ -581,9 +663,17 @@ impl AnalyticsEventsClient {
         completed_at_ms: u64,
         elapsed: Duration,
     ) {
-        self.record_fact(AnalyticsFact::Custom(CustomAnalyticsFact::GuardianReview(
-            Box::new(tracking.event_params(result, completed_at_ms, elapsed)),
-        )));
+        let Some(owner) = tracking.originating_owner() else {
+            return;
+        };
+        if let Some(queue) = &self.queue {
+            queue.try_send_for_owner(
+                AnalyticsFact::Custom(CustomAnalyticsFact::GuardianReview(Box::new(
+                    tracking.event_params(result, completed_at_ms, elapsed),
+                ))),
+                owner,
+            );
+        }
     }
 
     pub fn track_app_mentioned(&self, tracking: TrackEventsContext, mentions: Vec<AppInvocation>) {
@@ -1068,13 +1158,19 @@ async fn send_track_events(
     destination: &AnalyticsEventsDestination,
     mut events: Vec<TrackEventRequest>,
     thread_products: &ThreadProducts,
+    owner_generation: Option<u64>,
     runtime_auth: Option<&(RuntimeAuthSlot, RuntimeAuthMode)>,
 ) {
     if events.is_empty() {
         return;
     }
 
-    let Some((auth, http_client_factory)) = auth_manager.auth_with_http_client_factory().await
+    let Some(owner_generation) = owner_generation else {
+        return;
+    };
+    let Some((auth, http_client_factory)) = auth_manager
+        .auth_with_http_client_factory_for_owner(owner_generation)
+        .await
     else {
         return;
     };

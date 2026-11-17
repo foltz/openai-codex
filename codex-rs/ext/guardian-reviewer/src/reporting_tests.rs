@@ -55,6 +55,7 @@ fn review_completion_uses_one_monotonic_duration(
     )
     .with_metrics_without_metadata_tags(metrics);
     let mut report = ReviewReport::new(ReviewMetadata {
+        originating_owner: None,
         thread_id: "thread".to_string(),
         turn_id: "turn".to_string(),
         review_id: "review".to_string(),

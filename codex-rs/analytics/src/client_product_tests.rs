@@ -174,6 +174,12 @@ async fn product_streams_send_concurrently_and_preserve_event_order() {
             &destination,
             events,
             &products,
+            Some(
+                manager
+                    .auth_change_state_receiver()
+                    .borrow()
+                    .owner_generation,
+            ),
             /*runtime_auth*/ None,
         ),
     )

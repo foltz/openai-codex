@@ -304,6 +304,8 @@ fn client_with_receiver() -> (
         product_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         app_used_emitted_keys: Arc::new(Mutex::new(HashSet::new())),
         plugin_used_emitted_keys: Arc::new(Mutex::new(HashSet::new())),
+        auth_changes: tokio::sync::watch::channel(codex_login::AuthChangeState::default()).1,
+        owner_manager: std::sync::Weak::new(),
     };
     (AnalyticsEventsClient { queue: Some(queue) }, receiver)
 }
@@ -535,6 +537,12 @@ async fn api_key_auth_sends_only_plugin_events_to_codex_backend() {
             plugin_measurement("plugin-measurement", "sample@test"),
         ],
         &ThreadProducts::default(),
+        Some(
+            auth_manager
+                .auth_change_state_receiver()
+                .borrow()
+                .owner_generation,
+        ),
         /*runtime_auth*/ None,
     )
     .await;
@@ -825,7 +833,7 @@ fn track_plugin_measurements_rejects_unbounded_inputs_before_queueing() {
     client.track_plugin_measurements(mixed_rows);
     assert!(matches!(
         receiver.try_recv(),
-        Ok(AnalyticsEventsQueueMessage::Fact(fact))
+        Ok(AnalyticsEventsQueueMessage::Fact(fact, _))
             if matches!(
                 fact.as_ref(),
                 AnalyticsFact::Custom(CustomAnalyticsFact::PluginMeasurements(input))
@@ -837,7 +845,7 @@ fn track_plugin_measurements_rejects_unbounded_inputs_before_queueing() {
     client.track_plugin_measurements(measurements(MAX_PLUGIN_MEASUREMENTS_PER_BATCH));
     assert!(matches!(
         receiver.try_recv(),
-        Ok(AnalyticsEventsQueueMessage::Fact(fact))
+        Ok(AnalyticsEventsQueueMessage::Fact(fact, _))
             if matches!(
                 fact.as_ref(),
                 AnalyticsFact::Custom(CustomAnalyticsFact::PluginMeasurements(input))
@@ -857,7 +865,7 @@ fn track_request_only_enqueues_analytics_relevant_requests() {
         client.track_request(/*connection_id*/ 7, request_id, &request);
         assert!(matches!(
             receiver.try_recv(),
-            Ok(AnalyticsEventsQueueMessage::Fact(input))
+            Ok(AnalyticsEventsQueueMessage::Fact(input, _))
                 if matches!(*input, AnalyticsFact::ClientRequest { .. })
         ));
     }
@@ -869,7 +877,7 @@ fn track_request_only_enqueues_analytics_relevant_requests() {
     );
     assert!(matches!(
         receiver.try_recv(),
-        Ok(AnalyticsEventsQueueMessage::Fact(input))
+        Ok(AnalyticsEventsQueueMessage::Fact(input, _))
             if matches!(
                 *input,
                 AnalyticsFact::ExplicitClientInterruptRequest {
@@ -911,7 +919,7 @@ fn track_response_only_enqueues_analytics_relevant_responses() {
         client.track_response(/*connection_id*/ 7, request_id, &response);
         assert!(matches!(
             receiver.try_recv(),
-            Ok(AnalyticsEventsQueueMessage::Fact(input))
+            Ok(AnalyticsEventsQueueMessage::Fact(input, _))
                 if matches!(*input, AnalyticsFact::ClientResponse { .. })
         ));
     }
@@ -957,7 +965,7 @@ async fn flush_waits_for_preceding_fact_delivery() {
     let flush = tokio::spawn(async move { client.flush().await });
     assert!(matches!(
         receiver.recv().await,
-        Some(AnalyticsEventsQueueMessage::Fact(input))
+        Some(AnalyticsEventsQueueMessage::Fact(input, _))
             if matches!(*input, AnalyticsFact::ClientRequest { .. })
     ));
     let done_tx = match receiver.recv().await {
@@ -1020,7 +1028,7 @@ fn app_used_preserves_first_classification_and_emits_again_next_turn() {
         ("turn-1", Some(ElicitationType::AuthOrLink)),
         ("turn-2", None),
     ] {
-        let Ok(AnalyticsEventsQueueMessage::Fact(input)) = receiver.try_recv() else {
+        let Ok(AnalyticsEventsQueueMessage::Fact(input, _)) = receiver.try_recv() else {
             panic!("expected app-used analytics fact");
         };
         let AnalyticsFact::Custom(CustomAnalyticsFact::AppUsed(input)) = *input else {
@@ -1050,7 +1058,7 @@ fn track_notification_only_enqueues_analytics_relevant_notifications() {
 
     client.track_notification(&tracked_notification);
 
-    let Ok(AnalyticsEventsQueueMessage::Fact(input)) = receiver.try_recv() else {
+    let Ok(AnalyticsEventsQueueMessage::Fact(input, _)) = receiver.try_recv() else {
         panic!("expected analytics notification");
     };
     let AnalyticsFact::Notification(notification) = *input else {
@@ -1085,7 +1093,7 @@ fn track_notification_records_realtime_session_boundaries() {
         },
     ));
 
-    let Ok(AnalyticsEventsQueueMessage::Fact(input)) = receiver.try_recv() else {
+    let Ok(AnalyticsEventsQueueMessage::Fact(input, _)) = receiver.try_recv() else {
         panic!("expected realtime session started fact");
     };
     let AnalyticsFact::RealtimeSessionStarted {
@@ -1107,7 +1115,7 @@ fn track_notification_records_realtime_session_boundaries() {
         },
     ));
 
-    let Ok(AnalyticsEventsQueueMessage::Fact(input)) = receiver.try_recv() else {
+    let Ok(AnalyticsEventsQueueMessage::Fact(input, _)) = receiver.try_recv() else {
         panic!("expected realtime session closed fact");
     };
     let AnalyticsFact::RealtimeSessionClosed {
@@ -1133,7 +1141,7 @@ fn realtime_handoff_tracks_only_marker_without_transcript() {
             }),
         },
     ));
-    let Ok(AnalyticsEventsQueueMessage::Fact(input)) = receiver.try_recv() else {
+    let Ok(AnalyticsEventsQueueMessage::Fact(input, _)) = receiver.try_recv() else {
         panic!("expected realtime handoff marker");
     };
     assert!(matches!(
@@ -1269,6 +1277,12 @@ async fn account_switch_between_batches_does_not_send_old_credentials() {
         &destination,
         events,
         &ThreadProducts::default(),
+        Some(
+            manager
+                .auth_change_state_receiver()
+                .borrow()
+                .owner_generation,
+        ),
         /*runtime_auth*/ None,
     )
     .await;
@@ -1283,4 +1297,52 @@ async fn account_switch_between_batches_does_not_send_old_credentials() {
     );
     assert!(requests[0].contains("test-access-token-a"));
     fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn queued_fact_keeps_captured_owner_and_refuses_a_foreign_manager() {
+    let manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("synthetic"));
+    let other = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("synthetic"));
+    let (sender, mut receiver) = mpsc::channel(4);
+    let (changes, observed) = tokio::sync::watch::channel(codex_login::AuthChangeState {
+        owner_generation: 7,
+        ..Default::default()
+    });
+    let queue = AnalyticsEventsQueue {
+        sender,
+        product_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        app_used_emitted_keys: Arc::new(Mutex::new(HashSet::new())),
+        plugin_used_emitted_keys: Arc::new(Mutex::new(HashSet::new())),
+        auth_changes: observed,
+        owner_manager: Arc::downgrade(&manager),
+    };
+    // Unit stamp witness; this is not an account mutation or network-send test.
+    let fact = || {
+        AnalyticsFact::Custom(CustomAnalyticsFact::GuardianReview(Box::new(
+            crate::GuardianReviewTrackContext::new(
+                "thread".into(),
+                "turn".into(),
+                "review".into(),
+                None,
+                crate::GuardianApprovalRequestSource::MainTurn,
+                crate::GuardianReviewedAction::RequestPermissions {},
+                1000,
+            )
+            .event_params(Default::default(), 1000, std::time::Duration::ZERO),
+        )))
+    };
+    let origin = crate::AnalyticsOwner::new(&manager, 7);
+    queue.try_send_for_owner(fact(), &origin);
+    changes.send_modify(|state| state.owner_generation = 8);
+    assert!(matches!(
+        receiver.try_recv(),
+        Ok(AnalyticsEventsQueueMessage::Fact(_, 7))
+    ));
+    queue.try_send(fact());
+    assert!(matches!(
+        receiver.try_recv(),
+        Ok(AnalyticsEventsQueueMessage::Fact(_, 8))
+    ));
+    queue.try_send_for_owner(fact(), &crate::AnalyticsOwner::new(&other, 8));
+    assert!(receiver.try_recv().is_err());
 }

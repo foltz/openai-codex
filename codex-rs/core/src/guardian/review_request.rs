@@ -177,6 +177,10 @@ impl ReviewHost for super::super::runtime::ReviewRuntime {
             .unzip();
         let report =
             codex_guardian_reviewer::ReviewReport::new(codex_guardian_reviewer::ReviewMetadata {
+                originating_owner: turn
+                    .extension_data
+                    .get::<crate::session::turn_context::OriginatingAccountRecord>()
+                    .and_then(|record| record.analytics_owner()),
                 thread_id: session.thread_id.to_string(),
                 turn_id: assessment_turn_id,
                 review_id: review_id.to_owned(),

@@ -3269,6 +3269,27 @@ impl AuthManager {
         Some((cached.auth.clone()?, self.http_client_factory()))
     }
 
+    /// Retain the enqueue-time owner without bypassing the guarded factory path.
+    pub async fn auth_with_http_client_factory_for_owner(
+        &self,
+        expected_owner_generation: u64,
+    ) -> Option<(CodexAuth, HttpClientFactory)> {
+        let current = || {
+            self.owner_admission_snapshot()
+                .is_some_and(|(snapshot, _)| {
+                    snapshot.revisions.owner_generation == expected_owner_generation
+                })
+        };
+        if !current() {
+            return None;
+        }
+        let result = self.auth_with_http_client_factory().await?;
+        if !current() {
+            return None;
+        }
+        Some(result)
+    }
+
     fn command_auth_with_factory(
         &self,
         resolved: CodexAuth,

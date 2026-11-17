@@ -1682,10 +1682,8 @@ impl ModelClientSession {
     }
 
     fn observe_origin_gateway(&self, setup: &CurrentClientSetup) {
-        if let (Some(record), codex_model_provider::GatewayAdmission::Bound(binding)) =
-            (&self.origin_record, &setup.gateway_admission)
-        {
-            record.observe_gateway(binding);
+        if let Some(record) = &self.origin_record {
+            record.observe_gateway(&setup.gateway_admission);
         }
     }
 
@@ -1718,10 +1716,8 @@ impl<'a> ResponsesHttpExecutor<'a> {
     }
 
     fn observe_origin_gateway(&self, setup: &CurrentClientSetup) {
-        if let (Some(record), codex_model_provider::GatewayAdmission::Bound(binding)) =
-            (&self.origin_record, &setup.gateway_admission)
-        {
-            record.observe_gateway(binding);
+        if let Some(record) = &self.origin_record {
+            record.observe_gateway(&setup.gateway_admission);
         }
     }
 

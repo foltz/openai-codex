@@ -115,7 +115,10 @@ impl ModelProviderSharedState {
         command: &CredentialExportConfig,
         owner: &Arc<AuthManager>,
     ) -> Arc<GatewayExport> {
-        let owner_key = Arc::downgrade(owner);
+        let owner = owner
+            .owner_pin_source()
+            .unwrap_or_else(|| Arc::clone(owner));
+        let owner_key = Arc::downgrade(&owner);
         let mut entries = self
             .gateway_exports
             .lock()
@@ -131,6 +134,7 @@ impl ModelProviderSharedState {
         let export = Arc::new(GatewayExport::new(
             command.clone(),
             owner.application_network_policy(),
+            &owner,
         ));
         entries.push(GatewayExportEntry {
             owner: owner_key,

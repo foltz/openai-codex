@@ -11,6 +11,7 @@ mod callback_params;
 mod credential_export;
 mod gateway_admission;
 pub use gateway_admission::GatewayAdmission;
+pub use gateway_admission::GatewayExportBinding;
 mod device_code_auth;
 mod oauth;
 mod oauth_session;

@@ -67,7 +67,10 @@ impl GatewayAuthManager {
                 .observed_session_binding()
                 .map(GatewayAdmission::Bound)
                 .unwrap_or(GatewayAdmission::Unbound),
-            GatewayCredentialSource::Export(_) => GatewayAdmission::Unbound,
+            GatewayCredentialSource::Export(export) => export
+                .observed_binding()
+                .map(GatewayAdmission::ExportBound)
+                .unwrap_or(GatewayAdmission::Unbound),
         }
     }
 
@@ -91,9 +94,9 @@ impl GatewayAuthManager {
     pub async fn resolve_access_token_observed(&self) -> Result<(Arc<str>, GatewayAdmission)> {
         match &self.0 {
             GatewayCredentialSource::Export(export) => export
-                .token()
+                .token_observed()
                 .await
-                .map(|token| (token, GatewayAdmission::Unbound)),
+                .map(|(token, binding)| (token, GatewayAdmission::ExportBound(binding))),
             GatewayCredentialSource::OAuth(session) => {
                 let credentials = session
                     .resolve_access_token_observed()
@@ -107,8 +110,13 @@ impl GatewayAuthManager {
             }
         }
     }
-    /// Noninteractive admitted OAuth use; exporter admitted support is pending.
+    /// Noninteractive use of the exact admitted OAuth or exported credential.
     pub async fn resolve_access_token_for(&self, admission: &GatewayAdmission) -> Result<Arc<str>> {
+        if let (GatewayCredentialSource::Export(export), GatewayAdmission::ExportBound(binding)) =
+            (&self.0, admission)
+        {
+            return export.token_for(binding).await;
+        }
         let (GatewayCredentialSource::OAuth(session), GatewayAdmission::Bound(binding)) =
             (&self.0, admission)
         else {

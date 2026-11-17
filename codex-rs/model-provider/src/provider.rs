@@ -579,6 +579,14 @@ impl ModelProvider for ConfiguredModelProvider {
         &self,
     ) -> ModelProviderFuture<'_, codex_protocol::error::Result<ProviderUnauthorizedRecovery>> {
         Box::pin(async {
+            if self
+                .auth_manager
+                .as_ref()
+                .is_some_and(|manager| manager.owner_pin_gateway().is_some())
+            {
+                return Ok(ProviderUnauthorizedRecovery::NotConfigured);
+            }
+
             let Some(gateway) = self.gateway_auth_manager()? else {
                 return Ok(ProviderUnauthorizedRecovery::NotConfigured);
             };

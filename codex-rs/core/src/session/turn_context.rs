@@ -355,7 +355,7 @@ pub(crate) struct OriginatingAccountRecord {
     gateway: codex_login::GatewayAdmission,
     /// When no sign-in was observed at admission (`Unbound`): the sign-in this
     /// turn's own first gateway resolution used. Set once; never replaced.
-    gateway_observed: std::sync::OnceLock<codex_login::OAuthSessionBinding>,
+    gateway_observed: std::sync::OnceLock<codex_login::GatewayAdmission>,
 }
 
 impl OriginatingAccountRecord {
@@ -404,9 +404,15 @@ impl OriginatingAccountRecord {
     /// no sign-in was observed at admission, the first such observation becomes
     /// the turn's origin binding (a one-time Missing -> Bound transition). A
     /// binding recorded at admission, or already observed, is never replaced.
-    pub(crate) fn observe_gateway(&self, binding: &codex_login::OAuthSessionBinding) {
-        if matches!(self.gateway, codex_login::GatewayAdmission::Unbound) {
-            let _ = self.gateway_observed.set(binding.clone());
+    pub(crate) fn observe_gateway(&self, admission: &codex_login::GatewayAdmission) {
+        if matches!(self.gateway, codex_login::GatewayAdmission::Unbound)
+            && matches!(
+                admission,
+                codex_login::GatewayAdmission::Bound(_)
+                    | codex_login::GatewayAdmission::ExportBound(_)
+            )
+        {
+            let _ = self.gateway_observed.set(admission.clone());
         }
     }
 
@@ -414,9 +420,7 @@ impl OriginatingAccountRecord {
     /// the one this turn's own request observed, or still missing.
     pub(crate) fn gateway_admission(&self) -> codex_login::GatewayAdmission {
         match (&self.gateway, self.gateway_observed.get()) {
-            (codex_login::GatewayAdmission::Unbound, Some(observed)) => {
-                codex_login::GatewayAdmission::Bound(observed.clone())
-            }
+            (codex_login::GatewayAdmission::Unbound, Some(observed)) => observed.clone(),
             (admission, _) => admission.clone(),
         }
     }

@@ -603,7 +603,7 @@ impl ThreadRequestProcessor {
     pub(crate) async fn thread_start(
         &self,
         request_id: ConnectionRequestId,
-        params: ThreadStartParams,
+        params: crate::thread_state::RetainingParams<ThreadStartParams>,
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
         client_mcp_extensions: ClientMcpExtensions,
@@ -1276,12 +1276,13 @@ impl ThreadRequestProcessor {
     async fn thread_start_inner(
         &self,
         request_id: ConnectionRequestId,
-        params: ThreadStartParams,
+        request: crate::thread_state::RetainingParams<ThreadStartParams>,
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
         client_mcp_extensions: ClientMcpExtensions,
         request_context: RequestContext,
     ) -> Result<(), JSONRPCErrorError> {
+        let crate::thread_state::RetainingParams { params, retention } = request;
         let ThreadStartParams {
             model,
             model_provider,
@@ -1307,11 +1308,20 @@ impl ThreadRequestProcessor {
             history_mode,
             session_start_source,
             clear_predecessor_thread_id,
+            clear_recovery,
+            retain_for_connection: _,
             thread_source,
             project_id,
             daybreak_enabled,
             environments,
         } = params;
+        if let Some(context) = &clear_recovery {
+            super::thread_clear_recovery::validate_recovery(
+                context,
+                session_start_source,
+                &clear_predecessor_thread_id,
+            )?;
+        }
         if matches!(
             history_mode,
             Some(codex_app_server_protocol::ThreadHistoryMode::Paginated)
@@ -1408,12 +1418,19 @@ impl ThreadRequestProcessor {
         let custody_ticket = self.background_tasks.ticket();
         let custody_error_outgoing = Arc::clone(&outgoing);
         let custody_error_request = error_request_id.clone();
+        let recovery_state = self.state_db.clone();
+        let retention_state_manager = self.thread_state_manager.clone();
         let thread_start_task = async move {
-            if let Err(error) = Self::thread_start_task(
+            let mut minted = None;
+            let result = Self::thread_start_task(
                 listener_task_context,
                 thread_store,
                 config_manager,
-                request_id,
+                ThreadStartCustody {
+                    request_id,
+                    retention,
+                    minted: &mut minted,
+                },
                 app_server_client_name,
                 app_server_client_version,
                 client_mcp_extensions,
@@ -1424,6 +1441,8 @@ impl ThreadRequestProcessor {
                 history_mode.map(Into::into),
                 session_start_source,
                 clear_predecessor_thread_id,
+                clear_recovery,
+                recovery_state,
                 thread_source.map(Into::into),
                 project_id,
                 daybreak_enabled,
@@ -1435,8 +1454,13 @@ impl ThreadRequestProcessor {
                 initial_config_warnings,
                 control_endpoint,
             )
-            .await
-            {
+            .await;
+            if let Err(error) = result {
+                if let Some((thread_id, principal, grant_id)) = minted {
+                    let _ = retention_state_manager
+                        .release_retention(thread_id, principal, &grant_id)
+                        .await;
+                }
                 outgoing.send_error(error_request_id, error).await;
             }
         };
@@ -1560,7 +1584,7 @@ impl ThreadRequestProcessor {
         listener_task_context: ListenerTaskContext,
         thread_store: Arc<dyn ThreadStore>,
         config_manager: ConfigManager,
-        request_id: ConnectionRequestId,
+        custody: ThreadStartCustody<'_>,
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
         client_mcp_extensions: ClientMcpExtensions,
@@ -1571,6 +1595,8 @@ impl ThreadRequestProcessor {
         history_mode: Option<ThreadHistoryMode>,
         session_start_source: Option<codex_app_server_protocol::ThreadStartSource>,
         clear_predecessor_thread_id: Option<String>,
+        clear_recovery: Option<codex_app_server_protocol::ThreadClearRecoveryContext>,
+        recovery_state: Option<StateDbHandle>,
         thread_source: Option<codex_protocol::protocol::ThreadSource>,
         project_id: Option<String>,
         daybreak_enabled: Option<bool>,
@@ -1582,6 +1608,11 @@ impl ThreadRequestProcessor {
         initial_config_warnings: Arc<Vec<ConfigWarningNotification>>,
         control_endpoint: Option<String>,
     ) -> Result<(), JSONRPCErrorError> {
+        let ThreadStartCustody {
+            request_id,
+            retention,
+            minted,
+        } = custody;
         let thread_start_started_at = std::time::Instant::now();
         let requested_cwd = typesafe_overrides.cwd.clone();
         let mut config = config_manager
@@ -1714,7 +1745,7 @@ impl ThreadRequestProcessor {
             thread_extension_init.insert(selected_capability_roots);
         }
         let mut start_options = StartThreadOptions::new(config, control_endpoint);
-        let reserved_thread_id = if start_options.config.ephemeral {
+        let mut reserved_thread_id = if start_options.config.ephemeral {
             None
         } else {
             stage_pending_thread_metadata(
@@ -1729,15 +1760,74 @@ impl ThreadRequestProcessor {
             )
             .await?
         };
+        // Recovery also reserves IDs for empty metadata and ephemeral threads.
+        // Its separate evidence does not depend on rollout materialization.
+        if clear_recovery.is_some() && reserved_thread_id.is_none() {
+            reserved_thread_id = Some(listener_task_context.thread_manager.reserve_thread_id());
+        }
+        let recovery = if let (Some(context), Some(successor)) =
+            (clear_recovery, reserved_thread_id)
+        {
+            let durability = if let Some(state) = &recovery_state {
+                let predecessor = context
+                    .predecessor_thread_id
+                    .as_deref()
+                    .map(ThreadId::from_string)
+                    .transpose()
+                    .map_err(|err| {
+                        invalid_request(format!("invalid recovery predecessor: {err}"))
+                    })?;
+                if let Err(err) = state.reserve_clear_recovery(successor, predecessor).await {
+                    remove_pending_thread_metadata(thread_store.as_ref(), reserved_thread_id).await;
+                    return Err(internal_error(format!(
+                        "failed to reserve recovery evidence: {err}"
+                    )));
+                }
+                codex_app_server_protocol::ThreadClearRecoveryDurability::Durable
+            } else {
+                // All exact recovery reads on this producer report unavailable,
+                // including during construction: no consumer can observe false none.
+                codex_app_server_protocol::ThreadClearRecoveryDurability::Unavailable
+            };
+            Some(codex_app_server_protocol::ThreadClearRecovery {
+                successor_thread_id: successor.to_string(),
+                context,
+                durability,
+            })
+        } else {
+            None
+        };
         let thread_id = reserved_thread_id
             .unwrap_or_else(|| listener_task_context.thread_manager.reserve_thread_id());
         start_options.reserved_thread_id = Some(thread_id);
         // Startup can prewarm the Responses socket before start_thread returns.
         // Register the creating client first so that handshake can request attestation.
-        listener_task_context
+        // Requested retention is installed in the same critical section, before
+        // the runtime is published and before any listener can arm idle unload.
+        let mut retained = match listener_task_context
             .thread_state_manager
-            .try_add_connection_to_thread(thread_id, request_id.connection_id)
-            .await;
+            .try_add_connection_to_thread_retaining(thread_id, request_id.connection_id, retention)
+            .await
+        {
+            Ok(retained) => retained,
+            Err(error) => {
+                remove_pending_thread_metadata(thread_store.as_ref(), reserved_thread_id).await;
+                if recovery.is_some()
+                    && let (Some(state), Some(successor)) = (&recovery_state, reserved_thread_id)
+                    && let Err(record_error) = state
+                        .finish_clear_recovery(successor, codex_state::ClearRecoveryPhase::Failed)
+                        .await
+                {
+                    warn!("recovery remains pending after subscription failure: {record_error}");
+                }
+                return Err(internal_error(format!(
+                    "failed to subscribe creating client to thread {thread_id}: {error:?}"
+                )));
+            }
+        };
+        if let Some((principal, grant_id)) = retained.minted_grant() {
+            *minted = Some((thread_id, principal, grant_id));
+        }
         let create_thread_started_at = std::time::Instant::now();
         let new_thread = listener_task_context
             .thread_manager
@@ -1778,6 +1868,14 @@ impl ThreadRequestProcessor {
                     .remove_thread_state(thread_id)
                     .await;
                 remove_pending_thread_metadata(thread_store.as_ref(), reserved_thread_id).await;
+                if recovery.is_some()
+                    && let (Some(state), Some(successor)) = (&recovery_state, reserved_thread_id)
+                    && let Err(record_err) = state
+                        .finish_clear_recovery(successor, codex_state::ClearRecoveryPhase::Failed)
+                        .await
+                {
+                    warn!("recovery remains pending after failed creation: {record_err}");
+                }
                 return Err(match err.details() {
                     CodexErrorDetails::InvalidRequest(message) => invalid_request(message.clone()),
                     CodexErrorDetails::UnsupportedOperation(message) => {
@@ -1787,6 +1885,14 @@ impl ThreadRequestProcessor {
                 });
             }
         };
+        if recovery.is_some()
+            && let Some(state) = &recovery_state
+        {
+            state.finish_clear_recovery(thread_id, codex_state::ClearRecoveryPhase::Complete)
+                .await.map_err(|err| internal_error(format!(
+                    "thread {thread_id} created but recovery evidence outcome is unknown: {err}; do not automatically retry"
+                )))?;
+        }
         let session_telemetry = thread.session_telemetry();
         session_telemetry.record_startup_phase(
             "thread_start_create_thread",
@@ -1820,23 +1926,29 @@ impl ThreadRequestProcessor {
         thread.daybreak_enabled = daybreak_enabled;
 
         // Auto-attach a thread listener when starting a thread.
-        log_listener_attach_result(
-            super::thread_lifecycle::ensure_conversation_listener(
-                listener_task_context.clone(),
-                thread_id,
-                request_id.connection_id,
-                experimental_raw_events,
-            )
-            .instrument(tracing::info_span!(
-                "app_server.thread_start.attach_listener",
-                otel.name = "app_server.thread_start.attach_listener",
-                thread_start.experimental_raw_events = experimental_raw_events,
-            ))
-            .await,
+        let attach = super::thread_lifecycle::ensure_conversation_listener(
+            listener_task_context.clone(),
             thread_id,
             request_id.connection_id,
-            "thread",
-        );
+            experimental_raw_events,
+        )
+        .instrument(tracing::info_span!(
+            "app_server.thread_start.attach_listener",
+            otel.name = "app_server.thread_start.attach_listener",
+            thread_start.experimental_raw_events = experimental_raw_events,
+        ))
+        .await;
+        if attach.is_err() {
+            // Never report a grant the failed attach did not keep.
+            if let Some((_, principal, grant_id)) = minted.take() {
+                let _ = listener_task_context
+                    .thread_state_manager
+                    .release_retention(thread_id, principal, &grant_id)
+                    .await;
+            }
+            retained = retention.unavailable();
+        }
+        log_listener_attach_result(attach, thread_id, request_id.connection_id, "thread");
 
         listener_task_context
             .thread_watch_manager
@@ -1866,6 +1978,8 @@ impl ThreadRequestProcessor {
         let thread_originator = config_snapshot.originator.clone();
 
         let response = ThreadStartResponse {
+            clear_recovery: recovery,
+            retention: retained.evidence(),
             thread: thread.clone(),
             disabled_plugin_ids: config_snapshot.disabled_plugin_ids,
             model: config_snapshot.model,
@@ -1891,6 +2005,8 @@ impl ThreadRequestProcessor {
                 otel.name = "app_server.thread_start.send_response",
             ))
             .await;
+        // The response transfers this grant to the client; later work must keep it.
+        *minted = None;
 
         listener_task_context
             .outgoing
@@ -7153,6 +7269,12 @@ fn build_thread_from_loaded_snapshot(
 #[cfg(test)]
 #[path = "thread_processor_tests.rs"]
 mod thread_processor_tests;
+
+struct ThreadStartCustody<'a> {
+    request_id: ConnectionRequestId,
+    retention: crate::thread_state::ConnectionRetention,
+    minted: &'a mut Option<crate::thread_state::MintedRetention>,
+}
 
 pub(crate) const BACKGROUND_TASK_DRAIN_CAP: Duration = Duration::from_secs(10);
 pub(crate) const THREAD_SHUTDOWN_CAP: Duration = Duration::from_secs(10);

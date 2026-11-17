@@ -168,6 +168,19 @@ enum RetentionAcquireAuthority {
     Eligible(RetentionPrincipalId),
 }
 
+fn connection_retention(
+    requested: bool,
+    authority: RetentionAcquireAuthority,
+) -> crate::thread_state::ConnectionRetention {
+    if !requested {
+        return crate::thread_state::ConnectionRetention::NotRequested;
+    }
+    match retention_principal_or_refusal(authority) {
+        Ok(principal) => crate::thread_state::ConnectionRetention::Requested(principal),
+        Err(reason) => crate::thread_state::ConnectionRetention::Refused(reason),
+    }
+}
+
 fn retention_principal_or_refusal(
     authority: RetentionAcquireAuthority,
 ) -> Result<RetentionPrincipalId, ThreadRetentionRefusalReason> {
@@ -1975,7 +1988,13 @@ impl MessageProcessor {
                 self.thread_processor
                     .thread_start(
                         request_id.clone(),
-                        params,
+                        crate::thread_state::RetainingParams {
+                            retention: connection_retention(
+                                params.retain_for_connection,
+                                session.retention_acquire_authority(),
+                            ),
+                            params,
+                        },
                         app_server_client_name.clone(),
                         client_version.clone(),
                         client_mcp_extensions.clone(),
@@ -2807,6 +2826,33 @@ mod retention_authority_tests {
         assert_eq!(
             retention_principal_or_refusal(session.retention_acquire_authority()),
             Err(ThreadRetentionRefusalReason::AuthorityUnavailable)
+        );
+    }
+    #[test]
+    fn retain_for_connection_reuses_acquire_authority_and_is_opt_in() {
+        use super::connection_retention;
+        use crate::thread_state::ConnectionRetention;
+
+        let principal = RetentionPrincipalId::connection_owned();
+        assert_eq!(
+            connection_retention(false, RetentionAcquireAuthority::Eligible(principal)),
+            ConnectionRetention::NotRequested
+        );
+        assert_eq!(
+            connection_retention(false, RetentionAcquireAuthority::Ineligible),
+            ConnectionRetention::NotRequested
+        );
+        assert_eq!(
+            connection_retention(true, RetentionAcquireAuthority::Eligible(principal)),
+            ConnectionRetention::Requested(principal)
+        );
+        assert_eq!(
+            connection_retention(true, RetentionAcquireAuthority::Ineligible),
+            ConnectionRetention::Refused(ThreadRetentionRefusalReason::IneligiblePrincipal)
+        );
+        assert_eq!(
+            connection_retention(true, RetentionAcquireAuthority::Unavailable),
+            ConnectionRetention::Refused(ThreadRetentionRefusalReason::AuthorityUnavailable)
         );
     }
 }

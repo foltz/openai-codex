@@ -903,6 +903,7 @@ impl ModelClient {
                     auth: selected.clone().into_auth_provider(*mode),
                     agent_identity_telemetry: setup.agent_identity_telemetry.clone(),
                     runtime: Some(selected.clone()),
+                    gateway_admission: codex_model_provider::GatewayAdmission::NotConfigured,
                 })
                 .await?
                 .auth;

@@ -13,6 +13,14 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result;
 
+/// Token-free gateway state captured with the actual selected credential.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GatewayAdmission {
+    NotConfigured,
+    Unbound,
+    Bound(codex_login::OAuthSessionBinding),
+}
+
 /// Resolves gateway request credentials and exposes the optional interactive OAuth session.
 #[derive(Debug)]
 pub struct GatewayAuthManager(GatewayCredentialSource);
@@ -74,6 +82,45 @@ impl GatewayAuthManager {
         ))))
     }
 
+    pub async fn resolve_access_token_observed(&self) -> Result<(Arc<str>, GatewayAdmission)> {
+        match &self.0 {
+            GatewayCredentialSource::Export(export) => export
+                .token()
+                .await
+                .map(|token| (token, GatewayAdmission::Unbound)),
+            GatewayCredentialSource::OAuth(session) => {
+                let credentials = session
+                    .resolve_access_token_observed()
+                    .await
+                    .map_err(gateway_auth_error)?;
+                let admission = credentials
+                    .binding()
+                    .cloned()
+                    .map_or(GatewayAdmission::Unbound, GatewayAdmission::Bound);
+                Ok((Arc::from(credentials.access_token), admission))
+            }
+        }
+    }
+    /// Noninteractive admitted OAuth use; exporter admitted support is pending.
+    pub async fn resolve_access_token_for(&self, admission: &GatewayAdmission) -> Result<Arc<str>> {
+        let (GatewayCredentialSource::OAuth(session), GatewayAdmission::Bound(binding)) =
+            (&self.0, admission)
+        else {
+            return Err(CodexErr::InvalidRequest(
+                "gateway sign-in is not bound to the originating work".into(),
+            ));
+        };
+        let mut request = session
+            .begin_admitted_request(binding)
+            .map_err(gateway_auth_error)?;
+        Ok(Arc::from(
+            request
+                .credentials()
+                .await
+                .map_err(gateway_auth_error)?
+                .access_token,
+        ))
+    }
     pub async fn resolve_access_token(&self) -> Result<Arc<str>> {
         match &self.0 {
             GatewayCredentialSource::Export(export) => export.token().await,
@@ -105,3 +152,7 @@ fn gateway_auth_error(error: std::io::Error) -> CodexErr {
         "Gateway OAuth authentication failed; check the gateway configuration and credential store.",
     ))
 }
+
+#[cfg(test)]
+#[path = "gateway_admission_tests.rs"]
+mod admission_tests;

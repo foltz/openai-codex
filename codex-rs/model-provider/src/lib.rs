@@ -57,6 +57,7 @@ pub use codex_model_provider_info::CHATGPT_CODEX_BASE_URL;
 pub use codex_model_provider_info::GCP_PROVIDER_ID;
 pub use codex_model_provider_info::RemoteCompactionSupport;
 pub use codex_protocol::account::ProviderAccount;
+pub use gateway_auth::GatewayAdmission;
 pub use gateway_auth::GatewayAuthManager;
 pub use provider::ModelProvider;
 pub use provider::ModelProviderFuture;

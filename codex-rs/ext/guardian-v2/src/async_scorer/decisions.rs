@@ -319,6 +319,7 @@ impl DecisionsSampler {
                     auth: selected.clone().into_auth_provider(*mode),
                     agent_identity_telemetry: None,
                     runtime: Some(selected),
+                    gateway_admission: codex_model_provider::GatewayAdmission::NotConfigured,
                 }
             }
             None => codex_model_provider::auth_provider_for_request(

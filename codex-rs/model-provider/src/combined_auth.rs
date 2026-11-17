@@ -33,7 +33,8 @@ pub(crate) async fn compose_auth(
     let manager = manager
         .as_ref()
         .map_err(|error| CodexErr::InvalidRequest(error.clone()))?;
-    let token = manager.resolve_access_token().await?;
+    let (token, admission) = manager.resolve_access_token_observed().await?;
+    resolved.gateway_admission = admission;
     let (name, value) = gateway_header(config.delivery(), &token)?;
     resolved.auth = Arc::new(CombinedAuth {
         primary: resolved.auth,

@@ -82,6 +82,7 @@ pub struct ResolvedProviderAuth {
     pub auth: SharedAuthProvider,
     pub agent_identity_telemetry: Option<AgentIdentityTelemetry>,
     pub runtime: Option<RuntimeAuth>,
+    pub gateway_admission: crate::GatewayAdmission,
 }
 
 impl ResolvedProviderAuth {
@@ -91,6 +92,7 @@ impl ResolvedProviderAuth {
             auth,
             agent_identity_telemetry: None,
             runtime: None,
+            gateway_admission: crate::GatewayAdmission::NotConfigured,
         }
     }
 
@@ -100,6 +102,7 @@ impl ResolvedProviderAuth {
             auth: selected.clone().into_auth_provider(mode),
             agent_identity_telemetry: None,
             runtime: Some(selected),
+            gateway_admission: crate::GatewayAdmission::NotConfigured,
         }
     }
 

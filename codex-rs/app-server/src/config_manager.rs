@@ -248,6 +248,58 @@ impl ConfigManager {
         }
     }
 
+    /// Retire the actual same-home cloud generation and validate its replacement
+    /// before publishing it. Requirements belong to the captured policy owner;
+    /// config-server selection must not silently become ChatGPT selection.
+    pub(crate) async fn reset_managed_cloud_config(
+        &self,
+        auth_manager: Arc<AuthManager>,
+        chatgpt_base_url: String,
+        http_client_factory: codex_http_client::HttpClientFactory,
+        requirements: &codex_config::ConfigRequirementsToml,
+    ) -> Result<(), crate::managed_transition::ResetInventoryError> {
+        use crate::managed_transition::ResetInventoryError;
+        self.cloud_config_bundle
+            .read()
+            .map_err(|_| ResetInventoryError::ConfigPublicationUnavailable)?
+            .retire_ema_policy();
+        {
+            let roots = self
+                .mcp_ema_cancellation
+                .lock()
+                .map_err(|_| ResetInventoryError::ConfigPublicationUnavailable)?;
+            roots.startup.cancel();
+            roots.lifetime.cancel();
+        }
+        let loader = codex_cloud_config::managed_cloud_config_bundle_loader(
+            auth_manager,
+            chatgpt_base_url,
+            self.codex_home.clone(),
+            http_client_factory,
+            requirements,
+        )
+        .await
+        .map_err(|_| ResetInventoryError::CloudConfigUnavailable)?;
+        loader
+            .get()
+            .await
+            .map_err(|_| ResetInventoryError::CloudConfigUnavailable)?;
+        // Require both publications before either can become fresh. Failure
+        // leaves the old generation retired and its EMA roots cancelled.
+        let mut current = self
+            .cloud_config_bundle
+            .write()
+            .map_err(|_| ResetInventoryError::ConfigPublicationUnavailable)?;
+        let mut roots = self
+            .mcp_ema_cancellation
+            .lock()
+            .map_err(|_| ResetInventoryError::ConfigPublicationUnavailable)?;
+        current.retire_ema_policy();
+        *current = loader;
+        *roots = EmaCancellationRoots::default();
+        Ok(())
+    }
+
     /// Strict reset participant: load the real process configuration without
     /// startup's defaults fallback or poisoned-publication defaults. The caller
     /// must first retire and replace the account-bound cloud loader; this method

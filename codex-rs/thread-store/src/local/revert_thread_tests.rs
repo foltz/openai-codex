@@ -358,6 +358,7 @@ async fn create_paginated_thread(store: &LocalThreadStore, thread_id: ThreadId) 
             extra_config: None,
             forked_from_id: None,
             parent_thread_id: None,
+            clear_lineage: None,
             source: SessionSource::Exec,
             thread_source: None,
             originator: "test_originator".to_string(),

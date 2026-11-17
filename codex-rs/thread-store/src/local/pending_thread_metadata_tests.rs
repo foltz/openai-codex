@@ -647,6 +647,7 @@ fn create_thread_params(thread_id: ThreadId) -> CreateThreadParams {
         extra_config: None,
         forked_from_id: None,
         parent_thread_id: None,
+        clear_lineage: None,
         source: SessionSource::Exec,
         thread_source: None,
         originator: "test_originator".to_string(),

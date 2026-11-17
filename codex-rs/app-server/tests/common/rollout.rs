@@ -361,6 +361,8 @@ pub fn create_fake_rollout_with_text_elements(
         forked_from_id: None,
         forked_from_ordinal_exclusive: None,
         parent_thread_id: None,
+        clear_predecessor_thread_id: None,
+        clear_transition_id: None,
         timestamp: meta_rfc3339.to_string(),
         cwd: test_path_buf("/"),
         runtime_workspace_roots: None,

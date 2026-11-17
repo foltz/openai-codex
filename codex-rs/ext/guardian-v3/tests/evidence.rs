@@ -57,6 +57,7 @@ async fn captures_originals_without_generated_context_or_later_appends() -> anyh
             extra_config: None,
             forked_from_id: None,
             parent_thread_id: None,
+            clear_lineage: None,
             source: SessionSource::Exec,
             thread_source: None,
             originator: "test-originator".into(),

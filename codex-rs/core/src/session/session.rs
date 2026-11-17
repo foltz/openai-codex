@@ -1276,6 +1276,7 @@ impl Session {
                             extra_config: config.extra_config.clone(),
                             forked_from_id,
                             parent_thread_id,
+                            clear_lineage: None,
                             source: session_source,
                             thread_source: session_configuration.thread_source.clone(),
                             originator: session_configuration.originator.clone(),

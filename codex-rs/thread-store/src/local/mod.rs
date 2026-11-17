@@ -892,6 +892,8 @@ impl ThreadStore for LocalThreadStore {
 mod tests {
     #[path = "acquisition_tests.rs"]
     mod acquisition_tests;
+    #[path = "clear_lineage_tests.rs"]
+    mod clear_lineage_tests;
     #[path = "delegated_preview_tests.rs"]
     mod delegated_preview_tests;
     use std::sync::Arc;
@@ -2396,6 +2398,7 @@ mod tests {
             extra_config: None,
             forked_from_id: None,
             parent_thread_id: None,
+            clear_lineage: None,
             source: SessionSource::Exec,
             thread_source: None,
             originator: "test_originator".to_string(),

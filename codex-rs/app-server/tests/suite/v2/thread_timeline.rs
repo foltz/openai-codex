@@ -66,6 +66,7 @@ async fn timeline_pages_mix_items_and_resolve_the_opening_realtime_session() -> 
             extra_config: None,
             forked_from_id: None,
             parent_thread_id: None,
+            clear_lineage: None,
             source: SessionSource::Cli,
             thread_source: None,
             originator: "test_originator".to_string(),

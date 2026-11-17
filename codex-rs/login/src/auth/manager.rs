@@ -4440,6 +4440,41 @@ impl AuthManager {
         UnauthorizedRecovery::new(Arc::clone(self))
     }
 
+    /// None means ordinary auth, not uncertainty in a selected command source.
+    /// The caller supplies evidence from the actual rejected request.
+    pub async fn recover_rejected_credential(
+        self: &Arc<Self>,
+        failed: Option<AuthCredentialFingerprint>,
+    ) -> Option<Result<CodexAuth, RefreshTokenError>> {
+        let source = self.command_source.as_ref()?;
+        let mut recovery = self.unauthorized_recovery();
+        recovery.record_failed_credential(failed);
+        Some(match recovery.next().await {
+            Err(error) => Err(error),
+            Ok(_) => self.command_auth_after_recovery(source),
+        })
+    }
+
+    fn command_auth_after_recovery(
+        &self,
+        source: &Arc<super::command_source::CommandSource>,
+    ) -> Result<CodexAuth, RefreshTokenError> {
+        self.require_command_mode_allowed()?;
+        let auth = self.auth_cached().ok_or_else(|| {
+            RefreshTokenError::Transient(std::io::Error::other(
+                "recovered command auth unavailable",
+            ))
+        })?;
+        self.validate_external_auth(&auth, source)?;
+        let guard = source
+            .cache_guard(Some(&auth))
+            .map_err(RefreshTokenError::Transient)?;
+        guard
+            .require_current_domain()
+            .map_err(RefreshTokenError::Transient)?;
+        Ok(auth)
+    }
+
     fn require_command_mode_allowed(&self) -> Result<(), RefreshTokenError> {
         if self.command_source.is_none() {
             return Ok(());

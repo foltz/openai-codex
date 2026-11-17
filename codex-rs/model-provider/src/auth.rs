@@ -254,6 +254,28 @@ impl AuthProvider for AuthManagerAuthProvider {
         rejected_headers: HeaderMap,
     ) -> codex_api::AuthRefreshFuture<'_> {
         Box::pin(async move {
+            let failed = rejected_headers
+                .get(http::header::AUTHORIZATION)
+                .and_then(|header| header.to_str().ok())
+                .and_then(codex_login::AuthCredentialFingerprint::from_bearer_header);
+            if let Some(result) = self.auth_manager.recover_rejected_credential(failed).await {
+                let Ok(auth) = result else {
+                    return false;
+                };
+                if !self.is_expected_auth(&auth)
+                    || self.auth_manager.refresh_failure_for_auth(&auth).is_some()
+                {
+                    return false;
+                }
+                let Ok(headers) = auth_provider_from_auth(&auth).to_auth_headers() else {
+                    return false;
+                };
+                return !headers.is_empty()
+                    && headers
+                        .iter()
+                        .any(|(name, value)| rejected_headers.get(name) != Some(value));
+            }
+
             let Some(auth) = self.current_auth() else {
                 return false;
             };

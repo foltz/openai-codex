@@ -152,3 +152,98 @@ async fn rejected_old_frozen_header_coalesces_to_the_current_newer_credential() 
     );
     assert!(source.usable_auth(manager.auth_cached().as_ref()));
 }
+
+#[tokio::test]
+async fn ordinary_live_recovery_is_inapplicable_without_loading_a_poisoned_cache() {
+    let manager = AuthManager::from_optional_auth_for_testing(None);
+    let poison = manager.clone();
+    assert!(
+        std::thread::spawn(move || {
+            let _guard = poison.inner.write().unwrap();
+            panic!("synthetic native cache poison");
+        })
+        .join()
+        .is_err()
+    );
+    assert!(manager.recover_rejected_credential(None).await.is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn live_recovery_of_an_old_header_returns_the_current_validated_credential() {
+    let home = tempfile::tempdir().unwrap();
+    let newer = record(2);
+    let (source, manager) = selected_fixture(home.path(), newer.clone());
+    let failed = AuthCredentialFingerprint::from_bearer_header(&format!(
+        "Bearer {}",
+        record(1).access_token
+    ));
+    let auth = manager
+        .recover_rejected_credential(failed)
+        .await
+        .expect("selected command source")
+        .unwrap();
+    assert_eq!(auth.get_token().unwrap(), newer.access_token);
+    assert!(source.usable_auth(Some(&auth)));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn live_recovery_refuses_the_actually_rejected_current_credential() {
+    let home = tempfile::tempdir().unwrap();
+    let current = record(2);
+    let (source, manager) = selected_fixture(home.path(), current.clone());
+    let failed =
+        AuthCredentialFingerprint::from_bearer_header(&format!("Bearer {}", current.access_token));
+    assert!(
+        manager
+            .recover_rejected_credential(failed)
+            .await
+            .expect("selected, never native fallback")
+            .is_err()
+    );
+    assert!(!source.usable_auth(manager.auth_cached().as_ref()));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn live_recovery_missing_proof_is_a_selected_error_not_native_fallback() {
+    let home = tempfile::tempdir().unwrap();
+    let (source, manager) = selected_fixture(home.path(), record(1));
+    let result = manager
+        .recover_rejected_credential(None)
+        .await
+        .expect("selected command source");
+    assert!(result.is_err());
+    assert!(source.usable_auth(manager.auth_cached().as_ref()));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn live_recovery_unavailable_selected_provider_is_not_native_fallback() {
+    let home = tempfile::tempdir().unwrap();
+    let (_, manager) = selected_fixture(home.path(), record(1));
+    let before = std::fs::read(home.path().join("auth.json")).unwrap();
+    let poison = manager.clone();
+    assert!(
+        std::thread::spawn(move || {
+            let _guard = poison.external_auth.write().unwrap();
+            panic!("synthetic selected provider poison");
+        })
+        .join()
+        .is_err()
+    );
+    assert!(
+        manager
+            .recover_rejected_credential(AuthCredentialFingerprint::from_bearer_header(
+                "Bearer synthetic"
+            ))
+            .await
+            .expect("selected, never native fallback")
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read(home.path().join("auth.json")).unwrap(),
+        before
+    );
+}

@@ -286,3 +286,89 @@ async fn independent_callback_keeps_ordinary_tokio_dispatch_without_host() {
         17
     );
 }
+
+#[tokio::test]
+async fn retained_queued_callback_keeps_account_work_until_body_completion() {
+    use crate::account_work_permits::AccountWorkPermits;
+    use crate::processor_task_retirement::ProcessorTasks;
+    use codex_extension_api::TurnStartAdmission;
+    use tokio::time::Instant;
+    let auth_tasks = ProcessorTasks::default();
+    let auxiliary_tasks = ProcessorTasks::default();
+    let permits = AccountWorkPermits::new();
+    let work = crate::account_turn_admission::AccountTurnAdmission {
+        shutdown: Default::default(),
+        permits: permits.clone(),
+        work: Default::default(),
+        auth_tasks: Some(auth_tasks.ticket()),
+    }
+    .admit_operation_work()
+    .unwrap();
+    let queues = RequestSerializationQueues::default();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let ticket = auxiliary_tasks.ticket();
+    let originator = codex_otel::auth_storage::AuthStorageOriginator::current();
+    let observation = auxiliary_tasks
+        .spawn(async move {
+            queues
+                .enqueue_background_and_wait(
+                    RequestSerializationQueueKey::Global("owned-plugin-callback"),
+                    RequestSerializationAccess::Exclusive,
+                    run_retained_plugin_change(ticket, work, originator, async move {
+                        entered_tx.send(()).unwrap();
+                        release_rx.await.unwrap();
+                    }),
+                )
+                .await
+                .unwrap();
+        })
+        .unwrap();
+    drop(observation);
+    tokio::time::timeout(crate::managed_transition::DRAIN_DEADLINE, entered_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    permits.close();
+    assert!(permits.try_acquire().is_none());
+    assert!(permits.admitted_count() > 0);
+    assert!(!auxiliary_tasks.observe_until(Instant::now()).await.terminal);
+    release_tx.send(()).unwrap();
+    let deadline = Instant::now() + crate::managed_transition::DRAIN_DEADLINE;
+    assert!(auxiliary_tasks.shutdown_until(deadline).await.is_clean());
+    assert!(auth_tasks.shutdown_until(deadline).await.is_clean());
+    assert_eq!(permits.admitted_count(), 0);
+}
+
+#[tokio::test]
+async fn retained_callback_refuses_missing_auth_custody_before_polling_effects() {
+    use codex_extension_api::TurnStartAdmission;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let tasks = crate::processor_task_retirement::ProcessorTasks::default();
+    let work = crate::account_turn_admission::AccountTurnAdmission {
+        shutdown: Default::default(),
+        permits: crate::account_work_permits::AccountWorkPermits::new(),
+        work: Default::default(),
+        auth_tasks: None,
+    }
+    .admit_operation_work()
+    .unwrap();
+    let polled = Arc::new(AtomicBool::new(false));
+    let observed = Arc::clone(&polled);
+    run_retained_plugin_change(
+        tasks.ticket(),
+        work,
+        codex_otel::auth_storage::AuthStorageOriginator::current(),
+        async move {
+            observed.store(true, Ordering::SeqCst);
+        },
+    )
+    .await;
+    assert!(!polled.load(Ordering::SeqCst));
+    assert!(
+        !tasks
+            .observe_until(tokio::time::Instant::now())
+            .await
+            .is_clean()
+    );
+}

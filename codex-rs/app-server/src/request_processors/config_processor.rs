@@ -85,6 +85,27 @@ const SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT: &[&str] = &[
 ];
 
 #[derive(Clone)]
+pub(crate) struct WeakConfigRequestProcessor {
+    outgoing: Arc<OutgoingMessageSender>,
+    config_manager: ConfigManager,
+    thread_manager: std::sync::Weak<ThreadManager>,
+    model_catalog: Arc<ModelCatalog>,
+    analytics_events_client: AnalyticsEventsClient,
+}
+
+impl WeakConfigRequestProcessor {
+    pub(crate) fn upgrade(&self) -> Option<ConfigRequestProcessor> {
+        Some(ConfigRequestProcessor {
+            outgoing: Arc::clone(&self.outgoing),
+            config_manager: self.config_manager.clone(),
+            thread_manager: self.thread_manager.upgrade()?,
+            model_catalog: Arc::clone(&self.model_catalog),
+            analytics_events_client: self.analytics_events_client.clone(),
+        })
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct ConfigRequestProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     config_manager: ConfigManager,
@@ -94,6 +115,16 @@ pub(crate) struct ConfigRequestProcessor {
 }
 
 impl ConfigRequestProcessor {
+    pub(crate) fn downgrade(&self) -> WeakConfigRequestProcessor {
+        WeakConfigRequestProcessor {
+            outgoing: Arc::clone(&self.outgoing),
+            config_manager: self.config_manager.clone(),
+            thread_manager: Arc::downgrade(&self.thread_manager),
+            model_catalog: Arc::clone(&self.model_catalog),
+            analytics_events_client: self.analytics_events_client.clone(),
+        }
+    }
+
     pub(crate) fn new(
         outgoing: Arc<OutgoingMessageSender>,
         config_manager: ConfigManager,

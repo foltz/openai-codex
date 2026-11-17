@@ -5166,7 +5166,11 @@ impl ThreadRequestProcessor {
 
             let thread_state = {
                 let pending = self.pending_thread_unloads.lock().await;
-                if pending.contains_key(&existing_thread_id)
+                if super::thread_lifecycle::require_resume_not_unloading(
+                    &pending,
+                    existing_thread_id,
+                )
+                .is_err()
                     || matches!(existing_thread.agent_status().await, AgentStatus::Shutdown)
                 {
                     return Err(thread_closing_for_resume(existing_thread_id));

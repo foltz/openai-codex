@@ -730,6 +730,7 @@ mod thread_processor_behavior_tests {
             personality: None,
             exclude_turns: false,
             initial_turns_page: None,
+            retain_for_connection: None,
         };
         let config_snapshot = ThreadConfigSnapshot {
             turn_extension_init: Default::default(),
@@ -1250,7 +1251,8 @@ mod thread_processor_behavior_tests {
         assert!(
             manager
                 .try_add_connection_to_thread(thread_id, connection)
-                .await,
+                .await
+                .is_ok(),
             "connection should be live"
         );
         {
@@ -1301,13 +1303,15 @@ mod thread_processor_behavior_tests {
         assert!(
             manager
                 .try_add_connection_to_thread(thread_id, connection_a)
-                .await,
+                .await
+                .is_ok(),
             "connection_a should be live"
         );
         assert!(
             manager
                 .try_add_connection_to_thread(thread_id, connection_b)
-                .await,
+                .await
+                .is_ok(),
             "connection_b should be live"
         );
         {
@@ -1346,7 +1350,8 @@ mod thread_processor_behavior_tests {
         assert!(
             manager
                 .try_add_connection_to_thread(thread_id, connection_a)
-                .await,
+                .await
+                .is_ok(),
             "connection_a should be live"
         );
         let mut has_connections = manager
@@ -1370,6 +1375,7 @@ mod thread_processor_behavior_tests {
             manager
                 .try_add_connection_to_thread(thread_id, connection_b)
                 .await
+                .is_ok()
         );
         tokio::time::timeout(Duration::from_secs(1), has_connections.changed())
             .await
@@ -1394,6 +1400,7 @@ mod thread_processor_behavior_tests {
             manager
                 .try_add_connection_to_thread(thread_id, connection)
                 .await
+                .is_ok()
         };
         let ((), attached) = tokio::time::timeout(Duration::from_secs(1), async {
             tokio::join!(wait_for_subscriber, attach_connection)
@@ -1420,6 +1427,7 @@ mod thread_processor_behavior_tests {
             !manager
                 .try_add_connection_to_thread(thread_id, connection)
                 .await
+                .is_ok()
         );
         assert!(!manager.has_subscribers(thread_id).await);
         Ok(())
@@ -1441,6 +1449,7 @@ mod thread_processor_behavior_tests {
                 unrelated_supported_connection,
                 ConnectionCapabilities {
                     request_attestation: true,
+                    ..ConnectionCapabilities::default()
                 },
             )
             .await;
@@ -1449,6 +1458,7 @@ mod thread_processor_behavior_tests {
                 earlier_supported_connection,
                 ConnectionCapabilities {
                     request_attestation: true,
+                    ..ConnectionCapabilities::default()
                 },
             )
             .await;
@@ -1457,6 +1467,7 @@ mod thread_processor_behavior_tests {
                 later_supported_connection,
                 ConnectionCapabilities {
                     request_attestation: true,
+                    ..ConnectionCapabilities::default()
                 },
             )
             .await;
@@ -1468,21 +1479,25 @@ mod thread_processor_behavior_tests {
             manager
                 .try_add_connection_to_thread(other_thread_id, unrelated_supported_connection)
                 .await
+                .is_ok()
         );
         assert!(
             manager
                 .try_add_connection_to_thread(thread_id, later_supported_connection)
                 .await
+                .is_ok()
         );
         assert!(
             manager
                 .try_add_connection_to_thread(thread_id, earlier_supported_connection)
                 .await
+                .is_ok()
         );
         assert!(
             manager
                 .try_add_connection_to_thread(thread_id, unsupported_connection)
                 .await
+                .is_ok()
         );
 
         assert_eq!(

@@ -241,11 +241,14 @@ async fn production_claim_and_acquire_have_one_winner_in_both_lock_orders() {
         let settings = crate::request_processors::thread_settings_from_config_snapshot(
             &started.thread.config_snapshot().await,
         );
+        let (_drained_tx, drained_rx) = tokio::sync::watch::channel(false);
         let (_commands, generation) = entry.lock().await.set_listener(
             cancel_tx,
+            drained_rx,
             &started.thread,
             codex_file_watcher::WatchRegistration::default(),
             settings,
+            started.thread.config_snapshot().await.history_mode,
         );
         let watch = state
             .subscribe_to_retention(thread_id)

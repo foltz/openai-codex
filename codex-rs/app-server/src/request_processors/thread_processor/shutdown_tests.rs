@@ -84,8 +84,14 @@ async fn fixture_with_extensions(
     );
     let manager = Arc::new(ThreadManager::new(
         &config,
-        Arc::clone(&auth),
-        codex_core::build_models_manager(&config, auth),
+        codex_core::build_startup_models(
+            &config,
+            Arc::clone(&auth),
+            "processor-thread-retirement-test".to_string(),
+            codex_core::test_support::fixed_model_catalog(codex_core::build_models_manager(
+                &config, auth, None,
+            )),
+        ),
         codex_core::CodexAppsToolsCache::default(),
         codex_protocol::protocol::SessionSource::Exec,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
@@ -95,9 +101,8 @@ async fn fixture_with_extensions(
         )),
         /*analytics_events_client*/ None,
         codex_core::passthrough_image_store(),
-        codex_core::thread_store_from_config(&config, /*state_db*/ None),
+        codex_thread_store::ThreadStoreBuilder::from_config(&config, None).build(),
         /*agent_graph_store*/ None,
-        "processor-thread-retirement-test".to_string(),
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,
     ));
@@ -322,11 +327,12 @@ struct IdleUnloadHarness {
     state: ThreadStateManager,
     thread: Arc<codex_core::CodexThread>,
     thread_id: ThreadId,
-    pending: Arc<tokio::sync::Mutex<crate::thread_state::recovery::PendingThreadUnloads>>,
+    pending: crate::thread_state::PendingThreadUnloads,
     outgoing_rx: tokio::sync::mpsc::Receiver<crate::outgoing_message::OutgoingEnvelope>,
     retention: tokio::sync::watch::Receiver<crate::thread_state::RetentionSnapshot>,
     unload: tokio::task::JoinHandle<Option<crate::thread_state::RetentionRetirementRefusal>>,
     _commands: tokio::sync::mpsc::UnboundedReceiver<crate::thread_state::ThreadListenerCommand>,
+    _drained: tokio::sync::watch::Sender<bool>,
 }
 
 /// Production idle unload over a real manager thread whose stop hook is the
@@ -350,19 +356,22 @@ async fn start_idle_unload(
     let settings = crate::request_processors::thread_settings_from_config_snapshot(
         &thread.config_snapshot().await,
     );
+    let (drained_tx, drained_rx) = tokio::sync::watch::channel(false);
     let (commands, generation) = entry.lock().await.set_listener(
         cancel_tx,
+        drained_rx,
         &thread,
         codex_file_watcher::WatchRegistration::default(),
         settings,
+        thread.config_snapshot().await.history_mode,
     );
     let retention = state
         .subscribe_to_retention(thread_id)
         .await
         .expect("lifecycle watch");
     let expected = *retention.borrow();
-    let mut unloads = crate::thread_state::recovery::PendingThreadUnloads::default();
-    unloads.insert(thread_id);
+    let mut unloads = std::collections::HashMap::new();
+    unloads.insert(thread_id, tokio::sync::watch::channel(()).0);
     let pending = Arc::new(tokio::sync::Mutex::new(unloads));
     let (outgoing_tx, outgoing_rx) = tokio::sync::mpsc::channel(64);
     let outgoing = Arc::new(crate::outgoing_message::OutgoingMessageSender::new(
@@ -396,6 +405,7 @@ async fn start_idle_unload(
         retention,
         unload,
         _commands: commands,
+        _drained: drained_tx,
     }
 }
 
@@ -501,7 +511,13 @@ async fn slow_idle_unload_closes_after_late_release_with_timed_out_prior_report(
 
         // Custody while the loop hangs past the deadline.
         assert!(!harness.unload.is_finished());
-        assert!(harness.pending.lock().await.contains(&harness.thread_id));
+        assert!(
+            harness
+                .pending
+                .lock()
+                .await
+                .contains_key(&harness.thread_id)
+        );
         assert!(drain_thread_closed(&mut harness.outgoing_rx).is_empty());
         assert!(
             harness
@@ -522,7 +538,13 @@ async fn slow_idle_unload_closes_after_late_release_with_timed_out_prior_report(
             vec![harness.thread_id.to_string()]
         );
         assert!(harness.manager.list_thread_ids().await.is_empty());
-        assert!(!harness.pending.lock().await.contains(&harness.thread_id));
+        assert!(
+            !harness
+                .pending
+                .lock()
+                .await
+                .contains_key(&harness.thread_id)
+        );
         assert_eq!(ticket.wait().await, report, "original report stays sticky");
 
         let shutdown = ThreadShutdownOwner::default()
@@ -586,7 +608,13 @@ async fn idle_unload_without_observed_release_never_closes() {
     assert_eq!(report.ordinary, ThreadShutdownOutcome::TimedOut);
     assert!(!report.is_complete());
     assert!(drain_thread_closed(&mut harness.outgoing_rx).is_empty());
-    assert!(!harness.pending.lock().await.contains(&harness.thread_id));
+    assert!(
+        !harness
+            .pending
+            .lock()
+            .await
+            .contains_key(&harness.thread_id)
+    );
     assert!(
         harness
             .manager
@@ -687,17 +715,23 @@ async fn late_release_archives_custody_and_admits_same_id_successor() {
     );
     assert!(harness.manager.list_thread_ids().await.contains(&thread_id));
 
-    // (b) A concurrent resume (its own owner scope) is refused while the
-    // passive late-release wait holds the unowned idle claim.
-    crate::thread_state::recovery::resume_scope(async {
-        let mut pending = harness.pending.lock().await;
-        assert!(pending.blocks(&thread_id));
+    // (b) Exercise the exact guard used by production warm resume and its
+    // queued response while the original unload still owns the pending watch.
+    // This unit is not an RPC driver.
+    {
+        let pending = harness.pending.lock().await;
+        assert!(pending.contains_key(&thread_id));
+        let before = pending.len();
+        let refusal =
+            super::super::thread_lifecycle::require_resume_not_unloading(&pending, thread_id)
+                .expect_err("resume must not supersede an unfinished unload");
         assert_eq!(
-            pending.reserve(thread_id),
-            Err("thread is closing; retry after the transition completes")
+            refusal,
+            super::super::thread_lifecycle::thread_closing_for_resume(thread_id)
         );
-    })
-    .await;
+        assert_eq!(pending.len(), before);
+        assert!(pending.contains_key(&thread_id));
+    }
     assert!(!harness.unload.is_finished());
 
     release_tx.send(()).expect("release blocked cleanup");
@@ -710,7 +744,7 @@ async fn late_release_archives_custody_and_admits_same_id_successor() {
         vec![thread_id.to_string()]
     );
     assert!(harness.manager.list_thread_ids().await.is_empty());
-    assert!(!harness.pending.lock().await.contains(&thread_id));
+    assert!(!harness.pending.lock().await.contains_key(&thread_id));
     assert!(harness.thread.late_release_is_quiescent());
     // Moved, not erased: the exact row keeps its retiring snapshot and ticket.
     assert!(harness.retention.borrow().retiring);
@@ -993,6 +1027,7 @@ async fn idle_unload_finishes_after_slow_writer_shutdown_body(
     // The shared fixture is ephemeral; the real durable writer needs persistence.
     let mut durable = config.clone();
     durable.ephemeral = false;
+    durable.thread_unload_delay = Duration::ZERO;
     let started = manager
         .start_thread(StartThreadOptions::new(durable, None))
         .await
@@ -1062,9 +1097,7 @@ async fn idle_unload_finishes_after_slow_writer_shutdown_body(
     thread_watch_manager
         .upsert_thread_silently(&thread_id.to_string())
         .await;
-    let pending = Arc::new(tokio::sync::Mutex::new(
-        crate::thread_state::recovery::PendingThreadUnloads::default(),
-    ));
+    let pending = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
     let context = crate::request_processors::thread_lifecycle::ListenerTaskContext {
         thread_manager: Arc::clone(&manager),
         thread_state_manager: state.clone(),
@@ -1072,7 +1105,6 @@ async fn idle_unload_finishes_after_slow_writer_shutdown_body(
         pending_thread_unloads: Arc::clone(&pending),
         thread_watch_manager,
         codex_home: home.path().to_path_buf(),
-        thread_unload_delay: Duration::ZERO,
         skills_watcher,
         turn_cost_worker: None,
     };
@@ -1130,7 +1162,7 @@ async fn idle_unload_finishes_after_slow_writer_shutdown_body(
 
     // Upstream loaded list `[thread_id]` while the writer is still blocked.
     assert_eq!(manager.list_thread_ids().await, vec![thread_id]);
-    assert!(pending.lock().await.contains(&thread_id));
+    assert!(pending.lock().await.contains_key(&thread_id));
     assert!(drain_thread_closed(&mut outgoing_rx).is_empty());
 
     // Once persistence can finish, the delayed shutdown must still remove the
@@ -1196,7 +1228,7 @@ struct ClearFenceHarness {
     retention: tokio::sync::watch::Receiver<crate::thread_state::RetentionSnapshot>,
     outgoing: Arc<crate::outgoing_message::OutgoingMessageSender>,
     outgoing_rx: tokio::sync::mpsc::Receiver<crate::outgoing_message::OutgoingEnvelope>,
-    pending: Arc<tokio::sync::Mutex<crate::thread_state::recovery::PendingThreadUnloads>>,
+    pending: crate::thread_state::PendingThreadUnloads,
     thread_watch_manager: crate::thread_status::ThreadWatchManager,
 }
 
@@ -1204,7 +1236,8 @@ impl ClearFenceHarness {
     async fn start(order: &StopOrder) -> Self {
         let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
         builder.thread_lifecycle_contributor(Arc::new(order.clone()));
-        let (home, manager, config) = fixture_with_extensions(Arc::new(builder.build())).await;
+        let (home, manager, mut config) = fixture_with_extensions(Arc::new(builder.build())).await;
+        config.thread_unload_delay = Duration::from_secs(1);
         let started = manager
             .start_thread(StartThreadOptions::new(config, None))
             .await
@@ -1248,9 +1281,7 @@ impl ClearFenceHarness {
         thread_watch_manager
             .upsert_thread_silently(&predecessor.to_string())
             .await;
-        let pending = Arc::new(tokio::sync::Mutex::new(
-            crate::thread_state::recovery::PendingThreadUnloads::default(),
-        ));
+        let pending = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
         let context = crate::request_processors::thread_lifecycle::ListenerTaskContext {
             thread_manager: Arc::clone(&manager),
             thread_state_manager: state.clone(),
@@ -1258,8 +1289,6 @@ impl ClearFenceHarness {
             pending_thread_unloads: Arc::clone(&pending),
             thread_watch_manager: thread_watch_manager.clone(),
             codex_home: home.path().to_path_buf(),
-            // The websocket fixture's `thread_unload_delay_secs=1`.
-            thread_unload_delay: Duration::from_secs(1),
             skills_watcher,
             turn_cost_worker: None,
         };
@@ -1614,7 +1643,7 @@ async fn busy_idle_claim_has_no_cancellation_side_effects() {
     );
     assert_eq!(*harness.retention.borrow(), snapshot_before);
     assert!(!harness.retention.borrow().retiring);
-    assert!(!harness.pending.lock().await.contains(&predecessor));
+    assert!(!harness.pending.lock().await.contains_key(&predecessor));
     assert!(
         harness
             .manager

@@ -174,6 +174,19 @@ pub(super) fn thread_closing_for_resume(thread_id: impl std::fmt::Display) -> JS
     ))
 }
 
+/// The pending watch is owned by the unload that inserted it. Resume may not
+/// replace that owner or release the marker while exact-runtime cleanup runs.
+pub(super) fn require_resume_not_unloading(
+    pending: &std::collections::HashMap<ThreadId, watch::Sender<()>>,
+    thread_id: ThreadId,
+) -> Result<(), JSONRPCErrorError> {
+    if pending.contains_key(&thread_id) {
+        Err(thread_closing_for_resume(thread_id))
+    } else {
+        Ok(())
+    }
+}
+
 /// Marks this exact runtime after listener startup, even after its app-server state is removed.
 struct ListenerStarted;
 
@@ -463,7 +476,7 @@ async fn start_listener(
         let (pending, mut state) = loop {
             let pending = if created || !connection_ids.is_empty() {
                 let pending = listener_task_context.pending_thread_unloads.lock().await;
-                if pending.contains_key(&conversation_id) {
+                if require_resume_not_unloading(&pending, conversation_id).is_err() {
                     return ListenerStartOutcome::Stale;
                 }
                 Some(pending)
@@ -1337,7 +1350,7 @@ pub(super) async fn handle_pending_thread_resume_request(
 
     let retained = {
         let pending_thread_unloads = pending_thread_unloads.lock().await;
-        if pending_thread_unloads.contains_key(&conversation_id)
+        if require_resume_not_unloading(&pending_thread_unloads, conversation_id).is_err()
             || matches!(conversation.agent_status().await, AgentStatus::Shutdown)
         {
             drop(pending_thread_unloads);

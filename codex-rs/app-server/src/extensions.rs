@@ -431,7 +431,8 @@ mod tests {
         assert!(
             thread_state_manager
                 .try_add_connection_to_thread(thread_id, subscribed_connection)
-                .await,
+                .await
+                .is_ok(),
             "connection should be subscribed"
         );
         let sink = app_server_extension_event_sink(outgoing, thread_state_manager);
@@ -495,7 +496,8 @@ mod tests {
         assert!(
             thread_state_manager
                 .try_add_connection_to_thread(thread_id, subscribed_connection)
-                .await,
+                .await
+                .is_ok(),
             "connection should be subscribed"
         );
 
@@ -543,7 +545,8 @@ mod tests {
         assert!(
             thread_state_manager
                 .try_add_connection_to_thread(thread_id, subscribed_connection)
-                .await,
+                .await
+                .is_ok(),
             "connection should be subscribed"
         );
         let (listener_command_tx, listener_command_rx) = mpsc::unbounded_channel();

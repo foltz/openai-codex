@@ -103,6 +103,7 @@ pub(crate) struct GuardianReviewContext {
     review_execution: Option<codex_direct_tool_timing::ReviewExecution>,
     environments: TurnEnvironmentSnapshot,
     project_instructions: Option<Arc<LoadedAgentsMd>>,
+    gateway_admission: codex_login::GatewayAdmission,
     // Model and reasoning inputs are carried for the follow-up Guardian and V2 migrations.
     pub(crate) model_info: Arc<CatalogModel>,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
@@ -112,7 +113,19 @@ pub(crate) struct GuardianReviewContext {
     pub(crate) approvals_reviewer: ApprovalsReviewer,
 }
 
+fn turn_gateway_admission(turn: &TurnContext) -> codex_login::GatewayAdmission {
+    turn.extension_data
+        .get::<crate::session::turn_context::OriginatingAccountRecord>()
+        .map_or(codex_login::GatewayAdmission::NotConfigured, |record| {
+            record.gateway_admission()
+        })
+}
+
 impl GuardianReviewContext {
+    pub(crate) fn gateway_admission(&self) -> codex_login::GatewayAdmission {
+        self.gateway_admission.clone()
+    }
+
     /// Keep the issuing instructions across retries even if a later turn selects other environments.
     async fn capture_project_instructions(&mut self, session: &crate::session::session::Session) {
         if self.project_instructions.is_none() {
@@ -144,6 +157,7 @@ impl GuardianReviewContext {
             serving_assessment: None,
             review_execution: None,
             parent_response: turn.extension_data.get::<ParentResponse>(),
+            gateway_admission: turn_gateway_admission(&turn),
             environments: environments.clone(),
             project_instructions: None,
             model_info: Arc::clone(&settings.model_info),
@@ -171,6 +185,7 @@ impl From<&Arc<StepContext>> for GuardianReviewContext {
             serving_assessment: step.serving_assessment.clone(),
             review_execution: None,
             parent_response: step.turn.extension_data.get::<ParentResponse>(),
+            gateway_admission: turn_gateway_admission(&step.turn),
             turn: Arc::clone(&step.turn),
             environments: step.environments.clone(),
             project_instructions: Some(step.loaded_agents_md.clone().unwrap_or_default()),
@@ -190,6 +205,7 @@ impl From<Arc<TurnContext>> for GuardianReviewContext {
             serving_assessment: None,
             review_execution: None,
             parent_response: turn.extension_data.get::<ParentResponse>(),
+            gateway_admission: turn_gateway_admission(&turn),
             environments: turn.initial_environments.clone(),
             project_instructions: None,
             model_info: Arc::clone(turn.model_info()),

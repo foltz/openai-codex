@@ -426,6 +426,15 @@ impl OriginatingAccountRecord {
         self.renewal.as_ref()
     }
 
+    pub(crate) fn source_login_revisions(&self) -> Option<(u64, u64)> {
+        self.snapshot.as_ref().map(|snapshot| {
+            (
+                snapshot.revisions.source_generation,
+                snapshot.revisions.login_generation,
+            )
+        })
+    }
+
     /// The recorded owner revision, when a snapshot was recorded.
     pub(crate) fn owner_generation(&self) -> Option<u64> {
         self.snapshot

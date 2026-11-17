@@ -10,6 +10,7 @@ use std::sync::atomic::AtomicBool;
 
 use super::*;
 use crate::guardian::input_budget::CheckpointRecovery;
+use crate::session::turn_context::{OriginatingAccountRecord, ReviewerAccountFence};
 use codex_features::Feature;
 use codex_guardian_reviewer::ReviewerPool;
 use codex_guardian_reviewer::ReviewerRequest;
@@ -25,6 +26,7 @@ pub struct PreparedGuardianContext {
     key: GuardianReviewSessionReuseKey,
     parent_compaction: Option<ResponseItem>,
     reviewer_selection: ReviewerSelection,
+    account_fence: Option<Arc<OriginatingAccountRecord>>,
     pub history_reset: CancellationToken,
 }
 
@@ -92,7 +94,7 @@ impl GuardianInvocationSetup {
             .map_err(|_| {
                 anyhow::anyhow!("Guardian invocation cannot admit reviewer construction")
             })?;
-        let (mut options, state) = self.context.thread_options_inner(kind, snapshot).await;
+        let (mut options, state) = self.context.thread_options_inner(kind, snapshot).await?;
         options.account_work = work;
         Ok((options, state))
     }
@@ -106,6 +108,7 @@ impl PreparedGuardianContext {
         history: &ContextManager,
         node_repl_policy: &GuardianNodeReplPolicy,
         access: codex_mcp::McpAttemptAccess<'_>,
+        account_fence: Option<Arc<OriginatingAccountRecord>>,
     ) -> anyhow::Result<Self> {
         let _work = parent.derive_mcp_attempt_work(access)?;
         let (reset_version, history_reset) = parent.history_reset().await;
@@ -133,6 +136,15 @@ impl PreparedGuardianContext {
         .with_node_repl_policy(node_repl_policy);
         key.root_review_version = root_review_version;
         key.parent_reset_version = history.reset_version;
+        key.account_scope = account_fence.as_ref().map(|fence| {
+            Arc::new(ReviewerAccountScope::new(
+                &parent.services.auth_manager,
+                fence.owner_generation(),
+                fence.source_login_revisions(),
+                fence.renewal_binding().cloned(),
+                context.gateway_admission(),
+            ))
+        });
         Ok(Self {
             parent,
             context,
@@ -141,12 +153,24 @@ impl PreparedGuardianContext {
             key,
             parent_compaction,
             reviewer_selection: ReviewerSelection::ReuseIfAvailable,
+            account_fence,
             history_reset,
         })
     }
 }
 
 impl PreparedGuardianContext {
+    fn reviewer_binding_matches(&self, reviewer: &GuardianReviewSession) -> bool {
+        let Some(fence) = &self.account_fence else {
+            return true;
+        };
+        let manager = &reviewer.session.services.auth_manager;
+        manager.owner_pin_source().is_none()
+            || (manager.owner_pin_gateway() == Some(self.context.gateway_admission())
+                && manager.owner_pin_renewal().as_ref() == fence.renewal_binding()
+                && fence.verify_current(manager).is_ok())
+    }
+
     pub fn reuse_key(
         &self,
         previous: Option<&GuardianReviewSession>,
@@ -172,14 +196,25 @@ impl PreparedGuardianContext {
     ) -> anyhow::Result<(crate::StartThreadOptions, GuardianReviewState)> {
         self.parent
             .derive_mcp_attempt_work(codex_mcp::McpAttemptAccess::Unscoped)?;
-        Ok(self.thread_options_inner(kind, snapshot).await)
+        self.thread_options_inner(kind, snapshot).await
     }
 
     async fn thread_options_inner(
         &self,
         kind: GuardianReviewSessionKind,
         snapshot: Option<GuardianReviewForkSnapshot>,
-    ) -> (crate::StartThreadOptions, GuardianReviewState) {
+    ) -> anyhow::Result<(crate::StartThreadOptions, GuardianReviewState)> {
+        let auth_manager = match &self.account_fence {
+            Some(fence) => fence
+                .pinned_manager(
+                    &self.parent.services.auth_manager,
+                    self.context.gateway_admission(),
+                )
+                .map_err(|reason| {
+                    anyhow::anyhow!("account admission refused Guardian construction: {reason}")
+                })?,
+            None => Arc::clone(&self.parent.services.auth_manager),
+        };
         let (state, initial_history) = GuardianReviewState::for_session(
             kind,
             snapshot,
@@ -187,17 +222,20 @@ impl PreparedGuardianContext {
             self.parent_compaction.as_ref(),
         );
         let mut config = self.config.clone();
+        if self.account_fence.is_some() {
+            config.analytics_enabled = Some(false);
+        }
         config.model_provider.supports_websockets &= self
             .parent
             .services
             .model_client
             .responses_websocket_enabled();
-        let options = crate::StartThreadOptions {
+        let mut options = crate::StartThreadOptions {
             prompt_cache_key: self.parent.services.model_client.prompt_cache_key_policy(),
             history_mode: Some(codex_protocol::protocol::ThreadHistoryMode::Paginated),
             internal_parent: Some(crate::thread_manager::InternalSessionParent {
                 thread_id: self.parent.thread_id(),
-                auth_manager: Arc::clone(&self.parent.services.auth_manager),
+                auth_manager,
                 agent_control: crate::agent::control::AgentControlInit::Provided {
                     control: Arc::clone(&self.parent.services.agent_control),
                     runtime: self.parent.services.local_agent_runtime.clone(),
@@ -225,7 +263,12 @@ impl PreparedGuardianContext {
             client_mcp_extensions: self.parent.services.client_mcp_extensions.clone(),
             ..crate::StartThreadOptions::new(config, /*control_endpoint*/ None)
         };
-        (options, state)
+        if let Some(fence) = &self.account_fence {
+            options
+                .thread_extension_init
+                .insert(ReviewerAccountFence(Arc::clone(fence)));
+        }
+        Ok((options, state))
     }
 
     /// Binds context bookkeeping to an agent that Guardian has already started.
@@ -265,16 +308,18 @@ impl PreparedGuardianContext {
             thread_instructions: inherited.thread,
             ..context
         };
-        crate::session::emit_subagent_session_started(
-            &self.parent.services.analytics_events_client,
-            self.parent.app_server_client_metadata().await,
-            session.session_id(),
-            session.thread_id(),
-            Some(self.parent.thread_id()),
-            session.thread_config_snapshot().await,
-            SubAgentSource::Other(GUARDIAN_REVIEWER_NAME.to_owned()),
-            /*resumed_created_at*/ None,
-        );
+        if self.account_fence.is_none() {
+            crate::session::emit_subagent_session_started(
+                &self.parent.services.analytics_events_client,
+                self.parent.app_server_client_metadata().await,
+                session.session_id(),
+                session.thread_id(),
+                Some(self.parent.thread_id()),
+                session.thread_config_snapshot().await,
+                SubAgentSource::Other(GUARDIAN_REVIEWER_NAME.to_owned()),
+                /*resumed_created_at*/ None,
+            );
+        }
         GuardianReviewSession {
             session,
             io,
@@ -290,6 +335,24 @@ pub(in crate::guardian) struct PreparedReview {
     context: Arc<GuardianInvocationSetup>,
     params: Arc<GuardianReviewSessionParams>,
     recovery_requested: Arc<AtomicBool>,
+}
+
+struct ReviewerFenceScope<'a> {
+    client: &'a crate::client::ModelClient,
+    previous: Option<Arc<OriginatingAccountRecord>>,
+}
+impl<'a> ReviewerFenceScope<'a> {
+    fn install(session: &'a Session, fence: &Arc<OriginatingAccountRecord>) -> Self {
+        let client = &session.services.model_client;
+        let previous = client.account_fence();
+        client.set_account_fence(Some(Arc::clone(fence)));
+        Self { client, previous }
+    }
+}
+impl Drop for ReviewerFenceScope<'_> {
+    fn drop(&mut self) {
+        self.client.set_account_fence(self.previous.take());
+    }
 }
 
 impl ReviewerRequest for PreparedReview {
@@ -316,6 +379,29 @@ impl ReviewerRequest for PreparedReview {
         session: &GuardianReviewSession,
         kind: GuardianReviewSessionKind,
     ) -> ReviewSessionResult {
+        let _fence_scope = if let Some(fence) = &self.context.account_fence {
+            if let Err(reason) = fence.verify_current(&self.context.parent.services.auth_manager) {
+                return ReviewSessionResult {
+                    outcome: GuardianReviewSessionOutcome::PromptBuildFailed(refused_review(
+                        reason,
+                    )),
+                    disposition: SessionDisposition::Discard,
+                    analytics: GuardianReviewAnalyticsResult::without_session(),
+                };
+            }
+            if !self.context.reviewer_binding_matches(session) {
+                return ReviewSessionResult {
+                    outcome: GuardianReviewSessionOutcome::PromptBuildFailed(refused_review(
+                        "reviewer authentication binding changed",
+                    )),
+                    disposition: SessionDisposition::Discard,
+                    analytics: GuardianReviewAnalyticsResult::without_session(),
+                };
+            }
+            Some(ReviewerFenceScope::install(&session.session, fence))
+        } else {
+            None
+        };
         // A prewarmed session can already be fresh on the initial attempt. Consume
         // this before running: even a failed review can leave new input in history.
         let fresh_parent_checkpoint =
@@ -385,6 +471,16 @@ impl ReviewerRequest for PreparedReview {
             result.outcome = outcome;
             return result;
         }
+        // All awaited checkpoint/authorization work is complete. Re-prove origin
+        // before publishing a result; no account switch can relabel the verdict.
+        if let Some(fence) = &self.context.account_fence
+            && let Err(reason) = fence.verify_current(&self.context.parent.services.auth_manager)
+        {
+            result.outcome =
+                GuardianReviewSessionOutcome::PromptBuildFailed(refused_review(reason));
+            result.disposition = SessionDisposition::Discard;
+            return result;
+        }
         if let Some((items, history_version, mut state)) = checkpoint {
             state.commit_snapshot(
                 items,
@@ -445,16 +541,96 @@ pub(crate) async fn run_guardian_review_session(
 pub(in crate::guardian) async fn prepare_review(
     params: GuardianReviewSessionParams,
 ) -> anyhow::Result<PreparedReview> {
-    let work = params
-        .parent_session
-        .turn_operation_work(params.parent_context.turn())?;
-    prepare_review_with_work(params, work).await
+    let (work, fence) = review_account_work(&params)?;
+    prepare_review_with_authority(params, work, fence).await
+}
+
+fn refused_review(reason: &str) -> anyhow::Error {
+    anyhow::anyhow!("account admission refused Guardian review setup: {reason}")
+}
+
+type ReviewAccount = (
+    Option<Box<dyn codex_extension_api::HostOperationWork>>,
+    Option<Arc<OriginatingAccountRecord>>,
+);
+
+/// Account custody for one Guardian review. Review content always comes from
+/// the originating turn A (`parent_context`, upstream #49880); this chooses
+/// only the finite account work that the review itself consumes.
+///
+/// - A still holds custody (in-turn review): derive from A, as before.
+/// - A has ended: fresh limited admission for this review only, gated on A's
+///   admission-time `OriginatingAccountRecord`. Refused when the record is
+///   missing, the server is draining, admission is closed (managed transition)
+///   or exhausted (`RetryAfter` is a refusal; nothing waits), or the atomic
+///   owner snapshot differs. The check runs while the new permit is held; the
+///   returned fence re-proves the owner on every reviewer request, which also
+///   covers native auth changes that bypass the permit barrier.
+pub(super) fn review_account_work(
+    params: &GuardianReviewSessionParams,
+) -> anyhow::Result<ReviewAccount> {
+    let session = &params.parent_session;
+    let Some(host) = session.services.host_admission.as_ref() else {
+        return Ok((None, None));
+    };
+    let origin = params.parent_context.turn();
+    match host.derive_operation_work(&session.services.thread_extension_data, &origin.sub_id) {
+        Ok(work) if work.is_some() || !host.requires_account_work() => return Ok((work, None)),
+        Ok(None) => {}
+        Ok(Some(_)) => unreachable!("guard accepts present work"),
+        Err(codex_extension_api::TurnWorkRefused::Unavailable) => {}
+        Err(codex_extension_api::TurnWorkRefused::RetryAfter(_)) => {
+            return Err(refused_review("originating turn custody exhausted"));
+        }
+    }
+    let Some(record) = origin.extension_data.get::<OriginatingAccountRecord>() else {
+        return Err(refused_review("originating turn has no account record"));
+    };
+    // Point check of the shutdown gate; the probe is released immediately.
+    if host.admit_turn_start().is_none() {
+        return Err(refused_review("server is draining"));
+    }
+    let work = host.admit_operation_work().map_err(|_| {
+        refused_review("account work admission closed (managed transition or exhaustion)")
+    })?;
+    record
+        .verify_current(&session.services.auth_manager)
+        .map_err(refused_review)?;
+    Ok((work, Some(record)))
 }
 
 /// An isolated request has explicit operation custody, not a synthetic live turn.
 pub(in crate::guardian) async fn prepare_review_with_work(
     params: GuardianReviewSessionParams,
     work: Option<Box<dyn codex_extension_api::HostOperationWork>>,
+) -> anyhow::Result<PreparedReview> {
+    let fence = if params
+        .parent_session
+        .services
+        .host_admission
+        .as_ref()
+        .is_some_and(|host| host.requires_account_work())
+    {
+        let record = params
+            .parent_context
+            .turn()
+            .extension_data
+            .get::<OriginatingAccountRecord>()
+            .ok_or_else(|| anyhow::anyhow!("Guardian origin account record unavailable"))?;
+        record
+            .verify_current(&params.parent_session.services.auth_manager)
+            .map_err(|reason| anyhow::anyhow!("Guardian account admission refused: {reason}"))?;
+        Some(record)
+    } else {
+        None
+    };
+    prepare_review_with_authority(params, work, fence).await
+}
+
+async fn prepare_review_with_authority(
+    params: GuardianReviewSessionParams,
+    work: Option<Box<dyn codex_extension_api::HostOperationWork>>,
+    account_fence: Option<Arc<OriginatingAccountRecord>>,
 ) -> anyhow::Result<PreparedReview> {
     anyhow::ensure!(
         work.is_some()
@@ -481,6 +657,7 @@ pub(in crate::guardian) async fn prepare_review_with_work(
         &params.parent_history,
         &params.node_repl_policy,
         codex_mcp::McpAttemptAccess::from_work(preparation_work.as_deref()),
+        account_fence,
     )
     .await?;
     Ok(PreparedReview {
@@ -563,6 +740,7 @@ pub(super) fn prepare_prewarm<'a>(
             &history,
             &config.node_repl_policy,
             access,
+            None,
         )
         .await
     })

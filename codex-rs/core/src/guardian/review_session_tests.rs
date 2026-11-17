@@ -1972,3 +1972,22 @@ async fn explicit_isolated_preparation_uses_request_root_and_leaves_uncounted_pr
     assert_eq!(gate.counts.live.load(Ordering::SeqCst), 0);
     let _key = projection.reuse_key(None);
 }
+
+#[tokio::test]
+async fn reviewer_account_scope_separates_source_and_login_without_credential_revision() {
+    let params = test_review_params().await;
+    let manager = &params.parent_session.services.auth_manager;
+    let scope = |source_login_revisions| {
+        ReviewerAccountScope::new(
+            manager,
+            Some(7),
+            source_login_revisions,
+            manager.renewal_binding(),
+            codex_login::GatewayAdmission::NotConfigured,
+        )
+    };
+    assert_eq!(scope(Some((3, 4))), scope(Some((3, 4))));
+    assert_ne!(scope(Some((3, 4))), scope(Some((5, 4))));
+    assert_ne!(scope(Some((3, 4))), scope(Some((3, 5))));
+    assert_ne!(scope(Some((3, 4))), scope(None));
+}

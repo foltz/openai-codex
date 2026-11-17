@@ -137,6 +137,53 @@ fn had_prior_review_context(prompt_mode: &GuardianPromptMode) -> bool {
     matches!(prompt_mode, GuardianPromptMode::Delta { .. })
 }
 
+/// Account scope of a detached review's owner-pinned reviewer: the exact auth
+/// manager its pin copies from, the pinned owner revision, the renewal
+/// authority admitted with that owner, and the provider gateway sign-in the
+/// pin resolves against. Reviewers built on the shared manager (in-turn
+/// reviews) have none, so the two never share a reviewer. The provider scope
+/// is the key's `model_provider`.
+///
+/// A gateway sign-in (or renewal source) can change without an owner
+/// revision, so both are part of the scope: a reviewer pinned to another
+/// sign-in is never reused for this review.
+#[derive(Clone, Debug)]
+pub(super) struct ReviewerAccountScope {
+    source: Arc<codex_login::AuthManager>,
+    owner_generation: Option<u64>,
+    source_login_revisions: Option<(u64, u64)>,
+    renewal: Option<codex_login::AuthRenewalBinding>,
+    gateway: codex_login::GatewayAdmission,
+}
+
+impl ReviewerAccountScope {
+    pub(super) fn new(
+        source: &Arc<codex_login::AuthManager>,
+        owner_generation: Option<u64>,
+        source_login_revisions: Option<(u64, u64)>,
+        renewal: Option<codex_login::AuthRenewalBinding>,
+        gateway: codex_login::GatewayAdmission,
+    ) -> Self {
+        Self {
+            source: Arc::clone(source),
+            owner_generation,
+            source_login_revisions,
+            renewal,
+            gateway,
+        }
+    }
+}
+
+impl PartialEq for ReviewerAccountScope {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.source, &other.source)
+            && self.owner_generation == other.owner_generation
+            && self.source_login_revisions == other.source_login_revisions
+            && self.renewal == other.renewal
+            && self.gateway == other.gateway
+    }
+}
+
 /// Opaque compatibility key derived by the existing context builder.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GuardianReviewSessionReuseKey {
@@ -168,6 +215,7 @@ pub struct GuardianReviewSessionReuseKey {
     codex_linux_sandbox_exe: Option<PathBuf>,
     features: ManagedFeatures,
     environment_ids: Vec<String>,
+    account_scope: Option<Arc<ReviewerAccountScope>>,
 }
 
 impl GuardianReviewSessionReuseKey {
@@ -211,6 +259,7 @@ impl GuardianReviewSessionReuseKey {
             codex_linux_sandbox_exe: spawn_config.codex_linux_sandbox_exe.clone(),
             features: spawn_config.features.clone(),
             environment_ids: Vec::new(),
+            account_scope: None,
         }
     }
 

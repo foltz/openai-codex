@@ -171,3 +171,41 @@ async fn absent_gateway_is_distinct_from_configured_unbound() {
         "Bearer primary"
     );
 }
+
+#[tokio::test]
+async fn admitted_composition_refuses_unbound_and_replaced_sign_in_without_requests() {
+    let server = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let home = tempfile::tempdir().unwrap();
+    let primary = primary(home.path());
+    let info = info(&server);
+    let session = seed(&info, &primary, Some("origin"));
+    let manager = Arc::new(GatewayAuthManager(GatewayCredentialSource::OAuth(session)));
+    let ordinary = composed(&info, manager.clone()).await;
+    let admission = ordinary.gateway_admission;
+    assert_eq!(manager.observed_admission(), admission);
+    let source = Ok(manager);
+    let resolve = |admission| {
+        crate::combined_auth::compose_auth_for(
+            &info,
+            Some(&source),
+            ResolvedProviderAuth::new(auth_provider_from_auth(&CodexAuth::from_api_key("primary"))),
+            Some(admission),
+        )
+    };
+    assert!(resolve(GatewayAdmission::Unbound).await.is_err());
+    let admitted = resolve(admission.clone()).await.unwrap();
+    let headers = admitted
+        .auth
+        .apply_auth_headers(http::HeaderMap::new())
+        .await
+        .unwrap();
+    assert_eq!(headers.get("x-gateway-auth").unwrap(), "Bearer gateway");
+    seed(&info, &primary, Some("replacement"));
+    assert!(resolve(admission).await.is_err());
+    server.verify().await;
+}

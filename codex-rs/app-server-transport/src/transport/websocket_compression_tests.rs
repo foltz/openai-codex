@@ -27,12 +27,14 @@ async fn tcp_compression_negotiates_and_retains_history() -> Result<(), Box<dyn 
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let (transport_event_tx, mut events) = mpsc::channel(CHANNEL_CAPACITY);
+        let custody = crate::OwnerCustody::new(CancellationToken::new());
         let router = Router::new()
             .fallback(any(websocket_upgrade_handler))
             .with_state(WebSocketListenerState {
                 transport_event_tx,
                 auth_policy: Arc::new(WebsocketAuthPolicy::default()),
                 compression,
+                owner_expiry: custody.expiry(),
             });
         let server = tokio::spawn(async move {
             axum::serve(
@@ -91,6 +93,7 @@ async fn local_socket_compression_negotiates_and_retains_history() -> Result<(),
             temp_dir.path().join("app-server-control").join("rpc.sock"),
         )?;
         let (transport_event_tx, mut events) = mpsc::channel(CHANNEL_CAPACITY);
+        let custody = crate::OwnerCustody::new(CancellationToken::new());
         let shutdown = CancellationToken::new();
         let server = start_control_socket_acceptor(
             socket_path.clone(),
@@ -98,6 +101,7 @@ async fn local_socket_compression_negotiates_and_retains_history() -> Result<(),
             shutdown.clone(),
             DaemonShutdownAccess::Disabled,
             compression,
+            &custody,
         )
         .await?;
         for offer in [None, Some(ZSTD_STREAM_PROTOCOL), Some("future-protocol")] {

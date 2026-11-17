@@ -1,5 +1,8 @@
 use super::CHANNEL_CAPACITY;
 use super::ConnectionOrigin;
+use super::ConnectionProvenance;
+use super::RefusalCustody;
+use super::RefusalRecipient;
 use super::TransportEvent;
 use super::forward_incoming_message;
 use super::next_connection_id;
@@ -90,6 +93,7 @@ struct WebSocketListenerState {
     transport_event_tx: mpsc::Sender<TransportEvent>,
     auth_policy: Arc<WebsocketAuthPolicy>,
     compression: WebSocketCompression,
+    owner_expiry: crate::OwnerExpiry,
 }
 
 async fn health_check_handler() -> StatusCode {
@@ -144,7 +148,8 @@ async fn websocket_upgrade_handler(
                 websocket_reader,
                 state.transport_event_tx,
                 compression,
-                super::ConnectionProvenance::Unproven,
+                ConnectionProvenance::Unproven,
+                state.owner_expiry,
             )
             .await;
         })
@@ -164,6 +169,7 @@ pub async fn start_websocket_acceptor(
     shutdown_token: CancellationToken,
     auth_policy: WebsocketAuthPolicy,
     compression: WebSocketCompression,
+    owner_expiry: crate::OwnerExpiry,
 ) -> IoResult<JoinHandle<()>> {
     if is_unauthenticated_non_loopback_listener(bind_address, &auth_policy) {
         return Err(std::io::Error::new(
@@ -187,6 +193,7 @@ pub async fn start_websocket_acceptor(
             transport_event_tx,
             auth_policy: Arc::new(auth_policy),
             compression,
+            owner_expiry: owner_expiry.clone(),
         });
     let server = axum::serve(
         listener,
@@ -195,9 +202,17 @@ pub async fn start_websocket_acceptor(
     .with_graceful_shutdown(async move {
         shutdown_token.cancelled().await;
     });
+    // (b) axum's graceful drain can outlive the transport cancel; it stops at
+    // the host's owner expiry and hands the server future back, unpolled.
     Ok(tokio::spawn(async move {
-        if let Err(err) = server.await {
-            error!("websocket acceptor failed: {err}");
+        match owner_expiry
+            .run("websocket_acceptor", server.into_future())
+            .await
+        {
+            Ok(Some(Err(err))) => error!("websocket acceptor failed: {err}"),
+            Ok(Some(Ok(()))) => {}
+            Ok(None) => info!("websocket acceptor graceful drain stopped at owner expiry"),
+            Err(refused) => error!("websocket acceptor not driven: {refused}"),
         }
         info!("websocket acceptor shutting down");
     }))
@@ -208,7 +223,8 @@ pub(crate) async fn run_websocket_connection<M, SinkError, StreamError>(
     websocket_reader: impl futures::stream::Stream<Item = Result<M, StreamError>> + Send + 'static,
     transport_event_tx: mpsc::Sender<TransportEvent>,
     compression: WebSocketCompression,
-    provenance: super::ConnectionProvenance,
+    provenance: ConnectionProvenance,
+    owner_expiry: crate::OwnerExpiry,
 ) where
     M: AppServerWebSocketMessage + Send + 'static,
     SinkError: Send + 'static,
@@ -265,6 +281,7 @@ pub(crate) async fn run_websocket_connection<M, SinkError, StreamError>(
         connection_id,
         disconnect_token.clone(),
         decoder,
+        owner_expiry,
     ));
 
     tokio::select! {
@@ -411,14 +428,21 @@ async fn run_websocket_inbound_loop<M, StreamError>(
     connection_id: ConnectionId,
     disconnect_token: CancellationToken,
     mut decoder: Option<ZstdDecoder>,
+    owner_expiry: crate::OwnerExpiry,
 ) where
     M: AppServerWebSocketMessage + Send + 'static,
     StreamError: std::fmt::Display + Send + 'static,
 {
+    let refusal_custody = RefusalCustody {
+        owner: &owner_expiry,
+        recipient: RefusalRecipient::WebSocket,
+    };
     tokio::pin!(websocket_reader);
     loop {
         let incoming_message = tokio::select! {
+            biased;
             _ = disconnect_token.cancelled() => break,
+            () = owner_expiry.owner_released_wait() => break,
             incoming_message = websocket_reader.next() => incoming_message,
         };
         let message = match incoming_message {
@@ -472,6 +496,7 @@ async fn run_websocket_inbound_loop<M, StreamError>(
             &writer_tx_for_reader,
             connection_id,
             &text,
+            refusal_custody,
         )
         .await
         {
@@ -483,3 +508,7 @@ async fn run_websocket_inbound_loop<M, StreamError>(
 #[cfg(test)]
 #[path = "websocket_compression_tests.rs"]
 mod compression_tests;
+
+#[cfg(test)]
+#[path = "websocket_refusal_tests.rs"]
+mod refusal_tests;

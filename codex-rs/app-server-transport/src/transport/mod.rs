@@ -15,6 +15,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use tracing::debug;
 use tracing::error;
 use tracing::warn;
 
@@ -26,12 +27,15 @@ pub const CHANNEL_CAPACITY: usize = 128;
 mod provenance;
 mod remote_control;
 mod stdio;
+mod stdio_threads;
 mod unix_socket;
 #[cfg(test)]
 mod unix_socket_tests;
 mod websocket;
 
 pub use provenance::PeerExecutableIdentity;
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) use provenance::identities_match;
 pub use remote_control::REMOTE_CONTROL_DISABLED_ENV_VAR;
 pub use remote_control::RemoteControlDisabledByRequirements;
 pub use remote_control::RemoteControlEnableError;
@@ -49,6 +53,7 @@ pub use unix_socket::DaemonSocketFileGuard;
 pub use unix_socket::acquire_app_server_startup_lock;
 pub use unix_socket::bind_private_daemon_socket;
 pub use unix_socket::start_control_socket_acceptor;
+pub use unix_socket::start_control_socket_acceptor_with_bound_hook;
 pub use unix_socket::verified_local_daemon_socket;
 pub use websocket::start_websocket_acceptor;
 
@@ -188,6 +193,7 @@ pub enum TransportEvent {
         origin: ConnectionOrigin,
         provenance: ConnectionProvenance,
         auth: Option<crate::ConnectionAuth>,
+        provenance: ConnectionProvenance,
         writer: mpsc::Sender<QueuedOutgoingMessage>,
         disconnect_sender: Option<CancellationToken>,
     },
@@ -224,15 +230,45 @@ fn next_connection_id() -> ConnectionId {
     ConnectionId(CONNECTION_ID_COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
+/// Who receives a not-admitted refusal, for its accounting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RefusalRecipient {
+    /// Stdio output: a dropped refusal is abandoned unless the recipient
+    /// positively closed (EPIPE/POLLHUP).
+    Stdio,
+    /// A websocket peer: a closed writer is a positive disconnect
+    /// (undeliverable); a full queue at the deadline is abandoned.
+    WebSocket,
+}
+
+/// The host owner custody under which a connection's refusals are sent:
+/// bounded by its latched owner deadline, and counted there when they cannot
+/// be queued. Callers without a host owner pass `OwnerExpiry::never()`, a
+/// reporting-only handle that never arms a deadline, so its refusals use a
+/// single `try_send`.
+#[derive(Clone, Copy)]
+pub(crate) struct RefusalCustody<'a> {
+    pub(crate) owner: &'a crate::OwnerExpiry,
+    pub(crate) recipient: RefusalRecipient,
+}
+
 async fn forward_incoming_message(
     transport_event_tx: &mpsc::Sender<TransportEvent>,
     writer: &mpsc::Sender<QueuedOutgoingMessage>,
     connection_id: ConnectionId,
     payload: &str,
+    custody: RefusalCustody<'_>,
 ) -> bool {
     match serde_json::from_str::<JSONRPCMessage>(payload) {
         Ok(message) => {
-            enqueue_incoming_message(transport_event_tx, writer, connection_id, message).await
+            enqueue_incoming_message_with_owner(
+                transport_event_tx,
+                writer,
+                connection_id,
+                message,
+                custody,
+            )
+            .await
         }
         Err(err) => {
             error!("Failed to deserialize JSONRPCMessage: {err}");
@@ -241,11 +277,33 @@ async fn forward_incoming_message(
     }
 }
 
+#[cfg(test)]
 async fn enqueue_incoming_message(
     transport_event_tx: &mpsc::Sender<TransportEvent>,
     writer: &mpsc::Sender<QueuedOutgoingMessage>,
     connection_id: ConnectionId,
     message: JSONRPCMessage,
+) -> bool {
+    let owner = crate::OwnerExpiry::never();
+    enqueue_incoming_message_with_owner(
+        transport_event_tx,
+        writer,
+        connection_id,
+        message,
+        RefusalCustody {
+            owner: &owner,
+            recipient: RefusalRecipient::Stdio,
+        },
+    )
+    .await
+}
+
+async fn enqueue_incoming_message_with_owner(
+    transport_event_tx: &mpsc::Sender<TransportEvent>,
+    writer: &mpsc::Sender<QueuedOutgoingMessage>,
+    connection_id: ConnectionId,
+    message: JSONRPCMessage,
+    custody: RefusalCustody<'_>,
 ) -> bool {
     let event = TransportEvent::IncomingMessage {
         connection_id,
@@ -253,7 +311,10 @@ async fn enqueue_incoming_message(
     };
     match transport_event_tx.try_send(event) {
         Ok(()) => true,
-        Err(mpsc::error::TrySendError::Closed(_)) => false,
+        Err(mpsc::error::TrySendError::Closed(event)) => {
+            refuse_unadmitted(writer, event, custody).await;
+            false
+        }
         Err(mpsc::error::TrySendError::Full(TransportEvent::IncomingMessage {
             connection_id,
             message: JSONRPCMessage::Request(request),
@@ -278,7 +339,96 @@ async fn enqueue_incoming_message(
                 }
             }
         }
-        Err(mpsc::error::TrySendError::Full(event)) => transport_event_tx.send(event).await.is_ok(),
+        Err(mpsc::error::TrySendError::Full(event)) => match transport_event_tx.send(event).await {
+            Ok(()) => true,
+            Err(mpsc::error::SendError(event)) => {
+                refuse_unadmitted(writer, event, custody).await;
+                false
+            }
+        },
+    }
+}
+
+pub(crate) const NOT_ADMITTED_MESSAGE: &str = "Server is shutting down; request was not admitted.";
+
+/// A request frame that was read but can no longer be admitted (the server
+/// stopped receiving) is answered with an explicit refusal, never dropped
+/// silently. The output side may still be open even though input is closed.
+///
+/// The send runs under the host owner (`OwnerExpiry::run`), bounded by the
+/// latched owner deadline with the clock checked before every poll: never a
+/// fresh budget, never polled past the deadline. With no deadline latched it
+/// is a single `try_send`. A refusal that is not queued is counted, never
+/// lost: a full queue or an expired send is abandoned output (stdio: unless
+/// its recipient positively closed); a closed websocket writer is a positive
+/// disconnect (undeliverable). Abandoned output makes the exit incomplete.
+async fn refuse_unadmitted(
+    writer: &mpsc::Sender<QueuedOutgoingMessage>,
+    event: TransportEvent,
+    custody: RefusalCustody<'_>,
+) {
+    let TransportEvent::IncomingMessage {
+        connection_id,
+        message: JSONRPCMessage::Request(request),
+    } = event
+    else {
+        return;
+    };
+    let refusal = OutgoingMessage::Error(OutgoingError {
+        id: request.id,
+        error: JSONRPCErrorError {
+            code: INTERNAL_ERROR_CODE,
+            message: NOT_ADMITTED_MESSAGE.to_string(),
+            data: None,
+        },
+    });
+    let bytes = serialize_outgoing_message(refusal.clone())
+        .map_or(0, |json| u64::try_from(json.len() + 1).unwrap_or(u64::MAX));
+    let queued = QueuedOutgoingMessage::new(refusal);
+    let owner = custody.owner;
+    // `Some(true)` queued, `Some(false)` writer closed, `None` not queued by
+    // the deadline (or, without one, a full queue).
+    let outcome = match owner.deadline() {
+        Some(_) => {
+            owner
+                .run("not_admitted_refusal", {
+                    let writer = writer.clone();
+                    async move { writer.send(queued).await.is_ok() }
+                })
+                .await
+                // No live owner: refused before admission; counted below.
+                .unwrap_or(None)
+        }
+        // No latched deadline to wait under: never a fresh budget.
+        None => match writer.try_send(queued) {
+            Ok(()) => Some(true),
+            Err(mpsc::error::TrySendError::Closed(_)) => Some(false),
+            Err(mpsc::error::TrySendError::Full(_)) => None,
+        },
+    };
+    match (outcome, custody.recipient) {
+        (Some(true), _) => {}
+        (Some(false), RefusalRecipient::WebSocket) => {
+            owner.record_undeliverable_after_disconnect(/*messages*/ 1, bytes);
+            debug!(
+                "not-admitted refusal for connection {:?} undeliverable: websocket closed",
+                connection_id
+            );
+        }
+        (Some(false), RefusalRecipient::Stdio) | (None, RefusalRecipient::Stdio) => {
+            owner.record_dropped_output(/*messages*/ 1, bytes);
+            warn!(
+                "not-admitted refusal for connection {:?} could not be queued; counted as dropped output",
+                connection_id
+            );
+        }
+        (None, RefusalRecipient::WebSocket) => {
+            owner.record_abandoned(/*messages*/ 1, bytes);
+            warn!(
+                "not-admitted refusal for connection {:?} could not be queued by the owner deadline; counted as abandoned",
+                connection_id
+            );
+        }
     }
 }
 
@@ -415,6 +565,133 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[tokio::test]
+    async fn request_read_after_admission_closed_is_refused_explicitly() {
+        let connection_id = ConnectionId(42);
+        let (transport_event_tx, mut transport_event_rx) = mpsc::channel(1);
+        // The processor stopped admitting: its receiver is closed.
+        transport_event_rx.close();
+        let (writer_tx, mut writer_rx) = mpsc::channel(1);
+        let request = JSONRPCMessage::Request(JSONRPCRequest {
+            id: RequestId::Integer(9),
+            method: "config/read".to_string(),
+            params: Some(json!({ "includeLayers": false })),
+            trace: None,
+        });
+
+        assert!(
+            !enqueue_incoming_message(&transport_event_tx, &writer_tx, connection_id, request)
+                .await
+        );
+
+        let refusal = writer_rx
+            .try_recv()
+            .expect("a read but not admitted request is refused, not dropped");
+        assert_eq!(
+            serde_json::to_value(refusal.message).expect("serialize refusal"),
+            json!({
+                "id": 9,
+                "error": {
+                    "code": INTERNAL_ERROR_CODE,
+                    "message": NOT_ADMITTED_MESSAGE,
+                }
+            })
+        );
+    }
+
+    fn not_admitted_request(id: i64) -> JSONRPCMessage {
+        JSONRPCMessage::Request(JSONRPCRequest {
+            id: RequestId::Integer(id),
+            method: "config/read".to_string(),
+            params: Some(json!({ "includeLayers": false })),
+            trace: None,
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn undeliverable_refusal_with_a_full_queue_is_counted_by_the_owner_deadline() {
+        let connection_id = ConnectionId(42);
+        let (transport_event_tx, mut transport_event_rx) = mpsc::channel(1);
+        transport_event_rx.close();
+        // The outbound queue is full and nobody drains it.
+        let (writer_tx, _writer_rx) = mpsc::channel(1);
+        writer_tx
+            .try_send(QueuedOutgoingMessage::new(OutgoingMessage::Error(
+                OutgoingError {
+                    id: RequestId::Integer(1),
+                    error: JSONRPCErrorError {
+                        code: INTERNAL_ERROR_CODE,
+                        message: "earlier reply".to_string(),
+                        data: None,
+                    },
+                },
+            )))
+            .expect("fill the queue");
+        let custody = crate::OwnerCustody::new(CancellationToken::new());
+        let owner = custody.expiry();
+        let start = tokio::time::Instant::now();
+        let deadline = owner
+            .arm(start + std::time::Duration::from_secs(35))
+            .expect("the custody owner is live");
+
+        assert!(
+            !enqueue_incoming_message_with_owner(
+                &transport_event_tx,
+                &writer_tx,
+                connection_id,
+                not_admitted_request(9),
+                RefusalCustody {
+                    owner: &owner,
+                    recipient: RefusalRecipient::Stdio,
+                },
+            )
+            .await
+        );
+
+        // Bounded by the latched owner deadline, no fresh budget.
+        assert_eq!(tokio::time::Instant::now(), deadline);
+        // Counted, never silently dropped: the host exit is incomplete.
+        assert_eq!(owner.abandoned_output().messages, 1);
+        assert!(owner.abandoned_output().bytes > 0);
+        assert_eq!(owner.returned_tasks(), vec!["not_admitted_refusal"]);
+    }
+
+    #[tokio::test]
+    async fn refusal_without_a_latched_deadline_is_counted_when_the_queue_is_full() {
+        let connection_id = ConnectionId(42);
+        let (transport_event_tx, mut transport_event_rx) = mpsc::channel(1);
+        transport_event_rx.close();
+        let (writer_tx, _writer_rx) = mpsc::channel(1);
+        writer_tx
+            .try_send(QueuedOutgoingMessage::new(OutgoingMessage::Error(
+                OutgoingError {
+                    id: RequestId::Integer(1),
+                    error: JSONRPCErrorError {
+                        code: INTERNAL_ERROR_CODE,
+                        message: "earlier reply".to_string(),
+                        data: None,
+                    },
+                },
+            )))
+            .expect("fill the queue");
+        let owner = crate::OwnerExpiry::never();
+
+        assert!(
+            !enqueue_incoming_message_with_owner(
+                &transport_event_tx,
+                &writer_tx,
+                connection_id,
+                not_admitted_request(9),
+                RefusalCustody {
+                    owner: &owner,
+                    recipient: RefusalRecipient::Stdio,
+                },
+            )
+            .await
+        );
+        assert_eq!(owner.abandoned_output().messages, 1);
     }
 
     #[tokio::test]

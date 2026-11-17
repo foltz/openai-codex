@@ -855,6 +855,12 @@ pub async fn run_main_with_transport_options(
     // Remote enrollment must cancel before RPC drain without shutting down telemetry.
     let remote_control_shutdown_token = transport_shutdown_token.child_token();
     let mut transport_accept_handles = Vec::<JoinHandle<()>>::new();
+    // Keep physical custody in this host scope, outside the processor task.
+    // Transport EOF/control/signal intake records the first absolute deadline.
+    let (owner_latch, host_custody) = shutdown_intake::OwnerLatch::new();
+    let owner_latch = Arc::new(owner_latch);
+    shutdown_intake::install_intake_latch(&owner_latch);
+    let owner_expiry = owner_latch.expiry();
 
     let websocket_compression = if config
         .features
@@ -867,6 +873,11 @@ pub async fn run_main_with_transport_options(
     let single_client_mode = matches!(&transport, AppServerTransport::Stdio);
     let graceful_signal_restart_enabled =
         runtime_options.install_shutdown_signal_handler && !single_client_mode;
+    if graceful_signal_restart_enabled {
+        shutdown_intake::spawn_signal_intake(owner_expiry.clone(), async {
+            shutdown_signal().await.is_ok()
+        });
+    }
     let mut app_server_client_name_rx = None;
 
     match &transport {
@@ -877,6 +888,7 @@ pub async fn run_main_with_transport_options(
                 transport_event_tx.clone(),
                 stdio_client_name_tx,
                 runtime_options.install_shutdown_signal_handler,
+                owner_expiry.clone(),
             )
             .await?;
             transport_accept_handles.push(handle);
@@ -895,6 +907,7 @@ pub async fn run_main_with_transport_options(
                     DaemonShutdownAccess::Disabled
                 },
                 websocket_compression,
+                &host_custody,
             )
             .await?;
             transport_accept_handles.push(accept_handle);
@@ -906,6 +919,7 @@ pub async fn run_main_with_transport_options(
                 transport_shutdown_token.clone(),
                 policy_from_settings(&auth)?,
                 websocket_compression,
+                owner_expiry.clone(),
             )
             .await?;
             transport_accept_handles.push(accept_handle);
@@ -1096,6 +1110,7 @@ pub async fn run_main_with_transport_options(
         });
         processor.remote_control_processor.daemon_settings_file = daemon_settings_file;
         let processor = Arc::new(processor);
+        standalone_shutdown::register_processor_intake(&owner_latch, &processor);
         let mut thread_created_rx = processor.thread_created_receiver();
         let mut running_turn_count_rx = processor.subscribe_running_assistant_turn_count();
         let mut active_admissions_rx = processor.turn_admission.subscribe_active();

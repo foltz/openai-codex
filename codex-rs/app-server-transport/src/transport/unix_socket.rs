@@ -44,21 +44,51 @@ pub enum DaemonShutdownAccess {
     Managed,
 }
 
+/// Starts the control-socket acceptor under the caller's explicit custody.
+///
+/// `owner_custody` is borrowed only to take its non-owning
+/// [`crate::OwnerExpiry`] handle; the acceptor and its connections never hold
+/// it strongly. The caller must keep the `OwnerCustody` alive through the
+/// acceptor's join and its shutdown: work stopped at the owner deadline
+/// (for example a not-admitted refusal still waiting on a stalled peer) is
+/// retained in that custody and released exactly once when the caller drops
+/// it. Dropping it earlier makes later bounded work refuse admission
+/// (`NoCustodyOwner`), which is reported, never silently dropped.
 pub async fn start_control_socket_acceptor(
     socket_path: AbsolutePathBuf,
     transport_event_tx: mpsc::Sender<TransportEvent>,
     shutdown_token: CancellationToken,
     daemon_shutdown_access: DaemonShutdownAccess,
     compression: WebSocketCompression,
+    owner_custody: &crate::OwnerCustody,
 ) -> IoResult<JoinHandle<()>> {
-    // Capture this image before publishing the listener; failure grants no proof.
+    start_control_socket_acceptor_with_bound_hook(
+        socket_path,
+        transport_event_tx,
+        shutdown_token,
+        daemon_shutdown_access,
+        compression,
+        owner_custody.expiry(),
+        || Ok(()),
+    )
+    .await
+}
+
+/// Publish only after the protected socket exists and before accepting RPCs.
+/// The caller retains the physical owner through the acceptor's retirement.
+pub async fn start_control_socket_acceptor_with_bound_hook(
+    socket_path: AbsolutePathBuf,
+    transport_event_tx: mpsc::Sender<TransportEvent>,
+    shutdown_token: CancellationToken,
+    daemon_shutdown_access: DaemonShutdownAccess,
+    compression: WebSocketCompression,
+    owner_expiry: crate::OwnerExpiry,
+    on_bound: impl FnOnce() -> IoResult<()>,
+) -> IoResult<JoinHandle<()>> {
     let running_identity = PeerExecutableIdentity::capture_running_process().ok();
     let (listener, socket_guard) = bind_private_daemon_socket(socket_path.as_path()).await?;
-    info!(
-        socket_path = %socket_guard.socket_path.display(),
-        "app-server control socket listening"
-    );
-
+    on_bound()?;
+    info!(socket_path = %socket_guard.socket_path.display(), "app-server control socket listening");
     Ok(tokio::spawn(run_control_socket_acceptor(
         listener,
         transport_event_tx,
@@ -67,6 +97,7 @@ pub async fn start_control_socket_acceptor(
         daemon_shutdown_access,
         compression,
         running_identity,
+        owner_expiry,
     )))
 }
 
@@ -157,11 +188,18 @@ async fn run_control_socket_acceptor(
     daemon_shutdown_access: DaemonShutdownAccess,
     compression: WebSocketCompression,
     running_identity: Option<PeerExecutableIdentity>,
+    owner_expiry: crate::OwnerExpiry,
 ) {
     let _socket_guard = socket_guard;
     loop {
         let stream = tokio::select! {
+            biased;
             _ = shutdown_token.cancelled() => {
+                break;
+            }
+            // The external owner released its custody: admit nothing more.
+            () = owner_expiry.owner_released_wait() => {
+                info!("control socket owner custody released; acceptor stops admitting");
                 break;
             }
             result = listener.accept() => {
@@ -188,6 +226,7 @@ async fn run_control_socket_acceptor(
             PeerExecutableIdentity::from_unix_stream(&stream),
         );
         let transport_event_tx = transport_event_tx.clone();
+        let owner_expiry = owner_expiry.clone();
         tokio::spawn(async move {
             let mut shutdown_request = false;
             let mut negotiated_compression = WebSocketCompression::Plain;
@@ -241,7 +280,7 @@ async fn run_control_socket_acceptor(
                 }
             };
             if shutdown_request {
-                run_daemon_shutdown(websocket_stream, transport_event_tx).await;
+                run_daemon_shutdown(websocket_stream, transport_event_tx, owner_expiry).await;
                 return;
             }
             let (websocket_writer, websocket_reader) = websocket_stream.split();
@@ -251,6 +290,8 @@ async fn run_control_socket_acceptor(
                 transport_event_tx,
                 negotiated_compression,
                 provenance,
+                provenance,
+                owner_expiry,
             )
             .await;
         });
@@ -261,19 +302,33 @@ async fn run_control_socket_acceptor(
 async fn run_daemon_shutdown(
     mut websocket: tokio_tungstenite::WebSocketStream<UnixStream>,
     transport_event_tx: mpsc::Sender<TransportEvent>,
+    owner_expiry: crate::OwnerExpiry,
 ) {
     let pid = std::process::id().to_string();
     if !matches!(websocket.next().await, Some(Ok(Message::Text(request))) if request == pid) {
         return;
     }
+    // An accepted daemon shutdown request is the first shutdown edge: record
+    // it here, at intake, before anything is queued toward the processor.
+    owner_expiry.mark_shutdown_edge();
     if websocket.send(Message::Text(pid.into())).await.is_err() {
         return;
     }
     // Let the manager receive the acknowledgment before the main loop closes connections.
     let _ = tokio::time::timeout(Duration::from_secs(2), websocket.next()).await;
-    let _ = transport_event_tx
-        .send(TransportEvent::DaemonShutdown)
-        .await;
+    // Bounded by the latched owner deadline (the processor may be stuck).
+    let send = async move {
+        transport_event_tx
+            .send(TransportEvent::DaemonShutdown)
+            .await
+            .is_ok()
+    };
+    match owner_expiry.run("daemon_shutdown_request", send).await {
+        Ok(Some(true)) => {}
+        Ok(Some(false)) => warn!("daemon shutdown request not delivered: processor gone"),
+        Ok(None) => warn!("daemon shutdown request still queued at the owner deadline; retained"),
+        Err(refused) => warn!("daemon shutdown request not delivered: {refused}"),
+    }
 }
 
 // Unix callers hold the physical socket's startup lock through bind and publication.

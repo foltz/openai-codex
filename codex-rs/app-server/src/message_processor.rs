@@ -1400,6 +1400,37 @@ impl MessageProcessor {
         }
     }
 
+    /// Standalone host drain: the historical worker stops plus the census the
+    /// in-process host takes, under the caller's already-clamped deadline.
+    pub(crate) async fn drain_standalone_background_tasks_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> ProcessorBackgroundShutdown {
+        if let Some(worker) = &self.turn_cost_worker {
+            worker.shutdown();
+        }
+        self.drain_background_tasks_until(deadline).await
+    }
+
+    /// Census of the plugin worker registry (curated sync and refresh
+    /// workers). The registry latches its first deadline, so this reports the
+    /// background stage's sticky outcome without extending it.
+    pub(crate) async fn plugin_tasks_shutdown_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> codex_core_plugins::PluginTaskDrain {
+        self.thread_manager
+            .plugins_manager()
+            .shutdown_until(deadline)
+            .await
+    }
+
+    /// Thread-clear contract: a held clear reservation is reported
+    /// incomplete at shutdown and never awaited. True when none is held.
+    pub(crate) async fn report_held_clear_reservations(&self) -> bool {
+        self.thread_processor.report_held_clear_reservations().await
+    }
+
     pub(crate) fn begin_login_shutdown(
         &self,
         deadline: tokio::time::Instant,
@@ -1414,6 +1445,16 @@ impl MessageProcessor {
 
     pub(crate) async fn clear_all_thread_listeners(&self) {
         self.thread_processor.clear_all_thread_listeners().await;
+    }
+
+    pub(crate) fn begin_thread_shutdown(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<
+        crate::request_processors::ProcessorThreadRetirement,
+        codex_core::ThreadManagerRetirementError,
+    > {
+        self.thread_processor.begin_thread_shutdown(deadline)
     }
 
     pub(crate) async fn shutdown_threads(&self) {

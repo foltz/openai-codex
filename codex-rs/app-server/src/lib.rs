@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
+use crate::standalone_shutdown::{STANDALONE_STAGE_CAPS, StandaloneShutdownOwner};
 use codex_arg0::Arg0DispatchPaths;
 use codex_code_mode::CodeModeSessionProvider;
 use codex_code_mode::GrpcCodeModeSessionProvider;
@@ -13,6 +14,8 @@ use codex_login::AuthManager;
 #[cfg(debug_assertions)]
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_cli::CliConfigOverrides;
+use futures::FutureExt;
+use futures::future::BoxFuture;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::ErrorKind;
@@ -199,6 +202,160 @@ fn stderr_span_events() -> FmtSpan {
     FmtSpan::NEW | FmtSpan::CLOSE
 }
 
+/// Delivery accounting for a reply the router could not queue. Positively
+/// closed recipients (a websocket `Closed`, or stdio EPIPE) count as
+/// undeliverable after disconnect. Anything else (a stdio writer gone without
+/// a positive close, e.g. after SIGTERM) is abandoned, which is incomplete.
+fn account_reply_drop(
+    expiry: &codex_app_server_transport::OwnerExpiry,
+    refused_without_close: &mut HashSet<ConnectionId>,
+    drop: crate::transport::ReplyDrop,
+) {
+    match drop {
+        crate::transport::ReplyDrop::WriterRefused {
+            connection_id,
+            disconnectable: false,
+        } => {
+            refused_without_close.insert(connection_id);
+            expiry.record_dropped_output(/*messages*/ 1, /*bytes*/ 0);
+        }
+        crate::transport::ReplyDrop::WriterRefused {
+            disconnectable: true,
+            ..
+        } => expiry.record_undeliverable_after_disconnect(/*messages*/ 1, /*bytes*/ 0),
+        crate::transport::ReplyDrop::Unregistered(connection_id) => {
+            if refused_without_close.contains(&connection_id) {
+                expiry.record_dropped_output(/*messages*/ 1, /*bytes*/ 0);
+            } else {
+                expiry.record_undeliverable_after_disconnect(/*messages*/ 1, /*bytes*/ 0);
+            }
+        }
+    }
+}
+
+/// Production stages of the standalone drain (see `standalone_shutdown`).
+/// Retained by the owner after the drain: processor, retirement ticket and
+/// any parked connection cleanup stay owned until the host returns.
+struct ProcessorShutdownStages {
+    processor: Arc<MessageProcessor>,
+    connections: Vec<(ConnectionId, ConnectionState)>,
+    cleanup: Option<ConnectionCleanupTasks>,
+    thread_retirement: Option<crate::request_processors::ProcessorThreadRetirement>,
+    expiry: codex_app_server_transport::OwnerExpiry,
+}
+
+impl standalone_shutdown::StandaloneStages for ProcessorShutdownStages {
+    fn bind_runtimes(&mut self, owner_deadline: tokio::time::Instant) -> BoxFuture<'static, bool> {
+        // Synchronous (no async registry lock): binds every reachable runtime
+        // now. Incomplete if this binding, or the earlier one at intake,
+        // found a runtime whose cleanup had already started in Legacy mode.
+        let binding = self
+            .processor
+            .bind_thread_shutdown_deadlines_now(owner_deadline);
+        let intake = self.processor.intake_thread_binding();
+        for census in std::iter::once(binding).chain(intake) {
+            if !census.is_complete() {
+                warn!(
+                    ?census,
+                    "standalone shutdown: thread cleanup deadline not bound for every runtime"
+                );
+            }
+        }
+        let clean = binding.is_complete() && intake.is_none_or(|census| census.is_complete());
+        futures::future::ready(clean).boxed()
+    }
+
+    fn connections(&mut self, stage_deadline: tokio::time::Instant) -> BoxFuture<'static, bool> {
+        let Some(mut cleanup) = self.cleanup.take() else {
+            return futures::future::ready(false).boxed();
+        };
+        for (connection_id, connection_state) in self.connections.drain(..) {
+            let processor = Arc::clone(&self.processor);
+            let session = Arc::clone(&connection_state.session);
+            cleanup.spawn(async move {
+                processor
+                    .connection_closed_until(connection_id, &session, Some(stage_deadline))
+                    .await;
+            });
+        }
+        // Each close is cooperative: at the latched owner expiry it stops
+        // before its next unit and hands its owner back (no abort). A timed-out
+        // RPC drain leaves accepted work unproven, so the stage is incomplete.
+        // A request accepted before stdin EOF and never answered is output
+        // abandoned for a recipient that is still there.
+        let processor = Arc::clone(&self.processor);
+        let expiry = self.expiry.clone();
+        async move {
+            let drained = cleanup.drain().await;
+            let unanswered = processor.unanswered_after_half_close();
+            expiry.record_abandoned(unanswered, /*bytes*/ 0);
+            drained && processor.connection_rpc_drains_complete() && unanswered == 0
+        }
+        .boxed()
+    }
+
+    fn background(&mut self, stage_deadline: tokio::time::Instant) -> BoxFuture<'static, bool> {
+        let processor = Arc::clone(&self.processor);
+        async move {
+            let report = processor
+                .drain_standalone_background_tasks_until(stage_deadline)
+                .await;
+            if !report.is_clean() {
+                warn!(?report, "standalone background shutdown incomplete");
+            }
+            report.is_clean()
+        }
+        .boxed()
+    }
+
+    fn plugin_tasks(&mut self, stage_deadline: tokio::time::Instant) -> BoxFuture<'static, bool> {
+        let processor = Arc::clone(&self.processor);
+        async move {
+            let drain = processor.plugin_tasks_shutdown_until(stage_deadline).await;
+            if !drain.is_clean() {
+                // E.g. the curated-sync OS thread still in a git step: its
+                // retained join is reported incomplete, never as stopped.
+                warn!(?drain, "standalone plugin worker drain incomplete");
+            }
+            drain.is_clean()
+        }
+        .boxed()
+    }
+
+    fn threads(&mut self, stage_deadline: tokio::time::Instant) -> BoxFuture<'static, bool> {
+        // Permanent: closes construction admission and binds (tightens) each
+        // runtime's deadline before its Shutdown submission.
+        let processor = Arc::clone(&self.processor);
+        match self.processor.begin_thread_shutdown(stage_deadline) {
+            Ok(retirement) => {
+                self.thread_retirement = Some(retirement.clone());
+                async move {
+                    // Thread-clear contract (kept from the legacy path): a held
+                    // clear reservation is reported incomplete, never awaited.
+                    let no_held_clear = processor.report_held_clear_reservations().await;
+                    let report = retirement.wait().await;
+                    if !report.is_complete() {
+                        warn!(
+                            ?report,
+                            "standalone thread shutdown incomplete; custody retained"
+                        );
+                    }
+                    no_held_clear && report.is_complete()
+                }
+                .boxed()
+            }
+            Err(error) => {
+                warn!(?error, "standalone thread shutdown custody unavailable");
+                async move {
+                    let _ = processor.report_held_clear_reservations().await;
+                    false
+                }
+                .boxed()
+            }
+        }
+    }
+}
+
 /// Control-plane messages from the processor/transport side to the outbound router task.
 ///
 /// `run_main_with_transport_options` uses two loops/tasks:
@@ -222,6 +379,8 @@ enum OutboundControlEvent {
     Closed { connection_id: ConnectionId },
     /// Disconnect all connection-oriented clients during graceful restart.
     DisconnectAll,
+    /// Route queued drained replies, release writers, then stop.
+    CloseAllAfterQueued,
 }
 
 #[derive(Default)]
@@ -1035,14 +1194,23 @@ pub async fn run_main_with_transport_options(
         owner_latch.subscribe(),
     );
 
-    let outbound_handle = tokio::spawn(async move {
+    let router_expiry = owner_expiry.clone();
+    let outbound_router = async move {
         let mut outbound_connections = HashMap::<ConnectionId, OutboundConnectionState>::new();
+        // Writers that refused a reply without a positive close (e.g. stdio
+        // after SIGTERM). Later replies to them are abandoned, not undeliverable.
+        let mut refused_without_close = HashSet::<ConnectionId>::new();
+        let mut control_open = true;
         loop {
             tokio::select! {
                     biased;
-                    event = outbound_control_rx.recv() => {
+                    event = outbound_control_rx.recv(), if control_open => {
                         let Some(event) = event else {
-                            break;
+                            // Never drop queued replies because the control
+                            // side closed first: keep routing until the
+                            // outgoing channel itself closes.
+                            control_open = false;
+                            continue;
                         };
                         match event {
                             OutboundControlEvent::Opened {
@@ -1077,17 +1245,49 @@ pub async fn run_main_with_transport_options(
                                 }
                                 outbound_connections.clear();
                             }
+                            OutboundControlEvent::CloseAllAfterQueued => {
+                                // Replies enqueued before the drain finished
+                                // are routed first (FIFO), never dropped.
+                                while let Ok(envelope) = outgoing_rx.try_recv() {
+                                    if let Some(reply_drop) =
+                                        route_outgoing_envelope(&mut outbound_connections, envelope)
+                                            .await
+                                    {
+                                        account_reply_drop(
+                                            &router_expiry,
+                                            &mut refused_without_close,
+                                            reply_drop,
+                                        );
+                                    }
+                                }
+                                outbound_connections.clear();
+                                break;
+                            }
                         }
                     }
                     envelope = outgoing_rx.recv() => {
                     let Some(envelope) = envelope else {
                         break;
                     };
-                    route_outgoing_envelope(&mut outbound_connections, envelope).await;
+                    if let Some(reply_drop) =
+                        route_outgoing_envelope(&mut outbound_connections, envelope).await
+                    {
+                        account_reply_drop(&router_expiry, &mut refused_without_close, reply_drop);
+                    }
                 }
             }
         }
         info!("outbound router task exited (channel closed)");
+    };
+    // (b) Stops before its next route at owner expiry and hands its writers
+    // and queues back to the host owner; never aborted.
+    let outbound_handle = tokio::spawn({
+        let owner_expiry = owner_expiry.clone();
+        async move {
+            if let Err(refused) = owner_expiry.run("outbound_router", outbound_router).await {
+                error!("outbound router not driven: {refused}");
+            }
+        }
     });
 
     let recovery_file = daemon_recovery_file_path(&config.codex_home);
@@ -1097,7 +1297,7 @@ pub async fn run_main_with_transport_options(
             .as_path()
             .join("app-server-daemon/settings.json")
     });
-    let processor_handle = tokio::spawn({
+    let processor_handle = standalone_shutdown::spawn_fenced_processor(owner_expiry.clone(), {
         let auth_manager = Arc::clone(&auth_manager);
         let initialize_notification_sender = outgoing_message_sender.clone();
         let outbound_control_tx = outbound_control_tx;
@@ -1143,7 +1343,9 @@ pub async fn run_main_with_transport_options(
         let mut running_turn_count_rx = processor.subscribe_running_assistant_turn_count();
         let mut active_admissions_rx = processor.turn_admission.subscribe_active();
         let mut connections = HashMap::<ConnectionId, ConnectionState>::new();
-        let mut connection_cleanup_tasks = ConnectionCleanupTasks::new();
+        let mut connection_cleanup_tasks =
+            ConnectionCleanupTasks::with_expiry(owner_expiry.clone());
+        let owner_latch = Arc::clone(&owner_latch);
         let mut thread_listener_tasks = tokio::task::JoinSet::new();
         let mut remote_control_status_rx = remote_control_handle.status_receiver();
         let mut remote_control_status = remote_control_status_rx.borrow().clone();
@@ -1464,58 +1666,78 @@ pub async fn run_main_with_transport_options(
             }
             drop(snapshot);
             drop(thread_listener_tasks);
+            let remaining_connection_count = connections.len();
+            let mut owner = StandaloneShutdownOwner::new(owner_latch.latch(), owner_latch.expiry());
+            processor.retire_command_exec_sandbox_cleanup(Some(owner.deadline().into_std()));
             if !shutdown_state.forced() {
-                futures::future::join_all(connections.iter().map(
-                    |(&connection_id, connection_state)| {
-                        processor.connection_closed(connection_id, &connection_state.session)
-                    },
-                ))
+                let mut stages = ProcessorShutdownStages {
+                    processor: Arc::clone(&processor),
+                    connections: connections.drain().collect(),
+                    cleanup: Some(connection_cleanup_tasks),
+                    thread_retirement: None,
+                    expiry: owner_latch.expiry(),
+                };
+                standalone_shutdown::drain_processor_stages(
+                    &mut owner,
+                    &mut stages,
+                    STANDALONE_STAGE_CAPS,
+                )
                 .await;
-                connection_cleanup_tasks.drain().await;
-                processor.drain_background_tasks().await;
-                processor.shutdown_threads().await;
+                let ProcessorShutdownStages {
+                    processor: stages_processor,
+                    cleanup,
+                    thread_retirement,
+                    ..
+                } = stages;
+                drop(stages_processor);
+                owner.retain((cleanup, thread_retirement));
             } else {
                 connection_cleanup_tasks.abort();
+                owner.record("forced", false);
             }
+            standalone_shutdown::submit_close_all(
+                &mut owner,
+                &outbound_control_tx,
+                OutboundControlEvent::CloseAllAfterQueued,
+            )
+            .await;
             info!(
                 exit_reason,
-                remaining_connection_count = connections.len(),
+                remaining_connection_count,
                 shutdown_forced = shutdown_state.forced(),
                 "processor task exited"
             );
             if managed_daemon && shutdown_state.forced() {
-                AppServerExit::Forced
+                (AppServerExit::Forced, Some(owner))
             } else {
-                AppServerExit::Graceful
+                (AppServerExit::Graceful, Some(owner))
             }
         }
     });
 
     drop(transport_event_tx);
 
-    if matches!(processor_handle.await, Ok(AppServerExit::Forced)) {
-        return Ok(AppServerExit::Forced);
-    }
-    let _ = outbound_handle.await;
-
-    // A processor failure may be the first edge; telemetry must still use the
-    // one host deadline, rather than acquire an independent shutdown budget.
-    owner_latch.latch();
-    transport_shutdown_token.cancel();
-    let telemetry = otel_reloader_handle.await;
-    let telemetry_clean = telemetry
-        .as_ref()
-        .is_ok_and(|actor| actor.shutdown_result == Some(Ok(())));
-    for handle in transport_accept_handles {
-        let _ = handle.await;
-    }
-
-    // Keep the actor (including incomplete exporters) alive until this host returns.
-    Ok(if telemetry_clean {
-        AppServerExit::Graceful
-    } else {
-        AppServerExit::ShutdownIncomplete
-    })
+    let mut shutdown_owner = match standalone_shutdown::join_processor(
+        &owner_latch,
+        Some(host_custody),
+        processor_handle,
+    )
+    .await
+    {
+        standalone_shutdown::ProcessorJoin::Forced => return Ok(AppServerExit::Forced),
+        standalone_shutdown::ProcessorJoin::Owner(owner) => owner,
+    };
+    let exit = standalone_shutdown::finish_host_shutdown(
+        &mut shutdown_owner,
+        outbound_handle,
+        || transport_shutdown_token.cancel(),
+        otel_reloader_handle,
+        |reloader| reloader.shutdown_result == Some(Ok(())),
+        futures::future::join_all(transport_accept_handles),
+    )
+    .await;
+    drop(shutdown_owner);
+    Ok(exit)
 }
 
 struct SqliteRecoveryNotice {

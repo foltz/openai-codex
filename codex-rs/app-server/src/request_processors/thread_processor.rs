@@ -1617,6 +1617,21 @@ impl ThreadRequestProcessor {
             .begin(&self.thread_manager, &self.thread_state_manager, deadline)
     }
 
+    pub(crate) async fn report_held_clear_reservations(&self) -> bool {
+        let held = self
+            .thread_state_manager
+            .held_clear_transition_reservations()
+            .await;
+        for (thread_id, unproven) in &held {
+            warn!(
+                thread_id = %thread_id,
+                unproven,
+                "clear reservation held at shutdown; reported incomplete, not awaited"
+            );
+        }
+        held.is_empty()
+    }
+
     pub(crate) async fn shutdown_threads(&self) {
         let report = self
             .thread_manager

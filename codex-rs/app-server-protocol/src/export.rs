@@ -1040,6 +1040,13 @@ fn build_schema_bundle(schemas: Vec<GeneratedSchema>) -> Result<Value> {
             continue;
         }
 
+        // Standalone roots declare the dialect; embedded definitions inherit
+        // the bundle's dialect. Normalize only this root metadata before the
+        // strict duplicate-definition comparison below.
+        if let Value::Object(ref mut object) = value {
+            object.remove("$schema");
+        }
+
         if let Some(ref ns) = namespace {
             rewrite_refs_to_namespace(&mut value, ns);
         } else {
@@ -2520,6 +2527,39 @@ mod tests {
             true
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn retention_response_bundles_as_root_and_nested_definition() -> Result<()> {
+        let out = tempfile::tempdir()?;
+        let carrier =
+            write_json_schema::<v2::ThreadStartResponse>(out.path(), "v2::ThreadStartResponse")?;
+        let response = write_json_schema::<v2::ThreadRetentionAcquireResponse>(
+            out.path(),
+            "v2::ThreadRetentionAcquireResponse",
+        )?;
+        assert!(response.value.get("$schema").is_some());
+        let bundle = build_schema_bundle(vec![carrier, response])?;
+        let response = &bundle["definitions"]["v2"]["ThreadRetentionAcquireResponse"];
+        assert!(response.get("$schema").is_none());
+        assert!(response.get("oneOf").is_some());
+        assert_eq!(bundle["$schema"], "http://json-schema.org/draft-07/schema#");
+        Ok(())
+    }
+
+    #[test]
+    fn retention_response_bundle_still_refuses_structural_collision() -> Result<()> {
+        let out = tempfile::tempdir()?;
+        let carrier =
+            write_json_schema::<v2::ThreadStartResponse>(out.path(), "v2::ThreadStartResponse")?;
+        let mut response = write_json_schema::<v2::ThreadRetentionAcquireResponse>(
+            out.path(),
+            "v2::ThreadRetentionAcquireResponse",
+        )?;
+        response.value["oneOf"][0]["additionalProperties"] = Value::Bool(true);
+        let error = build_schema_bundle(vec![carrier, response]).unwrap_err();
+        assert!(error.to_string().contains("schema definition collision"));
         Ok(())
     }
 

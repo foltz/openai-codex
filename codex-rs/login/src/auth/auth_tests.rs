@@ -4028,3 +4028,134 @@ async fn native_persistence_required_custody_refusal_preserves_storage_and_permi
     assert_eq!(semaphore.available_permits(), 1);
     Ok(())
 }
+
+async fn native_owner_fixture(home: &Path, endpoint: &str) -> anyhow::Result<Arc<AuthManager>> {
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".into()),
+            chatgpt_account_id: Some(WORKSPACE_ID_ALLOWED.into()),
+        },
+        home,
+    )?;
+    let storage = FileAuthStorage::new(home.to_path_buf());
+    let mut stored = storage.load()?.context("stored auth")?;
+    stored.tokens.as_mut().context("tokens")?.oauth_provenance = Some(AccountOAuthProvenance {
+        issuer: endpoint.to_owned(),
+        client_id: "synthetic-native-owner-client".into(),
+    });
+    storage.save(&stored)?;
+    Ok(Arc::new(
+        AuthManager::new_from_auth_config(build_config(home, None, None).await, false, None).await,
+    ))
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn native_bound_renewal_refuses_changed_owner_before_http() -> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    let home = tempdir()?;
+    let server = MockServer::start().await;
+    let manager = native_owner_fixture(home.path(), &server.uri()).await?;
+    let expected = manager.owner_snapshot().context("owner")?;
+    let binding = manager.renewal_binding().context("binding")?;
+    let before = std::fs::read(home.path().join("auth.json"))?;
+    manager.set_cached_auth(Some(CodexAuth::from_api_key("replacement-owner")));
+    assert!(
+        manager
+            .refresh_native_for_owner(&expected, &binding, RefreshReason::Forced)
+            .await
+            .is_err()
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert_eq!(std::fs::read(home.path().join("auth.json"))?, before);
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn native_bound_renewal_refuses_owner_changed_during_response() -> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    let home = tempdir()?;
+    let server = MockServer::start().await;
+    let manager = native_owner_fixture(home.path(), &server.uri()).await?;
+    let expected = manager.owner_snapshot().context("owner")?;
+    let binding = manager.renewal_binding().context("binding")?;
+    let before = std::fs::read(home.path().join("auth.json"))?;
+    let changing = Arc::clone(&manager);
+    Mock::given(path("/oauth/token"))
+        .respond_with(move |_: &wiremock::Request| {
+            changing.set_cached_auth(Some(CodexAuth::from_api_key("replacement-owner")));
+            ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "test-access-token", "refresh_token": "rotated"
+            }))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    assert!(
+        manager
+            .refresh_native_for_owner(&expected, &binding, RefreshReason::Forced)
+            .await
+            .is_err()
+    );
+    assert_eq!(std::fs::read(home.path().join("auth.json"))?, before);
+    assert!(matches!(manager.auth_cached(), Some(CodexAuth::ApiKey(_))));
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn native_bound_renewal_publishes_fresh_snapshot_and_preserves_source() -> anyhow::Result<()>
+{
+    let _access_token_guard = remove_access_token_env_var();
+    let home = tempdir()?;
+    let server = MockServer::start().await;
+    let manager = native_owner_fixture(home.path(), &server.uri()).await?;
+    let expected = manager.owner_snapshot().context("owner")?;
+    let binding = manager.renewal_binding().context("binding")?;
+    let original = manager.auth_cached().context("initial auth")?;
+    Mock::given(path("/oauth/token"))
+        .and(body_partial_json(json!({
+            "client_id": "synthetic-native-owner-client",
+            "refresh_token": "test-refresh-token"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "test-access-token", "refresh_token": "rotated"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    manager
+        .refresh_native_for_owner(&expected, &binding, RefreshReason::Forced)
+        .await?;
+    assert_eq!(
+        original.get_token_data()?.refresh_token,
+        "test-refresh-token"
+    );
+    let renewed = manager.auth_cached().context("renewed auth")?;
+    assert_eq!(renewed.get_token_data()?.refresh_token, "rotated");
+    assert_eq!(
+        FileAuthStorage::new(home.path().to_path_buf())
+            .load()?
+            .context("durable auth")?
+            .tokens
+            .context("durable tokens")?
+            .refresh_token,
+        "rotated"
+    );
+    let after = manager.owner_snapshot().context("owner after")?;
+    assert_eq!(
+        after.revisions.owner_generation,
+        expected.revisions.owner_generation
+    );
+    assert_eq!(
+        after.revisions.source_generation,
+        expected.revisions.source_generation
+    );
+    assert_eq!(
+        after.revisions.login_generation,
+        expected.revisions.login_generation
+    );
+    Ok(())
+}

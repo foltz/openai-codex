@@ -5130,6 +5130,9 @@ mod command_source_fence_tests;
 #[path = "command_recovery_tests.rs"]
 mod command_recovery_tests;
 
+#[path = "native_owner_renewal.rs"]
+mod native_owner_renewal;
+
 #[path = "renewal_binding.rs"]
 mod renewal_binding;
 pub use renewal_binding::AuthRenewalBinding;

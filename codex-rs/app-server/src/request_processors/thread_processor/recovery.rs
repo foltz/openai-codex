@@ -11,7 +11,7 @@ use tokio::time::Instant;
 
 impl ThreadRequestProcessor {
     /// Claim bounded custody before shutdown can start. The request's owner keeps
-    /// exclusion through retirement observation, including cancellation of this wait.
+    /// exclusion through successor publication, including cancellation of this wait.
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "the pending reservation excludes idle claims while exact authority is checked"
@@ -23,6 +23,9 @@ impl ThreadRequestProcessor {
     ) -> Result<bool, JSONRPCErrorError> {
         use crate::thread_state::RetentionRetirementRefusal;
 
+        if !crate::thread_state::recovery::resume_owner_available() {
+            return Err(invalid_request("resume recovery has no request owner"));
+        }
         let _resume = self.thread_state_manager.lock_goal_resume(id).await;
         let reservation =
             UnloadReservation::acquire(self.pending_thread_unloads.clone(), id).await?;
@@ -157,6 +160,9 @@ impl ThreadRequestProcessor {
         id: ThreadId,
         deadline: Instant,
     ) -> Result<bool, JSONRPCErrorError> {
+        if !crate::thread_state::recovery::resume_owner_available() {
+            return Err(invalid_request("resume recovery has no request owner"));
+        }
         let _resume = self.thread_state_manager.lock_goal_resume(id).await;
         let reservation =
             UnloadReservation::acquire(self.pending_thread_unloads.clone(), id).await?;
@@ -260,7 +266,9 @@ impl ThreadRequestProcessor {
                 thread_id: id.to_string(),
             }))
             .await;
-        reservation.release().await;
+        reservation
+            .handoff()
+            .map_err(|_| invalid_request("resume recovery has no request owner"))?;
         Ok(true)
     }
 }
@@ -279,7 +287,17 @@ impl UnloadReservation {
         id: ThreadId,
     ) -> Result<Self, JSONRPCErrorError> {
         let mut pending = table.lock().await;
-        if pending.contains_key(&id) {
+        if let Some(sender) = pending.get(&id) {
+            if crate::thread_state::recovery::owns_watch(id, sender) {
+                let sender = sender.clone();
+                drop(pending);
+                return Ok(Self {
+                    table,
+                    id,
+                    sender,
+                    released: true,
+                });
+            }
             return Err(invalid_request(format!(
                 "thread {id} is closing; retry after the transition completes"
             )));
@@ -295,8 +313,16 @@ impl UnloadReservation {
         })
     }
     async fn release(mut self) {
-        Self::remove_exact(&self.table, self.id, &self.sender).await;
-        self.released = true;
+        if !self.released {
+            Self::remove_exact(&self.table, self.id, &self.sender).await;
+            self.released = true;
+        }
+    }
+    fn handoff(self) -> Result<(), Self> {
+        if self.released {
+            return Ok(());
+        }
+        crate::thread_state::recovery::retain_watch(self.id, self.sender.clone(), self)
     }
     async fn remove_exact(
         table: &crate::thread_state::PendingThreadUnloads,
@@ -346,6 +372,48 @@ mod tests {
                 .same_channel(&replacement)
         );
     }
+    #[tokio::test]
+    async fn recovered_watch_spans_publication_but_not_foreign_tasks_or_scope_exit() {
+        let table = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let id = ThreadId::new();
+        let (sender, mut completion) = tokio::sync::watch::channel(());
+        crate::thread_state::recovery::resume_scope(async {
+            let reservation = UnloadReservation::acquire(table.clone(), id).await.unwrap();
+            completion = reservation.sender.subscribe();
+            assert!(reservation.handoff().is_ok());
+            assert!(!crate::thread_state::recovery::unload_blocks_resume(
+                &table.lock().await,
+                id
+            ));
+            // A nested observation must not drop the outer publication fence.
+            UnloadReservation::acquire(table.clone(), id)
+                .await
+                .unwrap()
+                .release()
+                .await;
+            assert!(table.lock().await.contains_key(&id));
+            let foreign = table.clone();
+            assert!(
+                tokio::spawn(async move {
+                    crate::thread_state::recovery::unload_blocks_resume(&foreign.lock().await, id)
+                })
+                .await
+                .unwrap()
+            );
+            let replacement = tokio::sync::watch::channel(()).0;
+            assert!(!crate::thread_state::recovery::owns_watch(id, &replacement));
+        })
+        .await;
+        drop(sender);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), completion.changed())
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert!(!table.lock().await.contains_key(&id));
+    }
+
     #[tokio::test]
     async fn cancellation_releases_original_unload_watch() {
         let table = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));

@@ -180,7 +180,7 @@ pub(super) fn require_resume_not_unloading(
     pending: &std::collections::HashMap<ThreadId, watch::Sender<()>>,
     thread_id: ThreadId,
 ) -> Result<(), JSONRPCErrorError> {
-    if pending.contains_key(&thread_id) {
+    if crate::thread_state::recovery::unload_blocks_resume(pending, thread_id) {
         Err(thread_closing_for_resume(thread_id))
     } else {
         Ok(())

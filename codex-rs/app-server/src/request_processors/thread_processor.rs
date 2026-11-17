@@ -658,20 +658,23 @@ impl ThreadRequestProcessor {
         app_server_client_version: Option<String>,
         client_mcp_extensions: ClientMcpExtensions,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        let mut prepared_config = None;
-        // Keep the resume future off the request handler's stack.
-        while Box::pin(self.thread_resume_inner(
-            &target,
-            &request,
-            app_server_client_name.clone(),
-            app_server_client_version.clone(),
-            client_mcp_extensions.clone(),
-            &mut prepared_config,
-        ))
-        .await?
-        .is_continue()
-        {}
-        Ok(None)
+        crate::thread_state::recovery::resume_scope(async {
+            let mut prepared_config = None;
+            // Keep the resume future off the request handler's stack.
+            while Box::pin(self.thread_resume_inner(
+                &target,
+                &request,
+                app_server_client_name.clone(),
+                app_server_client_version.clone(),
+                client_mcp_extensions.clone(),
+                &mut prepared_config,
+            ))
+            .await?
+            .is_continue()
+            {}
+            Ok(None)
+        })
+        .await
     }
 
     pub(crate) async fn thread_fork(
@@ -4295,7 +4298,8 @@ impl ThreadRequestProcessor {
                 .pending_thread_unloads
                 .lock()
                 .await
-                .contains_key(&thread_id)
+                .get(&thread_id)
+                .is_some_and(|sender| !crate::thread_state::recovery::owns_watch(thread_id, sender))
         {
             return Err(thread_closing_for_resume(thread_id));
         }
@@ -4404,6 +4408,16 @@ impl ThreadRequestProcessor {
                 .await?;
             (thread_history, Some(stored_thread))
         };
+        // A path-only request reveals its actual identity after history lookup.
+        // Recover before taking the cold-start lock, then reread any flushed history.
+        if let InitialHistory::Resumed(resumed) = &thread_history
+            && self
+                .recover_retiring_thread(resumed.conversation_id)
+                .await?
+        {
+            *prepared_config = None;
+            return Ok(ControlFlow::Continue(()));
+        }
         // Path-based resume can use an empty request thread ID. Coordinate once its real
         // identity is known; unrelated loaded threads never wait for this cold startup.
         let _goal_resume_guard = if let InitialHistory::Resumed(resumed) = &thread_history {
@@ -4429,7 +4443,10 @@ impl ThreadRequestProcessor {
                 .pending_thread_unloads
                 .lock()
                 .await
-                .contains_key(&resumed.conversation_id)
+                .get(&resumed.conversation_id)
+                .is_some_and(|sender| {
+                    !crate::thread_state::recovery::owns_watch(resumed.conversation_id, sender)
+                })
         {
             return Err(thread_closing_for_resume(resumed.conversation_id));
         }

@@ -12,6 +12,7 @@ tokio::task_local! { static OWNER: ResumeOwner; }
 struct ResumeOwner {
     id: Uuid,
     reservations: Mutex<Vec<Arc<AtomicBool>>>,
+    watches: Mutex<Vec<OwnedWatch>>,
 }
 impl Drop for ResumeOwner {
     fn drop(&mut self) {
@@ -31,10 +32,72 @@ pub(crate) async fn resume_scope<T>(future: impl Future<Output = T>) -> T {
             ResumeOwner {
                 id: Uuid::new_v4(),
                 reservations: Mutex::new(Vec::new()),
+                watches: Mutex::new(Vec::new()),
             },
             future,
         )
         .await
+}
+
+// The source still uses watch senders for ordinary unload completion. These
+// entries retain an exact recovery reservation until the owning resume scope
+// returns (or is cancelled), including cold successor publication/attachment.
+struct OwnedWatch {
+    id: ThreadId,
+    sender: tokio::sync::watch::Sender<()>,
+    _custody: Box<dyn Send>,
+}
+
+pub(crate) fn resume_owner_available() -> bool {
+    OWNER.try_with(|_| ()).is_ok()
+}
+
+pub(crate) fn owns_watch(id: ThreadId, sender: &tokio::sync::watch::Sender<()>) -> bool {
+    OWNER
+        .try_with(|owner| {
+            owner
+                .watches
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .any(|entry| entry.id == id && entry.sender.same_channel(sender))
+        })
+        .unwrap_or(false)
+}
+
+pub(crate) fn retain_watch<T: Send + 'static>(
+    id: ThreadId,
+    sender: tokio::sync::watch::Sender<()>,
+    custody: T,
+) -> Result<(), T> {
+    let mut custody = Some(custody);
+    let retained = OWNER
+        .try_with(|owner| {
+            owner
+                .watches
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(OwnedWatch {
+                    id,
+                    sender,
+                    _custody: Box::new(custody.take().unwrap()),
+                });
+        })
+        .is_ok();
+    if retained {
+        Ok(())
+    } else {
+        Err(custody.unwrap())
+    }
+}
+
+pub(crate) fn unload_blocks_resume(
+    pending: &HashMap<ThreadId, tokio::sync::watch::Sender<()>>,
+    id: ThreadId,
+) -> bool {
+    pending
+        .get(&id)
+        .is_some_and(|sender| !owns_watch(id, sender))
 }
 
 #[derive(Default)]

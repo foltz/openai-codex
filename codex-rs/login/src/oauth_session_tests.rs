@@ -1191,3 +1191,6 @@ async fn failed_save_retains_rotation_without_overwriting_a_new_external_login()
         );
     }
 }
+
+#[path = "oauth_session_bound_tests.rs"]
+mod bound_tests;

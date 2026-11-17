@@ -39,6 +39,16 @@ impl OAuthSessionRequest {
         }
     }
 
+    pub(super) fn new_bound(manager: OAuthSessionManager, authorization_id: String) -> Self {
+        Self {
+            manager,
+            policy: RefreshPolicy::Bound {
+                authorization_id,
+                rejected_access_token: None,
+            },
+            sent_token: None,
+        }
+    }
     /// Observes persisted credentials using the existing session lifecycle. The returned
     /// identity is captured with the token, never read separately after resolution.
     pub async fn credentials(&mut self) -> io::Result<OAuthRequestCredentials> {
@@ -59,12 +69,27 @@ impl OAuthSessionRequest {
         let Some(token) = self.sent_token.take() else {
             return false;
         };
-        self.policy = RefreshPolicy::AfterRejection(token);
+        self.policy = match &self.policy {
+            RefreshPolicy::Bound {
+                authorization_id, ..
+            } => RefreshPolicy::Bound {
+                authorization_id: authorization_id.clone(),
+                rejected_access_token: Some(token),
+            },
+            _ => RefreshPolicy::AfterRejection(token),
+        };
         true
     }
 
     /// Identifies credential failures that belong to unauthorized recovery.
     pub fn is_recovering(&self) -> bool {
-        matches!(self.policy, RefreshPolicy::AfterRejection(_))
+        matches!(
+            &self.policy,
+            RefreshPolicy::AfterRejection(_)
+                | RefreshPolicy::Bound {
+                    rejected_access_token: Some(_),
+                    ..
+                }
+        )
     }
 }

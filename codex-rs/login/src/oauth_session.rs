@@ -84,15 +84,45 @@ enum RefreshPolicy {
     // Reconcile the cached token with the persisted grant before reusing it.
     ObserveStored,
     AfterRejection(String),
+    Bound {
+        authorization_id: String,
+        rejected_access_token: Option<String>,
+    },
 }
 
 impl RefreshPolicy {
+    fn check_admission(&self, token: Option<&StoredToken>) -> io::Result<()> {
+        if let Self::Bound {
+            authorization_id, ..
+        } = self
+        {
+            if authorization_id.trim().is_empty()
+                || token.and_then(|token| token.authorization_id.as_ref()) != Some(authorization_id)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "provider OAuth sign-in changed since admission",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn can_reuse(&self, token: &StoredToken) -> bool {
         token_is_usable(token)
             && match self {
                 Self::WhenExpired | Self::ObserveStored => true,
                 Self::AfterRejection(rejected_access_token) => {
                     token.access_token != *rejected_access_token
+                }
+                Self::Bound {
+                    authorization_id,
+                    rejected_access_token,
+                } => {
+                    token.authorization_id.as_ref() == Some(authorization_id)
+                        && rejected_access_token
+                            .as_ref()
+                            .is_none_or(|rejected| token.access_token != *rejected)
                 }
             }
     }
@@ -185,6 +215,19 @@ impl OAuthSessionManager {
     pub fn begin_request(&self) -> OAuthSessionRequest {
         OAuthSessionRequest::new(self.clone())
     }
+    /// Restrict noninteractive work to its actual origin credential's grant ID.
+    pub fn begin_bound_request(&self, authorization_id: &str) -> io::Result<OAuthSessionRequest> {
+        if authorization_id.trim().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "missing admitted OAuth sign-in",
+            ));
+        }
+        Ok(OAuthSessionRequest::new_bound(
+            self.clone().without_interactive_login(),
+            authorization_id.to_owned(),
+        ))
+    }
 
     /// Returns a usable token, refreshing or starting browser login according to the host policy.
     pub async fn resolve_access_token(&self) -> io::Result<String> {
@@ -267,9 +310,14 @@ impl OAuthSessionManager {
             let result = match manager.refresh(&mut cached, &policy).await {
                 Err(error) => Err(error),
                 Ok(RefreshOutcome::Credentials(token)) => {
-                    cached.login_required = None;
-                    manager.publish_status(OAuthSessionStatus::Succeeded, Some(&token));
-                    Ok(token)
+                    match policy.check_admission(Some(&token)) {
+                        Err(error) => Err(error),
+                        Ok(()) => {
+                            cached.login_required = None;
+                            manager.publish_status(OAuthSessionStatus::Succeeded, Some(&token));
+                            Ok(token)
+                        }
+                    }
                 }
                 Ok(RefreshOutcome::LoginRequired) => {
                     cached.login_required = cached.token.clone();
@@ -332,7 +380,9 @@ impl OAuthSessionManager {
                 cached.token = stored;
                 cached.pending = None;
             }
+            policy.check_admission(cached.token.as_ref())?;
             if cached.pending.is_some() {
+                policy.check_admission(cached.pending.as_ref())?;
                 self.persist_pending(cached, &credential_lock).await?;
             }
             if let Some(token) = cached.token.as_ref()
@@ -357,7 +407,20 @@ impl OAuthSessionManager {
                 .await
             {
                 Ok(response) => {
+                    if matches!(policy, RefreshPolicy::Bound { .. }) {
+                        // A legacy/direct writer may not honor the credential
+                        // lock. Do not overwrite its replacement sign-in.
+                        let stored = self.load_token_async().await?;
+                        policy.check_admission(stored.as_ref())?;
+                        if stored != cached.token {
+                            return Err(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                "provider OAuth credential changed during bound refresh",
+                            ));
+                        }
+                    }
                     cached.pending = Some(response.into_stored(cached.token.as_ref())?);
+                    policy.check_admission(cached.pending.as_ref())?;
                     return self
                         .persist_pending(cached, &credential_lock)
                         .await
@@ -470,6 +533,7 @@ impl OAuthSessionManager {
         // persistence with refreshes. Use the current stored token as the failed-save baseline.
         let credential_lock = Arc::new(storage::lock_credentials(&self.state.codex_home).await?);
         let stored = self.load_token_async().await?;
+        policy.check_admission(stored.as_ref())?;
         if stored != cached.token {
             cached.token = stored;
             cached.pending = None;

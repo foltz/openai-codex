@@ -65,6 +65,7 @@ mod exec_args_tests;
 #[cfg(test)]
 #[path = "exec_server_args_tests.rs"]
 mod exec_server_args_tests;
+mod managed_auth_cmd;
 mod marketplace_cmd;
 mod mcp_cmd;
 mod mcp_login;
@@ -73,6 +74,7 @@ mod migrate_rollouts;
 mod plugin_cmd;
 mod queue_cmd;
 mod remote_control_cmd;
+mod runtime_capabilities;
 #[cfg(target_os = "windows")]
 mod sandbox_setup;
 mod sandbox_uninstall;
@@ -140,6 +142,9 @@ struct MultitoolCli {
 
     #[clap(subcommand)]
     subcommand: Option<Subcommand>,
+    /// Token-free inventory without loading credentials or runtime configuration.
+    #[clap(long, hide = true)]
+    runtime_capabilities: bool,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -167,6 +172,10 @@ enum Subcommand {
 
     /// Remove stored authentication credentials.
     Logout(LogoutCommand),
+
+    /// Repository-owned same-image managed authentication client.
+    #[clap(hide = true, name = "__managed-auth-transition")]
+    ManagedAuthTransition(managed_auth_cmd::ManagedAuthCommand),
 
     /// Manage external MCP servers for Codex.
     Mcp(McpCli),
@@ -983,14 +992,19 @@ async fn dispatch_cli(
     arg0_paths: Arg0DispatchPaths,
     remote_control_disabled: bool,
 ) -> anyhow::Result<Option<impl Future<Output = anyhow::Result<()>>>> {
+    let args: Vec<_> = std::env::args_os().collect();
     let MultitoolCli {
+        runtime_capabilities,
         config_overrides: mut root_config_overrides,
         feature_toggles,
         remote,
         mut interactive,
         subcommand,
-    } = config_override_args::try_parse_from(std::env::args_os())
-        .unwrap_or_else(|error| error.exit());
+    } = config_override_args::try_parse_from(args.clone()).unwrap_or_else(|error| error.exit());
+    if runtime_capabilities {
+        println!("{}", runtime_capabilities::report(args)?);
+        return Ok(None);
+    }
     // Retain the launch target through TUI exit, even if a launcher changes selection.
     let daemon_cli_executable = arg0_paths
         .codex_self_exe
@@ -1676,6 +1690,14 @@ async fn dispatch_cli(
             );
             run_logout(logout_cli.config_overrides).await;
         }
+        Some(Subcommand::ManagedAuthTransition(command)) => {
+            reject_remote_mode_for_subcommand(
+                root_remote.as_deref(),
+                root_remote_auth_token_env.as_deref(),
+                "__managed-auth-transition",
+            )?;
+            managed_auth_cmd::run(command).await?;
+        }
         Some(Subcommand::Completion(completion_cli)) => {
             reject_remote_mode_for_subcommand(
                 root_remote.as_deref(),
@@ -2359,6 +2381,7 @@ fn unsupported_subcommand_name_for_strict_config(
         Some(Subcommand::Login(_)) => Some("login"),
         Some(Subcommand::GitCredential(_)) => Some("git-credential"),
         Some(Subcommand::Logout(_)) => Some("logout"),
+        Some(Subcommand::ManagedAuthTransition(_)) => Some("__managed-auth-transition"),
         Some(Subcommand::Completion(_)) => Some("completion"),
         Some(Subcommand::Update) => Some("update"),
         Some(Subcommand::Cloud(_)) => Some("cloud"),
@@ -2930,6 +2953,7 @@ enabled = true
             subcommand,
             feature_toggles: _,
             remote: _,
+            runtime_capabilities: _,
         } = cli;
         interactive
             .shared
@@ -2967,6 +2991,7 @@ enabled = true
             subcommand,
             feature_toggles: _,
             remote: _,
+            runtime_capabilities: _,
         } = cli;
         interactive
             .shared
@@ -3011,6 +3036,7 @@ enabled = true
             subcommand,
             feature_toggles: _,
             remote: _,
+            runtime_capabilities: _,
         } = cli;
 
         let Subcommand::Archive(SessionArchiveCommand {

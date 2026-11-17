@@ -82,6 +82,7 @@ async fn compressed_session_negotiates_fragments_and_retains_history() -> Result
     };
     let client = async {
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            interactive_client: false,
             required_human_approval: false,
             endpoint: RemoteAppServerEndpoint::UnixSocket { socket_path },
             client_name: "compression-test".to_string(),

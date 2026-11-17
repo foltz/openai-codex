@@ -86,6 +86,8 @@ pub enum RemoteAppServerEndpoint {
 pub struct RemoteAppServerConnectArgs {
     /// This client collects fresh human decisions for managed command checkpoints.
     pub required_human_approval: bool,
+    /// Request interactive behavior; the server independently proves the peer.
+    pub interactive_client: bool,
     pub endpoint: RemoteAppServerEndpoint,
     pub client_name: String,
     pub client_version: String,
@@ -97,7 +99,7 @@ pub struct RemoteAppServerConnectArgs {
 impl RemoteAppServerConnectArgs {
     pub(crate) fn initialize_params(&self) -> InitializeParams {
         let capabilities = InitializeCapabilities {
-            interactive_client: false,
+            interactive_client: self.interactive_client,
             required_human_approval: self.required_human_approval,
             explicit_gateway_oauth: false,
             experimental_api: self.experimental_api,

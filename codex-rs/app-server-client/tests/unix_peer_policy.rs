@@ -233,6 +233,7 @@ async fn connect_once(
     let result = tokio::time::timeout(
         Duration::from_secs(10),
         RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            interactive_client: false,
             required_human_approval: false,
             endpoint: RemoteAppServerEndpoint::UnixSocket {
                 socket_path: AbsolutePathBuf::from_absolute_path(socket).unwrap(),

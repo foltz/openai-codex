@@ -529,6 +529,7 @@ async fn connect_remote_app_server(
     endpoint: RemoteAppServerEndpoint,
 ) -> color_eyre::Result<AppServerClient> {
     let app_server = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+        interactive_client: true,
         required_human_approval: true,
         endpoint,
         client_name: "codex-tui".to_string(),

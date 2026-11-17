@@ -1206,8 +1206,21 @@ mod tests {
         })
     }
 
+    #[test]
+    fn remote_interactive_request_is_explicit_and_independent_of_human_approval() {
+        for interactive in [false, true] {
+            let mut args = test_remote_connect_args("ws://127.0.0.1:1".into());
+            args.interactive_client = interactive;
+            args.required_human_approval = false;
+            let capabilities = args.initialize_params().capabilities.unwrap();
+            assert_eq!(capabilities.interactive_client, interactive);
+            assert!(!capabilities.required_human_approval);
+        }
+    }
+
     fn test_remote_connect_args(websocket_url: String) -> RemoteAppServerConnectArgs {
         RemoteAppServerConnectArgs {
+            interactive_client: false,
             required_human_approval: false,
             endpoint: RemoteAppServerEndpoint::WebSocket {
                 websocket_url,
@@ -1578,6 +1591,7 @@ mod tests {
             websocket.close(None).await.expect("close should succeed");
         });
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            interactive_client: false,
             required_human_approval: false,
             endpoint: RemoteAppServerEndpoint::UnixSocket { socket_path },
             client_name: "codex-app-server-client-test".to_string(),
@@ -1670,6 +1684,7 @@ mod tests {
         )
         .await;
         let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            interactive_client: false,
             required_human_approval: false,
             endpoint: RemoteAppServerEndpoint::WebSocket {
                 websocket_url,
@@ -1691,6 +1706,7 @@ mod tests {
     #[tokio::test]
     async fn remote_connect_rejects_non_loopback_ws_when_auth_configured() {
         let result = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            interactive_client: false,
             required_human_approval: false,
             endpoint: RemoteAppServerEndpoint::WebSocket {
                 websocket_url: "ws://example.com:4500".to_string(),
@@ -1897,6 +1913,7 @@ mod tests {
         })
         .await;
         let mut client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            interactive_client: false,
             channel_capacity: 1,
             ..test_remote_connect_args(websocket_url)
         })

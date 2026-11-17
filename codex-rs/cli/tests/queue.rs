@@ -337,6 +337,7 @@ async fn remote_session_commands_with_workload_identity_use_server_auth() -> Res
 
     let endpoint = format!("unix://{}", socket_path.as_path().display());
     let mut app = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+        interactive_client: false,
         required_human_approval: false,
         endpoint: RemoteAppServerEndpoint::UnixSocket { socket_path },
         client_name: "queue-e2e-test".to_string(),

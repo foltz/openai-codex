@@ -18,6 +18,7 @@ pub struct AccountOAuthGrant {
     pub(super) manager: Arc<AuthManager>,
     pub(super) tokens: TokenData,
     pub(super) login_generation: u64,
+    pub(super) owner_pin: Option<Arc<super::owner_pin::OwnerPin>>,
 }
 
 /// Identity of a refresh grant, excluding access and ID token rotation.
@@ -97,6 +98,11 @@ impl AccountOAuthGrant {
     }
 
     pub(super) fn owner_is_current(&self) -> bool {
+        if let Some(pin) = &self.owner_pin {
+            if pin.cached_auth().is_err() {
+                return false;
+            }
+        }
         let Ok(cached) = self.manager.inner.read() else {
             return false;
         };
@@ -116,7 +122,11 @@ impl AccountOAuthGrant {
         if !self.owner_is_current() {
             return Ok(None);
         }
-        let stored = self.manager.read_account_grant_tokens().await?;
+        let stored = if let Some(pin) = &self.owner_pin {
+            pin.read_bound_account_grant_tokens().await?
+        } else {
+            self.manager.read_account_grant_tokens().await?
+        };
         Ok(stored.filter(|tokens| {
             self.owner_is_current()
                 && AccountOAuthGrantRevision::from(&self.tokens)
@@ -133,4 +143,24 @@ pub(super) fn same_account_login(a: &TokenData, b: &TokenData) -> bool {
     a.login_owner_id == b.login_owner_id
         && a.account_id == b.account_id
         && a.id_token.chatgpt_user_id == b.id_token.chatgpt_user_id
+}
+
+/// Shared eligibility oracle for ordinary and owner-pinned grant reads.
+pub(super) fn eligible_account_grant(tokens: &TokenData, cached: &TokenData) -> bool {
+    tokens
+        .oauth_provenance
+        .as_ref()
+        .is_some_and(|p| !p.issuer.trim().is_empty() && !p.client_id.trim().is_empty())
+        && tokens
+            .login_owner_id
+            .as_ref()
+            .is_some_and(|id| !id.is_empty())
+        && !tokens.refresh_token.is_empty()
+        && tokens
+            .id_token
+            .chatgpt_user_id
+            .as_ref()
+            .is_some_and(|id| !id.is_empty())
+        && tokens.account_id.as_ref().is_some_and(|id| !id.is_empty())
+        && same_account_grant(tokens, cached)
 }

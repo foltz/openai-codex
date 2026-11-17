@@ -4430,3 +4430,130 @@ async fn owner_pin_shares_actual_agent_bootstrap_exclusion() -> anyhow::Result<(
     assert_eq!(source.agent_identity_lock.available_permits(), 1);
     Ok(())
 }
+
+async fn native_pin_grant_fixture(home: &Path) -> anyhow::Result<Arc<AuthManager>> {
+    let source = native_owner_fixture(home, "http://127.0.0.1:1").await?;
+    let storage = FileAuthStorage::new(home.to_path_buf());
+    let mut auth = storage.load()?.context("synthetic native grant")?;
+    auth.tokens.as_mut().context("tokens")?.login_owner_id = Some("pinned-login".into());
+    storage.save(&auth)?;
+    source.reload_with_cached_auth().await?;
+    Ok(source)
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn owner_pin_grant_lease_excludes_source_refresh_and_retains_pin_after_release()
+-> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    let home = tempdir()?;
+    let source = native_pin_grant_fixture(home.path()).await?;
+    let pinned = pin_current_owner(&source);
+    let expected = pinned.auth_cached().context("pinned account")?;
+    let lease = pinned
+        .lease_account_oauth_grant()
+        .await?
+        .context("eligible native grant")?;
+    assert_eq!(
+        lease.tokens().login_owner_id.as_deref(),
+        Some("pinned-login")
+    );
+    assert!(
+        source.refresh_lock.clone().try_acquire_owned().is_err(),
+        "lease must exclude the original manager's refresh"
+    );
+    assert_eq!(
+        pinned.refresh_lock.available_permits(),
+        1,
+        "a private replacement semaphore is not the lease"
+    );
+    let grant = lease.release();
+    assert_eq!(source.refresh_lock.available_permits(), 1);
+    assert!(grant.current_tokens().await?.is_some());
+    assert!(pinned.account_login_is_current(&expected).await?);
+    source.set_cached_auth(Some(CodexAuth::from_api_key("changed-owner")));
+    assert!(grant.current_tokens().await?.is_none());
+    assert!(pinned.account_oauth_grant().await.is_err());
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn owner_pin_grant_rejects_a_foreign_durable_login_without_adopting_or_saving()
+-> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    let home = tempdir()?;
+    let source = native_pin_grant_fixture(home.path()).await?;
+    let pinned = pin_current_owner(&source);
+    let expected = pinned.auth_cached().context("pinned account")?;
+    let grant = pinned
+        .account_oauth_grant()
+        .await?
+        .context("initial grant")?;
+    let storage = FileAuthStorage::new(home.path().to_path_buf());
+    let mut other = storage.load()?.context("stored account")?;
+    other.tokens.as_mut().context("tokens")?.login_owner_id = Some("different-login".into());
+    other.tokens.as_mut().context("tokens")?.refresh_token = "foreign-refresh".into();
+    storage.save(&other)?;
+    let before = std::fs::read(home.path().join("auth.json"))?;
+    assert!(grant.current_tokens().await?.is_none());
+    assert!(pinned.account_oauth_grant().await?.is_none());
+    assert!(pinned.lease_account_oauth_grant().await?.is_none());
+    assert!(!pinned.account_login_is_current(&expected).await?);
+    assert_eq!(grant.tokens().refresh_token, "test-refresh-token");
+    assert_eq!(
+        source
+            .auth_cached()
+            .unwrap()
+            .get_token_data()?
+            .refresh_token,
+        "test-refresh-token"
+    );
+    assert_eq!(std::fs::read(home.path().join("auth.json"))?, before);
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn owner_pin_preserves_login_check_without_inventing_an_eligible_oauth_grant()
+-> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    let home = tempdir()?;
+    let source = native_pin_grant_fixture(home.path()).await?;
+    let storage = FileAuthStorage::new(home.path().to_path_buf());
+    let mut auth = storage.load()?.context("stored account")?;
+    auth.tokens.as_mut().context("tokens")?.oauth_provenance = None;
+    storage.save(&auth)?;
+    source.reload_with_cached_auth().await?;
+    let pinned = pin_current_owner(&source);
+    let expected = pinned.auth_cached().context("pinned account")?;
+    assert!(pinned.account_login_is_current(&expected).await?);
+    assert!(pinned.account_oauth_grant().await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn owner_pin_waiting_for_source_grant_lease_rechecks_owner_before_reading()
+-> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    let home = tempdir()?;
+    let source = native_pin_grant_fixture(home.path()).await?;
+    let pinned = pin_current_owner(&source);
+    let before = std::fs::read(home.path().join("auth.json"))?;
+    let guard = source.refresh_lock.acquire().await?;
+    let mut waiting = Box::pin(pinned.lease_account_oauth_grant());
+    assert!(
+        std::future::Future::poll(
+            waiting.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop())
+        )
+        .is_pending()
+    );
+    source.set_cached_auth(Some(CodexAuth::from_api_key("replacement-while-waiting")));
+    drop(guard);
+    assert!(waiting.await.is_err());
+    assert_eq!(std::fs::read(home.path().join("auth.json"))?, before);
+    assert_eq!(source.refresh_lock.available_permits(), 1);
+    Ok(())
+}

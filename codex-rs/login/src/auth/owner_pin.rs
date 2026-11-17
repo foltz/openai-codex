@@ -76,7 +76,9 @@ impl OwnerPin {
         Ok(cached.auth.clone())
     }
 
-    fn snapshot(&self) -> Result<(Option<CodexAuth>, AuthOwnerSnapshot), AuthOwnerChanged> {
+    pub(super) fn snapshot(
+        &self,
+    ) -> Result<(Option<CodexAuth>, AuthOwnerSnapshot), AuthOwnerChanged> {
         let (auth, revisions, renewal) = self.source.renewal_snapshot().ok_or(AuthOwnerChanged)?;
         if renewal != self.renewal {
             return Err(AuthOwnerChanged);

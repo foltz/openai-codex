@@ -3365,7 +3365,13 @@ impl AuthManager {
     pub async fn lease_account_oauth_grant(
         self: &Arc<Self>,
     ) -> std::io::Result<Option<AccountOAuthGrantLease>> {
-        let permit = Arc::clone(&self.refresh_lock)
+        let refresh_lock = if let Some(pin) = &self.owner_pin {
+            pin.cached_auth().map_err(std::io::Error::other)?;
+            &pin.source.refresh_lock
+        } else {
+            &self.refresh_lock
+        };
+        let permit = Arc::clone(refresh_lock)
             .acquire_owned()
             .await
             .map_err(|_| std::io::Error::other("Account refresh coordination is unavailable."))?;
@@ -3380,6 +3386,19 @@ impl AuthManager {
     pub async fn account_oauth_grant(
         self: &Arc<Self>,
     ) -> std::io::Result<Option<AccountOAuthGrant>> {
+        if let Some(pin) = &self.owner_pin {
+            let login_generation = pin.source.auth_change_state_tx.borrow().login_generation;
+            let Some(tokens) = pin.read_bound_account_grant_tokens().await? else {
+                return Ok(None);
+            };
+            let grant = AccountOAuthGrant {
+                manager: Arc::clone(&pin.source),
+                tokens,
+                login_generation,
+                owner_pin: Some(Arc::clone(pin)),
+            };
+            return Ok(grant.owner_is_current().then_some(grant));
+        }
         self.require_unpinned_mutation()?;
 
         let login_generation = self.auth_change_state_tx.borrow().login_generation;
@@ -3390,6 +3409,7 @@ impl AuthManager {
             manager: Arc::clone(self),
             tokens,
             login_generation,
+            owner_pin: None,
         };
         if !grant.owner_is_current() {
             return Ok(None);
@@ -3400,6 +3420,9 @@ impl AuthManager {
     /// Checks the persisted account owner without requiring an EMA-eligible account grant.
     /// Dedicated enterprise credentials still belong to this account login.
     pub async fn account_login_is_current(&self, expected: &CodexAuth) -> std::io::Result<bool> {
+        if let Some(pin) = &self.owner_pin {
+            return pin.account_login_is_current(expected).await;
+        }
         self.require_unpinned_mutation()?;
 
         if !matches!(expected, CodexAuth::Chatgpt(_)) {
@@ -3479,22 +3502,7 @@ impl AuthManager {
         }
         let cached = auth.get_token_data()?;
         let stored = self.read_persisted_account_tokens().await?;
-        Ok(stored.filter(|tokens| {
-            tokens.oauth_provenance.as_ref().is_some_and(|provenance| {
-                !provenance.issuer.trim().is_empty() && !provenance.client_id.trim().is_empty()
-            }) && tokens
-                .login_owner_id
-                .as_ref()
-                .is_some_and(|id| !id.is_empty())
-                && !tokens.refresh_token.is_empty()
-                && tokens
-                    .id_token
-                    .chatgpt_user_id
-                    .as_ref()
-                    .is_some_and(|id| !id.is_empty())
-                && tokens.account_id.as_ref().is_some_and(|id| !id.is_empty())
-                && same_account_grant(tokens, &cached)
-        }))
+        Ok(stored.filter(|tokens| account_grant::eligible_account_grant(tokens, &cached)))
     }
 
     /// Reloads auth from the active source. Returns whether the auth value changed.
@@ -5368,6 +5376,9 @@ mod command_source_fence_tests;
 #[cfg(test)]
 #[path = "command_recovery_tests.rs"]
 mod command_recovery_tests;
+
+#[path = "pinned_grants.rs"]
+mod pinned_grants;
 
 #[path = "owner_pin.rs"]
 mod owner_pin;

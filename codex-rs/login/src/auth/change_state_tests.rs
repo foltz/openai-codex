@@ -344,3 +344,74 @@ async fn captured_credentials_are_revoked_if_account_changes_before_client_const
         ))
     ));
 }
+
+#[test]
+fn owner_checked_cache_read_accepts_same_owner_refresh_but_refuses_replacement() {
+    let manager =
+        AuthManager::from_auth_for_testing(chatgpt_auth("user-a", "workspace-a", "first"));
+    let admitted = manager.owner_snapshot().unwrap();
+    manager.set_cached_auth(Some(chatgpt_auth("user-a", "workspace-a", "renewed")));
+    let current = manager.owner_snapshot().unwrap();
+    assert_eq!(
+        current.revisions.owner_generation,
+        admitted.revisions.owner_generation
+    );
+    assert!(current.revisions.generation > admitted.revisions.generation);
+    let actual = manager
+        .auth_for_owner(admitted.revisions.owner_generation)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        actual.get_token().unwrap(),
+        manager.auth_cached().unwrap().get_token().unwrap()
+    );
+    manager.set_cached_auth(Some(chatgpt_auth("user-b", "workspace-b", "replacement")));
+    assert!(
+        manager
+            .auth_for_owner(admitted.revisions.owner_generation)
+            .is_err()
+    );
+}
+
+#[test]
+fn owner_snapshot_and_checked_read_refuse_poisoned_cache() {
+    let manager = AuthManager::from_auth_for_testing(chatgpt_auth("user", "workspace", "token"));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _cache = manager.inner.write().unwrap();
+        panic!("synthetic poison");
+    }));
+    assert!(manager.owner_snapshot().is_none());
+    assert!(manager.auth_for_owner(0).is_err());
+}
+
+#[test]
+fn owner_snapshot_keeps_upstream_source_and_login_revisions() {
+    let manager = AuthManager::from_auth_for_testing(chatgpt_auth("user", "workspace", "token"));
+    let expected = AuthChangeState {
+        generation: 3,
+        owner_generation: 5,
+        source_generation: 7,
+        login_generation: 11,
+    };
+    manager.auth_change_state_tx.send_replace(expected);
+    let snapshot = manager.owner_snapshot().unwrap();
+    assert_eq!(snapshot.revisions, expected);
+    assert_eq!(snapshot.chatgpt_user_id.as_deref(), Some("user"));
+    assert_eq!(snapshot.account_id.as_deref(), Some("workspace"));
+}
+
+#[cfg(unix)]
+#[test]
+fn owner_checked_command_read_refuses_stale_durable_record() {
+    use super::command_cache_publication_tests::{record, selected_fixture};
+    let home = tempfile::tempdir().unwrap();
+    let (_, manager) = selected_fixture(home.path(), record(1));
+    let admitted = manager.owner_snapshot().unwrap();
+    let newer = record(2);
+    super::super::command_store::commit(home.path(), &newer, &newer.auth().unwrap()).unwrap();
+    assert!(
+        manager
+            .auth_for_owner(admitted.revisions.owner_generation)
+            .is_err()
+    );
+}

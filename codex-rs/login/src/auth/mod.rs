@@ -27,6 +27,8 @@ pub use bedrock_api_key::BedrockApiKeyAuth;
 pub use bedrock_api_key::login_with_bedrock_api_key;
 pub use change_state::AuthChangeState;
 pub use change_state::AuthOwner;
+pub use change_state::AuthOwnerChanged;
+pub use change_state::AuthOwnerSnapshot;
 pub use change_state::RequestAuthChange;
 pub use error::RefreshTokenFailedError;
 pub use error::RefreshTokenFailedReason;

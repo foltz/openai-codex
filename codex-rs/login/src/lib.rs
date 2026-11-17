@@ -48,6 +48,8 @@ pub use auth::AuthManager;
 pub use auth::AuthManagerConfig;
 pub use auth::AuthManagerInitializationError;
 pub use auth::AuthOwner;
+pub use auth::AuthOwnerChanged;
+pub use auth::AuthOwnerSnapshot;
 pub use auth::AuthRenewalBinding;
 pub use auth::AuthRuntimeConfig;
 pub use auth::CLIENT_ID;

@@ -4,6 +4,20 @@ use super::AuthManager;
 use super::CodexAuth;
 use std::sync::Arc;
 
+/// Token-free cached identity and all revisions captured under one cache lock.
+/// This metadata grants no renewal authority and does not validate durable auth.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthOwnerSnapshot {
+    pub auth_mode: Option<codex_protocol::auth::AuthMode>,
+    pub chatgpt_user_id: Option<String>,
+    pub account_id: Option<String>,
+    pub revisions: AuthChangeState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("authentication owner changed or is unavailable")]
+pub struct AuthOwnerChanged;
+
 /// An account owner within a particular credential source, retained by in-flight work.
 #[derive(Clone)]
 pub struct AuthOwner {

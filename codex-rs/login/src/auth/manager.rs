@@ -3016,6 +3016,58 @@ impl AuthManager {
         Some(*self.auth_change_state_tx.borrow())
     }
 
+    /// Capture cached identity and all four revisions atomically. Token-free
+    /// metadata only: durable/source/gateway authority must be checked separately.
+    pub fn owner_snapshot(&self) -> Option<super::AuthOwnerSnapshot> {
+        let cached = self.inner.read().ok()?;
+        Some(self.owner_snapshot_locked(&cached))
+    }
+
+    fn owner_snapshot_locked(&self, cached: &CachedAuth) -> super::AuthOwnerSnapshot {
+        let auth = cached.auth.as_ref();
+        super::AuthOwnerSnapshot {
+            auth_mode: auth.map(CodexAuth::api_auth_mode),
+            chatgpt_user_id: auth.and_then(CodexAuth::get_chatgpt_user_id),
+            account_id: auth.and_then(CodexAuth::get_account_id),
+            revisions: *self.auth_change_state_tx.borrow(),
+        }
+    }
+
+    /// Cached credential for this account owner, without refresh or native IO.
+    /// Command auth additionally requires current durable authority custody.
+    /// Source/login binding and gateway admission remain separate requirements.
+    pub fn auth_for_owner(
+        &self,
+        expected_owner_generation: u64,
+    ) -> Result<Option<CodexAuth>, super::AuthOwnerChanged> {
+        let capture = |cached: &CachedAuth| {
+            if self.auth_change_state_tx.borrow().owner_generation != expected_owner_generation {
+                return Err(super::AuthOwnerChanged);
+            }
+            Ok(cached.auth.clone())
+        };
+        if self.command_source.is_some() {
+            let resolved = self.auth_cached().ok_or(super::AuthOwnerChanged)?;
+            let publication = self
+                .cache_publication(Some(&resolved))
+                .map_err(|_| super::AuthOwnerChanged)?;
+            publication
+                .revalidate()
+                .map_err(|_| super::AuthOwnerChanged)?;
+            let auth = capture(&publication.cache)?;
+            if !Self::auths_equal_for_refresh(auth.as_ref(), Some(&resolved)) {
+                return Err(super::AuthOwnerChanged);
+            }
+            publication
+                .revalidate()
+                .map_err(|_| super::AuthOwnerChanged)?;
+            Ok(auth)
+        } else {
+            let cached = self.inner.read().map_err(|_| super::AuthOwnerChanged)?;
+            capture(&cached)
+        }
+    }
+
     /// Identify this credential source's current account owner without refreshing auth.
     pub fn auth_owner(self: &Arc<Self>) -> AuthOwner {
         AuthOwner::new(

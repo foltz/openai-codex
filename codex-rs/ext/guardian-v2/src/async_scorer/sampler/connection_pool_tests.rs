@@ -1268,8 +1268,7 @@ async fn automatic_refill_owns_descendants_after_origin_is_dropped() -> Result<(
 #[tokio::test]
 async fn response_drain_keeps_lease_account_work_after_score_owner_and_stop_waiter_drop()
 -> Result<()> {
-    let server =
-        responses::start_websocket_server_with_headers(vec![
+    let server = responses::start_websocket_server_with_headers(vec![
             responses::WebSocketConnectionConfig {
                 requests: Vec::new(),
                 response_headers: Vec::new(),
@@ -1278,7 +1277,7 @@ async fn response_drain_keeps_lease_account_work_after_score_owner_and_stop_wait
             };
             INITIAL_WEBSOCKET_CONNECTIONS
         ])
-        .await;
+    .await;
     let mut config = sampler_config(format!(
         "http://{}/v1",
         server.uri().trim_start_matches("ws://")
@@ -1322,5 +1321,167 @@ async fn response_drain_keeps_lease_account_work_after_score_owner_and_stop_wait
     tokio::time::timeout(Duration::from_secs(5), sampler.shutdown()).await?;
     assert_eq!(counts.live.load(Ordering::SeqCst), 0);
     server.shutdown().await;
+    Ok(())
+}
+
+// These cases require real loopback service; none silently skips networking.
+fn evidence_pool(base: String) -> Arc<ConnectionPool> {
+    let pool = ConnectionPool::new(Arc::new(sampler_config(base)));
+    *pool.retry_after.lock().unwrap() = Some(Instant::now() + CONNECT_COOLDOWN);
+    pool
+}
+
+fn evidence_request() -> ResponsesApiRequest {
+    ResponsesApiRequest {
+        model: "test-model".into(),
+        stream: true,
+        service_tier: None,
+        input: Vec::new(),
+        tools: None,
+        tool_choice: "auto".into(),
+        parallel_tool_calls: false,
+        reasoning: None,
+        store: false,
+        stream_options: None,
+        include: Vec::new(),
+        prompt_cache_key: None,
+        prompt_cache_options: None,
+        text: None,
+        client_metadata: None,
+        access_programs: None,
+    }
+}
+
+#[tokio::test]
+async fn http_rejection_evidence_is_actual_auth_not_lease_setup() -> Result<()> {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .and(header("authorization", "Bearer test-api-key"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let pool = evidence_pool(format!("{}/v1", server.uri()));
+    let (lease, evidence) =
+        tokio::time::timeout(Duration::from_secs(2), pool.lease_with_attempt(None)).await?;
+    let lease = lease?;
+    assert!(evidence.fingerprint().is_none());
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        lease.stream_request(&evidence_request()),
+    )
+    .await?;
+    assert!(matches!(
+        result,
+        Err(ApiError::Transport(TransportError::Http {
+            status: http::StatusCode::UNAUTHORIZED,
+            ..
+        }))
+    ));
+    assert!(
+        evidence.fingerprint()
+            == codex_login::AuthCredentialFingerprint::from_bearer_header("Bearer test-api-key")
+    );
+    drop(lease);
+    pool.shutdown().await;
+    server.verify().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn reused_websocket_retains_original_handshake_evidence() -> Result<()> {
+    let server = responses::start_websocket_server_with_headers(vec![
+        responses::WebSocketConnectionConfig {
+            requests: Vec::new(),
+            response_headers: Vec::new(),
+            accept_delay: None,
+            close_after_requests: false,
+        },
+    ])
+    .await;
+    let pool = evidence_pool(format!(
+        "{}/v1",
+        server.uri().replacen("ws://", "http://", 1)
+    ));
+    let permit = Arc::clone(&pool.sockets).acquire_owned().await?;
+    let connection =
+        tokio::time::timeout(Duration::from_secs(2), pool.open_connection(permit)).await??;
+    assert!(server.wait_for_handshakes(1, Duration::from_secs(2)).await);
+    let header = server
+        .single_handshake()
+        .header("authorization")
+        .expect("actual auth header");
+    let expected = codex_login::AuthCredentialFingerprint::from_bearer_header(&header);
+    assert!(expected.is_some());
+    pool.idle_connections.lock().unwrap().push(connection);
+    let (first, evidence) =
+        tokio::time::timeout(Duration::from_secs(2), pool.lease_with_attempt(None)).await?;
+    let first = first?;
+    assert!(matches!(&first.connection, Connection::Websocket(_)));
+    assert!(evidence.fingerprint() == expected);
+    first.reuse().await;
+    let (second, reused) =
+        tokio::time::timeout(Duration::from_secs(2), pool.lease_with_attempt(None)).await?;
+    let second = second?;
+    assert!(matches!(&second.connection, Connection::Websocket(_)));
+    assert!(reused.fingerprint() == expected);
+    server.single_handshake(); // Refuse a second physical handshake.
+    drop(second);
+    pool.shutdown().await;
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_websocket_open_preserves_actual_rejected_auth() -> Result<()> {
+    use wiremock::matchers::{header, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(header("authorization", "Bearer test-api-key"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let pool = evidence_pool(format!("{}/v1", server.uri()));
+    let setup = pool.client_setup().await?;
+    let permit = Arc::clone(&pool.sockets).acquire_owned().await?;
+    let evidence = RequestAuthEvidence::default();
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        pool.open_connection_with_setup(permit, setup, evidence.clone()),
+    )
+    .await?;
+    assert!(matches!(
+        result,
+        Err(LunaSamplerError::Api(ApiError::Transport(
+            TransportError::Http {
+                status: http::StatusCode::UNAUTHORIZED,
+                ..
+            }
+        )))
+    ));
+    assert!(
+        evidence.fingerprint()
+            == codex_login::AuthCredentialFingerprint::from_bearer_header("Bearer test-api-key")
+    );
+    pool.shutdown().await;
+    server.verify().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn refused_account_work_carries_no_credential_guess() -> Result<()> {
+    let mut config = sampler_config("http://127.0.0.1:1/v1".into());
+    config.require_account_work = true;
+    let pool = ConnectionPool::new(Arc::new(config));
+    let (result, evidence) =
+        tokio::time::timeout(Duration::from_secs(2), pool.lease_with_attempt(None)).await?;
+    assert!(matches!(result, Err(LunaSamplerError::AccountWorkRefused)));
+    assert!(evidence.fingerprint().is_none());
+    pool.shutdown().await;
     Ok(())
 }

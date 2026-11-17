@@ -11,9 +11,16 @@ use std::sync::{Arc, Mutex};
 /// Evidence only; retains no auth provider, credentials or finite account root.
 /// Create a fresh pair per API attempt. Never share one recorder between
 /// concurrent requests: its snapshot belongs to that attempt's last auth apply.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct RequestAuthEvidence(Arc<Mutex<Option<AuthCredentialFingerprint>>>);
 impl RequestAuthEvidence {
+    /// Attach this attempt cell to its auth delegate; never share concurrently.
+    pub fn observe(&self, inner: SharedAuthProvider) -> SharedAuthProvider {
+        Arc::new(ObservedRequestAuth {
+            inner,
+            evidence: self.clone(),
+        })
+    }
     pub fn fingerprint(&self) -> Option<AuthCredentialFingerprint> {
         self.0.lock().ok().and_then(|value| value.clone())
     }
@@ -74,14 +81,8 @@ impl AuthProvider for ObservedRequestAuth {
 pub fn observe_request_auth(
     inner: SharedAuthProvider,
 ) -> (SharedAuthProvider, RequestAuthEvidence) {
-    let evidence = RequestAuthEvidence(Arc::new(Mutex::new(None)));
-    (
-        Arc::new(ObservedRequestAuth {
-            inner,
-            evidence: evidence.clone(),
-        }),
-        evidence,
-    )
+    let evidence = RequestAuthEvidence::default();
+    (evidence.observe(inner), evidence)
 }
 
 #[cfg(test)]

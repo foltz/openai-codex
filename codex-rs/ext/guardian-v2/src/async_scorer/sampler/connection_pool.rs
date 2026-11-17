@@ -37,6 +37,7 @@ use codex_login::default_client::default_headers;
 use codex_model_provider::ACCOUNT_ROUTING_HEADER;
 use codex_model_provider::AgentIdentitySessionFallback;
 use codex_model_provider::ProviderAuthScope;
+use codex_model_provider::RequestAuthEvidence;
 use codex_model_provider::ResponsesConnectionKey;
 use codex_protocol::ThreadId;
 use codex_websocket_client::WebSocketConnector;
@@ -86,6 +87,7 @@ struct HttpTransport {
 }
 
 pub(super) struct PooledConnection {
+    auth_evidence: RequestAuthEvidence,
     connection: ResponsesWebsocketConnection,
     request_kind: RequestMode,
     // The bridge routes by thread ID, so each socket needs its own identity.
@@ -298,6 +300,26 @@ impl ConnectionPool {
         self: &Arc<Self>,
         work: Option<&dyn codex_protocol::mcp_work::McpAttemptWork>,
     ) -> Result<ConnectionLease, LunaSamplerError> {
+        self.lease_with_attempt(work).await.0
+    }
+
+    pub(super) async fn lease_with_attempt(
+        self: &Arc<Self>,
+        work: Option<&dyn codex_protocol::mcp_work::McpAttemptWork>,
+    ) -> (
+        Result<ConnectionLease, LunaSamplerError>,
+        RequestAuthEvidence,
+    ) {
+        let mut evidence = RequestAuthEvidence::default();
+        let result = self.lease_with_work_inner(work, &mut evidence).await;
+        (result, evidence)
+    }
+
+    async fn lease_with_work_inner(
+        self: &Arc<Self>,
+        work: Option<&dyn codex_protocol::mcp_work::McpAttemptWork>,
+        evidence: &mut RequestAuthEvidence,
+    ) -> Result<ConnectionLease, LunaSamplerError> {
         let work = super::super::work::derive(self.config.require_account_work, work)?;
         // Reserve before the first semaphore, routing or transport await. A
         // dropped response transfers this exact token, even after stop closes.
@@ -312,7 +334,7 @@ impl ConnectionPool {
             .map_err(|_| LunaSamplerError::Superseded)?;
         let admitted = Instant::now();
         let setup = self.client_setup().await?;
-        let fresh_connection = self.runtime_connection(&setup).await?;
+        let fresh_connection = self.runtime_connection(&setup, evidence.clone()).await?;
         let ClientSetup {
             mut provider,
             auth,
@@ -355,6 +377,7 @@ impl ConnectionPool {
         };
         let (connection, thread_id, request_kind) = match connection {
             Some(connection) => {
+                *evidence = connection.auth_evidence.clone();
                 if self
                     .idle_connections
                     .lock()
@@ -369,6 +392,9 @@ impl ConnectionPool {
                 (Connection::Websocket(connection), thread_id, request_kind)
             }
             None => {
+                // Discarded handshake evidence cannot authenticate HTTP fallback.
+                *evidence = RequestAuthEvidence::default();
+                let auth = evidence.observe(auth);
                 self.replenish_with_work(work.as_deref());
                 // Sampling owns the retry budget across both transports.
                 provider.retry.max_attempts = 0;
@@ -554,6 +580,7 @@ impl ConnectionPool {
     async fn runtime_connection(
         &self,
         setup: &ClientSetup,
+        evidence: RequestAuthEvidence,
     ) -> Result<Option<PooledConnection>, LunaSamplerError> {
         if setup.runtime_id.is_none() || !self.config.provider.info().supports_websockets {
             return Ok(None);
@@ -569,7 +596,10 @@ impl ConnectionPool {
         let Ok(permit) = Arc::clone(&self.sockets).try_acquire_owned() else {
             return Ok(None);
         };
-        match self.open_connection_with_setup(permit, setup.clone()).await {
+        match self
+            .open_connection_with_setup(permit, setup.clone(), evidence)
+            .await
+        {
             Ok(connection) => Ok(Some(connection)),
             Err(LunaSamplerError::ConnectionTimeout) => {
                 *self
@@ -602,14 +632,19 @@ impl ConnectionPool {
         &self,
         permit: OwnedSemaphorePermit,
     ) -> Result<PooledConnection, LunaSamplerError> {
-        self.open_connection_with_setup(permit, self.client_setup().await?)
-            .await
+        self.open_connection_with_setup(
+            permit,
+            self.client_setup().await?,
+            RequestAuthEvidence::default(),
+        )
+        .await
     }
 
     async fn open_connection_with_setup(
         &self,
         permit: OwnedSemaphorePermit,
         setup: ClientSetup,
+        auth_evidence: RequestAuthEvidence,
     ) -> Result<PooledConnection, LunaSamplerError> {
         let ClientSetup {
             provider,
@@ -630,7 +665,7 @@ impl ConnectionPool {
         );
 
         let provider_info = self.config.provider.info();
-        let client = ResponsesWebsocketClient::new(provider, auth);
+        let client = ResponsesWebsocketClient::new(provider, auth_evidence.observe(auth));
         let connect = async {
             let connector = self
                 .websocket_connector
@@ -692,6 +727,7 @@ impl ConnectionPool {
         }
 
         Ok(PooledConnection {
+            auth_evidence,
             connection,
             request_kind,
             thread_id,

@@ -226,13 +226,17 @@ impl SamplingExecution {
             telemetry.attempts = telemetry.attempts.saturating_add(1);
             completion.output = Some(Vec::new());
             completion.remaining_tokens = retention_budget;
-            let lease = match tokio::select! {
+            let (lease_result, rejected_credential) = tokio::select! {
                 biased;
                 _ = &mut owner_changed => return Err(account_changed_error()),
-                lease = self.connections.lease_with_work(self.work.as_deref()) => lease,
-            } {
+                lease = self.connections.lease_with_attempt(self.work.as_deref()) => lease,
+            };
+            let lease = match lease_result {
                 Ok(lease) => lease,
                 Err(error) => {
+                    if let Some(recovery) = auth_recovery.as_mut() {
+                        recovery.record_failed_credential(rejected_credential.fingerprint());
+                    }
                     if self
                         .retry_after_failure(&error, &mut auth_recovery, &mut retries)
                         .await
@@ -310,6 +314,9 @@ impl SamplingExecution {
                 Ok(stream) => stream,
                 Err(error) => {
                     let error = LunaSamplerError::Api(error);
+                    if let Some(recovery) = auth_recovery.as_mut() {
+                        recovery.record_failed_credential(rejected_credential.fingerprint());
+                    }
                     if self
                         .retry_after_failure(&error, &mut auth_recovery, &mut retries)
                         .await
@@ -334,6 +341,9 @@ impl SamplingExecution {
                         let error = LunaSamplerError::Api(error);
                         if completion.ready.is_none() {
                             return Err(error);
+                        }
+                        if let Some(recovery) = auth_recovery.as_mut() {
+                            recovery.record_failed_credential(rejected_credential.fingerprint());
                         }
                         if self
                             .retry_after_failure(&error, &mut auth_recovery, &mut retries)

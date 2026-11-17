@@ -4159,3 +4159,59 @@ async fn native_bound_renewal_publishes_fresh_snapshot_and_preserves_source() ->
     );
     Ok(())
 }
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn native_bound_renewal_refuses_stale_storage_and_unproven_source() -> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    for replace_storage in [false, true] {
+        let home = tempdir()?;
+        let server = MockServer::start().await;
+        let manager = native_owner_fixture(home.path(), &server.uri()).await?;
+        let expected = manager.owner_snapshot().context("owner")?;
+        let binding = manager.renewal_binding().context("binding")?;
+        let storage = FileAuthStorage::new(home.path().to_path_buf());
+        let original = storage.load()?.context("initial storage")?;
+        let mut replacement = original.clone();
+        replacement.tokens.as_mut().context("tokens")?.refresh_token =
+            "concurrent-login-refresh".into();
+        let expected_storage = if replace_storage {
+            replacement.clone()
+        } else {
+            original
+        };
+        Mock::given(path("/oauth/token"))
+            .respond_with(move |_: &wiremock::Request| {
+                if replace_storage {
+                    storage.save(&replacement).expect("synthetic concurrent login");
+                }
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "access_token": if replace_storage { "test-access-token" } else { "unproven-new-source" },
+                    "refresh_token": "late-renewal"
+                }))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert!(
+            manager
+                .refresh_native_for_owner(&expected, &binding, RefreshReason::Forced)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            FileAuthStorage::new(home.path().to_path_buf()).load()?,
+            Some(expected_storage)
+        );
+        assert_eq!(
+            manager
+                .auth_cached()
+                .context("unchanged cached auth")?
+                .get_token_data()?
+                .refresh_token,
+            "test-refresh-token"
+        );
+        assert_eq!(manager.owner_snapshot(), Some(expected));
+    }
+    Ok(())
+}

@@ -418,3 +418,26 @@ async fn actual_endpoint_timeout_keeps_original_auth_child_counted_until_join() 
     assert!(f.held.finished.load(Ordering::SeqCst));
     assert!(f.server.received_requests().await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn managed_reset_bad_configuration_keeps_old_catalog_and_marks_reload_required() {
+    let fixture = fixture(false, false, false).await;
+    let previous = {
+        let state = fixture.catalog.state.lock().await;
+        (Arc::clone(&state.config), Arc::clone(&state.models_manager))
+    };
+    std::fs::write(
+        fixture._home.path().join("config.toml"),
+        "model_provider = [",
+    )
+    .unwrap();
+    assert!(matches!(
+        fixture.catalog.reset_for_managed_auth().await,
+        Err(ModelCatalogResetError::Config)
+    ));
+    let state = fixture.catalog.state.lock().await;
+    assert!(Arc::ptr_eq(&state.config, &previous.0));
+    assert!(Arc::ptr_eq(&state.models_manager, &previous.1));
+    assert!(state.needs_reload);
+    assert_eq!(fixture.held.calls.load(Ordering::SeqCst), 1);
+}

@@ -183,6 +183,14 @@ impl ThreadModelCatalog {
             }
     }
 
+    pub(super) fn publish_managed_api_key_model_discovery(
+        &self,
+        enabled: bool,
+    ) -> Result<(), codex_models_manager::manager::ManagedModelsResetError> {
+        self.factory
+            .publish_managed_api_key_model_discovery(enabled)
+    }
+
     pub(super) fn set_api_key_model_discovery_enabled(&self, enabled: bool) {
         self.factory.set_api_key_model_discovery_enabled(enabled);
     }

@@ -971,3 +971,193 @@ async fn managed_reset_refuses_logout_intent_without_credential_change_during_ca
     assert!(manager.get_remote_models().await.is_empty());
     assert!(manager.refreshed_model_catalog().is_none());
 }
+
+#[tokio::test]
+async fn retired_family_invalidates_without_resolving_failing_old_endpoint() {
+    let endpoint = TestModelsEndpoint::with_command_auth(vec![Err(CodexErr::InvalidRequest(
+        "retired provider must not be contacted".to_string(),
+    ))]);
+    let cache = Arc::new(TestModelsCache::default());
+    let manager = OpenAiModelsManager::new_with_cache(cache.clone(), endpoint.clone(), None)
+        .with_provider_catalog();
+    assert_eq!(manager.retire_for_managed_auth().await, Ok(()));
+    assert_eq!(endpoint.fetch_count(), 0);
+    let entry = cache.entry.lock().unwrap().clone().unwrap();
+    assert!(entry.identity.is_none());
+    assert!(entry.models.is_empty());
+    assert!(manager.refreshed_model_catalog().is_none());
+}
+
+#[tokio::test]
+async fn retired_family_waits_for_original_cache_publication_without_refetch() {
+    let cache = ControlledStoreCache::new(1, 0);
+    let endpoint = TestModelsEndpoint::new(vec![vec![remote_model("old-provider", "Old", 0)]]);
+    let manager = Arc::new(
+        OpenAiModelsManager::new_with_cache(cache.clone(), endpoint.clone(), None)
+            .with_provider_catalog(),
+    );
+    let old_manager = manager.clone();
+    let old = tokio::spawn(async move {
+        old_manager
+            .list_models(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), cache.entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let mut retirement = manager.retire_for_managed_auth();
+    poll_pending(retirement.as_mut()).await;
+    assert_eq!(cache.calls.load(Ordering::SeqCst), 1);
+    cache.release.add_permits(1);
+    old.await.unwrap();
+    assert_eq!(retirement.await, Ok(()));
+    assert_eq!(endpoint.fetch_count(), 1);
+    let entry = cache.inner.entry.lock().unwrap().clone().unwrap();
+    assert!(entry.identity.is_none());
+    assert!(entry.models.is_empty());
+}
+
+#[tokio::test]
+async fn retirement_requires_explicit_manager_support_and_preserves_static_authority() {
+    let static_manager = StaticModelsManager::new(
+        None,
+        ModelsResponse {
+            models: vec![remote_model("configured", "Configured", 0)],
+        },
+        ModelOrigin::ExplicitConfig,
+    );
+    assert_eq!(static_manager.retire_for_managed_auth().await, Ok(()));
+    assert_eq!(static_manager.get_remote_models().await.len(), 1);
+    let unknown = UnknownResetManager(static_manager);
+    assert_eq!(
+        unknown.retire_for_managed_auth().await,
+        Err(ManagedModelsResetError::Unsupported)
+    );
+}
+
+#[tokio::test]
+async fn retired_family_refuses_failed_cache_invalidation() {
+    let endpoint = TestModelsEndpoint::with_command_auth(vec![Err(CodexErr::InvalidRequest(
+        "retired endpoint must not be contacted".to_string(),
+    ))]);
+    let manager = OpenAiModelsManager::new_with_cache(
+        TestModelsCache::failing(false, true),
+        endpoint.clone(),
+        None,
+    );
+    assert_eq!(
+        manager.retire_for_managed_auth().await,
+        Err(ManagedModelsResetError::Cache)
+    );
+    assert_eq!(endpoint.fetch_count(), 0);
+}
+
+#[tokio::test]
+async fn staged_discovery_enables_fresh_reset_without_publishing_early() {
+    let endpoint =
+        TestModelsEndpoint::without_refresh(vec![vec![remote_model("staged", "Staged", 0)]]);
+    let auth = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("synthetic-key"));
+    let manager = OpenAiModelsManager::new_without_cache(endpoint.clone(), Some(auth));
+    manager.set_api_key_model_discovery_enabled(false);
+    assert_eq!(
+        manager
+            .reset_for_managed_auth_with_discovery(DEFAULT_HTTP_CLIENT_FACTORY, true)
+            .await,
+        Ok(())
+    );
+    assert_eq!(endpoint.fetch_count(), 1);
+    assert!(!manager.settings.api_key_model_discovery_enabled());
+    assert!(manager.remote_models.read().await.entry.identity.is_some());
+    manager
+        .publish_managed_api_key_model_discovery(true)
+        .unwrap();
+    assert_eq!(
+        manager.get_remote_models().await,
+        vec![remote_model("staged", "Staged", 0)]
+    );
+}
+
+#[tokio::test]
+async fn staged_discovery_disables_fetch_despite_old_live_enablement() {
+    let endpoint =
+        TestModelsEndpoint::without_refresh(vec![vec![remote_model("forbidden", "Forbidden", 0)]]);
+    let auth = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("synthetic-key"));
+    let manager = OpenAiModelsManager::new_without_cache(endpoint.clone(), Some(auth));
+    manager.set_api_key_model_discovery_enabled(true);
+    assert_eq!(
+        manager
+            .reset_for_managed_auth_with_discovery(DEFAULT_HTTP_CLIENT_FACTORY, false)
+            .await,
+        Ok(())
+    );
+    assert_eq!(endpoint.fetch_count(), 0);
+    assert!(manager.settings.api_key_model_discovery_enabled());
+    assert!(manager.remote_models.read().await.entry.identity.is_none());
+    manager
+        .publish_managed_api_key_model_discovery(false)
+        .unwrap();
+    assert!(!manager.settings.api_key_model_discovery_enabled());
+}
+
+#[tokio::test]
+async fn staged_discovery_disable_preserves_command_auth_catalog_refresh() {
+    let endpoint = TestModelsEndpoint::with_command_auth(vec![Ok(vec![remote_model(
+        "command", "Command", 0,
+    )])]);
+    let manager = OpenAiModelsManager::new_without_cache(endpoint.clone(), None);
+    assert_eq!(
+        manager
+            .reset_for_managed_auth_with_discovery(DEFAULT_HTTP_CLIENT_FACTORY, false)
+            .await,
+        Ok(())
+    );
+    assert_eq!(endpoint.fetch_count(), 1);
+}
+
+#[test]
+fn managed_discovery_publication_refuses_poison_instead_of_recovering() {
+    let settings = ModelCatalogSettings::default();
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _live = settings.live_discovery.lock().unwrap();
+            panic!("poison synthetic live discovery publication");
+        }))
+        .is_err()
+    );
+    assert_eq!(
+        settings.publish_managed_api_key_model_discovery(true),
+        Err(ManagedModelsResetError::DiscoveryPublication)
+    );
+}
+
+#[tokio::test]
+async fn staged_reset_and_publication_require_explicit_manager_support() {
+    let static_manager = StaticModelsManager::new(
+        None,
+        ModelsResponse { models: Vec::new() },
+        ModelOrigin::ExplicitConfig,
+    );
+    assert_eq!(
+        static_manager
+            .reset_for_managed_auth_with_discovery(DEFAULT_HTTP_CLIENT_FACTORY, true)
+            .await,
+        Ok(())
+    );
+    assert_eq!(
+        static_manager.publish_managed_api_key_model_discovery(true),
+        Ok(())
+    );
+    let unknown = UnknownResetManager(static_manager);
+    assert_eq!(
+        unknown
+            .reset_for_managed_auth_with_discovery(DEFAULT_HTTP_CLIENT_FACTORY, true)
+            .await,
+        Err(ManagedModelsResetError::Unsupported)
+    );
+    assert_eq!(
+        unknown.publish_managed_api_key_model_discovery(true),
+        Err(ManagedModelsResetError::Unsupported)
+    );
+}

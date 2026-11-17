@@ -10,6 +10,7 @@ use codex_core::config::Config;
 use codex_features::Feature;
 use codex_model_provider_info::OPENAI_PROVIDER_ID;
 use codex_models_manager::ModelOrigin;
+use codex_models_manager::manager::ManagedModelsResetError;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_models_manager::manager::SharedModelsManager;
 use codex_protocol::openai_models::ModelPreset;
@@ -26,6 +27,40 @@ pub(crate) struct ModelCatalog {
     startup_cwd: Option<PathBuf>,
     state: Mutex<CatalogState>,
     auth_tasks: crate::processor_task_retirement::ProcessorTasks,
+}
+
+/// Secret-safe errors; configuration/provider diagnostics can carry secrets.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ModelCatalogResetError {
+    #[error("model catalog strict configuration unavailable")]
+    Config,
+    #[error("model catalog provider requirements refused reset")]
+    ProviderRequirements,
+    #[error("model catalog reset failed: {0:?}")]
+    Catalog(ManagedModelsResetError),
+}
+
+async fn reset_model_roots(
+    startup: SharedModelsManager,
+    current: SharedModelsManager,
+    selected: &SharedModelsManager,
+    factory: codex_http_client::HttpClientFactory,
+    discovery: bool,
+) -> Result<(), ModelCatalogResetError> {
+    let mut retired: Vec<SharedModelsManager> = Vec::new();
+    for old in [startup, current] {
+        if Arc::ptr_eq(&old, selected) || retired.iter().any(|prior| Arc::ptr_eq(prior, &old)) {
+            continue;
+        }
+        old.retire_for_managed_auth()
+            .await
+            .map_err(ModelCatalogResetError::Catalog)?;
+        retired.push(old);
+    }
+    selected
+        .reset_for_managed_auth_with_discovery(factory, discovery)
+        .await
+        .map_err(ModelCatalogResetError::Catalog)
 }
 
 struct CatalogState {
@@ -53,6 +88,61 @@ impl ModelCatalog {
                 models_manager,
             }),
         }
+    }
+
+    /// The caller owns the account admission barrier, original task census and
+    /// deadline. This method never admits new background work during reset.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "serialize strict reload with current/invalidate; no fallback state is published"
+    )]
+    pub(crate) async fn reset_for_managed_auth(&self) -> Result<(), ModelCatalogResetError> {
+        let mut state = self.state.lock().await;
+        state.needs_reload = true;
+        let config = self
+            .config_manager
+            .load_managed_reset_config()
+            .await
+            .map_err(|_| ModelCatalogResetError::Config)?;
+        self.config_manager
+            .check_thread_model_provider(&config)
+            .await
+            .map_err(|_| ModelCatalogResetError::ProviderRequirements)?;
+        let changed = config.model_provider_id != state.config.model_provider_id
+            || config.model_provider != state.config.model_provider
+            || config.model_catalog != state.config.model_catalog
+            || config.features.enabled(Feature::RuntimeAgentInstances)
+                != state
+                    .config
+                    .features
+                    .enabled(Feature::RuntimeAgentInstances)
+            || config.runtime_auth_mode != state.config.runtime_auth_mode;
+        let selected = if changed {
+            self.thread_manager.models_manager_for_config(&config)
+        } else {
+            Arc::clone(&state.models_manager)
+        };
+        let discovery = config.features.enabled(Feature::ApiKeyModelDiscovery);
+        reset_model_roots(
+            self.thread_manager.get_models_manager(),
+            Arc::clone(&state.models_manager),
+            &selected,
+            config.http_client_factory(),
+            discovery,
+        )
+        .await?;
+        // Requirements may have changed while the selected endpoint was awaited.
+        self.config_manager
+            .check_thread_model_provider(&config)
+            .await
+            .map_err(|_| ModelCatalogResetError::ProviderRequirements)?;
+        self.thread_manager
+            .publish_managed_api_key_model_discovery(discovery)
+            .map_err(ModelCatalogResetError::Catalog)?;
+        state.config = Arc::new(config);
+        state.models_manager = selected;
+        state.needs_reload = false;
+        Ok(())
     }
 
     /// Loads the same startup context used to reload the catalog after account setup.
@@ -227,3 +317,7 @@ impl ModelCatalog {
 #[cfg(test)]
 #[path = "model_auth_task_tests.rs"]
 mod auth_task_tests;
+
+#[cfg(test)]
+#[path = "model_reset_tests.rs"]
+mod reset_tests;

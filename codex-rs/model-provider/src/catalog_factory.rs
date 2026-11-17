@@ -16,6 +16,14 @@ pub trait ModelCatalogFactory: Send + Sync {
         api_key_model_discovery_default: bool,
     ) -> SharedModelsManager;
 
+    /// Managed publication must be explicit and fallible; a no-op default is not acknowledgement.
+    fn publish_managed_api_key_model_discovery(
+        &self,
+        _enabled: bool,
+    ) -> Result<(), codex_models_manager::manager::ManagedModelsResetError> {
+        Err(codex_models_manager::manager::ManagedModelsResetError::Unsupported)
+    }
+
     /// Publish a live discovery setting to existing and future catalogs.
     /// Sources that do not perform API-key discovery may ignore it.
     fn set_api_key_model_discovery_enabled(&self, _enabled: bool) {}
@@ -35,5 +43,12 @@ impl ModelCatalogFactory for ModelCatalogSettings {
 
     fn set_api_key_model_discovery_enabled(&self, enabled: bool) {
         ModelCatalogSettings::set_api_key_model_discovery_enabled(self, enabled);
+    }
+
+    fn publish_managed_api_key_model_discovery(
+        &self,
+        enabled: bool,
+    ) -> Result<(), codex_models_manager::manager::ManagedModelsResetError> {
+        ModelCatalogSettings::publish_managed_api_key_model_discovery(self, enabled)
     }
 }

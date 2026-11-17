@@ -1271,6 +1271,15 @@ impl ThreadManager {
         Ok(info.model)
     }
 
+    pub fn publish_managed_api_key_model_discovery(
+        &self,
+        enabled: bool,
+    ) -> Result<(), codex_models_manager::manager::ManagedModelsResetError> {
+        self.state
+            .model_catalog
+            .publish_managed_api_key_model_discovery(enabled)
+    }
+
     pub fn set_api_key_model_discovery_enabled(&self, enabled: bool) {
         self.state
             .model_catalog

@@ -164,6 +164,7 @@ pub enum ManagedModelsResetError {
     Endpoint,
     AuthChanged,
     OriginatorInventory,
+    DiscoveryPublication,
 }
 
 /// Coordinates model discovery plus cached metadata on disk.
@@ -202,6 +203,31 @@ pub trait ModelsManager: fmt::Debug + Send + Sync {
     /// Update API-key discovery for this catalog and its derived catalogs.
     /// Static catalogs ignore this setting.
     fn set_api_key_model_discovery_enabled(&self, _enabled: bool) {}
+
+    /// Fence and invalidate a retired catalog family without resolving credentials
+    /// or contacting an endpoint that is no longer selected.
+    fn retire_for_managed_auth(
+        &self,
+    ) -> ModelsManagerFuture<'_, Result<(), ManagedModelsResetError>> {
+        Box::pin(async { Err(ManagedModelsResetError::Unsupported) })
+    }
+
+    /// Use the selected discovery policy without publishing a shared live setting.
+    fn reset_for_managed_auth_with_discovery(
+        &self,
+        _http_client_factory: HttpClientFactory,
+        _enabled: bool,
+    ) -> ModelsManagerFuture<'_, Result<(), ManagedModelsResetError>> {
+        Box::pin(async { Err(ManagedModelsResetError::Unsupported) })
+    }
+
+    /// Strict factory/test-owner publication; ordinary live-setting behavior is unchanged.
+    fn publish_managed_api_key_model_discovery(
+        &self,
+        _enabled: bool,
+    ) -> Result<(), ManagedModelsResetError> {
+        Err(ManagedModelsResetError::Unsupported)
+    }
 
     /// Fence prior publications and replace account-bound state before managed success.
     /// Unknown implementations must refuse rather than acknowledge an incomplete reset.
@@ -418,6 +444,18 @@ impl ModelCatalogSettings {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(enabled);
     }
 
+    pub fn publish_managed_api_key_model_discovery(
+        &self,
+        enabled: bool,
+    ) -> Result<(), ManagedModelsResetError> {
+        let mut live = self
+            .live_discovery
+            .lock()
+            .map_err(|_| ManagedModelsResetError::DiscoveryPublication)?;
+        *live = Some(enabled);
+        Ok(())
+    }
+
     fn api_key_model_discovery_enabled(&self) -> bool {
         self.live_discovery
             .lock()
@@ -541,20 +579,13 @@ impl StaticModelsManager {
 impl ModelsManager for OpenAiModelsManager {
     #[expect(
         clippy::await_holding_invalid_type,
-        reason = "exclusive family publication fence spans reset; ordinary refreshes use its read side and hold no catalog state across I/O"
+        reason = "exclusive family fence spans invalidation; no endpoint/auth refresh runs"
     )]
-    fn reset_for_managed_auth(
+    fn retire_for_managed_auth(
         &self,
-        http_client_factory: HttpClientFactory,
     ) -> ModelsManagerFuture<'_, Result<(), ManagedModelsResetError>> {
         Box::pin(async move {
-            // Wait for every prior refresh/cache/TTL publication before invalidation.
-            // No task is detached or aborted. The inventory caller owns the deadline.
-            let _reset = self.reset_publication.write().await;
-            let auth_changes = self
-                .auth_manager
-                .as_ref()
-                .map(|auth| auth.auth_change_state_receiver());
+            let _retirement = self.reset_publication.write().await;
             let mut pending: Vec<_> = self
                 .originator_managers
                 .lock()
@@ -573,26 +604,37 @@ impl ModelsManager for OpenAiModelsManager {
                         .cloned(),
                 );
                 descendants.push(manager);
-                // Keep a large inventory cancellable by its caller-owned deadline.
                 tokio::task::yield_now().await;
             }
-            // A concurrently created descendant starts with an account-independent seed.
-            // Its first cache/endpoint access must wait on this same family fence.
-            self.reset_local_for_managed_auth(http_client_factory.clone())
-                .await?;
+            self.invalidate_local_for_managed_auth().await?;
             for manager in descendants {
-                manager
-                    .reset_local_for_managed_auth(http_client_factory.clone())
-                    .await?;
-            }
-            if auth_changes
-                .as_ref()
-                .is_some_and(|changes| changes.has_changed().unwrap_or(true))
-            {
-                return Err(ManagedModelsResetError::AuthChanged);
+                manager.invalidate_local_for_managed_auth().await?;
             }
             Ok(())
         })
+    }
+
+    fn reset_for_managed_auth(
+        &self,
+        http_client_factory: HttpClientFactory,
+    ) -> ModelsManagerFuture<'_, Result<(), ManagedModelsResetError>> {
+        Box::pin(self.reset_family_for_managed_auth(http_client_factory, None))
+    }
+
+    fn reset_for_managed_auth_with_discovery(
+        &self,
+        http_client_factory: HttpClientFactory,
+        enabled: bool,
+    ) -> ModelsManagerFuture<'_, Result<(), ManagedModelsResetError>> {
+        Box::pin(self.reset_family_for_managed_auth(http_client_factory, Some(enabled)))
+    }
+
+    fn publish_managed_api_key_model_discovery(
+        &self,
+        enabled: bool,
+    ) -> Result<(), ManagedModelsResetError> {
+        self.settings
+            .publish_managed_api_key_model_discovery(enabled)
     }
 
     fn ensure_initialized(
@@ -797,15 +839,64 @@ impl ModelsManager for OpenAiModelsManager {
 }
 
 impl OpenAiModelsManager {
-    /// Called only with the family's exclusive reset publication right.
-    async fn reset_local_for_managed_auth(
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "exclusive family publication fence spans strict reset without state locks over I/O"
+    )]
+    async fn reset_family_for_managed_auth(
         &self,
         http_client_factory: HttpClientFactory,
+        discovery: Option<bool>,
     ) -> Result<(), ManagedModelsResetError> {
+        // Wait for every prior refresh/cache/TTL publication before invalidation.
+        // No task is detached or aborted. The inventory caller owns the deadline.
+        let _reset = self.reset_publication.write().await;
         let auth_changes = self
             .auth_manager
             .as_ref()
             .map(|auth| auth.auth_change_state_receiver());
+        let mut pending: Vec<_> = self
+            .originator_managers
+            .lock()
+            .map_err(|_| ManagedModelsResetError::OriginatorInventory)?
+            .values()
+            .cloned()
+            .collect();
+        let mut descendants = Vec::new();
+        while let Some(manager) = pending.pop() {
+            pending.extend(
+                manager
+                    .originator_managers
+                    .lock()
+                    .map_err(|_| ManagedModelsResetError::OriginatorInventory)?
+                    .values()
+                    .cloned(),
+            );
+            descendants.push(manager);
+            // Keep a large inventory cancellable by its caller-owned deadline.
+            tokio::task::yield_now().await;
+        }
+        // A concurrently created descendant starts with an account-independent seed.
+        // Its first cache/endpoint access must wait on this same family fence.
+        self.reset_local_for_managed_auth(http_client_factory.clone(), discovery)
+            .await?;
+        for manager in descendants {
+            manager
+                .reset_local_for_managed_auth(http_client_factory.clone(), discovery)
+                .await?;
+        }
+        if auth_changes
+            .as_ref()
+            .is_some_and(|changes| changes.has_changed().unwrap_or(true))
+        {
+            return Err(ManagedModelsResetError::AuthChanged);
+        }
+        Ok(())
+    }
+
+    /// Called only with the family's exclusive publication fence. This phase
+    /// does not ask the retired provider for credentials or a new catalog.
+    async fn invalidate_local_for_managed_auth(&self) -> Result<String, ManagedModelsResetError> {
         let models = match self.catalog_source {
             CatalogSource::Default => load_remote_models_from_file()
                 .map_err(|_| ManagedModelsResetError::BundledCatalog)?,
@@ -831,8 +922,24 @@ impl OpenAiModelsManager {
                 .await
                 .map_err(|_| ManagedModelsResetError::Cache)?;
         }
-        let should_refresh =
-            !self.api_key_discovery_disabled() && self.should_refresh_models().await;
+        Ok(client_version)
+    }
+
+    /// Called only with the family's exclusive reset publication right.
+    async fn reset_local_for_managed_auth(
+        &self,
+        http_client_factory: HttpClientFactory,
+        discovery: Option<bool>,
+    ) -> Result<(), ManagedModelsResetError> {
+        let auth_changes = self
+            .auth_manager
+            .as_ref()
+            .map(|auth| auth.auth_change_state_receiver());
+        let client_version = self.invalidate_local_for_managed_auth().await?;
+        let should_refresh = match discovery {
+            Some(enabled) => self.should_refresh_models_with_discovery(enabled).await,
+            None => !self.api_key_discovery_disabled() && self.should_refresh_models().await,
+        };
         if auth_changes
             .as_ref()
             .is_some_and(|changes| changes.has_changed().unwrap_or(true))
@@ -1133,6 +1240,19 @@ impl OpenAiModelsManager {
         )
     }
 
+    async fn should_refresh_models_with_discovery(&self, enabled: bool) -> bool {
+        let uses_api_key = self.uses_api_key_auth();
+        let command = self.endpoint_client.has_command_auth();
+        let supports_api_key = self.endpoint_client.supports_api_key_models();
+        if uses_api_key && !command && (!supports_api_key || !enabled) {
+            return false;
+        }
+        self.endpoint_client.supports_gateway_catalog()
+            || self.endpoint_client.uses_codex_backend().await
+            || command
+            || (supports_api_key && !command && uses_api_key && enabled)
+    }
+
     async fn should_refresh_models(&self) -> bool {
         self.endpoint_client.supports_gateway_catalog()
             || self.endpoint_client.uses_codex_backend().await
@@ -1239,6 +1359,27 @@ impl OpenAiModelsManager {
 }
 
 impl ModelsManager for StaticModelsManager {
+    fn reset_for_managed_auth_with_discovery(
+        &self,
+        _http_client_factory: HttpClientFactory,
+        _enabled: bool,
+    ) -> ModelsManagerFuture<'_, Result<(), ManagedModelsResetError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn publish_managed_api_key_model_discovery(
+        &self,
+        _enabled: bool,
+    ) -> Result<(), ManagedModelsResetError> {
+        Ok(())
+    }
+
+    fn retire_for_managed_auth(
+        &self,
+    ) -> ModelsManagerFuture<'_, Result<(), ManagedModelsResetError>> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn reset_for_managed_auth(
         &self,
         _http_client_factory: HttpClientFactory,

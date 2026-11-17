@@ -65,6 +65,13 @@ pub fn fixed_model_catalog(
         fn set_api_key_model_discovery_enabled(&self, enabled: bool) {
             self.0.set_api_key_model_discovery_enabled(enabled);
         }
+
+        fn publish_managed_api_key_model_discovery(
+            &self,
+            enabled: bool,
+        ) -> Result<(), codex_models_manager::manager::ManagedModelsResetError> {
+            self.0.publish_managed_api_key_model_discovery(enabled)
+        }
     }
 
     Arc::new(FixedCatalog(manager))

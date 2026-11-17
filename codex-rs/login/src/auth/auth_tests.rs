@@ -3541,3 +3541,173 @@ mod managed_adoption;
 
 #[path = "cache_observation_tests.rs"]
 mod cache_observation;
+
+#[cfg(target_os = "macos")]
+fn command_constructor_environment() -> Vec<EnvVarGuard> {
+    vec![
+        EnvVarGuard::set(
+            "CODEX_CHATGPT_AUTH_COMMAND",
+            "/nonexistent/synthetic-auth-command",
+        ),
+        EnvVarGuard::set("CODEX_CHATGPT_AUTH_BINDING", "fixture#example"),
+        EnvVarGuard::set("CODEX_CHATGPT_AUTH_SOURCE", "source"),
+        EnvVarGuard::set("CODEX_CHATGPT_AUTH_ACCOUNT", "account"),
+        EnvVarGuard::set("CODEX_CHATGPT_AUTH_PRINCIPAL", "principal"),
+        EnvVarGuard::remove(OPENAI_FEDERATION_RULE_ID_ENV_VAR),
+        EnvVarGuard::remove(OPENAI_IDENTITY_TOKEN_FILE_ENV_VAR),
+    ]
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn command_shared_constructor_uses_owned_record_and_shared_authority_not_ambient_auth()
+-> anyhow::Result<()> {
+    let _environment = command_constructor_environment();
+    let _ambient = EnvVarGuard::set(CODEX_ACCESS_TOKEN_ENV_VAR, "unusable-ambient-token");
+    let _api = EnvVarGuard::set("OPENAI_API_KEY", "synthetic-ambient-api-key");
+    let home = tempdir()?;
+    let record = super::command_cache_publication_tests::record(1);
+    super::super::command_store::commit(home.path(), &record, &record.auth()?)?;
+    let original = std::fs::read(home.path().join("auth.json"))?;
+    let first = AuthManager::shared_from_auth_config_with_modes(
+        build_config(home.path(), None, None).await,
+        true,
+        Some(vec![AuthMode::ChatgptAuthTokens]),
+    )
+    .await?;
+    let second = AuthManager::shared_from_auth_config_with_modes(
+        build_config(home.path(), None, None).await,
+        true,
+        Some(vec![AuthMode::ChatgptAuthTokens]),
+    )
+    .await?;
+    assert!(!first.enable_codex_api_key_env);
+    assert!(Arc::ptr_eq(
+        first.command_source.as_ref().unwrap(),
+        second.command_source.as_ref().unwrap()
+    ));
+    for manager in [&first, &second] {
+        let auth = manager.auth_cached().context("owned cached auth")?;
+        assert!(auth.is_external_chatgpt_tokens());
+        assert_eq!(auth.get_token()?, record.access_token);
+        assert!(manager.has_external_auth());
+        assert!(manager.authoritative_auth_cached().is_ok());
+    }
+    assert_eq!(std::fs::read(home.path().join("auth.json"))?, original);
+    // The nonexistent command would fail if construction attempted renewal.
+    let recovered = first
+        .recover_rejected_credential(Some(
+            AuthCredentialFingerprint::from_bearer_header("Bearer older-synthetic-token").unwrap(),
+        ))
+        .await
+        .context("selected authority")??;
+    assert_eq!(recovered.get_token()?, record.access_token);
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn command_shared_constructor_refuses_mode_before_missing_home_access() -> anyhow::Result<()>
+{
+    let _environment = command_constructor_environment();
+    let root = tempdir()?;
+    let absent = root.path().join("must-not-be-created");
+    let result = AuthManager::shared_from_auth_config_with_modes(
+        build_config(&absent, None, None).await,
+        true,
+        Some(vec![AuthMode::ApiKey]),
+    )
+    .await;
+    let error = match result {
+        Ok(_) => panic!("forbidden command mode accepted"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("command auth mode forbidden"));
+    assert!(!absent.exists());
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn command_shared_constructor_rejects_mismatched_owned_identity_without_fallback()
+-> anyhow::Result<()> {
+    let _environment = command_constructor_environment();
+    let _ambient = EnvVarGuard::set("OPENAI_API_KEY", "synthetic-fallback-must-not-win");
+    let home = tempdir()?;
+    let record = super::command_cache_publication_tests::record(1);
+    super::super::command_store::commit(home.path(), &record, &record.auth()?)?;
+    let original = std::fs::read(home.path().join("auth.json"))?;
+    let _wrong = EnvVarGuard::set("CODEX_CHATGPT_AUTH_ACCOUNT", "wrong-account");
+    let result = AuthManager::shared_from_auth_config_with_modes(
+        build_config(home.path(), None, None).await,
+        true,
+        None,
+    )
+    .await;
+    assert!(result.is_err());
+    assert_eq!(std::fs::read(home.path().join("auth.json"))?, original);
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn command_shared_constructor_refuses_wif_conflict_before_command_storage()
+-> anyhow::Result<()> {
+    let _environment = command_constructor_environment();
+    let _rule = EnvVarGuard::set(OPENAI_FEDERATION_RULE_ID_ENV_VAR, "synthetic-rule");
+    let _assertion = EnvVarGuard::set(
+        OPENAI_IDENTITY_TOKEN_FILE_ENV_VAR,
+        "/nonexistent/synthetic-assertion",
+    );
+    let home = tempdir()?;
+    let absent = home.path().join("must-not-be-created");
+    let result = AuthManager::shared_from_auth_config_with_modes(
+        build_config(&absent, None, None).await,
+        true,
+        None,
+    )
+    .await;
+    let error = match result {
+        Ok(_) => panic!("competing authorities accepted"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("conflicting external auth authorities")
+    );
+    assert!(!absent.exists());
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn command_shared_constructor_keeps_partial_wif_configuration_fail_closed()
+-> anyhow::Result<()> {
+    let _environment = command_constructor_environment();
+    let _rule = EnvVarGuard::set(OPENAI_FEDERATION_RULE_ID_ENV_VAR, "synthetic-rule");
+    let home = tempdir()?;
+    let absent = home.path().join("must-not-be-created");
+    let result = AuthManager::shared_from_auth_config_with_modes(
+        build_config(&absent, None, None).await,
+        true,
+        None,
+    )
+    .await;
+    let error = match result {
+        Ok(_) => panic!("partial workload configuration accepted"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains(OPENAI_IDENTITY_TOKEN_FILE_ENV_VAR)
+    );
+    assert!(!absent.exists());
+    Ok(())
+}

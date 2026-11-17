@@ -2628,6 +2628,20 @@ impl AuthManager {
         let initial_load = auth_config
             .load_auth_with_modes(enable_codex_api_key_env, allowed_auth_modes.as_deref())
             .await;
+        Self::from_initial_auth_config(
+            auth_config,
+            enable_codex_api_key_env,
+            allowed_auth_modes,
+            initial_load,
+        )
+    }
+
+    fn from_initial_auth_config(
+        auth_config: AuthConfig,
+        enable_codex_api_key_env: bool,
+        allowed_auth_modes: Option<Vec<AuthMode>>,
+        initial_load: std::io::Result<Option<CodexAuth>>,
+    ) -> Self {
         let initial_load_failed = initial_load.is_err();
         let managed_auth = initial_load.ok().flatten();
         let AuthConfig {
@@ -4423,12 +4437,52 @@ impl AuthManager {
         allowed_auth_modes: Option<Vec<AuthMode>>,
     ) -> Result<Arc<Self>, AuthManagerInitializationError> {
         let external_auth = WorkloadIdentityExternalAuth::from_process_config(&auth_config)?;
-        let mut manager =
+        // Reject competing authorities before command selection touches storage.
+        let command_requested =
+            std::env::var_os("CODEX_CHATGPT_AUTH_COMMAND").is_some_and(|value| !value.is_empty());
+        if command_requested && external_auth.is_some() {
+            return Err(
+                permanent_external_auth_error("conflicting external auth authorities").into(),
+            );
+        }
+        let command_source = super::command_source::CommandSource::selected(
+            &auth_config,
+            allowed_auth_modes.as_deref(),
+        )
+        .map_err(RefreshTokenError::Transient)?;
+        let mut manager = if command_source.is_some() {
+            // Selected command auth must never hydrate ambient API credentials or
+            // a native login snapshot, even transiently before installation.
+            Self::from_initial_auth_config(auth_config, false, allowed_auth_modes, Ok(None))
+        } else {
             Self::new_from_auth_config(auth_config, enable_codex_api_key_env, allowed_auth_modes)
-                .await;
+                .await
+        };
         manager.workload_identity_selected = external_auth.is_some();
+        if let Some(source) = command_source.as_ref() {
+            manager.command_source = Some(Arc::clone(source));
+            *manager.external_auth.get_mut().map_err(|_| {
+                RefreshTokenError::Transient(std::io::Error::other(
+                    "external auth lock is poisoned",
+                ))
+            })? = Some(Arc::new(Arc::clone(source)));
+        }
         let manager = Arc::new(manager);
-        if let Some(external_auth) = external_auth {
+        if let Some(source) = command_source {
+            source
+                .managers
+                .lock()
+                .map_err(|_| {
+                    RefreshTokenError::Transient(std::io::Error::other(
+                        "command manager registry unavailable",
+                    ))
+                })?
+                .push(Arc::downgrade(&manager));
+            // Both authority slots are already installed before resolve can fan
+            // out a publication. Failure returns no partially initialized manager.
+            let auth = manager.resolve_external_auth(&source).await?;
+            manager.commit_external_auth(auth)?;
+        } else if let Some(external_auth) = external_auth {
             manager
                 .install_external_auth(Arc::new(external_auth))
                 .await?;

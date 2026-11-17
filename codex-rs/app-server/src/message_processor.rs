@@ -168,6 +168,7 @@ pub(crate) struct MessageProcessor {
     skills_watcher: Arc<SkillsWatcher>,
     account_processor: Arc<AccountRequestProcessor>,
     workspace_routing_tasks: crate::processor_task_retirement::ProcessorTasks,
+    login_tasks: crate::processor_task_retirement::ProcessorTasks,
     apps_processor: AppsRequestProcessor,
     catalog_processor: CatalogRequestProcessor,
     command_exec_processor: CommandExecRequestProcessor,
@@ -205,6 +206,7 @@ pub(crate) struct ProcessorBackgroundShutdown {
     pub command_exec: crate::command_exec::CommandExecSandboxShutdown,
     pub model_auth: crate::processor_task_retirement::ProcessorTaskDrain,
     pub workspace_routing: crate::processor_task_retirement::ProcessorTaskDrain,
+    pub login: Result<crate::request_processors::AccountLoginReport, ()>,
 }
 
 impl ProcessorBackgroundShutdown {
@@ -231,6 +233,7 @@ impl ProcessorBackgroundShutdown {
             && self.command_exec.is_clean()
             && self.model_auth.is_clean()
             && self.workspace_routing.is_clean()
+            && self.login.as_ref().is_ok_and(|report| report.is_clean())
     }
 }
 
@@ -561,6 +564,7 @@ impl MessageProcessor {
                 request_serialization_queues.clone(),
             );
         let workspace_routing_tasks = crate::processor_task_retirement::ProcessorTasks::default();
+        let login_tasks = crate::processor_task_retirement::ProcessorTasks::default();
         let account_processor = AccountRequestProcessor::new(
             auth_manager.clone(),
             Arc::clone(&thread_manager),
@@ -569,6 +573,7 @@ impl MessageProcessor {
             config_manager.clone(),
             Arc::clone(&model_catalog),
             workspace_routing_tasks.ticket(),
+            login_tasks.ticket(),
         );
         let apps_processor = AppsRequestProcessor::new(
             Arc::clone(&thread_manager),
@@ -750,6 +755,7 @@ impl MessageProcessor {
             skills_watcher,
             account_processor,
             workspace_routing_tasks,
+            login_tasks,
             apps_processor,
             catalog_processor,
             command_exec_processor,
@@ -1094,6 +1100,7 @@ impl MessageProcessor {
         if let Some(worker) = &self.turn_cost_worker {
             worker.shutdown();
         }
+        let login = self.begin_login_shutdown(deadline);
         let plugins = self.thread_manager.plugins_manager();
         let (
             models,
@@ -1104,6 +1111,7 @@ impl MessageProcessor {
             plugins,
             command_exec,
             workspace_routing,
+            login,
         ) = tokio::join!(
             self.shutdown_models_refresh_worker_until(deadline),
             async {
@@ -1119,6 +1127,12 @@ impl MessageProcessor {
             self.command_exec_processor
                 .sandbox_cleanup_shutdown_until(deadline),
             self.workspace_routing_tasks.shutdown_until(deadline),
+            async {
+                match login {
+                    Ok(owner) => Ok(owner.wait().await),
+                    Err(_) => Err(()),
+                }
+            },
         );
         // The periodic model producer must finish before taking this auth-task
         // observation. A timeout/panic above remains unclean even if this is zero.
@@ -1133,6 +1147,7 @@ impl MessageProcessor {
             command_exec,
             model_auth,
             workspace_routing,
+            login,
         }
     }
 
@@ -1145,6 +1160,14 @@ impl MessageProcessor {
         if !report.is_clean() {
             tracing::warn!(?report, "processor background retirement incomplete");
         }
+    }
+
+    pub(crate) fn begin_login_shutdown(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> std::io::Result<crate::request_processors::AccountLoginShutdown> {
+        self.account_processor
+            .begin_login_shutdown(deadline, &self.login_tasks)
     }
 
     pub(crate) async fn cancel_active_login(&self) {

@@ -19,6 +19,10 @@ use codex_otel::auth_storage::AuthStorageOriginator;
 use codex_rmcp_client::EnterpriseOAuthCredentialGuard;
 
 mod backend_client;
+mod browser_logins;
+mod login_shutdown;
+pub(crate) use login_shutdown::AccountLoginReport;
+pub(crate) use login_shutdown::AccountLoginShutdown;
 mod bedrock_gov_cloud;
 mod bedrock_setup;
 mod enterprise_login;
@@ -115,6 +119,10 @@ pub(crate) struct AccountRequestProcessor {
     config_manager: ConfigManager,
     model_catalog: Arc<ModelCatalog>,
     workspace_routing_tasks: crate::processor_task_retirement::ProcessorTaskTicket,
+    login_tasks: crate::processor_task_retirement::ProcessorTaskTicket,
+    browser_logins: browser_logins::BrowserLogins,
+    login_shutdown: CancellationToken,
+    login_deadline: Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
     active_login: Arc<Mutex<Option<ActiveLogin>>>,
     workspace_routing: Arc<Mutex<Option<workspace_routing::CachedWorkspaceRouting>>>,
     workspace_routing_fetches: Arc<Mutex<workspace_routing::WorkspaceRoutingFetches>>,
@@ -135,16 +143,20 @@ impl AccountRequestProcessor {
         config_manager: ConfigManager,
         model_catalog: Arc<ModelCatalog>,
         workspace_routing_tasks: crate::processor_task_retirement::ProcessorTaskTicket,
+        login_tasks: crate::processor_task_retirement::ProcessorTaskTicket,
     ) -> Arc<Self> {
         let gateway_notifications = crate::gateway_oauth_notifications::spawn(
             Arc::clone(&auth_manager),
             config_manager.clone(),
             Arc::clone(&outgoing),
         );
+        let login_shutdown = CancellationToken::new();
         let enterprise_login = Arc::new(enterprise_login::EnterpriseLoginState::new(
             Arc::clone(&auth_manager),
             Arc::clone(&thread_manager),
             config_manager.clone(),
+            login_tasks.clone(),
+            login_shutdown.clone(),
         ));
         let processor = Arc::new(Self {
             _gateway_notifications: Arc::new(gateway_notifications),
@@ -155,6 +167,10 @@ impl AccountRequestProcessor {
             config_manager,
             model_catalog,
             workspace_routing_tasks,
+            login_tasks,
+            browser_logins: browser_logins::BrowserLogins::default(),
+            login_shutdown,
+            login_deadline: Arc::new(std::sync::Mutex::new(None)),
             active_login: Arc::new(Mutex::new(None)),
             gateway_login: Arc::new(std::sync::Mutex::new(/*t*/ None)),
             gateway_clients: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -753,7 +769,13 @@ impl AccountRequestProcessor {
         opts: LoginServerOptions,
         pause: Option<crate::turn_admission::TurnAdmissionPause>,
     ) -> Result<(String, String), JSONRPCErrorError> {
-        let server = run_login_server(opts)
+        let work = self
+            .thread_manager
+            .capture_request_operation_work()
+            .map_err(|_| internal_error("login account work unavailable"))?;
+        let server = self
+            .browser_logins
+            .start(opts)
             .map_err(|err| internal_error(format!("failed to start login server: {err}")))?;
         let login_id = Uuid::new_v4();
         let shutdown_handle = server.cancel_handle();
@@ -761,6 +783,10 @@ impl AccountRequestProcessor {
         // Replace active login if present.
         {
             let mut guard = self.active_login.lock().await;
+            if self.login_shutdown.is_cancelled() {
+                shutdown_handle.shutdown();
+                return Err(internal_error("login admission closed"));
+            }
             if let Some(existing) = guard.take() {
                 drop(existing);
             }
@@ -773,6 +799,7 @@ impl AccountRequestProcessor {
         let processor = self.clone();
         let active_login = self.active_login.clone();
         let auth_url = server.auth_url.clone();
+        let admission_cancel = shutdown_handle.clone();
         let task = async move {
             // Workspace credentials may change in the callback. Resume turns after caches and clients are updated.
             let _pause = pause;
@@ -813,7 +840,21 @@ impl AccountRequestProcessor {
                 *guard = None;
             }
         };
-        tokio::spawn(AuthStorageOriginator::current().scope(task));
+        let ticket = self.login_tasks.clone();
+        let originator = AuthStorageOriginator::current();
+        let admitted = self.login_tasks.spawn(async move {
+            if crate::auth_task_work::scope_with_ticket(ticket, work, originator.scope(task))
+                .await
+                .is_err()
+            {
+                tracing::warn!("browser login auth retirement unverified");
+            }
+        });
+        if admitted.is_err() {
+            admission_cancel.shutdown();
+            let _ = self.cancel_login_chatgpt_common(login_id).await;
+            return Err(internal_error("login task admission unavailable"));
+        }
 
         Ok((login_id.to_string(), auth_url))
     }
@@ -826,20 +867,29 @@ impl AccountRequestProcessor {
     async fn login_chatgpt_device_code_response(
         &self,
     ) -> Result<LoginAccountResponse, JSONRPCErrorError> {
+        let work = self
+            .thread_manager
+            .capture_request_operation_work()
+            .map_err(|_| internal_error("login account work unavailable"))?;
         let opts = self
             .login_chatgpt_common(
                 /*codex_streamlined_login*/ false,
                 LoginSuccessPage::default(),
             )
             .await?;
-        let device_code = request_device_code(&opts)
-            .await
-            .map_err(Self::login_chatgpt_device_code_start_error)?;
+        let device_code = tokio::select! {
+            biased;
+            _ = self.login_shutdown.cancelled() => return Err(internal_error("login admission closed")),
+            result = request_device_code(&opts) => result.map_err(Self::login_chatgpt_device_code_start_error)?,
+        };
         let login_id = Uuid::new_v4();
-        let cancel = CancellationToken::new();
+        let cancel = self.login_shutdown.child_token();
 
         {
             let mut guard = self.active_login.lock().await;
+            if self.login_shutdown.is_cancelled() {
+                return Err(internal_error("login admission closed"));
+            }
             if let Some(existing) = guard.take() {
                 drop(existing);
             }
@@ -854,6 +904,7 @@ impl AccountRequestProcessor {
 
         let processor = self.clone();
         let active_login = self.active_login.clone();
+        let admission_cancel = cancel.clone();
         let task = async move {
             let (success, error_msg) = tokio::select! {
                 _ = cancel.cancelled() => {
@@ -881,7 +932,21 @@ impl AccountRequestProcessor {
                 *guard = None;
             }
         };
-        tokio::spawn(AuthStorageOriginator::current().scope(task));
+        let ticket = self.login_tasks.clone();
+        let originator = AuthStorageOriginator::current();
+        let admitted = self.login_tasks.spawn(async move {
+            if crate::auth_task_work::scope_with_ticket(ticket, work, originator.scope(task))
+                .await
+                .is_err()
+            {
+                tracing::warn!("device-code login auth retirement unverified");
+            }
+        });
+        if admitted.is_err() {
+            admission_cancel.cancel();
+            let _ = self.cancel_login_chatgpt_common(login_id).await;
+            return Err(internal_error("login task admission unavailable"));
+        }
 
         Ok(LoginAccountResponse::ChatgptDeviceCode {
             login_id: login_id.to_string(),

@@ -48,6 +48,8 @@ pub(crate) struct EnterpriseLoginState {
     start_gate: Mutex<()>,
     // Account changes cancel queued and running setup before waiting for start_gate.
     setup_cancel: Mutex<CancellationToken>,
+    login_tasks: crate::processor_task_retirement::ProcessorTaskTicket,
+    login_shutdown: CancellationToken,
 }
 
 struct EnterpriseLoginAttempt {
@@ -67,6 +69,8 @@ impl EnterpriseLoginState {
         auth_manager: Arc<AuthManager>,
         thread_manager: Arc<ThreadManager>,
         config_manager: ConfigManager,
+        login_tasks: crate::processor_task_retirement::ProcessorTaskTicket,
+        login_shutdown: CancellationToken,
     ) -> Self {
         Self {
             auth_manager,
@@ -74,7 +78,9 @@ impl EnterpriseLoginState {
             config_manager,
             active: Mutex::new(None),
             start_gate: Mutex::new(()),
-            setup_cancel: Mutex::new(CancellationToken::new()),
+            setup_cancel: Mutex::new(login_shutdown.child_token()),
+            login_tasks,
+            login_shutdown,
         }
     }
 
@@ -86,7 +92,7 @@ impl EnterpriseLoginState {
         if login_id.is_none() {
             let mut setup_cancel = self.setup_cancel.lock().await;
             setup_cancel.cancel();
-            *setup_cancel = CancellationToken::new();
+            *setup_cancel = self.login_shutdown.child_token();
         }
         let (login_id, mut completion) = {
             let active = self.active.lock().await;
@@ -164,6 +170,10 @@ impl EnterpriseLoginState {
         scope: codex_config::McpEmaAuthScope,
         target: EnterpriseLoginTarget,
     ) -> Result<EnterpriseLogin, JSONRPCErrorError> {
+        let work = self
+            .thread_manager
+            .capture_request_operation_work()
+            .map_err(|_| internal_error("enterprise login account work unavailable"))?;
         // MCP requests are not in the account request queue. Serialize start and
         // cancellation here; the separate commit gate stays responsive to the worker.
         let setup_cancel = self.setup_cancel.lock().await.child_token();
@@ -216,7 +226,7 @@ impl EnterpriseLoginState {
         let keyring_backend = request.keyring_backend_kind;
         // Keep commit cancellation under `active`; cancelling the setup epoch must
         // not race an already-admitted synchronous credential write.
-        let cancel = CancellationToken::new();
+        let cancel = self.login_shutdown.child_token();
         let login_id = Uuid::new_v4().to_string();
         let (completed, completion) = watch::channel(EnterpriseLoginCompletion::Pending);
         *self.active.lock().await = Some(EnterpriseLoginAttempt {
@@ -249,7 +259,7 @@ impl EnterpriseLoginState {
         let authorization_url = handle.authorization_url();
         let lifecycle = Arc::clone(self);
         let completion_id = login_id.clone();
-        tokio::spawn(async move {
+        let worker = async move {
             let result = tokio::select! {
                 biased;
                 _ = cancel.cancelled() =>
@@ -303,7 +313,24 @@ impl EnterpriseLoginState {
                 Ok(()) => EnterpriseLoginCompletion::Succeeded,
                 Err(error) => EnterpriseLoginCompletion::Failed(EmaErrorDetail::from_error(&error)),
             });
-        });
+        };
+        let ticket = self.login_tasks.clone();
+        let originator = AuthStorageOriginator::current();
+        if self
+            .login_tasks
+            .spawn(async move {
+                if crate::auth_task_work::scope_with_ticket(ticket, work, originator.scope(worker))
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!("enterprise login auth retirement unverified");
+                }
+            })
+            .is_err()
+        {
+            self.clear(&login_id).await;
+            return Err(internal_error("enterprise sign-in admission unavailable"));
+        }
         Ok(EnterpriseLogin {
             login_id,
             authorization_url,

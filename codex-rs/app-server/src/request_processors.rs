@@ -419,7 +419,6 @@ use codex_login::login_with_api_key;
 use codex_login::login_with_bedrock_api_key;
 use codex_login::oauth_client_id;
 use codex_login::request_device_code;
-use codex_login::run_login_server;
 use codex_mcp::McpRuntimeContext;
 use codex_mcp::McpServerStatusSnapshot;
 use codex_mcp::McpSnapshotDetail;
@@ -579,6 +578,8 @@ mod token_usage_replay;
 mod turn_processor;
 mod windows_sandbox_processor;
 
+pub(crate) use account_processor::AccountLoginReport;
+pub(crate) use account_processor::AccountLoginShutdown;
 pub(crate) use account_processor::AccountRequestProcessor;
 pub(crate) use apps_processor::AppsRequestProcessor;
 pub(crate) use apps_processor::AppsShutdown;

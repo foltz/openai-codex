@@ -154,6 +154,8 @@ impl Harness {
             AnalyticsEventsClient::disabled(),
         ));
         let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
+            managed_transition_control_socket_endpoint: None,
+            managed_transition_process_instance_id: None,
             telemetry_reset: Default::default(),
             control_endpoint: None,
             cloud_skill_provider: None,

@@ -5,6 +5,7 @@ pub(crate) const METHOD_NOT_FOUND_ERROR_CODE: i64 = -32601;
 pub const INVALID_PARAMS_ERROR_CODE: i64 = -32602;
 pub(crate) const INTERNAL_ERROR_CODE: i64 = -32603;
 pub(crate) const OVERLOADED_ERROR_CODE: i64 = -32001;
+pub(crate) const ACCOUNT_TRANSITION_IN_PROGRESS_ERROR_CODE: i64 = -32002;
 pub const INPUT_TOO_LARGE_ERROR_CODE: &str = "input_too_large";
 
 pub(crate) fn server_draining_error() -> JSONRPCErrorError {
@@ -15,6 +16,14 @@ pub(crate) fn server_draining_error() -> JSONRPCErrorError {
 
 pub(crate) fn invalid_request(message: impl Into<String>) -> JSONRPCErrorError {
     error(INVALID_REQUEST_ERROR_CODE, message)
+}
+
+/// Refuse new account work before effects while a transition owns the barrier.
+pub(crate) fn account_transition_in_progress() -> JSONRPCErrorError {
+    error(
+        ACCOUNT_TRANSITION_IN_PROGRESS_ERROR_CODE,
+        "a managed account transition is in progress; retry after it completes",
+    )
 }
 
 pub(crate) fn method_not_found(message: impl Into<String>) -> JSONRPCErrorError {

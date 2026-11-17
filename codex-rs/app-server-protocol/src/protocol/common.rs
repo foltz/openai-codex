@@ -1430,6 +1430,29 @@ client_request_definitions! {
         response: v2::AccountSessionsSwitchResponse,
     },
 
+    // The coordinator owns transition admission. Its long-running start must
+    // not queue independent read/cancel requests behind drain or reset work.
+    #[experimental("account/managedAuthTransition")]
+    ManagedTransitionStart => "account/managedAuthTransition/start" {
+        params: v2::StartManagedTransitionParams,
+        serialization: None,
+        response: v2::StartManagedTransitionResponse,
+    },
+
+    #[experimental("account/managedAuthTransition")]
+    ManagedTransitionRead => "account/managedAuthTransition/read" {
+        params: v2::ReadManagedTransitionParams,
+        serialization: None,
+        response: v2::ReadManagedTransitionResponse,
+    },
+
+    #[experimental("account/managedAuthTransition")]
+    ManagedTransitionCancel => "account/managedAuthTransition/cancel" {
+        params: v2::CancelManagedTransitionParams,
+        serialization: None,
+        response: v2::CancelManagedTransitionResponse,
+    },
+
     LogoutAccount => "account/logout" {
         params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
         serialization: global("account-auth"),
@@ -2126,6 +2149,9 @@ server_notification_definitions! {
     McpServerStatusUpdated => "mcpServer/startupStatus/updated" (v2::McpServerStatusUpdatedNotification),
     #[experimental("mcpServer/event/stream/notification")]
     McpServerEventStream => "mcpServer/event/stream/notification" (v2::McpServerEventStreamNotification),
+    #[experimental("account/managedAuthTransition")]
+    ManagedTransitionStatus => "account/managedAuthTransition/updated" (v2::ManagedTransitionStatusNotification),
+
     AccountUpdated => "account/updated" (v2::AccountUpdatedNotification),
     GatewayOAuthChanged => "account/gatewayOAuth/changed" (v2::GatewayOAuthChangedNotification),
     AccountRateLimitsUpdated => "account/rateLimits/updated" (v2::AccountRateLimitsUpdatedNotification),

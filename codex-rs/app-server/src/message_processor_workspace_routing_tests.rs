@@ -64,6 +64,8 @@ async fn background_routing_call_sites_skip_config(api_key: Option<&str>) -> any
         analytics_events_client.clone(),
     ));
     let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
+        managed_transition_control_socket_endpoint: None,
+        managed_transition_process_instance_id: None,
         telemetry_reset: Default::default(),
         control_endpoint: None,
         cloud_skill_provider: None,
@@ -110,7 +112,8 @@ async fn background_routing_call_sites_skip_config(api_key: Option<&str>) -> any
             TEST_CONNECTION_ID,
             serde_json::from_value(json!({
                 "id": 1, "method": "initialize", "params": {
-                    "clientInfo": {"name": "workspace-routing-test", "version": "1"}
+                    "clientInfo": {"name": "workspace-routing-test", "version": "1"},
+                    "capabilities": {"experimentalApi": true, "interactiveClient": true}
                 }
             }))?,
             &crate::transport::AppServerTransport::Stdio,
@@ -178,7 +181,7 @@ async fn background_routing_call_sites_skip_config(api_key: Option<&str>) -> any
                 "id": 2, "method": "account/read", "params": {"refreshToken": false}
             }))?,
             &crate::transport::AppServerTransport::Stdio,
-            session,
+            Arc::clone(&session),
         )
         .await;
     let response: GetAccountResponse = read_response(&mut outgoing_rx, /*request_id*/ 2).await;
@@ -197,6 +200,97 @@ async fn background_routing_call_sites_skip_config(api_key: Option<&str>) -> any
         Ok(()),
         "explicit account/read must reload config"
     );
+    // The production constructor, dispatcher and turn host must share this
+    // actual barrier. A client-declared role never upgrades stdio provenance.
+    for (id, closed) in [(3, false), (6, true)] {
+        if closed {
+            processor
+                .managed_transition_coordinator
+                .account_work_permits()
+                .close();
+            assert!(
+                processor
+                    .thread_manager
+                    .admit_background_operation_work()
+                    .is_err()
+            );
+        }
+        processor
+            .process_request(
+                TEST_CONNECTION_ID,
+                serde_json::from_value(json!({
+                    "id": id, "method": "account/managedAuthTransition/read", "params": {
+                        "contractVersion": 1, "transitionId": "", "processInstanceId": "untrusted"
+                    }
+                }))?,
+                &crate::transport::AppServerTransport::Stdio,
+                Arc::clone(&session),
+            )
+            .await;
+        let response: codex_app_server_protocol::ReadManagedTransitionResponse =
+            read_response(&mut outgoing_rx, id).await;
+        let codex_app_server_protocol::ReadManagedTransitionResponse::Refused { refusal } =
+            response
+        else {
+            panic!("unproven caller must not read coordinator state")
+        };
+        assert_eq!(
+            refusal.kind,
+            codex_app_server_protocol::ManagedTransitionRefusalKind::AuthorizationNotAdmitted
+        );
+        if !closed {
+            assert!(
+                processor
+                    .managed_transition_coordinator
+                    .try_acquire_account_work_permit()
+                    .is_some()
+            );
+        }
+    }
+    processor
+        .process_request(
+            TEST_CONNECTION_ID,
+            serde_json::from_value(json!({
+                "id": 7, "method": "account/read", "params": {"refreshToken":false}
+            }))?,
+            &crate::transport::AppServerTransport::Stdio,
+            Arc::clone(&session),
+        )
+        .await;
+    loop {
+        let envelope = tokio::time::timeout(Duration::from_secs(5), outgoing_rx.recv())
+            .await?
+            .expect("outgoing channel remains open");
+        if let crate::outgoing_message::OutgoingEnvelope::ToConnection {
+            message: crate::outgoing_message::OutgoingMessage::Error(error),
+            ..
+        } = envelope
+        {
+            assert_eq!(error.id, codex_app_server_protocol::RequestId::Integer(7));
+            assert_eq!(
+                error.error.code,
+                crate::error_code::ACCOUNT_TRANSITION_IN_PROGRESS_ERROR_CODE
+            );
+            break;
+        }
+    }
+    processor
+        .process_request(
+            TEST_CONNECTION_ID,
+            serde_json::from_value(json!({
+                "id": 8, "method": "account/read", "params": {"cacheOnly":true}
+            }))?,
+            &crate::transport::AppServerTransport::Stdio,
+            Arc::clone(&session),
+        )
+        .await;
+    let cached: GetAccountResponse = read_response(&mut outgoing_rx, 8).await;
+    assert!(cached.auth_observation.is_some());
+    assert!(
+        loads_rx.try_recv().is_err(),
+        "barrier refusal/cache observation must not load config"
+    );
+
     processor.shutdown_threads().await;
     Ok(())
 }

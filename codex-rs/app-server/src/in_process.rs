@@ -518,6 +518,8 @@ async fn start_uninitialized(mut args: InProcessStartArgs) -> IoResult<InProcess
         let mut processor_handle = tokio::spawn(async move {
             let (startup_warnings_tx, mut startup_warnings_rx) = mpsc::unbounded_channel();
             let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
+                managed_transition_control_socket_endpoint: None,
+                managed_transition_process_instance_id: None,
                 telemetry_reset: Default::default(),
                 control_endpoint: None,
                 cloud_skill_provider: None,

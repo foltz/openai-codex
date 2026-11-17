@@ -114,7 +114,10 @@ pub(crate) fn classify(request: &ClientRequest) -> AccountDependency {
         | ClientRequest::UserVerificationEnroll { .. }
         | ClientRequest::UserVerificationStatus { .. }
         | ClientRequest::UserVerificationVerify { .. } => AccountDependency::Permit,
-        ClientRequest::BedrockDiscover { .. }
+        ClientRequest::ManagedTransitionStart { .. }
+        | ClientRequest::ManagedTransitionRead { .. }
+        | ClientRequest::ManagedTransitionCancel { .. }
+        | ClientRequest::BedrockDiscover { .. }
         | ClientRequest::CancelLoginAccount { .. }
         | ClientRequest::CollaborationModeList { .. }
         | ClientRequest::CommandExecResize { .. }
@@ -221,9 +224,10 @@ pub(crate) fn classify(request: &ClientRequest) -> AccountDependency {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_app_server_protocol::ExperimentalApi;
 
     fn request(method: &str, params: serde_json::Value) -> ClientRequest {
-        let wire =
+        let wire: codex_app_server_protocol::JSONRPCRequest =
             serde_json::from_value(serde_json::json!({"id":1, "method":method, "params":params}))
                 .unwrap();
         ClientRequest::try_from(wire).unwrap()
@@ -289,5 +293,31 @@ mod tests {
             )),
             AccountDependency::Independent
         );
+    }
+    #[test]
+    fn transition_controls_remain_independent_and_unserialized() {
+        for (method, mut params) in [
+            (
+                "start",
+                serde_json::json!({
+                    "intent":"adoptManagedLogout", "expectedAuthRevision":0,
+                    "expectedTransitionRevision":0, "expectedAuthFingerprint":null,
+                    "intendedResultAuthFingerprint":null
+                }),
+            ),
+            ("read", serde_json::json!({})),
+            ("cancel", serde_json::json!({})),
+        ] {
+            params["contractVersion"] = serde_json::json!(1);
+            params["transitionId"] = serde_json::json!("test");
+            params["processInstanceId"] = serde_json::json!("test");
+            let request = request(&format!("account/managedAuthTransition/{method}"), params);
+            assert_eq!(classify(&request), AccountDependency::Independent);
+            assert!(request.serialization_scope().is_none());
+            assert_eq!(
+                request.experimental_reason(),
+                Some("account/managedAuthTransition")
+            );
+        }
     }
 }

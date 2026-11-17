@@ -5,10 +5,12 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 
+use crate::account_dependency::{AccountDependency, classify};
 use crate::attestation::app_server_attestation_provider;
 use crate::config_manager::ConfigManager;
 use crate::connection_rpc_gate::ConnectionRpcGate;
 use crate::current_time::app_server_time_provider;
+use crate::error_code::account_transition_in_progress;
 use crate::error_code::internal_error;
 use crate::error_code::invalid_params;
 use crate::error_code::invalid_request;
@@ -163,6 +165,8 @@ pub(crate) struct MessageProcessor {
     models_refresh_worker: Arc<tokio::sync::Mutex<ModelsRefreshWorker>>,
     model_catalog: Arc<ModelCatalog>,
     reset_inventory: Arc<crate::managed_reset::ProductionResetInventory>,
+    managed_transition_coordinator: crate::managed_transition::ManagedTransitionCoordinator,
+    request_auth_tasks: crate::processor_task_retirement::ProcessorTasks,
     thread_manager: Arc<ThreadManager>,
     turn_cost_worker: Option<TurnCostWorker>,
     skills_watcher: Arc<SkillsWatcher>,
@@ -205,6 +209,7 @@ pub(crate) struct ProcessorBackgroundShutdown {
     pub plugins: codex_core_plugins::PluginTaskDrain,
     pub command_exec: crate::command_exec::CommandExecSandboxShutdown,
     pub model_auth: crate::processor_task_retirement::ProcessorTaskDrain,
+    pub request_auth: crate::processor_task_retirement::ProcessorTaskDrain,
     pub workspace_routing: crate::processor_task_retirement::ProcessorTaskDrain,
     pub login: Result<crate::request_processors::AccountLoginReport, ()>,
 }
@@ -232,6 +237,7 @@ impl ProcessorBackgroundShutdown {
             && self.plugins.is_clean()
             && self.command_exec.is_clean()
             && self.model_auth.is_clean()
+            && self.request_auth.is_clean()
             && self.workspace_routing.is_clean()
             && self.login.as_ref().is_ok_and(|report| report.is_clean())
     }
@@ -346,6 +352,8 @@ impl ConnectionSessionState {
 pub(crate) struct MessageProcessorArgs {
     pub(crate) telemetry_reset: crate::otel_reset_control::TelemetryResetControl,
     pub(crate) control_endpoint: Option<String>,
+    pub(crate) managed_transition_control_socket_endpoint: Option<String>,
+    pub(crate) managed_transition_process_instance_id: Option<String>,
     pub(crate) cloud_skill_provider: Option<Arc<dyn codex_skills_extension::SkillProvider>>,
     pub(crate) outgoing: Arc<OutgoingMessageSender>,
     pub(crate) analytics_events_client: AnalyticsEventsClient,
@@ -378,6 +386,8 @@ impl MessageProcessor {
     pub(crate) fn new(args: MessageProcessorArgs) -> Self {
         let MessageProcessorArgs {
             telemetry_reset,
+            managed_transition_control_socket_endpoint,
+            managed_transition_process_instance_id,
             control_endpoint,
             cloud_skill_provider,
             outgoing,
@@ -450,7 +460,16 @@ impl MessageProcessor {
         );
         let goal_service = Arc::new(GoalService::new());
         let turn_admission = TurnAdmission::default();
-        let turn_start_admission: Arc<dyn TurnStartAdmission> = Arc::new(turn_admission.clone());
+        let account_work_permits = crate::account_work_permits::AccountWorkPermits::new();
+        let account_turn_work = crate::account_turn_work::AccountTurnWork::default();
+        let request_auth_tasks = crate::processor_task_retirement::ProcessorTasks::default();
+        let turn_start_admission: Arc<dyn TurnStartAdmission> =
+            Arc::new(crate::account_turn_admission::AccountTurnAdmission {
+                shutdown: turn_admission.clone(),
+                permits: account_work_permits.clone(),
+                work: account_turn_work.clone(),
+                auth_tasks: Some(request_auth_tasks.ticket()),
+            });
         let extension_event_sink =
             app_server_extension_event_sink(outgoing.clone(), thread_state_manager.clone());
         let mut queue_service = None;
@@ -542,6 +561,27 @@ impl MessageProcessor {
             auth_manager: Arc::clone(&auth_manager),
             remote_control_handle: remote_control_handle.clone(),
         });
+        let endpoint = managed_transition_control_socket_endpoint.unwrap_or_else(|| {
+            crate::transport::app_server_control_socket_path(&config.codex_home)
+                .map(|path| path.display().to_string())
+                .unwrap_or_default()
+        });
+        let authoritative_auth =
+            crate::managed_transition::AuthoritativeAuthState::from_auth_manager(&auth_manager);
+        let target_evidence_source = Arc::new(
+            crate::managed_transition::ProcessTargetEvidenceSource::new(endpoint),
+        );
+        let reset: Arc<dyn crate::managed_transition::ResetInventory> = reset_inventory.clone();
+        let managed_transition_coordinator = match managed_transition_process_instance_id {
+            Some(process_instance_id) => crate::managed_transition::ManagedTransitionCoordinator::with_adoption_account_projection_and_process_instance(
+                authoritative_auth, target_evidence_source, process_instance_id,
+                Arc::clone(&auth_manager), reset, Arc::clone(&outgoing),
+            ),
+            None => crate::managed_transition::ManagedTransitionCoordinator::with_adoption_and_account_projection(
+                authoritative_auth, target_evidence_source,
+                Arc::clone(&auth_manager), reset, Arc::clone(&outgoing),
+            ),
+        }.with_account_work(account_work_permits, account_turn_work);
         let turn_cost_worker = TurnCostWorker::spawn(
             Arc::clone(&config),
             Arc::clone(&auth_manager),
@@ -764,6 +804,8 @@ impl MessageProcessor {
             models_refresh_worker,
             model_catalog,
             reset_inventory,
+            managed_transition_coordinator,
+            request_auth_tasks,
             thread_manager,
             turn_cost_worker,
             skills_watcher,
@@ -798,6 +840,7 @@ impl MessageProcessor {
 
     pub(crate) fn clear_runtime_references(&self) {
         let _ = self.workspace_routing_tasks.close_registration();
+        let _ = self.request_auth_tasks.close_registration();
         self.account_processor.clear_external_auth();
         self.apps_processor.shutdown();
         if let Ok(worker) = self.models_refresh_worker.try_lock() {
@@ -1151,6 +1194,7 @@ impl MessageProcessor {
         // The periodic model producer must finish before taking this auth-task
         // observation. A timeout/panic above remains unclean even if this is zero.
         let model_auth = self.model_catalog.observe_auth_tasks_until(deadline).await;
+        let request_auth = self.request_auth_tasks.shutdown_until(deadline).await;
         ProcessorBackgroundShutdown {
             models,
             turn_cost,
@@ -1160,6 +1204,7 @@ impl MessageProcessor {
             plugins,
             command_exec,
             model_auth,
+            request_auth,
             workspace_routing,
             login,
         }
@@ -1378,6 +1423,15 @@ impl MessageProcessor {
         {
             return Err(invalid_request(experimental_required_message(reason)));
         }
+        let account_work_permit = match classify(&codex_request) {
+            AccountDependency::Permit => Some(
+                self.managed_transition_coordinator
+                    .try_acquire_account_work_permit()
+                    .ok_or_else(account_transition_in_progress)?,
+            ),
+            AccountDependency::Independent => None,
+        };
+        let managed_transition_caller_authorized = session.managed_transition_caller_authorized();
         let connection_id = connection_request_id.connection_id;
         self.initialize_processor.track_initialized_request(
             connection_id,
@@ -1413,7 +1467,16 @@ impl MessageProcessor {
             ClientRequest::McpServerEventStreamStart { params, .. } => Some(
                 session
                     .mcp_event_streams
-                    .start(connection_id, params.clone(), self.mcp_processor.clone())
+                    .start(
+                        connection_id,
+                        params.clone(),
+                        self.mcp_processor.clone(),
+                        account_work_permit
+                            .as_ref()
+                            .map(codex_mcp::McpAttemptWork::derive_attempt)
+                            .transpose()
+                            .map_err(|_| account_transition_in_progress())?,
+                    )
                     .await?,
             ),
             _ => None,
@@ -1438,17 +1501,56 @@ impl MessageProcessor {
                 let originator = AuthStorageOriginator::from_client_name(
                     session.app_server_client_name().unwrap_or("none"),
                 );
+                let auth_ticket = processor.request_auth_tasks.ticket();
+                // Transition control owns the barrier rather than a permit
+                // counted by its own drain. Only an authorized control may
+                // open that distinct finite auth scope; ordinary RPCs always
+                // need counted request authority for auth descendants.
+                let transition_auth = managed_transition_caller_authorized
+                    && matches!(
+                        &codex_request,
+                        ClientRequest::ManagedTransitionStart { .. }
+                            | ClientRequest::ManagedTransitionRead { .. }
+                            | ClientRequest::ManagedTransitionCancel { .. }
+                    );
                 // Keep queued requests small to avoid large stack temporaries during construction.
                 let result = originator
-                    .scope(Box::pin(
-                        processor_for_request.handle_initialized_client_request(
-                            connection_request_id,
-                            codex_request,
-                            request_context,
-                            session,
-                            event_stream_ready,
-                        ),
-                    ))
+                    .scope(Box::pin(crate::account_turn_admission::within_request(
+                        account_work_permit,
+                        async move {
+                            let work = processor_for_request
+                                .thread_manager
+                                .derive_request_operation_work()
+                                .map_err(|_| account_transition_in_progress())?;
+                            let operation = processor_for_request
+                                .handle_initialized_client_request(
+                                    connection_request_id,
+                                    codex_request,
+                                    request_context,
+                                    session,
+                                    event_stream_ready,
+                                    managed_transition_caller_authorized,
+                                );
+                            let result = if transition_auth {
+                                crate::auth_task_work::scope_with_ticket(
+                                    auth_ticket,
+                                    work,
+                                    operation,
+                                )
+                                .await
+                            } else {
+                                crate::auth_task_work::scope_account_request(
+                                    auth_ticket,
+                                    work,
+                                    operation,
+                                )
+                                .await
+                            };
+                            result.map_err(|_| {
+                                internal_error("request auth task custody unavailable")
+                            })?
+                        },
+                    )))
                     .await;
                 if let Err(error) = result {
                     processor.outgoing.send_error(error_request_id, error).await;
@@ -1485,6 +1587,7 @@ impl MessageProcessor {
         request_context: RequestContext,
         session: Arc<ConnectionSessionState>,
         event_stream_ready: Option<McpEventStreamReady>,
+        managed_transition_caller_authorized: bool,
     ) -> Result<(), JSONRPCErrorError> {
         let connection_id = connection_request_id.connection_id;
         let app_server_client_name = session.app_server_client_name().map(str::to_string);
@@ -2289,6 +2392,24 @@ impl MessageProcessor {
             ClientRequest::CancelLoginAccount { params, .. } => {
                 self.account_processor.cancel_login_account(params).await
             }
+            ClientRequest::ManagedTransitionStart { params, .. } => Ok(Some(
+                self.managed_transition_coordinator
+                    .start_dispatch(params, managed_transition_caller_authorized)
+                    .await
+                    .into(),
+            )),
+            ClientRequest::ManagedTransitionRead { params, .. } => Ok(Some(
+                self.managed_transition_coordinator
+                    .read_dispatch(params, managed_transition_caller_authorized)
+                    .await
+                    .into(),
+            )),
+            ClientRequest::ManagedTransitionCancel { params, .. } => Ok(Some(
+                self.managed_transition_coordinator
+                    .cancel_dispatch(params, managed_transition_caller_authorized)
+                    .await
+                    .into(),
+            )),
             ClientRequest::GetAccount { params, .. } => {
                 self.account_processor.get_account(params).await
             }

@@ -11,21 +11,30 @@ use std::sync::Arc;
 struct CatalogAuthTasks {
     ticket: ProcessorTaskTicket,
     work: Option<Arc<dyn HostOperationWork>>,
+    require_account_work: bool,
 }
 impl std::fmt::Debug for CatalogAuthTasks {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("CatalogAuthTasks")
     }
 }
+impl CatalogAuthTasks {
+    fn derive_work(&self) -> Result<Option<Box<dyn HostOperationWork>>, AuthTaskFailure> {
+        match self.work.as_deref() {
+            Some(work) => work
+                .derive_operation()
+                .map(Some)
+                .map_err(|_| AuthTaskFailure::Refused),
+            None if self.require_account_work => Err(AuthTaskFailure::Refused),
+            None => Ok(None),
+        }
+    }
+}
+
 impl AuthTaskSpawner for CatalogAuthTasks {
     fn spawn(&self, future: AuthTaskFuture) -> Result<AuthTaskObservation, AuthTaskFailure> {
         // Derive before registration/spawn. No fresh fallback during drain or on exhaustion.
-        let work = self
-            .work
-            .as_deref()
-            .map(|work| work.derive_operation())
-            .transpose()
-            .map_err(|_| AuthTaskFailure::Refused)?;
+        let work = self.derive_work()?;
         let receipt = self
             .ticket
             .spawn(async move {
@@ -45,12 +54,7 @@ impl AuthTaskSpawner for CatalogAuthTasks {
         &self,
         task: AuthTaskBlocking,
     ) -> Result<AuthTaskObservation, AuthTaskFailure> {
-        let work = self
-            .work
-            .as_deref()
-            .map(|work| work.derive_operation())
-            .transpose()
-            .map_err(|_| AuthTaskFailure::Refused)?;
+        let work = self.derive_work()?;
         let receipt = self
             .ticket
             .spawn_blocking(move || {
@@ -76,6 +80,7 @@ pub(crate) fn spawner(
     Arc::new(CatalogAuthTasks {
         ticket,
         work: work.map(Arc::from),
+        require_account_work: false,
     })
 }
 
@@ -100,6 +105,29 @@ pub(crate) async fn scope_with_ticket<T>(
 ) -> codex_protocol::error::Result<T> {
     let result = codex_model_provider::with_auth_task_scope(
         AuthTaskAccess::Admitted(spawner(ticket.clone(), work)),
+        future,
+    )
+    .await;
+    if result.is_err() {
+        let _ = ticket.mark_unverified();
+    }
+    result
+}
+
+/// Independent RPCs may execute pure handlers, but cannot manufacture an
+/// ungated auth descendant. Permit-bearing requests derive custody from the
+/// same actual work used by host turns; scope failure stays sticky.
+pub(crate) async fn scope_account_request<T>(
+    ticket: ProcessorTaskTicket,
+    work: Option<Box<dyn HostOperationWork>>,
+    future: impl Future<Output = T>,
+) -> codex_protocol::error::Result<T> {
+    let result = codex_model_provider::with_auth_task_scope(
+        AuthTaskAccess::Admitted(Arc::new(CatalogAuthTasks {
+            ticket: ticket.clone(),
+            work: work.map(Arc::from),
+            require_account_work: true,
+        })),
         future,
     )
     .await;

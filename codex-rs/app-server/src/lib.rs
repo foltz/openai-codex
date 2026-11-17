@@ -572,6 +572,10 @@ pub async fn run_main_with_transport_options(
     #[cfg(target_os = "windows")]
     let _registered_core = codex_windows_sandbox::registered_core_requested();
     let control_endpoint = mcp_control_endpoint_uri(&transport);
+    let managed_transition_control_socket_endpoint = match &transport {
+        AppServerTransport::UnixSocket { socket_path } => Some(socket_path.display().to_string()),
+        _ => None,
+    };
     let managed_daemon = matches!(&transport, AppServerTransport::UnixSocket { .. })
         && runtime_options.managed_daemon;
     #[cfg(unix)]
@@ -1100,6 +1104,8 @@ pub async fn run_main_with_transport_options(
         let (startup_warnings_tx, mut startup_warnings_rx) = mpsc::unbounded_channel();
         let mut processor = MessageProcessor::new(MessageProcessorArgs {
             telemetry_reset,
+            managed_transition_control_socket_endpoint,
+            managed_transition_process_instance_id: None,
             control_endpoint,
             cloud_skill_provider,
             outgoing: outgoing_message_sender,

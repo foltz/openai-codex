@@ -119,6 +119,7 @@ pub struct ThreadRetentionAcquireParams {
     deny_unknown_fields
 )]
 #[ts(rename_all = "camelCase", export_to = "v2/")]
+#[schemars(title = "ThreadRetentionAcquireResponse")]
 pub enum ThreadRetentionAcquireResponse {
     Acquired {
         #[schemars(rename = "grantId")]
@@ -211,6 +212,21 @@ mod retention_wire_tests {
                 serde_json::json!({"status": "notHeld", "unexpected": true})
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn retention_response_has_one_schema_identity_as_root_and_nested_carrier() {
+        let root = schemars::schema_for!(ThreadRetentionAcquireResponse);
+        let start = schemars::schema_for!(ThreadStartResponse);
+        let embedded = start
+            .definitions
+            .get("ThreadRetentionAcquireResponse")
+            .expect("retention carrier must be reachable from thread/start");
+        assert_eq!(
+            serde_json::to_value(&root.schema).unwrap(),
+            serde_json::to_value(embedded).unwrap(),
+            "root and nested export must not collide in the v2 schema bundle"
         );
     }
 

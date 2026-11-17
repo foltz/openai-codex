@@ -1,4 +1,4 @@
-//! Shared token-free sign-in continuity. Native IO must hold its state guard.
+//! Shared token-free sign-in continuity with short read-observation guards.
 use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
@@ -19,6 +19,10 @@ pub(super) struct DomainState {
     closed: bool,
 }
 impl DomainState {
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
     pub fn prepare(&mut self, identity: &Option<GrantIdentity>) -> io::Result<()> {
         if self.closed || (self.identity != *identity && self.epoch == u64::MAX) {
             self.closed = true;
@@ -27,8 +31,8 @@ impl DomainState {
         Ok(())
     }
 
-    /// Call inside the actual storage read/save/delete critical section. Never
-    /// install a stale load after releasing the storage/domain serialization.
+    /// Writes hold this guard through storage commit. Reads must recheck their
+    /// captured epoch after I/O before installing an observed identity.
     pub fn observe(&mut self, identity: Option<GrantIdentity>) -> io::Result<()> {
         self.prepare(&identity)?;
         if self.identity != identity {
@@ -59,13 +63,6 @@ impl CredentialDomain {
         let domain = Arc::new(Self::default());
         domains.insert(credential_id, Arc::downgrade(&domain));
         Ok(domain)
-    }
-    #[cfg(test)]
-    pub fn is_locked(&self) -> bool {
-        matches!(
-            self.state.try_lock(),
-            Err(std::sync::TryLockError::WouldBlock)
-        )
     }
     pub fn lock(&self) -> io::Result<MutexGuard<'_, DomainState>> {
         let guard = self.state.lock().map_err(|_| unavailable())?;

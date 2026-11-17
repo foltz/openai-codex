@@ -400,7 +400,7 @@ async fn legacy_credential_id_does_not_authorize_another_storage_backend() {
     assert!(other.begin_admitted_request(&binding).is_err());
 }
 #[test]
-fn actual_load_and_save_are_serialized_and_old_load_cannot_gain_new_epoch() {
+fn actual_blocked_load_does_not_block_save_or_publish_stale_epoch() {
     let (client, _home) = client(loopback_config(), Arc::new(MockKeyringStore::default()));
     grant(
         &client,
@@ -408,6 +408,7 @@ fn actual_load_and_save_are_serialized_and_old_load_cannot_gain_new_epoch() {
         "old-token",
         Utc::now().timestamp() + 3600,
     );
+    let old = client.load_token().unwrap().unwrap();
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     *client.state.load_hook.lock().unwrap() = Some(Box::new(move || {
@@ -421,8 +422,8 @@ fn actual_load_and_save_are_serialized_and_old_load_cannot_gain_new_epoch() {
             .send(reader.load_token().unwrap().unwrap())
             .unwrap();
     });
+    // The hook runs after native I/O captured old bytes, before observation.
     entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-    assert!(client.state.domain.is_locked());
     let writer = client.clone();
     let (saved_tx, saved_rx) = std::sync::mpsc::channel();
     let write = std::thread::spawn(move || {
@@ -434,12 +435,16 @@ fn actual_load_and_save_are_serialized_and_old_load_cannot_gain_new_epoch() {
         );
         saved_tx.send(()).unwrap();
     });
-    release_tx.send(()).unwrap();
-    let old = loaded_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    // The real write must complete while the old read is still suspended.
     saved_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    release_tx.send(()).unwrap();
+    let current = loaded_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     read.join().unwrap();
     write.join().unwrap();
-    assert_eq!(old.access_token, "old-token");
+    assert_eq!(current.access_token, "new-token");
+    assert_eq!(current.authorization_id.as_deref(), Some("replacement"));
     let stale = super::super::OAuthRequestCredentials::from_resolved(&client, old);
     assert!(stale.binding().is_none());
+    let current = super::super::OAuthRequestCredentials::from_resolved(&client, current);
+    assert!(current.binding().is_some());
 }

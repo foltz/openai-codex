@@ -526,14 +526,28 @@ impl OAuthSessionManager {
     }
 
     fn load_token(&self) -> io::Result<Option<StoredToken>> {
-        let mut domain = self.state.domain.lock()?;
-        #[cfg(test)]
-        if let Some(hook) = self.state.load_hook.lock().unwrap().take() {
-            hook();
+        // A canceled readiness/login observer may leave native keyring I/O
+        // running. It must not hold the sign-in domain hostage to that read.
+        for _ in 0..2 {
+            let epoch = self.state.domain.lock()?.epoch();
+            let token = self.state.storage.load(&self.credential_id())?;
+            #[cfg(test)]
+            if let Some(hook) = self.state.load_hook.lock().unwrap().take() {
+                hook();
+            }
+            let mut domain = self.state.domain.lock()?;
+            if domain.epoch() != epoch {
+                // A writer or another observation superseded this snapshot.
+                // Reload rather than assigning its old bytes a current epoch.
+                continue;
+            }
+            domain.observe(token.as_ref().map(grant_identity))?;
+            return Ok(token);
         }
-        let token = self.state.storage.load(&self.credential_id())?;
-        domain.observe(token.as_ref().map(grant_identity))?;
-        Ok(token)
+        Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "provider OAuth sign-in changed during credential read",
+        ))
     }
 
     fn save_token(&self, token: &StoredToken) -> io::Result<()> {

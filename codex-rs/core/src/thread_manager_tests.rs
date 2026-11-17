@@ -220,6 +220,7 @@ async fn shared_service_tier_is_published_by_registered_startup() {
             /*forked_from_thread_id*/ None,
             Some(Arc::clone(&startup)),
             /*captured_account_work*/ None,
+            /*deferred_clear_session_start*/ None,
         ));
         let io = std::future::poll_fn(|cx| {
             assert!(start.as_mut().poll(cx).is_pending());

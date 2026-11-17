@@ -404,3 +404,256 @@ mod publication_tests {
         );
     }
 }
+
+impl AuthManager {
+    /// Renew through the exact admitted host authority. The caller retains the
+    /// finite account-work root; no detached task or replacement ledger is born.
+    pub(super) async fn refresh_external_for_owner(
+        &self,
+        expected: &super::super::AuthOwnerSnapshot,
+        renewal: &AuthRenewalBinding,
+        failed: Option<AuthCredentialFingerprint>,
+    ) -> Result<(), RefreshTokenError> {
+        let refused =
+            || permanent_external_auth_error("owner renewal authority changed or unproven");
+        let _refresh = self.refresh_lock.acquire().await.map_err(|_| refused())?;
+        let (attempted, revisions, live) = self.renewal_snapshot().ok_or_else(refused)?;
+        let attempted = attempted.ok_or_else(refused)?;
+        if revisions != expected.revisions
+            || live != *renewal
+            || renewal.source.is_none()
+            || attempted.api_auth_mode() != expected.auth_mode.ok_or_else(refused)?
+            || attempted.get_account_id() != expected.account_id
+            || attempted.get_chatgpt_user_id() != expected.chatgpt_user_id
+        {
+            return Err(refused());
+        }
+        // Prove principal coverage before invoking an external callback.
+        let carried = FixedPrincipal::carried_by(&attempted);
+        match (&renewal.fixed_principal, carried) {
+            (Some(fixed), Some(carried)) if *fixed != carried => return Err(refused()),
+            (None, None) => return Err(refused()),
+            (Some(fixed), _)
+                if fixed.chatgpt_user_id.trim().is_empty()
+                    || fixed.account_id.trim().is_empty() =>
+            {
+                return Err(refused());
+            }
+            _ => (),
+        }
+        if let Some(source) = &self.command_source {
+            self.require_command_mode_allowed()?;
+            let failed = failed.ok_or_else(|| {
+                permanent_external_auth_error("rejected command credential was not recorded")
+            })?;
+            let auth = source
+                .obtain(Some(failed.0))
+                .await
+                .map_err(RefreshTokenError::Transient)?;
+            self.validate_external_auth(&auth, source)?;
+            // obtain already publishes through source/native/cache custody.
+            // Do not re-publish against the now-obsolete credential revision.
+            let current = self
+                .auth_for_owner(expected.revisions.owner_generation)
+                .map_err(|_| refused())?
+                .ok_or_else(refused)?;
+            if self.renewal_binding().as_ref() != Some(renewal)
+                || !Self::auths_equal_for_refresh(Some(&auth), Some(&current))
+            {
+                return Err(refused());
+            }
+            return Ok(());
+        }
+        let source = renewal.source.as_ref().ok_or_else(refused)?;
+        let auth = source
+            .refresh(ExternalAuthRefreshContext {
+                reason: ExternalAuthRefreshReason::Unauthorized,
+                previous_account_id: attempted.get_account_id(),
+            })
+            .await
+            .map_err(|error| source.classify_error(error))?;
+        self.validate_external_auth(&auth, source.as_ref())?;
+        self.publish_auth_for_owner(expected, renewal, auth)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod invocation_tests {
+    use super::*;
+    struct PendingAuthority {
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl ExternalAuth for PendingAuthority {
+        fn resolve(&self) -> ExternalAuthFuture<'_, CodexAuth> {
+            Box::pin(async { Err(std::io::Error::other("unexpected resolve")) })
+        }
+        fn refresh(&self, _: ExternalAuthRefreshContext) -> ExternalAuthFuture<'_, CodexAuth> {
+            Box::pin(async {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.started.notify_one();
+                self.release.notified().await;
+                Ok(CodexAuth::from_api_key("renewed"))
+            })
+        }
+        fn fixed_principal(&self) -> Option<FixedPrincipal> {
+            Some(FixedPrincipal {
+                chatgpt_user_id: "principal".into(),
+                account_id: "account".into(),
+            })
+        }
+    }
+    fn pending() -> (Arc<AuthManager>, Arc<PendingAuthority>) {
+        let manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("old"));
+        let authority = Arc::new(PendingAuthority {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        *manager.external_auth.write().unwrap() = Some(authority.clone());
+        (manager, authority)
+    }
+    fn begin(manager: &Arc<AuthManager>) -> tokio::task::JoinHandle<Result<(), RefreshTokenError>> {
+        let snapshot = manager.owner_snapshot().unwrap();
+        let binding = manager.renewal_binding().unwrap();
+        let manager = manager.clone();
+        tokio::spawn(async move {
+            manager
+                .refresh_external_for_owner(&snapshot, &binding, None)
+                .await
+        })
+    }
+    async fn started(authority: &PendingAuthority) {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            authority.started.notified(),
+        )
+        .await
+        .unwrap();
+    }
+    async fn finished(
+        task: tokio::task::JoinHandle<Result<(), RefreshTokenError>>,
+    ) -> Result<(), RefreshTokenError> {
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+    #[tokio::test]
+    async fn same_admitted_host_can_publish_after_actual_callback() {
+        let (manager, authority) = pending();
+        let before = manager.owner_snapshot().unwrap();
+        let task = begin(&manager);
+        started(&authority).await;
+        authority.release.notify_one();
+        finished(task).await.unwrap();
+        assert_eq!(
+            manager.auth_cached().unwrap().get_token().unwrap(),
+            "renewed"
+        );
+        assert_eq!(
+            manager.owner_snapshot().unwrap().revisions.owner_generation,
+            before.revisions.owner_generation
+        );
+        assert_eq!(authority.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn owner_change_during_actual_callback_refuses_late_result() {
+        let (manager, authority) = pending();
+        let task = begin(&manager);
+        started(&authority).await;
+        manager.set_cached_auth(Some(CodexAuth::from_api_key("new-owner")));
+        let before = manager.owner_snapshot().unwrap();
+        authority.release.notify_one();
+        assert!(finished(task).await.is_err());
+        assert_eq!(
+            manager.auth_cached().unwrap().get_token().unwrap(),
+            "new-owner"
+        );
+        assert_eq!(manager.owner_snapshot().unwrap(), before);
+    }
+    #[tokio::test]
+    async fn source_replacement_during_actual_callback_refuses_late_result() {
+        let (manager, authority) = pending();
+        let task = begin(&manager);
+        started(&authority).await;
+        *manager.external_auth.write().unwrap() = Some(Arc::new(FixedApiKeyAuth(
+            CodexAuth::from_api_key("replacement"),
+        )));
+        let before = manager.owner_snapshot().unwrap();
+        authority.release.notify_one();
+        assert!(finished(task).await.is_err());
+        assert_eq!(manager.auth_cached().unwrap().get_token().unwrap(), "old");
+        assert_eq!(manager.owner_snapshot().unwrap(), before);
+    }
+    #[tokio::test]
+    async fn cancelled_callback_releases_existing_refresh_gate() {
+        let (manager, authority) = pending();
+        let task = begin(&manager);
+        started(&authority).await;
+        task.abort();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .unwrap();
+        assert!(result.unwrap_err().is_cancelled());
+        assert!(manager.refresh_lock.try_acquire().is_ok());
+        assert_eq!(manager.auth_cached().unwrap().get_token().unwrap(), "old");
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_bound_invocation_refuses_missing_proof_without_mutation() {
+        use super::super::command_cache_publication_tests::{record, selected_fixture};
+        let home = tempfile::tempdir().unwrap();
+        let (_, manager) = selected_fixture(home.path(), record(1));
+        let before = manager.owner_snapshot().unwrap();
+        let binding = manager.renewal_binding().unwrap();
+        let bytes = std::fs::read(home.path().join("auth.json")).unwrap();
+        assert!(
+            manager
+                .refresh_external_for_owner(&before, &binding, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(manager.owner_snapshot().unwrap(), before);
+        assert_eq!(std::fs::read(home.path().join("auth.json")).unwrap(), bytes);
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_old_request_proof_accepts_already_published_current_record() {
+        use super::super::command_cache_publication_tests::{record, selected_fixture};
+        let home = tempfile::tempdir().unwrap();
+        let (_, manager) = selected_fixture(home.path(), record(1));
+        let before = manager.owner_snapshot().unwrap();
+        let binding = manager.renewal_binding().unwrap();
+        let failed = AuthCredentialFingerprint::from_bearer_header("Bearer older-synthetic-token");
+        manager
+            .refresh_external_for_owner(&before, &binding, failed)
+            .await
+            .unwrap();
+        assert_eq!(manager.owner_snapshot().unwrap(), before);
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_current_rejection_cannot_claim_same_cache_recovery() {
+        use super::super::command_cache_publication_tests::{record, selected_fixture};
+        let home = tempfile::tempdir().unwrap();
+        let (source, manager) = selected_fixture(home.path(), record(1));
+        let before = manager.owner_snapshot().unwrap();
+        let binding = manager.renewal_binding().unwrap();
+        let auth = manager.auth_cached().unwrap();
+        let failed = AuthCredentialFingerprint::from_bearer_header(&format!(
+            "Bearer {}",
+            auth.get_token().unwrap()
+        ));
+        assert!(
+            manager
+                .refresh_external_for_owner(&before, &binding, failed)
+                .await
+                .is_err()
+        );
+        assert!(!source.usable_auth(Some(&auth)));
+        assert_eq!(manager.owner_snapshot().unwrap(), before);
+    }
+}

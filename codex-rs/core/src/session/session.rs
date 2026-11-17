@@ -2052,6 +2052,7 @@ impl Session {
                 workspace_routing.as_ref().clone(),
                 extensions.model_request_contributors().to_vec(),
             )
+            .with_account_fence(thread_extension_data.get::<super::turn_context::ReviewerAccountFence>().map(|fence| Arc::clone(&fence.0)))
             .with_executed_tool_calls(executed_tool_calls.clone())
             .with_restored_history(matches!(
                 &initial_history,

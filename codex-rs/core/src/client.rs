@@ -132,6 +132,8 @@ use crate::cyber_access_program;
 use crate::feedback_tags;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::subagent_header_value;
+use crate::session::turn_context::AUTH_MANAGER_CHANGED_SINCE_ORIGIN;
+use crate::session::turn_context::OriginatingAccountRecord;
 use crate::util::emit_feedback_auth_recovery_tags;
 use codex_feedback::FeedbackRequestTags;
 use codex_feedback::emit_feedback_request_tags_with_auth_env;
@@ -222,6 +224,7 @@ struct ModelClientState {
     cached_websocket_session: StdMutex<WebsocketSession>,
     /// Last full tool list used for sampling, retained across turns and connection resets.
     last_inference_tools: StdMutex<Option<Arc<[ToolSpec]>>>,
+    account_fence: StdMutex<Option<Arc<OriginatingAccountRecord>>>,
 }
 
 impl std::fmt::Debug for ModelClientState {
@@ -267,6 +270,15 @@ impl std::fmt::Debug for ModelClientState {
             .field("last_inference_tools", &self.last_inference_tools)
             .finish()
     }
+}
+
+/// When a fenced client checks the originating owner.
+#[derive(Clone, Copy, Debug)]
+enum AccountFenceCheck {
+    /// Before any credential, routing or identity resolution.
+    BeforeResolution,
+    /// After resolution, given the owner revision read before it.
+    AfterResolution(Option<u64>),
 }
 
 enum ClientRouting {
@@ -342,6 +354,7 @@ pub struct ModelClientSession {
     /// appends, or continuation requests), and must not send it between different turns.
     /// An auth ownership change clears it so the new owner gets fresh routing state.
     turn_state: Arc<OnceLock<String>>,
+    origin_record: Option<Arc<OriginatingAccountRecord>>,
 }
 
 /// Executes HTTP Responses requests without owning a turn's WebSocket state.
@@ -635,6 +648,7 @@ impl ModelClient {
                 agent_identity_session_fallback: AgentIdentitySessionFallback::default(),
                 cached_websocket_session: StdMutex::new(WebsocketSession::default()),
                 last_inference_tools: StdMutex::new(None),
+                account_fence: StdMutex::new(None),
             }),
             agent_identity_policy,
             prompt_cache_key_policy: PromptCacheKey::default(),
@@ -649,6 +663,51 @@ impl ModelClient {
                 cyber_access_program::ApiKeyCyberAccessPrograms::UnsupportedProvider,
             required_cyber_access_programs: None,
         }
+    }
+
+    pub(crate) fn set_account_fence(&self, fence: Option<Arc<OriginatingAccountRecord>>) {
+        *self
+            .state
+            .account_fence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = fence;
+    }
+
+    /// Constructs the client already fenced, before any request can be made.
+    pub(crate) fn with_account_fence(self, fence: Option<Arc<OriginatingAccountRecord>>) -> Self {
+        self.set_account_fence(fence);
+        self
+    }
+
+    pub(crate) fn account_fence(&self) -> Option<Arc<OriginatingAccountRecord>> {
+        self.state
+            .account_fence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Checks a fenced (detached Guardian) client against the originating
+    /// owner. Unfenced clients pass, and so does provider-configured bearer
+    /// auth (`provider.auth`): its private command-backed manager only yields
+    /// API-key auth, never the account's tokens or identity.
+    fn verify_account_fence(&self, check: AccountFenceCheck) -> Result<()> {
+        if self.state.provider.info().auth.is_some() {
+            return Ok(());
+        }
+        let Some(fence) = self.account_fence() else {
+            return Ok(());
+        };
+        let Some(manager) = self.auth_manager() else {
+            return Err(std::io::Error::other(AUTH_MANAGER_CHANGED_SINCE_ORIGIN).into());
+        };
+        let verified = match check {
+            AccountFenceCheck::BeforeResolution => fence.verify_current(&manager),
+            AccountFenceCheck::AfterResolution(owner_generation) => {
+                fence.verify_request(&manager, owner_generation)
+            }
+        };
+        verified.map_err(|reason| std::io::Error::other(reason).into())
     }
 
     pub(crate) fn with_executed_tool_calls(mut self, recorder: ExecutedToolCalls) -> Self {
@@ -757,6 +816,7 @@ impl ModelClient {
             client: self.clone(),
             websocket_session,
             turn_state: Arc::new(OnceLock::new()),
+            origin_record: None,
         }
     }
 
@@ -867,6 +927,7 @@ impl ModelClient {
                 api_auth: Arc::clone(&call_setup.api_auth),
                 agent_identity_telemetry: call_setup.agent_identity_telemetry.clone(),
                 runtime_id: None,
+                gateway_admission: call_setup.gateway_admission.clone(),
                 http_client_factory,
             });
         }
@@ -1354,11 +1415,16 @@ impl ModelClient {
         routing: ClientRouting,
         provider: &SharedModelProvider,
     ) -> Result<CurrentClientSetup> {
+        self.verify_account_fence(AccountFenceCheck::BeforeResolution)?;
+        let owner_generation = self
+            .auth_manager()
+            .and_then(|manager| manager.owner_admission_snapshot())
+            .map(|(snapshot, _)| snapshot.revisions.owner_generation);
         let routing = match routing {
             ClientRouting::Workspace => Some(&self.state.workspace_routing),
             ClientRouting::ConfiguredProvider => None,
         };
-        codex_model_provider::resolve_request(
+        let setup = codex_model_provider::resolve_request(
             provider.as_ref(),
             Some(ProviderAuthScope {
                 agent_identity_policy: self.agent_identity_policy,
@@ -1368,7 +1434,9 @@ impl ModelClient {
             routing,
             self.http_client_factory.clone(),
         )
-        .await
+        .await?;
+        self.verify_account_fence(AccountFenceCheck::AfterResolution(owner_generation))?;
+        Ok(setup)
     }
 
     fn responses_headers(&self, auth: Option<&CodexAuth>, model: &str) -> ApiHeaderMap {
@@ -1603,6 +1671,23 @@ impl Drop for ModelClientSession {
 }
 
 impl ModelClientSession {
+    /// Serves the turn whose admission record is `origin_record`.
+    pub(crate) fn with_origin_record(
+        mut self,
+        origin_record: Option<Arc<OriginatingAccountRecord>>,
+    ) -> Self {
+        self.origin_record = origin_record;
+        self
+    }
+
+    fn observe_origin_gateway(&self, setup: &CurrentClientSetup) {
+        if let (Some(record), codex_model_provider::GatewayAdmission::Bound(binding)) =
+            (&self.origin_record, &setup.gateway_admission)
+        {
+            record.observe_gateway(binding);
+        }
+    }
+
     pub(crate) fn inference_tools_changed(&self, tools: &Arc<[ToolSpec]>) -> bool {
         let previous = self
             .client
@@ -1764,6 +1849,7 @@ impl ModelClientSession {
                 .client
                 .current_client_setup(ClientRouting::Workspace)
                 .await?;
+            self.observe_origin_gateway(&client_setup);
             let (observed_auth, rejected_credential) =
                 codex_model_provider::observe_request_auth(Arc::clone(&client_setup.api_auth));
             client_setup.api_auth = observed_auth;
@@ -1817,6 +1903,8 @@ impl ModelClientSession {
                     if let Some(recovery) = auth_recovery.as_mut() {
                         recovery.record_failed_credential(rejected_credential.fingerprint());
                     }
+                    self.client
+                        .verify_account_fence(AccountFenceCheck::BeforeResolution)?;
                     pending_retry = PendingUnauthorizedRetry::from_recovery(
                         handle_unauthorized(
                             unauthorized_transport,
@@ -1996,6 +2084,7 @@ impl ResponsesHttpExecutor<'_> {
                 .client
                 .current_client_setup(ClientRouting::Workspace)
                 .await?;
+            self.observe_origin_gateway(&client_setup);
             let (observed_auth, rejected_credential) =
                 codex_model_provider::observe_request_auth(Arc::clone(&client_setup.api_auth));
             client_setup.api_auth = observed_auth;
@@ -2143,6 +2232,8 @@ impl ResponsesHttpExecutor<'_> {
                     if let Some(recovery) = auth_recovery.as_mut() {
                         recovery.record_failed_credential(rejected_credential.fingerprint());
                     }
+                    self.client
+                        .verify_account_fence(AccountFenceCheck::BeforeResolution)?;
                     pending_retry = PendingUnauthorizedRetry::from_recovery(
                         handle_unauthorized(
                             unauthorized_transport,
@@ -2224,6 +2315,7 @@ impl ModelClientSession {
                 .client
                 .current_client_setup(ClientRouting::Workspace)
                 .await?;
+            self.observe_origin_gateway(&client_setup);
             let (observed_auth, rejected_credential) =
                 codex_model_provider::observe_request_auth(Arc::clone(&client_setup.api_auth));
             client_setup.api_auth = observed_auth;
@@ -2305,6 +2397,8 @@ impl ModelClientSession {
                     if let Some(recovery) = auth_recovery.as_mut() {
                         recovery.record_failed_credential(rejected_credential.fingerprint());
                     }
+                    self.client
+                        .verify_account_fence(AccountFenceCheck::BeforeResolution)?;
                     pending_retry = PendingUnauthorizedRetry::from_recovery(
                         handle_unauthorized(
                             unauthorized_transport,

@@ -107,6 +107,7 @@ pub struct ResolvedProviderRequest {
     pub api_auth: SharedAuthProvider,
     pub agent_identity_telemetry: Option<AgentIdentityTelemetry>,
     pub runtime_id: Option<String>,
+    pub gateway_admission: crate::GatewayAdmission,
     pub http_client_factory: HttpClientFactory,
 }
 
@@ -201,6 +202,7 @@ pub async fn resolve_request(
                 api_auth: resolved_auth.auth,
                 agent_identity_telemetry: resolved_auth.agent_identity_telemetry,
                 runtime_id,
+                gateway_admission: resolved_auth.gateway_admission,
                 http_client_factory,
             })
         }

@@ -4,6 +4,7 @@
 use crate::connection_rpc_gate::ConnectionRpcGate;
 use crate::error_code::internal_error;
 use crate::error_code::invalid_request;
+use crate::processor_task_retirement::ProcessorTasks;
 use crate::request_processors::build_legacy_api_turns_from_rollout_items;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::ThreadSampleParams;
@@ -52,7 +53,6 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::TaskTracker;
 
 const SAMPLE_TIMEOUT: Duration = Duration::from_secs(30);
 // Bytes conservatively bound tokens, including for byte-fallback tokenizers.
@@ -81,7 +81,7 @@ pub(crate) struct SampleTask {
 
 pub(crate) async fn generate_sample(
     task: SampleTask,
-    tasks: &TaskTracker,
+    tasks: &ProcessorTasks,
     rpc_gate: Arc<ConnectionRpcGate>,
 ) -> SampleResult {
     let deadline = Instant::now() + SAMPLE_TIMEOUT;
@@ -95,15 +95,30 @@ pub(crate) async fn generate_sample(
     }
     let (sender, receiver) = oneshot::channel();
     let originator = AuthStorageOriginator::current();
-    tasks.spawn(run_sample_child(
+    spawn_sample_child(
+        tasks,
         rpc_gate,
         originator.scope(async move { Box::pin(task.run(deadline)).await }),
         sender,
-    ));
+    )?;
     tokio::time::timeout_at(deadline, receiver)
         .await
         .map_err(|_| internal_error("sample timed out"))?
         .map_err(|_| internal_error("sample task stopped"))?
+}
+
+/// Register the physical child before returning its private result observer.
+/// The task owner keeps the original even when the caller drops that observer.
+fn spawn_sample_child(
+    tasks: &ProcessorTasks,
+    rpc_gate: Arc<ConnectionRpcGate>,
+    future: impl std::future::Future<Output = SampleResult> + Send + 'static,
+    sender: oneshot::Sender<SampleResult>,
+) -> Result<(), JSONRPCErrorError> {
+    tasks
+        .spawn(run_sample_child(rpc_gate, future, sender))
+        .map(|_| ())
+        .map_err(|_| internal_error("sample task admission unavailable"))
 }
 
 /// The outer RPC already owns its request ticket. Preserve a concrete child
@@ -499,6 +514,73 @@ mod child_tests {
         .await;
         let error = receive.await.unwrap().unwrap_err();
         assert_eq!(error.message, "synthetic sample refusal");
+        assert_eq!(gate.unanswered(), 0);
+        assert!(gate.shutdown_with_evidence().await.is_clean());
+    }
+
+    #[tokio::test]
+    async fn closed_task_owner_refuses_sample_birth_without_polling_child() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let tasks = ProcessorTasks::default();
+        tasks.close_registration().unwrap();
+        let gate = Arc::new(ConnectionRpcGate::new());
+        let polled = Arc::new(AtomicBool::new(false));
+        let child_polled = Arc::clone(&polled);
+        let (send, _receive) = oneshot::channel();
+        let result = spawn_sample_child(
+            &tasks,
+            Arc::clone(&gate),
+            async move {
+                child_polled.store(true, Ordering::SeqCst);
+                Err(invalid_request("must not run"))
+            },
+            send,
+        );
+        assert_eq!(
+            result.unwrap_err().message,
+            "sample task admission unavailable"
+        );
+        assert!(!polled.load(Ordering::SeqCst));
+        assert_eq!(gate.unanswered(), 0);
+        assert!(gate.shutdown_with_evidence().await.is_clean());
+    }
+
+    #[tokio::test]
+    async fn dropped_sample_reply_observer_does_not_discard_owned_original() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let tasks = ProcessorTasks::default();
+        let gate = Arc::new(ConnectionRpcGate::new());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(AtomicBool::new(false));
+        let (send, receive) = oneshot::channel();
+        spawn_sample_child(
+            &tasks,
+            Arc::clone(&gate),
+            {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                let completed = Arc::clone(&completed);
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    completed.store(true, Ordering::SeqCst);
+                    Err(invalid_request("finished after observer dropped"))
+                }
+            },
+            send,
+        )
+        .unwrap();
+        entered.notified().await;
+        drop(receive);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut drain = Box::pin(tasks.shutdown_until(deadline));
+        assert!(futures::poll!(drain.as_mut()).is_pending());
+        drop(drain);
+        assert!(!completed.load(Ordering::SeqCst));
+        release.notify_one();
+        assert!(tasks.shutdown_until(deadline).await.is_clean());
+        assert!(completed.load(Ordering::SeqCst));
         assert_eq!(gate.unanswered(), 0);
         assert!(gate.shutdown_with_evidence().await.is_clean());
     }

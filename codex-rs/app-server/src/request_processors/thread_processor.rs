@@ -20,6 +20,7 @@ use super::thread_lifecycle::thread_closing_for_resume;
 use super::*;
 use crate::connection_rpc_gate::ConnectionRpcGate;
 use crate::error_code::method_not_found;
+use crate::processor_task_retirement::{ProcessorTaskDrain, ProcessorTaskJoin, ProcessorTasks};
 use crate::thread_sample::SampleTask;
 use crate::thread_sample::SampleThread;
 use crate::thread_sample::generate_sample;
@@ -519,7 +520,7 @@ pub(crate) struct ThreadRequestProcessor {
     pub(super) thread_goal_processor: ThreadGoalRequestProcessor,
     pub(super) state_db: Option<StateDbHandle>,
     pub(super) log_db: Option<LogDbLayer>,
-    pub(super) background_tasks: TaskTracker,
+    pub(super) background_tasks: ProcessorTasks,
     pub(super) sample_responses: Arc<crate::thread_sample::SampleResponseRegistry>,
     pub(super) skills_watcher: Arc<SkillsWatcher>,
     pub(super) turn_cost_worker: Option<crate::turn_cost_worker::TurnCostWorkerHandle>,
@@ -581,7 +582,7 @@ impl ThreadRequestProcessor {
             thread_goal_processor,
             state_db,
             log_db,
-            background_tasks: TaskTracker::new(),
+            background_tasks: ProcessorTasks::default(),
             sample_responses,
             skills_watcher,
             turn_cost_worker,
@@ -1411,21 +1412,40 @@ impl ThreadRequestProcessor {
                 outgoing.send_error(error_request_id, error).await;
             }
         };
-        self.background_tasks
+        let receipt = self
+            .background_tasks
             .spawn(thread_start_task.instrument(request_context.span()))
-            .await
-            .map_err(|_| internal_error("thread startup task stopped before completing"))?;
+            .map_err(|_| internal_error("background thread-start admission unavailable"))?;
+        match receipt.await {
+            ProcessorTaskJoin::Joined => {}
+            ProcessorTaskJoin::Cancelled | ProcessorTaskJoin::Panicked => {
+                return Err(internal_error(
+                    "thread startup task stopped before completing",
+                ));
+            }
+        }
         Ok(())
     }
 
     pub(crate) async fn drain_background_tasks(&self) {
-        self.background_tasks.close();
-        if tokio::time::timeout(BACKGROUND_TASK_DRAIN_CAP, self.background_tasks.wait())
-            .await
-            .is_err()
-        {
-            warn!("timed out waiting for background tasks to shut down; proceeding");
+        let report = self
+            .drain_background_tasks_until(tokio::time::Instant::now() + BACKGROUND_TASK_DRAIN_CAP)
+            .await;
+        if !report.is_clean() {
+            warn!(
+                ?report,
+                "background thread-start shutdown incomplete; custody retained"
+            );
         }
+    }
+
+    /// Close birth and observe the exact retained originals. Observer cancellation
+    /// or an expired wait never removes their join receipts from this owner.
+    pub(crate) async fn drain_background_tasks_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> ProcessorTaskDrain {
+        self.background_tasks.shutdown_until(deadline).await
     }
 
     pub(crate) async fn clear_all_thread_listeners(&self) {

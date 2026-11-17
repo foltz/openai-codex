@@ -137,7 +137,7 @@ fn main() -> anyhow::Result<()> {
             // Runtime teardown can wait forever for blocked rollout I/O.
             std::process::exit(0);
         }
-        exit.into_shutdown_result()
+        exit.into_shutdown_result().map_err(Into::into)
     })
 }
 

@@ -3,6 +3,7 @@ use super::thread_processor::thread_turns_page_size;
 use super::*;
 use crate::extensions::send_thread_warning;
 use crate::thread_state::ListenerStateCandidate;
+use crate::thread_state::RetentionSnapshot;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadQueueChangedNotification;
 use codex_core::ThreadEvictionOutcome;
@@ -31,6 +32,9 @@ pub(super) struct ListenerTaskContext {
 
 struct UnloadingState {
     delay: Duration,
+    retention_rx: watch::Receiver<RetentionSnapshot>,
+    retention: (bool, Instant),
+    parent_owned: bool,
     has_subscribers_rx: watch::Receiver<bool>,
     has_subscribers: (bool, Instant),
     thread_status_rx: watch::Receiver<ThreadStatus>,
@@ -42,7 +46,13 @@ impl UnloadingState {
         delay: Duration,
         has_subscribers_rx: watch::Receiver<bool>,
         thread_status_rx: watch::Receiver<ThreadStatus>,
+        retention_rx: watch::Receiver<RetentionSnapshot>,
+        parent_owned: bool,
     ) -> Self {
+        let retention = {
+            let snapshot = *retention_rx.borrow();
+            (snapshot.granted, snapshot.unretained_since.into())
+        };
         let has_subscribers = (*has_subscribers_rx.borrow(), Instant::now());
         let is_active = (
             matches!(*thread_status_rx.borrow(), ThreadStatus::Active { .. }),
@@ -50,6 +60,9 @@ impl UnloadingState {
         );
         Self {
             delay,
+            retention_rx,
+            retention,
+            parent_owned,
             has_subscribers_rx,
             has_subscribers,
             thread_status_rx,
@@ -58,7 +71,19 @@ impl UnloadingState {
     }
 
     fn unloading_target(&self) -> Option<Instant> {
-        match (self.has_subscribers, self.is_active) {
+        let snapshot = *self.retention_rx.borrow();
+        if snapshot.retiring || snapshot.clear_held {
+            return None;
+        }
+        // V2 child eviction belongs to Core's parent-owned cache policy. Keep
+        // upstream observer-based eviction there; ordinary runtime lifetime is
+        // controlled by explicit retention rather than passive subscribers.
+        let held = if self.parent_owned {
+            self.has_subscribers
+        } else {
+            self.retention
+        };
+        match (held, self.is_active) {
             ((false, has_no_subscribers_since), (false, is_inactive_since)) => {
                 std::cmp::max(has_no_subscribers_since, is_inactive_since).checked_add(self.delay)
             }
@@ -67,6 +92,8 @@ impl UnloadingState {
     }
 
     fn sync_receiver_values(&mut self) {
+        let snapshot = *self.retention_rx.borrow();
+        self.retention = (snapshot.granted, snapshot.unretained_since.into());
         let has_subscribers = *self.has_subscribers_rx.borrow();
         if self.has_subscribers.0 != has_subscribers {
             self.has_subscribers = (has_subscribers, Instant::now());
@@ -109,6 +136,10 @@ impl UnloadingState {
             };
             tokio::select! {
                 _ = unloading_sleep => return true,
+                changed = self.retention_rx.changed() => {
+                    if changed.is_err() { return false; }
+                    self.sync_receiver_values();
+                },
                 changed = self.has_subscribers_rx.changed() => {
                     if changed.is_err() {
                         return false;
@@ -541,6 +572,13 @@ async fn start_listener(
             .thread_watch_manager
             .subscribe(conversation_id)
             .await;
+        let Some(retention_rx) = listener_task_context
+            .thread_state_manager
+            .subscribe_to_retention(conversation_id)
+            .await
+        else {
+            return ListenerStartOutcome::Stale;
+        };
         (
             listener_command_rx,
             listener_generation,
@@ -548,6 +586,8 @@ async fn start_listener(
                 config.thread_unload_delay,
                 has_subscribers_rx,
                 thread_status_rx,
+                retention_rx,
+                is_v2_child,
             ),
             attached,
             retained,
@@ -792,16 +832,18 @@ async fn start_listener(
                         pending_thread_unloads.lock().await.remove(&conversation_id);
                         return;
                     }
-                    unload_thread_without_subscribers(
-                        thread_manager.clone(),
-                        outgoing_for_task.clone(),
-                        pending_thread_unloads.clone(),
-                        thread_state_manager.clone(),
-                        thread_watch_manager.clone(),
-                        conversation_id,
-                        conversation.clone(),
-                    )
-                    .await;
+                    let expected_retention = *unloading_state.retention_rx.borrow();
+                    let refused = unload_idle_unretained_thread(
+                        thread_manager.clone(), outgoing_for_task.clone(), pending_thread_unloads.clone(),
+                        thread_state_manager.clone(), thread_watch_manager.clone(), conversation_id,
+                        conversation.clone(), listener_generation, expected_retention,
+                    ).await;
+                    if refused.is_some() {
+                        // A concurrent grant, clear reservation, or active task won
+                        // the claim. Keep the exact listener and re-evaluate later.
+                        unloading_state.note_thread_activity_observed();
+                        continue;
+                    }
                     break false;
                 }
             }
@@ -914,7 +956,8 @@ pub(super) async fn wait_for_thread_shutdown(thread: &Arc<CodexThread>) -> Threa
     }
 }
 
-pub(super) async fn unload_thread_without_subscribers(
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn unload_idle_unretained_thread(
     thread_manager: Arc<ThreadManager>,
     outgoing: Arc<OutgoingMessageSender>,
     pending_thread_unloads: PendingThreadUnloads,
@@ -922,63 +965,128 @@ pub(super) async fn unload_thread_without_subscribers(
     thread_watch_manager: ThreadWatchManager,
     thread_id: ThreadId,
     thread: Arc<CodexThread>,
-) {
-    info!("thread {thread_id} has no subscribers and is idle; shutting down");
+    listener_generation: u64,
+    expected_retention: RetentionSnapshot,
+) -> Option<crate::thread_state::RetentionRetirementRefusal> {
+    info!("thread {thread_id} has no retention grant and is idle; shutting down");
 
-    // Any pending app-server -> client requests for this thread can no longer be
-    // answered; cancel their callbacks before shutdown/unload.
+    // The claim is checked first: an active exact clear reservation (or any
+    // other refusal) must leave no side effect, so pending requests are
+    // cancelled only after retirement is committed below.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let ticket = match thread_state_manager
+        .claim_thread_retirement(
+            thread_id,
+            expected_retention,
+            &thread,
+            listener_generation,
+            deadline.into(),
+        )
+        .await
+    {
+        Ok((claim, ticket)) => (claim, ticket),
+        Err(error) => {
+            pending_thread_unloads.lock().await.remove(&thread_id);
+            tracing::debug!(thread_id = %thread_id, ?error, "idle thread retirement was refused");
+            return Some(error);
+        }
+    };
+    let (claim, ticket) = ticket;
+    // Retirement is committed: pending app-server -> client requests for this
+    // thread can no longer be answered; cancel their callbacks before waiting
+    // for shutdown/unload.
     outgoing
         .cancel_requests_for_thread(thread_id, /*error*/ None)
         .await;
-    thread_state_manager.remove_thread_state(thread_id).await;
-
-    tokio::spawn(async move {
-        // The deadline bounds our warning, not background cleanup. Keep polling the
-        // same future so even delayed shutdown submission can eventually finish.
-        let shutdown = thread.shutdown_and_wait();
-        tokio::pin!(shutdown);
-        let result = match tokio::time::timeout(Duration::from_secs(/*secs*/ 10), &mut shutdown)
+    let report = ticket.wait().await;
+    // The original report is recorded as-is; an incomplete report keeps the
+    // lifecycle row (and its ticket) through observation removal below.
+    if !thread_state_manager
+        .record_retirement_report(claim, report)
+        .await
+    {
+        pending_thread_unloads.lock().await.remove(&thread_id);
+        return None;
+    }
+    if !report.is_complete() {
+        warn!(
+            event.name = "codex.app_server.thread_shutdown_slow",
+            thread_id = %thread_id,
+            ?report,
+            "idle thread retirement remains incomplete; awaiting observed resource release"
+        );
+        // Separate positive evidence only: the exact loop joined and its
+        // cleanup owner recorded a clean receipt. This never drives cleanup
+        // and never rewrites `report`, which stays incomplete in custody.
+        // A joined loop with a clean cleanup receipt is still not a release
+        // while the session's sandbox cleanup is unproven.
+        if !thread.observe_resource_release().await || thread.sandbox_cleanup_outcome().is_some() {
+            pending_thread_unloads.lock().await.remove(&thread_id);
+            warn!(
+                thread_id = %thread_id,
+                ?report,
+                "idle thread resource release was not observed; thread stays loaded"
+            );
+            return None;
+        }
+        info!(
+            thread_id = %thread_id,
+            ?report,
+            "idle thread resources released after retirement deadline; retirement report remains incomplete"
+        );
+        // Move the exact retiring row, with its sticky incomplete report, into
+        // retired custody before the runtime leaves the manager. Otherwise the
+        // row outlives observation removal and blocks every same-id resume.
+        if !thread_state_manager
+            .archive_late_release(claim, &thread)
             .await
         {
-            Ok(result) => result,
-            Err(_) => {
-                warn!(
-                    event.name = "codex.app_server.thread_shutdown_slow",
-                    "thread {thread_id} shutdown is taking longer than expected; continuing to wait"
-                );
-                shutdown.await
-            }
-        };
-        match result {
-            Ok(()) => {
-                // A delayed unload can finish after thread/revert replaces this runtime under
-                // the same thread ID. Only the runtime that scheduled this unload may remove it.
-                if thread_manager
-                    .remove_thread_if_matches(&thread_id, &thread)
-                    .await
-                    .is_none()
-                {
-                    info!("thread {thread_id} was replaced or removed before teardown finalized");
-                    pending_thread_unloads.lock().await.remove(&thread_id);
-                    return;
-                }
-                thread_watch_manager
-                    .remove_thread(&thread_id.to_string())
-                    .await;
-                let notification = ThreadClosedNotification {
-                    thread_id: thread_id.to_string(),
-                };
-                outgoing
-                    .send_server_notification(ServerNotification::ThreadClosed(notification))
-                    .await;
-                pending_thread_unloads.lock().await.remove(&thread_id);
-            }
-            Err(_) => {
-                pending_thread_unloads.lock().await.remove(&thread_id);
-                warn!("failed to submit Shutdown to thread {thread_id}");
-            }
+            pending_thread_unloads.lock().await.remove(&thread_id);
+            warn!(
+                thread_id = %thread_id,
+                ?report,
+                "idle thread late release lacks exact custody or quiescence evidence; thread stays loaded"
+            );
+            return None;
         }
-    });
+    }
+    let removed = thread_manager
+        .remove_thread_if_same(&thread_id, &thread)
+        .await;
+    if removed.is_none() {
+        info!("thread {thread_id} was replaced or removed before teardown finalized");
+        pending_thread_unloads.lock().await.remove(&thread_id);
+        return None;
+    }
+    thread_state_manager.remove_thread_state(thread_id).await;
+    thread_watch_manager
+        .remove_thread(&thread_id.to_string())
+        .await;
+    let notification = ThreadClosedNotification {
+        thread_id: thread_id.to_string(),
+    };
+    outgoing
+        .send_server_notification(ServerNotification::ThreadClosed(notification))
+        .await;
+    pending_thread_unloads.lock().await.remove(&thread_id);
+    None
+}
+
+/// Save the exact-generation observation before deciding whether ordinary unload is safe.
+#[cfg(test)]
+pub(crate) async fn observe_idle_retirement_report(
+    manager: &ThreadStateManager,
+    claim: crate::thread_state::RetentionRetirementClaim,
+    report: codex_core::ThreadRetirementReport,
+) -> bool {
+    if !manager.record_retirement_report(claim, report).await {
+        return false;
+    }
+    if !report.is_complete() {
+        warn!(thread_id = %claim.thread_id, ?report, "idle thread retirement remains incomplete");
+        return false;
+    }
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1539,4 +1647,63 @@ pub(super) fn set_thread_status_and_interrupt_stale_turns(
         }
     }
     thread.status = status;
+}
+
+#[cfg(test)]
+mod retention_clock_tests {
+    use super::*;
+
+    fn idle_state(parent_owned: bool) -> (UnloadingState, watch::Sender<RetentionSnapshot>) {
+        let snapshot = RetentionSnapshot {
+            generation: uuid::Uuid::new_v4(),
+            revision: uuid::Uuid::new_v4(),
+            granted: false,
+            unretained_since: tokio::time::Instant::now() - Duration::from_secs(30),
+            retiring: false,
+            clear_held: false,
+        };
+        // A passive observer is deliberately present in both cases.
+        let (_, observers) = watch::channel(true);
+        let (_, status) = watch::channel(ThreadStatus::Idle);
+        let (retention, receiver) = watch::channel(snapshot);
+        let mut state = UnloadingState::new(
+            Duration::from_secs(10),
+            observers,
+            status,
+            receiver,
+            parent_owned,
+        );
+        state.is_active.1 = Instant::now() - Duration::from_secs(30);
+        (state, retention)
+    }
+
+    #[tokio::test]
+    async fn passive_observation_does_not_pin_ordinary_runtime_but_preserves_parent_cache_policy() {
+        let (mut ordinary, _) = idle_state(false);
+        assert!(ordinary.should_unload_now());
+        let (mut parent_owned, _) = idle_state(true);
+        assert!(!parent_owned.should_unload_now());
+    }
+
+    #[tokio::test]
+    async fn explicit_grant_and_clear_hold_disarm_retirement_and_release_restarts_clock() {
+        let (mut state, sender) = idle_state(false);
+        assert!(state.should_unload_now());
+        sender.send_modify(|snapshot| snapshot.granted = true);
+        assert!(!state.should_unload_now());
+        sender.send_modify(|snapshot| {
+            snapshot.granted = false;
+            snapshot.unretained_since = tokio::time::Instant::now();
+        });
+        assert!(!state.should_unload_now());
+        sender.send_modify(|snapshot| {
+            snapshot.unretained_since = tokio::time::Instant::now() - Duration::from_secs(30);
+            snapshot.clear_held = true;
+        });
+        assert!(!state.should_unload_now());
+        sender.send_modify(|snapshot| snapshot.clear_held = false);
+        assert!(state.should_unload_now());
+        sender.send_modify(|snapshot| snapshot.retiring = true);
+        assert!(!state.should_unload_now());
+    }
 }

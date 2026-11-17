@@ -364,3 +364,86 @@ delivery = {{ kind = "header", name = "X-Gateway-Authorization" }}
     }
     Ok(())
 }
+
+/// A returned device prompt must not release the actual account-login original.
+#[tokio::test]
+async fn device_gateway_prompt_retains_original_until_login_shutdown_joins_it() -> Result<()> {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/devicecode"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "device_code": "synthetic-device-code", "user_code": "ABCD-EFGH",
+            "verification_uri": "https://login.example/device", "expires_in": 60, "interval": 60
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(
+            ResponseTemplate::new(400).set_body_json(json!({"error": "authorization_pending"})),
+        )
+        .mount(&server)
+        .await;
+    let home = TempDir::new()?;
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!(
+            r#"
+model_provider = "gateway"
+[model_providers.gateway]
+name = "Gateway"
+requires_openai_auth = true
+base_url = "{url}/v1"
+wire_api = "responses"
+[model_providers.gateway.gateway_oauth]
+authorization_url = "{url}/authorize"
+device_authorization_url = "{url}/devicecode"
+token_url = "{url}/token"
+client_id = "retained-device-login"
+credentials_store = "file"
+delivery = {{ kind = "header", name = "X-Gateway-Authorization" }}
+"#,
+            url = server.uri()
+        ),
+    )?;
+    let config = Arc::new(
+        ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .build()
+            .await?,
+    );
+    let auth = AuthManager::from_auth_for_testing_with_home(
+        CodexAuth::from_api_key("synthetic-primary"),
+        home.path().to_path_buf(),
+    );
+    let _session = seed_gateway_auth(
+        &config.model_provider,
+        &auth,
+        json!({"access_token":"expired", "refresh_token":null, "expires_at":0}),
+    );
+    let (processor, _outgoing) = build_test_processor(config, auth).await;
+    let session = ConnectionSessionState::new(crate::transport::ConnectionOrigin::Stdio);
+    let response = timeout(
+        Duration::from_secs(5),
+        processor.account_processor.gateway_oauth_login(
+            codex_app_server_protocol::GatewayOAuthLoginParams {
+                model_provider: None,
+                device_auth: true,
+            },
+            TEST_CONNECTION_ID,
+            &session.rpc_gate,
+        ),
+    )
+    .await?
+    .map_err(|error| anyhow::anyhow!("{}", error.message))?;
+    assert!(response.prompt.is_some());
+    assert!(processor.login_tasks.len() > 0);
+    let shutdown =
+        processor.begin_login_shutdown(tokio::time::Instant::now() + Duration::from_secs(5))?;
+    let report = timeout(Duration::from_secs(6), shutdown.wait()).await?;
+    assert!(report.is_clean(), "{report:?}");
+    assert_eq!(processor.login_tasks.len(), 0);
+    processor.clear_runtime_references();
+    Ok(())
+}

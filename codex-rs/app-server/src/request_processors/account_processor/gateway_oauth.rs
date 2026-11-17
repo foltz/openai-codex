@@ -102,7 +102,14 @@ impl AccountRequestProcessor {
         owner: ConnectionId,
         connection_gate: &crate::connection_rpc_gate::ConnectionRpcGate,
     ) -> Result<GatewayOAuthLoginResponse, JSONRPCErrorError> {
-        let cancel = CancellationToken::new();
+        if self.login_shutdown.is_cancelled() {
+            return Err(internal_error("gateway login admission closed"));
+        }
+        let work = self
+            .thread_manager
+            .capture_request_operation_work()
+            .map_err(|_| internal_error("gateway login account work unavailable"))?;
+        let cancel = self.login_shutdown.child_token();
         let guard = {
             let mut active = self
                 .gateway_login
@@ -159,7 +166,7 @@ impl AccountRequestProcessor {
             let login_id = uuid::Uuid::new_v4().to_string();
             let provider_id = config.model_provider_id.clone();
             let outgoing = Arc::clone(&self.outgoing);
-            let login = tokio::spawn(async move {
+            let login = async move {
                 let result = client
                     .login_with_device_code(cancel.cancelled(), |prompt| {
                         let _ = prompt_tx.send(codex_app_server_protocol::GatewayOAuthPrompt {
@@ -190,15 +197,36 @@ impl AccountRequestProcessor {
                     )
                     .await;
                 result
-            });
+            };
+            let ticket = self.login_tasks.clone();
+            let originator = AuthStorageOriginator::current();
+            let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+            let receipt = self
+                .login_tasks
+                .spawn(async move {
+                    let result = crate::auth_task_work::scope_with_ticket(
+                        ticket,
+                        work,
+                        originator.scope(login),
+                    )
+                    .await
+                    .map_err(|_| std::io::Error::other("gateway auth retirement unavailable"))
+                    .and_then(|result| result);
+                    let _ = result_tx.send(result);
+                })
+                .map_err(|_| internal_error("gateway login task admission unavailable"))?;
             return match prompt_rx.await {
                 Ok(prompt) => Ok(GatewayOAuthLoginResponse {
                     prompt: Some(prompt),
                 }),
                 Err(_) => {
-                    login
+                    if receipt.await != crate::processor_task_retirement::ProcessorTaskJoin::Joined
+                    {
+                        return Err(internal_error("gateway login task did not join"));
+                    }
+                    result_rx
                         .await
-                        .map_err(|err| internal_error(err.to_string()))?
+                        .map_err(|_| internal_error("gateway login result unavailable"))?
                         .map_err(|err| internal_error(err.to_string()))?;
                     Ok(GatewayOAuthLoginResponse { prompt: None })
                 }

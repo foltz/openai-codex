@@ -1,5 +1,6 @@
 //! Bound-grant tests use the actual storage and HTTP refresh lifecycle.
 use super::*;
+use crate::OAuthRequestCredentials;
 use pretty_assertions::assert_eq;
 fn grant(client: &OAuthSessionManager, id: &str, access: &str, expiry: i64) {
     client

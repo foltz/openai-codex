@@ -300,7 +300,10 @@ mod publication_tests {
                 .publish_auth_for_owner(&snapshot, &binding, CodexAuth::from_api_key("renewed"))
                 .unwrap()
         );
-        assert_eq!(manager.auth_cached().unwrap().get_token().unwrap(), "renewed");
+        assert_eq!(
+            manager.auth_cached().unwrap().get_token().unwrap(),
+            "renewed"
+        );
         let after = manager.owner_snapshot().unwrap();
         assert_eq!(
             after.revisions.owner_generation,

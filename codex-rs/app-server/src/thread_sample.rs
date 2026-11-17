@@ -95,18 +95,29 @@ pub(crate) async fn generate_sample(
     }
     let (sender, receiver) = oneshot::channel();
     let originator = AuthStorageOriginator::current();
-    tasks.spawn(async move {
-        rpc_gate
-            .run(originator.scope(async move {
-                let result = Box::pin(task.run(deadline)).await;
-                let _ = sender.send(result);
-            }))
-            .await;
-    });
+    tasks.spawn(run_sample_child(
+        rpc_gate,
+        originator.scope(async move { Box::pin(task.run(deadline)).await }),
+        sender,
+    ));
     tokio::time::timeout_at(deadline, receiver)
         .await
         .map_err(|_| internal_error("sample timed out"))?
         .map_err(|_| internal_error("sample task stopped"))?
+}
+
+/// The outer RPC already owns its request ticket. Preserve a concrete child
+/// refusal/panic result rather than silently dropping its response channel.
+async fn run_sample_child(
+    rpc_gate: Arc<ConnectionRpcGate>,
+    future: impl std::future::Future<Output = SampleResult>,
+    sender: oneshot::Sender<SampleResult>,
+) {
+    let result = rpc_gate
+        .run_child(future)
+        .await
+        .unwrap_or_else(|_| Err(internal_error("sample task stopped")));
+    let _ = sender.send(result);
 }
 
 impl SampleTask {
@@ -454,4 +465,41 @@ async fn collect_response(mut upstream: ModelResponseStream) -> SampleResult {
         }
     }
     Err(internal_error("sample stream ended before completion"))
+}
+
+#[cfg(test)]
+mod child_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn closed_gate_returns_sample_refusal_without_polling_child() {
+        let gate = Arc::new(ConnectionRpcGate::new());
+        gate.close().await;
+        let (send, receive) = oneshot::channel();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            run_sample_child(gate.clone(), std::future::pending(), send),
+        )
+        .await
+        .unwrap();
+        let error = receive.await.unwrap().unwrap_err();
+        assert_eq!(error.message, "sample task stopped");
+        assert_eq!(gate.unanswered(), 0);
+    }
+
+    #[tokio::test]
+    async fn admitted_sample_child_preserves_its_actual_error_for_parent() {
+        let gate = Arc::new(ConnectionRpcGate::new());
+        let (send, receive) = oneshot::channel();
+        run_sample_child(
+            gate.clone(),
+            async { Err(invalid_request("synthetic sample refusal")) },
+            send,
+        )
+        .await;
+        let error = receive.await.unwrap().unwrap_err();
+        assert_eq!(error.message, "synthetic sample refusal");
+        assert_eq!(gate.unanswered(), 0);
+        assert!(gate.shutdown_with_evidence().await.is_clean());
+    }
 }

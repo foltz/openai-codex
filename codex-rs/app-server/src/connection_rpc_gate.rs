@@ -89,6 +89,13 @@ impl Drop for RpcTicket {
     }
 }
 
+/// Internal child failure; its already-admitted parent owns the RPC reply.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConnectionRpcChildError {
+    Closed,
+    Panicked,
+}
+
 impl ConnectionRpcGate {
     pub(crate) fn new() -> Self {
         let accepting = true;
@@ -154,23 +161,36 @@ impl ConnectionRpcGate {
             .saturating_add(pending)
     }
 
+    /// Run an internal child of an already-admitted RPC. The caller retains
+    /// its original in the processor TaskTracker and owns the parent reply.
+    /// This is not incoming-request admission: use run_admitted with an actual
+    /// RpcTicket for that. Closing still refuses before polling the child,
+    /// admitted children join the same drain, and panic remains sticky.
+    pub(crate) async fn run_child<F, T>(&self, future: F) -> Result<T, ConnectionRpcChildError>
+    where
+        F: Future<Output = T>,
+    {
+        let token = {
+            let accepting = self.accepting.lock().await;
+            if !*accepting || self.is_closed() {
+                return Err(ConnectionRpcChildError::Closed);
+            }
+            self.tasks.token()
+        };
+        let result = AssertUnwindSafe(future).catch_unwind().await.map_err(|_| {
+            self.panicked.store(true, Ordering::Release);
+            ConnectionRpcChildError::Panicked
+        });
+        drop(token);
+        result
+    }
+
     #[cfg(test)]
     pub(crate) async fn run<F>(&self, future: F)
     where
         F: Future<Output = ()>,
     {
-        let token = {
-            let accepting = self.accepting.lock().await;
-            if !*accepting || self.is_closed() {
-                return;
-            }
-            self.tasks.token()
-        };
-
-        if AssertUnwindSafe(future).catch_unwind().await.is_err() {
-            self.panicked.store(true, Ordering::Release);
-        }
-        drop(token);
+        let _ = self.run_child(future).await;
     }
 
     pub(crate) fn is_closed(&self) -> bool {
@@ -491,3 +511,7 @@ mod tests {
         assert_eq!(gate.unanswered(), u64::MAX);
     }
 }
+
+#[cfg(test)]
+#[path = "connection_rpc_child_tests.rs"]
+mod child_tests;

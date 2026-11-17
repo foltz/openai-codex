@@ -2028,7 +2028,13 @@ impl MessageProcessor {
                 self.thread_processor
                     .thread_fork(
                         request_id.clone(),
-                        params,
+                        crate::thread_state::RetainingParams {
+                            retention: connection_retention(
+                                params.retain_for_connection,
+                                session.retention_acquire_authority(),
+                            ),
+                            params,
+                        },
                         app_server_client_name.clone(),
                         client_version.clone(),
                         client_mcp_extensions.clone(),

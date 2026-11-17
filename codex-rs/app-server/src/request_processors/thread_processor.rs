@@ -658,21 +658,32 @@ impl ThreadRequestProcessor {
     pub(crate) async fn thread_fork(
         &self,
         request_id: ConnectionRequestId,
-        params: ThreadForkParams,
+        request: crate::thread_state::RetainingParams<ThreadForkParams>,
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
         client_mcp_extensions: ClientMcpExtensions,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        let mut minted = None;
         // Keep the large fork future out of the shared request dispatcher's stack frame.
-        Box::pin(self.thread_fork_inner(
+        let result = Box::pin(self.thread_fork_inner(
             request_id,
-            params,
+            request,
             app_server_client_name,
             app_server_client_version,
             client_mcp_extensions,
+            &mut minted,
         ))
-        .await
-        .map(|()| None)
+        .await;
+        // A fork that fails before its response releases exactly the grant it minted.
+        if result.is_err()
+            && let Some((thread_id, principal, grant_id)) = minted
+        {
+            let _ = self
+                .thread_state_manager
+                .release_retention(thread_id, principal, &grant_id)
+                .await;
+        }
+        result.map(|()| None)
     }
 
     pub(crate) async fn thread_sample(
@@ -1228,6 +1239,46 @@ impl ThreadRequestProcessor {
         }
         self.finalize_thread_teardown(thread_id).await;
         Ok(())
+    }
+
+    /// Failure cleanup for a request that cannot report its atomic grant.
+    pub(super) async fn release_minted_retention(
+        &self,
+        thread_id: ThreadId,
+        retained: &crate::thread_state::ConnectionRetentionOutcome,
+    ) {
+        if let Some((principal, grant_id)) = retained.minted_grant() {
+            let _ = self
+                .thread_state_manager
+                .release_retention(thread_id, principal, &grant_id)
+                .await;
+        }
+    }
+
+    /// Attaches the requesting connection's listener with requested retention.
+    /// A failed attach holds no grant: it failed before subscribing, or it
+    /// unsubscribed, which revokes the grant on the ordinary path.
+    async fn attach_listener_retaining(
+        &self,
+        thread_id: ThreadId,
+        connection_id: ConnectionId,
+        retention: crate::thread_state::ConnectionRetention,
+    ) -> (
+        Result<super::thread_lifecycle::EnsureConversationListenerResult, JSONRPCErrorError>,
+        crate::thread_state::ConnectionRetentionOutcome,
+    ) {
+        match super::thread_lifecycle::ensure_conversation_listener_retaining(
+            self.listener_task_context(),
+            thread_id,
+            connection_id,
+            /*raw_events_enabled*/ false,
+            retention,
+        )
+        .await
+        {
+            Ok((attached, retained)) => (Ok(attached), retained),
+            Err(error) => (Err(error), retention.unavailable()),
+        }
     }
 
     fn listener_task_context(&self) -> ListenerTaskContext {
@@ -5530,11 +5581,13 @@ impl ThreadRequestProcessor {
     async fn thread_fork_inner(
         &self,
         request_id: ConnectionRequestId,
-        params: ThreadForkParams,
+        request: crate::thread_state::RetainingParams<ThreadForkParams>,
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
         client_mcp_extensions: ClientMcpExtensions,
+        minted: &mut Option<crate::thread_state::MintedRetention>,
     ) -> Result<(), JSONRPCErrorError> {
+        let crate::thread_state::RetainingParams { params, retention } = request;
         if params.experimental_disable_prediction_mcp && !params.experimental_prediction_mode {
             return Err(invalid_request(
                 "`experimentalDisablePredictionMcp` requires `experimentalPredictionMode: true`",
@@ -5566,6 +5619,7 @@ impl ThreadRequestProcessor {
             ));
         }
         let ThreadForkParams {
+            retain_for_connection: _,
             thread_id,
             experimental_prediction_mode,
             experimental_disable_prediction_mcp,
@@ -6082,18 +6136,16 @@ impl ThreadRequestProcessor {
 
         let instruction_sources = forked_thread.legacy_instruction_sources().await;
 
-        // Auto-attach a conversation listener when forking a thread.
-        log_listener_attach_result(
-            self.ensure_conversation_listener(
-                thread_id,
-                request_id.connection_id,
-                /*raw_events_enabled*/ false,
-            )
-            .await,
-            thread_id,
-            request_id.connection_id,
-            "thread",
-        );
+        // Auto-attach a conversation listener when forking a thread. Requested
+        // retention is installed with the subscription, before the listener
+        // that arms idle retirement for the new runtime exists.
+        let (attach, retained) = self
+            .attach_listener_retaining(thread_id, request_id.connection_id, retention)
+            .await;
+        log_listener_attach_result(attach, thread_id, request_id.connection_id, "thread");
+        if let Some((principal, grant_id)) = retained.minted_grant() {
+            *minted = Some((thread_id, principal, grant_id));
+        }
 
         let config_snapshot = forked_thread.config_snapshot().await;
 
@@ -6179,6 +6231,7 @@ impl ThreadRequestProcessor {
             thread_response_active_permission_profile(config_snapshot.active_permission_profile);
         let thread_originator = config_snapshot.originator.clone();
         let response = ThreadForkResponse {
+            retention: retained.evidence(),
             thread: thread.clone(),
             disabled_plugin_ids: config_snapshot.disabled_plugin_ids,
             model: config_snapshot.model.clone(),
@@ -6200,6 +6253,8 @@ impl ThreadRequestProcessor {
         self.outgoing
             .send_response_with_thread_originator(request_id, response, thread_originator)
             .await;
+        // The successful response transfers the reported grant to the client.
+        *minted = None;
         // `excludeTurns` is the cheap fork path, so skip restored usage replay
         // instead of rebuilding history only to attribute a historical update.
         if let Some(token_usage_turn_id) = token_usage_turn_id {

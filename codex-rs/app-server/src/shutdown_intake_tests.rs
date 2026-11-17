@@ -45,6 +45,7 @@ async fn callback_can_register_another_callback_after_latch() {
     let nested_calls = calls.clone();
     latch.on_edge(move |deadline| {
         let latch = weak.upgrade().unwrap();
+        let nested_calls = Arc::clone(&nested_calls);
         latch.on_edge(move |nested| {
             assert_eq!(nested, deadline);
             nested_calls.fetch_add(1, Ordering::SeqCst);

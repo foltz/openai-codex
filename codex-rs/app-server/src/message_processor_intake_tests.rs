@@ -1,4 +1,3 @@
-use super::*;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -13,7 +12,7 @@ async fn real_processor_intake_closes_admission_and_latches_existing_cleanup_own
             .await
             .unwrap(),
     );
-    let auth = codex_login::AuthManager::shared_from_config(config.as_ref(), false);
+    let auth = codex_login::AuthManager::shared_from_config(config.as_ref(), false).await;
     let (processor, _outgoing) =
         super::message_processor_tracing_tests::build_test_processor(config, auth).await;
     let permit = processor
@@ -53,7 +52,7 @@ async fn registered_intake_callback_keeps_only_weak_processor_custody() {
             .await
             .unwrap(),
     );
-    let auth = codex_login::AuthManager::shared_from_config(config.as_ref(), false);
+    let auth = codex_login::AuthManager::shared_from_config(config.as_ref(), false).await;
     let (processor, _outgoing) =
         super::message_processor_tracing_tests::build_test_processor(config, auth).await;
     let (latch, _custody) = crate::shutdown_intake::OwnerLatch::new();
@@ -88,7 +87,7 @@ async fn published_intake_deadline_without_binding_receipt_is_not_clean() {
             .await
             .unwrap(),
     );
-    let auth = codex_login::AuthManager::shared_from_config(config.as_ref(), false);
+    let auth = codex_login::AuthManager::shared_from_config(config.as_ref(), false).await;
     let (processor, _outgoing) =
         super::message_processor_tracing_tests::build_test_processor(config, auth).await;
     let first = tokio::time::Instant::now() + Duration::from_secs(35);

@@ -290,7 +290,6 @@ async fn run_control_socket_acceptor(
                 transport_event_tx,
                 negotiated_compression,
                 provenance,
-                provenance,
                 owner_expiry,
             )
             .await;

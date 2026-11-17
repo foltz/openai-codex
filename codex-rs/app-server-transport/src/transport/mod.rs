@@ -193,7 +193,6 @@ pub enum TransportEvent {
         origin: ConnectionOrigin,
         provenance: ConnectionProvenance,
         auth: Option<crate::ConnectionAuth>,
-        provenance: ConnectionProvenance,
         writer: mpsc::Sender<QueuedOutgoingMessage>,
         disconnect_sender: Option<CancellationToken>,
     },

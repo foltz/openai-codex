@@ -77,9 +77,8 @@ pub async fn start_stdio_connection(
         .send(TransportEvent::ConnectionOpened {
             connection_id,
             origin: ConnectionOrigin::Stdio,
-            provenance: crate::transport::ConnectionProvenance::Unproven,
-            auth: None,
             provenance: ConnectionProvenance::Unproven,
+            auth: None,
             writer: writer_tx,
             disconnect_sender: None,
         })

@@ -583,7 +583,6 @@ impl OAuthSessionManager {
         // persistence with refreshes. Use the current stored token as the failed-save baseline.
         let credential_lock = Arc::new(storage::lock_credentials(&self.state.codex_home).await?);
         let stored = self.load_token_async().await?;
-        policy.check_admission(stored.as_ref())?;
         if stored != cached.token {
             cached.token = stored;
             cached.pending = None;

@@ -1,6 +1,11 @@
+use futures::FutureExt;
+use futures::future::BoxFuture;
+use futures::future::Shared;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::outgoing_message::OutgoingMessageSender;
 use codex_app_server_protocol::ServerNotification;
@@ -32,6 +37,35 @@ pub(crate) struct SkillsWatcher {
     runtime_extra_roots_registration: Mutex<WatchRegistration>,
     shutdown_token: CancellationToken,
     _shutdown_drop_guard: DropGuard,
+    completion: Shared<BoxFuture<'static, SkillsWatcherShutdown>>,
+    shutdown_deadline: Mutex<Option<Instant>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SkillsWatcherShutdown {
+    Joined,
+    Cancelled,
+    Panicked,
+    NotStarted,
+    TimedOut,
+    Unavailable,
+}
+
+fn observe_event_loop(
+    task: Option<JoinHandle<()>>,
+) -> Shared<BoxFuture<'static, SkillsWatcherShutdown>> {
+    async move {
+        let Some(task) = task else {
+            return SkillsWatcherShutdown::NotStarted;
+        };
+        match task.await {
+            Ok(()) => SkillsWatcherShutdown::Joined,
+            Err(error) if error.is_cancelled() => SkillsWatcherShutdown::Cancelled,
+            Err(_) => SkillsWatcherShutdown::Panicked,
+        }
+    }
+    .boxed()
+    .shared()
 }
 
 impl SkillsWatcher {
@@ -51,7 +85,7 @@ impl SkillsWatcher {
         let shutdown_token = CancellationToken::new();
         let shutdown_drop_guard = shutdown_token.clone().drop_guard();
         let system_skills_root = system_cache_root_dir(codex_home);
-        Self::spawn_event_loop(
+        let task = Self::spawn_event_loop(
             rx,
             skills_service,
             system_skills_root,
@@ -63,11 +97,38 @@ impl SkillsWatcher {
             runtime_extra_roots_registration: Mutex::new(WatchRegistration::default()),
             shutdown_token,
             _shutdown_drop_guard: shutdown_drop_guard,
+            completion: observe_event_loop(task),
+            shutdown_deadline: Mutex::new(None),
         })
     }
 
     pub(crate) fn shutdown(&self) {
         self.shutdown_token.cancel();
+    }
+
+    /// The first observation binds the deadline. Dropping an observer retains
+    /// the actual event-loop join; no timeout aborts or forgets that owner.
+    pub(crate) async fn shutdown_until(&self, deadline: Instant) -> SkillsWatcherShutdown {
+        let deadline = {
+            let Ok(mut original) = self.shutdown_deadline.lock() else {
+                return SkillsWatcherShutdown::Unavailable;
+            };
+            *original.get_or_insert(deadline)
+        };
+        self.shutdown();
+        // This future only observes a spawned task, so a ready join may be
+        // normalized after expiry without resuming side-effecting cleanup.
+        if let Some(outcome) = self.completion.clone().now_or_never() {
+            return outcome;
+        }
+        if Instant::now() >= deadline {
+            return SkillsWatcherShutdown::TimedOut;
+        }
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline) => SkillsWatcherShutdown::TimedOut,
+            outcome = self.completion.clone() => outcome,
+        }
     }
 
     pub(crate) fn register_runtime_extra_roots(&self, extra_roots: &[AbsolutePathBuf]) {
@@ -136,15 +197,16 @@ impl SkillsWatcher {
         system_skills_root: AbsolutePathBuf,
         outgoing: Arc<OutgoingMessageSender>,
         shutdown_token: CancellationToken,
-    ) {
+    ) -> Option<JoinHandle<()>> {
         let mut rx = ThrottledWatchReceiver::new(rx, WATCHER_THROTTLE_INTERVAL);
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             warn!("skills watcher listener skipped: no Tokio runtime available");
-            return;
+            return None;
         };
-        handle.spawn(async move {
+        Some(handle.spawn(async move {
             loop {
                 let event = tokio::select! {
+                    biased;
                     _ = shutdown_token.cancelled() => break,
                     event = rx.recv() => event,
                 };
@@ -160,12 +222,18 @@ impl SkillsWatcher {
                     continue;
                 }
                 skills_service.clear_cache();
-                outgoing
-                    .send_server_notification(ServerNotification::SkillsChanged(
+                tokio::select! {
+                    biased;
+                    _ = shutdown_token.cancelled() => break,
+                    _ = outgoing.send_server_notification(ServerNotification::SkillsChanged(
                         SkillsChangedNotification {},
-                    ))
-                    .await;
+                    )) => {},
+                }
             }
-        });
+        }))
     }
 }
+
+#[cfg(test)]
+#[path = "skills_watcher_tests.rs"]
+mod tests;

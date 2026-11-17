@@ -230,10 +230,12 @@ impl AuthStorageBackend for CommittedStorage {
     }
     fn save(&self, auth: &AuthDotJson) -> std::io::Result<()> {
         let _guard = self.lock()?;
+        super::super::command_store::refuse_native_write(&self.home)?;
         self.inner.save(auth)
     }
     fn compare_and_save(&self, expected: &AuthDotJson, auth: &AuthDotJson) -> std::io::Result<()> {
         let _guard = self.lock()?;
+        super::super::command_store::refuse_native_write(&self.home)?;
         self.inner.compare_and_save(expected, auth)
     }
     fn delete(&self) -> std::io::Result<bool> {

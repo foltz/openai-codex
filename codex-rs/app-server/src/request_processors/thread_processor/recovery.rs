@@ -26,9 +26,11 @@ impl ThreadRequestProcessor {
         if !crate::thread_state::recovery::resume_owner_available() {
             return Err(invalid_request("resume recovery has no request owner"));
         }
-        let _resume = self.thread_state_manager.lock_goal_resume(id).await;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let _resume = lock_resume_until(&self.thread_state_manager, id, deadline).await?;
         let reservation =
-            UnloadReservation::acquire(self.pending_thread_unloads.clone(), id).await?;
+            UnloadReservation::acquire_until(self.pending_thread_unloads.clone(), id, deadline)
+                .await?;
         let current =
             self.thread_manager.get_thread(id).await.map_err(|_| {
                 invalid_request(format!("thread {id} changed during resume; retry"))
@@ -60,13 +62,7 @@ impl ThreadRequestProcessor {
         let claim = match generation {
             Ok(generation) => {
                 self.thread_state_manager
-                    .claim_thread_retirement(
-                        id,
-                        expected,
-                        old,
-                        generation,
-                        Instant::now() + Duration::from_secs(10),
-                    )
+                    .claim_thread_retirement(id, expected, old, generation, deadline)
                     .await
             }
             Err(_) => Err(RetentionRetirementRefusal::Busy),
@@ -163,9 +159,10 @@ impl ThreadRequestProcessor {
         if !crate::thread_state::recovery::resume_owner_available() {
             return Err(invalid_request("resume recovery has no request owner"));
         }
-        let _resume = self.thread_state_manager.lock_goal_resume(id).await;
+        let _resume = lock_resume_until(&self.thread_state_manager, id, deadline).await?;
         let reservation =
-            UnloadReservation::acquire(self.pending_thread_unloads.clone(), id).await?;
+            UnloadReservation::acquire_until(self.pending_thread_unloads.clone(), id, deadline)
+                .await?;
         self.recover_reserved_retiring_thread(id, reservation, deadline)
             .await
     }
@@ -273,6 +270,23 @@ impl ThreadRequestProcessor {
     }
 }
 
+async fn lock_resume_until(
+    state: &crate::thread_state::ThreadStateManager,
+    id: ThreadId,
+    deadline: Instant,
+) -> Result<tokio::sync::OwnedMutexGuard<()>, JSONRPCErrorError> {
+    if Instant::now() >= deadline {
+        return Err(invalid_request("resume recovery deadline expired"));
+    }
+    let guard = tokio::time::timeout_at(deadline, state.lock_goal_resume(id))
+        .await
+        .map_err(|_| invalid_request("resume recovery lock deadline expired"))?;
+    if Instant::now() >= deadline {
+        return Err(invalid_request("resume recovery deadline expired"));
+    }
+    Ok(guard)
+}
+
 /// Owns exactly one 0.169 unload watch. Cancellation releases only this watch,
 /// never a replacement. Until cleanup runs, resume/listener attach fail closed.
 struct UnloadReservation {
@@ -282,6 +296,23 @@ struct UnloadReservation {
     released: bool,
 }
 impl UnloadReservation {
+    async fn acquire_until(
+        table: crate::thread_state::PendingThreadUnloads,
+        id: ThreadId,
+        deadline: Instant,
+    ) -> Result<Self, JSONRPCErrorError> {
+        if Instant::now() >= deadline {
+            return Err(invalid_request("resume recovery deadline expired"));
+        }
+        let reservation = tokio::time::timeout_at(deadline, Self::acquire(table, id))
+            .await
+            .map_err(|_| invalid_request("resume recovery reservation deadline expired"))??;
+        if Instant::now() >= deadline {
+            return Err(invalid_request("resume recovery deadline expired"));
+        }
+        Ok(reservation)
+    }
+
     async fn acquire(
         table: crate::thread_state::PendingThreadUnloads,
         id: ThreadId,
@@ -354,6 +385,41 @@ impl Drop for UnloadReservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn recovery_deadline_bounds_the_actual_goal_resume_lock() {
+        let state = crate::thread_state::ThreadStateManager::new();
+        let id = ThreadId::new();
+        let held = state.lock_goal_resume(id).await;
+        assert!(
+            lock_resume_until(&state, id, Instant::now() + Duration::from_secs(10))
+                .await
+                .is_err()
+        );
+        drop(held);
+        assert!(lock_resume_until(&state, id, Instant::now()).await.is_err());
+        assert!(
+            lock_resume_until(&state, id, Instant::now() + Duration::from_secs(10))
+                .await
+                .is_ok()
+        );
+    }
+    #[tokio::test(start_paused = true)]
+    async fn recovery_deadline_bounds_watch_reservation_without_inserting() {
+        let table = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let id = ThreadId::new();
+        let held = table.lock().await;
+        assert!(
+            UnloadReservation::acquire_until(
+                table.clone(),
+                id,
+                Instant::now() + Duration::from_secs(10)
+            )
+            .await
+            .is_err()
+        );
+        drop(held);
+        assert!(!table.lock().await.contains_key(&id));
+    }
     #[tokio::test]
     async fn watch_reservation_refuses_overlap_and_cannot_remove_replacement() {
         let table = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));

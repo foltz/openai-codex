@@ -1,3 +1,10 @@
+mod shutdown;
+pub(crate) use shutdown::ProcessorThreadRetirement;
+pub(crate) use shutdown::ProcessorThreadShutdown;
+pub(crate) use shutdown::ThreadShutdownOwner;
+#[cfg(test)]
+pub(crate) use shutdown::tests::fixture as thread_shutdown_fixture;
+
 #[path = "daemon_continuation.rs"]
 mod daemon_continuation;
 
@@ -515,6 +522,7 @@ pub(crate) struct ThreadRequestProcessor {
     pub(super) thread_store: Arc<dyn ThreadStore>,
     pub(crate) pending_thread_unloads: PendingThreadUnloads,
     pub(super) thread_state_manager: ThreadStateManager,
+    thread_shutdown: ThreadShutdownOwner,
     pub(super) thread_watch_manager: ThreadWatchManager,
     pub(super) thread_list_state_permit: Arc<Semaphore>,
     pub(super) thread_goal_processor: ThreadGoalRequestProcessor,
@@ -577,6 +585,7 @@ impl ThreadRequestProcessor {
             thread_store,
             pending_thread_unloads,
             thread_state_manager,
+            thread_shutdown: ThreadShutdownOwner::default(),
             thread_watch_manager,
             thread_list_state_permit,
             thread_goal_processor,
@@ -1459,6 +1468,16 @@ impl ThreadRequestProcessor {
         deadline: tokio::time::Instant,
     ) -> codex_core::ShutdownDeadlineBinding {
         self.thread_manager.bind_shutdown_deadlines_now(deadline)
+    }
+
+    /// Permanent host retirement observes both current Core ownership and
+    /// prior exact retirement tickets retained outside observation state.
+    pub(crate) fn begin_thread_shutdown(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<ProcessorThreadRetirement, codex_core::ThreadManagerRetirementError> {
+        self.thread_shutdown
+            .begin(&self.thread_manager, &self.thread_state_manager, deadline)
     }
 
     pub(crate) async fn shutdown_threads(&self) {

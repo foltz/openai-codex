@@ -2082,6 +2082,8 @@ server_notification_definitions! {
     /// NEW NOTIFICATIONS
     Error => "error" (v2::ErrorNotification),
     ThreadStarted => "thread/started" (v2::ThreadStartedNotification),
+    #[experimental("thread/interactiveSubscriptions")]
+    ThreadInteractiveSubscriptionChanged => "thread/interactiveSubscriptions/changed" (v2::ThreadInteractiveSubscriptionChangedNotification),
     ThreadStatusChanged => "thread/status/changed" (v2::ThreadStatusChangedNotification),
     #[experimental("thread/readState/changed")]
     ThreadReadStateChanged => "thread/readState/changed" (v2::ThreadReadStateChangedNotification),

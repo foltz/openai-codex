@@ -54,6 +54,193 @@ pub enum ThreadStartSource {
     Clear,
 }
 
+/// A server-owned count of trusted interactive clients attached to one exact
+/// thread.
+///
+/// This is subscription evidence only. It does not establish thread succession,
+/// loaded state, or authority to transfer a clear transition.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub struct ThreadInteractiveSubscriptionEntry {
+    pub thread_id: String,
+    /// Distinct live thread-event subscriptions held by server-verified
+    /// interactive clients. Not evidence of human presence, focus or retention.
+    pub interactive_subscription_count: u32,
+}
+
+/// Requests the current authoritative interactive-subscription snapshot.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub struct ThreadInteractiveSubscriptionListParams {}
+
+/// Complete server-owned interactive-subscription state for one app-server
+/// process generation.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub struct ThreadInteractiveSubscriptionListResponse {
+    /// New for each app-server process and rotated before its revision can
+    /// overflow. A different generation requires the caller to discard any
+    /// cached subscription state and fetch a new snapshot.
+    pub generation: String,
+    /// Monotonically increasing only within `generation`.
+    pub revision: u64,
+    /// Exact threads with at least one trusted interactive subscription.
+    pub entries: Vec<ThreadInteractiveSubscriptionEntry>,
+}
+
+/// An atomic subscription-state transition. A zero count explicitly records a
+/// removal; it is not encoded by omitting an entry.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub struct ThreadInteractiveSubscriptionChangedNotification {
+    pub generation: String,
+    pub revision: u64,
+    pub changes: Vec<ThreadInteractiveSubscriptionEntry>,
+}
+
+/// Requests an explicit, process-local retention grant for one exact thread.
+/// The server derives the eligible principal; callers cannot provide one.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub struct ThreadRetentionAcquireParams {
+    pub thread_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "status",
+    deny_unknown_fields
+)]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub enum ThreadRetentionAcquireResponse {
+    Acquired {
+        #[schemars(rename = "grantId")]
+        grant_id: String,
+    },
+    AlreadyHeld {
+        #[schemars(rename = "grantId")]
+        grant_id: String,
+    },
+    Refused {
+        reason: ThreadRetentionRefusalReason,
+    },
+}
+
+/// Releases one opaque, process-local retention grant for one exact thread.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub struct ThreadRetentionReleaseParams {
+    pub thread_id: String,
+    pub grant_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "status",
+    deny_unknown_fields
+)]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub enum ThreadRetentionReleaseResponse {
+    Released {},
+    NotHeld {},
+    GrantMismatch {},
+    Refused {
+        reason: ThreadRetentionRefusalReason,
+    },
+}
+
+/// A typed, no-mutation refusal for the exact-thread retention carrier.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub enum ThreadRetentionRefusalReason {
+    IneligiblePrincipal,
+    AuthorityUnavailable,
+    UnknownThread,
+    InvalidThreadId,
+}
+
+#[cfg(test)]
+mod retention_wire_tests {
+    use super::*;
+
+    #[test]
+    fn retention_carrier_uses_closed_camel_case_wire_shapes() {
+        let response = ThreadRetentionAcquireResponse::Acquired {
+            grant_id: "server-minted".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(response).expect("response serializes"),
+            serde_json::json!({"status": "acquired", "grantId": "server-minted"})
+        );
+        assert!(
+            serde_json::from_value::<ThreadRetentionAcquireParams>(
+                serde_json::json!({"threadId": "t", "unexpected": true})
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ThreadRetentionAcquireResponse>(
+                serde_json::json!({"status": "acquired", "grantId": "g", "unexpected": true})
+            )
+            .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(ThreadRetentionReleaseResponse::GrantMismatch {})
+                .expect("release response serializes"),
+            serde_json::json!({"status": "grantMismatch"})
+        );
+        assert!(
+            serde_json::from_value::<ThreadRetentionReleaseParams>(
+                serde_json::json!({"threadId": "t", "grantId": "g", "unexpected": true})
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ThreadRetentionReleaseResponse>(
+                serde_json::json!({"status": "notHeld", "unexpected": true})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn retain_for_connection_is_an_opt_in_experimental_flag() {
+        let absent = serde_json::to_value(ThreadStartParams::default()).expect("params serialize");
+        assert_eq!(absent.get("retainForConnection"), None);
+        let requested = ThreadStartParams {
+            retain_for_connection: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&requested).expect("params serialize")["retainForConnection"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            <ThreadStartParams as crate::ExperimentalApi>::experimental_reason(&requested),
+            Some("thread/start.retainForConnection")
+        );
+        let resume: ThreadResumeParams =
+            serde_json::from_value(serde_json::json!({"threadId": "t"})).expect("resume params");
+        assert!(!resume.retain_for_connection);
+        let fork: ThreadForkParams = serde_json::from_value(
+            serde_json::json!({"threadId": "t", "retainForConnection": true}),
+        )
+        .expect("fork params");
+        assert!(fork.retain_for_connection);
+    }
+}
+
 // === Threads, Turns, and Items ===
 // Thread APIs
 #[derive(
@@ -121,11 +308,19 @@ pub struct ThreadStartParams {
     pub history_mode: Option<ThreadHistoryMode>,
     #[ts(optional = nullable)]
     pub session_start_source: Option<ThreadStartSource>,
-    /// Explicit client-declared predecessor for a Clear start only. This is
-    /// not authority to infer a global newest thread in the workspace.
+    /// The thread that this client deliberately replaced while clearing its
+    /// visible conversation. This is meaningful only when
+    /// `session_start_source` is `Clear`.
+    ///
+    /// A consumer must treat this as an explicit client lifecycle edge, not as
+    /// permission to infer a global "newest" thread for the workspace.
     #[experimental("thread/start.clearPredecessor")]
     #[ts(optional = nullable)]
     pub clear_predecessor_thread_id: Option<String>,
+    /// Independent recovery provenance; incompatible with clearPredecessorThreadId.
+    #[experimental("thread/start.clearRecovery")]
+    #[ts(optional = nullable)]
+    pub clear_recovery: Option<super::ThreadClearRecoveryContext>,
     /// Optional client-supplied analytics source classification for this thread.
     #[ts(optional = nullable)]
     pub thread_source: Option<ThreadSource>,
@@ -170,6 +365,13 @@ pub struct ThreadStartParams {
     #[experimental("thread/start.experimentalRawEvents")]
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub experimental_raw_events: bool,
+    /// Ask the server to install this connection's retention grant for the
+    /// thread atomically, before the runtime can arm idle retirement. Honoured
+    /// only for a connection eligible for `thread/retention/acquire`; the
+    /// response's `retention` field is the only evidence that it was honoured.
+    #[experimental("thread/start.retainForConnection")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub retain_for_connection: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, JsonSchema, TS)]
@@ -193,6 +395,10 @@ pub struct MockExperimentalMethodResponse {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadStartResponse {
+    /// Accepted recovery provenance, not authoritative clear lineage.
+    #[experimental("thread/start.clearRecovery")]
+    #[serde(default)]
+    pub clear_recovery: Option<super::ThreadClearRecovery>,
     pub thread: Thread,
     pub model: String,
     pub model_provider: String,
@@ -226,6 +432,13 @@ pub struct ThreadStartResponse {
     #[experimental("thread/start.multiAgentMode")]
     #[serde(default)]
     pub multi_agent_mode: MultiAgentMode,
+    /// Evidence for `retainForConnection`, with the same shape as a
+    /// `thread/retention/acquire` result. Absent when not requested or when
+    /// the server does not support atomic retention.
+    #[experimental("thread/start.retainForConnection")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub retention: Option<ThreadRetentionAcquireResponse>,
 }
 
 impl ThreadStartResponse {
@@ -446,6 +659,13 @@ pub struct ThreadResumeParams {
     #[experimental("thread/resume.initialTurnsPage")]
     #[ts(optional = nullable)]
     pub initial_turns_page: Option<ThreadResumeInitialTurnsPageParams>,
+    /// Ask the server to install this connection's retention grant for the
+    /// thread atomically, before the runtime can arm idle retirement. Honoured
+    /// only for a connection eligible for `thread/retention/acquire`; the
+    /// response's `retention` field is the only evidence that it was honoured.
+    #[experimental("thread/resume.retainForConnection")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub retain_for_connection: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
@@ -503,6 +723,13 @@ pub struct ThreadResumeResponse {
     /// `sortDirection: "desc"`. The first page includes the item identified by the cursor.
     #[serde(default)]
     pub items_backwards_cursor: Option<String>,
+    /// Evidence for `retainForConnection`, with the same shape as a
+    /// `thread/retention/acquire` result. Absent when not requested or when
+    /// the server does not support atomic retention.
+    #[experimental("thread/resume.retainForConnection")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub retention: Option<ThreadRetentionAcquireResponse>,
 }
 
 impl ThreadResumeResponse {
@@ -663,6 +890,13 @@ pub struct ThreadForkParams {
     #[experimental("thread/fork.deferGoalContinuation")]
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub defer_goal_continuation: bool,
+    /// Ask the server to install this connection's retention grant for the
+    /// thread atomically, before the runtime can arm idle retirement. Honoured
+    /// only for a connection eligible for `thread/retention/acquire`; the
+    /// response's `retention` field is the only evidence that it was honoured.
+    #[experimental("thread/fork.retainForConnection")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub retain_for_connection: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
@@ -702,6 +936,13 @@ pub struct ThreadForkResponse {
     #[experimental("thread/fork.multiAgentMode")]
     #[serde(default)]
     pub multi_agent_mode: MultiAgentMode,
+    /// Evidence for `retainForConnection`, with the same shape as a
+    /// `thread/retention/acquire` result. Absent when not requested or when
+    /// the server does not support atomic retention.
+    #[experimental("thread/fork.retainForConnection")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub retention: Option<ThreadRetentionAcquireResponse>,
 }
 
 impl ThreadForkResponse {
@@ -764,6 +1005,67 @@ pub struct ThreadUnsubscribeParams {
 #[ts(export_to = "v2/")]
 pub struct ThreadUnsubscribeResponse {
     pub status: ThreadUnsubscribeStatus,
+}
+
+/// Parameters for the server-owned clear-and-replace operation.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadClearParams {
+    /// The predecessor currently displayed by the requesting connection.
+    pub thread_id: String,
+    /// Required for successful clear: model settings resolved for a fresh session.
+    /// Missing or null input is decoded so the server can preserve authority checks,
+    /// then refused before creating a durable clear transition.
+    #[schemars(required)]
+    #[ts(as = "ThreadClearModelSettings")]
+    pub model_settings: Option<ThreadClearModelSettings>,
+    /// Ask the server to install this connection's retention grant for the
+    /// successor before the successor can arm idle retirement. The response's
+    /// `retention` field is the only evidence that it was honoured.
+    #[experimental("thread/clear.retainForConnection")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub retain_for_connection: bool,
+}
+
+/// Fresh-session values supplied by the clearing client, not inherited live settings.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadClearModelSettings {
+    /// An unset model uses ordinary server model-default resolution.
+    pub model: Option<String>,
+    /// An unset effort replaces the predecessor's configured effort with no override.
+    pub reasoning_effort: Option<ReasoningEffort>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadClearResponse {
+    pub transition_id: String,
+    pub predecessor_thread_id: String,
+    pub successor_thread: Thread,
+    /// Evidence for `retainForConnection` on the successor, with the same
+    /// shape as a `thread/retention/acquire` result. Absent when not requested
+    /// or when the server does not support atomic retention.
+    #[experimental("thread/clear.retainForConnection")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub retention: Option<ThreadRetentionAcquireResponse>,
+}
+
+/// Stable machine-readable causes returned in JSON-RPC error data by `thread/clear`.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub enum ThreadClearErrorCode {
+    UnknownPredecessor,
+    NotSubscribed,
+    TransitionConflict,
+    TransitionCompleted,
+    StateUnavailable,
+    SuccessorCreationFailed,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
@@ -2205,15 +2507,45 @@ impl From<CoreTokenUsage> for TokenUsageBreakdown {
 #[ts(export_to = "v2/")]
 pub struct ThreadStartedNotification {
     pub thread: Thread,
-    /// Client-declared source from the corresponding thread/start request.
+    /// The client-declared source for this start, when the source was supplied
+    /// on the corresponding `thread/start` request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub session_start_source: Option<ThreadStartSource>,
-    /// Explicit Clear predecessor; absent for ordinary starts and forks.
-    /// Resumes do not emit thread/started.
+    /// The explicit predecessor of a `Clear` start. This is omitted for normal
+    /// new sessions and forks; resumes do not emit `thread/started`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub clear_predecessor_thread_id: Option<String>,
+}
+
+/// Requester-scoped authoritative predecessor evidence for `thread/clear`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadClearEndedNotification {
+    pub transition_id: String,
+    pub predecessor_thread_id: String,
+    pub successor_thread_id: String,
+    pub reason: ThreadClearEndReason,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub enum ThreadClearEndReason {
+    Clear,
+}
+
+/// Requester-scoped authoritative successor evidence for `thread/clear`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadClearStartedNotification {
+    pub transition_id: String,
+    pub predecessor_thread_id: String,
+    pub successor_thread: Thread,
+    pub start_source: ThreadStartSource,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

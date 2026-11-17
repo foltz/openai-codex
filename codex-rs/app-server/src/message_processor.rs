@@ -1050,6 +1050,7 @@ impl MessageProcessor {
                 connection_id,
                 ConnectionCapabilities {
                     request_attestation,
+                    ..Default::default()
                 },
             )
             .await;

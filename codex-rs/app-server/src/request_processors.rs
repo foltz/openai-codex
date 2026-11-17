@@ -760,3 +760,9 @@ pub(crate) fn build_legacy_api_turns_from_rollout_items(items: &[RolloutItem]) -
     }
     builder.finish()
 }
+
+pub(crate) use thread_processor::ProcessorThreadRetirement;
+pub(crate) use thread_processor::ProcessorThreadShutdown;
+pub(crate) use thread_processor::ThreadShutdownOwner;
+#[cfg(test)]
+pub(crate) use thread_processor::thread_shutdown_fixture;

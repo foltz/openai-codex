@@ -360,6 +360,7 @@ pub struct ModelClientSession {
 /// Executes HTTP Responses requests without owning a turn's WebSocket state.
 pub(crate) struct ResponsesHttpExecutor<'a> {
     client: &'a ModelClient,
+    origin_record: Option<Arc<OriginatingAccountRecord>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1702,7 +1703,26 @@ impl ModelClientSession {
 
 impl<'a> ResponsesHttpExecutor<'a> {
     pub(crate) fn new(client: &'a ModelClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            origin_record: None,
+        }
+    }
+
+    pub(crate) fn with_origin_record(
+        mut self,
+        record: Option<Arc<OriginatingAccountRecord>>,
+    ) -> Self {
+        self.origin_record = record;
+        self
+    }
+
+    fn observe_origin_gateway(&self, setup: &CurrentClientSetup) {
+        if let (Some(record), codex_model_provider::GatewayAdmission::Bound(binding)) =
+            (&self.origin_record, &setup.gateway_admission)
+        {
+            record.observe_gateway(binding);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2755,6 +2775,7 @@ impl ModelClientSession {
                 }
 
                 ResponsesHttpExecutor::new(&self.client)
+                    .with_origin_record(self.origin_record.clone())
                     .stream_responses_http(
                         &self.turn_state,
                         /*expected_auth_owner*/ None,

@@ -551,6 +551,125 @@ pub(crate) async fn resolve_server_request_on_thread_listener(
 mod tests {
 
     #[tokio::test]
+    async fn retaining_listener_install_is_atomic_and_reuses_only_its_exact_grant() {
+        let manager = ThreadStateManager::new();
+        let thread = ThreadId::new();
+        let connection = ConnectionId(1);
+        let principal = RetentionPrincipalId::connection_owned();
+        manager
+            .connection_initialized(
+                connection,
+                ConnectionCapabilities {
+                    retention_principal: Some(principal),
+                    ..Default::default()
+                },
+            )
+            .await;
+        let candidate = manager.created_listener_state(thread).await;
+        let request = Some((connection, ConnectionRetention::Requested(principal)));
+        let refused = manager
+            .subscribe_and_install_listener_retaining(
+                thread,
+                &candidate,
+                &[connection],
+                request,
+                |_| Err::<(), _>("not installed"),
+            )
+            .await;
+        assert!(matches!(refused, Err("not installed")));
+        assert!(!manager.state.lock().await.lifecycle.contains_key(&thread));
+        let (_, _, attached, outcome) = manager
+            .subscribe_and_install_listener_retaining(
+                thread,
+                &candidate,
+                &[connection],
+                request,
+                |_| Ok::<_, ()>(()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(attached);
+        let (owner, minted) = outcome.minted_grant().expect("exact new grant");
+        assert_eq!(owner, principal);
+        let snapshot = manager.subscribe_to_retention(thread).await.unwrap();
+        assert!(
+            snapshot.borrow().granted,
+            "grant precedes listener driver publication"
+        );
+        let (_, _, _, again) = manager
+            .subscribe_and_install_listener_retaining(
+                thread,
+                &candidate,
+                &[connection],
+                request,
+                |_| Ok::<_, ()>(()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            again.minted_grant().is_none(),
+            "pre-existing grant must not be released as new"
+        );
+        assert_eq!(
+            again.evidence(),
+            Some(ThreadRetentionAcquireResponse::AlreadyHeld {
+                grant_id: minted.into_wire(),
+            })
+        );
+        manager.remove_connection(connection).await;
+        assert!(
+            !snapshot.borrow().granted,
+            "ordinary connection close revokes its grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_listener_candidate_cannot_grant_retention_to_replacement_state() {
+        let manager = ThreadStateManager::new();
+        let thread = ThreadId::new();
+        let connection = ConnectionId(1);
+        let principal = RetentionPrincipalId::connection_owned();
+        manager
+            .connection_initialized(
+                connection,
+                ConnectionCapabilities {
+                    retention_principal: Some(principal),
+                    ..Default::default()
+                },
+            )
+            .await;
+        let stale = manager.created_listener_state(thread).await;
+        let replacement = manager.thread_state(thread).await;
+        assert!(!Arc::ptr_eq(stale.state(), &replacement));
+        let mut invoked = false;
+        let result = manager
+            .subscribe_and_install_listener_retaining(
+                thread,
+                &stale,
+                &[connection],
+                Some((connection, ConnectionRetention::Requested(principal))),
+                |_| {
+                    invoked = true;
+                    Ok::<_, ()>(())
+                },
+            )
+            .await
+            .unwrap();
+        assert!(result.is_none());
+        assert!(!invoked);
+        assert!(
+            !manager
+                .subscribe_to_retention(thread)
+                .await
+                .unwrap()
+                .borrow()
+                .granted
+        );
+    }
+
+    #[tokio::test]
     async fn atomic_listener_install_preserves_upstream_failure_and_exact_subscription_identity() {
         let manager = ThreadStateManager::new();
         let id = ThreadId::new();
@@ -3304,7 +3423,26 @@ impl ThreadStateManager {
         connection_ids: &[ConnectionId],
         install: impl FnOnce(bool) -> Result<T, E>,
     ) -> Result<Option<(T, watch::Receiver<bool>, bool)>, E> {
-        let (installed, watcher, attached, change) = {
+        self.subscribe_and_install_listener_retaining(
+            thread_id,
+            candidate,
+            connection_ids,
+            None,
+            install,
+        )
+        .await
+        .map(|value| value.map(|(installed, watcher, attached, _)| (installed, watcher, attached)))
+    }
+
+    pub(crate) async fn subscribe_and_install_listener_retaining<T, E>(
+        &self,
+        thread_id: ThreadId,
+        candidate: &ListenerStateCandidate,
+        connection_ids: &[ConnectionId],
+        retention: Option<(ConnectionId, ConnectionRetention)>,
+        install: impl FnOnce(bool) -> Result<T, E>,
+    ) -> Result<Option<(T, watch::Receiver<bool>, bool, ConnectionRetentionOutcome)>, E> {
+        let (installed, watcher, attached, change, retained) = {
             let mut state = self.state.lock().await;
             if state.clear_successor_reservations.contains_key(&thread_id)
                 || state
@@ -3358,11 +3496,20 @@ impl ThreadStateManager {
             let entry = state.threads.get(&thread_id).expect("installed entry");
             entry.update_has_connections();
             let watcher = entry.has_connections_watcher.subscribe();
+            let retained = match retention {
+                Some((id, request)) if connection_ids.contains(&id) => {
+                    state.grant_connection_retention_locked(thread_id, id, request)
+                }
+                Some(_) => ConnectionRetentionOutcome::Refused(
+                    ThreadRetentionRefusalReason::IneligiblePrincipal,
+                ),
+                None => ConnectionRetentionOutcome::NotRequested,
+            };
             let change = state.interactive_subscription_change(changes);
-            (installed, watcher, attached, change)
+            (installed, watcher, attached, change, retained)
         };
         self.publish_interactive_subscription_change(change).await;
-        Ok(Some((installed, watcher, attached)))
+        Ok(Some((installed, watcher, attached, retained)))
     }
 
     #[allow(dead_code)] // Used by in-crate state tests; live requests use the guarded variant.

@@ -151,6 +151,7 @@ enum ListenerStartup<'a> {
     Subscribe {
         connection_id: ConnectionId,
         raw_events_enabled: bool,
+        retention: crate::thread_state::ConnectionRetention,
     },
     Created {
         connection_ids: &'a [ConnectionId],
@@ -159,7 +160,10 @@ enum ListenerStartup<'a> {
 }
 
 enum ListenerStartOutcome {
-    Started { attached: bool },
+    Started {
+        attached: bool,
+        retained: crate::thread_state::ConnectionRetentionOutcome,
+    },
     Stale,
     Rejected,
 }
@@ -169,11 +173,29 @@ impl ListenerStartOutcome {
         self,
         thread_id: ThreadId,
     ) -> Result<EnsureConversationListenerResult, JSONRPCErrorError> {
+        self.into_retaining_subscription(thread_id)
+            .map(|(result, _)| result)
+    }
+
+    fn into_retaining_subscription(
+        self,
+        thread_id: ThreadId,
+    ) -> Result<
+        (
+            EnsureConversationListenerResult,
+            crate::thread_state::ConnectionRetentionOutcome,
+        ),
+        JSONRPCErrorError,
+    > {
         match self {
-            Self::Started { attached: true } => Ok(EnsureConversationListenerResult::Attached),
-            Self::Started { attached: false } => {
-                Ok(EnsureConversationListenerResult::ConnectionClosed)
-            }
+            Self::Started { attached, retained } => Ok((
+                if attached {
+                    EnsureConversationListenerResult::Attached
+                } else {
+                    EnsureConversationListenerResult::ConnectionClosed
+                },
+                retained,
+            )),
             Self::Stale => Err(invalid_request(format!(
                 "thread {thread_id} is closing; retry after the thread is closed"
             ))),
@@ -248,6 +270,30 @@ pub(super) async fn ensure_conversation_listener(
     connection_id: ConnectionId,
     raw_events_enabled: bool,
 ) -> Result<EnsureConversationListenerResult, JSONRPCErrorError> {
+    ensure_conversation_listener_retaining(
+        listener_task_context,
+        conversation_id,
+        connection_id,
+        raw_events_enabled,
+        crate::thread_state::ConnectionRetention::NotRequested,
+    )
+    .await
+    .map(|(result, _)| result)
+}
+
+pub(super) async fn ensure_conversation_listener_retaining(
+    listener_task_context: ListenerTaskContext,
+    conversation_id: ThreadId,
+    connection_id: ConnectionId,
+    raw_events_enabled: bool,
+    retention: crate::thread_state::ConnectionRetention,
+) -> Result<
+    (
+        EnsureConversationListenerResult,
+        crate::thread_state::ConnectionRetentionOutcome,
+    ),
+    JSONRPCErrorError,
+> {
     let conversation = match listener_task_context
         .thread_manager
         .get_thread(conversation_id)
@@ -275,10 +321,11 @@ pub(super) async fn ensure_conversation_listener(
         ListenerStartup::Subscribe {
             connection_id,
             raw_events_enabled,
+            retention,
         },
     )
     .await
-    .into_subscription(conversation_id)
+    .into_retaining_subscription(conversation_id)
 }
 
 pub(super) fn log_listener_attach_result(
@@ -351,12 +398,21 @@ async fn start_listener(
         && matches!(config_snapshot.session_source, SessionSource::SubAgent(_));
     let thread_settings_baseline = thread_settings_from_config_snapshot(&config_snapshot);
     let thread_state = Arc::clone(listener_state.state());
-    let (mut listener_command_rx, listener_generation, mut unloading_state, attached) = {
+    let retention = match &startup {
+        ListenerStartup::Subscribe {
+            connection_id,
+            retention,
+            ..
+        } => Some((*connection_id, *retention)),
+        _ => None,
+    };
+    let (mut listener_command_rx, listener_generation, mut unloading_state, attached, retained) = {
         let (created, connection_ids, raw_events_enabled) = match &startup {
             ListenerStartup::Active => (false, &[][..], false),
             ListenerStartup::Subscribe {
                 connection_id,
                 raw_events_enabled,
+                ..
             } => (
                 false,
                 std::slice::from_ref(connection_id),
@@ -416,10 +472,11 @@ async fn start_listener(
         }
         let installed = listener_task_context
             .thread_state_manager
-            .subscribe_and_install_listener(
+            .subscribe_and_install_listener_retaining(
                 conversation_id,
                 &listener_state,
                 connection_ids,
+                retention,
                 |attached| {
                     let listener_matches = state.listener_matches(&conversation);
                     if !created && conversation.has_shutdown_status() {
@@ -461,12 +518,14 @@ async fn start_listener(
                 },
             )
             .await;
-        let ((listener_command_rx, listener_generation), has_subscribers_rx, attached) =
+        let ((listener_command_rx, listener_generation), has_subscribers_rx, attached, retained) =
             match installed {
-                Ok(Some((Some(listener), has_subscribers_rx, attached))) => {
-                    (listener, has_subscribers_rx, attached)
+                Ok(Some((Some(listener), has_subscribers_rx, attached, retained))) => {
+                    (listener, has_subscribers_rx, attached, retained)
                 }
-                Ok(Some((None, _, attached))) => return ListenerStartOutcome::Started { attached },
+                Ok(Some((None, _, attached, retained))) => {
+                    return ListenerStartOutcome::Started { attached, retained };
+                }
                 Ok(None) => return ListenerStartOutcome::Stale,
                 Err(()) => return ListenerStartOutcome::Rejected,
             };
@@ -491,6 +550,7 @@ async fn start_listener(
                 thread_status_rx,
             ),
             attached,
+            retained,
         )
     };
     let ListenerTaskContext {
@@ -843,7 +903,7 @@ async fn start_listener(
             thread_state.clear_listener();
         }
     });
-    ListenerStartOutcome::Started { attached }
+    ListenerStartOutcome::Started { attached, retained }
 }
 
 pub(super) async fn wait_for_thread_shutdown(thread: &Arc<CodexThread>) -> ThreadShutdownResult {

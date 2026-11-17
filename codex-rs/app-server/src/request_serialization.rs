@@ -15,6 +15,7 @@ use tokio::sync::Notify;
 use tracing::Instrument;
 
 use crate::connection_rpc_gate::ConnectionRpcGate;
+use crate::connection_rpc_gate::RpcTicket;
 use crate::outgoing_message::ConnectionId;
 
 type BoxFutureUnit = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
@@ -110,7 +111,7 @@ impl RequestSerializationQueueKey {
 }
 
 pub(crate) struct QueuedInitializedRequest {
-    gate: Option<Arc<ConnectionRpcGate>>,
+    gate: Option<(Arc<ConnectionRpcGate>, RpcTicket)>,
     future: BoxFutureUnit,
 }
 
@@ -119,9 +120,28 @@ impl QueuedInitializedRequest {
         gate: Arc<ConnectionRpcGate>,
         future: impl Future<Output = ()> + Send + 'static,
     ) -> Self {
+        let ticket = ConnectionRpcGate::ticket(&gate);
         Self {
-            gate: Some(gate),
+            gate: Some((gate, ticket)),
             future: Box::pin(future),
+        }
+    }
+
+    /// The explicit error reply sent if this request is never admitted.
+    pub(crate) fn with_refusal(
+        mut self,
+        refusal: impl Future<Output = bool> + Send + 'static,
+    ) -> Self {
+        if let Some((_, ticket)) = self.gate.as_mut() {
+            ticket.with_refusal(refusal);
+        }
+        self
+    }
+
+    /// Settle a request that will never start: refuse it explicitly.
+    async fn refuse(self) {
+        if let Some((_, ticket)) = self.gate {
+            ticket.refuse().await;
         }
     }
 
@@ -135,7 +155,7 @@ impl QueuedInitializedRequest {
     pub(crate) async fn run(self) {
         let Self { gate, future } = self;
         match gate {
-            Some(gate) => gate.run(future).await,
+            Some((gate, ticket)) => gate.run_admitted(ticket, future).await,
             None => future.await,
         }
     }
@@ -158,21 +178,42 @@ pub(crate) struct RequestSerializationQueues {
 }
 
 impl RequestSerializationQueues {
+    #[cfg(test)]
+    pub(crate) async fn pending_count_for_tests(
+        &self,
+        key: &RequestSerializationQueueKey,
+    ) -> usize {
+        self.inner
+            .lock()
+            .await
+            .get(key)
+            .map_or(0, |queue| queue.requests.len())
+    }
+
     /// Release requests whose connection closed while they waited in a queue.
+    /// Each released request is refused explicitly, never dropped silently.
     pub(crate) async fn discard_closed(&self) {
-        let mut queues = self.inner.lock().await;
-        for queue in queues.values_mut() {
-            let previous_len = queue.requests.len();
-            queue.requests.retain(|request| {
-                !request
-                    .request
-                    .gate
-                    .as_ref()
-                    .is_some_and(|gate| gate.is_closed())
-            });
-            if queue.requests.len() != previous_len {
-                queue.changed.notify_one();
+        let mut released = Vec::new();
+        {
+            let mut queues = self.inner.lock().await;
+            for queue in queues.values_mut() {
+                let (closed, open): (VecDeque<_>, VecDeque<_>) =
+                    queue.requests.drain(..).partition(|request| {
+                        request
+                            .request
+                            .gate
+                            .as_ref()
+                            .is_some_and(|(gate, _)| gate.is_closed())
+                    });
+                queue.requests = open;
+                if !closed.is_empty() {
+                    queue.changed.notify_one();
+                    released.extend(closed);
+                }
             }
+        }
+        for request in released {
+            request.request.refuse().await;
         }
     }
 

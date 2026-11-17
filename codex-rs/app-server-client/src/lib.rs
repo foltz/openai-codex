@@ -12,7 +12,7 @@
 //! - Typed and raw request/notification dispatch.
 //! - Server request resolution and rejection.
 //! - Ordered, lossless event consumption that cannot block request processing.
-//! - Bounded graceful shutdown with abort fallback.
+//! - Bounded shutdown observation with retained original-task custody.
 //!
 //! The facade interposes a worker task between the caller and the underlying
 //! [`InProcessClientHandle`](codex_app_server::in_process::InProcessClientHandle),
@@ -45,6 +45,7 @@ use std::time::Duration;
 pub use codex_app_server::app_server_control_socket_path;
 pub use codex_app_server::in_process::DEFAULT_IN_PROCESS_CHANNEL_CAPACITY;
 pub use codex_app_server::in_process::EmbeddedNetworkPolicy;
+pub use codex_app_server::in_process::InProcessHost;
 pub use codex_app_server::in_process::InProcessServerEvent;
 use codex_app_server::in_process::InProcessStartArgs;
 use codex_app_server::in_process::LogDbLayer;
@@ -75,7 +76,10 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio::sync::watch;
+use tokio::time::Instant;
 use tokio::time::timeout;
+use tokio::time::timeout_at;
 use toml::Value as TomlValue;
 use tracing::warn;
 
@@ -337,6 +341,7 @@ enum ClientCommand {
     },
     Shutdown {
         response_tx: oneshot::Sender<IoResult<()>>,
+        deadline: Instant,
     },
 }
 
@@ -355,6 +360,8 @@ pub struct InProcessAppServerClient {
     command_tx: mpsc::Sender<ClientCommand>,
     event_rx: mpsc::UnboundedReceiver<InProcessServerEvent>,
     worker_handle: tokio::task::JoinHandle<()>,
+    // Retain original runtime custody even after a bounded observer returns.
+    _host: Arc<InProcessHost>,
 }
 
 #[derive(Clone)]
@@ -375,15 +382,51 @@ pub enum AppServerClient {
     Remote(RemoteAppServerClient),
 }
 
+/// Answers a command the worker will not run because its owner is gone.
+fn fail_closed_command(command: ClientCommand) {
+    let error = || {
+        IoError::new(
+            ErrorKind::BrokenPipe,
+            "in-process app-server client was dropped",
+        )
+    };
+    match command {
+        ClientCommand::Request { response_tx, .. } => {
+            let _ = response_tx.send(Err(error()));
+        }
+        ClientCommand::Notify { response_tx, .. }
+        | ClientCommand::ResolveServerRequest { response_tx, .. }
+        | ClientCommand::RejectServerRequest { response_tx, .. }
+        | ClientCommand::Shutdown { response_tx, .. } => {
+            let _ = response_tx.send(Err(error()));
+        }
+    }
+}
+
 impl InProcessAppServerClient {
     /// Starts the in-process runtime and facade worker task.
     ///
     /// The returned client is ready for requests and ordered event consumption.
     /// Request queues remain bounded without blocking on unread notifications.
+    #[deprecated(note = "use start_in_host with host custody retained by the embedding caller")]
     pub async fn start(args: InProcessClientStartArgs) -> IoResult<Self> {
+        let host = Arc::new(InProcessHost::default());
+        let result = Self::start_in_host(Arc::clone(&host), args).await;
+        drop(host);
+        result
+    }
+
+    /// Starts an embedded client with custody supplied before the first
+    /// cancellable await. The caller must retain the host through startup and
+    /// any incomplete shutdown report; the worker also retains it while the
+    /// facade is alive so a timed-out observer cannot discard runtime custody.
+    pub async fn start_in_host(
+        host: Arc<InProcessHost>,
+        args: InProcessClientStartArgs,
+    ) -> IoResult<Self> {
         let channel_capacity = args.channel_capacity.max(1);
-        let mut handle =
-            codex_app_server::in_process::start(args.into_runtime_start_args()).await?;
+        let runtime_args = args.into_runtime_start_args();
+        let mut handle = codex_app_server::in_process::start_in_host(&host, runtime_args).await?;
         let request_sender = handle.sender();
         let (command_tx, mut command_rx) = mpsc::channel::<ClientCommand>(channel_capacity);
         // e9996ec62a preserved transcript events by awaiting a bounded queue, but that can
@@ -391,15 +434,59 @@ impl InProcessAppServerClient {
         // Match the remote-client fix in 79ea57715636: only this local consumer queue is
         // unbounded; commands and the embedded runtime stay bounded and events remain ordered.
         let (event_tx, event_rx) = mpsc::unbounded_channel::<InProcessServerEvent>();
+        // Set only when the event consumer is dropped without an explicit
+        // shutdown. Detached request tasks then fail with BrokenPipe instead
+        // of keeping a dropped owner's work alive.
+        let (owner_dropped_tx, owner_dropped_rx) = watch::channel(false);
 
+        let worker_host = Arc::clone(&host);
         let worker_handle = tokio::spawn(async move {
-            let mut event_stream_enabled = true;
+            // Keep the host alive if the caller's bounded observer returns
+            // incomplete and drops its JoinHandle. The worker owns the same
+            // low-level client/host pair and remains the durable observer.
+            let _host = worker_host;
             loop {
                 tokio::select! {
+                    // Consumer-closed first: once the owner is gone no further
+                    // command is admitted, however fast retained handles send.
+                    biased;
+                    () = event_tx.closed() => {
+                        // Cloned request handles do not own the runtime lifetime.
+                        // Stop admitting commands first, so retained handles that
+                        // keep sending cannot delay this exit; the drain is then
+                        // bounded by what is already buffered. Explicit shutdown
+                        // queues its Shutdown before releasing the consumer, so if
+                        // one exists it is buffered here.
+                        command_rx.close();
+                        let mut explicit_shutdown = None;
+                        while let Ok(command) = command_rx.try_recv() {
+                            match command {
+                                ClientCommand::Shutdown { response_tx, deadline } => {
+                                    explicit_shutdown = Some((response_tx, deadline));
+                                }
+                                command => fail_closed_command(command),
+                            }
+                        }
+                        match explicit_shutdown {
+                            Some((response_tx, deadline)) => {
+                                let shutdown_result = handle.shutdown_until(deadline).await;
+                                let _ = response_tx.send(shutdown_result);
+                            }
+                            None => {
+                                let _ = owner_dropped_tx.send_replace(true);
+                                // Same bounded runtime shutdown as the closed
+                                // command-channel path. Its cleanup closes the
+                                // embedded connection, which revokes grants.
+                                let _ = handle.shutdown().await;
+                            }
+                        }
+                        break;
+                    }
                     command = command_rx.recv() => {
                         match command {
                             Some(ClientCommand::Request { request, response_tx }) => {
                                 let request_sender = request_sender.clone();
+                                let mut owner_dropped = owner_dropped_rx.clone();
                                 // Request waits happen on a detached task so
                                 // this loop can keep draining runtime events
                                 // while the request is blocked on client input.
@@ -413,7 +500,21 @@ impl InProcessAppServerClient {
                                         | ClientRequest::UserVerificationVerify { .. });
                                     let mut response_tx = response_tx;
                                     tokio::select! {
+                                        // An owner drop beats a response that became
+                                        // ready in the same poll: that response would
+                                        // otherwise be the runtime's shutdown error.
+                                        biased;
                                         _ = response_tx.closed(), if cancellable => {}
+                                        // `false` means the worker exited without an
+                                        // owner drop; that disables only this branch.
+                                        true = async move {
+                                            owner_dropped.wait_for(|dropped| *dropped).await.is_ok()
+                                        } => {
+                                            let _ = response_tx.send(Err(IoError::new(
+                                                ErrorKind::BrokenPipe,
+                                                "in-process app-server client was dropped",
+                                            )));
+                                        }
                                         result = request_sender.request(*request) => {
                                             let _ = response_tx.send(result);
                                         }
@@ -444,8 +545,11 @@ impl InProcessAppServerClient {
                                 let send_result = request_sender.fail_server_request(request_id, error);
                                 let _ = response_tx.send(send_result);
                             }
-                            Some(ClientCommand::Shutdown { response_tx }) => {
-                                let shutdown_result = handle.shutdown().await;
+                            Some(ClientCommand::Shutdown {
+                                response_tx,
+                                deadline,
+                            }) => {
+                                let shutdown_result = handle.shutdown_until(deadline).await;
                                 let _ = response_tx.send(shutdown_result);
                                 break;
                             }
@@ -455,7 +559,7 @@ impl InProcessAppServerClient {
                             }
                         }
                     }
-                    event = handle.next_event(), if event_stream_enabled => {
+                    event = handle.next_event() => {
                         let Some(event) = event else {
                             break;
                         };
@@ -479,9 +583,9 @@ impl InProcessAppServerClient {
                             continue;
                         }
 
-                        if event_tx.send(event).is_err() {
-                            event_stream_enabled = false;
-                        }
+                        // A failed send means the consumer is gone; the biased
+                        // `event_tx.closed()` branch exits on the next iteration.
+                        let _ = event_tx.send(event);
                     }
                 }
             }
@@ -491,6 +595,7 @@ impl InProcessAppServerClient {
             command_tx,
             event_rx,
             worker_handle,
+            _host: host,
         })
     }
 
@@ -598,37 +703,72 @@ impl InProcessAppServerClient {
 
     /// Shuts down worker and in-process runtime with bounded wait.
     ///
-    /// If graceful shutdown exceeds timeout, the worker task is aborted to
-    /// avoid leaking background tasks in embedding callers.
+    /// If graceful shutdown exceeds the bound, returns an incomplete I/O
+    /// error. The worker is deliberately not aborted: its host-owned runtime
+    /// and cleanup receipts remain observable after this caller returns.
     pub async fn shutdown(self) -> IoResult<()> {
         let Self {
             command_tx,
             event_rx,
             worker_handle,
+            _host,
         } = self;
         let mut worker_handle = worker_handle;
-        // Stop forwarding caller-facing events before asking the worker to shut down.
-        drop(event_rx);
+        // Keep the event consumer alive until the worker has been observed or
+        // the deadline elapsed. Dropping it first would let the worker's
+        // owner-drop exit win before this caller-deadlined Shutdown is queued.
+        let deadline = Instant::now() + IN_PROCESS_SHUTDOWN_TIMEOUT;
+        let mut command_error = None;
         let (response_tx, response_rx) = oneshot::channel();
-        if command_tx
-            .send(ClientCommand::Shutdown { response_tx })
-            .await
-            .is_ok()
-            && let Ok(command_result) = timeout(IN_PROCESS_SHUTDOWN_TIMEOUT, response_rx).await
+        match timeout_at(
+            deadline,
+            command_tx.send(ClientCommand::Shutdown {
+                response_tx,
+                deadline,
+            }),
+        )
+        .await
         {
-            command_result.map_err(|_| {
-                IoError::new(
+            Ok(Ok(())) => match timeout_at(deadline, response_rx).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => command_error = Some(error),
+                Ok(Err(_)) => {
+                    command_error = Some(IoError::new(
+                        ErrorKind::BrokenPipe,
+                        "in-process app-server shutdown channel is closed",
+                    ));
+                }
+                Err(_) => {
+                    command_error = Some(IoError::new(
+                        ErrorKind::TimedOut,
+                        "in-process app-server shutdown acknowledgement timed out",
+                    ));
+                }
+            },
+            Ok(Err(_)) => {
+                command_error = Some(IoError::new(
                     ErrorKind::BrokenPipe,
-                    "in-process app-server shutdown channel is closed",
-                )
-            })??;
+                    "in-process app-server worker channel is closed",
+                ));
+            }
+            Err(_) => {
+                command_error = Some(IoError::new(
+                    ErrorKind::TimedOut,
+                    "in-process app-server shutdown command timed out",
+                ));
+            }
         }
 
-        if let Err(_elapsed) = timeout(IN_PROCESS_SHUTDOWN_TIMEOUT, &mut worker_handle).await {
-            worker_handle.abort();
-            let _ = worker_handle.await;
-        }
-        Ok(())
+        let result = match timeout_at(deadline, &mut worker_handle).await {
+            Ok(Ok(())) => command_error.map_or(Ok(()), Err),
+            Ok(Err(_)) => Err(IoError::other("in-process app-server worker panicked")),
+            Err(_) => Err(IoError::new(
+                ErrorKind::TimedOut,
+                "in-process app-server worker shutdown timed out",
+            )),
+        };
+        drop(event_rx);
+        result
     }
 }
 
@@ -2219,6 +2359,7 @@ mod tests {
             command_tx,
             event_rx,
             worker_handle,
+            _host: Arc::new(InProcessHost::default()),
         };
 
         let event = timeout(Duration::from_secs(2), client.next_event())
@@ -2316,7 +2457,7 @@ mod tests {
         let worker_completed = Arc::clone(&completed);
         let worker_handle = tokio::spawn(async move {
             let response_tx = match command_rx.recv().await {
-                Some(ClientCommand::Shutdown { response_tx }) => response_tx,
+                Some(ClientCommand::Shutdown { response_tx, .. }) => response_tx,
                 _ => panic!("expected shutdown command"),
             };
             tokio::time::sleep(Duration::from_secs(30)).await;
@@ -2327,9 +2468,92 @@ mod tests {
             command_tx,
             event_rx,
             worker_handle,
+            _host: Arc::new(InProcessHost::default()),
         };
 
         client.shutdown().await.expect("shutdown should complete");
         assert!(completed.load(Ordering::Acquire));
+    }
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_timeout_retains_original_worker() {
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let (_event_tx, event_rx) = mpsc::unbounded_channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let (done_tx, done_rx) = oneshot::channel();
+        let worker_handle = tokio::spawn(async move {
+            let Some(ClientCommand::Shutdown { response_tx, .. }) = command_rx.recv().await else {
+                panic!("expected shutdown");
+            };
+            let _ = release_rx.await;
+            let _ = response_tx.send(Ok(()));
+            let _ = done_tx.send(());
+        });
+        let client = InProcessAppServerClient {
+            command_tx,
+            event_rx,
+            worker_handle,
+            _host: Arc::new(InProcessHost::default()),
+        };
+        let error = client
+            .shutdown()
+            .await
+            .expect_err("unjoined worker is incomplete");
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
+        release_tx
+            .send(())
+            .expect("original worker was not aborted");
+        done_rx
+            .await
+            .expect("original worker can still complete after observer timeout");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_error_still_observes_original_worker() {
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let (_event_tx, event_rx) = mpsc::unbounded_channel();
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_completed = Arc::clone(&completed);
+        let worker_handle = tokio::spawn(async move {
+            let Some(ClientCommand::Shutdown { response_tx, .. }) = command_rx.recv().await else {
+                panic!("expected shutdown");
+            };
+            let _ = response_tx.send(Err(IoError::other("original cleanup incomplete")));
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            worker_completed.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let client = InProcessAppServerClient {
+            command_tx,
+            event_rx,
+            worker_handle,
+            _host: Arc::new(InProcessHost::default()),
+        };
+        let error = client
+            .shutdown()
+            .await
+            .expect_err("cleanup error must propagate");
+        assert_eq!(error.to_string(), "original cleanup incomplete");
+        assert!(completed.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn shutdown_worker_panic_is_not_clean() {
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let (_event_tx, event_rx) = mpsc::unbounded_channel();
+        let worker_handle = tokio::spawn(async move {
+            let _command = command_rx.recv().await;
+            panic!("original worker failed");
+        });
+        let client = InProcessAppServerClient {
+            command_tx,
+            event_rx,
+            worker_handle,
+            _host: Arc::new(InProcessHost::default()),
+        };
+        let error = client
+            .shutdown()
+            .await
+            .expect_err("panic cannot be successful shutdown");
+        assert_eq!(error.kind(), ErrorKind::Other);
+        assert!(error.to_string().contains("worker panicked"));
     }
 }

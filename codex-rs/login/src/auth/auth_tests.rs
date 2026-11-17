@@ -4237,6 +4237,9 @@ impl ExternalAuth for OwnerPinUnexpectedAuthority {
             ))
         })
     }
+    fn refresh(&self, _context: ExternalAuthRefreshContext) -> ExternalAuthFuture<'_, CodexAuth> {
+        self.resolve()
+    }
 }
 
 #[tokio::test]
@@ -4303,14 +4306,20 @@ async fn owner_pin_cannot_mutate_or_adopt_a_new_authority() -> anyhow::Result<()
     let pinned = pin_current_owner(&source);
     let before = std::fs::read(home.path().join("auth.json"))?;
     let fingerprint = AuthManager::managed_account_fingerprint(WORKSPACE_ID_ALLOWED);
-    let precondition = source.capture_managed_adoption_precondition(Some(&fingerprint))?;
+    let precondition = source
+        .capture_managed_adoption_precondition(Some(&fingerprint))
+        .expect("native fixture adoption precondition");
     assert!(
         pinned
             .prepare_managed_adoption(Some(&fingerprint), &precondition)
             .await
             .is_err()
     );
-    assert!(!pinned.managed_transition_eligible()?);
+    assert!(
+        !pinned
+            .managed_transition_eligible()
+            .expect("pinned eligibility observation")
+    );
     let callback = AtomicUsize::new(0);
     assert!(
         pinned

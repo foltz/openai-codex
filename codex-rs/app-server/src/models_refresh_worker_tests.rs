@@ -551,3 +551,58 @@ async fn catalog_reload_recovers_original_project_after_startup_fallback() -> an
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn panicked_worker_payload_observes_unlocked_sticky_completion() {
+    struct Probe {
+        worker: Arc<std::sync::OnceLock<std::sync::Weak<ModelsRefreshWorker>>>,
+        unlocked: Arc<std::sync::atomic::AtomicBool>,
+        terminal: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            let worker = self.worker.get().unwrap().upgrade().unwrap();
+            if let Ok(completion) = worker.completion.try_lock() {
+                self.unlocked.store(true, Ordering::SeqCst);
+                self.terminal.store(
+                    matches!(
+                        *completion,
+                        RefreshCompletion::Finished(ModelsRefreshShutdown::Panicked)
+                    ),
+                    Ordering::SeqCst,
+                );
+            }
+        }
+    }
+    let slot = Arc::new(std::sync::OnceLock::new());
+    let unlocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let terminal = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let probe = Probe {
+        worker: slot.clone(),
+        unlocked: unlocked.clone(),
+        terminal: terminal.clone(),
+    };
+    let (start, ready) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        ready.await.unwrap();
+        std::panic::panic_any(probe);
+    });
+    let worker = Arc::new(ModelsRefreshWorker {
+        shutdown: CancellationToken::new(),
+        completion: Mutex::new(RefreshCompletion::Running(task)),
+    });
+    assert!(slot.set(Arc::downgrade(&worker)).is_ok());
+    start.send(()).unwrap();
+    assert_eq!(
+        worker
+            .shutdown_until(Instant::now() + Duration::from_secs(10))
+            .await,
+        ModelsRefreshShutdown::Panicked
+    );
+    assert!(unlocked.load(Ordering::SeqCst));
+    assert!(terminal.load(Ordering::SeqCst));
+    assert_eq!(
+        worker.shutdown_until(Instant::now()).await,
+        ModelsRefreshShutdown::Panicked
+    );
+}

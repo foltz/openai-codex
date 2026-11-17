@@ -67,12 +67,16 @@ impl ModelsRefreshWorker {
             _ = tokio::time::sleep_until(deadline) => return ModelsRefreshShutdown::TimedOut,
             joined = task => joined,
         };
-        let outcome = match joined {
+        let outcome = match &joined {
             Ok(()) => ModelsRefreshShutdown::Joined,
             Err(error) if error.is_cancelled() => ModelsRefreshShutdown::Cancelled,
             Err(_) => ModelsRefreshShutdown::Panicked,
         };
         *completion = RefreshCompletion::Finished(outcome);
+        // Publish the terminal outcome and release the poll right before a
+        // panic payload destructor can re-enter completion observation.
+        drop(completion);
+        drop(joined);
         outcome
     }
 }

@@ -4215,3 +4215,218 @@ async fn native_bound_renewal_refuses_stale_storage_and_unproven_source() -> any
     }
     Ok(())
 }
+
+fn pin_current_owner(source: &Arc<AuthManager>) -> Arc<AuthManager> {
+    AuthManager::owner_pinned(
+        source,
+        &source.owner_snapshot().unwrap(),
+        &source.renewal_binding().unwrap(),
+        crate::GatewayAdmission::NotConfigured,
+    )
+    .unwrap()
+}
+
+#[derive(Debug)]
+struct OwnerPinUnexpectedAuthority(Arc<AtomicUsize>);
+impl ExternalAuth for OwnerPinUnexpectedAuthority {
+    fn resolve(&self) -> ExternalAuthFuture<'_, CodexAuth> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {
+            Err(std::io::Error::other(
+                "pinned mutation must refuse before provider resolution",
+            ))
+        })
+    }
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn owner_pin_cached_observation_and_reload_do_not_select_storage() -> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    let home = tempdir()?;
+    let source = native_owner_fixture(home.path(), "http://127.0.0.1:1").await?;
+    let pinned = pin_current_owner(&source);
+    let original = std::fs::read(home.path().join("auth.json"))?;
+    std::fs::rename(
+        home.path().join("auth.json"),
+        home.path().join("retained.json"),
+    )?;
+    assert_eq!(pinned.auth_observation()["stateKnown"], true);
+    assert_eq!(
+        pinned
+            .auth_cached()
+            .unwrap()
+            .get_token_data()?
+            .refresh_token,
+        "test-refresh-token"
+    );
+    assert!(!pinned.reload_with_cached_auth().await?);
+    assert!(pinned.auth().await.is_some());
+    assert!(!home.path().join("auth.json").exists());
+    assert_eq!(std::fs::read(home.path().join("retained.json"))?, original);
+    assert!(pinned.logout().await.is_err());
+    assert!(!home.path().join("auth.json").exists());
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn owner_pin_changed_source_owner_refuses_all_credential_entrypoints() -> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    let home = tempdir()?;
+    let source = native_owner_fixture(home.path(), "http://127.0.0.1:1").await?;
+    let pinned = pin_current_owner(&source);
+    let original = std::fs::read(home.path().join("auth.json"))?;
+    source.set_cached_auth(Some(CodexAuth::from_api_key("replacement-owner")));
+    assert!(pinned.auth_cached().is_none());
+    assert_eq!(pinned.auth_observation()["stateKnown"], false);
+    assert!(pinned.authoritative_auth_cached().is_err());
+    assert!(pinned.auth().await.is_none());
+    assert!(pinned.auth_with_http_client_factory().await.is_none());
+    assert!(!pinned.reload().await);
+    assert!(pinned.reload_with_cached_auth().await.is_err());
+    assert!(pinned.refresh_token().await.is_err());
+    assert!(pinned.refresh_token_from_authority().await.is_err());
+    assert!(pinned.logout().await.is_err());
+    assert!(pinned.account_oauth_grant().await.is_err());
+    assert_eq!(std::fs::read(home.path().join("auth.json"))?, original);
+    assert!(matches!(source.auth_cached(), Some(CodexAuth::ApiKey(_))));
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn owner_pin_cannot_mutate_or_adopt_a_new_authority() -> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    let home = tempdir()?;
+    let source = native_owner_fixture(home.path(), "http://127.0.0.1:1").await?;
+    let pinned = pin_current_owner(&source);
+    let before = std::fs::read(home.path().join("auth.json"))?;
+    let fingerprint = AuthManager::managed_account_fingerprint(WORKSPACE_ID_ALLOWED);
+    let precondition = source.capture_managed_adoption_precondition(Some(&fingerprint))?;
+    assert!(
+        pinned
+            .prepare_managed_adoption(Some(&fingerprint), &precondition)
+            .await
+            .is_err()
+    );
+    assert!(!pinned.managed_transition_eligible()?);
+    let callback = AtomicUsize::new(0);
+    assert!(
+        pinned
+            .with_managed_cached_result(Some(&fingerprint), || {
+                callback.fetch_add(1, Ordering::SeqCst);
+            })
+            .is_err()
+    );
+    assert_eq!(callback.load(Ordering::SeqCst), 0);
+    assert!(
+        pinned
+            .try_set_cached_auth(Some(CodexAuth::from_api_key("forbidden")))
+            .is_err()
+    );
+    assert!(pinned.restrict_auth_modes(vec![AuthMode::ApiKey]).is_err());
+    let calls = Arc::new(AtomicUsize::new(0));
+    assert!(
+        pinned
+            .set_external_auth(Arc::new(OwnerPinUnexpectedAuthority(calls.clone())))
+            .await
+            .is_err()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    pinned.set_forced_chatgpt_workspace_id(Some(vec!["forbidden".into()]));
+    assert!(source.forced_chatgpt_workspace_id().is_none());
+    assert_eq!(std::fs::read(home.path().join("auth.json"))?, before);
+    assert_eq!(
+        pinned.auth_cached().unwrap().get_account_id().as_deref(),
+        Some(WORKSPACE_ID_ALLOWED)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn owner_pin_retains_native_source_and_login_revision_fences() -> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    for login in [false, true] {
+        let home = tempdir()?;
+        let source = native_owner_fixture(home.path(), "http://127.0.0.1:1").await?;
+        let pinned = pin_current_owner(&source);
+        let owner = source.owner_snapshot().unwrap().revisions.owner_generation;
+        // Unit injection: isolate each newer revision while cached credentials
+        // and owner generation stay fixed; this is not a storage/login run.
+        source.auth_change_state_tx.send_modify(|state| {
+            if login {
+                state.login_generation += 1;
+            } else {
+                state.source_generation += 1;
+            }
+        });
+        assert_eq!(
+            source.owner_snapshot().unwrap().revisions.owner_generation,
+            owner
+        );
+        assert!(pinned.auth_cached().is_none());
+        assert!(pinned.reload_with_cached_auth().await.is_err());
+        assert!(pinned.refresh_token().await.is_err());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn owner_pin_host_authority_is_exact_and_recovery_requires_wire_proof() {
+    use super::command_cache_publication_tests::{record, selected_fixture};
+    let home = tempdir().unwrap();
+    let (_, source) = selected_fixture(home.path(), record(1));
+    let pinned = pin_current_owner(&source);
+    let before = std::fs::read(home.path().join("auth.json")).unwrap();
+    assert!(matches!(
+        pinned.recover_rejected_credential(None).await,
+        Some(Err(_))
+    ));
+    assert!(
+        source
+            .refresh_failure_for_auth(&source.auth_cached().unwrap())
+            .is_none(),
+        "missing wire proof is not a permanent credential failure"
+    );
+    assert_eq!(
+        std::fs::read(home.path().join("auth.json")).unwrap(),
+        before
+    );
+    let calls = Arc::new(AtomicUsize::new(0));
+    *source.external_auth.write().unwrap() =
+        Some(Arc::new(OwnerPinUnexpectedAuthority(calls.clone())));
+    assert!(pinned.auth_cached().is_none());
+    assert!(pinned.auth().await.is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn owner_pin_shares_actual_agent_bootstrap_exclusion() -> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    let home = tempdir()?;
+    let source = native_owner_fixture(home.path(), "http://127.0.0.1:1").await?;
+    let pinned = pin_current_owner(&source);
+    assert!(std::ptr::eq(
+        pinned.agent_identity_bootstrap_owner(),
+        source.as_ref()
+    ));
+    let guard = source.agent_identity_lock.acquire().await?;
+    let mut work = Box::pin(
+        pinned.agent_identity_auth(AgentIdentityAuthPolicy::ChatGptAuth, SessionSource::Exec),
+    );
+    assert!(
+        std::future::Future::poll(
+            work.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop())
+        )
+        .is_pending()
+    );
+    drop(work);
+    drop(guard);
+    assert_eq!(source.agent_identity_lock.available_permits(), 1);
+    Ok(())
+}

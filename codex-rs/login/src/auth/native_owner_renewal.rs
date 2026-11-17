@@ -9,6 +9,8 @@ impl AuthManager {
         renewal: &AuthRenewalBinding,
         reason: RefreshReason,
     ) -> Result<(), RefreshTokenError> {
+        self.require_unpinned_mutation()
+            .map_err(RefreshTokenError::Transient)?;
         let refused = || permanent_external_auth_error("native renewal owner or source changed");
         let refresh_guard = Arc::new(
             self.refresh_lock
@@ -55,7 +57,16 @@ impl AuthManager {
                 auth.client(),
                 reason,
             )
-            .await?;
+            .await;
+            if let Err(RefreshTokenError::Permanent(error)) = &response {
+                self.record_bound_refresh_failure(
+                    expected,
+                    renewal,
+                    &CodexAuth::Chatgpt(auth.clone()),
+                    error,
+                );
+            }
+            let response = response?;
             let provenance = tokens
                 .oauth_provenance
                 .clone()

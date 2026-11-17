@@ -10,6 +10,23 @@ pub struct AuthRenewalBinding {
     auth_mode: Option<AuthMode>,
 }
 impl AuthRenewalBinding {
+    pub(super) fn matches_provider(&self, provider: &Option<Arc<dyn ExternalAuth>>) -> bool {
+        same_provider(&self.source, provider)
+    }
+    pub(super) fn covers_owner(&self, auth: &CodexAuth) -> bool {
+        if self.auth_mode != Some(auth.api_auth_mode()) {
+            return false;
+        }
+        let complete = |p: &FixedPrincipal| {
+            !p.account_id.trim().is_empty() && !p.chatgpt_user_id.trim().is_empty()
+        };
+        match (&self.fixed_principal, FixedPrincipal::carried_by(auth)) {
+            (Some(fixed), Some(carried)) => complete(fixed) && *fixed == carried,
+            (Some(fixed), None) => complete(fixed),
+            (None, Some(carried)) => complete(&carried),
+            (None, None) => false,
+        }
+    }
     pub(super) fn is_host(&self) -> bool {
         self.source.is_some()
     }
@@ -49,6 +66,13 @@ impl AuthManager {
     pub(super) fn renewal_snapshot(
         &self,
     ) -> Option<(Option<CodexAuth>, AuthChangeState, AuthRenewalBinding)> {
+        if let Some(pin) = &self.owner_pin {
+            return Some((
+                pin.cached_auth().ok()?,
+                *self.auth_change_state_tx.borrow(),
+                pin.renewal.clone(),
+            ));
+        }
         let observed = self.external_auth.read().ok()?.clone();
         let fixed_principal = observed
             .as_ref()
@@ -198,6 +222,34 @@ mod tests {
 }
 
 impl AuthManager {
+    /// Only a real refresh response may classify the captured credential as
+    /// permanently failed. Admission/proof refusals must never poison the source.
+    pub(super) fn record_bound_refresh_failure(
+        &self,
+        expected: &super::super::AuthOwnerSnapshot,
+        binding: &AuthRenewalBinding,
+        attempted: &CodexAuth,
+        error: &RefreshTokenFailedError,
+    ) {
+        let Ok(authority) = self.external_auth.read() else {
+            return;
+        };
+        if !binding.matches_provider(&authority) {
+            return;
+        }
+        let Ok(mut cached) = self.inner.write() else {
+            return;
+        };
+        if self.owner_snapshot_locked(&cached) == *expected
+            && Self::auths_equal_for_refresh(cached.auth.as_ref(), Some(attempted))
+        {
+            cached.permanent_refresh_failure = Some(AuthScopedRefreshFailure {
+                auth: attempted.clone(),
+                error: error.clone(),
+            });
+        }
+    }
+
     /// Guarded host-only publication; invocation and durable commit are separate.
     pub(super) fn publish_auth_for_owner(
         &self,
@@ -477,13 +529,17 @@ impl AuthManager {
             return Ok(());
         }
         let source = renewal.source.as_ref().ok_or_else(refused)?;
-        let auth = source
+        let refreshed = source
             .refresh(ExternalAuthRefreshContext {
                 reason: ExternalAuthRefreshReason::Unauthorized,
                 previous_account_id: attempted.get_account_id(),
             })
             .await
-            .map_err(|error| source.classify_error(error))?;
+            .map_err(|error| source.classify_error(error));
+        if let Err(RefreshTokenError::Permanent(error)) = &refreshed {
+            self.record_bound_refresh_failure(expected, renewal, &attempted, error);
+        }
+        let auth = refreshed?;
         self.validate_external_auth(&auth, source.as_ref())?;
         self.publish_auth_for_owner(expected, renewal, auth)?;
         Ok(())

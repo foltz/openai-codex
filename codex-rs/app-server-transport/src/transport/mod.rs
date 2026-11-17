@@ -186,6 +186,7 @@ pub enum TransportEvent {
     ConnectionOpened {
         connection_id: ConnectionId,
         origin: ConnectionOrigin,
+        provenance: ConnectionProvenance,
         auth: Option<crate::ConnectionAuth>,
         writer: mpsc::Sender<QueuedOutgoingMessage>,
         disconnect_sender: Option<CancellationToken>,
@@ -197,6 +198,16 @@ pub enum TransportEvent {
         connection_id: ConnectionId,
         message: JSONRPCMessage,
     },
+}
+
+/// Server-observed connection provenance. Client-provided initialize fields do
+/// not contribute to this value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConnectionProvenance {
+    #[default]
+    Unproven,
+    InProcess,
+    UnixPeerExecutable(PeerExecutableIdentity),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

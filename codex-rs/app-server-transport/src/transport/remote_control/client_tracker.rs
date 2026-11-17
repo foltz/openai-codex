@@ -179,6 +179,7 @@ impl ClientTracker {
                 self.send_transport_event(TransportEvent::ConnectionOpened {
                     connection_id,
                     origin: ConnectionOrigin::RemoteControl,
+                    provenance: crate::transport::ConnectionProvenance::Unproven,
                     auth: self.auth.clone(),
                     writer: writer_tx,
                     disconnect_sender: Some(disconnect_token.clone()),
@@ -530,9 +531,13 @@ mod tests {
         {
             TransportEvent::ConnectionOpened {
                 connection_id,
+                provenance,
                 disconnect_sender: Some(disconnect_sender),
                 ..
-            } => (connection_id, disconnect_sender),
+            } => {
+                assert_eq!(provenance, crate::transport::ConnectionProvenance::Unproven);
+                (connection_id, disconnect_sender)
+            }
             other => panic!("expected connection opened, got {other:?}"),
         };
         match transport_event_rx

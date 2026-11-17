@@ -144,6 +144,7 @@ async fn websocket_upgrade_handler(
                 websocket_reader,
                 state.transport_event_tx,
                 compression,
+                super::ConnectionProvenance::Unproven,
             )
             .await;
         })
@@ -207,6 +208,7 @@ pub(crate) async fn run_websocket_connection<M, SinkError, StreamError>(
     websocket_reader: impl futures::stream::Stream<Item = Result<M, StreamError>> + Send + 'static,
     transport_event_tx: mpsc::Sender<TransportEvent>,
     compression: WebSocketCompression,
+    provenance: super::ConnectionProvenance,
 ) where
     M: AppServerWebSocketMessage + Send + 'static,
     SinkError: Send + 'static,
@@ -236,6 +238,7 @@ pub(crate) async fn run_websocket_connection<M, SinkError, StreamError>(
         .send(TransportEvent::ConnectionOpened {
             connection_id,
             origin: ConnectionOrigin::WebSocket,
+            provenance,
             auth: None,
             writer: writer_tx,
             disconnect_sender: Some(disconnect_token.clone()),

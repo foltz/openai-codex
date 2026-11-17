@@ -1214,6 +1214,7 @@ pub async fn run_main_with_transport_options(
                             TransportEvent::ConnectionOpened {
                                 connection_id,
                                 origin,
+                                provenance,
                                 auth,
                                 writer,
                                 disconnect_sender,
@@ -1246,6 +1247,7 @@ pub async fn run_main_with_transport_options(
                                     ConnectionState::new(
                                         origin,
                                         auth,
+                                        provenance,
                                         outbound_initialized,
                                         outbound_experimental_api_enabled,
                                         outbound_opted_out_notification_methods,

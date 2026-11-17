@@ -5,7 +5,8 @@ use std::io::ErrorKind;
 use std::io::Result as IoResult;
 use std::path::Path;
 
-use super::TransportEvent;
+use super::provenance::identities_match;
+use super::{ConnectionProvenance, PeerExecutableIdentity, TransportEvent};
 use crate::transport::websocket::run_websocket_connection;
 use crate::websocket_compression::WEBSOCKET_COMPRESSION_HEADER;
 use crate::websocket_compression::WebSocketCompression;
@@ -50,6 +51,8 @@ pub async fn start_control_socket_acceptor(
     daemon_shutdown_access: DaemonShutdownAccess,
     compression: WebSocketCompression,
 ) -> IoResult<JoinHandle<()>> {
+    // Capture this image before publishing the listener; failure grants no proof.
+    let running_identity = PeerExecutableIdentity::capture_running_process().ok();
     let (listener, socket_guard) = bind_private_daemon_socket(socket_path.as_path()).await?;
     info!(
         socket_path = %socket_guard.socket_path.display(),
@@ -63,6 +66,7 @@ pub async fn start_control_socket_acceptor(
         socket_guard,
         daemon_shutdown_access,
         compression,
+        running_identity,
     )))
 }
 
@@ -152,6 +156,7 @@ async fn run_control_socket_acceptor(
     socket_guard: DaemonSocketFileGuard,
     daemon_shutdown_access: DaemonShutdownAccess,
     compression: WebSocketCompression,
+    running_identity: Option<PeerExecutableIdentity>,
 ) {
     let _socket_guard = socket_guard;
     loop {
@@ -178,6 +183,10 @@ async fn run_control_socket_acceptor(
             }
         };
 
+        let provenance = unix_peer_provenance(
+            running_identity,
+            PeerExecutableIdentity::from_unix_stream(&stream),
+        );
         let transport_event_tx = transport_event_tx.clone();
         tokio::spawn(async move {
             let mut shutdown_request = false;
@@ -241,6 +250,7 @@ async fn run_control_socket_acceptor(
                 websocket_reader,
                 transport_event_tx,
                 negotiated_compression,
+                provenance,
             )
             .await;
         });
@@ -540,5 +550,69 @@ impl Drop for DaemonSocketFileGuard {
                 "failed to remove app-server control socket file"
             );
         }
+    }
+}
+
+/// Retains only an accept-time executable identity matching this server.
+fn unix_peer_provenance(
+    running_process_identity: Option<PeerExecutableIdentity>,
+    peer_identity: IoResult<Option<PeerExecutableIdentity>>,
+) -> ConnectionProvenance {
+    let Some(running_process_identity) = running_process_identity else {
+        return ConnectionProvenance::Unproven;
+    };
+    let peer_identity = match peer_identity {
+        Ok(identity) => identity,
+        Err(err) => {
+            tracing::debug!(error_kind = ?err.kind(), "Unix peer executable identity unavailable");
+            None
+        }
+    };
+    peer_identity
+        .filter(|identity| identities_match(running_process_identity, *identity))
+        .map(ConnectionProvenance::UnixPeerExecutable)
+        .unwrap_or(ConnectionProvenance::Unproven)
+}
+
+#[cfg(test)]
+mod accepted_provenance_tests {
+    use super::*;
+    fn identity(inode: u64) -> PeerExecutableIdentity {
+        PeerExecutableIdentity::FileIdentity { device: 1, inode }
+    }
+    #[test]
+    fn missing_server_identity_never_mints_peer_proof() {
+        assert_eq!(
+            unix_peer_provenance(None, Ok(Some(identity(1)))),
+            ConnectionProvenance::Unproven
+        );
+    }
+    #[test]
+    fn missing_or_failed_peer_identity_remains_unproven() {
+        assert_eq!(
+            unix_peer_provenance(Some(identity(1)), Ok(None)),
+            ConnectionProvenance::Unproven
+        );
+        assert_eq!(
+            unix_peer_provenance(
+                Some(identity(1)),
+                Err(std::io::Error::other("identity unavailable"))
+            ),
+            ConnectionProvenance::Unproven
+        );
+    }
+    #[test]
+    fn a_different_image_does_not_get_same_image_provenance() {
+        assert_eq!(
+            unix_peer_provenance(Some(identity(1)), Ok(Some(identity(2)))),
+            ConnectionProvenance::Unproven
+        );
+    }
+    #[test]
+    fn exact_accept_time_identity_is_carried_without_a_pid_or_path() {
+        assert_eq!(
+            unix_peer_provenance(Some(identity(1)), Ok(Some(identity(1)))),
+            ConnectionProvenance::UnixPeerExecutable(identity(1))
+        );
     }
 }

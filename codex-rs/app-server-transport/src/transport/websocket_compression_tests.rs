@@ -67,6 +67,7 @@ async fn tcp_compression_negotiates_and_retains_history() -> Result<(), Box<dyn 
                     websocket,
                     &mut events,
                     WebSocketCompression::from_response_header(expected)?,
+                    crate::transport::ConnectionProvenance::Unproven,
                 ),
             )
             .await??;
@@ -78,6 +79,12 @@ async fn tcp_compression_negotiates_and_retains_history() -> Result<(), Box<dyn 
 
 #[tokio::test]
 async fn local_socket_compression_negotiates_and_retains_history() -> Result<(), Box<dyn Error>> {
+    #[cfg(unix)]
+    let expected_provenance = crate::transport::ConnectionProvenance::UnixPeerExecutable(
+        crate::transport::PeerExecutableIdentity::capture_running_process()?,
+    );
+    #[cfg(not(unix))]
+    let expected_provenance = crate::transport::ConnectionProvenance::Unproven;
     for compression in [WebSocketCompression::Plain, WebSocketCompression::Zstd] {
         let temp_dir = tempfile::TempDir::new()?;
         let socket_path = AbsolutePathBuf::from_absolute_path(
@@ -120,6 +127,7 @@ async fn local_socket_compression_negotiates_and_retains_history() -> Result<(),
                     websocket,
                     &mut events,
                     WebSocketCompression::from_response_header(expected)?,
+                    expected_provenance,
                 ),
             )
             .await??;
@@ -134,10 +142,15 @@ async fn roundtrip<S: AsyncRead + AsyncWrite + Unpin>(
     mut websocket: WebSocketStream<S>,
     events: &mut mpsc::Receiver<TransportEvent>,
     compression: WebSocketCompression,
+    expected_provenance: crate::transport::ConnectionProvenance,
 ) -> Result<(), Box<dyn Error>> {
-    let Some(TransportEvent::ConnectionOpened { writer, .. }) = events.recv().await else {
+    let Some(TransportEvent::ConnectionOpened {
+        writer, provenance, ..
+    }) = events.recv().await
+    else {
         return Err("expected connection opened".into());
     };
+    assert_eq!(provenance, expected_provenance);
     let mut encoder = ZstdEncoder::new()?;
     let mut decoder = ZstdDecoder::new(/*max_message_size*/ 1024)?;
     for index in 0..2 {

@@ -31,6 +31,7 @@ pub use transport::AppServerTransport;
 pub use transport::AppServerTransportParseError;
 pub use transport::CHANNEL_CAPACITY;
 pub use transport::ConnectionOrigin;
+pub use transport::ConnectionProvenance;
 pub use transport::DaemonShutdownAccess;
 pub use transport::DaemonSocketFileGuard;
 pub use transport::PeerExecutableIdentity;

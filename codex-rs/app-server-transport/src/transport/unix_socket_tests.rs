@@ -551,3 +551,56 @@ fn assert_socket_path_removed(_socket_path: &Path) {
     // uds_windows uses a regular filesystem path as its rendezvous point,
     // but there is no Unix socket filesystem node to assert on.
 }
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+#[tokio::test]
+async fn accepted_same_image_provenance_is_reestablished_on_reconnect() {
+    let home = tempfile::tempdir().unwrap();
+    let socket = AbsolutePathBuf::from_absolute_path(home.path().join("peer.sock")).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+    let stop = CancellationToken::new();
+    let acceptor = start_control_socket_acceptor(
+        socket.clone(),
+        tx,
+        stop.clone(),
+        DaemonShutdownAccess::Disabled,
+        WebSocketCompression::Plain,
+    )
+    .await
+    .unwrap();
+    let expected = super::PeerExecutableIdentity::capture_running_process().unwrap();
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let stream = UnixStream::connect(socket.as_path()).await.unwrap();
+        let (mut client, _) = tokio_tungstenite::client_async("ws://localhost/rpc", stream)
+            .await
+            .unwrap();
+        let (id, proof) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await.unwrap() {
+                    TransportEvent::ConnectionOpened {
+                        connection_id,
+                        provenance,
+                        ..
+                    } => break (connection_id, provenance),
+                    TransportEvent::ConnectionClosed { .. } => {}
+                    other => panic!("unexpected event: {other:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            proof,
+            super::ConnectionProvenance::UnixPeerExecutable(expected)
+        );
+        ids.push(id);
+        client.close(None).await.unwrap();
+    }
+    assert_ne!(ids[0], ids[1]);
+    stop.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(5), acceptor)
+        .await
+        .unwrap()
+        .unwrap();
+}

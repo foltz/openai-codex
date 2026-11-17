@@ -545,8 +545,9 @@ async fn start_uninitialized(mut args: InProcessStartArgs) -> IoResult<InProcess
                 plugin_startup_tasks: Some(PluginStartupConfig::Current),
             }));
             let mut thread_created_rx = processor.thread_created_receiver();
-            let session = Arc::new(ConnectionSessionState::new(
+            let session = Arc::new(ConnectionSessionState::with_provenance(
                 crate::transport::ConnectionOrigin::InProcess,
+                crate::transport::ConnectionProvenance::InProcess,
             ));
             let mut listen_for_threads = true;
 

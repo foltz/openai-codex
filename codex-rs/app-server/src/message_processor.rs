@@ -192,6 +192,7 @@ pub(crate) struct ConnectionSessionState {
     disconnect: CancellationToken,
     pub(crate) rpc_gate: Arc<ConnectionRpcGate>,
     pub(crate) origin: crate::transport::ConnectionOrigin,
+    pub(crate) provenance: crate::transport::ConnectionProvenance,
     pub(crate) mcp_event_streams: McpEventStreams,
     initialized: OnceLock<InitializedConnectionSessionState>,
 }
@@ -208,8 +209,16 @@ pub(crate) struct InitializedConnectionSessionState {
 
 impl ConnectionSessionState {
     pub(crate) fn new(origin: crate::transport::ConnectionOrigin) -> Self {
+        Self::with_provenance(origin, crate::transport::ConnectionProvenance::Unproven)
+    }
+
+    pub(crate) fn with_provenance(
+        origin: crate::transport::ConnectionOrigin,
+        provenance: crate::transport::ConnectionProvenance,
+    ) -> Self {
         Self {
             origin,
+            provenance,
             disconnect: CancellationToken::new(),
             rpc_gate: Arc::new(ConnectionRpcGate::new()),
             mcp_event_streams: McpEventStreams::default(),

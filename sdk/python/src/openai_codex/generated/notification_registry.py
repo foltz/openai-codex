@@ -35,6 +35,7 @@ from .v2_all import ItemCompletedNotification
 from .v2_all import ItemGuardianApprovalReviewCompletedNotification
 from .v2_all import ItemGuardianApprovalReviewStartedNotification
 from .v2_all import ItemStartedNotification
+from .v2_all import ManagedTransitionStatusNotification
 from .v2_all import McpServerEventStreamNotification
 from .v2_all import McpServerOauthLoginCompletedNotification
 from .v2_all import McpServerStatusUpdatedNotification
@@ -56,10 +57,13 @@ from .v2_all import StrictReviewRequiredNotification
 from .v2_all import TerminalInteractionNotification
 from .v2_all import ThreadArchivedNotification
 from .v2_all import ThreadAttachmentUpdatedNotification
+from .v2_all import ThreadClearEndedNotification
+from .v2_all import ThreadClearStartedNotification
 from .v2_all import ThreadClosedNotification
 from .v2_all import ThreadDeletedNotification
 from .v2_all import ThreadGoalClearedNotification
 from .v2_all import ThreadGoalUpdatedNotification
+from .v2_all import ThreadInteractiveSubscriptionChangedNotification
 from .v2_all import ThreadNameUpdatedNotification
 from .v2_all import ThreadPredictionUpdatedNotification
 from .v2_all import ThreadProjectUpdatedNotification
@@ -121,6 +125,7 @@ KnownNotificationPayload: TypeAlias = (
     | ItemGuardianApprovalReviewCompletedNotification
     | ItemGuardianApprovalReviewStartedNotification
     | ItemStartedNotification
+    | ManagedTransitionStatusNotification
     | McpServerEventStreamNotification
     | McpServerOauthLoginCompletedNotification
     | McpServerStatusUpdatedNotification
@@ -142,10 +147,13 @@ KnownNotificationPayload: TypeAlias = (
     | TerminalInteractionNotification
     | ThreadArchivedNotification
     | ThreadAttachmentUpdatedNotification
+    | ThreadClearEndedNotification
+    | ThreadClearStartedNotification
     | ThreadClosedNotification
     | ThreadDeletedNotification
     | ThreadGoalClearedNotification
     | ThreadGoalUpdatedNotification
+    | ThreadInteractiveSubscriptionChangedNotification
     | ThreadNameUpdatedNotification
     | ThreadPredictionUpdatedNotification
     | ThreadProjectUpdatedNotification
@@ -182,6 +190,7 @@ KnownNotificationPayload: TypeAlias = (
 NOTIFICATION_MODELS: dict[str, type[KnownNotificationPayload]] = {
     "account/gatewayOAuth/changed": GatewayOAuthChangedNotification,
     "account/login/completed": AccountLoginCompletedNotification,
+    "account/managedAuthTransition/updated": ManagedTransitionStatusNotification,
     "account/rateLimits/updated": AccountRateLimitsUpdatedNotification,
     "account/updated": AccountUpdatedNotification,
     "app/list/updated": AppListUpdatedNotification,
@@ -212,6 +221,7 @@ NOTIFICATION_MODELS: dict[str, type[KnownNotificationPayload]] = {
     "item/reasoning/summaryTextDelta": ReasoningSummaryTextDeltaNotification,
     "item/reasoning/textDelta": ReasoningTextDeltaNotification,
     "item/started": ItemStartedNotification,
+    "kcf/thread/interactiveSubscription/changed": ThreadInteractiveSubscriptionChangedNotification,
     "mcpServer/event/stream/notification": McpServerEventStreamNotification,
     "mcpServer/oauthLogin/completed": McpServerOauthLoginCompletedNotification,
     "mcpServer/startupStatus/updated": McpServerStatusUpdatedNotification,
@@ -228,6 +238,8 @@ NOTIFICATION_MODELS: dict[str, type[KnownNotificationPayload]] = {
     "skills/changed": SkillsChangedNotification,
     "thread/archived": ThreadArchivedNotification,
     "thread/attachment/updated": ThreadAttachmentUpdatedNotification,
+    "thread/clear/ended": ThreadClearEndedNotification,
+    "thread/clear/started": ThreadClearStartedNotification,
     "thread/closed": ThreadClosedNotification,
     "thread/compacted": ContextCompactedNotification,
     "thread/deleted": ThreadDeletedNotification,

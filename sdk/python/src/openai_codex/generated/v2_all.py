@@ -722,23 +722,11 @@ class CommandExecResizeResponse(BaseModel):
     )
 
 
-class CommandExecResponse(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    exit_code: Annotated[int, Field(alias="exitCode", description="Process exit code.")]
-    stderr: Annotated[
-        str,
-        Field(
-            description="Buffered stderr capture.\n\nEmpty when stderr was streamed via `command/exec/outputDelta`."
-        ),
-    ]
-    stdout: Annotated[
-        str,
-        Field(
-            description="Buffered stdout capture.\n\nEmpty when stdout was streamed via `command/exec/outputDelta`."
-        ),
-    ]
+class CommandExecSandboxCleanupState(Enum):
+    complete = "complete"
+    incomplete = "incomplete"
+    timed_out = "timed_out"
+    unreported = "unreported"
 
 
 class CommandExecTerminalSize(BaseModel):
@@ -1450,6 +1438,17 @@ class ExternalAgentImportedConnectorSource(RootModel[Literal["remoteMcpServersCo
     root: Literal["remoteMcpServersConfig"]
 
 
+class ExternalAuthReceipt(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    coherent: bool
+    expires_at: Annotated[int, Field(alias="expiresAt")]
+    generation: Annotated[int, Field(ge=0)]
+    protection_mode: Annotated[str, Field(alias="protectionMode")]
+    source: str
+
+
 class FeedbackRequirements(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -1942,6 +1941,13 @@ class GetAccountParams(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
+    cache_only: Annotated[
+        bool | None,
+        Field(
+            alias="cacheOnly",
+            description="Observe only the existing auth cache, without refresh or configuration discovery.",
+        ),
+    ] = None
     refresh_token: Annotated[
         bool | None,
         Field(
@@ -2238,6 +2244,13 @@ class InitializeCapabilities(BaseModel):
     extensions: Annotated[
         dict[str, Any] | None,
         Field(description="MCP extension settings declared by the app-server client."),
+    ] = None
+    interactive_client: Annotated[
+        bool | None,
+        Field(
+            alias="interactiveClient",
+            description="Requests interactive-client classification; the server independently verifies entitlement.",
+        ),
     ] = None
     mcp_server_openai_form_elicitation: Annotated[
         bool | None,
@@ -2537,6 +2550,69 @@ class ManagedHooksRequirements(BaseModel):
     user_prompt_submit: Annotated[list[ConfiguredHookMatcherGroup], Field(alias="UserPromptSubmit")]
     managed_dir: Annotated[str | None, Field(alias="managedDir")] = None
     windows_managed_dir: Annotated[str | None, Field(alias="windowsManagedDir")] = None
+
+
+class ManagedTransitionIntent(Enum):
+    adopt_managed_auth = "adoptManagedAuth"
+    adopt_managed_logout = "adoptManagedLogout"
+
+
+class ManagedTransitionPhase(Enum):
+    idle = "idle"
+    admitted = "admitted"
+    draining = "draining"
+    adopting = "adopting"
+    resetting = "resetting"
+    succeeded = "succeeded"
+    cancelled = "cancelled"
+    quarantined = "quarantined"
+
+
+class ManagedTransitionRefusalKind(Enum):
+    invalid_request = "invalidRequest"
+    process_mismatch = "processMismatch"
+    stale_auth_revision = "staleAuthRevision"
+    stale_transition_revision = "staleTransitionRevision"
+    stale_auth_fingerprint = "staleAuthFingerprint"
+    concurrent_transition = "concurrentTransition"
+    completed_replay = "completedReplay"
+    transition_id_conflict = "transitionIdConflict"
+    late_cancellation = "lateCancellation"
+    authorization_not_admitted = "authorizationNotAdmitted"
+    authoritative_auth_unavailable = "authoritativeAuthUnavailable"
+    drain_timed_out = "drainTimedOut"
+    target_changed = "targetChanged"
+    auth_source_changed = "authSourceChanged"
+    reset_failed = "resetFailed"
+    auth_install_failed = "authInstallFailed"
+    intended_result_mismatch = "intendedResultMismatch"
+
+
+class ManagedTransitionStatus(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        populate_by_name=True,
+    )
+    auth_revision: Annotated[int, Field(alias="authRevision", ge=0)]
+    intent: ManagedTransitionIntent | None
+    phase: ManagedTransitionPhase
+    prior_auth_fingerprint: Annotated[str | None, Field(alias="priorAuthFingerprint")]
+    prior_auth_revision: Annotated[int, Field(alias="priorAuthRevision", ge=0)]
+    prior_transition_revision: Annotated[int, Field(alias="priorTransitionRevision", ge=0)]
+    process_instance_id: Annotated[str, Field(alias="processInstanceId")]
+    refusal: ManagedTransitionRefusalKind | None
+    result_auth_fingerprint: Annotated[str | None, Field(alias="resultAuthFingerprint")]
+    retryable: bool
+    transition_id: Annotated[str | None, Field(alias="transitionId")]
+    transition_revision: Annotated[int, Field(alias="transitionRevision", ge=0)]
+
+
+class ManagedTransitionStatusNotification(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        populate_by_name=True,
+    )
+    status: ManagedTransitionStatus
 
 
 class MarketplaceAddParams(BaseModel):
@@ -4862,6 +4938,24 @@ class McpServerEventStreamNotificationServerNotification(BaseModel):
     params: McpServerEventStreamNotification
 
 
+class AccountManagedAuthTransitionUpdatedServerNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    emitted_at_ms: Annotated[
+        int | None,
+        Field(
+            alias="emittedAtMs",
+            description="Unix timestamp (in milliseconds) when app-server emitted this notification.",
+        ),
+    ] = None
+    method: Annotated[
+        Literal["account/managedAuthTransition/updated"],
+        Field(title="Account/managedAuthTransition/updatedNotificationMethod"),
+    ]
+    params: ManagedTransitionStatusNotification
+
+
 class RemoteControlStatusChangedServerNotification(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -5546,6 +5640,107 @@ class ThreadAttachmentUpdatedNotification(BaseModel):
     thread_id: Annotated[str, Field(alias="threadId")]
 
 
+class ThreadClearEndReason(RootModel[Literal["clear"]]):
+    root: Literal["clear"]
+
+
+class ThreadClearEndedNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    predecessor_thread_id: Annotated[str, Field(alias="predecessorThreadId")]
+    reason: ThreadClearEndReason
+    successor_thread_id: Annotated[str, Field(alias="successorThreadId")]
+    transition_id: Annotated[str, Field(alias="transitionId")]
+
+
+class ModelSettings(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    model: Annotated[
+        str | None,
+        Field(description="An unset model uses ordinary server model-default resolution."),
+    ] = None
+    reasoning_effort: Annotated[
+        ReasoningEffort | None,
+        Field(
+            alias="reasoningEffort",
+            description="An unset effort replaces the predecessor's configured effort with no override.",
+        ),
+    ] = None
+
+
+class ThreadClearParams(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    model_settings: Annotated[
+        ModelSettings,
+        Field(
+            alias="modelSettings",
+            description="Required for successful clear: model settings resolved for a fresh session. Missing or null input is decoded so the server can preserve authority checks, then refused before creating a durable clear transition.",
+        ),
+    ]
+    thread_id: Annotated[
+        str,
+        Field(
+            alias="threadId",
+            description="The predecessor currently displayed by the requesting connection.",
+        ),
+    ]
+
+
+class ThreadClearRecoveryContext(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        populate_by_name=True,
+    )
+    contract_version: Annotated[
+        int,
+        Field(
+            alias="contractVersion",
+            description="Must match the recovery-read contract on this connection before creation.",
+            ge=0,
+        ),
+    ]
+    predecessor_thread_id: Annotated[
+        str | None,
+        Field(
+            alias="predecessorThreadId",
+            description="Null means genuinely no displayed predecessor, not an unavailable known ID.",
+        ),
+    ] = None
+
+
+class ThreadClearRecoveryDurability(Enum):
+    durable = "durable"
+    unavailable = "unavailable"
+
+
+class SupportThreadClearRecoveryObservation(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    type: Annotated[Literal["support"], Field(title="SupportThreadClearRecoveryObservationType")]
+
+
+class NoneThreadClearRecoveryObservation(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    type: Annotated[Literal["none"], Field(title="NoneThreadClearRecoveryObservationType")]
+
+
+class ThreadClearTransition(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    predecessor_thread_id: Annotated[str, Field(alias="predecessorThreadId")]
+    successor_thread_id: Annotated[str, Field(alias="successorThreadId")]
+    transition_id: Annotated[str, Field(alias="transitionId")]
+
+
 class ThreadClosedNotification(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -5664,6 +5859,21 @@ class ThreadInjectItemsResponse(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
+
+
+class ThreadInteractiveSubscriptionEntry(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    interactive_subscription_count: Annotated[
+        int,
+        Field(
+            alias="interactiveSubscriptionCount",
+            description="Distinct live thread-event subscriptions held by server-verified interactive clients. Not evidence of human presence, focus or retention.",
+            ge=0,
+        ),
+    ]
+    thread_id: Annotated[str, Field(alias="threadId")]
 
 
 class HookPromptThreadItem(BaseModel):
@@ -6551,6 +6761,13 @@ class ThreadResumeParams(BaseModel):
     sandbox: SandboxMode | None = None
     service_tier: Annotated[str | None, Field(alias="serviceTier")] = None
     thread_id: Annotated[str, Field(alias="threadId")]
+
+
+class ThreadRetentionRefusalReason(Enum):
+    ineligible_principal = "ineligiblePrincipal"
+    authority_unavailable = "authorityUnavailable"
+    unknown_thread = "unknownThread"
+    invalid_thread_id = "invalidThreadId"
 
 
 class ThreadRevertParams(BaseModel):
@@ -7451,6 +7668,18 @@ class AppsReadResponse(BaseModel):
     missing_app_ids: Annotated[list[str], Field(alias="missingAppIds")]
 
 
+class AuthObservation(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    account_id: Annotated[str | None, Field(alias="accountId")] = None
+    mode: AuthMode | None = None
+    principal: str | None = None
+    provider: ExternalAuthReceipt | None = None
+    state_known: Annotated[bool, Field(alias="stateKnown")]
+    version: Annotated[int, Field(ge=0)]
+
+
 class BrowserUseConfig(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -7534,6 +7763,15 @@ class ThreadUnsubscribeRequest(BaseModel):
     id: RequestId
     method: Annotated[Literal["thread/unsubscribe"], Field(title="Thread/unsubscribeRequestMethod")]
     params: ThreadUnsubscribeParams
+
+
+class ThreadClearRequest(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    id: RequestId
+    method: Annotated[Literal["thread/clear"], Field(title="Thread/clearRequestMethod")]
+    params: ThreadClearParams
 
 
 class ThreadNameSetRequest(BaseModel):
@@ -8579,6 +8817,57 @@ class CommandExecResizeParams(BaseModel):
     size: Annotated[CommandExecTerminalSize, Field(description="New PTY size in character cells.")]
 
 
+class CommandExecSandboxCleanup(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    handed_off: Annotated[
+        int,
+        Field(
+            alias="handedOff",
+            description="Targets still held by another live launch, which releases them.",
+            ge=0,
+        ),
+    ]
+    host_owned: Annotated[
+        int,
+        Field(
+            alias="hostOwned",
+            description="Targets that were never codex's and were left untouched.",
+            ge=0,
+        ),
+    ]
+    joined: Annotated[
+        bool,
+        Field(
+            description="Every cleanup helper of the launch was observed to exit before the owner's deadline."
+        ),
+    ]
+    preserved_unproven: Annotated[
+        int,
+        Field(
+            alias="preservedUnproven",
+            description="Targets preserved as unproven (incomplete or still pending).",
+            ge=0,
+        ),
+    ]
+    reaped: Annotated[
+        int,
+        Field(
+            description="Targets this launch installed and removed (or found already gone).", ge=0
+        ),
+    ]
+    state: Annotated[CommandExecSandboxCleanupState, Field(description="Overall cleanup outcome.")]
+    timed_out: Annotated[
+        int,
+        Field(
+            alias="timedOut",
+            description="Targets retained because the cleanup deadline passed.",
+            ge=0,
+        ),
+    ]
+
+
 class ComputerUseRequirements(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -9015,6 +9304,7 @@ class GetAccountResponse(BaseModel):
         populate_by_name=True,
     )
     account: Account | None = None
+    auth_observation: Annotated[AuthObservation | None, Field(alias="authObservation")] = None
     requires_openai_auth: Annotated[bool, Field(alias="requiresOpenaiAuth")]
     user_id: Annotated[
         str | None,
@@ -9346,6 +9636,20 @@ class LoginAccountParams(
         | AmazonBedrockAccessKeysLoginAccountParams,
         Field(title="LoginAccountParams"),
     ]
+
+
+class ManagedTransitionRefusal(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        populate_by_name=True,
+    )
+    auth_fingerprint: Annotated[str | None, Field(alias="authFingerprint")]
+    auth_revision: Annotated[int, Field(alias="authRevision", ge=0)]
+    kind: ManagedTransitionRefusalKind
+    process_instance_id: Annotated[str, Field(alias="processInstanceId")]
+    retryable: bool
+    transition_id: Annotated[str, Field(alias="transitionId")]
+    transition_revision: Annotated[int, Field(alias="transitionRevision", ge=0)]
 
 
 class McpResourceReadParams(BaseModel):
@@ -9975,6 +10279,23 @@ class ScheduledTaskSummary(BaseModel):
     name: str
     prompt: str
     schedule: ScheduledTaskSchedule
+
+
+class ThreadClearEndedServerNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    emitted_at_ms: Annotated[
+        int | None,
+        Field(
+            alias="emittedAtMs",
+            description="Unix timestamp (in milliseconds) when app-server emitted this notification.",
+        ),
+    ] = None
+    method: Annotated[
+        Literal["thread/clear/ended"], Field(title="Thread/clear/endedNotificationMethod")
+    ]
+    params: ThreadClearEndedNotification
 
 
 class ThreadStatusChangedServerNotification(BaseModel):
@@ -10675,6 +10996,57 @@ class SubAgentSource(
     root: SubAgentSourceValue | ThreadSpawnSubAgentSource | OtherSubAgentSource
 
 
+class ThreadClearRecovery(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    context: ThreadClearRecoveryContext
+    durability: ThreadClearRecoveryDurability
+    successor_thread_id: Annotated[str, Field(alias="successorThreadId")]
+
+
+class PendingThreadClearRecoveryObservation(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    recovery: ThreadClearRecovery
+    type: Annotated[Literal["pending"], Field(title="PendingThreadClearRecoveryObservationType")]
+
+
+class CompleteThreadClearRecoveryObservation(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    recovery: ThreadClearRecovery
+    type: Annotated[Literal["complete"], Field(title="CompleteThreadClearRecoveryObservationType")]
+
+
+class FailedThreadClearRecoveryObservation(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    recovery: ThreadClearRecovery
+    type: Annotated[Literal["failed"], Field(title="FailedThreadClearRecoveryObservationType")]
+
+
+class ThreadClearRecoveryObservation(
+    RootModel[
+        SupportThreadClearRecoveryObservation
+        | NoneThreadClearRecoveryObservation
+        | PendingThreadClearRecoveryObservation
+        | CompleteThreadClearRecoveryObservation
+        | FailedThreadClearRecoveryObservation
+    ]
+):
+    root: (
+        SupportThreadClearRecoveryObservation
+        | NoneThreadClearRecoveryObservation
+        | PendingThreadClearRecoveryObservation
+        | CompleteThreadClearRecoveryObservation
+        | FailedThreadClearRecoveryObservation
+    )
+
+
 class ThreadForkParams(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -10782,6 +11154,15 @@ class ThreadGoalUpdatedNotification(BaseModel):
     goal: ThreadGoal
     thread_id: Annotated[str, Field(alias="threadId")]
     turn_id: Annotated[str | None, Field(alias="turnId")] = None
+
+
+class ThreadInteractiveSubscriptionChangedNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    changes: list[ThreadInteractiveSubscriptionEntry]
+    generation: str
+    revision: Annotated[int, Field(ge=0)]
 
 
 class UserMessageThreadItem(BaseModel):
@@ -11747,6 +12128,32 @@ class ConfigValueWriteRequest(BaseModel):
     params: ConfigValueWriteParams
 
 
+class CommandExecResponse(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    exit_code: Annotated[int, Field(alias="exitCode", description="Process exit code.")]
+    sandbox_cleanup: Annotated[
+        CommandExecSandboxCleanup | None,
+        Field(
+            alias="sandboxCleanup",
+            description='Owner-side cleanup report for a Linux sandbox launch.\n\nPresent only when the command ran through the Linux sandbox launcher; absent for unsandboxed and non-Linux commands. Independent of the command timeout: `exitCode` 124 reports a command timeout, while `sandboxCleanup.state == "timed_out"` reports that cleanup of the sandbox\'s synthetic mount targets was not proven before the cleanup deadline.',
+        ),
+    ] = None
+    stderr: Annotated[
+        str,
+        Field(
+            description="Buffered stderr capture.\n\nEmpty when stderr was streamed via `command/exec/outputDelta`."
+        ),
+    ]
+    stdout: Annotated[
+        str,
+        Field(
+            description="Buffered stdout capture.\n\nEmpty when stdout was streamed via `command/exec/outputDelta`."
+        ),
+    ]
+
+
 class ComputerUseConfig(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -12258,6 +12665,24 @@ class ErrorServerNotification(BaseModel):
     ] = None
     method: Annotated[Literal["error"], Field(title="ErrorNotificationMethod")]
     params: ErrorNotification
+
+
+class KcfThreadInteractiveSubscriptionChangedServerNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    emitted_at_ms: Annotated[
+        int | None,
+        Field(
+            alias="emittedAtMs",
+            description="Unix timestamp (in milliseconds) when app-server emitted this notification.",
+        ),
+    ] = None
+    method: Annotated[
+        Literal["kcf/thread/interactiveSubscription/changed"],
+        Field(title="Kcf/thread/interactiveSubscription/changedNotificationMethod"),
+    ]
+    params: ThreadInteractiveSubscriptionChangedNotification
 
 
 class ThreadReadStateChangedServerNotification(BaseModel):
@@ -13321,6 +13746,25 @@ class Thread(BaseModel):
     ]
 
 
+class ThreadClearResponse(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    predecessor_thread_id: Annotated[str, Field(alias="predecessorThreadId")]
+    successor_thread: Annotated[Thread, Field(alias="successorThread")]
+    transition_id: Annotated[str, Field(alias="transitionId")]
+
+
+class ThreadClearStartedNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    predecessor_thread_id: Annotated[str, Field(alias="predecessorThreadId")]
+    start_source: Annotated[ThreadStartSource, Field(alias="startSource")]
+    successor_thread: Annotated[Thread, Field(alias="successorThread")]
+    transition_id: Annotated[str, Field(alias="transitionId")]
+
+
 class ThreadForkResponse(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -13538,6 +13982,20 @@ class ThreadStartedNotification(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
+    clear_predecessor_thread_id: Annotated[
+        str | None,
+        Field(
+            alias="clearPredecessorThreadId",
+            description="The explicit predecessor of a `Clear` start. This is omitted for normal new sessions and forks; resumes do not emit `thread/started`.",
+        ),
+    ] = None
+    session_start_source: Annotated[
+        ThreadStartSource | None,
+        Field(
+            alias="sessionStartSource",
+            description="The client-declared source for this start, when the source was supplied on the corresponding `thread/start` request.",
+        ),
+    ] = None
     thread: Thread
 
 
@@ -13712,6 +14170,7 @@ class ClientRequest(
         | ThreadArchiveRequest
         | ThreadDeleteRequest
         | ThreadUnsubscribeRequest
+        | ThreadClearRequest
         | ThreadNameSetRequest
         | ThreadGoalSetRequest
         | ThreadGoalGetRequest
@@ -13824,6 +14283,7 @@ class ClientRequest(
         | ThreadArchiveRequest
         | ThreadDeleteRequest
         | ThreadUnsubscribeRequest
+        | ThreadClearRequest
         | ThreadNameSetRequest
         | ThreadGoalSetRequest
         | ThreadGoalGetRequest
@@ -14064,6 +14524,23 @@ class ThreadStartedServerNotification(BaseModel):
     params: ThreadStartedNotification
 
 
+class ThreadClearStartedServerNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    emitted_at_ms: Annotated[
+        int | None,
+        Field(
+            alias="emittedAtMs",
+            description="Unix timestamp (in milliseconds) when app-server emitted this notification.",
+        ),
+    ] = None
+    method: Annotated[
+        Literal["thread/clear/started"], Field(title="Thread/clear/startedNotificationMethod")
+    ]
+    params: ThreadClearStartedNotification
+
+
 class ItemAutoApprovalReviewStartedServerNotification(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -14104,6 +14581,9 @@ class ServerNotification(
     RootModel[
         ErrorServerNotification
         | ThreadStartedServerNotification
+        | ThreadClearEndedServerNotification
+        | ThreadClearStartedServerNotification
+        | KcfThreadInteractiveSubscriptionChangedServerNotification
         | ThreadStatusChangedServerNotification
         | ThreadReadStateChangedServerNotification
         | ThreadArchivedServerNotification
@@ -14150,6 +14630,7 @@ class ServerNotification(
         | McpServerOauthLoginCompletedServerNotification
         | McpServerStartupStatusUpdatedServerNotification
         | McpServerEventStreamNotificationServerNotification
+        | AccountManagedAuthTransitionUpdatedServerNotification
         | AccountUpdatedServerNotification
         | AccountGatewayOAuthChangedServerNotification
         | AccountRateLimitsUpdatedServerNotification
@@ -14193,6 +14674,9 @@ class ServerNotification(
     root: Annotated[
         ErrorServerNotification
         | ThreadStartedServerNotification
+        | ThreadClearEndedServerNotification
+        | ThreadClearStartedServerNotification
+        | KcfThreadInteractiveSubscriptionChangedServerNotification
         | ThreadStatusChangedServerNotification
         | ThreadReadStateChangedServerNotification
         | ThreadArchivedServerNotification
@@ -14239,6 +14723,7 @@ class ServerNotification(
         | McpServerOauthLoginCompletedServerNotification
         | McpServerStartupStatusUpdatedServerNotification
         | McpServerEventStreamNotificationServerNotification
+        | AccountManagedAuthTransitionUpdatedServerNotification
         | AccountUpdatedServerNotification
         | AccountGatewayOAuthChangedServerNotification
         | AccountRateLimitsUpdatedServerNotification

@@ -1739,6 +1739,10 @@
     },
     "GetAccountParams": {
       "properties": {
+        "cacheOnly": {
+          "description": "Observe only the existing auth cache, without refresh or configuration discovery.",
+          "type": "boolean"
+        },
         "refreshToken": {
           "description": "When `true`, requests a proactive token refresh before returning.\n\nIn managed auth mode this triggers the normal refresh-token flow. In external auth mode this flag is ignored. Clients should refresh tokens themselves and call `account/login/start` with `chatgptAuthTokens`.",
           "type": "boolean"
@@ -1830,6 +1834,10 @@
             "object",
             "null"
           ]
+        },
+        "interactiveClient": {
+          "description": "Requests interactive-client classification; the server independently verifies entitlement.",
+          "type": "boolean"
         },
         "mcpServerOpenaiFormElicitation": {
           "description": "Legacy opt-in for the `openai/form` MCP extension.\n\nNew clients should declare `openai/form` in [`Self::extensions`].",
@@ -2173,6 +2181,14 @@
       "enum": [
         "codex",
         "chatgpt"
+      ],
+      "type": "string"
+    },
+    "ManagedTransitionIntent": {
+      "description": "A token-free intent for a managed transition. The credential writer and the authoritative auth operation intentionally live behind later server-side admission stages; neither is represented on this wire surface.",
+      "enum": [
+        "adoptManagedAuth",
+        "adoptManagedLogout"
       ],
       "type": "string"
     },
@@ -4754,6 +4770,67 @@
       ],
       "type": "object"
     },
+    "ThreadClearParams": {
+      "description": "Parameters for the server-owned clear-and-replace operation.",
+      "properties": {
+        "modelSettings": {
+          "description": "Required for successful clear: model settings resolved for a fresh session. Missing or null input is decoded so the server can preserve authority checks, then refused before creating a durable clear transition.",
+          "properties": {
+            "model": {
+              "description": "An unset model uses ordinary server model-default resolution.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reasoningEffort": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ReasoningEffort"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "An unset effort replaces the predecessor's configured effort with no override."
+            }
+          },
+          "type": "object"
+        },
+        "threadId": {
+          "description": "The predecessor currently displayed by the requesting connection.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "modelSettings",
+        "threadId"
+      ],
+      "type": "object"
+    },
+    "ThreadClearRecoveryContext": {
+      "additionalProperties": false,
+      "description": "Caller provenance, never an authoritative clear edge or a shutdown receipt.",
+      "properties": {
+        "contractVersion": {
+          "description": "Must match the recovery-read contract on this connection before creation.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "predecessorThreadId": {
+          "description": "Null means genuinely no displayed predecessor, not an unavailable known ID.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "contractVersion"
+      ],
+      "type": "object"
+    },
     "ThreadCompactStartParams": {
       "properties": {
         "threadId": {
@@ -6758,6 +6835,30 @@
         "params"
       ],
       "title": "Thread/unsubscribeRequest",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "thread/clear"
+          ],
+          "title": "Thread/clearRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/ThreadClearParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "Thread/clearRequest",
       "type": "object"
     },
     {

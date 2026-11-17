@@ -1,11 +1,91 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "CommandExecSandboxCleanup": {
+      "description": "Structured cleanup summary for one Linux sandbox launch, collected by the launch owner. Carries only a state and counts: no paths or handles.",
+      "properties": {
+        "handedOff": {
+          "description": "Targets still held by another live launch, which releases them.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "hostOwned": {
+          "description": "Targets that were never codex's and were left untouched.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "joined": {
+          "description": "Every cleanup helper of the launch was observed to exit before the owner's deadline.",
+          "type": "boolean"
+        },
+        "preservedUnproven": {
+          "description": "Targets preserved as unproven (incomplete or still pending).",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "reaped": {
+          "description": "Targets this launch installed and removed (or found already gone).",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "state": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/CommandExecSandboxCleanupState"
+            }
+          ],
+          "description": "Overall cleanup outcome."
+        },
+        "timedOut": {
+          "description": "Targets retained because the cleanup deadline passed.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "handedOff",
+        "hostOwned",
+        "joined",
+        "preservedUnproven",
+        "reaped",
+        "state",
+        "timedOut"
+      ],
+      "type": "object"
+    },
+    "CommandExecSandboxCleanupState": {
+      "description": "Final state of a sandbox launch's cleanup of its synthetic mount targets: `complete` (every target removed, or never codex's), `incomplete` (a target was preserved because its removal could not be proven safe), `timed_out` (the cleanup deadline, not the command timeout, passed first; never relabelled), or `unreported` (the launcher ended without a report).",
+      "enum": [
+        "complete",
+        "incomplete",
+        "timed_out",
+        "unreported"
+      ],
+      "type": "string"
+    }
+  },
   "description": "Final buffered result for `command/exec`.",
   "properties": {
     "exitCode": {
       "description": "Process exit code.",
       "format": "int32",
       "type": "integer"
+    },
+    "sandboxCleanup": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/CommandExecSandboxCleanup"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Owner-side cleanup report for a Linux sandbox launch.\n\nPresent only when the command ran through the Linux sandbox launcher; absent for unsandboxed and non-Linux commands. Independent of the command timeout: `exitCode` 124 reports a command timeout, while `sandboxCleanup.state == \"timed_out\"` reports that cleanup of the sandbox's synthetic mount targets was not proven before the cleanup deadline."
     },
     "stderr": {
       "description": "Buffered stderr capture.\n\nEmpty when stderr was streamed via `command/exec/outputDelta`.",

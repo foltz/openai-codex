@@ -32,7 +32,6 @@
       "type": "object"
     },
     "ApplyPatchApprovalParams": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
         "callId": {
           "description": "Use to correlate this with [codex_protocol::protocol::PatchApplyBeginEvent] and [codex_protocol::protocol::PatchApplyEndEvent].",
@@ -71,7 +70,6 @@
       "type": "object"
     },
     "ApplyPatchApprovalResponse": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
         "decision": {
           "$ref": "#/definitions/ReviewDecision"
@@ -84,12 +82,10 @@
       "type": "object"
     },
     "AttestationGenerateParams": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
       "title": "AttestationGenerateParams",
       "type": "object"
     },
     "AttestationGenerateResponse": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
         "token": {
           "description": "Opaque client attestation token.",
@@ -103,7 +99,6 @@
       "type": "object"
     },
     "ChatgptAuthTokensRefreshParams": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
         "previousAccountId": {
           "description": "Workspace/account identifier that Codex was previously using.\n\nClients that manage multiple accounts/workspaces can use this as a hint to refresh the token for the correct workspace.\n\nThis may be `null` when the prior auth state did not include a workspace identifier (`chatgpt_account_id`).",
@@ -134,7 +129,6 @@
       ]
     },
     "ChatgptAuthTokensRefreshResponse": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
         "accessToken": {
           "type": "string"
@@ -178,7 +172,6 @@
       "type": "object"
     },
     "ClientNotification": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
       "oneOf": [
         {
           "properties": {
@@ -200,7 +193,6 @@
       "title": "ClientNotification"
     },
     "ClientRequest": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
       "description": "Request from the client to the server.",
       "oneOf": [
         {
@@ -370,6 +362,30 @@
             "params"
           ],
           "title": "Thread/unsubscribeRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "thread/clear"
+              ],
+              "title": "Thread/clearRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ThreadClearParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Thread/clearRequest",
           "type": "object"
         },
         {
@@ -2943,7 +2959,6 @@
       ]
     },
     "CommandExecutionRequestApprovalParams": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
         "approvalId": {
           "description": "Unique identifier for this specific approval callback.\n\nFor regular shell/unified_exec approvals, this is null.\n\nFor zsh-exec-bridge subcommand approvals, multiple callbacks can belong to one parent `itemId`, so `approvalId` is a distinct opaque callback id (a UUID) used to disambiguate routing. Stdin approvals also use a distinct callback id; inspect `kind` to distinguish them.",
@@ -3060,7 +3075,6 @@
       "type": "object"
     },
     "CommandExecutionRequestApprovalResponse": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
         "decision": {
           "$ref": "#/definitions/CommandExecutionApprovalDecision"
@@ -3073,7 +3087,6 @@
       "type": "object"
     },
     "DynamicToolCallParams": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
         "arguments": true,
         "callId": {
@@ -3106,7 +3119,6 @@
       "type": "object"
     },
     "DynamicToolCallResponse": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
         "contentItems": {
           "items": {
@@ -3126,7 +3138,6 @@
       "type": "object"
     },
     "ExecCommandApprovalParams": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
         "approvalId": {
           "description": "Identifier for this specific approval callback.",
@@ -3175,7 +3186,6 @@
       "type": "object"
     },
     "ExecCommandApprovalResponse": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
         "decision": {
           "$ref": "#/definitions/ReviewDecision"
@@ -3290,7 +3300,6 @@
       ]
     },
     "FileChangeRequestApprovalParams": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
         "grantRoot": {
           "description": "[UNSTABLE] When set, the agent is asking the user to allow writes under this root for the remainder of the session (unclear if this is honored today).",
@@ -3331,7 +3340,6 @@
       "type": "object"
     },
     "FileChangeRequestApprovalResponse": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
         "decision": {
           "$ref": "#/definitions/FileChangeApprovalDecision"
@@ -3351,7 +3359,6 @@
       "type": "string"
     },
     "FuzzyFileSearchParams": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
         "cancellationToken": {
           "type": [
@@ -3377,7 +3384,6 @@
       "type": "object"
     },
     "FuzzyFileSearchResponse": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
         "files": {
           "items": {
@@ -3434,7 +3440,6 @@
       "type": "object"
     },
     "FuzzyFileSearchSessionCompletedNotification": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
         "sessionId": {
           "type": "string"
@@ -3447,7 +3452,6 @@
       "type": "object"
     },
     "FuzzyFileSearchSessionUpdatedNotification": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
         "files": {
           "items": {
@@ -3515,6 +3519,10 @@
             "null"
           ]
         },
+        "interactiveClient": {
+          "description": "Requests interactive-client classification; the server independently verifies entitlement.",
+          "type": "boolean"
+        },
         "mcpServerOpenaiFormElicitation": {
           "description": "Legacy opt-in for the `openai/form` MCP extension.\n\nNew clients should declare `openai/form` in [`Self::extensions`].",
           "type": "boolean"
@@ -3542,7 +3550,6 @@
       "type": "object"
     },
     "InitializeParams": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
         "capabilities": {
           "anyOf": [
@@ -3565,7 +3572,6 @@
       "type": "object"
     },
     "InitializeResponse": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
         "codexHome": {
           "allOf": [
@@ -3597,7 +3603,6 @@
       "type": "object"
     },
     "JSONRPCError": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
       "description": "A response to a request that indicates an error occurred.",
       "properties": {
         "error": {
@@ -3615,7 +3620,6 @@
       "type": "object"
     },
     "JSONRPCErrorError": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
         "code": {
           "format": "int64",
@@ -3634,7 +3638,6 @@
       "type": "object"
     },
     "JSONRPCMessage": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
       "anyOf": [
         {
           "$ref": "#/definitions/JSONRPCRequest"
@@ -3653,7 +3656,6 @@
       "title": "JSONRPCMessage"
     },
     "JSONRPCNotification": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
       "description": "A notification which does not expect a response.",
       "properties": {
         "method": {
@@ -3668,7 +3670,6 @@
       "type": "object"
     },
     "JSONRPCRequest": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
       "description": "A request that expects a response.",
       "properties": {
         "id": {
@@ -3698,7 +3699,6 @@
       "type": "object"
     },
     "JSONRPCResponse": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
       "description": "A successful (non-error) response to a request.",
       "properties": {
         "id": {
@@ -4253,7 +4253,6 @@
       "type": "string"
     },
     "McpServerElicitationRequestParams": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
       "oneOf": [
         {
           "properties": {
@@ -4371,7 +4370,6 @@
       "type": "object"
     },
     "McpServerElicitationRequestResponse": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
         "_meta": {
           "description": "Optional client metadata for form-mode action handling."
@@ -4545,7 +4543,6 @@
       "type": "string"
     },
     "PermissionsRequestApprovalParams": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
         "cwd": {
           "$ref": "#/definitions/v2/LegacyAppPathString"
@@ -4593,7 +4590,6 @@
       "type": "object"
     },
     "PermissionsRequestApprovalResponse": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
         "permissions": {
           "$ref": "#/definitions/GrantedPermissionProfile"
@@ -4621,7 +4617,6 @@
       "type": "object"
     },
     "RequestId": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
       "anyOf": [
         {
           "type": "string"
@@ -4743,7 +4738,6 @@
       ]
     },
     "ServerNotification": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
       "description": "Notification sent from the server to the client.",
       "oneOf": [
         {
@@ -4785,6 +4779,66 @@
             "params"
           ],
           "title": "Thread/startedNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
+                "thread/clear/ended"
+              ],
+              "title": "Thread/clear/endedNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ThreadClearEndedNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Thread/clear/endedNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
+                "thread/clear/started"
+              ],
+              "title": "Thread/clear/startedNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ThreadClearStartedNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Thread/clear/startedNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
+                "kcf/thread/interactiveSubscription/changed"
+              ],
+              "title": "Kcf/thread/interactiveSubscription/changedNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ThreadInteractiveSubscriptionChangedNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Kcf/thread/interactiveSubscription/changedNotification",
           "type": "object"
         },
         {
@@ -5716,6 +5770,26 @@
           "properties": {
             "method": {
               "enum": [
+                "account/managedAuthTransition/updated"
+              ],
+              "title": "Account/managedAuthTransition/updatedNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ManagedTransitionStatusNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Account/managedAuthTransition/updatedNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
                 "account/updated"
               ],
               "title": "Account/updatedNotificationMethod",
@@ -6485,7 +6559,6 @@
       "title": "ServerNotification"
     },
     "ServerRequest": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
       "description": "Request initiated from the server and sent to the client.",
       "oneOf": [
         {
@@ -6772,7 +6845,6 @@
       "type": "object"
     },
     "ToolRequestUserInputParams": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
       "description": "EXPERIMENTAL. Params sent with a request_user_input event.",
       "properties": {
         "autoResolutionMs": {
@@ -6852,7 +6924,6 @@
       "type": "object"
     },
     "ToolRequestUserInputResponse": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
       "description": "EXPERIMENTAL. Response payload mapping question ids to answers.",
       "properties": {
         "answers": {
@@ -6982,7 +7053,6 @@
         ]
       },
       "AccountLoginCompletedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "error": {
             "type": [
@@ -7017,7 +7087,6 @@
         "type": "object"
       },
       "AccountRateLimitsUpdatedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Sparse rolling rate-limit update.\n\nClients should merge available values into the most recent `account/rateLimits/read` response or refetch that snapshot. Nullable account metadata may be unavailable in a rolling update and does not clear a previously observed value.",
         "properties": {
           "rateLimits": {
@@ -7235,7 +7304,6 @@
         "type": "object"
       },
       "AccountUpdatedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "authMode": {
             "anyOf": [
@@ -7384,7 +7452,6 @@
         "type": "string"
       },
       "AgentMessageDeltaNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "delta": {
             "type": "string"
@@ -7786,7 +7853,6 @@
         "type": "object"
       },
       "AppListUpdatedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "EXPERIMENTAL - notification emitted when the app list changes.",
         "properties": {
           "data": {
@@ -8225,7 +8291,6 @@
         "type": "object"
       },
       "AppsInstalledParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Read the committed installed connector runtime snapshot.",
         "properties": {
           "forceRefresh": {
@@ -8244,7 +8309,6 @@
         "type": "object"
       },
       "AppsInstalledResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "The installed connectors in one committed runtime snapshot.",
         "properties": {
           "apps": {
@@ -8261,7 +8325,6 @@
         "type": "object"
       },
       "AppsListParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "EXPERIMENTAL - list available apps/connectors.",
         "properties": {
           "cursor": {
@@ -8296,7 +8359,6 @@
         "type": "object"
       },
       "AppsListResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "EXPERIMENTAL - app list response.",
         "properties": {
           "data": {
@@ -8320,7 +8382,6 @@
         "type": "object"
       },
       "AppsReadParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "EXPERIMENTAL - read metadata for specific apps/connectors.",
         "properties": {
           "appIds": {
@@ -8349,7 +8410,6 @@
         "type": "object"
       },
       "AppsReadResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "EXPERIMENTAL - app/read response.",
         "properties": {
           "apps": {
@@ -8503,8 +8563,56 @@
           }
         ]
       },
+      "AuthObservation": {
+        "properties": {
+          "accountId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mode": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/AuthMode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "principal": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/ExternalAuthReceipt"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "stateKnown": {
+            "type": "boolean"
+          },
+          "version": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "stateKnown",
+          "version"
+        ],
+        "type": "object"
+      },
       "AuthRecoveryNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "message": {
             "type": "string"
@@ -8829,7 +8937,6 @@
         "type": "object"
       },
       "CancelLoginAccountParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "loginId": {
             "type": "string"
@@ -8842,7 +8949,6 @@
         "type": "object"
       },
       "CancelLoginAccountResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "status": {
             "$ref": "#/definitions/v2/CancelLoginAccountStatus"
@@ -9290,7 +9396,6 @@
         ]
       },
       "CommandExecOutputDeltaNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Base64-encoded output chunk emitted for a streaming `command/exec` request.\n\nThese notifications are connection-scoped. If the originating connection closes, the server terminates the process.",
         "properties": {
           "capReached": {
@@ -9343,7 +9448,6 @@
         ]
       },
       "CommandExecParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Run a standalone command (argv vector) in the server sandbox without creating a thread or turn.\n\nThe final `command/exec` response is deferred until the process exits and is sent only after all `command/exec/outputDelta` notifications for that connection have been emitted.",
         "properties": {
           "command": {
@@ -9447,7 +9551,6 @@
         "type": "object"
       },
       "CommandExecResizeParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Resize a running PTY-backed `command/exec` session.",
         "properties": {
           "processId": {
@@ -9471,19 +9574,28 @@
         "type": "object"
       },
       "CommandExecResizeResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Empty success response for `command/exec/resize`.",
         "title": "CommandExecResizeResponse",
         "type": "object"
       },
       "CommandExecResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Final buffered result for `command/exec`.",
         "properties": {
           "exitCode": {
             "description": "Process exit code.",
             "format": "int32",
             "type": "integer"
+          },
+          "sandboxCleanup": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/CommandExecSandboxCleanup"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Owner-side cleanup report for a Linux sandbox launch.\n\nPresent only when the command ran through the Linux sandbox launcher; absent for unsandboxed and non-Linux commands. Independent of the command timeout: `exitCode` 124 reports a command timeout, while `sandboxCleanup.state == \"timed_out\"` reports that cleanup of the sandbox's synthetic mount targets was not proven before the cleanup deadline."
           },
           "stderr": {
             "description": "Buffered stderr capture.\n\nEmpty when stderr was streamed via `command/exec/outputDelta`.",
@@ -9501,6 +9613,73 @@
         ],
         "title": "CommandExecResponse",
         "type": "object"
+      },
+      "CommandExecSandboxCleanup": {
+        "description": "Structured cleanup summary for one Linux sandbox launch, collected by the launch owner. Carries only a state and counts: no paths or handles.",
+        "properties": {
+          "handedOff": {
+            "description": "Targets still held by another live launch, which releases them.",
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "hostOwned": {
+            "description": "Targets that were never codex's and were left untouched.",
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "joined": {
+            "description": "Every cleanup helper of the launch was observed to exit before the owner's deadline.",
+            "type": "boolean"
+          },
+          "preservedUnproven": {
+            "description": "Targets preserved as unproven (incomplete or still pending).",
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "reaped": {
+            "description": "Targets this launch installed and removed (or found already gone).",
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "state": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/v2/CommandExecSandboxCleanupState"
+              }
+            ],
+            "description": "Overall cleanup outcome."
+          },
+          "timedOut": {
+            "description": "Targets retained because the cleanup deadline passed.",
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "handedOff",
+          "hostOwned",
+          "joined",
+          "preservedUnproven",
+          "reaped",
+          "state",
+          "timedOut"
+        ],
+        "type": "object"
+      },
+      "CommandExecSandboxCleanupState": {
+        "description": "Final state of a sandbox launch's cleanup of its synthetic mount targets: `complete` (every target removed, or never codex's), `incomplete` (a target was preserved because its removal could not be proven safe), `timed_out` (the cleanup deadline, not the command timeout, passed first; never relabelled), or `unreported` (the launcher ended without a report).",
+        "enum": [
+          "complete",
+          "incomplete",
+          "timed_out",
+          "unreported"
+        ],
+        "type": "string"
       },
       "CommandExecTerminalSize": {
         "description": "PTY size in character cells for `command/exec` PTY sessions.",
@@ -9525,7 +9704,6 @@
         "type": "object"
       },
       "CommandExecTerminateParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Terminate a running `command/exec` session.",
         "properties": {
           "processId": {
@@ -9540,13 +9718,11 @@
         "type": "object"
       },
       "CommandExecTerminateResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Empty success response for `command/exec/terminate`.",
         "title": "CommandExecTerminateResponse",
         "type": "object"
       },
       "CommandExecWriteParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Write stdin bytes to a running `command/exec` session, close stdin, or both.",
         "properties": {
           "closeStdin": {
@@ -9572,13 +9748,11 @@
         "type": "object"
       },
       "CommandExecWriteResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Empty success response for `command/exec/write`.",
         "title": "CommandExecWriteResponse",
         "type": "object"
       },
       "CommandExecutionOutputDeltaNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "delta": {
             "type": "string"
@@ -10069,7 +10243,6 @@
         "type": "object"
       },
       "ConfigBatchWriteParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "edits": {
             "items": {
@@ -10373,7 +10546,6 @@
         ]
       },
       "ConfigReadParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "cwd": {
             "description": "Optional working directory to resolve project config layers. If specified, return the effective config as seen from that directory (i.e., including any project layers between `cwd` and the project/repo root).",
@@ -10390,7 +10562,6 @@
         "type": "object"
       },
       "ConfigReadResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "config": {
             "$ref": "#/definitions/v2/Config"
@@ -10665,7 +10836,6 @@
         "type": "object"
       },
       "ConfigRequirementsReadResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "requirements": {
             "anyOf": [
@@ -10691,7 +10861,6 @@
         "type": "object"
       },
       "ConfigValueWriteParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "expectedVersion": {
             "type": [
@@ -10723,7 +10892,6 @@
         "type": "object"
       },
       "ConfigWarningNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "details": {
             "description": "Optional extra guidance or error details.",
@@ -10762,7 +10930,6 @@
         "type": "object"
       },
       "ConfigWriteResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "filePath": {
             "allOf": [
@@ -11056,7 +11223,6 @@
         ]
       },
       "ConsumeAccountRateLimitResetCreditParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "creditId": {
             "description": "Opaque reset-credit identifier to redeem. When omitted, the backend selects the next available credit.",
@@ -11077,7 +11243,6 @@
         "type": "object"
       },
       "ConsumeAccountRateLimitResetCreditResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "outcome": {
             "$ref": "#/definitions/v2/ConsumeAccountRateLimitResetCreditOutcome"
@@ -11243,7 +11408,6 @@
         ]
       },
       "ContextCompactedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Deprecated: Use `ContextCompaction` item type instead.",
         "properties": {
           "threadId": {
@@ -11299,7 +11463,6 @@
         "type": "string"
       },
       "DeprecationNoticeNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "details": {
             "description": "Optional extra guidance, such as migration steps or rationale.",
@@ -11495,7 +11658,6 @@
         ]
       },
       "EnvironmentConnectionNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "environmentId": {
             "type": "string"
@@ -11527,7 +11689,6 @@
         "type": "object"
       },
       "ErrorNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "error": {
             "$ref": "#/definitions/v2/TurnError"
@@ -11604,7 +11765,6 @@
         "type": "object"
       },
       "ExperimentalFeatureEnablementSetParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "enablement": {
             "additionalProperties": {
@@ -11621,7 +11781,6 @@
         "type": "object"
       },
       "ExperimentalFeatureEnablementSetResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "enablement": {
             "additionalProperties": {
@@ -11638,7 +11797,6 @@
         "type": "object"
       },
       "ExperimentalFeatureListParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "cursor": {
             "description": "Opaque pagination cursor returned by a previous call.",
@@ -11668,7 +11826,6 @@
         "type": "object"
       },
       "ExperimentalFeatureListResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "data": {
             "items": {
@@ -11730,7 +11887,6 @@
         ]
       },
       "ExternalAgentConfigDetectParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "cwds": {
             "description": "Zero or more working directories to include for repo-scoped detection.",
@@ -11783,7 +11939,6 @@
         "type": "object"
       },
       "ExternalAgentConfigDetectResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "connectors": {
             "default": [],
@@ -11806,7 +11961,6 @@
         "type": "object"
       },
       "ExternalAgentConfigImportCompletedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "importId": {
             "type": "string"
@@ -11826,7 +11980,6 @@
         "type": "object"
       },
       "ExternalAgentConfigImportHistoriesReadResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "connectors": {
             "items": {
@@ -11885,7 +12038,6 @@
         "type": "object"
       },
       "ExternalAgentConfigImportHistoryRecordParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "itemTypeResults": {
             "description": "Completed results grouped by imported item type.",
@@ -11907,7 +12059,6 @@
         "type": "object"
       },
       "ExternalAgentConfigImportHistoryRecordResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "importId": {
             "type": "string"
@@ -12062,7 +12213,6 @@
         "type": "object"
       },
       "ExternalAgentConfigImportParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "migrationItems": {
             "items": {
@@ -12099,7 +12249,6 @@
         "type": "object"
       },
       "ExternalAgentConfigImportProgressNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "importId": {
             "type": "string"
@@ -12119,7 +12268,6 @@
         "type": "object"
       },
       "ExternalAgentConfigImportResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "importId": {
             "type": "string"
@@ -12258,6 +12406,36 @@
         ],
         "type": "string"
       },
+      "ExternalAuthReceipt": {
+        "properties": {
+          "coherent": {
+            "type": "boolean"
+          },
+          "expiresAt": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "generation": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "protectionMode": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "coherent",
+          "expiresAt",
+          "generation",
+          "protectionMode",
+          "source"
+        ],
+        "type": "object"
+      },
       "FeedbackRequirements": {
         "properties": {
           "enabled": {
@@ -12270,7 +12448,6 @@
         "type": "object"
       },
       "FeedbackSaveParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "classification": {
             "type": "string"
@@ -12325,7 +12502,6 @@
         "type": "object"
       },
       "FeedbackSaveResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "promptHash": {
             "description": "Same prompt hash as feedback/upload; null when prompt metadata is absent.",
@@ -12349,7 +12525,6 @@
         "type": "object"
       },
       "FeedbackUploadParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "classification": {
             "type": "string"
@@ -12395,7 +12570,6 @@
         "type": "object"
       },
       "FeedbackUploadResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "promptHash": {
             "default": null,
@@ -12416,7 +12590,6 @@
         "type": "object"
       },
       "FileChangeOutputDeltaNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Deprecated legacy notification for `apply_patch` textual output.\n\nThe server no longer emits this notification.",
         "properties": {
           "delta": {
@@ -12442,7 +12615,6 @@
         "type": "object"
       },
       "FileChangePatchUpdatedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "changes": {
             "items": {
@@ -12714,7 +12886,6 @@
         "type": "string"
       },
       "FsChangedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Filesystem watch notification emitted for `fs/watch` subscribers.",
         "properties": {
           "changedPaths": {
@@ -12737,7 +12908,6 @@
         "type": "object"
       },
       "FsCopyParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Copy a file or directory tree on the host filesystem.",
         "properties": {
           "destinationPath": {
@@ -12769,13 +12939,11 @@
         "type": "object"
       },
       "FsCopyResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Successful response for `fs/copy`.",
         "title": "FsCopyResponse",
         "type": "object"
       },
       "FsCreateDirectoryParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Create a directory on the host filesystem.",
         "properties": {
           "path": {
@@ -12801,13 +12969,11 @@
         "type": "object"
       },
       "FsCreateDirectoryResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Successful response for `fs/createDirectory`.",
         "title": "FsCreateDirectoryResponse",
         "type": "object"
       },
       "FsGetMetadataParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Request metadata for an absolute path.",
         "properties": {
           "path": {
@@ -12826,7 +12992,6 @@
         "type": "object"
       },
       "FsGetMetadataResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Metadata returned by `fs/getMetadata`.",
         "properties": {
           "createdAtMs": {
@@ -12886,7 +13051,6 @@
         "type": "object"
       },
       "FsReadDirectoryParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "List direct child names for a directory.",
         "properties": {
           "path": {
@@ -12905,7 +13069,6 @@
         "type": "object"
       },
       "FsReadDirectoryResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Directory entries returned by `fs/readDirectory`.",
         "properties": {
           "entries": {
@@ -12923,7 +13086,6 @@
         "type": "object"
       },
       "FsReadFileParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Read a file from the host filesystem.",
         "properties": {
           "path": {
@@ -12942,7 +13104,6 @@
         "type": "object"
       },
       "FsReadFileResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Base64-encoded file contents returned by `fs/readFile`.",
         "properties": {
           "dataBase64": {
@@ -12957,7 +13118,6 @@
         "type": "object"
       },
       "FsRemoveParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Remove a file or directory tree from the host filesystem.",
         "properties": {
           "force": {
@@ -12990,13 +13150,11 @@
         "type": "object"
       },
       "FsRemoveResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Successful response for `fs/remove`.",
         "title": "FsRemoveResponse",
         "type": "object"
       },
       "FsUnwatchParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Stop filesystem watch notifications for a prior `fs/watch`.",
         "properties": {
           "watchId": {
@@ -13011,13 +13169,11 @@
         "type": "object"
       },
       "FsUnwatchResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Successful response for `fs/unwatch`.",
         "title": "FsUnwatchResponse",
         "type": "object"
       },
       "FsWatchParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Start filesystem watch notifications for an absolute path.",
         "properties": {
           "path": {
@@ -13041,7 +13197,6 @@
         "type": "object"
       },
       "FsWatchResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Successful response for `fs/watch`.",
         "properties": {
           "path": {
@@ -13060,7 +13215,6 @@
         "type": "object"
       },
       "FsWriteFileParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Write a file on the host filesystem.",
         "properties": {
           "dataBase64": {
@@ -13084,7 +13238,6 @@
         "type": "object"
       },
       "FsWriteFileResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Successful response for `fs/writeFile`.",
         "title": "FsWriteFileResponse",
         "type": "object"
@@ -13304,12 +13457,10 @@
         ]
       },
       "GatewayOAuthCancelResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "title": "GatewayOAuthCancelResponse",
         "type": "object"
       },
       "GatewayOAuthChangedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "authUrl": {
             "description": "Authorization handoff, sent only to the connection that started login.",
@@ -13363,7 +13514,6 @@
         "type": "object"
       },
       "GatewayOAuthLoginResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "prompt": {
             "anyOf": [
@@ -13412,7 +13562,6 @@
         "type": "object"
       },
       "GatewayOAuthReadResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Current effective gateway policy and credential readiness; never contains credentials.",
         "properties": {
           "error": {
@@ -13472,8 +13621,11 @@
         "type": "string"
       },
       "GetAccountParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
+          "cacheOnly": {
+            "description": "Observe only the existing auth cache, without refresh or configuration discovery.",
+            "type": "boolean"
+          },
           "refreshToken": {
             "description": "When `true`, requests a proactive token refresh before returning.\n\nIn managed auth mode this triggers the normal refresh-token flow. In external auth mode this flag is ignored. Clients should refresh tokens themselves and call `account/login/start` with `chatgptAuthTokens`.",
             "type": "boolean"
@@ -13497,7 +13649,6 @@
         "type": "object"
       },
       "GetAccountRateLimitsResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "accountId": {
             "description": "Account associated with this usage snapshot, when supplied by the backend.",
@@ -13552,12 +13703,21 @@
         "type": "object"
       },
       "GetAccountResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "account": {
             "anyOf": [
               {
                 "$ref": "#/definitions/v2/Account"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "authObservation": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/AuthObservation"
               },
               {
                 "type": "null"
@@ -13583,7 +13743,6 @@
         "type": "object"
       },
       "GetAccountSecuritySetupResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Optional security reminder bound to the account that fetched it. Unavailable or ineligible accounts return no notice; this read never changes account security.",
         "properties": {
           "notice": {
@@ -13613,7 +13772,6 @@
         "type": "object"
       },
       "GetAccountTokenUsageResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "dailyUsageBuckets": {
             "items": {
@@ -13647,7 +13805,6 @@
         "type": "object"
       },
       "GetWorkspaceMessagesResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "featureEnabled": {
             "description": "Whether the workspace-message backend route is available for this client.",
@@ -13997,7 +14154,6 @@
         "type": "string"
       },
       "GuardianWarningNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "message": {
             "description": "Concise guardian warning message for the user.",
@@ -14016,7 +14172,6 @@
         "type": "object"
       },
       "HookCompletedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "run": {
             "$ref": "#/definitions/v2/HookRunSummary"
@@ -14413,7 +14568,6 @@
         "type": "string"
       },
       "HookStartedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "run": {
             "$ref": "#/definitions/v2/HookRunSummary"
@@ -14477,7 +14631,6 @@
         "type": "object"
       },
       "HooksListParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "cwds": {
             "description": "Working directories to inspect when no thread is specified. An empty list uses the session cwd.",
@@ -14498,7 +14651,6 @@
         "type": "object"
       },
       "HooksListResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "data": {
             "items": {
@@ -14649,7 +14801,6 @@
         "type": "object"
       },
       "ItemCompletedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "completedAtMs": {
             "description": "Unix timestamp (in milliseconds) when this item lifecycle completed.",
@@ -14686,7 +14837,6 @@
         "type": "object"
       },
       "ItemGuardianApprovalReviewCompletedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "[UNSTABLE] Temporary notification payload for approval auto-review. This shape is expected to change soon.",
         "properties": {
           "action": {
@@ -14740,7 +14890,6 @@
         "type": "object"
       },
       "ItemGuardianApprovalReviewStartedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "[UNSTABLE] Temporary notification payload for approval auto-review. This shape is expected to change soon.",
         "properties": {
           "action": {
@@ -14784,7 +14933,6 @@
         "type": "object"
       },
       "ItemStartedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "item": {
             "$ref": "#/definitions/v2/ThreadItem"
@@ -14814,7 +14962,6 @@
         "type": "string"
       },
       "ListMcpServerStatusParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "cursor": {
             "description": "Opaque pagination cursor returned by a previous call.",
@@ -14861,7 +15008,6 @@
         "type": "object"
       },
       "ListMcpServerStatusResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "data": {
             "items": {
@@ -14948,7 +15094,6 @@
         "type": "string"
       },
       "LoginAccountParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "oneOf": [
           {
             "properties": {
@@ -15117,7 +15262,6 @@
         "title": "LoginAccountParams"
       },
       "LoginAccountResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "oneOf": [
           {
             "properties": {
@@ -15233,7 +15377,6 @@
         "type": "string"
       },
       "LogoutAccountResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "title": "LogoutAccountResponse",
         "type": "object"
       },
@@ -15354,8 +15497,194 @@
         ],
         "type": "object"
       },
+      "ManagedTransitionIntent": {
+        "description": "A token-free intent for a managed transition. The credential writer and the authoritative auth operation intentionally live behind later server-side admission stages; neither is represented on this wire surface.",
+        "enum": [
+          "adoptManagedAuth",
+          "adoptManagedLogout"
+        ],
+        "type": "string"
+      },
+      "ManagedTransitionPhase": {
+        "enum": [
+          "idle",
+          "admitted",
+          "draining",
+          "adopting",
+          "resetting",
+          "succeeded",
+          "cancelled",
+          "quarantined"
+        ],
+        "type": "string"
+      },
+      "ManagedTransitionRefusal": {
+        "additionalProperties": false,
+        "properties": {
+          "authFingerprint": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "authRevision": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "kind": {
+            "$ref": "#/definitions/v2/ManagedTransitionRefusalKind"
+          },
+          "processInstanceId": {
+            "type": "string"
+          },
+          "retryable": {
+            "type": "boolean"
+          },
+          "transitionId": {
+            "type": "string"
+          },
+          "transitionRevision": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "authFingerprint",
+          "authRevision",
+          "kind",
+          "processInstanceId",
+          "retryable",
+          "transitionId",
+          "transitionRevision"
+        ],
+        "type": "object"
+      },
+      "ManagedTransitionRefusalKind": {
+        "description": "Typed, secret-safe reasons for a transition request to be refused.",
+        "enum": [
+          "invalidRequest",
+          "processMismatch",
+          "staleAuthRevision",
+          "staleTransitionRevision",
+          "staleAuthFingerprint",
+          "concurrentTransition",
+          "completedReplay",
+          "transitionIdConflict",
+          "lateCancellation",
+          "authorizationNotAdmitted",
+          "authoritativeAuthUnavailable",
+          "drainTimedOut",
+          "targetChanged",
+          "authSourceChanged",
+          "resetFailed",
+          "authInstallFailed",
+          "intendedResultMismatch"
+        ],
+        "type": "string"
+      },
+      "ManagedTransitionStatus": {
+        "additionalProperties": false,
+        "properties": {
+          "authRevision": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "intent": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/ManagedTransitionIntent"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "phase": {
+            "$ref": "#/definitions/v2/ManagedTransitionPhase"
+          },
+          "priorAuthFingerprint": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "priorAuthRevision": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "priorTransitionRevision": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "processInstanceId": {
+            "type": "string"
+          },
+          "refusal": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/ManagedTransitionRefusalKind"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "resultAuthFingerprint": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "retryable": {
+            "type": "boolean"
+          },
+          "transitionId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "transitionRevision": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "authRevision",
+          "intent",
+          "phase",
+          "priorAuthFingerprint",
+          "priorAuthRevision",
+          "priorTransitionRevision",
+          "processInstanceId",
+          "refusal",
+          "resultAuthFingerprint",
+          "retryable",
+          "transitionId",
+          "transitionRevision"
+        ],
+        "type": "object"
+      },
+      "ManagedTransitionStatusNotification": {
+        "additionalProperties": false,
+        "properties": {
+          "status": {
+            "$ref": "#/definitions/v2/ManagedTransitionStatus"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "ManagedTransitionStatusNotification",
+        "type": "object"
+      },
       "MarketplaceAddParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "refName": {
             "type": [
@@ -15383,7 +15712,6 @@
         "type": "object"
       },
       "MarketplaceAddResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "alreadyAdded": {
             "type": "boolean"
@@ -15430,7 +15758,6 @@
         "type": "object"
       },
       "MarketplaceRemoveParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "marketplaceName": {
             "type": "string"
@@ -15443,7 +15770,6 @@
         "type": "object"
       },
       "MarketplaceRemoveResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "installedRoot": {
             "anyOf": [
@@ -15481,7 +15807,6 @@
         "type": "object"
       },
       "MarketplaceUpgradeParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "marketplaceName": {
             "type": [
@@ -15494,7 +15819,6 @@
         "type": "object"
       },
       "MarketplaceUpgradeResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "errors": {
             "items": {
@@ -15557,7 +15881,6 @@
         "type": "string"
       },
       "McpResourceReadParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "_meta": {
             "additionalProperties": true,
@@ -15612,7 +15935,6 @@
         "type": "object"
       },
       "McpResourceReadResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "contents": {
             "items": {
@@ -15679,7 +16001,6 @@
         "type": "object"
       },
       "McpServerEventStreamNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "notification": {
             "$ref": "#/definitions/v2/McpServerEventNotification"
@@ -15756,7 +16077,6 @@
         "type": "string"
       },
       "McpServerOauthLoginCompletedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "error": {
             "type": [
@@ -15792,7 +16112,6 @@
         "type": "object"
       },
       "McpServerOauthLoginParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "clientRegistration": {
             "anyOf": [
@@ -15838,7 +16157,6 @@
         "type": "object"
       },
       "McpServerOauthLoginResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "authorizationUrl": {
             "type": "string"
@@ -15859,7 +16177,6 @@
         "type": "object"
       },
       "McpServerRefreshResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "title": "McpServerRefreshResponse",
         "type": "object"
       },
@@ -15969,7 +16286,6 @@
         "type": "string"
       },
       "McpServerStatusUpdatedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "error": {
             "type": [
@@ -16008,7 +16324,6 @@
         "type": "object"
       },
       "McpServerToolCallParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "_meta": true,
           "arguments": true,
@@ -16031,7 +16346,6 @@
         "type": "object"
       },
       "McpServerToolCallResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "_meta": true,
           "content": {
@@ -16099,7 +16413,6 @@
         "type": "object"
       },
       "McpToolCallProgressNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "itemId": {
             "type": "string"
@@ -16506,7 +16819,6 @@
         "type": "object"
       },
       "ModelListParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "cursor": {
             "description": "Opaque pagination cursor returned by a previous call.",
@@ -16543,7 +16855,6 @@
         "type": "object"
       },
       "ModelListResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "data": {
             "items": {
@@ -16566,12 +16877,10 @@
         "type": "object"
       },
       "ModelProviderCapabilitiesReadParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "title": "ModelProviderCapabilitiesReadParams",
         "type": "object"
       },
       "ModelProviderCapabilitiesReadResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "imageGeneration": {
             "type": "boolean"
@@ -16588,7 +16897,6 @@
         "type": "object"
       },
       "ModelProviderConfigWriteParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
         "properties": {
           "settings": {
@@ -16602,7 +16910,6 @@
         "type": "object"
       },
       "ModelProviderConfigWriteResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "provider": {
             "$ref": "#/definitions/v2/ModelProviderSummary"
@@ -16615,7 +16922,6 @@
         "type": "object"
       },
       "ModelProviderError": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Structured JSON-RPC error data. Unknown errors must retain the client's normal fallback.",
         "oneOf": [
           {
@@ -16690,12 +16996,10 @@
         "title": "ModelProviderError"
       },
       "ModelProviderListParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "title": "ModelProviderListParams",
         "type": "object"
       },
       "ModelProviderListResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "canChangeDefault": {
             "type": "boolean"
@@ -16756,7 +17060,6 @@
         "type": "string"
       },
       "ModelReroutedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "fromModel": {
             "type": "string"
@@ -16785,7 +17088,6 @@
         "type": "object"
       },
       "ModelSafetyBufferingUpdatedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "fasterModel": {
             "type": [
@@ -16892,7 +17194,6 @@
         "type": "string"
       },
       "ModelVerificationNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "threadId": {
             "type": "string"
@@ -17147,7 +17448,6 @@
         "type": "string"
       },
       "NullableGatewayOAuthLoginParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "anyOf": [
           {
             "$ref": "#/definitions/v2/GatewayOAuthLoginParams"
@@ -17159,7 +17459,6 @@
         "title": "Nullable_GatewayOAuthLoginParams"
       },
       "NullableGatewayOAuthReadParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "anyOf": [
           {
             "$ref": "#/definitions/v2/GatewayOAuthReadParams"
@@ -17171,7 +17470,6 @@
         "title": "Nullable_GatewayOAuthReadParams"
       },
       "NullableGetAccountRateLimitsParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "anyOf": [
           {
             "$ref": "#/definitions/v2/GetAccountRateLimitsParams"
@@ -17183,7 +17481,6 @@
         "title": "Nullable_GetAccountRateLimitsParams"
       },
       "NullableGetAccountTokenUsageParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "anyOf": [
           {
             "$ref": "#/definitions/v2/GetAccountTokenUsageParams"
@@ -17514,7 +17811,6 @@
         "type": "string"
       },
       "PermissionProfileListParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "cursor": {
             "description": "Opaque pagination cursor returned by a previous call.",
@@ -17544,7 +17840,6 @@
         "type": "object"
       },
       "PermissionProfileListResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "data": {
             "items": {
@@ -17600,7 +17895,6 @@
         "type": "string"
       },
       "PlanDeltaNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "EXPERIMENTAL - proposed plan streaming deltas for plan items. Clients should not assume concatenated deltas match the completed plan item content.",
         "properties": {
           "delta": {
@@ -17792,7 +18086,6 @@
         "type": "object"
       },
       "PluginInstallParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "installAttemptId": {
             "description": "Client-generated identifier used to correlate one installation attempt.",
@@ -17843,7 +18136,6 @@
         "type": "string"
       },
       "PluginInstallResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "appsNeedingAuth": {
             "items": {
@@ -17863,7 +18155,6 @@
         "type": "object"
       },
       "PluginInstalledParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "cwds": {
             "description": "Optional working directories used to discover repo marketplaces.",
@@ -17890,7 +18181,6 @@
         "type": "object"
       },
       "PluginInstalledResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "marketplaceLoadErrors": {
             "default": [],
@@ -18071,7 +18361,6 @@
         "type": "string"
       },
       "PluginListParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "cwds": {
             "description": "Optional working directories used to discover repo marketplaces. When omitted, only home-scoped marketplaces and the official curated marketplace are considered.",
@@ -18102,7 +18391,6 @@
         "type": "object"
       },
       "PluginListResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "featuredPluginIds": {
             "default": [],
@@ -18171,7 +18459,6 @@
         "type": "object"
       },
       "PluginReadParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "marketplacePath": {
             "anyOf": [
@@ -18200,7 +18487,6 @@
         "type": "object"
       },
       "PluginReadResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "plugin": {
             "$ref": "#/definitions/v2/PluginDetail"
@@ -18243,7 +18529,6 @@
         "type": "object"
       },
       "PluginReconcileParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "reason": {
             "description": "Optional client-provided reason recorded with the reconciliation attempt.",
@@ -18257,7 +18542,6 @@
         "type": "object"
       },
       "PluginReconcileResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Bundle and installed-state changes observed by this pass, not a runtime-readiness acknowledgement or a cumulative diff since the client's last request. Other metadata-only changes are not listed.",
         "properties": {
           "changedPlugins": {
@@ -18324,7 +18608,6 @@
         "type": "string"
       },
       "PluginShareCheckoutParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "remotePluginId": {
             "type": "string"
@@ -18337,7 +18620,6 @@
         "type": "object"
       },
       "PluginShareCheckoutResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "marketplaceName": {
             "type": "string"
@@ -18439,7 +18721,6 @@
         "type": "object"
       },
       "PluginShareDeleteParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "remotePluginId": {
             "type": "string"
@@ -18452,7 +18733,6 @@
         "type": "object"
       },
       "PluginShareDeleteResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "title": "PluginShareDeleteResponse",
         "type": "object"
       },
@@ -18486,12 +18766,10 @@
         "type": "object"
       },
       "PluginShareListParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "title": "PluginShareListParams",
         "type": "object"
       },
       "PluginShareListResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "data": {
             "items": {
@@ -18546,7 +18824,6 @@
         "type": "string"
       },
       "PluginShareSaveParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "discoverability": {
             "anyOf": [
@@ -18584,7 +18861,6 @@
         "type": "object"
       },
       "PluginShareSaveResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "canPublishToWorkspace": {
             "default": null,
@@ -18642,7 +18918,6 @@
         "type": "string"
       },
       "PluginShareUpdateTargetsParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "discoverability": {
             "$ref": "#/definitions/v2/PluginShareUpdateDiscoverability"
@@ -18666,7 +18941,6 @@
         "type": "object"
       },
       "PluginShareUpdateTargetsResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "discoverability": {
             "$ref": "#/definitions/v2/PluginShareDiscoverability"
@@ -18686,7 +18960,6 @@
         "type": "object"
       },
       "PluginSkillReadParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "remoteMarketplaceName": {
             "type": "string"
@@ -18707,7 +18980,6 @@
         "type": "object"
       },
       "PluginSkillReadResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "contents": {
             "type": [
@@ -18977,7 +19249,6 @@
         "type": "object"
       },
       "PluginUninstallParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "pluginId": {
             "type": "string"
@@ -18990,7 +19261,6 @@
         "type": "object"
       },
       "PluginUninstallResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "title": "PluginUninstallResponse",
         "type": "object"
       },
@@ -19013,7 +19283,6 @@
         "type": "object"
       },
       "ProcessExitedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Final process exit notification for `process/spawn`.",
         "properties": {
           "exitCode": {
@@ -19061,7 +19330,6 @@
         "type": "object"
       },
       "ProcessOutputDeltaNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Base64-encoded output chunk emitted for a streaming `process/spawn` request.",
         "properties": {
           "capReached": {
@@ -19196,7 +19464,6 @@
         "type": "string"
       },
       "ProjectChangedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "changeType": {
             "$ref": "#/definitions/v2/ProjectChangeType"
@@ -19697,7 +19964,6 @@
         "type": "object"
       },
       "RawResponseCompletedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Internal-only notification containing the exact usage from one upstream Responses API completion.",
         "properties": {
           "responseId": {
@@ -19739,7 +20005,6 @@
         "type": "object"
       },
       "RawResponseItemCompletedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "item": {
             "$ref": "#/definitions/v2/ResponseItem"
@@ -19959,7 +20224,6 @@
         ]
       },
       "ReasoningSummaryPartAddedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "itemId": {
             "type": "string"
@@ -19985,7 +20249,6 @@
         "type": "object"
       },
       "ReasoningSummaryTextDeltaNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "delta": {
             "type": "string"
@@ -20015,7 +20278,6 @@
         "type": "object"
       },
       "ReasoningTextDeltaNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "contentIndex": {
             "format": "int64",
@@ -20070,7 +20332,6 @@
         "type": "object"
       },
       "RemoteControlStatusChangedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Current remote-control connection status and remote identity exposed to clients.",
         "properties": {
           "environmentId": {
@@ -21241,7 +21502,6 @@
         "type": "string"
       },
       "ReviewStartParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "delivery": {
             "anyOf": [
@@ -21270,7 +21530,6 @@
         "type": "object"
       },
       "ReviewStartResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "reviewThreadId": {
             "description": "The thread id supplied to `review/start`.",
@@ -21669,7 +21928,6 @@
         "type": "object"
       },
       "SendAddCreditsNudgeEmailParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "creditType": {
             "$ref": "#/definitions/v2/AddCreditsNudgeCreditType"
@@ -21682,7 +21940,6 @@
         "type": "object"
       },
       "SendAddCreditsNudgeEmailResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "status": {
             "$ref": "#/definitions/v2/AddCreditsNudgeEmailStatus"
@@ -21741,7 +21998,6 @@
         "type": "object"
       },
       "ServerRequestResolvedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "requestId": {
             "$ref": "#/definitions/v2/RequestId"
@@ -22104,13 +22360,11 @@
         "type": "object"
       },
       "SkillsChangedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Notification emitted when watched local skill files change.\n\nTreat this as an invalidation signal and re-run `skills/list` with the client's current parameters when refreshed skill metadata is needed.",
         "title": "SkillsChangedNotification",
         "type": "object"
       },
       "SkillsConfigWriteParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "enabled": {
             "type": "boolean"
@@ -22141,7 +22395,6 @@
         "type": "object"
       },
       "SkillsConfigWriteResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "effectiveEnabled": {
             "type": "boolean"
@@ -22154,7 +22407,6 @@
         "type": "object"
       },
       "SkillsExtraRootsSetParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "extraRoots": {
             "items": {
@@ -22170,7 +22422,6 @@
         "type": "object"
       },
       "SkillsExtraRootsSetResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "title": "SkillsExtraRootsSetResponse",
         "type": "object"
       },
@@ -22200,7 +22451,6 @@
         "type": "object"
       },
       "SkillsListParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "cwds": {
             "description": "When empty, defaults to the current session working directory.",
@@ -22218,7 +22468,6 @@
         "type": "object"
       },
       "SkillsListResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "data": {
             "items": {
@@ -22266,7 +22515,6 @@
         "type": "object"
       },
       "StrictReviewRequiredNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "startedAtMs": {
             "description": "Unix timestamp (in milliseconds) when this review started.",
@@ -22385,7 +22633,6 @@
         "type": "object"
       },
       "TerminalInteractionNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "itemId": {
             "type": "string"
@@ -22699,7 +22946,6 @@
         "type": "string"
       },
       "ThreadApproveGuardianDeniedActionParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "event": {
             "description": "Serialized `codex_protocol::protocol::GuardianAssessmentEvent`."
@@ -22716,12 +22962,10 @@
         "type": "object"
       },
       "ThreadApproveGuardianDeniedActionResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "title": "ThreadApproveGuardianDeniedActionResponse",
         "type": "object"
       },
       "ThreadArchiveParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "threadId": {
             "type": "string"
@@ -22734,12 +22978,10 @@
         "type": "object"
       },
       "ThreadArchiveResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "title": "ThreadArchiveResponse",
         "type": "object"
       },
       "ThreadArchivedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "threadId": {
             "type": "string"
@@ -22787,7 +23029,6 @@
         "type": "string"
       },
       "ThreadAttachmentAddParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Parameters for creating or locating an attachment on its owning thread.",
         "properties": {
           "attachmentType": {
@@ -22811,7 +23052,6 @@
         "type": "object"
       },
       "ThreadAttachmentAddResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "The created or existing attachment.",
         "properties": {
           "attachment": {
@@ -22829,7 +23069,6 @@
         "type": "object"
       },
       "ThreadAttachmentListParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Parameters for listing attachments from one thread.",
         "properties": {
           "cursor": {
@@ -22857,7 +23096,6 @@
         "type": "object"
       },
       "ThreadAttachmentListResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "One page of attachments associated with the requested thread.",
         "properties": {
           "data": {
@@ -22905,7 +23143,6 @@
         "type": "object"
       },
       "ThreadAttachmentOwnerListParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Parameters for reverse lookup by attachment identity within this server's store.",
         "properties": {
           "archived": {
@@ -22944,7 +23181,6 @@
         "type": "object"
       },
       "ThreadAttachmentOwnerListResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "One page of matching owners, including threads without their own user messages.",
         "properties": {
           "data": {
@@ -22967,7 +23203,6 @@
         "type": "object"
       },
       "ThreadAttachmentRemoveParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Parameters for deleting an attachment by its stable thread-local identity.",
         "properties": {
           "attachmentType": {
@@ -22989,13 +23224,11 @@
         "type": "object"
       },
       "ThreadAttachmentRemoveResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Successful deletion does not return additional attachment data.",
         "title": "ThreadAttachmentRemoveResponse",
         "type": "object"
       },
       "ThreadAttachmentUpdatedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Notification published after a thread attachment is created or deleted.",
         "properties": {
           "attachmentId": {
@@ -23024,8 +23257,289 @@
         "title": "ThreadAttachmentUpdatedNotification",
         "type": "object"
       },
+      "ThreadClearEndReason": {
+        "enum": [
+          "clear"
+        ],
+        "type": "string"
+      },
+      "ThreadClearEndedNotification": {
+        "description": "Requester-scoped authoritative predecessor evidence for `thread/clear`.",
+        "properties": {
+          "predecessorThreadId": {
+            "type": "string"
+          },
+          "reason": {
+            "$ref": "#/definitions/v2/ThreadClearEndReason"
+          },
+          "successorThreadId": {
+            "type": "string"
+          },
+          "transitionId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "predecessorThreadId",
+          "reason",
+          "successorThreadId",
+          "transitionId"
+        ],
+        "title": "ThreadClearEndedNotification",
+        "type": "object"
+      },
+      "ThreadClearParams": {
+        "description": "Parameters for the server-owned clear-and-replace operation.",
+        "properties": {
+          "modelSettings": {
+            "description": "Required for successful clear: model settings resolved for a fresh session. Missing or null input is decoded so the server can preserve authority checks, then refused before creating a durable clear transition.",
+            "properties": {
+              "model": {
+                "description": "An unset model uses ordinary server model-default resolution.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "reasoningEffort": {
+                "anyOf": [
+                  {
+                    "$ref": "#/definitions/v2/ReasoningEffort"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "An unset effort replaces the predecessor's configured effort with no override."
+              }
+            },
+            "type": "object"
+          },
+          "threadId": {
+            "description": "The predecessor currently displayed by the requesting connection.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "modelSettings",
+          "threadId"
+        ],
+        "title": "ThreadClearParams",
+        "type": "object"
+      },
+      "ThreadClearRecovery": {
+        "properties": {
+          "context": {
+            "$ref": "#/definitions/v2/ThreadClearRecoveryContext"
+          },
+          "durability": {
+            "$ref": "#/definitions/v2/ThreadClearRecoveryDurability"
+          },
+          "successorThreadId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "context",
+          "durability",
+          "successorThreadId"
+        ],
+        "type": "object"
+      },
+      "ThreadClearRecoveryContext": {
+        "additionalProperties": false,
+        "description": "Caller provenance, never an authoritative clear edge or a shutdown receipt.",
+        "properties": {
+          "contractVersion": {
+            "description": "Must match the recovery-read contract on this connection before creation.",
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "predecessorThreadId": {
+            "description": "Null means genuinely no displayed predecessor, not an unavailable known ID.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "contractVersion"
+        ],
+        "type": "object"
+      },
+      "ThreadClearRecoveryDurability": {
+        "enum": [
+          "durable",
+          "unavailable"
+        ],
+        "type": "string"
+      },
+      "ThreadClearRecoveryObservation": {
+        "oneOf": [
+          {
+            "properties": {
+              "type": {
+                "enum": [
+                  "support"
+                ],
+                "title": "SupportThreadClearRecoveryObservationType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "title": "SupportThreadClearRecoveryObservation",
+            "type": "object"
+          },
+          {
+            "description": "Absence is not proof of freshness or permission to register an identity.",
+            "properties": {
+              "type": {
+                "enum": [
+                  "none"
+                ],
+                "title": "NoneThreadClearRecoveryObservationType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "title": "NoneThreadClearRecoveryObservation",
+            "type": "object"
+          },
+          {
+            "description": "May remain pending after a crash; consumers must bound their wait.",
+            "properties": {
+              "recovery": {
+                "$ref": "#/definitions/v2/ThreadClearRecovery"
+              },
+              "type": {
+                "enum": [
+                  "pending"
+                ],
+                "title": "PendingThreadClearRecoveryObservationType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "recovery",
+              "type"
+            ],
+            "title": "PendingThreadClearRecoveryObservation",
+            "type": "object"
+          },
+          {
+            "properties": {
+              "recovery": {
+                "$ref": "#/definitions/v2/ThreadClearRecovery"
+              },
+              "type": {
+                "enum": [
+                  "complete"
+                ],
+                "title": "CompleteThreadClearRecoveryObservationType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "recovery",
+              "type"
+            ],
+            "title": "CompleteThreadClearRecoveryObservation",
+            "type": "object"
+          },
+          {
+            "properties": {
+              "recovery": {
+                "$ref": "#/definitions/v2/ThreadClearRecovery"
+              },
+              "type": {
+                "enum": [
+                  "failed"
+                ],
+                "title": "FailedThreadClearRecoveryObservationType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "recovery",
+              "type"
+            ],
+            "title": "FailedThreadClearRecoveryObservation",
+            "type": "object"
+          }
+        ]
+      },
+      "ThreadClearResponse": {
+        "properties": {
+          "predecessorThreadId": {
+            "type": "string"
+          },
+          "successorThread": {
+            "$ref": "#/definitions/v2/Thread"
+          },
+          "transitionId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "predecessorThreadId",
+          "successorThread",
+          "transitionId"
+        ],
+        "title": "ThreadClearResponse",
+        "type": "object"
+      },
+      "ThreadClearStartedNotification": {
+        "description": "Requester-scoped authoritative successor evidence for `thread/clear`.",
+        "properties": {
+          "predecessorThreadId": {
+            "type": "string"
+          },
+          "startSource": {
+            "$ref": "#/definitions/v2/ThreadStartSource"
+          },
+          "successorThread": {
+            "$ref": "#/definitions/v2/Thread"
+          },
+          "transitionId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "predecessorThreadId",
+          "startSource",
+          "successorThread",
+          "transitionId"
+        ],
+        "title": "ThreadClearStartedNotification",
+        "type": "object"
+      },
+      "ThreadClearTransition": {
+        "description": "Server-recorded succession, not proof of current interactive attachment.",
+        "properties": {
+          "predecessorThreadId": {
+            "type": "string"
+          },
+          "successorThreadId": {
+            "type": "string"
+          },
+          "transitionId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "predecessorThreadId",
+          "successorThreadId",
+          "transitionId"
+        ],
+        "type": "object"
+      },
       "ThreadClosedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "threadId": {
             "type": "string"
@@ -23038,7 +23552,6 @@
         "type": "object"
       },
       "ThreadCompactStartParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "threadId": {
             "type": "string"
@@ -23051,12 +23564,10 @@
         "type": "object"
       },
       "ThreadCompactStartResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "title": "ThreadCompactStartResponse",
         "type": "object"
       },
       "ThreadDeleteParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "threadId": {
             "type": "string"
@@ -23069,12 +23580,10 @@
         "type": "object"
       },
       "ThreadDeleteResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "title": "ThreadDeleteResponse",
         "type": "object"
       },
       "ThreadDeletedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "threadId": {
             "type": "string"
@@ -23114,7 +23623,6 @@
         "type": "object"
       },
       "ThreadForkParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "There are two ways to fork a thread: 1. By thread_id: load the thread from disk by thread_id and fork it into a new thread. 2. By path: load the thread from disk by path and fork it into a new thread.\n\nIf using a non-empty path, the thread_id param will be ignored. Empty string path values are treated as absent.\n\nPrefer using thread_id whenever possible.",
         "properties": {
           "approvalPolicy": {
@@ -23228,7 +23736,6 @@
         "type": "object"
       },
       "ThreadForkResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "approvalPolicy": {
             "$ref": "#/definitions/v2/AskForApproval"
@@ -23353,7 +23860,6 @@
         "type": "object"
       },
       "ThreadGoalClearParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "origin": {
             "anyOf": [
@@ -23377,7 +23883,6 @@
         "type": "object"
       },
       "ThreadGoalClearResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "cleared": {
             "type": "boolean"
@@ -23390,7 +23895,6 @@
         "type": "object"
       },
       "ThreadGoalClearedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "threadId": {
             "type": "string"
@@ -23403,7 +23907,6 @@
         "type": "object"
       },
       "ThreadGoalGetParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "threadId": {
             "type": "string"
@@ -23416,7 +23919,6 @@
         "type": "object"
       },
       "ThreadGoalGetResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "goal": {
             "anyOf": [
@@ -23441,7 +23943,6 @@
         "type": "string"
       },
       "ThreadGoalSetParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "objective": {
             "type": [
@@ -23488,7 +23989,6 @@
         "type": "object"
       },
       "ThreadGoalSetResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "goal": {
             "$ref": "#/definitions/v2/ThreadGoal"
@@ -23512,7 +24012,6 @@
         "type": "string"
       },
       "ThreadGoalUpdatedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "goal": {
             "$ref": "#/definitions/v2/ThreadGoal"
@@ -23545,7 +24044,6 @@
         "type": "string"
       },
       "ThreadInjectItemsParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "items": {
             "description": "Raw Responses API items to append to the thread's model-visible history.",
@@ -23564,8 +24062,52 @@
         "type": "object"
       },
       "ThreadInjectItemsResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "title": "ThreadInjectItemsResponse",
+        "type": "object"
+      },
+      "ThreadInteractiveSubscriptionChangedNotification": {
+        "description": "An atomic subscription-state transition. A zero count explicitly records a removal; it is not encoded by omitting an entry.",
+        "properties": {
+          "changes": {
+            "items": {
+              "$ref": "#/definitions/v2/ThreadInteractiveSubscriptionEntry"
+            },
+            "type": "array"
+          },
+          "generation": {
+            "type": "string"
+          },
+          "revision": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "changes",
+          "generation",
+          "revision"
+        ],
+        "title": "ThreadInteractiveSubscriptionChangedNotification",
+        "type": "object"
+      },
+      "ThreadInteractiveSubscriptionEntry": {
+        "description": "A server-owned count of trusted interactive clients attached to one exact thread.\n\nThis is subscription evidence only. It does not establish thread succession, loaded state, or authority to transfer a clear transition.",
+        "properties": {
+          "interactiveSubscriptionCount": {
+            "description": "Distinct live thread-event subscriptions held by server-verified interactive clients. Not evidence of human presence, focus or retention.",
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "threadId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "interactiveSubscriptionCount",
+          "threadId"
+        ],
         "type": "object"
       },
       "ThreadItem": {
@@ -24587,7 +25129,6 @@
         "description": "Starting position for an item-history page."
       },
       "ThreadItemsListParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "cursor": {
             "anyOf": [
@@ -24649,7 +25190,6 @@
         "type": "object"
       },
       "ThreadItemsListResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "backwardsCursor": {
             "description": "Opaque cursor to pass as `cursor` when reversing `sortDirection`. This is only populated when the page contains at least one item.",
@@ -24692,7 +25232,6 @@
         ]
       },
       "ThreadListParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "archived": {
             "description": "Optional archived filter; when set to true, only archived threads are returned. If false or null, only non-archived threads are returned.",
@@ -24817,7 +25356,6 @@
         "type": "object"
       },
       "ThreadListResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "backwardsCursor": {
             "description": "Opaque cursor to pass as `cursor` when reversing `sortDirection`. This is only populated when the page contains at least one thread. Use it with the opposite `sortDirection`; for timestamp sorts it anchors at the start of the page timestamp so same-second updates are not skipped.",
@@ -24847,7 +25385,6 @@
         "type": "object"
       },
       "ThreadLoadedListParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "cursor": {
             "description": "Opaque pagination cursor returned by a previous call.",
@@ -24870,7 +25407,6 @@
         "type": "object"
       },
       "ThreadLoadedListResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "data": {
             "description": "Thread ids for sessions currently loaded in memory.",
@@ -24927,7 +25463,6 @@
         "type": "object"
       },
       "ThreadMetadataUpdateParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "gitInfo": {
             "anyOf": [
@@ -24951,7 +25486,6 @@
         "type": "object"
       },
       "ThreadMetadataUpdateResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "thread": {
             "$ref": "#/definitions/v2/Thread"
@@ -24964,7 +25498,6 @@
         "type": "object"
       },
       "ThreadNameUpdatedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "threadId": {
             "type": "string"
@@ -25025,7 +25558,6 @@
         ]
       },
       "ThreadPredictionUpdatedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "result": {
             "$ref": "#/definitions/v2/ThreadPredictionResult"
@@ -25046,7 +25578,6 @@
         "type": "object"
       },
       "ThreadProjectUpdatedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "projectId": {
             "type": [
@@ -25066,7 +25597,6 @@
         "type": "object"
       },
       "ThreadQueueChangedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "threadId": {
             "type": "string"
@@ -25079,7 +25609,6 @@
         "type": "object"
       },
       "ThreadReadParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "includeTurns": {
             "description": "When true, include turns and their items from rollout history. Full-history hydration is deprecated for paginated threads; prefer a metadata-only read and page with `thread/turns/list` and `thread/items/list`.",
@@ -25096,7 +25625,6 @@
         "type": "object"
       },
       "ThreadReadResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "thread": {
             "$ref": "#/definitions/v2/Thread"
@@ -25131,7 +25659,6 @@
         "type": "object"
       },
       "ThreadReadStateChangedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "readState": {
             "$ref": "#/definitions/v2/ThreadReadState"
@@ -25281,7 +25808,6 @@
         ]
       },
       "ThreadRealtimeClosedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "EXPERIMENTAL - emitted when thread realtime transport closes.",
         "properties": {
           "reason": {
@@ -25301,7 +25827,6 @@
         "type": "object"
       },
       "ThreadRealtimeErrorNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "EXPERIMENTAL - emitted when thread realtime encounters an error.",
         "properties": {
           "message": {
@@ -25441,7 +25966,6 @@
         "type": "object"
       },
       "ThreadRealtimeItemAddedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "EXPERIMENTAL - raw non-audio thread realtime item emitted by the backend.",
         "properties": {
           "item": true,
@@ -25457,7 +25981,6 @@
         "type": "object"
       },
       "ThreadRealtimeItemCompletedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "EXPERIMENTAL - a realtime timeline item published after canonical commit.",
         "properties": {
           "item": {
@@ -25475,7 +25998,6 @@
         "type": "object"
       },
       "ThreadRealtimeItemStartedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "EXPERIMENTAL - a realtime timeline item started before its content streams.",
         "properties": {
           "item": {
@@ -25493,7 +26015,6 @@
         "type": "object"
       },
       "ThreadRealtimeItemTranscriptDeltaNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "EXPERIMENTAL - text appended to an active realtime transcript item.",
         "properties": {
           "delta": {
@@ -25515,7 +26036,6 @@
         "type": "object"
       },
       "ThreadRealtimeOutputAudioDeltaNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "EXPERIMENTAL - streamed output audio emitted by thread realtime.",
         "properties": {
           "audio": {
@@ -25533,7 +26053,6 @@
         "type": "object"
       },
       "ThreadRealtimeSdpNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "EXPERIMENTAL - emitted with the remote SDP for a WebRTC realtime session.",
         "properties": {
           "sdp": {
@@ -25621,7 +26140,6 @@
         ]
       },
       "ThreadRealtimeStartedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "EXPERIMENTAL - emitted when thread realtime startup is accepted.",
         "properties": {
           "realtimeSessionId": {
@@ -25645,7 +26163,6 @@
         "type": "object"
       },
       "ThreadRealtimeTranscriptDeltaNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "EXPERIMENTAL - flat transcript delta emitted whenever realtime transcript text changes.",
         "properties": {
           "delta": {
@@ -25668,7 +26185,6 @@
         "type": "object"
       },
       "ThreadRealtimeTranscriptDoneNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "EXPERIMENTAL - final transcript text emitted when realtime completes a transcript part.",
         "properties": {
           "role": {
@@ -25734,7 +26250,6 @@
         "type": "object"
       },
       "ThreadResumeParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "There are three ways to resume a thread: 1. By thread_id: load the thread from disk by thread_id and resume it. 2. By history: instantiate the thread from memory and resume it. 3. By path: load the thread from disk by path and resume it.\n\nFor non-running threads, the precedence is: history > non-empty path > thread_id. If using history or a non-empty path for a non-running thread, the thread_id param will be ignored.\n\nIf thread_id identifies a running thread, app-server rejoins that thread and treats a non-empty path as a consistency check against the active rollout path. Empty string path values are treated as absent.\n\nPrefer using thread_id whenever possible.",
         "properties": {
           "approvalPolicy": {
@@ -25838,7 +26353,6 @@
         "type": "object"
       },
       "ThreadResumeResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "approvalPolicy": {
             "$ref": "#/definitions/v2/AskForApproval"
@@ -25943,8 +26457,17 @@
         "title": "ThreadResumeResponse",
         "type": "object"
       },
+      "ThreadRetentionRefusalReason": {
+        "description": "A typed, no-mutation refusal for the exact-thread retention carrier.",
+        "enum": [
+          "ineligiblePrincipal",
+          "authorityUnavailable",
+          "unknownThread",
+          "invalidThreadId"
+        ],
+        "type": "string"
+      },
       "ThreadRevertParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Replace a paginated thread's durable history with the prefix before one turn.\n\nThis only changes persisted conversation history. It does not revert local file changes.",
         "properties": {
           "beforeTurnId": {
@@ -25963,7 +26486,6 @@
         "type": "object"
       },
       "ThreadRevertResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "itemsBackwardsCursor": {
             "description": "Opaque cursor for hydrating paginated items backwards.\n\nPass this as `cursor` to `thread/items/list` with `sortDirection: \"desc\"`. The first page includes the item identified by the cursor.",
@@ -25995,7 +26517,6 @@
         "type": "object"
       },
       "ThreadRevertedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "threadId": {
             "type": "string"
@@ -26079,7 +26600,6 @@
         "type": "object"
       },
       "ThreadSectionChangedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Broadcast after a successful move into, within, or out of a section.",
         "properties": {
           "sectionId": {
@@ -26101,7 +26621,6 @@
         "type": "object"
       },
       "ThreadSectionCreateParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Parameters for creating an independently persisted thread section.",
         "properties": {
           "appearance": {
@@ -26127,7 +26646,6 @@
         "type": "object"
       },
       "ThreadSectionCreateResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "The independently persisted section created by the server.",
         "properties": {
           "section": {
@@ -26141,7 +26659,6 @@
         "type": "object"
       },
       "ThreadSectionDeleteParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Parameters for deleting an independently persisted thread section.",
         "properties": {
           "sectionId": {
@@ -26156,13 +26673,11 @@
         "type": "object"
       },
       "ThreadSectionDeleteResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Successful deletion does not return additional section data.",
         "title": "ThreadSectionDeleteResponse",
         "type": "object"
       },
       "ThreadSectionListParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Parameters for listing independently persisted thread sections.",
         "properties": {
           "cursor": {
@@ -26186,7 +26701,6 @@
         "type": "object"
       },
       "ThreadSectionListResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "One page of independently persisted thread sections.",
         "properties": {
           "data": {
@@ -26210,7 +26724,6 @@
         "type": "object"
       },
       "ThreadSectionMoveParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Parameters for moving a thread within a server-owned section ordering.",
         "properties": {
           "beforeThreadId": {
@@ -26240,12 +26753,10 @@
         "type": "object"
       },
       "ThreadSectionMoveResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "title": "ThreadSectionMoveResponse",
         "type": "object"
       },
       "ThreadSectionUpdateParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Parameters for updating an independently persisted thread section.",
         "properties": {
           "appearance": {
@@ -26276,7 +26787,6 @@
         "type": "object"
       },
       "ThreadSectionUpdateResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "The independently persisted section after its name is updated.",
         "properties": {
           "section": {
@@ -26290,7 +26800,6 @@
         "type": "object"
       },
       "ThreadSetNameParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "name": {
             "type": "string"
@@ -26307,7 +26816,6 @@
         "type": "object"
       },
       "ThreadSetNameResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "title": "ThreadSetNameResponse",
         "type": "object"
       },
@@ -26402,7 +26910,6 @@
         "type": "object"
       },
       "ThreadSettingsUpdatedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "threadId": {
             "type": "string"
@@ -26419,7 +26926,6 @@
         "type": "object"
       },
       "ThreadShellCommandParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "command": {
             "description": "Shell command string evaluated by the thread's configured shell. Unlike `command/exec`, this intentionally preserves shell syntax such as pipes, redirects, and quoting. This runs unsandboxed with full access rather than inheriting the thread sandbox policy.",
@@ -26445,7 +26951,6 @@
         "type": "object"
       },
       "ThreadShellCommandResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "title": "ThreadShellCommandResponse",
         "type": "object"
       },
@@ -26477,7 +26982,6 @@
         "type": "string"
       },
       "ThreadStartParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "approvalPolicy": {
             "anyOf": [
@@ -26602,7 +27106,6 @@
         "type": "object"
       },
       "ThreadStartResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "approvalPolicy": {
             "$ref": "#/definitions/v2/AskForApproval"
@@ -26688,8 +27191,25 @@
         "type": "string"
       },
       "ThreadStartedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
+          "clearPredecessorThreadId": {
+            "description": "The explicit predecessor of a `Clear` start. This is omitted for normal new sessions and forks; resumes do not emit `thread/started`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sessionStartSource": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/ThreadStartSource"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The client-declared source for this start, when the source was supplied on the corresponding `thread/start` request."
+          },
           "thread": {
             "$ref": "#/definitions/v2/Thread"
           }
@@ -26776,7 +27296,6 @@
         ]
       },
       "ThreadStatusChangedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "status": {
             "$ref": "#/definitions/v2/ThreadStatus"
@@ -26970,7 +27489,6 @@
         "type": "object"
       },
       "ThreadTokenUsageUpdatedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "threadId": {
             "type": "string"
@@ -26991,7 +27509,6 @@
         "type": "object"
       },
       "ThreadTurnsListParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "cursor": {
             "description": "Opaque cursor to pass to the next call to continue after the last turn.",
@@ -27042,7 +27559,6 @@
         "type": "object"
       },
       "ThreadTurnsListResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "backwardsCursor": {
             "description": "Opaque cursor to pass as `cursor` when reversing `sortDirection`. This is only populated when the page contains at least one turn. Use it with the opposite `sortDirection` to include the anchor turn again and catch updates to that turn.",
@@ -27072,7 +27588,6 @@
         "type": "object"
       },
       "ThreadUnarchiveParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "threadId": {
             "type": "string"
@@ -27085,7 +27600,6 @@
         "type": "object"
       },
       "ThreadUnarchiveResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "thread": {
             "$ref": "#/definitions/v2/Thread"
@@ -27098,7 +27612,6 @@
         "type": "object"
       },
       "ThreadUnarchivedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "threadId": {
             "type": "string"
@@ -27153,7 +27666,6 @@
         ]
       },
       "ThreadUnsubscribeParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "threadId": {
             "type": "string"
@@ -27166,7 +27678,6 @@
         "type": "object"
       },
       "ThreadUnsubscribeResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "status": {
             "$ref": "#/definitions/v2/ThreadUnsubscribeStatus"
@@ -27479,7 +27990,6 @@
         "type": "object"
       },
       "TurnCompletedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "threadId": {
             "type": "string"
@@ -27496,7 +28006,6 @@
         "type": "object"
       },
       "TurnDiffUpdatedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Notification that the turn-level unified diff has changed. Contains the latest aggregated diff across all file changes in the turn.",
         "properties": {
           "diff": {
@@ -27583,7 +28092,6 @@
         "type": "object"
       },
       "TurnInterruptParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "threadId": {
             "type": "string"
@@ -27600,7 +28108,6 @@
         "type": "object"
       },
       "TurnInterruptResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "title": "TurnInterruptResponse",
         "type": "object"
       },
@@ -27630,7 +28137,6 @@
         ]
       },
       "TurnModerationMetadataNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "metadata": true,
           "threadId": {
@@ -27672,7 +28178,6 @@
         "type": "string"
       },
       "TurnPlanUpdatedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "explanation": {
             "type": [
@@ -27702,7 +28207,6 @@
         "type": "object"
       },
       "TurnStartParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "approvalPolicy": {
             "anyOf": [
@@ -27866,7 +28370,6 @@
         "type": "object"
       },
       "TurnStartResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "turn": {
             "$ref": "#/definitions/v2/Turn"
@@ -27879,7 +28382,6 @@
         "type": "object"
       },
       "TurnStartedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "threadId": {
             "type": "string"
@@ -27905,7 +28407,6 @@
         "type": "string"
       },
       "TurnSteerParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "clientUserMessageId": {
             "type": [
@@ -27936,7 +28437,6 @@
         "type": "object"
       },
       "TurnSteerResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "turnId": {
             "type": "string"
@@ -28235,7 +28735,6 @@
         "type": "string"
       },
       "WarningNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "message": {
             "description": "Concise warning message for the user.",
@@ -28463,7 +28962,6 @@
         "type": "string"
       },
       "WindowsSandboxReadinessResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "status": {
             "$ref": "#/definitions/v2/WindowsSandboxReadiness"
@@ -28476,7 +28974,6 @@
         "type": "object"
       },
       "WindowsSandboxSetupCompletedNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "error": {
             "type": [
@@ -28506,7 +29003,6 @@
         "type": "string"
       },
       "WindowsSandboxSetupStartParams": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "cwd": {
             "anyOf": [
@@ -28529,7 +29025,6 @@
         "type": "object"
       },
       "WindowsSandboxSetupStartResponse": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "started": {
             "type": "boolean"
@@ -28542,7 +29037,6 @@
         "type": "object"
       },
       "WindowsWorldWritableWarningNotification": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "extraCount": {
             "format": "uint",

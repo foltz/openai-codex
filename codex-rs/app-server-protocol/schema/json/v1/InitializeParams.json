@@ -42,6 +42,10 @@
             "null"
           ]
         },
+        "interactiveClient": {
+          "description": "Requests interactive-client classification; the server independently verifies entitlement.",
+          "type": "boolean"
+        },
         "mcpServerOpenaiFormElicitation": {
           "description": "Legacy opt-in for the `openai/form` MCP extension.\n\nNew clients should declare `openai/form` in [`Self::extensions`].",
           "type": "boolean"

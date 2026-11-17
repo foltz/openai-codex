@@ -1660,6 +1660,55 @@
       ],
       "type": "string"
     },
+    "ThreadClearRecovery": {
+      "properties": {
+        "context": {
+          "$ref": "#/definitions/ThreadClearRecoveryContext"
+        },
+        "durability": {
+          "$ref": "#/definitions/ThreadClearRecoveryDurability"
+        },
+        "successorThreadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "context",
+        "durability",
+        "successorThreadId"
+      ],
+      "type": "object"
+    },
+    "ThreadClearRecoveryContext": {
+      "additionalProperties": false,
+      "description": "Caller provenance, never an authoritative clear edge or a shutdown receipt.",
+      "properties": {
+        "contractVersion": {
+          "description": "Must match the recovery-read contract on this connection before creation.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "predecessorThreadId": {
+          "description": "Null means genuinely no displayed predecessor, not an unavailable known ID.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "contractVersion"
+      ],
+      "type": "object"
+    },
+    "ThreadClearRecoveryDurability": {
+      "enum": [
+        "durable",
+        "unavailable"
+      ],
+      "type": "string"
+    },
     "ThreadEnvironment": {
       "description": "An environment selected by a loaded thread, independent of connection status.",
       "properties": {
@@ -2642,6 +2691,16 @@
         }
       },
       "type": "object"
+    },
+    "ThreadRetentionRefusalReason": {
+      "description": "A typed, no-mutation refusal for the exact-thread retention carrier.",
+      "enum": [
+        "ineligiblePrincipal",
+        "authorityUnavailable",
+        "unknownThread",
+        "invalidThreadId"
+      ],
+      "type": "string"
     },
     "ThreadSection": {
       "description": "An independently persisted, user-visible thread section.",

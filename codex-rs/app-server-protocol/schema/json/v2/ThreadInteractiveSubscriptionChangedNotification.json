@@ -1,0 +1,48 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ThreadInteractiveSubscriptionEntry": {
+      "description": "A server-owned count of trusted interactive clients attached to one exact thread.\n\nThis is subscription evidence only. It does not establish thread succession, loaded state, or authority to transfer a clear transition.",
+      "properties": {
+        "interactiveSubscriptionCount": {
+          "description": "Distinct live thread-event subscriptions held by server-verified interactive clients. Not evidence of human presence, focus or retention.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "interactiveSubscriptionCount",
+        "threadId"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "An atomic subscription-state transition. A zero count explicitly records a removal; it is not encoded by omitting an entry.",
+  "properties": {
+    "changes": {
+      "items": {
+        "$ref": "#/definitions/ThreadInteractiveSubscriptionEntry"
+      },
+      "type": "array"
+    },
+    "generation": {
+      "type": "string"
+    },
+    "revision": {
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "changes",
+    "generation",
+    "revision"
+  ],
+  "title": "ThreadInteractiveSubscriptionChangedNotification",
+  "type": "object"
+}

@@ -4,6 +4,10 @@
 
 export type GetAccountParams = {
 /**
+ * Observe only the existing auth cache, without refresh or configuration discovery.
+ */
+cacheOnly?: boolean,
+/**
  * When `true`, requests a proactive token refresh before returning.
  *
  * In managed auth mode this triggers the normal refresh-token flow. In

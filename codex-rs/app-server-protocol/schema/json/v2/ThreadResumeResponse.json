@@ -2695,6 +2695,16 @@
       },
       "type": "object"
     },
+    "ThreadRetentionRefusalReason": {
+      "description": "A typed, no-mutation refusal for the exact-thread retention carrier.",
+      "enum": [
+        "ineligiblePrincipal",
+        "authorityUnavailable",
+        "unknownThread",
+        "invalidThreadId"
+      ],
+      "type": "string"
+    },
     "ThreadSection": {
       "description": "An independently persisted, user-visible thread section.",
       "properties": {

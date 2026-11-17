@@ -64,6 +64,7 @@ async fn background_routing_call_sites_skip_config(api_key: Option<&str>) -> any
         analytics_events_client.clone(),
     ));
     let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
+        telemetry_reset: Default::default(),
         control_endpoint: None,
         cloud_skill_provider: None,
         outgoing,

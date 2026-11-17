@@ -687,20 +687,20 @@ pub async fn run_main_with_transport_options(
     .map(Arc::new)
     .map_err(std::io::Error::other)?;
 
-    let otel = codex_core::otel_init::build_provider(
-        &config,
-        env!("CARGO_PKG_VERSION"),
-        Some(OTEL_SERVICE_NAME),
-        default_analytics_enabled,
-    )
-    .map_err(|e| {
-        std::io::Error::new(
-            ErrorKind::InvalidData,
-            format!("error loading otel config: {e}"),
+    let mut prepared_otel = Some(
+        codex_core::otel_init::prepare_provider(
+            &config,
+            env!("CARGO_PKG_VERSION"),
+            Some(OTEL_SERVICE_NAME),
+            default_analytics_enabled,
         )
-    })?;
-    codex_core::otel_init::record_process_start(otel.as_ref(), OTEL_SERVICE_NAME);
-    codex_core::otel_init::install_sqlite_telemetry(otel.as_ref(), OTEL_SERVICE_NAME);
+        .map_err(|e| {
+            std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!("error loading otel config: {e}"),
+            )
+        })?,
+    );
     let unix_socket_startup_lock = match &transport {
         AppServerTransport::UnixSocket { .. } => {
             let startup_lock_path = app_server_startup_lock_path(&codex_home)?;
@@ -709,24 +709,7 @@ pub async fn run_main_with_transport_options(
         }
         _ => None,
     };
-    let state_db_init = match init_sqlite_state_db_with_fresh_start_on_corruption(&config).await {
-        Ok(state_db_init) => state_db_init,
-        Err(err) => {
-            return Err(std::io::Error::other(format!(
-                "failed to initialize sqlite state runtime under {}: {err:#}",
-                config.sqlite_config().home().display()
-            )));
-        }
-    };
-    let state_db = state_db_init.state_db;
-    if let Some(recovery_notice) = state_db_init.recovery_notice {
-        config_warnings.push(ConfigWarningNotification {
-            summary: SQLITE_RECOVERY_CONFIG_WARNING_SUMMARY.to_string(),
-            details: Some(recovery_notice.details),
-            path: None,
-            range: None,
-        });
-    }
+    let sqlite_warning_index = config_warnings.len();
 
     if let Ok(Some(err)) = check_execpolicy_for_warnings(&config.config_layer_stack).await {
         config_warnings.push(exec_policy_config_warning(&err));
@@ -797,20 +780,51 @@ pub async fn run_main_with_transport_options(
     );
     let feedback_layer = feedback.logger_layer();
     let feedback_metadata_layer = feedback.metadata_layer();
-    let log_db = state_db
-        .clone()
-        .map(|state_db| log_db::start(state_db, log_write_warning.clone()));
-    let log_db_layer = log_db
-        .clone()
-        .map(|layer| layer.with_filter(log_db::default_filter()));
-    let (otel_layers, otel_logger_reload_handle) = otel_reloader::layers(otel.as_ref());
-    let _ = tracing_subscriber::registry()
+    let (log_db_layer, log_db_reload) =
+        tracing_subscriber::reload::Layer::new(None::<log_db::LogDbLayer>);
+    let log_db_layer = log_db_layer.with_filter(log_db::default_filter());
+    let (otel_layers, otel_routes) = codex_otel::ManagedTelemetryRoutes::layers();
+    tracing_subscriber::registry()
         .with(stderr_fmt)
         .with(feedback_layer)
         .with(feedback_metadata_layer)
         .with(log_db_layer)
         .with(otel_layers)
-        .try_init();
+        .try_init()
+        .map_err(|_| std::io::Error::other("app-server tracing subscriber unavailable"))?;
+    let otel = otel_routes
+        .publish(&mut prepared_otel)
+        .map_err(|_| std::io::Error::other("initial telemetry publication unavailable"))?;
+    codex_core::otel_init::record_process_start(otel.provider.as_ref(), OTEL_SERVICE_NAME);
+    codex_core::otel_init::install_sqlite_telemetry(otel.provider.as_ref(), OTEL_SERVICE_NAME);
+    let state_db_init = match init_sqlite_state_db_with_fresh_start_on_corruption(&config).await {
+        Ok(state_db_init) => state_db_init,
+        Err(err) => {
+            return Err(std::io::Error::other(format!(
+                "failed to initialize sqlite state runtime under {}: {err:#}",
+                config.sqlite_config().home().display()
+            )));
+        }
+    };
+    let state_db = state_db_init.state_db;
+    if let Some(recovery_notice) = state_db_init.recovery_notice {
+        config_warnings.insert(
+            sqlite_warning_index,
+            ConfigWarningNotification {
+                summary: SQLITE_RECOVERY_CONFIG_WARNING_SUMMARY.to_string(),
+                details: Some(recovery_notice.details),
+                path: None,
+                range: None,
+            },
+        );
+    }
+
+    let log_db = state_db
+        .clone()
+        .map(|state_db| log_db::start(state_db, log_write_warning.clone()));
+    log_db_reload
+        .reload(log_db.clone())
+        .map_err(|_| std::io::Error::other("app-server log database subscriber unavailable"))?;
     if let Some(error) = state_db.as_ref().and_then(|db| db.diagnostic_logs_error()) {
         tracing::warn!(
             event.name = "diagnostic_database_unavailable",
@@ -998,17 +1012,22 @@ pub async fn run_main_with_transport_options(
     transport_accept_handles.push(remote_control_accept_handle);
 
     // Only the standalone server measures its local home, not embedded/cloud runtimes.
-    if let Some(metrics) = otel.as_ref().and_then(codex_otel::OtelProvider::metrics) {
+    if let Some(metrics) = otel
+        .provider
+        .as_ref()
+        .and_then(codex_otel::OtelProvider::metrics)
+    {
         codex_home_metrics::spawn(&config, metrics.clone(), transport_shutdown_token.clone());
     }
 
-    let otel_reloader_handle = otel_reloader::spawn(
+    let (telemetry_reset, otel_reloader_handle) = otel_reloader::spawn_managed_with_owner_deadline(
         otel,
-        otel_logger_reload_handle,
+        otel_routes,
         config_manager.clone(),
         Arc::clone(&auth_manager),
         default_analytics_enabled,
         transport_shutdown_token.clone(),
+        owner_latch.subscribe(),
     );
 
     let outbound_handle = tokio::spawn(async move {
@@ -1079,6 +1098,7 @@ pub async fn run_main_with_transport_options(
         let outbound_control_tx = outbound_control_tx;
         let (startup_warnings_tx, mut startup_warnings_rx) = mpsc::unbounded_channel();
         let mut processor = MessageProcessor::new(MessageProcessorArgs {
+            telemetry_reset,
             control_endpoint,
             cloud_skill_provider,
             outgoing: outgoing_message_sender,
@@ -1476,13 +1496,24 @@ pub async fn run_main_with_transport_options(
     }
     let _ = outbound_handle.await;
 
+    // A processor failure may be the first edge; telemetry must still use the
+    // one host deadline, rather than acquire an independent shutdown budget.
+    owner_latch.latch();
     transport_shutdown_token.cancel();
-    let _ = otel_reloader_handle.await;
+    let telemetry = otel_reloader_handle.await;
+    let telemetry_clean = telemetry
+        .as_ref()
+        .is_ok_and(|actor| actor.shutdown_result == Some(Ok(())));
     for handle in transport_accept_handles {
         let _ = handle.await;
     }
 
-    Ok(AppServerExit::Graceful)
+    // Keep the actor (including incomplete exporters) alive until this host returns.
+    Ok(if telemetry_clean {
+        AppServerExit::Graceful
+    } else {
+        AppServerExit::ShutdownIncomplete
+    })
 }
 
 struct SqliteRecoveryNotice {

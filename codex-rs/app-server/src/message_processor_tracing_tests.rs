@@ -264,6 +264,7 @@ pub(super) async fn build_test_processor(
         analytics_events_client.clone(),
     ));
     let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
+        telemetry_reset: Default::default(),
         control_endpoint: None,
         cloud_skill_provider: None,
         outgoing,

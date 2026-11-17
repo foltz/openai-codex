@@ -162,6 +162,7 @@ pub(crate) struct MessageProcessor {
     startup_warnings: StartupWarnings,
     models_refresh_worker: Arc<tokio::sync::Mutex<ModelsRefreshWorker>>,
     model_catalog: Arc<ModelCatalog>,
+    reset_inventory: Arc<crate::managed_reset::ProductionResetInventory>,
     thread_manager: Arc<ThreadManager>,
     turn_cost_worker: Option<TurnCostWorker>,
     skills_watcher: Arc<SkillsWatcher>,
@@ -323,6 +324,7 @@ impl ConnectionSessionState {
 }
 
 pub(crate) struct MessageProcessorArgs {
+    pub(crate) telemetry_reset: crate::otel_reset_control::TelemetryResetControl,
     pub(crate) control_endpoint: Option<String>,
     pub(crate) cloud_skill_provider: Option<Arc<dyn codex_skills_extension::SkillProvider>>,
     pub(crate) outgoing: Arc<OutgoingMessageSender>,
@@ -355,6 +357,7 @@ impl MessageProcessor {
     /// `Sender` so handlers can enqueue messages to be written to stdout.
     pub(crate) fn new(args: MessageProcessorArgs) -> Self {
         let MessageProcessorArgs {
+            telemetry_reset,
             control_endpoint,
             cloud_skill_provider,
             outgoing,
@@ -507,6 +510,18 @@ impl MessageProcessor {
         let models_refresh_worker = Arc::new(tokio::sync::Mutex::new(
             crate::models_refresh_worker::spawn(&model_catalog),
         ));
+        let reset_inventory = Arc::new(crate::managed_reset::ProductionResetInventory {
+            telemetry_reset,
+            config_manager: config_manager.clone(),
+            chatgpt_base_url: config.chatgpt_base_url.clone(),
+            thread_manager: Arc::clone(&thread_manager),
+            models_refresh_worker: Arc::clone(&models_refresh_worker),
+            model_catalog: Arc::clone(&model_catalog),
+            http_client_factory: config.http_client_factory(),
+            requirements: config.config_layer_stack.requirements_toml().clone(),
+            auth_manager: Arc::clone(&auth_manager),
+            remote_control_handle: remote_control_handle.clone(),
+        });
         let turn_cost_worker = TurnCostWorker::spawn(
             Arc::clone(&config),
             Arc::clone(&auth_manager),
@@ -724,6 +739,7 @@ impl MessageProcessor {
             },
             models_refresh_worker,
             model_catalog,
+            reset_inventory,
             thread_manager,
             turn_cost_worker,
             skills_watcher,

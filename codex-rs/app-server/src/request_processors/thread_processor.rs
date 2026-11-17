@@ -1432,6 +1432,15 @@ impl ThreadRequestProcessor {
         self.thread_state_manager.clear_all_listeners().await;
     }
 
+    /// Binds every runtime's cleanup deadline when host shutdown begins,
+    /// without closing admission; `begin_thread_shutdown` later tightens it.
+    pub(crate) fn bind_thread_shutdown_deadlines_now(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> codex_core::ShutdownDeadlineBinding {
+        self.thread_manager.bind_shutdown_deadlines_now(deadline)
+    }
+
     pub(crate) async fn shutdown_threads(&self) {
         let report = self
             .thread_manager

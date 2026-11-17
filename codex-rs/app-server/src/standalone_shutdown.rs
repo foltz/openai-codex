@@ -130,6 +130,22 @@ where
     tokio::spawn(async move { expiry.run("processor", body).await })
 }
 
+/// Wire the processor to the first shutdown edge (intake or loop): turn
+/// admission closes at once and the cleanup deadlines are bound to the
+/// original latched deadline, even if the processor loop is stuck. Holds only
+/// a `Weak` processor: no cycle through the latch.
+pub(crate) fn register_processor_intake(
+    latch: &OwnerLatch,
+    processor: &std::sync::Arc<crate::message_processor::MessageProcessor>,
+) {
+    let weak = std::sync::Arc::downgrade(processor);
+    latch.on_edge(move |deadline| {
+        if let Some(processor) = weak.upgrade() {
+            processor.begin_shutdown_at_intake(deadline);
+        }
+    });
+}
+
 /// The processor task's result as the host sees it.
 pub(crate) enum ProcessorJoin {
     /// Managed-daemon forced exit: the host returns at once.

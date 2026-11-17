@@ -153,6 +153,8 @@ pub(crate) const NOT_ADMITTED_MESSAGE: &str = "Server is shutting down; request 
 
 pub(crate) struct MessageProcessor {
     pub(crate) turn_admission: TurnAdmission,
+    intake_shutdown_deadline: OnceLock<tokio::time::Instant>,
+    intake_thread_binding: OnceLock<codex_core::ShutdownDeadlineBinding>,
     user_verification: Arc<crate::user_verification::Service>,
     outgoing: Arc<OutgoingMessageSender>,
     startup_warnings: StartupWarnings,
@@ -650,6 +652,8 @@ impl MessageProcessor {
 
         Self {
             turn_admission,
+            intake_shutdown_deadline: OnceLock::new(),
+            intake_thread_binding: OnceLock::new(),
             user_verification,
             outgoing,
             startup_warnings: StartupWarnings {
@@ -917,6 +921,54 @@ impl MessageProcessor {
         self.thread_processor
             .try_attach_thread_listener(thread_id, thread, connection_ids)
             .await;
+    }
+
+    pub(crate) fn begin_shutdown_at_intake(&self, deadline: tokio::time::Instant) {
+        self.turn_admission.begin_drain();
+        if self.intake_shutdown_deadline.set(deadline).is_err() {
+            return;
+        }
+        self.retire_command_exec_sandbox_cleanup(Some(deadline.into_std()));
+        let binding = self.bind_thread_shutdown_deadlines_now(deadline);
+        let _ = self.intake_thread_binding.set(binding);
+    }
+
+    /// Synchronous thread cleanup-deadline binding (see
+    /// `ThreadManager::bind_shutdown_deadlines_now`).
+    pub(crate) fn bind_thread_shutdown_deadlines_now(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> codex_core::ShutdownDeadlineBinding {
+        self.thread_processor
+            .bind_thread_shutdown_deadlines_now(deadline)
+    }
+
+    /// The census of the intake binding, if the first edge has been applied.
+    pub(crate) fn intake_thread_binding(&self) -> Option<codex_core::ShutdownDeadlineBinding> {
+        self.intake_thread_binding.get().copied().or_else(|| {
+            // Another intake caller can observe the published deadline while
+            // its synchronous binding is still in progress. Unknown is not
+            // positive proof of a clean census.
+            self.intake_shutdown_deadline
+                .get()
+                .map(|_| codex_core::ShutdownDeadlineBinding {
+                    unavailable: 1,
+                    ..Default::default()
+                })
+        })
+    }
+
+    /// The original deadline the first shutdown edge bound, if any.
+    #[cfg(test)]
+    pub(crate) fn intake_shutdown_deadline(&self) -> Option<tokio::time::Instant> {
+        self.intake_shutdown_deadline.get().copied()
+    }
+
+    /// Tightens the cleanup deadline of every command/exec sandbox launch to
+    /// `deadline`, or to now + the command/exec drain grace when the caller
+    /// has no deadline of its own. Only ever moves deadlines earlier.
+    pub(crate) fn retire_command_exec_sandbox_cleanup(&self, deadline: Option<std::time::Instant>) {
+        self.command_exec_processor.retire_sandbox_cleanup(deadline);
     }
 
     pub(crate) async fn drain_background_tasks(&self) {
@@ -2099,3 +2151,7 @@ mod thread_lifecycle_tests;
 #[cfg(test)]
 #[path = "message_processor_workspace_routing_tests.rs"]
 mod workspace_routing_tests;
+
+#[cfg(test)]
+#[path = "message_processor_intake_tests.rs"]
+mod intake_binding_tests;

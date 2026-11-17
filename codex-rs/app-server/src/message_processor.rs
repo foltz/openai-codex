@@ -1487,6 +1487,22 @@ impl MessageProcessor {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    pub(crate) async fn refuse_not_admitted(
+        &self,
+        connection_id: ConnectionId,
+        request_id: codex_app_server_protocol::RequestId,
+    ) -> bool {
+        self.outgoing
+            .send_error_delivered(
+                ConnectionRequestId {
+                    connection_id,
+                    request_id,
+                },
+                internal_error(NOT_ADMITTED_MESSAGE),
+            )
+            .await
+    }
+
     pub(crate) fn unanswered_after_half_close(&self) -> u64 {
         self.unanswered_after_half_close
             .load(std::sync::atomic::Ordering::Acquire)

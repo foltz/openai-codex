@@ -203,3 +203,57 @@ async fn connection_drain_preserves_handler_panic_and_half_close_unanswered() {
     assert_eq!(processor.unanswered_after_half_close(), 1);
     processor.clear_runtime_references();
 }
+
+#[tokio::test]
+async fn not_admitted_refusal_reports_exact_recipient_and_router_loss() {
+    use crate::outgoing_message::{ConnectionId, OutgoingEnvelope, OutgoingMessage};
+    use codex_app_server_protocol::RequestId;
+
+    let home = TempDir::new().unwrap();
+    let config = Arc::new(
+        codex_core::config::ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .build()
+            .await
+            .unwrap(),
+    );
+    let auth = codex_login::AuthManager::shared_from_config(config.as_ref(), false)
+        .await
+        .expect("initialize fixture auth manager");
+    let (processor, mut outgoing) =
+        super::message_processor_tracing_tests::build_test_processor(config, auth).await;
+    assert!(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            processor.refuse_not_admitted(ConnectionId(41), RequestId::Integer(73)),
+        )
+        .await
+        .expect("refusal must finish")
+    );
+    let envelope = tokio::time::timeout(Duration::from_secs(1), outgoing.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    match envelope {
+        OutgoingEnvelope::ToConnection {
+            connection_id,
+            message: OutgoingMessage::Error(error),
+            ..
+        } => {
+            assert_eq!(connection_id, ConnectionId(41));
+            assert_eq!(error.id, RequestId::Integer(73));
+            assert_eq!(error.error.message, super::NOT_ADMITTED_MESSAGE);
+        }
+        _ => panic!("refusal must retain the request and recipient"),
+    }
+    drop(outgoing);
+    assert!(
+        !tokio::time::timeout(
+            Duration::from_secs(1),
+            processor.refuse_not_admitted(ConnectionId(41), RequestId::Integer(74)),
+        )
+        .await
+        .expect("closed router must refuse promptly")
+    );
+    processor.clear_runtime_references();
+}

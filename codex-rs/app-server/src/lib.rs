@@ -1346,6 +1346,7 @@ pub async fn run_main_with_transport_options(
         let mut connection_cleanup_tasks =
             ConnectionCleanupTasks::with_expiry(owner_expiry.clone());
         let owner_latch = Arc::clone(&owner_latch);
+        let owner_expired = owner_expiry.expired_token();
         let mut thread_listener_tasks = tokio::task::JoinSet::new();
         let mut remote_control_status_rx = remote_control_handle.status_receiver();
         let mut remote_control_status = remote_control_status_rx.borrow().clone();
@@ -1386,7 +1387,13 @@ pub async fn run_main_with_transport_options(
             let mut clients_disconnected = false;
             let mut shutdown_state = ShutdownState::default();
             let mut shutdown_signal_future = Box::pin(shutdown_signal());
+            let mut shutdown_sends = standalone_shutdown::ShutdownSends::default();
             let exit_reason = loop {
+                // First shutdown edge (signal or daemon shutdown): latch the
+                // owner before any graceful drain, which then consumes it.
+                if shutdown_state.requested() {
+                    owner_latch.latch();
+                }
                 // Sample submissions first: one can publish a running turn before
                 // releasing its permit, and shutdown must observe that new turn.
                 let active_admissions = *active_admissions_rx.borrow_and_update();
@@ -1401,15 +1408,28 @@ pub async fn run_main_with_transport_options(
                     }
                     let finished = snapshot_finished || shutdown_state.forced();
                     if finished {
+                        // Before cancelling: telemetry must see the owner.
+                        owner_latch.latch();
                         transport_shutdown_token.cancel();
                     }
                     if managed_daemon && shutdown_state.forced() {
                         break "forced_shutdown_requested";
                     }
                     if !clients_disconnected {
-                        let _ = outbound_control_tx
-                            .send(OutboundControlEvent::DisconnectAll)
-                            .await;
+                        let control = outbound_control_tx.clone();
+                        let disconnect = async move {
+                            control
+                                .send(OutboundControlEvent::DisconnectAll)
+                                .await
+                                .is_ok()
+                        };
+                        if shutdown_sends
+                            .submit(&owner_latch, "disconnect_all", disconnect)
+                            .await
+                            .is_none()
+                        {
+                            break "shutdown_deadline_expired";
+                        }
                         clients_disconnected = true;
                     }
                     if finished {
@@ -1418,6 +1438,10 @@ pub async fn run_main_with_transport_options(
                 }
 
                 tokio::select! {
+                    // The graceful drain consumes the same owner budget.
+                    () = owner_expired.cancelled(), if shutdown_state.requested() => {
+                        break "shutdown_deadline_expired";
+                    }
                     _ = &mut snapshot, if shutdown_state.requested() && active_admissions == 0 && !snapshot_finished => {
                         snapshot_finished = true;
                     }
@@ -1445,6 +1469,7 @@ pub async fn run_main_with_transport_options(
                     }
                     event = transport_event_rx.recv() => {
                         let Some(event) = event else {
+                            owner_latch.latch();
                             break "transport_channel_closed";
                         };
                         if ready_to_exit && !matches!(event, TransportEvent::DaemonShutdown) {
@@ -1470,23 +1495,28 @@ pub async fn run_main_with_transport_options(
                                     Arc::new(AtomicBool::new(false));
                                 let outbound_opted_out_notification_methods =
                                     Arc::new(RwLock::new(HashSet::new()));
-                                if outbound_control_tx
-                                    .send(OutboundControlEvent::Opened {
-                                        connection_id,
-                                        writer,
-                                        disconnect_sender,
-                                        initialized: Arc::clone(&outbound_initialized),
-                                        experimental_api_enabled: Arc::clone(
-                                            &outbound_experimental_api_enabled,
-                                        ),
-                                        opted_out_notification_methods: Arc::clone(
-                                            &outbound_opted_out_notification_methods,
-                                        ),
+                                let control = outbound_control_tx.clone();
+                                let opened = OutboundControlEvent::Opened {
+                                    connection_id,
+                                    writer,
+                                    disconnect_sender,
+                                    initialized: Arc::clone(&outbound_initialized),
+                                    experimental_api_enabled: Arc::clone(
+                                        &outbound_experimental_api_enabled,
+                                    ),
+                                    opted_out_notification_methods: Arc::clone(
+                                        &outbound_opted_out_notification_methods,
+                                    ),
+                                };
+                                match shutdown_sends
+                                    .submit(&owner_latch, "connection_opened", async move {
+                                        control.send(opened).await.is_ok()
                                     })
                                     .await
-                                    .is_err()
                                 {
-                                    break "outbound_router_closed";
+                                    Some(true) => {}
+                                    Some(false) => break "outbound_router_closed",
+                                    None => break "shutdown_deadline_expired",
                                 }
                                 connections.insert(
                                     connection_id,
@@ -1505,19 +1535,51 @@ pub async fn run_main_with_transport_options(
                                     continue;
                                 };
                                 let stdio_closed = connection_state.origin == ConnectionOrigin::Stdio;
+                                if single_client_mode && stdio_closed {
+                                    // Stdio EOF is the shutdown edge: latch first.
+                                    owner_latch.latch();
+                                }
+                                // Closes admission (inbound) only. Requests read
+                                // but not admitted are refused explicitly.
                                 connection_state.session.rpc_gate.close().await;
-                                let outbound_closed = outbound_control_tx
-                                    .send(OutboundControlEvent::Closed { connection_id })
-                                    .await
-                                    .is_ok();
+                                let half_close_deadline =
+                                    (single_client_mode && stdio_closed).then(|| owner_latch.latch());
+                                // Stdin EOF closes only the inbound half: keep the
+                                // stdio output recipient registered so every accepted
+                                // reply is still written. Only a positive signal in the
+                                // writer (EPIPE/POLLHUP) means the recipient is gone.
+                                let outbound_closed = if stdio_closed {
+                                    Some(true)
+                                } else {
+                                    let control = outbound_control_tx.clone();
+                                    shutdown_sends
+                                        .submit(&owner_latch, "connection_closed", async move {
+                                            control
+                                                .send(OutboundControlEvent::Closed { connection_id })
+                                                .await
+                                                .is_ok()
+                                        })
+                                        .await
+                                };
                                 let processor = Arc::clone(&processor);
                                 connection_cleanup_tasks.spawn(async move {
-                                    processor
-                                        .connection_closed(connection_id, &connection_state.session)
-                                        .await;
+                                    let session = &connection_state.session;
+                                    if stdio_closed {
+                                        processor
+                                            .connection_half_closed_until(
+                                                connection_id,
+                                                session,
+                                                half_close_deadline,
+                                            )
+                                            .await;
+                                    } else {
+                                        processor.connection_closed(connection_id, session).await;
+                                    }
                                 });
-                                if !outbound_closed {
-                                    break "outbound_router_closed";
+                                match outbound_closed {
+                                    Some(true) => {}
+                                    Some(false) => break "outbound_router_closed",
+                                    None => break "shutdown_deadline_expired",
                                 }
                                 if single_client_mode && stdio_closed {
                                     // Pending remote enrollment must stop before RPCs drain.
@@ -1528,9 +1590,31 @@ pub async fn run_main_with_transport_options(
                             TransportEvent::IncomingMessage { connection_id, message } => {
                                 let Some(connection_state) = connections.get_mut(&connection_id) else {
                                     warn!("dropping message from unknown connection: {connection_id:?}");
+                                    if let JSONRPCMessage::Request(request) = message {
+                                        let refusing = Arc::clone(&processor);
+                                        let refused = shutdown_sends
+                                            .submit(&owner_latch, "not_admitted_refusal", async move {
+                                                refusing.refuse_not_admitted(connection_id, request.id).await
+                                            })
+                                            .await;
+                                        if refused != Some(true) {
+                                            owner_latch.expiry().record_abandoned(/*messages*/ 1, /*bytes*/ 0);
+                                        }
+                                    }
                                     continue;
                                 };
                                 if connection_state.session.rpc_gate.is_closed() {
+                                    if let JSONRPCMessage::Request(request) = message {
+                                        let refusing = Arc::clone(&processor);
+                                        let refused = shutdown_sends
+                                            .submit(&owner_latch, "not_admitted_refusal", async move {
+                                                refusing.refuse_not_admitted(connection_id, request.id).await
+                                            })
+                                            .await;
+                                        if refused != Some(true) {
+                                            owner_latch.expiry().record_abandoned(/*messages*/ 1, /*bytes*/ 0);
+                                        }
+                                    }
                                     continue;
                                 }
                                 match message {
@@ -1661,6 +1745,31 @@ pub async fn run_main_with_transport_options(
                 }
             };
 
+            // Admission is over. Frames already read but never admitted are
+            // refused explicitly; closing first makes every later send fail
+            // in the transport, which refuses those frames itself.
+            transport_event_rx.close();
+            while let Ok(event) = transport_event_rx.try_recv() {
+                if let TransportEvent::IncomingMessage {
+                    connection_id,
+                    message: JSONRPCMessage::Request(request),
+                } = event
+                {
+                    let refusing = Arc::clone(&processor);
+                    let refused = shutdown_sends
+                        .submit(&owner_latch, "not_admitted_refusal", async move {
+                            refusing
+                                .refuse_not_admitted(connection_id, request.id)
+                                .await
+                        })
+                        .await;
+                    if refused != Some(true) {
+                        owner_latch
+                            .expiry()
+                            .record_abandoned(/*messages*/ 1, /*bytes*/ 0);
+                    }
+                }
+            }
             if let Some(task) = recovery_task {
                 task.abort();
             }
@@ -1695,6 +1804,7 @@ pub async fn run_main_with_transport_options(
                 connection_cleanup_tasks.abort();
                 owner.record("forced", false);
             }
+            shutdown_sends.hand_to(&mut owner);
             standalone_shutdown::submit_close_all(
                 &mut owner,
                 &outbound_control_tx,

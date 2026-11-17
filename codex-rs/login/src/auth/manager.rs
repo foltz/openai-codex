@@ -3274,12 +3274,14 @@ impl AuthManager {
         &self,
         expected_owner_generation: u64,
     ) -> Option<(CodexAuth, HttpClientFactory)> {
-        let current = || {
-            self.owner_admission_snapshot()
-                .is_some_and(|(snapshot, _)| {
-                    snapshot.revisions.owner_generation == expected_owner_generation
-                })
-        };
+        // Expiry may make a credential snapshot unavailable. The owner revision
+        // is still known and must allow the guarded same-owner refresh below.
+        let source = self
+            .owner_pin
+            .as_ref()
+            .map_or(self, |pin| pin.source.as_ref());
+        let current =
+            || source.auth_change_state_tx.borrow().owner_generation == expected_owner_generation;
         if !current() {
             return None;
         }

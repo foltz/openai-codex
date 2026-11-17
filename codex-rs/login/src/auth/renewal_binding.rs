@@ -254,7 +254,9 @@ impl AuthManager {
         publication
             .revalidate()
             .map_err(RefreshTokenError::Transient)?;
-        Ok(self.set_cached_auth_locked_with_owner_proof(&mut publication.cache, Some(auth), true))
+        self.set_cached_auth_locked_with_owner_proof(&mut publication.cache, Some(auth), true);
+        // The setter reports coarse identity changes, not publication acceptance.
+        Ok(true)
     }
 }
 
@@ -298,6 +300,7 @@ mod publication_tests {
                 .publish_auth_for_owner(&snapshot, &binding, CodexAuth::from_api_key("renewed"))
                 .unwrap()
         );
+        assert_eq!(manager.auth_cached().unwrap().get_token().unwrap(), "renewed");
         let after = manager.owner_snapshot().unwrap();
         assert_eq!(
             after.revisions.owner_generation,

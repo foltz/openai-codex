@@ -711,6 +711,8 @@ fn sample_thread(thread_id: &str) -> Thread {
 
 fn sample_thread_start_response() -> ClientResponsePayload {
     ClientResponsePayload::ThreadStart(ThreadStartResponse {
+        retention: None,
+        clear_recovery: None,
         disabled_plugin_ids: Vec::new(),
         thread: sample_thread("thread-1"),
         model: "gpt-5".to_string(),
@@ -730,6 +732,7 @@ fn sample_thread_start_response() -> ClientResponsePayload {
 
 fn sample_thread_resume_response() -> ClientResponsePayload {
     ClientResponsePayload::ThreadResume(ThreadResumeResponse {
+        retention: None,
         disabled_plugin_ids: Vec::new(),
         thread: sample_thread("thread-2"),
         model: "gpt-5".to_string(),
@@ -753,6 +756,7 @@ fn sample_thread_resume_response() -> ClientResponsePayload {
 
 fn sample_thread_fork_response() -> ClientResponsePayload {
     ClientResponsePayload::ThreadFork(ThreadForkResponse {
+        retention: None,
         disabled_plugin_ids: Vec::new(),
         thread: sample_thread("thread-3"),
         model: "gpt-5".to_string(),
@@ -1303,8 +1307,10 @@ async fn account_switch_between_batches_does_not_send_old_credentials() {
 
 #[test]
 fn queued_fact_keeps_captured_owner_and_refuses_a_foreign_manager() {
-    let manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("synthetic"));
-    let other = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("synthetic"));
+    let manager =
+        AuthManager::from_auth_for_testing(codex_login::CodexAuth::from_api_key("synthetic"));
+    let other =
+        AuthManager::from_auth_for_testing(codex_login::CodexAuth::from_api_key("synthetic"));
     let (sender, mut receiver) = mpsc::channel(4);
     let (changes, observed) = tokio::sync::watch::channel(codex_login::AuthChangeState {
         owner_generation: 7,
@@ -1330,7 +1336,11 @@ fn queued_fact_keeps_captured_owner_and_refuses_a_foreign_manager() {
                 crate::GuardianReviewedAction::RequestPermissions {},
                 1000,
             )
-            .event_params(Default::default(), 1000, std::time::Duration::ZERO),
+            .event_params(
+                crate::GuardianReviewAnalyticsResult::without_session(),
+                1000,
+                std::time::Duration::ZERO,
+            ),
         )))
     };
     let origin = crate::AnalyticsOwner::new(&manager, 7);
@@ -1347,4 +1357,360 @@ fn queued_fact_keeps_captured_owner_and_refuses_a_foreign_manager() {
     ));
     queue.try_send_for_owner(fact(), &crate::AnalyticsOwner::new(&other, 8));
     assert!(receiver.try_recv().is_err());
+}
+
+/// A host whose analytics queue sends to a local server, signed in as account A and able
+/// to switch to account B the way a native login does.
+#[cfg(debug_assertions)]
+struct AccountSwitchHarness {
+    home: PathBuf,
+    stored: codex_login::AuthDotJson,
+    manager: Arc<AuthManager>,
+    controller: codex_http_client::NetworkPolicyController,
+    client: AnalyticsEventsClient,
+    requests: Arc<Mutex<Vec<String>>>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+/// Signals that the first delivery arrived, then waits for the release before answering.
+#[cfg(debug_assertions)]
+type HeldFirstDelivery = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
+#[cfg(debug_assertions)]
+impl AccountSwitchHarness {
+    async fn start(name: &str, hold_first: Option<HeldFirstDelivery>) -> Self {
+        use codex_http_client::DestinationPolicy;
+        use codex_http_client::NetworkPolicyController;
+        use codex_login::AuthCredentialsStoreMode as Store;
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+
+        let home = unique_capture_path(name);
+        fs::create_dir_all(&home).unwrap();
+        let mut stored: codex_login::AuthDotJson = serde_json::from_value(serde_json::json!({
+            "auth_mode": "chatgptAuthTokens",
+            "tokens": {
+                "id_token": "e30.e30.sig",
+                "access_token": "test-access-token-a",
+                "refresh_token": "",
+                "account_id": "account-a",
+            },
+        }))
+        .unwrap();
+        stored.last_refresh = Some(SystemTime::now().into());
+        codex_login::save_auth(&home, &stored, Store::File, Default::default()).unwrap();
+        let controller = NetworkPolicyController::default();
+        let manager = Arc::new(
+            AuthManager::new(
+                home.clone(),
+                /*enable_codex_api_key_env*/ false,
+                Store::File,
+                /*forced_chatgpt_workspace_id*/ None,
+                /*chatgpt_base_url*/ None,
+                Default::default(),
+                codex_login::AuthRouteConfig::from_http_client_factory(
+                    HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault)
+                        .with_network_policy(controller.policy()),
+                ),
+            )
+            .await,
+        );
+        assert!(controller.publish(
+            controller.policy().revision(),
+            DestinationPolicy::Unrestricted
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination = AnalyticsEventsDestination::Http {
+            base_url: format!("http://{}", listener.local_addr().unwrap()).into(),
+            api_key_headers: Default::default(),
+        };
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&requests);
+        let server = tokio::spawn(async move {
+            let mut hold_first = hold_first;
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut buffer = [0; 4096];
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]).to_lowercase();
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length: "))
+                            .unwrap()
+                            .parse()
+                            .unwrap();
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                captured
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8(request).unwrap());
+                if let Some((received, release)) = hold_first.take() {
+                    received.send(()).unwrap();
+                    release.await.unwrap();
+                }
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+        let client = AnalyticsEventsClient {
+            queue: Some(AnalyticsEventsQueue::new(
+                Arc::clone(&manager),
+                destination,
+                None,
+            )),
+        };
+        client.track_initialize(
+            /*connection_id*/ 1,
+            codex_app_server_protocol::InitializeParams {
+                client_info: codex_app_server_protocol::ClientInfo {
+                    name: "test".to_string(),
+                    title: None,
+                    version: "1".to_string(),
+                },
+                capabilities: None,
+            },
+            "test_client".to_string(),
+            AppServerRpcTransport::InProcess,
+        );
+        Self {
+            home,
+            stored,
+            manager,
+            controller,
+            client,
+            requests,
+            server,
+        }
+    }
+
+    /// Emits `codex_thread_initialized` for `thread_id` under the current account.
+    fn start_thread(&self, request_id: i64, thread_id: &str) {
+        let mut response = sample_thread_start_response();
+        if let ClientResponsePayload::ThreadStart(started) = &mut response {
+            started.thread.id = thread_id.to_string();
+        }
+        self.client.track_response(
+            /*connection_id*/ 1,
+            RequestId::Integer(request_id),
+            &response,
+        );
+    }
+
+    /// A native login to account B: stored, reloaded, and network policy republished.
+    async fn switch_to_account_b(&mut self) {
+        let tokens = self.stored.tokens.as_mut().unwrap();
+        tokens.account_id = Some("account-b".to_string());
+        tokens.access_token = "test-access-token-b".to_string();
+        codex_login::save_auth(
+            &self.home,
+            &self.stored,
+            codex_login::AuthCredentialsStoreMode::File,
+            Default::default(),
+        )
+        .unwrap();
+        self.manager.reload().await;
+        assert!(self.controller.publish(
+            self.controller.policy().revision(),
+            codex_http_client::DestinationPolicy::Unrestricted,
+        ));
+    }
+
+    async fn finish(self) -> Vec<String> {
+        self.client.flush().await;
+        self.server.abort();
+        let _ = self.server.await;
+        fs::remove_dir_all(&self.home).unwrap();
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+#[cfg(debug_assertions)]
+fn sent_as_account(request: &str, account: &str) -> bool {
+    request
+        .to_lowercase()
+        .contains(&format!("chatgpt-account-id: account-{account}"))
+        || request.contains(&format!("test-access-token-{account}"))
+}
+
+#[cfg(debug_assertions)]
+fn guardian_review_started(review_id: &str) -> crate::GuardianReviewTrackContext {
+    crate::GuardianReviewTrackContext::new(
+        "thread-1".to_string(),
+        "turn-1".to_string(),
+        review_id.to_string(),
+        /*target_item_id*/ None,
+        crate::GuardianApprovalRequestSource::DelegatedSubagent,
+        crate::GuardianReviewedAction::NetworkAccess {
+            protocol: codex_protocol::approvals::NetworkApprovalProtocol::Https,
+            port: 443,
+        },
+        /*review_timeout_ms*/ 90_000,
+    )
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn events_recorded_under_one_account_are_not_sent_with_the_next() {
+    let (first_received_tx, first_received_rx) = tokio::sync::oneshot::channel();
+    let (release_first_tx, release_first_rx) = tokio::sync::oneshot::channel();
+    let mut host = AccountSwitchHarness::start(
+        "enqueue-account-switch",
+        Some((first_received_tx, release_first_rx)),
+    )
+    .await;
+    host.start_thread(/*request_id*/ 1, "thread-1");
+    tokio::time::timeout(std::time::Duration::from_secs(10), first_received_rx)
+        .await
+        .expect("account A's first event should be delivered")
+        .unwrap();
+
+    // Account A records an event while the queue is busy delivering the first one.
+    host.start_thread(/*request_id*/ 2, "thread-account-a");
+    // The host then switches to account B before the queue reaches that event.
+    host.switch_to_account_b().await;
+    release_first_tx.send(()).unwrap();
+    host.client.flush().await;
+    // Control: an event recorded under account B is delivered as account B.
+    host.start_thread(/*request_id*/ 3, "thread-account-b");
+    let requests = host.finish().await;
+
+    assert!(sent_as_account(&requests[0], "a"));
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.contains("thread-account-b") && sent_as_account(request, "b")),
+        "account B's own event should be delivered: {requests:?}"
+    );
+    let mislabeled = requests
+        .iter()
+        .filter(|request| request.contains("thread-account-a") && sent_as_account(request, "b"))
+        .collect::<Vec<_>>();
+    assert!(
+        mislabeled.is_empty(),
+        "account A's event was sent as account B: {mislabeled:?}"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn guardian_decision_completing_after_account_switch_is_not_sent_as_the_next_account() {
+    let mut host = AccountSwitchHarness::start("guardian-origin-switch", /*hold_first*/ None).await;
+    host.start_thread(/*request_id*/ 1, "thread-1");
+    host.client.flush().await;
+
+    // A Guardian review starts in account A's turn...
+    let review = guardian_review_started("review-origin-account-a").with_originating_owner(Some(
+        crate::AnalyticsOwner::new(
+            &host.manager,
+            host.manager
+                .owner_snapshot()
+                .unwrap()
+                .revisions
+                .owner_generation,
+        ),
+    ));
+    // ...the host switches to account B while it runs, and the decision completes after.
+    host.switch_to_account_b().await;
+    host.client.track_guardian_review(
+        &review,
+        crate::GuardianReviewAnalyticsResult::without_session(),
+        /*completed_at_ms*/ 2,
+        std::time::Duration::ZERO,
+    );
+    host.client.flush().await;
+    // Control: the queue delivers account B's own events as account B.
+    host.start_thread(/*request_id*/ 2, "thread-account-b");
+    let requests = host.finish().await;
+
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.contains("thread-account-b") && sent_as_account(request, "b")),
+        "account B's own event should be delivered: {requests:?}"
+    );
+    let mislabeled = requests
+        .iter()
+        .filter(|request| {
+            request.contains("review-origin-account-a") && sent_as_account(request, "b")
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        mislabeled.is_empty(),
+        "account A's Guardian decision was sent as account B: {mislabeled:?}"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn guardian_decision_is_sent_only_while_its_originating_owner_is_current() {
+    let mut host = AccountSwitchHarness::start("guardian-origin-owner", /*hold_first*/ None).await;
+    host.start_thread(/*request_id*/ 1, "thread-1");
+    host.client.flush().await;
+    let owner_a = crate::AnalyticsOwner::new(
+        &host.manager,
+        host.manager
+            .auth_change_state_receiver()
+            .borrow()
+            .owner_generation,
+    );
+    let foreign_manager = AuthManager::from_auth_for_testing(
+        codex_login::CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+    );
+    let foreign_owner = crate::AnalyticsOwner::new(
+        &foreign_manager,
+        host.manager
+            .auth_change_state_receiver()
+            .borrow()
+            .owner_generation,
+    );
+    let track =
+        |client: &AnalyticsEventsClient, review_id: &str, owner: Option<crate::AnalyticsOwner>| {
+            client.track_guardian_review(
+                &guardian_review_started(review_id).with_originating_owner(owner),
+                crate::GuardianReviewAnalyticsResult::without_session(),
+                /*completed_at_ms*/ 2,
+                std::time::Duration::ZERO,
+            );
+        };
+
+    // While A is current, A's decision is delivered as A.
+    track(
+        &host.client,
+        "review-while-owner-current",
+        Some(owner_a.clone()),
+    );
+    // An owner from another manager cannot be verified by this queue.
+    track(&host.client, "review-foreign-manager", Some(foreign_owner));
+    host.client.flush().await;
+    host.switch_to_account_b().await;
+    // A's review that completes after the switch is dropped, never sent as B.
+    track(&host.client, "review-after-owner-changed", Some(owner_a));
+    host.client.flush().await;
+    let requests = host.finish().await;
+
+    assert!(
+        requests.iter().any(|request| {
+            request.contains("review-while-owner-current") && sent_as_account(request, "a")
+        }),
+        "account A's decision should be delivered while A is current: {requests:?}"
+    );
+    for review_id in ["review-foreign-manager", "review-after-owner-changed"] {
+        assert!(
+            !requests.iter().any(|request| request.contains(review_id)),
+            "{review_id} should not be delivered: {requests:?}"
+        );
+    }
 }

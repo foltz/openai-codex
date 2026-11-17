@@ -5010,3 +5010,7 @@ mod command_source_fence_tests;
 #[cfg(test)]
 #[path = "command_recovery_tests.rs"]
 mod command_recovery_tests;
+
+#[path = "renewal_binding.rs"]
+mod renewal_binding;
+pub use renewal_binding::AuthRenewalBinding;

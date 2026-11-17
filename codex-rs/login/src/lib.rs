@@ -48,6 +48,7 @@ pub use auth::AuthManager;
 pub use auth::AuthManagerConfig;
 pub use auth::AuthManagerInitializationError;
 pub use auth::AuthOwner;
+pub use auth::AuthRenewalBinding;
 pub use auth::AuthRuntimeConfig;
 pub use auth::CLIENT_ID;
 pub use auth::CLIENT_ID_OVERRIDE_ENV_VAR;

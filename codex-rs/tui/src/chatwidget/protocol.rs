@@ -394,6 +394,8 @@ impl ChatWidget {
             | ServerNotification::GatewayOAuthChanged(_)
             | ServerNotification::AccountRateLimitsUpdated(_)
             | ServerNotification::ThreadStarted(_)
+            | ServerNotification::ThreadClearEnded(_)
+            | ServerNotification::ThreadClearStarted(_)
             | ServerNotification::ThreadStatusChanged(_)
             | ServerNotification::ThreadReadStateChanged(_)
             | ServerNotification::ThreadSectionChanged(_)

@@ -618,6 +618,20 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::ThreadUnsubscribeResponse,
     },
+    // Uses `inspect_params` for the experimental `retainForConnection` field.
+    ThreadClear => "thread/clear" {
+        params: v2::ThreadClearParams,
+        inspect_params: true,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadClearResponse,
+    },
+    // Deliberately unscoped: observation must not queue behind clear mutation.
+    #[experimental("thread/clear/read")]
+    ThreadClearRead => "thread/clear/read" {
+        params: v2::ThreadClearReadParams,
+        serialization: None,
+        response: v2::ThreadClearReadResponse,
+    },
     #[experimental("thread/clear/recovery/read")]
     ThreadClearRecoveryRead => "thread/clear/recovery/read" {
         params: v2::ThreadClearRecoveryReadParams,
@@ -2106,6 +2120,8 @@ server_notification_definitions! {
     /// NEW NOTIFICATIONS
     Error => "error" (v2::ErrorNotification),
     ThreadStarted => "thread/started" (v2::ThreadStartedNotification),
+    ThreadClearEnded => "thread/clear/ended" (v2::ThreadClearEndedNotification),
+    ThreadClearStarted => "thread/clear/started" (v2::ThreadClearStartedNotification),
     #[experimental("kcf/thread/interactiveSubscription/changed")]
     ThreadInteractiveSubscriptionChanged => "kcf/thread/interactiveSubscription/changed" (v2::ThreadInteractiveSubscriptionChangedNotification),
     ThreadStatusChanged => "thread/status/changed" (v2::ThreadStatusChangedNotification),

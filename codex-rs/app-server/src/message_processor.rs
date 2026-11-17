@@ -1142,6 +1142,12 @@ impl MessageProcessor {
         }
     }
 
+    pub(crate) async fn reconcile_incomplete_clear_transitions(&self) {
+        self.thread_processor
+            .reconcile_incomplete_clear_transitions()
+            .await;
+    }
+
     pub(crate) async fn send_initialize_notifications_to_connection(
         &self,
         connection_id: ConnectionId,
@@ -2254,6 +2260,24 @@ impl MessageProcessor {
                 self.thread_processor
                     .thread_search_occurrences(params)
                     .await
+            }
+            ClientRequest::ThreadClearRead { params, .. } => self
+                .thread_processor
+                .thread_clear_read(params)
+                .await
+                .map(|response| Some(response.into())),
+            ClientRequest::ThreadClear { params, .. } => {
+                Box::pin(self.thread_processor.thread_clear(
+                    request_id.clone(),
+                    crate::thread_state::RetainingParams {
+                        retention: connection_retention(
+                            params.retain_for_connection,
+                            session.retention_acquire_authority(),
+                        ),
+                        params,
+                    },
+                ))
+                .await
             }
             ClientRequest::ThreadClearRecoveryRead { params, .. } => self
                 .thread_processor

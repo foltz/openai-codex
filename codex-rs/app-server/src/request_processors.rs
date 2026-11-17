@@ -201,6 +201,13 @@ use codex_app_server_protocol::ThreadBackgroundTerminalsListParams;
 use codex_app_server_protocol::ThreadBackgroundTerminalsListResponse;
 use codex_app_server_protocol::ThreadBackgroundTerminalsTerminateParams;
 use codex_app_server_protocol::ThreadBackgroundTerminalsTerminateResponse;
+use codex_app_server_protocol::ThreadClearEndReason;
+use codex_app_server_protocol::ThreadClearEndedNotification;
+use codex_app_server_protocol::ThreadClearErrorCode;
+use codex_app_server_protocol::ThreadClearModelSettings;
+use codex_app_server_protocol::ThreadClearParams;
+use codex_app_server_protocol::ThreadClearResponse;
+use codex_app_server_protocol::ThreadClearStartedNotification;
 use codex_app_server_protocol::ThreadClosedNotification;
 use codex_app_server_protocol::ThreadCompactStartParams;
 use codex_app_server_protocol::ThreadCompactStartResponse;
@@ -729,6 +736,8 @@ fn resolve_runtime_workspace_roots(workspace_roots: Vec<AbsolutePathBuf>) -> Vec
 
 pub(crate) mod config_errors;
 mod request_errors;
+mod thread_clear;
+mod thread_clear_read;
 mod thread_clear_recovery;
 mod thread_delete;
 mod thread_goal_processor;

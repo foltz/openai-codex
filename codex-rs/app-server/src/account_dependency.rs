@@ -89,6 +89,7 @@ pub(crate) fn classify(request: &ClientRequest) -> AccountDependency {
         | ClientRequest::ThreadCompactStart { .. }
         | ClientRequest::ThreadDelete { .. }
         | ClientRequest::ThreadFork { .. }
+        | ClientRequest::ThreadClear { .. }
         | ClientRequest::ThreadGuardianReview { .. }
         | ClientRequest::ThreadInjectItems { .. }
         | ClientRequest::ThreadPrepareApprovedPlan { .. }
@@ -191,6 +192,7 @@ pub(crate) fn classify(request: &ClientRequest) -> AccountDependency {
         | ClientRequest::ThreadItemsRead { .. }
         | ClientRequest::ThreadList { .. }
         | ClientRequest::ThreadClearRecoveryRead { .. }
+        | ClientRequest::ThreadClearRead { .. }
         | ClientRequest::ThreadInteractiveSubscriptionList { .. }
         | ClientRequest::ThreadRetentionAcquire { .. }
         | ClientRequest::ThreadRetentionRelease { .. }

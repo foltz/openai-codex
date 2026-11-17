@@ -1327,7 +1327,7 @@ impl ThreadRequestProcessor {
         .await
     }
 
-    async fn ensure_listener_task_running(
+    pub(super) async fn ensure_listener_task_running(
         &self,
         conversation_id: ThreadId,
         conversation: Arc<CodexThread>,
@@ -7246,7 +7246,7 @@ fn preview_from_rollout_items(items: &[RolloutItem]) -> String {
         .unwrap_or_default()
 }
 
-fn build_thread_from_snapshot(
+pub(super) fn build_thread_from_snapshot(
     thread_id: ThreadId,
     session_id: String,
     multi_agent_version: Option<codex_protocol::protocol::MultiAgentVersion>,

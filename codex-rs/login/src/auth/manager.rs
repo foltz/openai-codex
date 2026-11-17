@@ -2217,7 +2217,7 @@ enum UnauthorizedRecoveryMode {
 // path used by other auth sources.
 /// Request-local identity of a rejected bearer credential. Not serialized,
 /// logged, or usable as credential material.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AuthCredentialFingerprint(String);
 impl AuthCredentialFingerprint {
     fn from_token(token: &str) -> Self {

@@ -20,6 +20,8 @@ mod gcp;
 mod models_endpoint;
 mod models_identity;
 mod provider;
+mod request_auth_evidence;
+pub use request_auth_evidence::{RequestAuthEvidence, observe_request_auth};
 mod request_preparation;
 mod request_setup;
 mod runtime_auth;

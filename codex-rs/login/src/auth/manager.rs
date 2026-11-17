@@ -315,6 +315,32 @@ pub trait ExternalAuth: Send + Sync {
     fn classify_error(&self, error: std::io::Error) -> RefreshTokenError {
         RefreshTokenError::Transient(error)
     }
+
+    /// Principal fixed by the provider's trusted configuration. The default
+    /// grants no authority to renew an identity-free credential for an owner.
+    fn fixed_principal(&self) -> Option<FixedPrincipal> {
+        None
+    }
+}
+
+/// A non-blank ChatGPT user and workspace carried by a credential or explicitly
+/// vouched for by a configured provider. This value alone grants no authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FixedPrincipal {
+    pub chatgpt_user_id: String,
+    pub account_id: String,
+}
+impl FixedPrincipal {
+    pub fn carried_by(auth: &CodexAuth) -> Option<Self> {
+        let chatgpt_user_id = auth
+            .get_chatgpt_user_id()
+            .filter(|id| !id.trim().is_empty())?;
+        let account_id = auth.get_account_id().filter(|id| !id.trim().is_empty())?;
+        Some(Self {
+            chatgpt_user_id,
+            account_id,
+        })
+    }
 }
 
 struct FixedApiKeyAuth(CodexAuth);
@@ -3402,10 +3428,17 @@ impl AuthManager {
     }
 
     fn set_cached_auth(&self, new_auth: Option<CodexAuth>) -> bool {
-        let Ok(mut guard) = self.inner.write() else {
-            return false;
-        };
-        self.set_cached_auth_locked(&mut guard, new_auth)
+        self.try_set_cached_auth(new_auth).unwrap_or(false)
+    }
+
+    /// Distinguish failed publication from a successful unchanged cache for
+    /// command-provider fan-out. Native bool callers retain their old contract.
+    pub(super) fn try_set_cached_auth(&self, new_auth: Option<CodexAuth>) -> std::io::Result<bool> {
+        let mut guard = self
+            .inner
+            .write()
+            .map_err(|_| std::io::Error::other("auth cache publication unavailable"))?;
+        Ok(self.set_cached_auth_locked(&mut guard, new_auth))
     }
 
     fn publish_reloaded_auth(
@@ -4660,3 +4693,7 @@ mod account_user_id_tests;
 #[cfg(test)]
 #[path = "source_tests.rs"]
 mod source_tests;
+
+#[cfg(test)]
+#[path = "command_authority_tests.rs"]
+mod command_authority_tests;

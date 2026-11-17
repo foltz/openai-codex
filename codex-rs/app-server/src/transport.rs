@@ -138,19 +138,40 @@ fn disconnect_connection(
     false
 }
 
+/// A reply (response or error) that did not reach its connection's writer.
+/// A disconnect request is not proof of observed peer closure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReplyDrop {
+    /// The connection is not, or is no longer, registered with the router.
+    Unregistered(ConnectionId),
+    /// Its registered writer refused the reply (closed, or full for a
+    /// disconnectable connection) and was removed.
+    WriterRefused {
+        connection_id: ConnectionId,
+        disconnectable: bool,
+    },
+}
+
+enum SendOutcome {
+    Queued,
+    Skipped,
+    Unregistered,
+    Refused { disconnectable: bool },
+}
+
 async fn send_message_to_connection(
     connections: &mut HashMap<ConnectionId, OutboundConnectionState>,
     connection_id: ConnectionId,
     message: OutgoingMessage,
     write_complete_tx: Option<tokio::sync::oneshot::Sender<()>>,
-) -> bool {
+) -> SendOutcome {
     let Some(connection_state) = connections.get(&connection_id) else {
         warn!("dropping message for disconnected connection: {connection_id:?}");
-        return false;
+        return SendOutcome::Unregistered;
     };
     let message = filter_outgoing_message_for_connection(connection_state, message);
     if should_skip_notification_for_connection(connection_state, &message) {
-        return false;
+        return SendOutcome::Skipped;
     }
 
     let writer = connection_state.writer.clone();
@@ -160,21 +181,30 @@ async fn send_message_to_connection(
     };
     if connection_state.can_disconnect() {
         match writer.try_send(queued_message) {
-            Ok(()) => false,
+            Ok(()) => SendOutcome::Queued,
             Err(mpsc::error::TrySendError::Full(_)) => {
                 warn!(
                     "disconnecting slow connection after outbound queue filled: {connection_id:?}"
                 );
-                disconnect_connection(connections, connection_id)
+                disconnect_connection(connections, connection_id);
+                SendOutcome::Refused {
+                    disconnectable: true,
+                }
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                disconnect_connection(connections, connection_id)
+                disconnect_connection(connections, connection_id);
+                SendOutcome::Refused {
+                    disconnectable: true,
+                }
             }
         }
     } else if writer.send(queued_message).await.is_err() {
-        disconnect_connection(connections, connection_id)
+        disconnect_connection(connections, connection_id);
+        SendOutcome::Refused {
+            disconnectable: false,
+        }
     } else {
-        false
+        SendOutcome::Queued
     }
 }
 
@@ -205,16 +235,29 @@ fn filter_outgoing_message_for_connection(
 pub(crate) async fn route_outgoing_envelope(
     connections: &mut HashMap<ConnectionId, OutboundConnectionState>,
     envelope: OutgoingEnvelope,
-) {
+) -> Option<ReplyDrop> {
     match envelope {
         OutgoingEnvelope::ToConnection {
             connection_id,
             message,
             write_complete_tx,
         } => {
-            let _ =
+            let is_reply = matches!(
+                message,
+                OutgoingMessage::Response(_) | OutgoingMessage::Error(_)
+            );
+            let outcome =
                 send_message_to_connection(connections, connection_id, message, write_complete_tx)
                     .await;
+            match outcome {
+                _ if !is_reply => None,
+                SendOutcome::Queued | SendOutcome::Skipped => None,
+                SendOutcome::Unregistered => Some(ReplyDrop::Unregistered(connection_id)),
+                SendOutcome::Refused { disconnectable } => Some(ReplyDrop::WriterRefused {
+                    connection_id,
+                    disconnectable,
+                }),
+            }
         }
         OutgoingEnvelope::Broadcast { message } => {
             let target_connections: Vec<ConnectionId> = connections
@@ -240,6 +283,7 @@ pub(crate) async fn route_outgoing_envelope(
                 )
                 .await;
             }
+            None
         }
     }
 }
@@ -247,3 +291,7 @@ pub(crate) async fn route_outgoing_envelope(
 #[cfg(test)]
 #[path = "transport_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "router_reply_outcome_tests.rs"]
+mod router_reply_outcome_tests;

@@ -232,3 +232,44 @@ fn keyring_logout_coordinates_with_refresh_through_chained_symlinks() -> anyhow:
     }
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn keyring_fallback_repair_still_refuses_an_external_owner_marker() -> anyhow::Result<()> {
+    use codex_keyring_store::tests::MockKeyringStore;
+    use std::os::unix::fs::symlink;
+
+    for kind in [
+        AuthKeyringBackendKind::Direct,
+        AuthKeyringBackendKind::Secrets,
+    ] {
+        let home = tempfile::tempdir()?;
+        let storage = create_auth_storage_with_store(
+            home.path().to_path_buf(),
+            AuthCredentialsStoreMode::Keyring,
+            Arc::new(MockKeyringStore::default()),
+            kind,
+        );
+        let first = serde_json::from_value(serde_json::json!({"OPENAI_API_KEY": "first"}))?;
+        let second = serde_json::from_value(serde_json::json!({"OPENAI_API_KEY": "second"}))?;
+        storage.save(&first)?;
+        let marker = home.path().join(".external-auth-owner.json");
+        std::fs::write(&marker, "synthetic-owner-marker")?;
+        symlink("auth.json", get_auth_file(home.path()))?;
+        assert_eq!(
+            storage.save(&second).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            storage
+                .compare_and_save(&first, &second)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(storage.load()?, Some(first));
+        assert_eq!(std::fs::read_to_string(marker)?, "synthetic-owner-marker");
+        assert!(std::fs::symlink_metadata(get_auth_file(home.path()))?.is_symlink());
+    }
+    Ok(())
+}

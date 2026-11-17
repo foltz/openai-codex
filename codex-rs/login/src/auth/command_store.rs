@@ -286,6 +286,29 @@ pub(super) fn is_protected(_path: &Path) -> bool {
 }
 
 pub(super) fn refuse_native_write(home: &Path) -> io::Result<()> {
+    refuse_native_write_inner(home, false)
+}
+
+pub(super) fn refuse_keyring_native_write(home: &Path) -> io::Result<()> {
+    refuse_native_write_inner(home, true)
+}
+
+fn unusable_fallback_link(error: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(
+            error.raw_os_error(),
+            Some(libc::ELOOP) | Some(libc::ENOTDIR)
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+fn refuse_native_write_inner(home: &Path, keyring: bool) -> io::Result<()> {
     // Ownership evidence, not validity of ordinary managed credentials, fences
     // the native writer. An unenrolled home retains native repair semantics.
     let marker = match std::fs::symlink_metadata(home.join(".external-auth-owner.json")) {
@@ -306,6 +329,9 @@ pub(super) fn refuse_native_write(home: &Path) -> io::Result<()> {
         {
             false
         }
+        // Only the secure-only backend can repair an unresolvable fallback
+        // link. A marker still fences it; all other read errors stay closed.
+        Err(error) if keyring && unusable_fallback_link(&error) => false,
         Err(error) => return Err(error),
     };
     if marker || owned_record {

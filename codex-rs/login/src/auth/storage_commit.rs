@@ -26,6 +26,14 @@ struct CommittedStorage {
 }
 
 impl CommittedStorage {
+    fn refuse_external_owner(&self) -> std::io::Result<()> {
+        if self.mode == AuthCredentialsStoreMode::Keyring {
+            super::super::command_store::refuse_keyring_native_write(&self.home)
+        } else {
+            super::super::command_store::refuse_native_write(&self.home)
+        }
+    }
+
     fn lock(&self) -> std::io::Result<File> {
         let auth_file = get_auth_file(&self.home);
         // Keyring commits can unlink an intermediate symlink used by another
@@ -230,12 +238,12 @@ impl AuthStorageBackend for CommittedStorage {
     }
     fn save(&self, auth: &AuthDotJson) -> std::io::Result<()> {
         let _guard = self.lock()?;
-        super::super::command_store::refuse_native_write(&self.home)?;
+        self.refuse_external_owner()?;
         self.inner.save(auth)
     }
     fn compare_and_save(&self, expected: &AuthDotJson, auth: &AuthDotJson) -> std::io::Result<()> {
         let _guard = self.lock()?;
-        super::super::command_store::refuse_native_write(&self.home)?;
+        self.refuse_external_owner()?;
         self.inner.compare_and_save(expected, auth)
     }
     fn delete(&self) -> std::io::Result<bool> {

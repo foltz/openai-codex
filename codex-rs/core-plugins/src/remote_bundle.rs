@@ -297,6 +297,15 @@ pub(crate) async fn download_and_install_remote_plugin_bundle_with_generation(
     generation: &RemotePluginBundleSyncGeneration,
 ) -> Result<PluginInstallResult, RemotePluginBundleInstallError> {
     let bundle_bytes = download_remote_plugin_bundle(config, &bundle).await?;
+    install_downloaded_remote_plugin_bundle(codex_home, bundle, bundle_bytes, generation).await
+}
+
+async fn install_downloaded_remote_plugin_bundle(
+    codex_home: PathBuf,
+    bundle: ValidatedRemotePluginBundle,
+    bundle_bytes: Vec<u8>,
+    generation: &RemotePluginBundleSyncGeneration,
+) -> Result<PluginInstallResult, RemotePluginBundleInstallError> {
     let lease = generation.begin_commit().map_err(publication_error)?;
     let (result, _physical_lease) = lease
         .run_blocking(move || install_remote_plugin_bundle(codex_home, bundle, bundle_bytes))
@@ -312,6 +321,15 @@ pub(crate) async fn download_and_extract_remote_plugin_bundle_to_path(
     generation: &RemotePluginBundleSyncGeneration,
 ) -> Result<(AbsolutePathBuf, RemotePluginBundleCommitLease), RemotePluginBundleInstallError> {
     let bundle_bytes = download_remote_plugin_bundle(config, &bundle).await?;
+    extract_downloaded_remote_plugin_bundle(bundle, bundle_bytes, destination, generation).await
+}
+
+async fn extract_downloaded_remote_plugin_bundle(
+    bundle: ValidatedRemotePluginBundle,
+    bundle_bytes: Vec<u8>,
+    destination: AbsolutePathBuf,
+    generation: &RemotePluginBundleSyncGeneration,
+) -> Result<(AbsolutePathBuf, RemotePluginBundleCommitLease), RemotePluginBundleInstallError> {
     let lease = generation.begin_commit().map_err(publication_error)?;
     let (result, physical_lease) = lease
         .run_blocking(move || {
@@ -1101,6 +1119,93 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o755);
+    }
+
+    #[tokio::test]
+    async fn retired_download_cannot_install_valid_bundle_bytes() {
+        let home = tempdir().unwrap();
+        let generation = RemotePluginBundleSyncGeneration::capture(home.path()).unwrap();
+        crate::remote::reset_authority::retire_remote_plugin_bundle_sync(home.path())
+            .unwrap()
+            .wait_until(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        let bytes = tar_gz_bytes(&[(
+            ".codex-plugin/plugin.json",
+            br#"{"name":"linear","version":"1.2.3"}"#,
+            0o644,
+        )]);
+        let Err(error) = install_downloaded_remote_plugin_bundle(
+            home.path().to_path_buf(),
+            valid_remote_plugin_bundle(),
+            bytes,
+            &generation,
+        )
+        .await
+        else {
+            panic!("retired download installed a bundle")
+        };
+        assert!(matches!(error, RemotePluginBundleInstallError::Io { .. }));
+        assert!(!home.path().join(crate::store::PLUGINS_CACHE_DIR).exists());
+    }
+
+    #[tokio::test]
+    async fn retired_download_cannot_create_editable_checkout() {
+        let home = tempdir().unwrap();
+        let generation = RemotePluginBundleSyncGeneration::capture(home.path()).unwrap();
+        crate::remote::reset_authority::retire_remote_plugin_bundle_sync(home.path())
+            .unwrap()
+            .wait_until(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        let destination = home.path().join("checkout");
+        let bytes = tar_gz_bytes(&[(
+            ".codex-plugin/plugin.json",
+            br#"{"name":"linear","version":"1.2.3"}"#,
+            0o644,
+        )]);
+        let Err(error) = extract_downloaded_remote_plugin_bundle(
+            valid_remote_plugin_bundle(),
+            bytes,
+            AbsolutePathBuf::try_from(destination.clone()).unwrap(),
+            &generation,
+        )
+        .await
+        else {
+            panic!("retired download created a checkout")
+        };
+        assert!(matches!(error, RemotePluginBundleInstallError::Io { .. }));
+        assert!(!destination.exists());
+    }
+
+    #[tokio::test]
+    async fn actual_checkout_extraction_retains_lease_for_metadata_handoff() {
+        let home = tempdir().unwrap();
+        let generation = RemotePluginBundleSyncGeneration::capture(home.path()).unwrap();
+        let destination = home.path().join("checkout");
+        let bytes = tar_gz_bytes(&[(
+            ".codex-plugin/plugin.json",
+            br#"{"name":"linear","version":"1.2.3"}"#,
+            0o644,
+        )]);
+        let (path, publication_lease) = extract_downloaded_remote_plugin_bundle(
+            valid_remote_plugin_bundle(),
+            bytes,
+            AbsolutePathBuf::try_from(destination.clone()).unwrap(),
+            &generation,
+        )
+        .await
+        .unwrap();
+        assert_eq!(path.as_path(), destination.as_path());
+        assert!(destination.join(".codex-plugin/plugin.json").is_file());
+        let mut retirement = Box::pin(
+            crate::remote::reset_authority::retire_remote_plugin_bundle_sync(home.path())
+                .unwrap()
+                .wait_until(tokio::time::Instant::now() + Duration::from_secs(1)),
+        );
+        assert!(futures::poll!(retirement.as_mut()).is_pending());
+        drop(publication_lease);
+        retirement.await.unwrap();
     }
 
     fn valid_remote_plugin_bundle() -> ValidatedRemotePluginBundle {

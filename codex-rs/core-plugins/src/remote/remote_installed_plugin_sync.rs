@@ -855,6 +855,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retired_snapshot_cannot_delete_stale_cache_bytes() {
+        let home = tempfile::tempdir().unwrap();
+        let cache_path = home
+            .path()
+            .join(PLUGINS_CACHE_DIR)
+            .join(REMOTE_GLOBAL_MARKETPLACE_NAME)
+            .join("linear");
+        std::fs::create_dir_all(&cache_path).unwrap();
+        let sentinel = cache_path.join("preserve.txt");
+        std::fs::write(&sentinel, b"original installed bytes").unwrap();
+        let store = PluginStore::try_new(home.path().to_path_buf()).unwrap();
+        let generation = RemotePluginBundleSyncGeneration::capture(home.path()).unwrap();
+        super::super::reset_authority::retire_remote_plugin_bundle_sync(home.path())
+            .unwrap()
+            .wait_until(tokio::time::Instant::now() + std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        let mut removed = Vec::new();
+        assert!(
+            remove_stale_remote_plugin_caches_with_generation(
+                &store,
+                &BTreeMap::new(),
+                &mut removed,
+                &generation,
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read(&sentinel).unwrap(),
+            b"original installed bytes"
+        );
+        assert!(removed.is_empty());
+    }
+
+    #[tokio::test]
     async fn stale_remote_plugin_cleanup_skips_cache_mutations_in_progress() {
         let codex_home = tempfile::tempdir().expect("create codex home");
         let cached_manifest = codex_home

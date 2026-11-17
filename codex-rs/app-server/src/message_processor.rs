@@ -160,7 +160,7 @@ pub(crate) struct MessageProcessor {
     user_verification: Arc<crate::user_verification::Service>,
     outgoing: Arc<OutgoingMessageSender>,
     startup_warnings: StartupWarnings,
-    models_refresh_worker: ModelsRefreshWorker,
+    models_refresh_worker: Arc<tokio::sync::Mutex<ModelsRefreshWorker>>,
     model_catalog: Arc<ModelCatalog>,
     thread_manager: Arc<ThreadManager>,
     turn_cost_worker: Option<TurnCostWorker>,
@@ -504,7 +504,9 @@ impl MessageProcessor {
             Arc::clone(&config),
             Arc::clone(&thread_manager),
         ));
-        let models_refresh_worker = crate::models_refresh_worker::spawn(&model_catalog);
+        let models_refresh_worker = Arc::new(tokio::sync::Mutex::new(
+            crate::models_refresh_worker::spawn(&model_catalog),
+        ));
         let turn_cost_worker = TurnCostWorker::spawn(
             Arc::clone(&config),
             Arc::clone(&auth_manager),
@@ -755,7 +757,9 @@ impl MessageProcessor {
     pub(crate) fn clear_runtime_references(&self) {
         self.account_processor.clear_external_auth();
         self.apps_processor.shutdown();
-        self.models_refresh_worker.shutdown();
+        if let Ok(worker) = self.models_refresh_worker.try_lock() {
+            worker.shutdown();
+        }
         self.skills_watcher.shutdown();
     }
 
@@ -1037,6 +1041,18 @@ impl MessageProcessor {
         self.command_exec_processor.retire_sandbox_cleanup(deadline);
     }
 
+    /// Serialize observation with managed reset's replacement of this exact worker.
+    async fn shutdown_models_refresh_worker_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> crate::models_refresh_worker::ModelsRefreshShutdown {
+        let Ok(worker) = tokio::time::timeout_at(deadline, self.models_refresh_worker.lock()).await
+        else {
+            return crate::models_refresh_worker::ModelsRefreshShutdown::TimedOut;
+        };
+        worker.shutdown_until(deadline).await
+    }
+
     /// Join the actual background owners under the original host bound. RPC,
     /// login, connection, thread and telemetry retirement are separate stages;
     /// callers must stop request producers before interpreting this census.
@@ -1049,13 +1065,15 @@ impl MessageProcessor {
             .get()
             .copied()
             .map_or(deadline, |intake| intake.min(deadline));
-        self.models_refresh_worker.shutdown();
+        if let Ok(worker) = self.models_refresh_worker.try_lock() {
+            worker.shutdown();
+        }
         if let Some(worker) = &self.turn_cost_worker {
             worker.shutdown();
         }
         let plugins = self.thread_manager.plugins_manager();
         let (models, turn_cost, thread_starts, apps, skills, plugins, command_exec) = tokio::join!(
-            self.models_refresh_worker.shutdown_until(deadline),
+            self.shutdown_models_refresh_worker_until(deadline),
             async {
                 match &self.turn_cost_worker {
                     Some(worker) => Some(worker.shutdown_until(deadline).await),

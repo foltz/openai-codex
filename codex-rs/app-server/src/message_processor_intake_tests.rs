@@ -38,7 +38,12 @@ async fn real_processor_intake_closes_admission_and_latches_existing_cleanup_own
     );
     drop(permit);
     assert_eq!(
-        processor.models_refresh_worker.shutdown_until(first).await,
+        processor
+            .models_refresh_worker
+            .lock()
+            .await
+            .shutdown_until(first)
+            .await,
         crate::models_refresh_worker::ModelsRefreshShutdown::Joined
     );
     processor.clear_runtime_references();
@@ -74,6 +79,8 @@ async fn registered_intake_callback_keeps_only_weak_processor_custody() {
     assert_eq!(
         processor
             .models_refresh_worker
+            .lock()
+            .await
             .shutdown_until(latch.expiry().deadline().unwrap())
             .await,
         crate::models_refresh_worker::ModelsRefreshShutdown::Joined
@@ -104,7 +111,12 @@ async fn published_intake_deadline_without_binding_receipt_is_not_clean() {
     assert_eq!(pending.unavailable, 1);
     assert!(!pending.is_complete());
     assert_eq!(
-        processor.models_refresh_worker.shutdown_until(first).await,
+        processor
+            .models_refresh_worker
+            .lock()
+            .await
+            .shutdown_until(first)
+            .await,
         crate::models_refresh_worker::ModelsRefreshShutdown::Joined
     );
     processor.clear_runtime_references();

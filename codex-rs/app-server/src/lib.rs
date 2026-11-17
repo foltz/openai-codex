@@ -115,6 +115,7 @@ mod command_exec;
 mod config_layer;
 #[cfg(test)]
 mod core_auth_task_tests;
+mod managed_reset;
 mod managed_transition;
 mod otel_reset_control;
 mod startup_config;

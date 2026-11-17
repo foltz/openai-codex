@@ -217,6 +217,9 @@ mod retention_wire_tests {
 
     #[test]
     fn retention_response_has_one_schema_identity_as_root_and_nested_carrier() {
+        let typescript = ThreadRetentionAcquireResponse::decl();
+        assert!(typescript.contains("grantId: string"), "{typescript}");
+        assert!(!typescript.contains("grant_id"), "{typescript}");
         let root = schemars::schema_for!(ThreadRetentionAcquireResponse);
         let start = schemars::schema_for!(ThreadStartResponse);
         let embedded = start

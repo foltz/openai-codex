@@ -639,11 +639,29 @@ impl ThreadRequestProcessor {
         app_server_client_version: Option<String>,
         client_mcp_extensions: ClientMcpExtensions,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        self.thread_resume_with_retention(
+            target,
+            crate::thread_state::RetainingParams::not_requested(params),
+            app_server_client_name,
+            app_server_client_version,
+            client_mcp_extensions,
+        )
+        .await
+    }
+
+    pub(crate) async fn thread_resume_with_retention(
+        &self,
+        target: ThreadResumeTarget,
+        request: crate::thread_state::RetainingParams<ThreadResumeParams>,
+        app_server_client_name: Option<String>,
+        app_server_client_version: Option<String>,
+        client_mcp_extensions: ClientMcpExtensions,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
         let mut prepared_config = None;
         // Keep the resume future off the request handler's stack.
         while Box::pin(self.thread_resume_inner(
             &target,
-            &params,
+            &request,
             app_server_client_name.clone(),
             app_server_client_version.clone(),
             client_mcp_extensions.clone(),
@@ -4245,12 +4263,14 @@ impl ThreadRequestProcessor {
     async fn thread_resume_inner(
         &self,
         target: &ThreadResumeTarget,
-        params: &ThreadResumeParams,
+        request: &crate::thread_state::RetainingParams<ThreadResumeParams>,
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
         client_mcp_extensions: ClientMcpExtensions,
         prepared_config: &mut Option<PreparedResumeConfig>,
     ) -> Result<ControlFlow<()>, JSONRPCErrorError> {
+        let params = &request.params;
+        let retention = request.retention;
         if let Ok(thread_id) = ThreadId::from_string(&params.thread_id)
             && self
                 .pending_thread_unloads
@@ -4278,6 +4298,7 @@ impl ThreadRequestProcessor {
                     app_server_client_name.clone(),
                     app_server_client_version.clone(),
                     /*cold_resume_history*/ None,
+                    retention,
                 )
                 .await?
             {
@@ -4308,6 +4329,7 @@ impl ThreadRequestProcessor {
         };
 
         let ThreadResumeParams {
+            retain_for_connection: _,
             thread_id,
             history,
             path,
@@ -4446,6 +4468,7 @@ impl ThreadRequestProcessor {
                     app_server_client_name,
                     app_server_client_version,
                     cold_resume_history,
+                    retention,
                 )
                 .await?
             {
@@ -4733,18 +4756,11 @@ impl ThreadRequestProcessor {
                 } else {
                     None
                 };
-                // Auto-attach a thread listener when resuming a thread.
-                log_listener_attach_result(
-                    self.ensure_conversation_listener(
-                        thread_id,
-                        request_id.connection_id,
-                        /*raw_events_enabled*/ false,
-                    )
-                    .await,
-                    thread_id,
-                    request_id.connection_id,
-                    "thread",
-                );
+                // Install requested retention with the subscription before idle work can run.
+                let (attach, retained) = self
+                    .attach_listener_retaining(thread_id, request_id.connection_id, retention)
+                    .await;
+                log_listener_attach_result(attach, thread_id, request_id.connection_id, "thread");
 
                 let mut thread = match self
                     .load_thread_from_resume_source_or_send_internal(
@@ -4759,6 +4775,7 @@ impl ThreadRequestProcessor {
                 {
                     Ok(thread) => thread,
                     Err(message) => {
+                        self.release_minted_retention(thread_id, &retained).await;
                         self.outgoing
                             .send_error(request_id, internal_error(message))
                             .await;
@@ -4797,6 +4814,7 @@ impl ThreadRequestProcessor {
                         {
                             Ok(cursors) => cursors,
                             Err(error) => {
+                                self.release_minted_retention(thread_id, &retained).await;
                                 self.outgoing.send_error(request_id, error).await;
                                 return Ok(ControlFlow::Break(()));
                             }
@@ -4824,6 +4842,7 @@ impl ThreadRequestProcessor {
                     match initial_turns_page_result {
                         Ok(page) => Some(page),
                         Err(error) => {
+                            self.release_minted_retention(thread_id, &retained).await;
                             self.outgoing.send_error(request_id, error).await;
                             return Ok(ControlFlow::Break(()));
                         }
@@ -4853,6 +4872,7 @@ impl ThreadRequestProcessor {
 
                 let thread_originator = config_snapshot.originator.clone();
                 let response = ThreadResumeResponse {
+                    retention: retained.evidence(),
                     thread,
                     disabled_plugin_ids: config_snapshot.disabled_plugin_ids,
                     model: session_configured.model,
@@ -4959,6 +4979,7 @@ impl ThreadRequestProcessor {
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
         cold_resume_history: Option<&[RolloutItem]>,
+        retention: crate::thread_state::ConnectionRetention,
     ) -> Result<RunningThreadResumeResult, JSONRPCErrorError> {
         let running_thread = if params.history.is_some() {
             if let Ok(existing_thread_id) = ThreadId::from_string(&params.thread_id)
@@ -5235,6 +5256,7 @@ impl ThreadRequestProcessor {
             let command = crate::thread_state::ThreadListenerCommand::SendThreadResumeResponse {
                 request: Box::new(crate::thread_state::PendingThreadResumeRequest {
                     request_id: request_id.clone(),
+                    retention,
                     history_items,
                     cold_resume_token_usage_turn_id,
                     config_snapshot,

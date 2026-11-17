@@ -1227,7 +1227,7 @@ pub(super) async fn handle_pending_thread_resume_request(
         }
     }
 
-    {
+    let retained = {
         let pending_thread_unloads = pending_thread_unloads.lock().await;
         if pending_thread_unloads.contains_key(&conversation_id)
             || matches!(conversation.agent_status().await, AgentStatus::Shutdown)
@@ -1238,18 +1238,37 @@ pub(super) async fn handle_pending_thread_resume_request(
                 .await;
             return;
         }
-        if !thread_state_manager
-            .try_add_connection_to_thread(conversation_id, connection_id)
+        match thread_state_manager
+            .try_add_connection_to_thread_retaining(
+                conversation_id,
+                connection_id,
+                pending.retention,
+            )
             .await
         {
-            tracing::debug!(
-                thread_id = %conversation_id,
-                connection_id = ?connection_id,
-                "skipping running thread resume for closed connection"
-            );
-            return;
+            Ok(retained) => retained,
+            Err(crate::thread_state::ConnectionSubscriptionError::ConnectionClosed) => {
+                tracing::debug!(
+                    thread_id = %conversation_id,
+                    connection_id = ?connection_id,
+                    "skipping running thread resume for closed connection"
+                );
+                return;
+            }
+            Err(crate::thread_state::ConnectionSubscriptionError::ClearSuccessorReserved) => {
+                drop(pending_thread_unloads);
+                outgoing
+                    .send_error(
+                        request_id,
+                        invalid_request(format!(
+                            "thread {conversation_id} is reserved while its authoritative clear transition completes; retry thread/resume"
+                        )),
+                    )
+                    .await;
+                return;
+            }
         }
-    }
+    };
 
     let (turns_backwards_cursor, items_backwards_cursor) = if let Some(thread_store) =
         pending.resume_cursor_store.as_ref()
@@ -1262,6 +1281,11 @@ pub(super) async fn handle_pending_thread_resume_request(
         {
             Ok(cursors) => cursors,
             Err(error) => {
+                if let Some((principal, grant_id)) = retained.minted_grant() {
+                    let _ = thread_state_manager
+                        .release_retention(conversation_id, principal, &grant_id)
+                        .await;
+                }
                 outgoing.send_error(request_id, error).await;
                 return;
             }
@@ -1294,6 +1318,7 @@ pub(super) async fn handle_pending_thread_resume_request(
     thread.session_id = session_id;
 
     let response = ThreadResumeResponse {
+        retention: retained.evidence(),
         thread,
         disabled_plugin_ids,
         model,

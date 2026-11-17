@@ -2015,9 +2015,15 @@ impl MessageProcessor {
             }
             ClientRequest::ThreadResume { params, .. } => {
                 self.thread_processor
-                    .thread_resume(
+                    .thread_resume_with_retention(
                         ThreadResumeTarget::Client(request_id.clone()),
-                        params,
+                        crate::thread_state::RetainingParams {
+                            retention: connection_retention(
+                                params.retain_for_connection,
+                                session.retention_acquire_authority(),
+                            ),
+                            params,
+                        },
                         app_server_client_name.clone(),
                         client_version.clone(),
                         client_mcp_extensions.clone(),

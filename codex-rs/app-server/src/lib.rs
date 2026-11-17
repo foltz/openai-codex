@@ -108,13 +108,13 @@ mod app_server_tracing;
 mod attestation;
 mod auth_mode;
 mod auth_task_work;
-#[cfg(test)]
-mod core_auth_task_tests;
 mod bespoke_event_handling;
 mod code_mode_host;
 mod codex_home_metrics;
 mod command_exec;
 mod config_layer;
+#[cfg(test)]
+mod core_auth_task_tests;
 mod managed_transition;
 mod otel_reset_control;
 mod startup_config;
@@ -156,6 +156,7 @@ mod processor_task_retirement;
 mod request_processors;
 mod request_serialization;
 mod server_request_error;
+mod shutdown_intake;
 mod skills_watcher;
 mod startup_warnings;
 mod thread_sample;

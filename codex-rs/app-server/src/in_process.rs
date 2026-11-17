@@ -105,7 +105,7 @@ mod bootstrap;
 const IN_PROCESS_CONNECTION_ID: ConnectionId = ConnectionId(0);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 // Covers both bounded runtime drains plus the analytics client's 25-second best-effort flush.
-const SHUTDOWN_ACK_TIMEOUT: Duration = Duration::from_secs(35);
+pub(crate) const SHUTDOWN_ACK_TIMEOUT: Duration = Duration::from_secs(35);
 /// Default bounded channel capacity for in-process runtime queues.
 pub const DEFAULT_IN_PROCESS_CHANNEL_CAPACITY: usize = CHANNEL_CAPACITY;
 

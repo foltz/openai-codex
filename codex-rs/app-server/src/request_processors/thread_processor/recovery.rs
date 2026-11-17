@@ -448,7 +448,7 @@ mod tests {
             completion = reservation.sender.subscribe();
             assert!(reservation.handoff().is_ok());
             assert!(!crate::thread_state::recovery::unload_blocks_resume(
-                &table.lock().await,
+                &*table.lock().await,
                 id
             ));
             // A nested observation must not drop the outer publication fence.
@@ -461,7 +461,7 @@ mod tests {
             let foreign = table.clone();
             assert!(
                 tokio::spawn(async move {
-                    crate::thread_state::recovery::unload_blocks_resume(&foreign.lock().await, id)
+                    crate::thread_state::recovery::unload_blocks_resume(&*foreign.lock().await, id)
                 })
                 .await
                 .unwrap()

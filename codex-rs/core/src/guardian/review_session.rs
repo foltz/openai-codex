@@ -102,7 +102,37 @@ use codex_guardian_reviewer::wait_for_guardian_review;
 
 pub(crate) use codex_guardian_reviewer::GuardianReviewSessionOutcome;
 
+/// A detached review's owner proof (its admission-time `OriginatingAccountRecord`),
+/// recorded only when the review took fresh detached admission and carried to
+/// where its decision is consumed. In-turn reviews never record one.
+#[derive(Clone, Default)]
+pub(crate) struct DetachedAdmissionProof(
+    Arc<std::sync::Mutex<Option<Arc<crate::session::turn_context::OriginatingAccountRecord>>>>,
+);
+
+impl DetachedAdmissionProof {
+    pub(crate) fn record(
+        &self,
+        record: Arc<crate::session::turn_context::OriginatingAccountRecord>,
+    ) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(record);
+    }
+
+    pub(crate) fn get(
+        &self,
+    ) -> Option<Arc<crate::session::turn_context::OriginatingAccountRecord>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
 pub(crate) struct GuardianReviewSessionParams {
+    pub(crate) detached_admission: DetachedAdmissionProof,
     pub(crate) parent_session: Arc<Session>,
     pub(crate) parent_context: GuardianReviewContext,
     // Checkpoint selection and thread-owned prompt evidence must use the same history.

@@ -83,6 +83,7 @@ pub(super) fn validate<'a>(
 
 #[derive(Clone)]
 pub(super) struct ReviewRuntime {
+    pub(super) detached_admission: super::review_session::DetachedAdmissionProof,
     pub(super) session: Arc<Session>,
     pub(super) history_reset: CancellationToken,
     pub(super) context: GuardianReviewContext,

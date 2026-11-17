@@ -154,6 +154,7 @@ pub(super) async fn guardian_review_session_config(
 }
 
 struct ReviewAttemptOptions {
+    detached_admission: super::review_session::DetachedAdmissionProof,
     authorization: Option<ReviewAuthorization>,
     external_cancel: Option<CancellationToken>,
     deadline: ReviewDeadline,
@@ -176,6 +177,7 @@ impl ReviewInput {
         options: ReviewAttemptOptions,
     ) -> GuardianReviewSessionParams {
         GuardianReviewSessionParams {
+            detached_admission: options.detached_admission,
             parent_session: self.session,
             parent_history: self.history,
             reasoning_summary: self.context.reasoning_summary,
@@ -239,6 +241,7 @@ impl ReviewInput {
                 config,
                 category,
                 ReviewAttemptOptions {
+                    detached_admission: Default::default(),
                     authorization: None,
                     external_cancel: Some(cancellation.clone()),
                     deadline,
@@ -375,6 +378,7 @@ async fn run_guardian_review_session_with_retry_before_deadline(
                 request.guardian_scope(),
                 reasons.clone(),
                 ReviewAttemptOptions {
+                    detached_admission: Default::default(),
                     authorization: None,
                     external_cancel: external_cancel.clone(),
                     deadline,

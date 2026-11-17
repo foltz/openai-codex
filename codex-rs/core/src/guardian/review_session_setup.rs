@@ -642,6 +642,9 @@ async fn prepare_review_with_authority(
                 .is_some_and(|host| host.requires_account_work()),
         "Guardian preparation requires account work"
     );
+    if let Some(fence) = &account_fence {
+        params.detached_admission.record(Arc::clone(fence));
+    }
     let preparation_work = work
         .as_deref()
         .map(|work| work.derive_operation())

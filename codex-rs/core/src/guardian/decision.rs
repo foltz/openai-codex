@@ -145,9 +145,11 @@ pub(crate) fn decide_approval(
             }
         }
         let retried = reasons.retry.is_some();
+        let detached_admission = super::review_session::DetachedAdmissionProof::default();
         let decision = codex_guardian_reviewer::ReviewRequest {
             serving_assessment: context.serving_assessment.as_ref().map(|value| value.requires_review),
             host: ReviewRuntime {
+                detached_admission: detached_admission.clone(),
                 session: Arc::clone(&session),
                 history_reset: history_reset.clone(),
                 context: context.clone(),
@@ -188,7 +190,105 @@ pub(crate) fn decide_approval(
         if history_reset.is_cancelled() || cancellation.is_cancelled() {
             Some(ReviewDecision::Abort)
         } else {
-            decision
+            terminal_owner_fence(
+                detached_admission.get().as_deref(),
+                &session.services.auth_manager,
+                decision,
+            )
         }
     })
+}
+
+/// Terminal fence where a detached review's decision is consumed. `record` is
+/// the owner proof captured at the review's fresh detached admission. An
+/// approval granted after that owner changed (for example a native login that
+/// landed after the reviewer's last request) is withdrawn and delivered as a
+/// denial. Denials, timeouts, aborts and the user flow pass unchanged, and
+/// without a proof (an in-turn review) the decision is returned as before.
+pub(crate) fn terminal_owner_fence(
+    record: Option<&crate::session::turn_context::OriginatingAccountRecord>,
+    current: &Arc<codex_login::AuthManager>,
+    decision: Option<ReviewDecision>,
+) -> Option<ReviewDecision> {
+    let grants = matches!(
+        decision,
+        Some(
+            ReviewDecision::Approved
+                | ReviewDecision::ApprovedExecpolicyAmendment { .. }
+                | ReviewDecision::ApprovedForSession
+                | ReviewDecision::ApprovedMcpPolicyAmendment
+                | ReviewDecision::NetworkPolicyAmendment { .. }
+        )
+    );
+    let Some(record) = record.filter(|_| grants) else {
+        return decision;
+    };
+    match record.verify_current(current) {
+        Ok(()) => decision,
+        Err(reason) => {
+            tracing::info!("Guardian approval withdrawn at consumption: {reason}");
+            Some(ReviewDecision::Denied {
+                rejection: format!("Guardian approval withdrawn: {reason}"),
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod owner_fence_tests {
+    use super::*;
+    use crate::session::turn_context::OriginatingAccountRecord;
+    use codex_login::{AuthManager, CodexAuth};
+
+    #[tokio::test]
+    async fn detached_approval_is_withdrawn_after_source_logout_but_denials_are_preserved() {
+        let home = tempfile::tempdir().unwrap();
+        let manager = AuthManager::from_auth_for_testing_with_home(
+            CodexAuth::from_api_key("synthetic-origin"),
+            home.path().to_path_buf(),
+        );
+        let record = OriginatingAccountRecord::capture(&manager);
+        assert_eq!(
+            terminal_owner_fence(Some(&record), &manager, Some(ReviewDecision::Approved)),
+            Some(ReviewDecision::Approved)
+        );
+        // A genuine cache reload observes no durable login in this synthetic home.
+        // No credential provider or refresh is selected by the terminal fence.
+        assert!(manager.reload_with_cached_auth().await.unwrap());
+        for decision in [
+            ReviewDecision::Approved,
+            ReviewDecision::ApprovedForSession,
+            ReviewDecision::ApprovedMcpPolicyAmendment,
+        ] {
+            assert!(matches!(
+                terminal_owner_fence(Some(&record), &manager, Some(decision)),
+                Some(ReviewDecision::Denied { .. })
+            ));
+        }
+        for decision in [
+            Some(ReviewDecision::Abort),
+            Some(ReviewDecision::denied("original denial")),
+            None,
+        ] {
+            assert_eq!(
+                terminal_owner_fence(Some(&record), &manager, decision.clone()),
+                decision
+            );
+        }
+        assert_eq!(
+            terminal_owner_fence(None, &manager, Some(ReviewDecision::Approved)),
+            Some(ReviewDecision::Approved)
+        );
+    }
+
+    #[test]
+    fn detached_approval_cannot_move_to_an_identical_but_distinct_manager() {
+        let manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("synthetic"));
+        let other = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("synthetic"));
+        let record = OriginatingAccountRecord::capture(&manager);
+        assert!(matches!(
+            terminal_owner_fence(Some(&record), &other, Some(ReviewDecision::Approved)),
+            Some(ReviewDecision::Denied { .. })
+        ));
+    }
 }

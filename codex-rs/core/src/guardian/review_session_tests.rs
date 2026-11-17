@@ -275,6 +275,7 @@ async fn test_review_params() -> GuardianReviewSessionParams {
     .expect("guardian config");
 
     GuardianReviewSessionParams {
+        detached_admission: Default::default(),
         authorization: None,
         parent_history: session.clone_history().await,
         parent_session: Arc::new(session),

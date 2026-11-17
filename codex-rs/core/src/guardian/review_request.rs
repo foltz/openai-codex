@@ -123,6 +123,7 @@ impl ReviewHost for super::super::runtime::ReviewRuntime {
         let super::super::runtime::ReviewRuntime {
             session,
             history_reset: _,
+            detached_admission: _,
             mut context,
             request,
             reasons: _,
@@ -271,6 +272,7 @@ impl ReviewHost for super::super::runtime::ReviewRuntime {
             self.request.category,
             self.reasons.clone(),
             ReviewAttemptOptions {
+                detached_admission: self.detached_admission.clone(),
                 authorization: Some(ReviewAuthorization {
                     user_message_revision,
                     review_context_revision,

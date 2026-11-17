@@ -68,6 +68,7 @@ impl ThreadManager {
                     /*forked_from_thread_id*/ None,
                     Some(Arc::clone(&startup)),
                     Some(captured_account_work),
+                    /*deferred_clear_session_start*/ None,
                 );
                 tokio::pin!(start);
                 tokio::select! {

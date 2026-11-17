@@ -255,6 +255,7 @@ pub(crate) struct InitializedConnectionSessionState {
     pub(crate) app_server_client_name: String,
     pub(crate) client_version: String,
     pub(crate) request_attestation: bool,
+    pub(crate) interactive_client_requested: bool,
     pub(crate) client_mcp_extensions: ClientMcpExtensions,
 }
 
@@ -285,6 +286,19 @@ impl ConnectionSessionState {
         self.initialized
             .get()
             .is_some_and(|session| session.auth_observation_only)
+    }
+
+    pub(crate) fn interactive_client_requested(&self) -> bool {
+        self.initialized
+            .get()
+            .is_some_and(|session| session.interactive_client_requested)
+    }
+
+    pub(crate) fn managed_transition_caller_authorized(&self) -> bool {
+        crate::transport::managed_transition_caller_authorized(
+            self.interactive_client_requested(),
+            self.provenance,
+        )
     }
 
     pub(crate) fn experimental_api_enabled(&self) -> bool {
@@ -2411,3 +2425,41 @@ mod workspace_routing_tests;
 #[cfg(test)]
 #[path = "message_processor_intake_tests.rs"]
 mod intake_binding_tests;
+
+#[cfg(test)]
+mod managed_caller_session_tests {
+    use super::*;
+    use crate::transport::{ConnectionOrigin, ConnectionProvenance};
+    use codex_app_server_transport::PeerExecutableIdentity;
+
+    #[test]
+    fn session_requires_initialization_role_and_server_peer_proof() {
+        let peer = ConnectionProvenance::UnixPeerExecutable(PeerExecutableIdentity::FileIdentity {
+            device: 1,
+            inode: 1,
+        });
+        for (provenance, requested, expected) in [
+            (peer, false, false),
+            (peer, true, true),
+            (ConnectionProvenance::Unproven, true, false),
+            (ConnectionProvenance::InProcess, true, false),
+        ] {
+            let session =
+                ConnectionSessionState::with_provenance(ConnectionOrigin::InProcess, provenance);
+            assert!(!session.managed_transition_caller_authorized());
+            session
+                .initialize(InitializedConnectionSessionState {
+                    auth_observation_only: false,
+                    experimental_api_enabled: true,
+                    opted_out_notification_methods: HashSet::new(),
+                    app_server_client_name: "claimed-client".into(),
+                    client_version: "test".into(),
+                    request_attestation: true,
+                    interactive_client_requested: requested,
+                    client_mcp_extensions: ClientMcpExtensions::default(),
+                })
+                .unwrap();
+            assert_eq!(session.managed_transition_caller_authorized(), expected);
+        }
+    }
+}

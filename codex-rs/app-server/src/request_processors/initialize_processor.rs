@@ -79,6 +79,7 @@ impl InitializeRequestProcessor {
         let capabilities = params.capabilities.unwrap_or_default();
         let experimental_api_enabled = capabilities.experimental_api;
         let request_attestation = capabilities.request_attestation;
+        let interactive_client_requested = capabilities.interactive_client;
         let extensions = capabilities.extensions.as_ref();
         let auth_observation_only = extensions
             .and_then(|map| map.get("codex/auth-observation"))
@@ -141,6 +142,7 @@ impl InitializeRequestProcessor {
                 app_server_client_name: name.clone(),
                 client_version: version,
                 request_attestation,
+                interactive_client_requested,
                 client_mcp_extensions,
             })
             .is_err()

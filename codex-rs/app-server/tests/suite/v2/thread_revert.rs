@@ -757,6 +757,7 @@ async fn initialize_experimental(mcp: &mut TestAppServer) -> Result<()> {
                 version: "0.1.0".to_string(),
             },
             Some(InitializeCapabilities {
+                interactive_client: false,
                 required_human_approval: false,
                 explicit_gateway_oauth: false,
                 experimental_api: true,

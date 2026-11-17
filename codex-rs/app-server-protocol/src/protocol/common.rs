@@ -2899,6 +2899,7 @@ mod tests {
                     version: "0.1.0".to_string(),
                 },
                 capabilities: Some(v1::InitializeCapabilities {
+                    interactive_client: false,
                     required_human_approval: false,
                     explicit_gateway_oauth: false,
                     experimental_api: true,
@@ -2988,6 +2989,7 @@ mod tests {
                         version: "0.1.0".to_string(),
                     },
                     capabilities: Some(v1::InitializeCapabilities {
+                        interactive_client: false,
                         required_human_approval: false,
                         explicit_gateway_oauth: false,
                         experimental_api: true,

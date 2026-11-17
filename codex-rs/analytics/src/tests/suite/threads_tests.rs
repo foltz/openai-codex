@@ -217,6 +217,7 @@ async fn initialize_caches_client_and_thread_lifecycle_publishes_once_initialize
                         version: "1.0.0".to_string(),
                     },
                     capabilities: Some(InitializeCapabilities {
+                        interactive_client: false,
                         required_human_approval: false,
                         explicit_gateway_oauth: false,
                         experimental_api: false,

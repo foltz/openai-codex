@@ -3711,3 +3711,138 @@ async fn command_shared_constructor_keeps_partial_wif_configuration_fail_closed(
     assert!(!absent.exists());
     Ok(())
 }
+
+#[test]
+fn native_refresh_commit_refusal_preserves_exact_stored_bytes() -> anyhow::Result<()> {
+    let home = tempdir()?;
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".into()),
+            chatgpt_account_id: Some("account".into()),
+        },
+        home.path(),
+    )?;
+    let storage = create_auth_storage(
+        home.path().to_path_buf(),
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
+    );
+    let original = std::fs::read(home.path().join("auth.json"))?;
+    let expected = storage
+        .load()?
+        .context("stored auth")?
+        .tokens
+        .context("stored tokens")?;
+    let calls = AtomicUsize::new(0);
+    let result = super::persist_tokens_with_commit(
+        &storage,
+        &expected,
+        None,
+        RefreshResponse {
+            id_token: None,
+            access_token: Some("new".into()),
+            refresh_token: Some("rotated".into()),
+        },
+        |_, _| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::other("synthetic owner changed"))
+        },
+    );
+    assert!(result.is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(std::fs::read(home.path().join("auth.json"))?, original);
+    Ok(())
+}
+
+#[test]
+fn stale_native_refresh_never_reaches_owner_commit_callback() -> anyhow::Result<()> {
+    let home = tempdir()?;
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".into()),
+            chatgpt_account_id: Some("account".into()),
+        },
+        home.path(),
+    )?;
+    let storage = create_auth_storage(
+        home.path().to_path_buf(),
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
+    );
+    let expected = storage
+        .load()?
+        .context("stored auth")?
+        .tokens
+        .context("stored tokens")?;
+    super::persist_tokens(
+        &storage,
+        &expected,
+        None,
+        None,
+        Some("newer".into()),
+        Some("rotated".into()),
+    )?;
+    let before = std::fs::read(home.path().join("auth.json"))?;
+    let calls = AtomicUsize::new(0);
+    let result = super::persist_tokens_with_commit(
+        &storage,
+        &expected,
+        None,
+        RefreshResponse {
+            id_token: None,
+            access_token: Some("late".into()),
+            refresh_token: Some("stale".into()),
+        },
+        |_, _| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        },
+    );
+    assert!(result.is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(std::fs::read(home.path().join("auth.json"))?, before);
+    Ok(())
+}
+
+#[test]
+fn native_refresh_guarded_callback_commits_exact_validated_candidate() -> anyhow::Result<()> {
+    let home = tempdir()?;
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".into()),
+            chatgpt_account_id: Some("account".into()),
+        },
+        home.path(),
+    )?;
+    let storage = create_auth_storage(
+        home.path().to_path_buf(),
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
+    );
+    let expected = storage
+        .load()?
+        .context("stored auth")?
+        .tokens
+        .context("stored tokens")?;
+    let calls = AtomicUsize::new(0);
+    let updated = super::persist_tokens_with_commit(
+        &storage,
+        &expected,
+        None,
+        RefreshResponse {
+            id_token: None,
+            access_token: Some("renewed".into()),
+            refresh_token: Some("rotated".into()),
+        },
+        |before, after| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            storage.compare_and_save(before, after)
+        },
+    )?;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(storage.load()?, Some(updated));
+    Ok(())
+}

@@ -1792,6 +1792,33 @@ pub(super) fn persist_tokens(
     access_token: Option<String>,
     refresh_token: Option<String>,
 ) -> std::io::Result<AuthDotJson> {
+    persist_tokens_with_commit(
+        storage,
+        expected,
+        provenance,
+        RefreshResponse {
+            id_token,
+            access_token,
+            refresh_token,
+        },
+        |original, updated| storage.compare_and_save(original, updated),
+    )
+}
+
+/// Build the same CAS-validated native refresh while retaining its writer lock.
+/// A bound caller can validate owner state in the actual commit critical section.
+fn persist_tokens_with_commit(
+    storage: &Arc<dyn AuthStorageBackend>,
+    expected: &TokenData,
+    provenance: Option<AccountOAuthProvenance>,
+    response: RefreshResponse,
+    commit: impl FnOnce(&AuthDotJson, &AuthDotJson) -> std::io::Result<()>,
+) -> std::io::Result<AuthDotJson> {
+    let RefreshResponse {
+        id_token,
+        access_token,
+        refresh_token,
+    } = response;
     let _commit = storage.lock_for_write()?;
     let stored = storage.load()?;
     let mut auth_dot_json = stored.ok_or(std::io::Error::other("Token data is not available."))?;
@@ -1826,7 +1853,7 @@ pub(super) fn persist_tokens(
         tokens.refresh_token = refresh_token;
     }
     auth_dot_json.last_refresh = Some(Utc::now());
-    storage.compare_and_save(&original, &auth_dot_json)?;
+    commit(&original, &auth_dot_json)?;
     Ok(auth_dot_json)
 }
 

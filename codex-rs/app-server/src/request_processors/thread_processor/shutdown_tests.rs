@@ -942,87 +942,11 @@ async fn archive_late_release_refuses_without_exact_custody_or_receipt() {
     assert_eq!(ticket.wait().await, report);
 }
 
-/// Port of upstream app-server `thread_unload.rs::
-/// idle_unload_finishes_after_slow_writer_shutdown` onto the real listener,
-/// zero-delay idle countdown, and `unload_idle_unretained_thread`. The rollout
-/// coordination lock is taken after the durable writer exists and before any
-/// listener or countdown does, so no ordering depends on elapsed time.
-///
-/// The production listener is `tokio::spawn`ed and does not inherit a scoped
-/// dispatcher, so the capture layer is made the thread default on every runtime
-/// worker (and on the `block_on` thread) without touching the global default.
-#[test]
-fn idle_unload_finishes_after_slow_writer_shutdown() {
-    use tracing_subscriber::layer::SubscriberExt;
-    let (events_tx, events_rx) = tokio::sync::watch::channel(Vec::new());
-    let dispatch = tracing::Dispatch::new(
-        tracing_subscriber::registry().with(SlowShutdownEvents(Arc::new(events_tx))),
-    );
-    let worker_dispatch = dispatch.clone();
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .on_thread_start(move || {
-            // Runtime threads end with the runtime; the guard lives as long.
-            std::mem::forget(tracing::dispatcher::set_default(&worker_dispatch));
-        })
-        .build()
-        .expect("test runtime");
-    tracing::dispatcher::with_default(&dispatch, || {
-        runtime.block_on(idle_unload_finishes_after_slow_writer_shutdown_body(
-            events_rx,
-        ));
-    });
-}
-
-const THREAD_SHUTDOWN_SLOW: &str = "codex.app_server.thread_shutdown_slow";
-
-/// Captured `(thread_id, emitted_at)` for each `thread_shutdown_slow` event.
-type SlowShutdownCapture = Vec<(String, Instant)>;
-
-struct SlowShutdownEvents(Arc<tokio::sync::watch::Sender<SlowShutdownCapture>>);
-
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SlowShutdownEvents {
-    fn on_event(
-        &self,
-        event: &tracing::Event<'_>,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        #[derive(Default)]
-        struct Visitor {
-            name: Option<String>,
-            thread_id: Option<String>,
-        }
-        impl tracing::field::Visit for Visitor {
-            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-                match field.name() {
-                    "event.name" => self.name = Some(value.to_string()),
-                    "thread_id" => self.thread_id = Some(value.to_string()),
-                    _ => {}
-                }
-            }
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                match field.name() {
-                    "event.name" => self.name = Some(format!("{value:?}")),
-                    "thread_id" => self.thread_id = Some(format!("{value:?}")),
-                    _ => {}
-                }
-            }
-        }
-        let mut visitor = Visitor::default();
-        event.record(&mut visitor);
-        if visitor.name.as_deref() == Some(THREAD_SHUTDOWN_SLOW) {
-            let thread_id = visitor.thread_id.unwrap_or_default();
-            let emitted_at = Instant::now();
-            self.0
-                .send_modify(|events| events.push((thread_id, emitted_at)));
-        }
-    }
-}
-
-async fn idle_unload_finishes_after_slow_writer_shutdown_body(
-    mut slow_events: tokio::sync::watch::Receiver<SlowShutdownCapture>,
-) {
+/// 0.169 writer-lock cleanup is nonblocking under coordination contention.
+/// Keep the real listener/retirement path and prove ownership is released;
+/// genuinely stalled cleanup is covered by the separate late-release tests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_unload_finishes_while_writer_coordination_is_locked() {
     let (home, manager, config) = fixture().await;
     // The shared fixture is ephemeral; the real durable writer needs persistence.
     let mut durable = config.clone();
@@ -1040,8 +964,8 @@ async fn idle_unload_finishes_after_slow_writer_shutdown_body(
         "session birth holds the real thread writer lock"
     );
 
-    // Block the real cross-process writer-lock cleanup before any listener or
-    // idle countdown exists. Other tasks, including the 10s deadline, still run.
+    // Hold coordination before any listener or idle countdown exists. 0.169
+    // must release writer ownership without waiting for this unrelated lock.
     let coordination_lock = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -1119,9 +1043,6 @@ async fn idle_unload_finishes_after_slow_writer_shutdown_body(
     .await
     .expect("listener attaches");
 
-    // Upstream `codex.app_server.thread_shutdown_slow`: the unload's own retained
-    // ticket reports TimedOut, which is exactly the condition that emits that
-    // warning (the listener is spawned without the test's dispatcher).
     tokio::time::timeout(
         Duration::from_secs(10),
         retention.wait_for(|snapshot| snapshot.retiring),
@@ -1132,42 +1053,12 @@ async fn idle_unload_finishes_after_slow_writer_shutdown_body(
     let ticket = thread
         .begin_retirement(Instant::now() + Duration::from_secs(120))
         .expect("retained ticket");
-    assert!(
-        ticket.deadline() <= Instant::now() + Duration::from_secs(10),
-        "observer must replay the unload's original ticket"
-    );
-    let report = tokio::time::timeout(Duration::from_secs(15), ticket.wait())
+    let report = tokio::time::timeout(Duration::from_secs(10), ticket.wait())
         .await
-        .expect("unload deadline elapsed");
-    assert_eq!(report.ordinary, ThreadShutdownOutcome::TimedOut);
-    assert!(!report.is_complete());
+        .expect("coordination contention must not stall retirement");
+    assert!(report.is_complete(), "{report:?}");
 
-    // Upstream `wait_for_json_log_event("codex.app_server.thread_shutdown_slow")`:
-    // the warning itself, for this thread, emitted only after the deadline and
-    // while the writer lock (hence thread/closed) is still blocked.
-    let slow = tokio::time::timeout(
-        Duration::from_secs(10),
-        slow_events.wait_for(|events| !events.is_empty()),
-    )
-    .await
-    .expect("idle unload never reached the shutdown warning deadline")
-    .expect("slow event capture")
-    .clone();
-    assert_eq!(slow.len(), 1, "{slow:?}");
-    assert_eq!(slow[0].0, thread_id.to_string());
-    assert!(
-        slow[0].1 >= ticket.deadline(),
-        "slow warning must follow the retirement deadline"
-    );
-
-    // Upstream loaded list `[thread_id]` while the writer is still blocked.
-    assert_eq!(manager.list_thread_ids().await, vec![thread_id]);
-    assert!(pending.lock().await.contains_key(&thread_id));
-    assert!(drain_thread_closed(&mut outgoing_rx).is_empty());
-
-    // Once persistence can finish, the delayed shutdown must still remove the
-    // runtime and broadcast closure without another subscription or request.
-    drop(coordination_lock);
+    // Keep coordination locked until the runtime has retired and notified.
     let closed = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let envelope = outgoing_rx.recv().await.expect("outgoing stream");
@@ -1182,13 +1073,22 @@ async fn idle_unload_finishes_after_slow_writer_shutdown_body(
         }
     })
     .await
-    .expect("slow shutdown never finalized idle unload");
+    .expect("coordination contention prevented idle unload");
     assert_eq!(closed, thread_id.to_string());
-    // Exactly one warning, already emitted before thread/closed was broadcast.
-    assert_eq!(*slow_events.borrow(), slow);
     // Upstream empty loaded list.
     assert!(manager.list_thread_ids().await.is_empty());
-    assert!(!locks.join(format!("{thread_id}.lock")).exists());
+    // A stale filename is allowed by upstream's nonblocking Drop, but it
+    // must no longer own the writer lock even while coordination is held.
+    if let Ok(writer) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(locks.join(format!("{thread_id}.lock")))
+    {
+        writer
+            .try_lock()
+            .expect("retirement released writer ownership");
+    }
+    drop(coordination_lock);
     assert_eq!(ticket.wait().await, report, "original report stays sticky");
 }
 

@@ -4040,6 +4040,9 @@ async fn native_owner_fixture(home: &Path, endpoint: &str) -> anyhow::Result<Arc
     )?;
     let storage = FileAuthStorage::new(home.to_path_buf());
     let mut stored = storage.load()?.context("stored auth")?;
+    // 0.169 reads the selected workspace from tokens.account_id; the ID-token
+    // claim alone is not an account selection. Keep both fixture identities.
+    stored.tokens.as_mut().context("tokens")?.account_id = Some(WORKSPACE_ID_ALLOWED.into());
     stored.tokens.as_mut().context("tokens")?.oauth_provenance = Some(AccountOAuthProvenance {
         issuer: endpoint.to_owned(),
         client_id: "synthetic-native-owner-client".into(),

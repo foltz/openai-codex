@@ -1473,9 +1473,21 @@ impl MessageProcessor {
                         self.mcp_processor.clone(),
                         account_work_permit
                             .as_ref()
-                            .map(codex_mcp::McpAttemptWork::derive_attempt)
-                            .transpose()
-                            .map_err(|_| account_transition_in_progress())?,
+                            .map(|permit| {
+                                Ok::<_, JSONRPCErrorError>(Box::new(
+                                    crate::account_operation_work::AccountOperationWork {
+                                        permit: permit
+                                            .try_derive()
+                                            .ok_or_else(account_transition_in_progress)?,
+                                        turns: self
+                                            .managed_transition_coordinator
+                                            .account_turn_work(),
+                                        auth_tasks: Some(self.request_auth_tasks.ticket()),
+                                    },
+                                )
+                                    as Box<dyn codex_mcp::McpAttemptWork>)
+                            })
+                            .transpose()?,
                     )
                     .await?,
             ),

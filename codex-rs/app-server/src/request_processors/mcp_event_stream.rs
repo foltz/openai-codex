@@ -82,7 +82,8 @@ impl McpEventStreams {
             let task = tokio::spawn(async move {
                 let mut auth_changes =
                     McpEventStreamAuthChanges::new(Arc::clone(&processor.auth_manager));
-                let opened = tokio::select! {
+                let opened = with_attempt_auth(account_work.as_deref(), async {
+                    tokio::select! {
                     () = auth_changes.changed() => Err(internal_error(
                         "MCP event subscription authentication changed during startup",
                     )),
@@ -112,7 +113,12 @@ impl McpEventStreams {
                             )))?;
                         Ok((stream, thread))
                     } => result,
-                };
+                    }
+                })
+                .await
+                .unwrap_or_else(|()| {
+                    Err(internal_error("MCP event startup auth custody unavailable"))
+                });
                 match opened {
                     Ok((stream, thread)) => {
                         forward_events(
@@ -234,6 +240,7 @@ async fn forward_events(
                             )
                             .await;
                             let work = thread.admit_mcp_event_stream_retry()?;
+                            let result = with_attempt_auth(work.as_deref(), async {
                             let mut stream = thread
                                 .start_mcp_event_stream_with_authority(
                                     &params.name,
@@ -246,8 +253,10 @@ async fn forward_events(
                             // A reconnect may resume with an ordinary event,
                             // without another active notification. Its work
                             // ends at this bounded first-notification boundary.
-                            drop(work);
                             Ok::<_, anyhow::Error>((stream, notification))
+                            }).await.map_err(|()| anyhow::anyhow!("MCP event retry auth custody unavailable"))?;
+                            drop(work);
+                            result
                         }) => match result {
                             Ok(Ok((reconnected, Some(notification)))) => {
                                 stream = reconnected;
@@ -350,5 +359,76 @@ impl McpEventStreamAuthChanges {
             }
             self.revision = revision;
         }
+    }
+}
+
+async fn with_attempt_auth<T>(
+    work: Option<&dyn McpAttemptWork>,
+    future: impl std::future::Future<Output = T>,
+) -> Result<T, ()> {
+    match work {
+        Some(work) => codex_model_provider::with_auth_task_scope(
+            codex_model_provider::AuthTaskAccess::Admitted(
+                work.auth_task_spawner().map_err(|_| ())?,
+            ),
+            future,
+        )
+        .await
+        .map_err(|_| ()),
+        None => Ok(future.await),
+    }
+}
+
+#[cfg(test)]
+mod auth_custody_tests {
+    use super::*;
+    use crate::account_operation_work::AccountOperationWork;
+    use crate::account_turn_work::AccountTurnWork;
+    use crate::account_work_permits::AccountWorkPermits;
+    use crate::processor_task_retirement::ProcessorTasks;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[tokio::test]
+    async fn unsupported_attempt_refuses_before_startup_is_polled() {
+        let permits = AccountWorkPermits::new();
+        let work = permits.try_acquire().unwrap();
+        let polled = AtomicBool::new(false);
+        let result =
+            with_attempt_auth(Some(&work), async { polled.store(true, Ordering::SeqCst) }).await;
+        assert!(result.is_err());
+        assert!(!polled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn finite_startup_auth_uses_operation_ledger_and_releases_before_idle() {
+        let permits = AccountWorkPermits::new();
+        let tasks = ProcessorTasks::default();
+        let work = AccountOperationWork {
+            permit: permits.try_acquire().unwrap(),
+            turns: AccountTurnWork::default(),
+            auth_tasks: Some(tasks.ticket()),
+        };
+        assert_eq!(
+            with_attempt_auth(Some(&work), async {
+                codex_model_provider::run_auth_call(
+                    codex_model_provider::AuthTaskAccess::Ungated,
+                    async { 42 },
+                )
+                .await
+            })
+            .await
+            .unwrap()
+            .unwrap(),
+            42
+        );
+        assert_eq!(permits.admitted_count(), 1);
+        drop(work); // finite activation boundary; there is no idle scope owner
+        assert_eq!(permits.admitted_count(), 0);
+        assert!(
+            tasks
+                .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(1))
+                .await
+                .is_clean()
+        );
     }
 }

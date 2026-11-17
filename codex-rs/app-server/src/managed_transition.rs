@@ -552,7 +552,6 @@ impl ManagedTransitionCoordinator {
     }
 
     /// Listener-independent turn evidence shared with host admission hooks.
-    #[cfg(test)]
     pub(crate) fn account_turn_work(&self) -> crate::account_turn_work::AccountTurnWork {
         self.account_turn_work.clone()
     }

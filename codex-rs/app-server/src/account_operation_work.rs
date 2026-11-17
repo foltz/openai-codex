@@ -24,6 +24,30 @@ impl codex_mcp::McpAttemptWork for AccountWorkPermitGuard {
     }
 }
 
+impl codex_mcp::McpAttemptWork for AccountOperationWork {
+    fn auth_task_spawner(
+        &self,
+    ) -> Result<
+        std::sync::Arc<dyn codex_protocol::host_auth_work::AuthTaskSpawner>,
+        codex_mcp::McpAttemptRefused,
+    > {
+        HostOperationWork::auth_task_spawner(self).map_err(|_| codex_mcp::McpAttemptRefused)
+    }
+
+    fn derive_attempt(
+        &self,
+    ) -> Result<Box<dyn codex_mcp::McpAttemptWork>, codex_mcp::McpAttemptRefused> {
+        Ok(Box::new(Self {
+            permit: self
+                .permit
+                .try_derive()
+                .ok_or(codex_mcp::McpAttemptRefused)?,
+            turns: self.turns.clone(),
+            auth_tasks: self.auth_tasks.clone(),
+        }))
+    }
+}
+
 impl std::fmt::Debug for AccountOperationWork {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("AccountOperationWork")

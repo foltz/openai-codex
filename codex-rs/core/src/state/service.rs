@@ -49,6 +49,35 @@ use codex_utils_git_discovery::GitRootDiscovery;
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 
+/// Receives notice immediately before a session replaces its selected user
+/// runtime configuration.
+///
+/// Hosts that retain process-wide provenance for configuration-derived state
+/// use this boundary to invalidate that provenance before a legacy core reload
+/// can make it stale. The callback is synchronous so it can run before the
+/// session state mutation without extending the core reload's async critical
+/// section.
+pub trait RuntimeConfigChangeListener: Send + Sync {
+    fn before_runtime_config_change(&self);
+}
+
+/// Serializes host-owned and legacy core runtime configuration changes.
+///
+/// A host can retain provenance for configuration-derived runtime state only
+/// when a direct core reload cannot overlap an app-server-owned transition.
+/// The gate deliberately contains no host-specific semantics; the optional
+/// listener remains responsible for invalidating host provenance.
+#[derive(Clone, Debug, Default)]
+pub struct RuntimeConfigChangeGate {
+    lock: Arc<Mutex<()>>,
+}
+
+impl RuntimeConfigChangeGate {
+    pub async fn lock(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        Arc::clone(&self.lock).lock_owned().await
+    }
+}
+
 pub(crate) struct SessionServices {
     /// The single owner of live MCP connections for this thread.
     pub(crate) mcp_runtime: Arc<McpRuntime>,

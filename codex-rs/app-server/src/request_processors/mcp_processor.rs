@@ -1007,12 +1007,21 @@ mod request_custody_tests {
         assert!(permits.try_acquire().is_none());
         assert!(!tasks.shutdown_until(Instant::now()).await.terminal);
         release.send(()).unwrap();
-        assert!(
-            tasks
-                .shutdown_until(Instant::now() + Duration::from_secs(1))
-                .await
-                .is_clean()
-        );
+        // The first shutdown latched an already-expired deadline. Later
+        // observations must retain it, so explicitly await the released task's
+        // positive join instead of assuming a fresh shutdown budget.
+        let joined = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let observation = tasks.shutdown_until(Instant::now()).await;
+                if observation.terminal {
+                    break observation;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("released request must terminate under retained custody");
+        assert!(joined.is_clean(), "{joined:?}");
         assert_eq!(permits.admitted_count(), 0);
     }
 

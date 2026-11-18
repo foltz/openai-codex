@@ -51,6 +51,113 @@ fn tightening_writes_only_earlier_deadlines() {
     assert!(u64::from_le_bytes(value) <= monotonic_ns(earlier) + 1_000_000);
 }
 
+/// Capacity sizes only the saturation fixture; delivery never depends on it.
+#[test]
+fn a_full_channel_coalesces_without_blocking_and_retries_the_minimum() {
+    let custody = LinuxSandboxCleanupCustody::new(None).expect("custody");
+    let fd = custody.inherited_fds()[0];
+    let mut state = custody.tightener.state.lock().expect("state");
+    let writer = state.channel.as_raw_fd();
+    // Refuse a blocking implementation before attempting to fill its pipe.
+    assert_ne!(
+        unsafe { libc::fcntl(writer, libc::F_GETFL) } & libc::O_NONBLOCK,
+        0
+    );
+    let capacity = unsafe { libc::fcntl(writer, libc::F_GETPIPE_SZ) };
+    assert!(capacity >= 8);
+    let mut filled = 0;
+    loop {
+        match state.channel.write(&u64::MAX.to_le_bytes()) {
+            Ok(8) => filled += 8,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+            result => panic!("unexpected atomic fill result: {result:?}"),
+        }
+        assert!(filled <= capacity as usize);
+    }
+    drop(state);
+    let earlier = Instant::now() + Duration::from_secs(30);
+    custody.tightener.tighten(earlier + Duration::from_secs(10));
+    custody.tightener.tighten(earlier);
+    assert_eq!(custody.deadline(), Some(earlier));
+    assert_eq!(
+        custody.tightener.delivery_failure(),
+        Some("deadline-pending")
+    );
+    let frame = custody
+        .tightener
+        .state
+        .lock()
+        .expect("state")
+        .frame_ns
+        .expect("frame");
+    let mut argv = launcher_argv();
+    custody.attach_to_launcher_argv(&mut argv).expect("attach");
+    let index = argv
+        .iter()
+        .position(|arg| arg == CLEANUP_DEADLINE_ARG)
+        .expect("arg");
+    assert_eq!(argv[index + 1], frame.to_string());
+    // Drain only the bytes inserted by this fixture, without closing the reader.
+    let mut reader = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
+    let mut contents = vec![0; filled];
+    reader.read_exact(&mut contents).expect("drain fill");
+    // A later, non-tightening call must retry the pending earlier frame.
+    custody.tightener.tighten(earlier + Duration::from_secs(20));
+    let mut delivered = [0; 8];
+    reader.read_exact(&mut delivered).expect("pending frame");
+    assert_eq!(u64::from_le_bytes(delivered), frame);
+    assert_eq!(custody.tightener.delivery_failure(), None);
+    assert_eq!(custody.deadline(), Some(earlier));
+}
+
+#[test]
+fn an_unflushed_minimum_cannot_report_clean_completion() {
+    let mut custody = LinuxSandboxCleanupCustody::new(None).expect("custody");
+    let receiver = custody.child_tighten.take().expect("receiver");
+    {
+        let mut state = custody.tightener.state.lock().expect("state");
+        let flags = unsafe { libc::fcntl(state.channel.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(flags & libc::O_NONBLOCK, 0);
+        loop {
+            match state.channel.write(&u64::MAX.to_le_bytes()) {
+                Ok(8) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                result => panic!("unexpected fill result: {result:?}"),
+            }
+        }
+    }
+    custody
+        .tightener
+        .tighten(Instant::now() + Duration::from_secs(5));
+    write_and_close_report(
+        &mut custody,
+        "v=1\nkind=helpers\nreaper=none\nend\nv=1\nstate=complete\nend\n",
+    );
+    custody.spawned(None);
+    let report = custody.collect_blocking();
+    assert!(report.joined);
+    assert_eq!(report.state, SandboxCleanupState::Incomplete);
+    drop(receiver);
+}
+
+#[test]
+fn a_closed_deadline_receiver_cannot_report_clean_completion() {
+    let mut custody = LinuxSandboxCleanupCustody::new(None).expect("custody");
+    drop(custody.child_tighten.take());
+    custody
+        .tightener
+        .tighten(Instant::now() + Duration::from_secs(5));
+    assert_eq!(custody.tightener.delivery_failure(), Some("receiver-gone"));
+    write_and_close_report(
+        &mut custody,
+        "v=1\nkind=helpers\nreaper=none\nend\nv=1\nstate=complete\nend\n",
+    );
+    custody.spawned(None);
+    let report = custody.collect_blocking();
+    assert!(report.joined);
+    assert_eq!(report.state, SandboxCleanupState::Incomplete);
+}
+
 /// Without a spawned launcher, the helper declaration (no reaper) and the
 /// closed report leave nothing to join; the census is summarized from the
 /// receipt. This does not exercise pidfd exit evidence (see

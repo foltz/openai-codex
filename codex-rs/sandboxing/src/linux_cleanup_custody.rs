@@ -99,41 +99,98 @@ pub fn monotonic_ns(instant: Instant) -> u64 {
 /// retirement) for as long as the custody lives.
 #[derive(Debug)]
 pub(crate) struct LinuxTightener {
-    channel: Mutex<std::fs::File>,
-    deadline: Mutex<Option<Instant>>,
+    state: Mutex<TightenState>,
     /// Self-pipe that wakes a blocked collection when the deadline tightens.
     wake_read: OwnedFd,
     wake_write: Mutex<std::fs::File>,
 }
 
+#[derive(Debug)]
+struct TightenState {
+    channel: std::fs::File,
+    deadline: Option<Instant>,
+    frame_ns: Option<u64>,
+    delivered_ns: Option<u64>,
+    failure: Option<&'static str>,
+}
+
+impl TightenState {
+    fn pending(&self) -> bool {
+        self.frame_ns != self.delivered_ns
+    }
+
+    /// One atomic nonblocking frame attempt. EAGAIN/EINTR retain the slot;
+    /// neither a full pipe nor a signal storm can block a tightening caller.
+    fn flush(&mut self) {
+        if !self.pending() || self.failure.is_some() {
+            return;
+        }
+        let frame = self.frame_ns.expect("pending deadline").to_le_bytes();
+        count_io_call();
+        match self.channel.write(&frame) {
+            Ok(8) => self.delivered_ns = self.frame_ns,
+            Ok(_) => self.failure = Some("channel-corrupt"),
+            Err(error) => match error.kind() {
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => {}
+                io::ErrorKind::BrokenPipe => self.failure = Some("receiver-gone"),
+                _ => self.failure = Some("channel-failed"),
+            },
+        }
+    }
+}
+
 impl LinuxTightener {
     fn deadline(&self) -> Option<Instant> {
-        *self
-            .deadline
+        self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .deadline
+    }
+
+    fn flush(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .flush();
+    }
+
+    fn pending_fd(&self) -> Option<RawFd> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (state.pending() && state.failure.is_none()).then(|| state.channel.as_raw_fd())
+    }
+
+    fn delivery_failure(&self) -> Option<&'static str> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .failure
+            .or_else(|| state.pending().then_some("deadline-pending"))
     }
 }
 
 impl CleanupDeadlineSink for LinuxTightener {
-    /// Only an earlier deadline is applied. An 8-byte pipe write is atomic and
-    /// never blocks here; a launcher that has exited makes it fail harmlessly.
+    /// Keep only the earliest bound. Full pipes retain one pending minimum;
+    /// the existing collector retries it on POLLOUT, without a helper thread.
     fn tighten(&self, deadline: Instant) {
-        let mut current = self
-            .deadline
+        let mut state = self
+            .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if current.is_some_and(|current| current <= deadline) {
-            return;
+        if state.deadline.is_none_or(|current| deadline < current) {
+            state.deadline = Some(deadline);
+            // Convert once. Sampling two clocks may jitter; never extend the
+            // previously advertised monotonic frame, even by that jitter.
+            let frame = monotonic_ns(deadline);
+            state.frame_ns = Some(state.frame_ns.map_or(frame, |current| current.min(frame)));
         }
-        *current = Some(deadline);
-        let mut channel = self
-            .channel
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _ = channel.write_all(&monotonic_ns(deadline).to_le_bytes());
-        drop(channel);
-        // Non-blocking: a full wake pipe already guarantees a wake-up.
+        // Even a later no-op deadline retries an already pending minimum.
+        state.flush();
+        drop(state);
         let mut wake = self
             .wake_write
             .lock()
@@ -180,13 +237,21 @@ impl LinuxSandboxCleanupCustody {
         let (child_tighten, tighten) = cloexec_pipe()?;
         let (report, child_report) = cloexec_pipe()?;
         let (wake_read, wake_write) = cloexec_pipe()?;
+        set_nonblocking(&tighten)?;
         set_nonblocking(&report)?;
         set_nonblocking(&wake_read)?;
         set_nonblocking(&wake_write)?;
+        let frame_ns = deadline.map(monotonic_ns);
         Ok(Self {
             tightener: Arc::new(LinuxTightener {
-                channel: Mutex::new(std::fs::File::from(tighten)),
-                deadline: Mutex::new(deadline),
+                state: Mutex::new(TightenState {
+                    channel: std::fs::File::from(tighten),
+                    deadline,
+                    frame_ns,
+                    // The initial bound is carried in argv, not a queued frame.
+                    delivered_ns: frame_ns,
+                    failure: None,
+                }),
                 wake_read,
                 wake_write: Mutex::new(std::fs::File::from(wake_write)),
             }),
@@ -211,10 +276,16 @@ impl LinuxSandboxCleanupCustody {
             .position(|arg| arg == "--")
             .ok_or_else(|| io::Error::other("launcher argv has no `--`"))?;
         let mut custody = Vec::with_capacity(6);
-        if let Some(deadline) = self.tightener.deadline() {
+        let state = self
+            .tightener
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(frame) = state.frame_ns {
             custody.push(CLEANUP_DEADLINE_ARG.to_string());
-            custody.push(monotonic_ns(deadline).to_string());
+            custody.push(frame.to_string());
         }
+        drop(state);
         custody.push(CLEANUP_DEADLINE_FD_ARG.to_string());
         custody.push(tighten.as_raw_fd().to_string());
         custody.push(CLEANUP_REPORT_FD_ARG.to_string());
@@ -292,6 +363,10 @@ impl LinuxSandboxCleanupCustody {
             if expired() {
                 break false;
             }
+            self.tightener.flush();
+            if expired() {
+                break false;
+            }
             if report_open {
                 match drain_report(&self.report, &mut text, &expired) {
                     Drain::Open => {}
@@ -336,16 +411,19 @@ impl LinuxSandboxCleanupCustody {
             if remaining.is_zero() {
                 break false;
             }
-            let mut fds = vec![self.tightener.wake_read.as_raw_fd()];
+            let mut fds = vec![(self.tightener.wake_read.as_raw_fd(), libc::POLLIN)];
+            if let Some(fd) = self.tightener.pending_fd() {
+                fds.push((fd, libc::POLLOUT));
+            }
             if report_open {
-                fds.push(self.report.as_raw_fd());
+                fds.push((self.report.as_raw_fd(), libc::POLLIN));
             }
             if !launcher_exited && let LauncherState::Pinned(launcher) = &self.launcher {
-                fds.push(launcher.as_raw_fd());
+                fds.push((launcher.as_raw_fd(), libc::POLLIN));
             }
             for (_, state) in &helpers.named {
                 if let HelperState::Pending(pidfd) = state {
-                    fds.push(pidfd.as_raw_fd());
+                    fds.push((pidfd.as_raw_fd(), libc::POLLIN));
                 }
             }
             let timeout =
@@ -353,7 +431,16 @@ impl LinuxSandboxCleanupCustody {
             wait_any(&fds, timeout);
             drain_wake(&self.tightener.wake_read);
         };
-        parse_report(&String::from_utf8_lossy(&text), joined)
+        let mut report = parse_report(&String::from_utf8_lossy(&text), joined);
+        if let Some(reason) = self.tightener.delivery_failure() {
+            tracing::warn!(reason, "sandbox cleanup deadline delivery was not proven");
+            // Positive helper exit still proves joined. It does not prove the
+            // helper respected the original bound when delivery failed.
+            if report.state == SandboxCleanupState::Complete {
+                report.state = SandboxCleanupState::Incomplete;
+            }
+        }
+        report
     }
 }
 
@@ -523,13 +610,13 @@ fn poll_readable(fd: RawFd) -> bool {
     unsafe { libc::poll(&mut poll, 1, 0) > 0 }
 }
 
-fn wait_any(fds: &[RawFd], timeout: libc::c_int) {
+fn wait_any(fds: &[(RawFd, libc::c_short)], timeout: libc::c_int) {
     count_io_call();
     let mut polls: Vec<libc::pollfd> = fds
         .iter()
-        .map(|fd| libc::pollfd {
+        .map(|(fd, events)| libc::pollfd {
             fd: *fd,
-            events: libc::POLLIN,
+            events: *events,
             revents: 0,
         })
         .collect();

@@ -1699,7 +1699,7 @@ pub(super) async fn start_recording_app_server_with_realtime_speech(
                                     &request,
                                     ClientRequest::ThreadRealtimeListVoices { .. }
                                 );
-                            eprintln!("HOSTED_PROXY before embedded {}", request.method);
+                            eprintln!("HOSTED_PROXY before embedded {}", request.method_name());
                             let mut result = embedded.request(request).await?;
                             eprintln!("HOSTED_PROXY embedded response");
                             if unknown_voice && let Ok(value) = &mut result {

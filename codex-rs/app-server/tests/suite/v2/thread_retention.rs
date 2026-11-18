@@ -235,3 +235,86 @@ async fn retention_requires_experimental_opt_in() -> Result<()> {
     client.shutdown().await?;
     Ok(())
 }
+
+/// Exercise the real idle-unload path with the connection kept live. Two
+/// unretained zero-delay controls establish that the scheduler actually ran;
+/// a subscriber alone must not be mistaken for an explicit retention grant.
+#[tokio::test]
+async fn idle_retention_survives_live_connection_until_exact_release() -> Result<()> {
+    let (client, _home) = start_in_process_client(true).await?;
+    async fn start(
+        client: &in_process::InProcessClientHandle,
+        retain: bool,
+    ) -> Result<ThreadStartResponse> {
+        let value = client
+            .request(ClientRequest::ThreadStart {
+                request_id: RequestId::String(Uuid::new_v4().to_string()),
+                params: ThreadStartParams {
+                    ephemeral: Some(true),
+                    retain_for_connection: retain,
+                    config: Some(
+                        [("thread_unload_delay_secs".into(), serde_json::json!(0))].into(),
+                    ),
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await?
+            .map_err(|e| anyhow::anyhow!("start failed: {e:?}"))?;
+        Ok(serde_json::from_value(value)?)
+    }
+    async fn wait_unloaded(
+        client: &in_process::InProcessClientHandle,
+        target: &str,
+        held: Option<&str>,
+    ) -> Result<()> {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let value = client
+                    .request(ClientRequest::ThreadLoadedList {
+                        request_id: RequestId::String(Uuid::new_v4().to_string()),
+                        params: codex_app_server_protocol::ThreadLoadedListParams::default(),
+                    })
+                    .await?
+                    .map_err(|e| anyhow::anyhow!("loaded list failed: {e:?}"))?;
+                let loaded: codex_app_server_protocol::ThreadLoadedListResponse =
+                    serde_json::from_value(value)?;
+                if let Some(held) = held {
+                    assert!(
+                        loaded.data.iter().any(|id| id == held),
+                        "explicitly retained idle thread must remain loaded"
+                    );
+                }
+                if !loaded.data.iter().any(|id| id == target) {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await??;
+        Ok(())
+    }
+    let retained = start(&client, true).await?;
+    let Some(ThreadRetentionAcquireResponse::Acquired { grant_id }) = retained.retention else {
+        anyhow::bail!("start must mint the requested grant atomically");
+    };
+    for _ in 0..2 {
+        let control = start(&client, false).await?;
+        assert!(control.retention.is_none());
+        wait_unloaded(&client, &control.thread.id, Some(&retained.thread.id)).await?;
+    }
+    let value = client
+        .request(ClientRequest::ThreadRetentionRelease {
+            request_id: RequestId::String(Uuid::new_v4().to_string()),
+            params: ThreadRetentionReleaseParams {
+                thread_id: retained.thread.id.clone(),
+                grant_id,
+            },
+        })
+        .await?
+        .map_err(|e| anyhow::anyhow!("release failed: {e:?}"))?;
+    let released: ThreadRetentionReleaseResponse = serde_json::from_value(value)?;
+    assert_eq!(released, ThreadRetentionReleaseResponse::Released {});
+    wait_unloaded(&client, &retained.thread.id, None).await?;
+    client.shutdown().await?;
+    Ok(())
+}

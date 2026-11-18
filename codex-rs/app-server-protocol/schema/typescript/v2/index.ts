@@ -313,9 +313,17 @@ export type { McpElicitationTitledSingleSelectEnumSchema } from "./McpElicitatio
 export type { McpElicitationUntitledEnumItems } from "./McpElicitationUntitledEnumItems";
 export type { McpElicitationUntitledMultiSelectEnumSchema } from "./McpElicitationUntitledMultiSelectEnumSchema";
 export type { McpElicitationUntitledSingleSelectEnumSchema } from "./McpElicitationUntitledSingleSelectEnumSchema";
+export type { McpHostedEndpointCustodyCensus } from "./McpHostedEndpointCustodyCensus";
+export type { McpHostedEndpointRefusalReason } from "./McpHostedEndpointRefusalReason";
+export type { McpHostedEndpointRetireCensus } from "./McpHostedEndpointRetireCensus";
+export type { McpHostedEndpointRetirementOutcome } from "./McpHostedEndpointRetirementOutcome";
+export type { McpHostedEndpointThreadReceipt } from "./McpHostedEndpointThreadReceipt";
 export type { McpResourceReadParams } from "./McpResourceReadParams";
 export type { McpResourceReadResponse } from "./McpResourceReadResponse";
 export type { McpResourceReadTarget } from "./McpResourceReadTarget";
+export type { McpServerConfigIdentity } from "./McpServerConfigIdentity";
+export type { McpServerConfigIdentityLayer } from "./McpServerConfigIdentityLayer";
+export type { McpServerConfigIdentityResponse } from "./McpServerConfigIdentityResponse";
 export type { McpServerConnectionStatus } from "./McpServerConnectionStatus";
 export type { McpServerElicitationAction } from "./McpServerElicitationAction";
 export type { McpServerElicitationRequestParams } from "./McpServerElicitationRequestParams";

@@ -161,7 +161,7 @@ impl App {
         let result = StartupDraftPump::run_with_optional_draft(
             startup_draft.as_deref_mut(),
             tui,
-            Box::pin(app_server.start_thread_with_session_start_source(
+            Box::pin(app_server.prepare_retained_thread_start(
                 &local_settings,
                 &config,
                 /*session_start_source*/ None,
@@ -172,7 +172,7 @@ impl App {
             )),
         )
         .await;
-        let started = match result {
+        let (started, retention) = match result {
             Ok(started) => started,
             Err(error) => {
                 let (title, message) = if matches!(
@@ -235,7 +235,11 @@ impl App {
             startup_draft,
         ))
         .await?;
-        if self.current_displayed_thread_id() != Some(thread_id) {
+        if self.current_displayed_thread_id() == Some(thread_id) {
+            if let Some(retention) = retention {
+                retention.commit();
+            }
+        } else {
             self.agents_overview.blank_sessions.remove(&thread_id);
             let _ = app_server.thread_unsubscribe(thread_id).await;
             if let Some((_, checkout)) = &managed_worktree {

@@ -387,6 +387,11 @@ async fn command_center_new_reads_server_defaults_for_actual_destination() -> Re
         let starts = recorded_params(&requests, "thread/start");
         assert_eq!(starts.len(), 1, "{mode} {expected_cwd}");
         assert_eq!(
+            starts[0]["retainForConnection"], true,
+            "overview-created displayed sessions request adoption"
+        );
+        assert!(app.current_displayed_thread_id().is_some());
+        assert_eq!(
             (
                 &starts[0]["cwd"],
                 &starts[0]["model"],

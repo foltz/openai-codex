@@ -4381,18 +4381,16 @@ async fn shutdown_edge_binding_does_not_wait_on_a_held_thread_map_lock() {
     );
     tokio::time::resume();
 
-    // Published after the edge: bound at publication (never Legacy).
+    // This is the permanent edge and it has already expired. Current construction
+    // custody refuses a late birth synchronously, rather than publishing new work
+    // with an expired deadline. The separate publication-probe control proves
+    // that a thread admitted before expiry is bound before first visibility.
+    let visible_before = manager.list_thread_ids().await;
     let later = manager
-        .start_thread(StartThreadOptions::new(config.clone(), None))
-        .await
-        .expect("start thread after the edge");
-    assert_eq!(
-        later
-            .thread
-            .bind_shutdown_deadline(deadline + Duration::from_secs(60))
-            .expect("bound at publication"),
-        deadline
-    );
+        .start_thread(StartThreadOptions::new(config, None))
+        .await;
+    assert!(matches!(later, Err(CodexErr::InternalAgentDied)));
+    assert_eq!(manager.list_thread_ids().await, visible_before);
 }
 
 #[tokio::test]

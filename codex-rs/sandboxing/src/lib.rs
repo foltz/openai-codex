@@ -1,3 +1,8 @@
+mod forwarded_fds;
+pub use forwarded_fds::FORWARD_FD_ARG;
+pub use forwarded_fds::ForwardedFd;
+pub use forwarded_fds::ForwardedFdRole;
+pub use forwarded_fds::attach_forwarded_fds;
 pub mod cleanup_custody;
 #[cfg(target_os = "linux")]
 mod linux_cleanup_custody;

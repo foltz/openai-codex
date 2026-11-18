@@ -123,3 +123,46 @@ fn an_expired_deadline_polls_nothing_even_for_a_ready_descriptor() {
     assert_eq!(owner_gone.wait_readable(ready.as_fd()), Wait::Expired);
     assert_eq!(polls_for_tests(), polls);
 }
+
+#[test]
+fn custody_pair_requires_distinct_pipes_in_the_correct_directions() {
+    let (deadline_read, deadline_write) = pipe();
+    let (report_read, report_write) = pipe();
+    assert!(
+        validate_pipe_pair(
+            Some(deadline_read.as_raw_fd()),
+            Some(report_write.as_raw_fd())
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_pipe_pair(
+            Some(deadline_write.as_raw_fd()),
+            Some(report_write.as_raw_fd())
+        )
+        .is_err()
+    );
+    assert!(
+        validate_pipe_pair(
+            Some(deadline_read.as_raw_fd()),
+            Some(report_read.as_raw_fd())
+        )
+        .is_err()
+    );
+    assert!(
+        validate_pipe_pair(
+            Some(deadline_read.as_raw_fd()),
+            Some(deadline_write.as_raw_fd())
+        )
+        .is_err()
+    );
+    assert!(
+        validate_pipe_pair(
+            Some(deadline_read.as_raw_fd()),
+            Some(deadline_read.as_raw_fd())
+        )
+        .is_err()
+    );
+    assert!(validate_pipe_pair(Some(0), None).is_err());
+    assert!(unsafe { libc::fcntl(deadline_read.as_raw_fd(), libc::F_GETFD) } >= 0);
+}

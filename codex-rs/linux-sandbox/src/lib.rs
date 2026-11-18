@@ -18,6 +18,8 @@ mod exec_util;
 #[cfg(target_os = "linux")]
 mod fd_mount;
 #[cfg(target_os = "linux")]
+mod forwarded_fds;
+#[cfg(target_os = "linux")]
 mod launcher;
 #[cfg(target_os = "linux")]
 mod linux_run_main;

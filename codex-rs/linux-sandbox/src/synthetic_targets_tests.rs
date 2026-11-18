@@ -1,6 +1,7 @@
 use super::*;
 use crate::bwrap::SyntheticMountTarget;
 use pretty_assertions::assert_eq;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use tempfile::TempDir;
 
@@ -2234,4 +2235,33 @@ fn an_owner_closing_between_releases_leaves_a_reaped_prefix_and_an_owner_gone_re
     assert_eq!(CleanupState::of(&census), CleanupState::Incomplete);
     assert!(!dot_codex.exists(), "released while the owner lived");
     assert!(dot_git.is_dir(), "kept after the owner is gone");
+}
+
+#[test]
+fn cleanup_synthetic_mount_targets_preserves_real_pre_existing_empty_file() {
+    let fixture = fixture();
+    let file = fixture.work.path().join(".git");
+    fs::write(&file, "").expect("pre-existing empty metadata file");
+    let before = fs::symlink_metadata(&file).expect("metadata");
+    let target = SyntheticMountTarget::existing_empty_file(&file, &before);
+    let owner = own_token();
+    let first = register(&fixture, std::slice::from_ref(&target), &owner);
+    let second = register(&fixture, &[target], &owner);
+    for registrations in [&first, &second] {
+        let outcomes = release(
+            &fixture,
+            registrations,
+            &owner,
+            SandboxProof::NeverStarted,
+            &mut NamespaceScan::default(),
+        );
+        assert!(
+            outcomes
+                .iter()
+                .all(|(_, outcome)| matches!(outcome, TargetOutcome::HostOwned))
+        );
+    }
+    let after = fs::symlink_metadata(&file).expect("file is preserved");
+    assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+    assert_eq!(fs::read(&file).expect("read preserved file"), b"");
 }

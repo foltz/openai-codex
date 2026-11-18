@@ -348,6 +348,40 @@ fn set_nonblocking(fd: BorrowedFd<'_>) -> io::Result<()> {
     Ok(())
 }
 
+/// Validate both channels before ownership transfer, preventing duplicate OwnedFd
+/// ownership and aliases of the same pipe, and checking each channel's direction.
+pub(crate) fn validate_pipe_pair(read: Option<RawFd>, write: Option<RawFd>) -> Result<(), String> {
+    let mut identities = Vec::new();
+    for (fd, direction, what) in [
+        (read, libc::O_RDONLY, DEADLINE_FD_ARG),
+        (write, libc::O_WRONLY, REPORT_FD_ARG),
+    ] {
+        let Some(fd) = fd else {
+            continue;
+        };
+        if fd <= libc::STDERR_FILENO {
+            return Err(format!("--{what} uses a standard descriptor"));
+        }
+        // SAFETY: fcntl and fstat inspect an open descriptor without taking it.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        let mut info: libc::stat = unsafe { std::mem::zeroed() };
+        if flags < 0
+            || unsafe { libc::fstat(fd, &mut info) } < 0
+            || info.st_mode & libc::S_IFMT != libc::S_IFIFO
+            || flags & libc::O_ACCMODE != direction
+        {
+            return Err(format!(
+                "--{what} is not an open pipe with the required direction"
+            ));
+        }
+        if identities.contains(&(info.st_dev, info.st_ino)) {
+            return Err("cleanup channels must be distinct pipes".to_string());
+        }
+        identities.push((info.st_dev, info.st_ino));
+    }
+    Ok(())
+}
+
 /// Adopts an inherited pipe descriptor named on the command line: it must be
 /// open and a FIFO, and is made close-on-exec so neither bubblewrap nor the
 /// sandboxed command can inherit it.

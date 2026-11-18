@@ -1,6 +1,9 @@
 use std::ffi::CStr;
 use std::ffi::CString;
 use std::fs::File;
+use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
+use std::os::fd::OwnedFd;
 use std::os::raw::c_char;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -38,13 +41,17 @@ struct SystemBwrapCapabilities {
 
 static LAUNCHER: OnceLock<BubblewrapLauncher> = OnceLock::new();
 
-pub(crate) fn exec_bwrap(mut argv: Vec<String>, preserved_files: Vec<File>) -> ! {
+pub(crate) fn exec_bwrap(mut argv: Vec<String>, mut preserved_files: Vec<File>) -> ! {
     if argv
         .iter()
         .take_while(|arg| arg.as_str() != "--")
         .any(|arg| arg == "--unshare-pid")
     {
         argv.insert(1, "--as-pid-1".to_string());
+    }
+
+    if let Err(err) = attach_bwrap_parent_pidfd(&mut argv, &mut preserved_files, open_own_pidfd) {
+        panic!("refusing to launch the Linux sandbox: {err}");
     }
 
     match preferred_bwrap_launcher() {
@@ -63,6 +70,87 @@ pub(crate) fn exec_bwrap(mut argv: Vec<String>, preserved_files: Vec<File>) -> !
             )
         }
     }
+}
+
+/// Internal inner-stage flag carrying a pidfd for the bubblewrap parent.
+pub(crate) const BWRAP_PARENT_PIDFD_ARG: &str = "--bwrap-parent-pidfd";
+
+/// Let the trusted inner sandbox stage bind its lifetime to the bubblewrap
+/// process that this process is about to become.
+///
+/// bubblewrap implements `--die-with-parent` by arming `PR_SET_PDEATHSIG`
+/// immediately before it execs the inner stage, but the kernel discards that
+/// setting when the exec changes the AppArmor confinement label. Ubuntu's
+/// `bwrap-userns-restrict` profile does exactly that (`bwrap` ->
+/// `bwrap//&unpriv_bwrap`). Because the inner stage runs in a new session (and,
+/// with `--as-pid-1`, as PID 1 of the sandbox PID namespace), signalling the
+/// launcher's process group then kills only bubblewrap and leaves the sandboxed
+/// command running. The inner stage re-arms the parent-death signal itself and
+/// polls this pidfd to prove that bubblewrap was still alive once the signal
+/// was armed. From inside the PID namespace `getppid()` returns 0, so the
+/// pidfd is the only available proof; bubblewrap also closes inherited
+/// descriptors in its monitor, which rules out a pipe.
+///
+/// Fail closed: every `pidfd_open` error refuses the launch, including
+/// `ENOSYS`. Kernels without pidfds (before Linux 5.3) are unsupported because
+/// the startup race cannot be proven there.
+///
+/// Descriptor flow: `pidfd_open` returns the descriptor with `FD_CLOEXEC` set
+/// and it is owned as an `OwnedFd`/`File` in `preserved_files`. `FD_CLOEXEC`
+/// is cleared only by `make_files_inheritable` (`exec_util.rs`) immediately
+/// before the exec into bubblewrap, so it is inherited only along
+/// launcher -> bubblewrap -> `--apply-seccomp-then-exec` stage, which re-sets
+/// `FD_CLOEXEC` and closes it before applying any restriction or running user
+/// code. If clearing the flag fails, the panic drops `preserved_files` and
+/// closes it.
+fn attach_bwrap_parent_pidfd(
+    argv: &mut Vec<String>,
+    preserved_files: &mut Vec<File>,
+    open_pidfd: impl FnOnce() -> std::io::Result<OwnedFd>,
+) -> std::io::Result<()> {
+    let Some(command_separator) = argv.iter().position(|argument| argument == "--") else {
+        return Ok(());
+    };
+    let inner_command = command_separator + 1;
+    if argv.get(inner_command).is_none()
+        || !argv[inner_command + 1..]
+            .iter()
+            .take_while(|argument| argument.as_str() != "--")
+            .any(|argument| argument == "--apply-seccomp-then-exec")
+    {
+        return Ok(());
+    }
+
+    let pidfd = open_pidfd().map_err(|err| {
+        std::io::Error::new(
+            err.kind(),
+            format!(
+                "failed to open a pidfd for the bubblewrap parent ({err}); the inner sandbox \
+                 stage needs it to prove bubblewrap is alive after re-arming its parent-death \
+                 signal (Linux 5.3 or newer is required)"
+            ),
+        )
+    })?;
+    argv.splice(
+        inner_command + 1..inner_command + 1,
+        [
+            BWRAP_PARENT_PIDFD_ARG.to_string(),
+            pidfd.as_raw_fd().to_string(),
+        ],
+    );
+    preserved_files.push(File::from(pidfd));
+    Ok(())
+}
+
+fn open_own_pidfd() -> std::io::Result<OwnedFd> {
+    // SAFETY: pidfd_open takes a pid and flags and returns a new descriptor.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: pidfd_open returned a fresh descriptor (with FD_CLOEXEC set by
+    // the kernel) that nothing else owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) })
 }
 
 fn translate_legacy_bwrap_fd_mounts(argv: &mut Vec<String>) -> Result<(), String> {
@@ -245,6 +333,111 @@ fn exec_system_bwrap(
     }
     let err = std::io::Error::last_os_error();
     panic!("failed to exec system bubblewrap {program_path}: {err}");
+    fn inner_stage_argv() -> Vec<String> {
+        vec![
+            "bwrap".to_string(),
+            "--die-with-parent".to_string(),
+            "--".to_string(),
+            "/usr/bin/codex-linux-sandbox".to_string(),
+            "--apply-seccomp-then-exec".to_string(),
+            "--".to_string(),
+            "echo".to_string(),
+        ]
+    }
+
+    #[test]
+    fn attaches_parent_pidfd_to_the_inner_sandbox_stage() {
+        let mut argv = inner_stage_argv();
+        let mut preserved_files = Vec::new();
+
+        attach_bwrap_parent_pidfd(&mut argv, &mut preserved_files, open_own_pidfd)
+            .expect("pidfd should attach");
+
+        assert_eq!(preserved_files.len(), 1);
+        let pidfd = preserved_files[0].as_raw_fd();
+        assert_eq!(
+            argv,
+            vec![
+                "bwrap".to_string(),
+                "--die-with-parent".to_string(),
+                "--".to_string(),
+                "/usr/bin/codex-linux-sandbox".to_string(),
+                BWRAP_PARENT_PIDFD_ARG.to_string(),
+                pidfd.to_string(),
+                "--apply-seccomp-then-exec".to_string(),
+                "--".to_string(),
+                "echo".to_string(),
+            ]
+        );
+        // SAFETY: querying descriptor flags has no side effects.
+        let flags = unsafe { libc::fcntl(pidfd, libc::F_GETFD) };
+        assert_eq!(
+            flags,
+            libc::FD_CLOEXEC,
+            "the pidfd must stay close-on-exec until the exec into bubblewrap"
+        );
+        crate::exec_util::make_files_inheritable(&preserved_files);
+        // SAFETY: querying descriptor flags has no side effects.
+        let flags = unsafe { libc::fcntl(pidfd, libc::F_GETFD) };
+        assert_eq!(flags, 0, "the exec into bubblewrap must inherit the pidfd");
+        let mut poll_fd = libc::pollfd {
+            fd: pidfd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `poll_fd` is valid for the duration of the call.
+        let ready = unsafe { libc::poll(&mut poll_fd, 1, 0) };
+        assert_eq!(ready, 0, "the live current process must not poll as exited");
+    }
+
+    #[test]
+    fn refuses_launch_when_pidfd_open_fails() {
+        for errno in [
+            libc::EPERM,
+            libc::ENOSYS,
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ESRCH,
+            libc::EINVAL,
+        ] {
+            let mut argv = inner_stage_argv();
+            let mut preserved_files = Vec::new();
+
+            let err = attach_bwrap_parent_pidfd(&mut argv, &mut preserved_files, || {
+                Err(std::io::Error::from_raw_os_error(errno))
+            })
+            .expect_err("a pidfd_open failure must refuse the launch");
+
+            assert!(
+                err.to_string()
+                    .contains("failed to open a pidfd for the bubblewrap parent"),
+                "unexpected error for errno {errno}: {err}"
+            );
+            assert_eq!(argv, inner_stage_argv());
+            assert!(preserved_files.is_empty());
+        }
+    }
+
+    #[test]
+    fn does_not_attach_parent_pidfd_without_the_inner_sandbox_stage() {
+        let original = vec![
+            "bwrap".to_string(),
+            "--".to_string(),
+            "/usr/bin/true".to_string(),
+            "--".to_string(),
+            "--apply-seccomp-then-exec".to_string(),
+        ];
+        let mut argv = original.clone();
+        let mut preserved_files = Vec::new();
+
+        attach_bwrap_parent_pidfd(&mut argv, &mut preserved_files, || {
+            panic!("no pidfd is needed without the inner sandbox stage")
+        })
+        .expect("argv without the inner stage needs no pidfd");
+
+        assert_eq!(argv, original);
+        assert!(preserved_files.is_empty());
+    }
 }
 
 #[cfg(test)]

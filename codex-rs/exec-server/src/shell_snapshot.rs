@@ -372,6 +372,19 @@ impl ShellSnapshotCache {
         };
 
         telemetry.shell_snapshot_command(wait, availability, "used");
+        if let Some(reader) = &reader {
+            codex_sandboxing::attach_forwarded_fds(
+                prepared.sandbox,
+                &mut prepared.command,
+                &[codex_sandboxing::ForwardedFd::new(
+                    reader.as_raw_fd(),
+                    codex_sandboxing::ForwardedFdRole::SnapshotSource,
+                )],
+            )
+            .map_err(|err| {
+                internal_error(format!("failed to bind snapshot source descriptor: {err}"))
+            })?;
+        }
         Ok(reader)
     }
 }
@@ -441,6 +454,22 @@ done
     let shell_start = prepared.command.len() - params.argv.len();
     let mut argv = prepared.command.clone();
     argv[shell_start + 2] = script;
+    if let Some(probe) = &probe {
+        codex_sandboxing::attach_forwarded_fds(
+            prepared.sandbox,
+            &mut argv,
+            &[codex_sandboxing::ForwardedFd::new(
+                probe.as_raw_fd(),
+                codex_sandboxing::ForwardedFdRole::SnapshotProbe,
+            )],
+        )
+        .map_err(|err| {
+            (
+                "snapshot_probe_fd",
+                internal_error(format!("failed to bind snapshot probe descriptor: {err}")),
+            )
+        })?;
+    }
     let (program, args) = argv.split_first().ok_or_else(|| {
         (
             "missing_command",

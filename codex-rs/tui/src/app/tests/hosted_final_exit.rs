@@ -67,7 +67,12 @@ async fn hosted_session_with_transport_retention(
     ))
     .await?;
     eprintln!("HOSTED_SETUP dynamic tools started");
-    let started = boxed_future!(app_server.start_thread(&app.config)).await?;
+    let start = boxed_future!(app_server.start_thread(&app.config));
+    eprintln!(
+        "HOSTED_SETUP thread future bytes={}",
+        std::mem::size_of_val(start.as_ref().get_ref())
+    );
+    let started = start.await?;
     eprintln!("HOSTED_SETUP thread started");
     assert!(
         started.task_tools_available,

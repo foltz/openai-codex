@@ -1110,6 +1110,8 @@ impl AppServerSession {
 
     #[cfg(test)]
     pub(crate) async fn start_thread(&mut self, config: &Config) -> Result<AppServerStartedThread> {
+        #[cfg(test)]
+        eprintln!("HOSTED_START wrapper entered");
         self.start_thread_with_session_start_source(
             &LocalSettings::from(config),
             config,
@@ -1132,6 +1134,8 @@ impl AppServerSession {
         selected_profile: Option<&PermissionProfileSelection>,
         host_project_cwd: Option<&std::path::Path>,
     ) -> Result<AppServerStartedThread> {
+        #[cfg(test)]
+        eprintln!("HOSTED_START source entered");
         if self.thread_params_mode.settings_owner() == ThreadSettingsOwner::Server
             && selected_profile.is_some()
         {

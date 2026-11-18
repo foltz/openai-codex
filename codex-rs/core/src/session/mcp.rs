@@ -178,6 +178,7 @@ impl Session {
         .with_canonical_thread_id(self.thread_id.to_string())
         .with_control_endpoint(self.control_endpoint.clone())
         .with_connection_pool(self.services.mcp_manager.connection_pool())
+        .with_hosted_endpoint_custody(self.services.mcp_manager.hosted_endpoint_custody())
         .with_selected_environments(
             environments.all_selections().into(),
             environments.ready_environment_handles(),

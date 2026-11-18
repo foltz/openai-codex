@@ -112,6 +112,7 @@ enum OrderedMcpOverlay {
 #[derive(Clone)]
 pub struct McpManager {
     connection_pool: codex_mcp::McpConnectionPool,
+    hosted_endpoint_custody: codex_mcp::HostedEndpointCustody,
     plugins_manager: Arc<PluginsManager>,
     extensions: Arc<ExtensionRegistry<Config>>,
     codex_apps_tools_cache: ConnectorRuntimeManager<ToolInfo>,
@@ -137,6 +138,7 @@ impl McpManager {
     ) -> Self {
         Self {
             connection_pool: codex_mcp::McpConnectionPool::default(),
+            hosted_endpoint_custody: codex_mcp::HostedEndpointCustody::default(),
             plugins_manager,
             extensions,
             codex_apps_tools_cache,
@@ -153,7 +155,13 @@ impl McpManager {
             ConnectorRuntimeManager::default(),
         );
         manager.connection_pool = self.connection_pool.clone();
+        manager.hosted_endpoint_custody = self.hosted_endpoint_custody.clone();
         manager
+    }
+
+    /// Shared across every session and plugin-manager view of this runtime owner.
+    pub fn hosted_endpoint_custody(&self) -> codex_mcp::HostedEndpointCustody {
+        self.hosted_endpoint_custody.clone()
     }
 
     pub fn plugins_manager(&self) -> Arc<PluginsManager> {

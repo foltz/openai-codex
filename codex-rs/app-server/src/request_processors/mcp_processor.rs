@@ -219,7 +219,10 @@ impl McpRequestProcessor {
                     self.thread_manager.environment_manager(),
                     config.cwd.to_path_buf(),
                 )
-                .with_control_endpoint(self.control_endpoint.clone());
+                .with_control_endpoint(self.control_endpoint.clone())
+                .with_hosted_endpoint_custody(
+                    self.thread_manager.mcp_manager().hosted_endpoint_custody(),
+                );
                 (mcp_config, runtime_context)
             }
         };
@@ -508,7 +511,10 @@ impl McpRequestProcessor {
                         self.thread_manager.environment_manager(),
                         config.cwd.to_path_buf(),
                     )
-                    .with_control_endpoint(self.control_endpoint.clone()),
+                    .with_control_endpoint(self.control_endpoint.clone())
+                    .with_hosted_endpoint_custody(
+                        self.thread_manager.mcp_manager().hosted_endpoint_custody(),
+                    ),
                 ),
             };
             let mut snapshot = collect_mcp_server_status_snapshot_with_detail(
@@ -788,7 +794,10 @@ impl McpRequestProcessor {
         // environment stdio MCPs must declare their own absolute cwd.
         let runtime_context =
             McpRuntimeContext::new(Arc::clone(&environment_manager), config.cwd.to_path_buf())
-                .with_control_endpoint(self.control_endpoint.clone());
+                .with_control_endpoint(self.control_endpoint.clone())
+                .with_hosted_endpoint_custody(
+                    self.thread_manager.mcp_manager().hosted_endpoint_custody(),
+                );
         let response_request_id = request_id.clone();
 
         let task = async move {

@@ -1414,6 +1414,7 @@ pub struct McpRuntimeContext {
     local_http_client: Arc<dyn HttpClient>,
     canonical_thread_id: Option<String>,
     control_endpoint: Option<String>,
+    hosted_endpoint_custody: Option<crate::HostedEndpointCustody>,
 }
 
 /// Applies the local HTTP headers helper configured for an MCP server.
@@ -1480,7 +1481,19 @@ impl McpRuntimeContext {
             local_http_client,
             canonical_thread_id: None,
             control_endpoint: None,
+            hosted_endpoint_custody: None,
         }
+    }
+
+    /// Shares the runtime owner's weak hosted-connection custody. It carries no
+    /// ordinary connection lease and cannot keep a physical transport alive.
+    pub fn with_hosted_endpoint_custody(mut self, custody: crate::HostedEndpointCustody) -> Self {
+        self.hosted_endpoint_custody = Some(custody);
+        self
+    }
+
+    pub(crate) fn hosted_endpoint_custody(&self) -> Option<&crate::HostedEndpointCustody> {
+        self.hosted_endpoint_custody.as_ref()
     }
 
     /// Supplies the owning session's canonical identity; threadless callers

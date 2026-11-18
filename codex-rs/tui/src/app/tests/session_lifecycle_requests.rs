@@ -1,4 +1,7 @@
 use super::*;
+
+#[path = "clear_settings_tests.rs"]
+mod clear_settings;
 use crate::app_event::TranscriptExportDestination;
 use crate::bottom_pane::BottomPaneView;
 use crate::test_support::boxed_future;
@@ -6519,4 +6522,242 @@ async fn provider_error_preserves_partial_history_notice() -> Result<()> {
         proxy.await??;
     }
     Ok(())
+}
+
+#[test]
+fn clear_session_uses_exact_displayed_thread_before_unsubscribe_and_attaches_successor()
+-> Result<()> {
+    const TEST_STACK_SIZE_BYTES: usize = 8 * 1024 * 1024;
+
+    std::thread::Builder::new()
+        .name("tui-clear-displayed-predecessor".to_string())
+        .stack_size(TEST_STACK_SIZE_BYTES)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(async {
+                let mut app = make_test_app().await;
+                // Clear qualification must not wait for external plugin catalog sync.
+                app.config.features.disable(Feature::Plugins)?;
+                app.cli_kv_overrides
+                    .push(("features.plugins".to_string(), toml::Value::Boolean(false)));
+                let codex_home = tempdir()?;
+                app.config.codex_home = codex_home.path().to_path_buf().abs();
+                app.config.sqlite = SqliteConfig::new_for_testing(codex_home.path().abs());
+                let (mut app_server, requests, proxy) = start_recording_app_server(
+                    &app.config,
+                    /*blocked_thread_list*/ None,
+                    /*failed_thread_name*/ None,
+                )
+                .await?;
+                let mut tui = crate::tui::test_support::make_test_tui()?;
+
+                app.start_fresh_session(
+                    &mut tui,
+                    &mut app_server,
+                    /*session_start_source*/ None,
+                    /*initial_user_message*/ None,
+                    /*new_thread_name*/ None,
+                )
+                .await;
+                let primary = app
+                    .current_displayed_thread_id()
+                    .expect("first fresh session should be displayed");
+                let predecessor = app_server
+                    .start_thread(&app.config)
+                    .await?
+                    .session
+                    .thread_id;
+                assert_ne!(predecessor, primary);
+                app.active_thread_id = Some(predecessor);
+
+                app.handle_event(&mut tui, &mut app_server, AppEvent::ClearUi { name: None })
+                    .await?;
+
+                let starts = recorded_params(&requests, "thread/start");
+                assert_eq!(starts.len(), 2);
+                assert!(starts.iter().all(|params| {
+                    params.get("sessionStartSource") == Some(&serde_json::Value::Null)
+                        && params.get("clearPredecessorThreadId") == Some(&serde_json::Value::Null)
+                }));
+                let clears = recorded_params(&requests, "thread/clear");
+                assert_eq!(clears.len(), 1);
+                assert_eq!(clears[0]["threadId"], predecessor.to_string());
+                assert!(clears[0]["modelSettings"].is_object());
+                let (clear_index, first_unsubscribe) = {
+                    let recorded = requests.lock().expect("request recorder lock");
+                    let clear_index = recorded
+                        .iter()
+                        .position(|request| request.method == "thread/clear")
+                        .expect("combined clear request should be recorded");
+                    let first_unsubscribe = recorded
+                        .iter()
+                        .position(|request| request.method == "thread/unsubscribe")
+                        .expect("post-clear local cleanup should unsubscribe old listeners");
+                    (clear_index, first_unsubscribe)
+                };
+                assert!(clear_index < first_unsubscribe);
+
+                let successor = app
+                    .current_displayed_thread_id()
+                    .expect("clear successor should be displayed");
+                assert_ne!(successor, predecessor);
+                let retained: codex_app_server_protocol::ThreadRetentionAcquireResponse =
+                    app_server
+                        .request_handle()
+                        .request_typed(ClientRequest::ThreadRetentionAcquire {
+                            request_id: app_server.next_request_id(),
+                            params: codex_app_server_protocol::ThreadRetentionAcquireParams {
+                                thread_id: successor.to_string(),
+                            },
+                        })
+                        .await?;
+                assert!(matches!(
+                    retained,
+                    codex_app_server_protocol::ThreadRetentionAcquireResponse::AlreadyHeld { .. }
+                ));
+                assert_eq!(
+                    app_server
+                        .thread_read(successor, /*include_turns*/ false)
+                        .await?
+                        .id,
+                    successor.to_string()
+                );
+
+                app_server.shutdown().await?;
+                proxy.await??;
+                Ok(())
+            })
+        })?
+        .join()
+        .expect("clear displayed predecessor test thread")
+}
+
+#[test]
+fn failed_repeated_clear_keeps_resumed_predecessor_displayed_without_unsubscribe() -> Result<()> {
+    const TEST_STACK_SIZE_BYTES: usize = 8 * 1024 * 1024;
+
+    std::thread::Builder::new()
+        .name("tui-clear-failure-preserves-predecessor".to_string())
+        .stack_size(TEST_STACK_SIZE_BYTES)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(async {
+                let mut app = make_test_app().await;
+                app.config.features.disable(Feature::Plugins)?;
+                app.cli_kv_overrides
+                    .push(("features.plugins".to_owned(), toml::Value::Boolean(false)));
+                let codex_home = tempdir()?;
+                app.config.codex_home = codex_home.path().to_path_buf().abs();
+                app.config.sqlite = SqliteConfig::new_for_testing(codex_home.path().abs());
+                // Fresh-session startup rebuilds config from launch overrides, not
+                // the resolved SqliteConfig above. Keep that reload isolated too.
+                app.cli_kv_overrides.push((
+                    "sqlite_home".to_string(),
+                    toml::Value::String(codex_home.path().to_string_lossy().into_owned()),
+                ));
+                let reloaded = app
+                    .rebuild_config_for_cwd(app.config.cwd.to_path_buf())
+                    .await?;
+                assert_eq!(reloaded.sqlite, app.config.sqlite);
+                let (mut app_server, requests, proxy) = start_recording_app_server(
+                    &app.config,
+                    /*blocked_thread_list*/ None,
+                    /*failed_thread_name*/ None,
+                )
+                .await?;
+                let mut tui = crate::tui::test_support::make_test_tui()?;
+
+                app.start_fresh_session(
+                    &mut tui,
+                    &mut app_server,
+                    /*session_start_source*/ None,
+                    /*initial_user_message*/ None,
+                    /*new_thread_name*/ None,
+                )
+                .await;
+                let predecessor = app
+                    .current_displayed_thread_id()
+                    .expect("predecessor should be displayed");
+                assert_eq!(
+                    app.config.sqlite,
+                    SqliteConfig::new_for_testing(codex_home.path().abs())
+                );
+                let state = codex_state::StateRuntime::init(
+                    app.config.sqlite.clone(),
+                    app.config.model_provider_id.clone(),
+                )
+                .await
+                .map_err(std::io::Error::other)?;
+                let transition_id = codex_state::ClearTransitionId::new();
+                let codex_state::ClearTransitionReserveOutcome::Reserved(_) = state
+                    .reserve_clear_transition(transition_id, predecessor, ThreadId::new())
+                    .await
+                    .map_err(std::io::Error::other)?
+                else {
+                    panic!("expected fresh clear transition reservation");
+                };
+                for (expected, next) in [
+                    (
+                        codex_state::ClearTransitionPhase::Reserved,
+                        codex_state::ClearTransitionPhase::SuccessorCreated,
+                    ),
+                    (
+                        codex_state::ClearTransitionPhase::SuccessorCreated,
+                        codex_state::ClearTransitionPhase::Committed,
+                    ),
+                    (
+                        codex_state::ClearTransitionPhase::Committed,
+                        codex_state::ClearTransitionPhase::EvidenceClaimed,
+                    ),
+                    (
+                        codex_state::ClearTransitionPhase::EvidenceClaimed,
+                        codex_state::ClearTransitionPhase::Completed,
+                    ),
+                ] {
+                    assert!(
+                        state
+                            .advance_clear_transition_phase(transition_id, expected, next)
+                            .await
+                            .map_err(std::io::Error::other)?
+                    );
+                }
+                let request_count_before_failure =
+                    requests.lock().expect("request recorder lock").len();
+
+                app.clear_displayed_session(
+                    &mut tui,
+                    &mut app_server,
+                    /*initial_user_message*/ None,
+                    /*new_thread_name*/ None,
+                )
+                .await;
+
+                assert_eq!(app.current_displayed_thread_id(), Some(predecessor));
+                let failure_request_methods = {
+                    let recorded = requests.lock().expect("request recorder lock");
+                    recorded[request_count_before_failure..]
+                        .iter()
+                        .map(|request| request.method.clone())
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(failure_request_methods, vec!["config/read", "thread/clear"]);
+                assert_eq!(
+                    app_server
+                        .thread_read(predecessor, /*include_turns*/ false)
+                        .await?
+                        .id,
+                    predecessor.to_string()
+                );
+
+                app_server.shutdown().await?;
+                proxy.await??;
+                Ok(())
+            })
+        })?
+        .join()
+        .expect("clear failure preservation test thread")
 }

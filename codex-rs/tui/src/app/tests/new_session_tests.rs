@@ -541,7 +541,14 @@ async fn plan_implementation_reads_approved_plan_file_in_fresh_session() -> Resu
     app.config = app
         .rebuild_config_for_cwd(workspace.path().canonicalize()?)
         .await?;
-    let mut server = crate::start_embedded_app_server_for_picker(&app.config).await?;
+    app.config
+        .features
+        .set_enabled(codex_features::Feature::Plugins, false)?;
+    app.cli_kv_overrides
+        .push(("features.plugins".into(), toml::Value::Boolean(false)));
+    let (mut server, wire_requests, proxy) =
+        super::session_lifecycle_requests::start_recording_app_server(&app.config, None, None)
+            .await?;
     let mut tui = crate::tui::test_support::make_test_tui()?;
     let plan = format!(
         "# Plan\n{}\n- Verify the final step.\n",
@@ -559,6 +566,23 @@ async fn plan_implementation_reads_approved_plan_file_in_fresh_session() -> Resu
     .await?;
     let thread_id = app.chat_widget.thread_id().expect("fresh thread");
     assert_ne!(thread_id, source_id);
+    let starts = super::session_lifecycle_requests::recorded_params(&wire_requests, "thread/start");
+    assert_eq!(starts.len(), 2, "one original start and one plan start");
+    assert_eq!(starts[1]["sessionStartSource"], "clear");
+    assert_eq!(starts[1]["clearPredecessorThreadId"], source_id.to_string());
+    assert!(
+        super::session_lifecycle_requests::recorded_params(&wire_requests, "thread/clear")
+            .is_empty()
+    );
+    assert_eq!(
+        super::session_lifecycle_requests::recorded_params(
+            &wire_requests,
+            "thread/prepareApprovedPlan"
+        )
+        .len(),
+        1
+    );
+
     let attachments = app.config.codex_home.join("attachments");
     let mut dirs = std::fs::read_dir(&attachments)?;
     let path = dirs
@@ -628,6 +652,7 @@ async fn plan_implementation_reads_approved_plan_file_in_fresh_session() -> Resu
         )
     );
     server.shutdown().await?;
+    proxy.await??;
     Ok(())
 }
 

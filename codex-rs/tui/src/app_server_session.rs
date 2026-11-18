@@ -14,6 +14,7 @@ pub(crate) use final_exit::FINAL_EXIT_BUDGET;
 pub(crate) use final_exit::FinalExit;
 pub(crate) use final_exit::HostedRetireOutcome;
 pub(crate) use final_exit::final_exit_sessions;
+mod clear_recovery;
 pub(crate) mod fs;
 mod history;
 mod models;
@@ -23,6 +24,8 @@ pub(crate) mod provider_selection;
 mod provider_selection_tests;
 mod read_state;
 mod realtime;
+mod retention;
+pub(crate) use retention::PendingRetention;
 mod rollout_history;
 pub(crate) use read_state::unread_revision;
 mod side_chat_history;
@@ -399,6 +402,9 @@ pub(crate) struct AppServerSession {
     /// request handle below and have no connection owner.
     connection_owner: Option<AppServerClient>,
     reported_disconnect: Option<String>,
+    retention: retention::RetentionClient,
+    retention_warnings:
+        tokio::sync::mpsc::UnboundedReceiver<codex_app_server_protocol::WarningNotification>,
     request_handle: AppServerRequestHandle,
     request_id_namespace: Option<Uuid>,
     next_request_id: i64,
@@ -618,10 +624,13 @@ impl AppServerSession {
         request_handle: AppServerRequestHandle,
         thread_params_mode: ThreadParamsMode,
     ) -> Self {
+        let (retention, retention_warnings) = retention::RetentionClient::new();
         Self {
             backend_id,
             connection_owner,
             reported_disconnect: None,
+            retention,
+            retention_warnings,
             request_handle,
             request_id_namespace: None,
             next_request_id: 1,
@@ -715,6 +724,8 @@ impl AppServerSession {
             self.request_handle(),
             self.thread_params_mode,
         );
+        // A view uses the same connection's adoption ordering and warning route.
+        view.retention = self.retention.clone();
         view.request_id_namespace = Some(Uuid::new_v4());
         view.remote_cwd_override = self.remote_cwd_override.clone();
         view.model_provider_override = self.model_provider_override.clone();
@@ -1089,7 +1100,13 @@ impl AppServerSession {
     }
 
     pub(crate) async fn next_event(&mut self) -> Option<AppServerSessionEvent> {
-        let event = self.connection_owner.as_mut()?.next_event().await?;
+        let owner = self.connection_owner.as_mut()?;
+        let event = tokio::select! {
+            biased;
+            Some(warning) = self.retention_warnings.recv() =>
+                Some(AppServerEvent::ServerNotification(Box::new(codex_app_server_protocol::ServerNotification::Warning(warning)))),
+            event = owner.next_event() => event,
+        }?;
         if let AppServerEvent::Disconnected { message } = &event
             && self.reported_disconnect.is_none()
         {
@@ -1106,6 +1123,47 @@ impl AppServerSession {
             backend_id: self.backend_id,
             event,
         })
+    }
+
+    /// Adopts the clear successor from `thread/clear`'s retention evidence,
+    /// falling back to a separate acquisition only when evidence is absent.
+    pub(crate) async fn retain_clear_successor(
+        &self,
+        thread_id: &str,
+        evidence: Option<codex_app_server_protocol::ThreadRetentionAcquireResponse>,
+    ) -> Option<retention::PendingRetention> {
+        match self
+            .retention
+            .adopt_thread(self.request_handle(), thread_id.to_string(), evidence)
+            .await
+        {
+            Ok(retention) => Some(retention),
+            Err(error) => {
+                self.retention.warn_clear(thread_id, &error);
+                None
+            }
+        }
+    }
+
+    pub(crate) async fn thread_clear(
+        &mut self,
+        thread_id: ThreadId,
+        model_settings: codex_app_server_protocol::ThreadClearModelSettings,
+    ) -> Result<codex_app_server_protocol::ThreadClearResponse> {
+        let request_id = self.next_request_id();
+        // Ask for atomic adoption; only response evidence proves it happened.
+        // Never retried without the flag: servers that predate it ignore it.
+        self.request_handle
+            .request_typed(ClientRequest::ThreadClear {
+                request_id,
+                params: codex_app_server_protocol::ThreadClearParams {
+                    thread_id: thread_id.to_string(),
+                    model_settings: Some(model_settings),
+                    retain_for_connection: true,
+                },
+            })
+            .await
+            .wrap_err("thread/clear failed in TUI")
     }
 
     #[cfg(test)]

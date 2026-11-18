@@ -279,6 +279,7 @@ impl App {
                 started,
                 config,
                 local_settings,
+                retention: None,
             },
             ThreadAttachPresentation::FreshAfterClear,
             /*initial_user_message*/ None,

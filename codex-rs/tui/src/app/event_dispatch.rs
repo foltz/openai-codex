@@ -530,13 +530,9 @@ impl App {
                 if self.reject_pending_permission_root_switch() {
                     return Ok(AppRunControl::Continue);
                 }
-                self.clear_terminal_ui(tui, /*redraw_header*/ false)?;
-                self.reset_app_ui_state_after_clear();
-
-                self.start_fresh_session(
+                self.clear_displayed_session_boxed(
                     tui,
                     app_server,
-                    Some(ThreadStartSource::Clear),
                     /*initial_user_message*/ None,
                     name,
                 )

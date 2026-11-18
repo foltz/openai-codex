@@ -365,3 +365,58 @@ async fn delayed_thread_publication_checks_identity_after_the_host_transition() 
     started.thread.shutdown_and_wait().await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn user_reload_retains_applied_identity_when_no_thread_can_be_materialized()
+-> anyhow::Result<()> {
+    use crate::mcp_config_identity::AppliedMcpConfigIdentity;
+    use crate::mcp_config_identity::McpConfigIdentity;
+    let home = tempfile::tempdir()?;
+    let file = home.path().join(codex_config::CONFIG_TOML_FILE);
+    std::fs::write(&file, "[features]\nplugins = false\n")?;
+    let manager = ConfigManager::without_managed_config_for_tests(home.path().to_path_buf());
+    let initial = manager.load_latest_config(None).await?;
+    let applied = AppliedMcpConfigIdentity::from_startup_config(&initial);
+    let baseline = applied.current();
+    assert!(baseline.is_some());
+    let threads = codex_core::test_support::thread_manager_with_models_provider_and_home(
+        CodexAuth::from_api_key("dummy"),
+        initial.model_provider.clone(),
+        initial.codex_home.to_path_buf(),
+        Arc::new(EnvironmentManager::default_for_tests()),
+    )
+    .with_runtime_config_change_gate(applied.apply_gate())
+    .with_runtime_config_change_listener(Arc::new(applied.clone()));
+    let started = threads
+        .start_thread(codex_core::StartThreadOptions::new(initial, None))
+        .await?;
+    std::fs::write(
+        &file,
+        "model_provider = 'missing-provider'\n[features]\nplugins = false\n",
+    )?;
+    manager.load_config_layers(None).await?;
+    let current = started.thread.config().await;
+    assert!(
+        manager
+            .load_latest_config_with_session_layers(&current.config_layer_stack, &current.cwd)
+            .await
+            .is_err(),
+        "raw layers load, but this thread cannot materialize the unknown provider"
+    );
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        reload_user_config(&manager, &threads, &applied),
+    )
+    .await?;
+    assert_eq!(
+        applied.current(),
+        baseline,
+        "no identity-bearing publication occurred, so the last baseline remains truthful"
+    );
+    assert_eq!(
+        McpConfigIdentity::from_config(&started.thread.config().await)?,
+        baseline
+    );
+    started.thread.shutdown_and_wait().await?;
+    Ok(())
+}

@@ -4735,20 +4735,19 @@ impl ThreadRequestProcessor {
         }
         let response_history = thread_history.clone();
 
-        match self
-            .thread_manager
-            .start_thread(StartThreadOptions {
+        let parent_trace = match target {
+            ThreadResumeTarget::Client(request_id) => self.request_trace_context(request_id).await,
+            ThreadResumeTarget::DaemonRecovery(_) => None,
+        };
+        match box_thread_start_future(|| {
+            self.thread_manager.start_thread(StartThreadOptions {
                 initial_history: thread_history,
-                parent_trace: match target {
-                    ThreadResumeTarget::Client(request_id) => {
-                        self.request_trace_context(request_id).await
-                    }
-                    ThreadResumeTarget::DaemonRecovery(_) => None,
-                },
+                parent_trace,
                 client_mcp_extensions,
                 ..StartThreadOptions::new(config, self.control_endpoint.clone())
             })
-            .await
+        })
+        .await
         {
             Ok(NewThread {
                 thread_id,

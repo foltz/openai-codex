@@ -2710,6 +2710,83 @@ class McpAuthStatus(Enum):
     o_auth = "oAuth"
 
 
+class McpHostedEndpointCustodyCensus(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    capacity: Annotated[
+        int, Field(description="Bound on declared plus tombstoned endpoints.", ge=0)
+    ]
+    declared: Annotated[int, Field(ge=0)]
+    provisional: Annotated[int, Field(ge=0)]
+    tombstones: Annotated[int, Field(ge=0)]
+
+
+class McpHostedEndpointRefusalReason(Enum):
+    not_owner = "notOwner"
+    not_loopback = "notLoopback"
+    not_used = "notUsed"
+    rate_limited = "rateLimited"
+    network_denied = "networkDenied"
+    connection_closed = "connectionClosed"
+    proof_failed = "proofFailed"
+    retired = "retired"
+    capacity_exhausted = "capacityExhausted"
+    expired = "expired"
+
+
+class McpHostedEndpointRetireCensus(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    custody: McpHostedEndpointCustodyCensus
+    failed: Annotated[int, Field(ge=0)]
+    incomplete: Annotated[int, Field(ge=0)]
+    possibly_untracked: Annotated[
+        bool,
+        Field(
+            alias="possiblyUntracked",
+            description="Owners may have been admitted before the declaration. Makes the result incomplete.",
+        ),
+    ]
+    proven_before_retirement: Annotated[
+        int,
+        Field(
+            alias="provenBeforeRetirement",
+            description="Owners that left earlier with a cached complete retirement proof.",
+            ge=0,
+        ),
+    ]
+    retired: Annotated[int, Field(ge=0)]
+    timed_out: Annotated[int, Field(alias="timedOut", ge=0)]
+    unknown: Annotated[
+        int,
+        Field(
+            description="Owners that vanished without terminal proof. Any makes the result incomplete.",
+            ge=0,
+        ),
+    ]
+
+
+class McpHostedEndpointRetirementOutcome(Enum):
+    retired = "retired"
+    incomplete = "incomplete"
+    timed_out = "timedOut"
+    failed = "failed"
+
+
+class McpHostedEndpointThreadReceipt(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    connections: Annotated[int, Field(ge=0)]
+    outcome: McpHostedEndpointRetirementOutcome
+    thread_id: Annotated[
+        str | None,
+        Field(alias="threadId", description="`None` for a runtime that belongs to no thread."),
+    ] = None
+
+
 class McpResourceReadTarget(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -2721,6 +2798,22 @@ class McpResourceReadTarget(BaseModel):
             alias="linkId",
             description="Null explicitly requests no-auth access, subject to the app's resource policy.",
         ),
+    ]
+
+
+class McpServerConfigIdentityLayer(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    file_path: Annotated[
+        str,
+        Field(
+            alias="filePath",
+            description="Normalized absolute path spelling from the accepted selected user configuration snapshot. This deliberately does not resolve symlinks.",
+        ),
+    ]
+    version: Annotated[
+        str, Field(description="Existing canonical layer version, in `sha256:...` form.")
     ]
 
 
@@ -8392,6 +8485,17 @@ class ConfigMcpServerReloadRequest(BaseModel):
     params: Annotated[None, Field(None)] = None
 
 
+class ConfigMcpServerIdentityRequest(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    id: RequestId
+    method: Annotated[
+        Literal["config/mcpServer/identity"], Field(title="Config/mcpServer/identityRequestMethod")
+    ]
+    params: Annotated[None, Field(None)] = None
+
+
 class McpServerToolCallRequest(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -9692,6 +9796,21 @@ class McpResourceReadResponse(BaseModel):
             description="Originating call when the server applied app-specific resource scoping.",
         ),
     ] = None
+
+
+class McpServerConfigIdentity(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    layers: list[McpServerConfigIdentityLayer]
+
+
+class McpServerConfigIdentityResponse(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    applied: McpServerConfigIdentity
+    current: McpServerConfigIdentity
 
 
 class McpServerStatus(BaseModel):
@@ -14243,6 +14362,7 @@ class ClientRequest(
         | ExperimentalFeatureEnablementSetRequest
         | McpServerOauthLoginRequest
         | ConfigMcpServerReloadRequest
+        | ConfigMcpServerIdentityRequest
         | McpServerStatusListRequest
         | McpServerResourceReadRequest
         | McpServerToolCallRequest
@@ -14356,6 +14476,7 @@ class ClientRequest(
         | ExperimentalFeatureEnablementSetRequest
         | McpServerOauthLoginRequest
         | ConfigMcpServerReloadRequest
+        | ConfigMcpServerIdentityRequest
         | McpServerStatusListRequest
         | McpServerResourceReadRequest
         | McpServerToolCallRequest

@@ -2134,6 +2134,29 @@
             },
             "method": {
               "enum": [
+                "config/mcpServer/identity"
+              ],
+              "title": "Config/mcpServer/identityRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "id",
+            "method"
+          ],
+          "title": "Config/mcpServer/identityRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
                 "mcpServerStatus/list"
               ],
               "title": "McpServerStatus/listRequestMethod",
@@ -15880,6 +15903,224 @@
         ],
         "type": "string"
       },
+      "McpHostedEndpointCustodyCensus": {
+        "description": "Fixed custody bound and its use. Tombstones are permanent.",
+        "properties": {
+          "capacity": {
+            "description": "Bound on declared plus tombstoned endpoints.",
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "declared": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "provisional": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "tombstones": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "capacity",
+          "declared",
+          "provisional",
+          "tombstones"
+        ],
+        "type": "object"
+      },
+      "McpHostedEndpointRefusalReason": {
+        "description": "Typed, mutation-free refusal.",
+        "oneOf": [
+          {
+            "description": "Unknown endpoint, wrong capability, or not declared on this connection (including a connection that has closed).",
+            "enum": [
+              "notOwner"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Only literal, canonical loopback HTTP endpoints can be declared.",
+            "enum": [
+              "notLoopback"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "This connection has not named the endpoint in its own thread overrides.",
+            "enum": [
+              "notUsed"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Too many ownership challenges on this connection or overall.",
+            "enum": [
+              "rateLimited"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "The runtime owner's network policy refuses the challenge destination.",
+            "enum": [
+              "networkDenied"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "The requesting connection closed before any challenge was sent.",
+            "enum": [
+              "connectionClosed"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "The endpoint did not prove possession of the retirement capability.",
+            "enum": [
+              "proofFailed"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "The owner retired this endpoint; the tombstone is permanent.",
+            "enum": [
+              "retired"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "The fixed custody capacity is in use; nothing is evicted.",
+            "enum": [
+              "capacityExhausted"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "The caller's budget had already expired on arrival.",
+            "enum": [
+              "expired"
+            ],
+            "type": "string"
+          }
+        ]
+      },
+      "McpHostedEndpointRetireCensus": {
+        "properties": {
+          "custody": {
+            "$ref": "#/definitions/v2/McpHostedEndpointCustodyCensus"
+          },
+          "failed": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "incomplete": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "possiblyUntracked": {
+            "description": "Owners may have been admitted before the declaration. Makes the result incomplete.",
+            "type": "boolean"
+          },
+          "provenBeforeRetirement": {
+            "description": "Owners that left earlier with a cached complete retirement proof.",
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "retired": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "timedOut": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "unknown": {
+            "description": "Owners that vanished without terminal proof. Any makes the result incomplete.",
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "custody",
+          "failed",
+          "incomplete",
+          "possiblyUntracked",
+          "provenBeforeRetirement",
+          "retired",
+          "timedOut",
+          "unknown"
+        ],
+        "type": "object"
+      },
+      "McpHostedEndpointRetirementOutcome": {
+        "oneOf": [
+          {
+            "description": "Every physical attempt of every owner for this thread has positive terminal evidence.",
+            "enum": [
+              "retired"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Ownership or close was not observed, or an owner vanished without proof. Custody is retained.",
+            "enum": [
+              "incomplete"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "The deadline expired first. Custody is retained.",
+            "enum": [
+              "timedOut"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "A logical or process close failed. Custody is retained.",
+            "enum": [
+              "failed"
+            ],
+            "type": "string"
+          }
+        ]
+      },
+      "McpHostedEndpointThreadReceipt": {
+        "properties": {
+          "connections": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "outcome": {
+            "$ref": "#/definitions/v2/McpHostedEndpointRetirementOutcome"
+          },
+          "threadId": {
+            "description": "`None` for a runtime that belongs to no thread.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "connections",
+          "outcome"
+        ],
+        "type": "object"
+      },
       "McpResourceReadParams": {
         "properties": {
           "_meta": {
@@ -15973,6 +16214,56 @@
           "connectorId",
           "linkId"
         ],
+        "type": "object"
+      },
+      "McpServerConfigIdentity": {
+        "description": "Identity of every selected user configuration layer that supplied effective MCP configuration, ordered from base to highest-precedence profile.",
+        "properties": {
+          "layers": {
+            "items": {
+              "$ref": "#/definitions/v2/McpServerConfigIdentityLayer"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "layers"
+        ],
+        "type": "object"
+      },
+      "McpServerConfigIdentityLayer": {
+        "description": "One selected user configuration layer that contributes to effective MCP configuration.",
+        "properties": {
+          "filePath": {
+            "description": "Normalized absolute path spelling from the accepted selected user configuration snapshot. This deliberately does not resolve symlinks.",
+            "type": "string"
+          },
+          "version": {
+            "description": "Existing canonical layer version, in `sha256:...` form.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "filePath",
+          "version"
+        ],
+        "type": "object"
+      },
+      "McpServerConfigIdentityResponse": {
+        "description": "Paired MCP configuration identities for diagnostic comparison.\n\n`applied` identifies the selected user layers accepted at startup or by the most recent complete host-owned runtime publication, only while every live runtime (including delegates) agrees. The method returns an error when that process-wide identity is unavailable or runtime publication is incomplete. `current` is freshly loaded through the server's configuration manager when this method runs; disk edits alone never advance `applied`.",
+        "properties": {
+          "applied": {
+            "$ref": "#/definitions/v2/McpServerConfigIdentity"
+          },
+          "current": {
+            "$ref": "#/definitions/v2/McpServerConfigIdentity"
+          }
+        },
+        "required": [
+          "applied",
+          "current"
+        ],
+        "title": "McpServerConfigIdentityResponse",
         "type": "object"
       },
       "McpServerConnectionStatus": {

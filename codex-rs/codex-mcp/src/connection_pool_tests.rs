@@ -150,6 +150,10 @@ impl InProcessTransportFactory for TestServer {
 
 pub(crate) fn key(context: &McpRuntimeContext, config: &McpServerConfig) -> ConnectionKey {
     ConnectionKey {
+        hosted_endpoint: context
+            .hosted_endpoint_custody()
+            .cloned()
+            .zip(crate::runtime::hosted_endpoint_key(config).map(|(key, _)| key)),
         attempt_requirement: crate::McpAttemptRequirement::Ungated,
         server_name: "test_server".to_string(),
         identity: reusable_server_identity("test_server", config, context),
@@ -2287,4 +2291,47 @@ async fn physical_continuation_keeps_admitted_account_work_after_chat_cancellati
             .any(|row| row.kind == PoolWorkerKind::Startup && row.joined == 1 && row.pending == 0)
     );
     assert_eq!(live.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn retired_hosted_key_refuses_pool_acquisition_before_reserving_or_starting() {
+    let custody = crate::HostedEndpointCustody::default();
+    let endpoint = codex_rmcp_client::EndpointKey::for_streamable_http(
+        "http://127.0.0.1:4000/mcp",
+        "Bearer pool-hosted",
+    );
+    let capability = codex_rmcp_client::CapabilityDigest::of("pool-capability");
+    custody.track_override(endpoint, 1).expect("track");
+    custody.declare(endpoint, capability, 1).expect("declare");
+    assert!(
+        custody
+            .retire(endpoint, capability, 1, tokio::time::Instant::now())
+            .await
+            .expect("retire")
+            .is_complete()
+    );
+    let context = context().with_hosted_endpoint_custody(custody);
+    let config: McpServerConfig = serde_json::from_value(json!({
+        "url": "http://127.0.0.1:4000/mcp",
+        "http_headers": {"Authorization": "Bearer pool-hosted"}
+    }))
+    .expect("config");
+    let pool = McpConnectionPool::default();
+    let starts = AtomicUsize::new(0);
+    let result = pool
+        .acquire(
+            key(&context, &config),
+            &Arc::new(ConnectionSlot::default()),
+            Arc::new(Mutex::new(None)),
+            &CancellationToken::new(),
+            |_, _, _| {
+                starts.fetch_add(1, Ordering::SeqCst);
+                futures::future::ready(Err(StartupOutcomeError::Cancelled))
+                    .boxed()
+                    .shared()
+            },
+        )
+        .await;
+    assert!(matches!(result, Err(StartupOutcomeError::Cancelled)));
+    assert_eq!(starts.load(Ordering::SeqCst), 0);
 }

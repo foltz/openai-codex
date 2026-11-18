@@ -103,6 +103,10 @@ pub struct McpConnectionPool {
 
 #[derive(Clone)]
 pub(crate) struct ConnectionKey {
+    // This is launch authority, not a new sharing identity. `identity` below
+    // already binds the full configured endpoint; manager views share custody.
+    pub(crate) hosted_endpoint:
+        Option<(crate::HostedEndpointCustody, codex_rmcp_client::EndpointKey)>,
     pub(crate) server_name: String,
     pub(crate) attempt_requirement: crate::McpAttemptRequirement,
     pub(crate) identity: McpServerConnectionIdentity,
@@ -443,6 +447,15 @@ impl McpConnectionPool {
                     .entries
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // Cover Joiners as well as Creators: a join allocates no new
+                // lower and therefore never enters the physical constructor.
+                if key
+                    .hosted_endpoint
+                    .as_ref()
+                    .is_some_and(|(custody, endpoint)| custody.is_retired(endpoint))
+                {
+                    return Err(StartupOutcomeError::Cancelled);
+                }
                 entries.retain(|entry| entry.strong_count() > 0);
                 let lease_cancellation = cancellation.child_token();
                 let existing = entries

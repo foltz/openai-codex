@@ -964,6 +964,10 @@ impl McpConnectionSet {
                 (
                     pool.clone(),
                     ConnectionKey {
+                        hosted_endpoint: runtime_context.hosted_endpoint_custody().cloned().zip(
+                            crate::runtime::hosted_endpoint_key(server.config())
+                                .map(|(key, _)| key),
+                        ),
                         server_name: server_name.clone(),
                         identity: connection_identity.clone(),
                         attempt_requirement,

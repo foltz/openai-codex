@@ -1805,7 +1805,7 @@ impl MessageProcessor {
                                 .derive_request_operation_work()
                                 .map_err(|_| account_transition_in_progress())?;
                             let operation = box_dispatch_future(|| {
-                                processor_for_request.handle_initialized_client_request(
+                                processor_for_request.route_initialized_client_request(
                                     connection_request_id,
                                     codex_request,
                                     request_context,
@@ -1859,6 +1859,106 @@ impl MessageProcessor {
             tokio::spawn(async move {
                 request.run().await;
             });
+        }
+        Ok(())
+    }
+
+    async fn route_initialized_client_request(
+        self: Arc<Self>,
+        connection_request_id: ConnectionRequestId,
+        codex_request: ClientRequest,
+        request_context: RequestContext,
+        session: Arc<ConnectionSessionState>,
+        event_stream_ready: Option<McpEventStreamReady>,
+        managed_transition_caller_authorized: bool,
+    ) -> Result<(), JSONRPCErrorError> {
+        match codex_request {
+            request @ (ClientRequest::ThreadResume { .. } | ClientRequest::ThreadFork { .. }) => {
+                box_dispatch_future(|| {
+                    self.handle_thread_session_request(connection_request_id, request, session)
+                })
+                .await
+            }
+            request => {
+                box_dispatch_future(|| {
+                    self.handle_initialized_client_request(
+                        connection_request_id,
+                        request,
+                        request_context,
+                        session,
+                        event_stream_ready,
+                        managed_transition_caller_authorized,
+                    )
+                })
+                .await
+            }
+        }
+    }
+
+    // Keep long-running session startup out of the unrelated RPC match's poll frame.
+    async fn handle_thread_session_request(
+        self: Arc<Self>,
+        connection_request_id: ConnectionRequestId,
+        codex_request: ClientRequest,
+        session: Arc<ConnectionSessionState>,
+    ) -> Result<(), JSONRPCErrorError> {
+        let stack_probe = 0u8;
+        eprintln!("COLD_TRACE small session dispatch sp={:p}", &stack_probe);
+        let connection_id = connection_request_id.connection_id;
+        let app_server_client_name = session.app_server_client_name().map(str::to_string);
+        let client_version = session.client_version().map(str::to_string);
+        let client_mcp_extensions = session.client_mcp_extensions();
+        let request_id = ConnectionRequestId {
+            connection_id,
+            request_id: codex_request.id().clone(),
+        };
+        let result: Result<Option<ClientResponsePayload>, JSONRPCErrorError> = match codex_request {
+            ClientRequest::ThreadResume { params, .. } => {
+                self.thread_processor
+                    .thread_resume_with_retention(
+                        ThreadResumeTarget::Client(request_id.clone()),
+                        crate::thread_state::RetainingParams {
+                            retention: connection_retention(
+                                params.retain_for_connection,
+                                session.retention_acquire_authority(),
+                            ),
+                            params,
+                        },
+                        app_server_client_name.clone(),
+                        client_version.clone(),
+                        client_mcp_extensions.clone(),
+                    )
+                    .await
+            }
+            ClientRequest::ThreadFork { params, .. } => {
+                self.thread_processor
+                    .thread_fork(
+                        request_id.clone(),
+                        crate::thread_state::RetainingParams {
+                            retention: connection_retention(
+                                params.retain_for_connection,
+                                session.retention_acquire_authority(),
+                            ),
+                            params,
+                        },
+                        app_server_client_name.clone(),
+                        client_version.clone(),
+                        client_mcp_extensions.clone(),
+                    )
+                    .await
+            }
+            _ => unreachable!("only thread session requests use the small dispatch path"),
+        };
+        match result {
+            Ok(Some(response)) => {
+                self.outgoing
+                    .send_response_as(request_id.clone(), response)
+                    .await;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.outgoing.send_error(request_id.clone(), error).await;
+            }
         }
         Ok(())
     }
@@ -2116,39 +2216,8 @@ impl MessageProcessor {
                 }
                 Ok(response)
             }
-            ClientRequest::ThreadResume { params, .. } => {
-                self.thread_processor
-                    .thread_resume_with_retention(
-                        ThreadResumeTarget::Client(request_id.clone()),
-                        crate::thread_state::RetainingParams {
-                            retention: connection_retention(
-                                params.retain_for_connection,
-                                session.retention_acquire_authority(),
-                            ),
-                            params,
-                        },
-                        app_server_client_name.clone(),
-                        client_version.clone(),
-                        client_mcp_extensions.clone(),
-                    )
-                    .await
-            }
-            ClientRequest::ThreadFork { params, .. } => {
-                self.thread_processor
-                    .thread_fork(
-                        request_id.clone(),
-                        crate::thread_state::RetainingParams {
-                            retention: connection_retention(
-                                params.retain_for_connection,
-                                session.retention_acquire_authority(),
-                            ),
-                            params,
-                        },
-                        app_server_client_name.clone(),
-                        client_version.clone(),
-                        client_mcp_extensions.clone(),
-                    )
-                    .await
+            ClientRequest::ThreadResume { .. } | ClientRequest::ThreadFork { .. } => {
+                unreachable!("thread session requests use the small dispatch path")
             }
             ClientRequest::ThreadSample { params, .. } => self
                 .thread_processor

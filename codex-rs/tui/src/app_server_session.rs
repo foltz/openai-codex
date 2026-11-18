@@ -26,7 +26,6 @@ mod read_state;
 mod realtime;
 mod retention;
 pub(crate) use retention::PendingRetention;
-pub(crate) use retention::PendingRetention;
 mod rollout_history;
 pub(crate) use read_state::unread_revision;
 mod side_chat_history;

@@ -61,7 +61,7 @@ async fn start_in_process_client(
         state_db: None,
         environment_manager,
         config_warnings: Vec::new(),
-        session_source: SessionSource::Cli,
+        session_source: SessionSource::Cli.into(),
         enable_codex_api_key_env: false,
         initialize: InitializeParams {
             client_info: ClientInfo {

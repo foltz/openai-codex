@@ -95,6 +95,15 @@ async fn thread_interactive_subscription_list_is_empty_without_server_entitlemen
         .await?;
     assert!(matches!(initialized, JSONRPCMessage::Response(_)));
 
+    // Populate an actual subscription: an empty server would make this
+    // negative pass even if role self-assertion accidentally conferred authority.
+    let started_id = app_server
+        .send_raw_request("thread/start", Some(serde_json::json!({"ephemeral": true})))
+        .await?;
+    let started: ThreadStartResponse =
+        timeout(DEFAULT_TIMEOUT, app_server.read_response(started_id)).await??;
+    assert!(!started.thread.id.is_empty());
+
     let request_id = app_server
         .send_raw_request(
             "kcf/thread/interactiveSubscription/list",
@@ -141,7 +150,7 @@ async fn embedded_interactive_client_populates_public_subscription_snapshot() ->
         state_db: None,
         environment_manager,
         config_warnings: Vec::new(),
-        session_source: SessionSource::Cli,
+        session_source: SessionSource::Cli.into(),
         enable_codex_api_key_env: false,
         initialize: InitializeParams {
             client_info: ClientInfo {

@@ -457,7 +457,7 @@ impl McpRequestProcessor {
                 .await;
             outgoing.send_result(request, result).await;
         };
-        self.spawn_mcp_request(request_id, task).await;
+        self.spawn_mcp_request(request_id, task).await?;
         Ok(())
     }
 
@@ -770,7 +770,7 @@ impl McpRequestProcessor {
                 )
                 .await;
             };
-            self.spawn_mcp_request(request_id, task).await;
+            self.spawn_mcp_request(request_id, task).await?;
             return Ok(());
         }
 
@@ -821,7 +821,7 @@ impl McpRequestProcessor {
             )
             .await;
         };
-        self.spawn_mcp_request(request_id, task).await;
+        self.spawn_mcp_request(request_id, task).await?;
         Ok(())
     }
 
@@ -867,7 +867,7 @@ impl McpRequestProcessor {
                 .map_err(mcp_operation_error);
             outgoing.send_result(response_request_id, result).await;
         };
-        self.spawn_mcp_request(request_id, task).await;
+        self.spawn_mcp_request(request_id, task).await?;
         Ok(())
     }
 
@@ -875,15 +875,35 @@ impl McpRequestProcessor {
         &'a self,
         request_id: &'a ConnectionRequestId,
         task: impl Future<Output = ()> + Send + 'static,
-    ) -> impl Future<Output = ()> + 'a {
+    ) -> impl Future<Output = Result<(), JSONRPCErrorError>> + 'a {
+        // Tokio task locals do not cross spawn. Derive finite custody in the
+        // executing RPC before the trace lookup or any task boundary.
+        let work = crate::account_turn_admission::derive_request_work();
         // Bound the dispatcher future before awaiting the request trace lookup.
         let task = Box::pin(task);
         async move {
+            let work = work.map_err(|_| internal_error("MCP request account work unavailable"))?;
             let trace =
                 McpRequestTrace::from_w3c(self.outgoing.request_trace_context(request_id).await);
-            tokio::spawn(AuthStorageOriginator::current().scope(trace.scope(task)));
+            spawn_scoped_mcp_request(
+                work,
+                AuthStorageOriginator::current().scope(trace.scope(task)),
+            )
         }
     }
+}
+
+fn spawn_scoped_mcp_request(
+    work: Option<crate::account_work_permits::AccountWorkPermitGuard>,
+    task: impl Future<Output = ()> + Send + 'static,
+) -> Result<(), JSONRPCErrorError> {
+    // The existing auth ledger retains the original join and propagates the
+    // admitted auth context. Dropping its observer never cancels the original.
+    codex_model_provider::spawn_provider_task(Box::pin(
+        crate::account_turn_admission::within_request(work, task),
+    ))
+    .map(|_observation| ())
+    .map_err(|_| internal_error("MCP request auth task custody unavailable"))
 }
 
 fn mcp_operation_error(error: anyhow::Error) -> JSONRPCErrorError {
@@ -931,5 +951,87 @@ fn mcp_server_config_identity(identity: McpConfigIdentity) -> McpServerConfigIde
                 version: layer.version,
             })
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod request_custody_tests {
+    use super::*;
+    use crate::account_operation_work::AccountOperationWork;
+    use crate::account_turn_work::AccountTurnWork;
+    use crate::account_work_permits::AccountWorkPermits;
+    use crate::processor_task_retirement::ProcessorTasks;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+    use tokio::time::Duration;
+    use tokio::time::Instant;
+
+    #[tokio::test]
+    async fn spawned_mcp_request_keeps_account_and_auth_custody_after_rpc_returns() {
+        let permits = AccountWorkPermits::new();
+        let tasks = ProcessorTasks::default();
+        let operation = AccountOperationWork {
+            permit: permits.try_acquire().unwrap(),
+            turns: AccountTurnWork::default(),
+            auth_tasks: Some(tasks.ticket()),
+        };
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        crate::account_turn_admission::within_request(
+            permits.try_acquire(),
+            crate::auth_task_work::scope_account_request(
+                tasks.ticket(),
+                Some(Box::new(operation)),
+                async {
+                    let work = crate::account_turn_admission::derive_request_work().unwrap();
+                    spawn_scoped_mcp_request(work, async move {
+                        ready.send(()).unwrap();
+                        released.await.unwrap();
+                        // Captured authority derives during drain; it never opens
+                        // a fresh permit or becomes an ungated standalone call.
+                        assert!(
+                            crate::account_turn_admission::derive_request_work()
+                                .unwrap()
+                                .is_some()
+                        );
+                    })
+                    .unwrap();
+                    started.await.unwrap();
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        permits.close();
+        assert!(permits.admitted_count() > 0);
+        assert!(permits.try_acquire().is_none());
+        assert!(!tasks.shutdown_until(Instant::now()).await.terminal);
+        release.send(()).unwrap();
+        assert!(
+            tasks
+                .shutdown_until(Instant::now() + Duration::from_secs(1))
+                .await
+                .is_clean()
+        );
+        assert_eq!(permits.admitted_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn closed_auth_owner_refuses_mcp_dispatch_before_polling() {
+        let tasks = ProcessorTasks::default();
+        tasks.close_registration().unwrap();
+        let polled = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&polled);
+        let result = crate::auth_task_work::scope_account_request(tasks.ticket(), None, async {
+            assert!(
+                spawn_scoped_mcp_request(None, async move {
+                    observed.store(true, Ordering::SeqCst);
+                })
+                .is_err()
+            );
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(!polled.load(Ordering::SeqCst));
     }
 }

@@ -352,7 +352,7 @@ async fn stalled_remote_retirement_does_not_starve_an_embedded_close() -> Result
     app.config
         .features
         .set_enabled(codex_features::Feature::Plugins, false)?;
-    let embedded = crate::lib_tests::start_test_embedded_app_server(app.config.clone()).await?;
+    let embedded = crate::tests::start_test_embedded_app_server(app.config.clone()).await?;
     let embedded = AppServerSession::new(
         crate::backend_id::BackendId::new(),
         codex_app_server_client::AppServerClient::InProcess(embedded),

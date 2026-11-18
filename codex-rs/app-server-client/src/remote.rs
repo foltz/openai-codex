@@ -1848,14 +1848,17 @@ mod tests {
         assert!(error.to_string().contains("original retained by run host"));
         assert_eq!(Instant::now(), deadline);
         assert_eq!(
-            host.observe_client_workers_until(Instant::now()).await,
+            host.observe_client_workers_until(Instant::now())
+                .await
+                .expect("run-host observation succeeds"),
             vec![TaskObservation::TimedOut]
         );
         release.send(()).unwrap();
         done.await.unwrap();
         assert_eq!(
             host.observe_client_workers_until(Instant::now() + Duration::from_secs(1))
-                .await,
+                .await
+                .expect("run-host observation succeeds"),
             vec![TaskObservation::Terminated(TaskTermination::Normal)]
         );
     }
@@ -1907,7 +1910,8 @@ mod tests {
         assert!(queued.await.unwrap().is_err());
         assert_eq!(
             host.observe_client_workers_until(Instant::now() + Duration::from_secs(2))
-                .await,
+                .await
+                .expect("run-host observation succeeds"),
             vec![TaskObservation::Terminated(TaskTermination::Normal)]
         );
         release.send(()).unwrap();
@@ -2136,7 +2140,8 @@ mod final_exit_tests {
         );
         assert_eq!(
             host.observe_client_workers_until(Instant::now() + Duration::from_secs(1))
-                .await,
+                .await
+                .expect("run-host observation succeeds"),
             vec![TaskObservation::Terminated(TaskTermination::Normal)]
         );
     }

@@ -227,17 +227,15 @@ impl SandboxCleanupCustody {
 
     /// Collects the launch report in the owner's process until every cleanup
     /// helper is proven exited (launcher and reaper pidfds) or the cleanup
-    /// deadline passes. A launch that still has no deadline is retired now:
-    /// the owner grants
-    /// `retire_grace`. Blocking.
+    /// deadline passes. A launch that still has no deadline receives
+    /// `retire_grace` unless terminal proof is already available. Blocking.
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
     pub fn collect_blocking(self, retire_grace: Duration) -> SandboxCleanupSummary {
         #[cfg(target_os = "linux")]
         {
-            if self.inner.deadline().is_none() {
-                self.sink.tighten(Instant::now() + retire_grace);
-            }
-            self.inner.collect_blocking().summary()
+            self.inner
+                .collect_blocking_with_retire_grace(retire_grace)
+                .summary()
         }
         #[cfg(not(target_os = "linux"))]
         {

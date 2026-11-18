@@ -26,6 +26,7 @@ use std::os::fd::RawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 use std::time::Instant;
 
 use codex_protocol::exec_output::SandboxCleanupState;
@@ -348,11 +349,30 @@ impl LinuxSandboxCleanupCustody {
     ///
     /// Report EOF is never evidence of anything but a closed descriptor; an
     /// unnamed helper stays unproven. Blocking.
+    pub(crate) fn collect_blocking_with_retire_grace(
+        self,
+        retire_grace: Duration,
+    ) -> LinuxSandboxCleanupReport {
+        let retire_deadline = self
+            .tightener
+            .deadline()
+            .is_none()
+            .then(|| Instant::now() + retire_grace);
+        self.collect_blocking_until(retire_deadline)
+    }
+
+    #[cfg(test)]
     pub(crate) fn collect_blocking(self) -> LinuxSandboxCleanupReport {
+        self.collect_blocking_until(None)
+    }
+
+    fn collect_blocking_until(self, retire_deadline: Option<Instant>) -> LinuxSandboxCleanupReport {
         let expired = || {
-            self.tightener
-                .deadline()
-                .is_none_or(|deadline| Instant::now() >= deadline)
+            let deadline = match (self.tightener.deadline(), retire_deadline) {
+                (Some(owner), Some(retire)) => Some(owner.min(retire)),
+                (owner, retire) => owner.or(retire),
+            };
+            deadline.is_none_or(|deadline| Instant::now() >= deadline)
         };
         let mut text = Vec::new();
         let mut parsed_blocks = 0;
@@ -403,6 +423,14 @@ impl LinuxSandboxCleanupCustody {
             }
             if launcher_exited && helpers.all_proven_exited() && !report_open {
                 break true;
+            }
+            // First consume only currently available terminal evidence. A
+            // completed launch needs no new deadline delivered to a gone reader.
+            // Otherwise publish the retirement bound before any blocking wait.
+            if self.tightener.deadline().is_none()
+                && let Some(deadline) = retire_deadline
+            {
+                self.tightener.tighten(deadline);
             }
             let Some(deadline) = self.tightener.deadline() else {
                 break false;

@@ -34,6 +34,7 @@ use codex_utils_pty::SpawnedPty;
 use super::UNIFIED_EXEC_OUTPUT_MAX_BYTES;
 use super::UNIFIED_EXEC_OUTPUT_MAX_TOKENS;
 use super::UnifiedExecError;
+use super::cleanup::SandboxCleanup;
 use super::process_state::ProcessState;
 use crate::shell_snapshot::ShellSnapshotFile;
 
@@ -108,6 +109,7 @@ pub(crate) struct UnifiedExecProcess {
     output_task: Option<JoinHandle<()>>,
     sandbox_type: Option<SandboxType>,
     timed_out: AtomicBool,
+    sandbox_cleanup: Option<SandboxCleanup>,
     /// Explicit termination overrides retention of remote output after exit.
     pub(super) termination_requested: AtomicBool,
     // The shell may still need to replay this file after process startup returns.
@@ -154,6 +156,7 @@ impl UnifiedExecProcess {
             output_task: None,
             sandbox_type,
             timed_out: AtomicBool::new(false),
+            sandbox_cleanup: None,
             termination_requested: AtomicBool::new(false),
             _shell_snapshot: None,
         }
@@ -241,7 +244,27 @@ impl UnifiedExecProcess {
         }
     }
 
+    pub(super) async fn collect_sandbox_cleanup(&self) {
+        if let Some(cleanup) = &self.sandbox_cleanup {
+            cleanup.collect().await;
+        }
+    }
+
+    pub(super) fn retire(&self, deadline: std::time::Instant) {
+        if let Some(cleanup) = &self.sandbox_cleanup {
+            cleanup.tighten(deadline);
+        }
+        self.request_termination();
+    }
+
     pub(super) fn terminate(&self) {
+        if let Some(cleanup) = &self.sandbox_cleanup {
+            cleanup.terminate();
+        }
+        self.request_termination();
+    }
+
+    fn request_termination(&self) {
         match &self.process_handle {
             ProcessHandle::Local(process_handle) => process_handle.terminate(),
             ProcessHandle::ExecServer(process_handle) => {
@@ -255,6 +278,9 @@ impl UnifiedExecProcess {
     }
 
     pub(super) async fn terminate_confirmed(&self) -> Result<(), UnifiedExecError> {
+        if let Some(cleanup) = &self.sandbox_cleanup {
+            cleanup.terminate();
+        }
         match &self.process_handle {
             ProcessHandle::Local(process_handle) => process_handle.terminate(),
             ProcessHandle::ExecServer(process_handle) => {
@@ -266,6 +292,7 @@ impl UnifiedExecProcess {
         }
         self.signal_exit(self.exit_code());
         self.finish_termination();
+        self.collect_sandbox_cleanup().await;
         Ok(())
     }
 
@@ -357,6 +384,14 @@ impl UnifiedExecProcess {
         spawned: SpawnedPty,
         sandbox_type: SandboxType,
     ) -> Result<Self, UnifiedExecError> {
+        Self::from_spawned_with_cleanup(spawned, sandbox_type, None).await
+    }
+
+    pub(super) async fn from_spawned_with_cleanup(
+        spawned: SpawnedPty,
+        sandbox_type: SandboxType,
+        cleanup: Option<SandboxCleanup>,
+    ) -> Result<Self, UnifiedExecError> {
         let SpawnedPty {
             session: process_handle,
             stdout_rx,
@@ -368,6 +403,8 @@ impl UnifiedExecProcess {
             Some(sandbox_type),
             OutputDrainPolicy::BoundedAfterExit,
         );
+        // The scope/census/custody are installed before the first early-exit await.
+        managed.sandbox_cleanup = cleanup;
         managed.output_task = Some(Self::spawn_local_output_task(
             stdout_rx,
             stderr_rx,
@@ -378,11 +415,13 @@ impl UnifiedExecProcess {
         match exit_rx.try_recv() {
             Ok(exit_code) => {
                 managed.signal_exit(Some(exit_code));
+                managed.collect_sandbox_cleanup().await;
                 managed.check_for_sandbox_denial().await?;
                 return Ok(managed);
             }
             Err(TryRecvError::Closed) => {
                 managed.signal_exit(/*exit_code*/ None);
+                managed.collect_sandbox_cleanup().await;
                 managed.check_for_sandbox_denial().await?;
                 return Ok(managed);
             }
@@ -391,6 +430,7 @@ impl UnifiedExecProcess {
 
         if let Ok(exit_result) = tokio::time::timeout(EARLY_EXIT_GRACE_PERIOD, &mut exit_rx).await {
             managed.signal_exit(exit_result.ok());
+            managed.collect_sandbox_cleanup().await;
             managed.check_for_sandbox_denial().await?;
             return Ok(managed);
         }

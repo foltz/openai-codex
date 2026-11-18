@@ -186,6 +186,7 @@ pub(crate) fn spawn_exit_watcher(
             let _ = network_denial_monitor.await;
         }
         let _interaction_guard = interaction_lock.lock_owned().await;
+        process.collect_sandbox_cleanup().await;
 
         let duration = Instant::now().saturating_duration_since(started_at);
         let plugin_metrics_sidecar = plugin_metrics_sidecar

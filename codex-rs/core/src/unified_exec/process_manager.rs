@@ -13,6 +13,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use super::cleanup::SandboxCleanup;
 use super::oneshot::Completion;
 use super::process::OutputDrainPolicy;
 
@@ -815,6 +816,7 @@ impl UnifiedExecProcessManager {
                 self.release_process_id(request.process_id).await;
                 return Err(fail_process_with_message(process.as_ref(), message));
             }
+            process.collect_sandbox_cleanup().await;
             let exit_code = process.exit_code();
             let exit = exit_code.unwrap_or(-1);
             initial_exec_command_guard
@@ -1456,8 +1458,30 @@ impl UnifiedExecProcessManager {
             } else {
                 None
             };
+        let mut cleanup = SandboxCleanup::for_launch(
+            request.sandbox,
+            request.sandbox_cleanup_scope.clone(),
+            request.sandbox_cleanup_census.clone(),
+        )
+        .map_err(|err| UnifiedExecError::create_process(err.to_string()))?;
+        let mut command = request.command.clone();
+        if let Some(cleanup) = cleanup.as_mut()
+            && let Err(error) = cleanup.attach(&mut command)
+        {
+            cleanup.not_launched();
+            return Err(UnifiedExecError::create_process(error.to_string()));
+        }
+        let inherited_fds = cleanup
+            .as_ref()
+            .map(SandboxCleanup::inherited_fds)
+            .unwrap_or_default();
+        let child_fds = if cleanup.is_some() {
+            codex_utils_pty::ChildFds::Attached(&inherited_fds)
+        } else {
+            codex_utils_pty::ChildFds::Inherited(&[])
+        };
         let spawn_result = codex_sandboxing::spawn_process(codex_sandboxing::SpawnRequest {
-            command: &request.command,
+            command: &command,
             cwd: native_cwd.as_path(),
             env: &request.env,
             arg0: &request.arg0,
@@ -1465,12 +1489,35 @@ impl UnifiedExecProcessManager {
             windows_sandbox,
             tty,
             stdin_open: tty,
-            inherited_fds: codex_utils_pty::ChildFds::Inherited(&[]),
+            inherited_fds: child_fds,
         })
         .await;
-        let spawned =
-            spawn_result.map_err(|err| UnifiedExecError::create_process(err.to_string()))?;
-        UnifiedExecProcess::from_spawned(spawned, request.sandbox).await
+        // The spawn opened this pin before its wait task could reap. Transfer
+        // it now, before any await, and close child-side fds on failure too.
+        if let Some(cleanup) = cleanup.as_mut() {
+            let pin = spawn_result
+                .as_ref()
+                .ok()
+                .and_then(|spawned| spawned.session.take_launcher_pin());
+            if spawn_result.is_ok() && pin.is_none() {
+                // A successful local spawn must supply its original pin even
+                // if pidfd_open failed inside it. Never call this "not spawned".
+                return Err(UnifiedExecError::create_process(
+                    "local sandbox spawn omitted its launcher pin".to_string(),
+                ));
+            }
+            cleanup.spawned(pin);
+        }
+        let spawned = match spawn_result {
+            Ok(spawned) => spawned,
+            Err(error) => {
+                if let Some(cleanup) = cleanup.as_mut() {
+                    cleanup.not_launched();
+                }
+                return Err(UnifiedExecError::create_process(error.to_string()));
+            }
+        };
+        UnifiedExecProcess::from_spawned_with_cleanup(spawned, request.sandbox, cleanup).await
     }
 
     #[tracing::instrument(
@@ -1805,9 +1852,16 @@ impl UnifiedExecProcessManager {
             entries
         };
 
+        // Signal every original process before waiting for any one's cleanup.
+        for entry in &entries {
+            match self.sandbox_cleanup_scope.latched() {
+                Some(deadline) => entry.process.retire(deadline),
+                None => entry.process.terminate(),
+            }
+        }
         for entry in entries {
             unregister_network_approval_for_entry(&entry).await;
-            entry.process.terminate();
+            entry.process.collect_sandbox_cleanup().await;
         }
     }
 

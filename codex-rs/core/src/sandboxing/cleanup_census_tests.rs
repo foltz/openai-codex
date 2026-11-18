@@ -715,3 +715,22 @@ async fn stream_open_guard_precedes_backend_future_construction() {
     let totals = census.totals();
     assert_eq!((totals.operations, totals.missing_receipt), (1, 1));
 }
+
+#[test]
+fn live_launch_guard_is_unproven_before_finish_or_drop() {
+    let census = Arc::new(SandboxCleanupCensus::default());
+    let operation = SandboxCleanupOperation::new(Arc::clone(&census), true);
+    assert_eq!(census.totals().pending_receipt, 1);
+    assert!(census.totals().has_unproven());
+    operation.finish(SandboxLaunch::NotLaunched, None);
+    assert_eq!(census.totals().pending_receipt, 0);
+    assert!(!census.totals().has_unproven());
+
+    let operation = SandboxCleanupOperation::new(Arc::clone(&census), true);
+    assert!(census.totals().has_unproven());
+    drop(operation);
+    let totals = census.totals();
+    assert_eq!(totals.pending_receipt, 0);
+    assert_eq!(totals.missing_receipt, 1);
+    assert!(totals.has_unproven());
+}

@@ -36,6 +36,9 @@ pub(crate) struct SandboxCleanupCensusTotals {
     /// Operations that may have launched a helper but returned no receipt
     /// (a legacy or receipt-less backend): unproven, never clean by default.
     pub(crate) missing_receipt: u64,
+    /// Live operations that may have launched but have not recorded a result.
+    /// They remain unproven even if another owner still holds their guard.
+    pub(crate) pending_receipt: u64,
     /// Receipts whose helpers were not all observed to exit.
     pub(crate) unjoined: u64,
     /// Summed per-target counts across receipts.
@@ -56,7 +59,8 @@ impl SandboxCleanupCensusTotals {
     /// incomplete or unreported one, an unjoined helper, or a target
     /// preserved as unproven.
     pub(crate) fn has_unproven(&self) -> bool {
-        self.missing_receipt > 0
+        self.pending_receipt > 0
+            || self.missing_receipt > 0
             || self.incomplete > 0
             || self.unreported > 0
             || self.unjoined > 0
@@ -159,6 +163,7 @@ pub(crate) struct SandboxCleanupOperation {
     census: Arc<SandboxCleanupCensus>,
     fallback_launch: SandboxLaunch,
     recorded: bool,
+    pending: bool,
 }
 
 impl SandboxCleanupOperation {
@@ -170,16 +175,40 @@ impl SandboxCleanupOperation {
     }
 
     fn with_launch(census: Arc<SandboxCleanupCensus>, fallback_launch: SandboxLaunch) -> Self {
+        let pending = fallback_launch != SandboxLaunch::NotLaunched;
+        if pending {
+            let mut totals = census
+                .totals
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            totals.pending_receipt = totals.pending_receipt.saturating_add(1);
+        }
         Self {
             census,
             fallback_launch,
             recorded: false,
+            pending,
+        }
+    }
+
+    fn clear_pending(&mut self) {
+        if self.pending {
+            let mut totals = self
+                .census
+                .totals
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            totals.pending_receipt = totals.pending_receipt.saturating_sub(1);
+            self.pending = false;
         }
     }
 
     pub(crate) fn finish(mut self, launch: SandboxLaunch, receipt: Option<SandboxCleanupSummary>) {
         let launch = resolve_launch(launch, self.fallback_launch != SandboxLaunch::NotLaunched);
         self.census.record_launch(launch, receipt);
+        // Publish the terminal receipt before removing the pending debt, so
+        // concurrent retirement can only see a conservative intermediate view.
+        self.clear_pending();
         self.recorded = true;
     }
 
@@ -198,6 +227,7 @@ impl Drop for SandboxCleanupOperation {
     fn drop(&mut self) {
         if !self.recorded {
             self.census.record_launch(self.fallback_launch, None);
+            self.clear_pending();
         }
     }
 }

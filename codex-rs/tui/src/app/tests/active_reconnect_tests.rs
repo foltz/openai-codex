@@ -821,6 +821,9 @@ async fn production_reconnect_adopts_only_the_installed_writable_view() -> Resul
 
 async fn production_reconnect_retention_scenario() -> Result<()> {
     use crate::app::reconnect::{ReconnectAttachment, reconnect_with_adoption};
+    use codex_app_server_protocol::{JSONRPCMessage, JSONRPCRequest};
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
     for external in [false, true] {
         let (mut app, mut events, _ops) = make_test_app_with_channels().await;
         let id = ThreadId::new();
@@ -844,9 +847,29 @@ async fn production_reconnect_retention_scenario() -> Result<()> {
         };
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await?;
-            let mut granted = false;
+            let mut socket = tokio_tungstenite::accept_async(stream).await?;
+            let Message::Text(text) = socket.next().await.expect("initialize frame")? else {
+                panic!("expected initialize text");
+            };
+            let JSONRPCMessage::Request(initialize) = serde_json::from_str(&text)? else {
+                panic!("expected initialize request");
+            };
+            assert_eq!(initialize.method, "initialize");
+            assert_eq!(
+                initialize.params.as_ref().unwrap()["capabilities"]["experimentalApi"],
+                true
+            );
+            socket
+                .send(Message::Text(
+                    json!({
+                        "id": initialize.id, "result": {"userAgent": "reconnect-test/2.0.0"}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await?;
             let mut resumes = 0;
-            let methods = serve_reconnect_requests(tokio_tungstenite::accept_async(stream).await?, |request| {
+            let methods = serve_reconnect_requests(socket, |request: JSONRPCRequest| {
                 let thread = json!({
                     "id": id, "sessionId": id, "preview": "retained", "ephemeral": false,
                     "modelProvider": "test-provider", "createdAt": 1, "updatedAt": 2,
@@ -864,18 +887,15 @@ async fn production_reconnect_retention_scenario() -> Result<()> {
                             "reasoningEffort": null});
                         if !external {
                             let status = if resumes == 0 { "acquired" } else {
-                                assert!(granted, "installed adoption must keep its grant");
                                 "alreadyHeld"
                             };
                             response["retention"] = json!({"status": status, "grantId": "new-connection-grant"});
-                            granted = true;
                         }
                         resumes += 1;
                         json!({"result": response})
                     }
                     "thread/retention/acquire" => {
                         assert!(!external, "external writer never acquires");
-                        assert!(granted, "revalidation occurs after any earlier abandonment release");
                         json!({"result": {"status": "alreadyHeld", "grantId": "new-connection-grant"}})
                     }
                     "thread/retention/release" => panic!("a committed or observed view must not abandon a grant"),

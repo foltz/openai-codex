@@ -427,6 +427,9 @@ async fn start_listener(
 ) -> ListenerStartOutcome {
     let (cancel_tx, mut cancel_rx) = oneshot::channel();
     let (drained_tx, drained_rx) = watch::channel(false);
+    // Install custody before the listener becomes visible. Cancellation before
+    // spawn drops the sender and resolves this exact join as unproven.
+    let (joined, joining) = oneshot::channel::<tokio::task::JoinHandle<()>>();
     let config_snapshot = conversation.config_snapshot().await;
     let config = conversation.config().await;
     let environments = conversation.environment_selections().await;
@@ -549,6 +552,17 @@ async fn start_listener(
                         thread_settings_baseline,
                         config_snapshot.history_mode,
                     );
+                    use futures::FutureExt;
+                    state.listener_completion = Some(
+                        async move {
+                            match joining.await {
+                                Ok(listener) => listener.await.is_ok(),
+                                Err(_) => false,
+                            }
+                        }
+                        .boxed()
+                        .shared(),
+                    );
                     let Some(listener_command_tx) = state.listener_command_tx() else {
                         tracing::warn!(
                             "thread listener command sender missing immediately after listener registration"
@@ -617,7 +631,7 @@ async fn start_listener(
         ..
     } = listener_task_context;
     let outgoing_for_task = Arc::clone(&outgoing);
-    tokio::spawn(async move {
+    let listener = tokio::spawn(async move {
         let shutdown_complete = loop {
             tokio::select! {
                 biased;
@@ -906,6 +920,9 @@ async fn start_listener(
             thread_state.clear_listener();
         }
     });
+    // No await between task creation and handing its original to the retained
+    // shared join installed above; recovery waits on this, not shutdown events.
+    let _ = joined.send(listener);
     ListenerStartOutcome::Started { attached, retained }
 }
 

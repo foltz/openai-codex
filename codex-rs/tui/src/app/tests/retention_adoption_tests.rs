@@ -143,6 +143,7 @@ async fn resume_observation_and_provisional_adoption_scenario() -> Result<()> {
         crate::app_server_session::ResumeModelSettings::PreserveExistingThread
     ))
     .await?;
+    eprintln!("COLD_TRACE client resume returned");
     let ThreadRetentionAcquireResponse::Acquired { grant_id } = probe(&mut server, id).await?
     else {
         panic!("observing a thread must not have acquired a retention grant")

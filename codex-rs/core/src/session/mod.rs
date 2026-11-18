@@ -860,6 +860,7 @@ impl Session {
         custody: Option<Arc<startup_custody::SessionStartupCustody>>,
         resources: Option<Arc<startup_resources::StartupResources>>,
     ) -> CodexResult<(Arc<Self>, SessionIo)> {
+        eprintln!("COLD_TRACE session spawn_internal entry");
         args.config
             .config_layer_stack
             .ensure_config_server_applied()?;

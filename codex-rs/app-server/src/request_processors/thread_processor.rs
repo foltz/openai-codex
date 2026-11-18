@@ -4759,6 +4759,7 @@ impl ThreadRequestProcessor {
                 session_configured,
                 ..
             }) => {
+                eprintln!("COLD_TRACE core start returned");
                 let ThreadResumeTarget::Client(request_id) = target else {
                     // Observe lifecycle events without attaching a client subscription.
                     self.thread_watch_manager

@@ -119,3 +119,41 @@ fn hosting_control_endpoint_uses_the_bound_absolute_listener_path() {
         socket_path.to_path_buf()
     );
 }
+
+#[test]
+fn router_classifies_dropped_replies_by_positive_close() {
+    use super::account_reply_drop;
+    use crate::transport::ReplyDrop;
+    use codex_app_server_transport::AbandonedOutput;
+    use codex_app_server_transport::OwnerExpiry;
+    let expiry = OwnerExpiry::never();
+    let mut refused = std::collections::HashSet::new();
+    let stdio = super::ConnectionId(1);
+    let websocket = super::ConnectionId(2);
+
+    // A closed websocket (positive close) and an unknown recipient are
+    // undeliverable, not abandoned.
+    account_reply_drop(
+        &expiry,
+        &mut refused,
+        ReplyDrop::WriterRefused {
+            connection_id: websocket,
+            disconnectable: true,
+        },
+    );
+    account_reply_drop(&expiry, &mut refused, ReplyDrop::Unregistered(websocket));
+    assert_eq!(expiry.abandoned_output(), AbandonedOutput::default());
+    assert_eq!(expiry.undeliverable_after_disconnect().messages, 2);
+
+    // A stdio writer gone without a positive close: abandoned, now and later.
+    account_reply_drop(
+        &expiry,
+        &mut refused,
+        ReplyDrop::WriterRefused {
+            connection_id: stdio,
+            disconnectable: false,
+        },
+    );
+    account_reply_drop(&expiry, &mut refused, ReplyDrop::Unregistered(stdio));
+    assert_eq!(expiry.abandoned_output().messages, 2);
+}

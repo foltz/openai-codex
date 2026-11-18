@@ -306,14 +306,27 @@ impl BackendSessions {
         .await
     }
 
-    pub(super) async fn shutdown(self) -> std::io::Result<()> {
-        let mut first_error = None;
+    pub(super) async fn final_exit_within(
+        self,
+        budget: std::time::Duration,
+    ) -> crate::app_server_session::FinalExit {
+        let mut sessions = Vec::new();
+        let mut custody = Vec::new();
         for entry in self.entries {
-            if let Err(error) = entry.session.shutdown().await {
-                first_error.get_or_insert(error);
-            }
+            sessions.push(entry.session);
+            custody.push(entry.worker_custody);
         }
-        first_error.map_or(Ok(()), Err)
+        let exit = crate::app_server_session::final_exit_sessions(sessions, budget).await;
+        drop(custody);
+        exit
+    }
+
+    pub(super) async fn shutdown(self) -> std::io::Result<()> {
+        let exit = self
+            .final_exit_within(crate::app_server_session::FINAL_EXIT_BUDGET)
+            .await;
+        exit.report();
+        exit.into_result()
     }
 }
 

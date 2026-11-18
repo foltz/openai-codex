@@ -1318,6 +1318,8 @@ pub(super) enum RealtimeRequestBehavior {
     AcceptStart,
     AcceptSpeech,
     AcceptSpeechAndStallStop,
+    StallHostedRetire,
+    HostedUnsupported,
 }
 
 pub(super) async fn start_recording_realtime_speech_app_server(
@@ -1429,6 +1431,12 @@ pub(super) async fn start_recording_app_server_with_realtime_speech(
                     {
                         continue;
                     }
+                    if realtime_behavior == RealtimeRequestBehavior::StallHostedRetire
+                        && request.method == "kcf/mcpServer/hostedEndpoint/retire"
+                    {
+                        // Keep processing other requests; only this acknowledgement stalls.
+                        continue;
+                    }
                     let request_id = request.id.clone();
                     let params = request.params.as_ref();
                     let requires_pagination = match request.method.as_str() {
@@ -1467,7 +1475,19 @@ pub(super) async fn start_recording_app_server_with_realtime_speech(
                             RealtimeRequestBehavior::AcceptSpeech
                                 | RealtimeRequestBehavior::AcceptSpeechAndStallStop
                         ) && request.method == "thread/realtime/appendSpeech");
-                    let response = if fake_realtime_response {
+                    let response = if realtime_behavior
+                        == RealtimeRequestBehavior::HostedUnsupported
+                        && request.method.starts_with("kcf/mcpServer/hostedEndpoint/")
+                    {
+                        JSONRPCMessage::Error(JSONRPCError {
+                            id: request_id,
+                            error: JSONRPCErrorError {
+                                code: -32601,
+                                data: None,
+                                message: "method not found".to_owned(),
+                            },
+                        })
+                    } else if fake_realtime_response {
                         JSONRPCMessage::Response(JSONRPCResponse {
                             id: request_id,
                             result: serde_json::json!({}),

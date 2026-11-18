@@ -276,12 +276,13 @@ impl App {
         use tokio_stream::StreamExt;
 
         async fn shutdown_startup_sessions(sessions: impl IntoIterator<Item = AppServerSession>) {
-            let shutdowns = sessions.into_iter().map(AppServerSession::shutdown);
-            let shutdown_result: std::io::Result<Vec<()>> = futures::future::join_all(shutdowns)
-                .await
-                .into_iter()
-                .collect();
-            if let Err(shutdown_error) = shutdown_result {
+            let exit = crate::app_server_session::final_exit_sessions(
+                sessions,
+                crate::app_server_session::FINAL_EXIT_BUDGET,
+            )
+            .await;
+            exit.report();
+            if let Err(shutdown_error) = exit.into_result() {
                 tracing::warn!("app-server shutdown failed: {shutdown_error}");
             }
         }

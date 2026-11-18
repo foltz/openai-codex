@@ -283,7 +283,7 @@ async fn all_backends_are_latched_before_any_retire_wait_and_share_one_deadline(
 }
 
 #[tokio::test]
-async fn shared_hosted_server_outlives_every_backend_close_and_then_drops() -> Result<()> {
+async fn hosted_server_outlives_an_unrelated_backend_close_and_then_drops() -> Result<()> {
     let Hosted {
         app_server,
         proxy,
@@ -295,13 +295,15 @@ async fn shared_hosted_server_outlives_every_backend_close_and_then_drops() -> R
         panic!("the fixture owns a real hosted MCP server");
     };
     let weak = Arc::downgrade(server);
+    // The waiting backend must not own the endpoint: otherwise its own Arc
+    // would mask an early drop of the remote's completed close result.
+    drop(transport);
     let (cloud, mut commands, _events) = codex_app_server_client::CloudClient::channel(1);
     let cloud = AppServerSession::new(
         crate::backend_id::BackendId::new(),
         codex_app_server_client::AppServerClient::Cloud(cloud),
         crate::app_server_session::ThreadParamsMode::Embedded,
-    )
-    .with_thread_tool_transport(transport);
+    );
     let close_cloud = async {
         let command = commands.recv().await.expect("cloud close is admitted");
         assert!(matches!(

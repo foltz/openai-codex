@@ -307,6 +307,8 @@ pub(crate) async fn request_thread_start_with_history_fallback(
 ) -> std::result::Result<(ThreadStartResponse, ThreadHistorySupport, bool), TypedRequestError> {
     let mut history_support = ThreadHistorySupport::Paginated;
     loop {
+        #[cfg(test)]
+        eprintln!("HOSTED_START typed request");
         match request_handle
             .request_typed(ClientRequest::ThreadStart {
                 request_id,

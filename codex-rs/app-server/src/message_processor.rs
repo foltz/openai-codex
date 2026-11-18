@@ -998,6 +998,9 @@ impl MessageProcessor {
         transport: &AppServerTransport,
         session: Arc<ConnectionSessionState>,
     ) {
+        if request.method == "thread/start" {
+            eprintln!("HOSTED_SERVER process request entered");
+        }
         let request_method = request.method.as_str();
         tracing::trace!(
             ?connection_id,

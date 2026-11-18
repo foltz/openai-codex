@@ -212,6 +212,7 @@ impl Config {
             config.tool_suggest = resolve_tool_suggest_config_from_layer_stack(&layers);
         }
         config.config_layer_stack = layers
+            .with_mcp_user_input_identity_from(&incoming.config_layer_stack)
             .with_mcp_ema_cancellation(self.config_layer_stack.mcp_ema_cancellation().clone());
         config.plugins = cfg.plugins;
         if enterprise_retired {

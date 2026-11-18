@@ -249,6 +249,9 @@ impl ConfigLayerEntry {
 
 #[derive(Debug, Clone, Default)]
 pub struct ConfigLayerStack {
+    /// Accepted user inputs for the ordinary MCP map after an MCP-only refresh.
+    /// Separate from trusted user layers retained for pinned enterprise admission.
+    mcp_user_input_identity: Option<Vec<(AbsolutePathBuf, String)>>,
     /// Runtime-only EMA authority; it does not change the configuration's contents.
     cloud_config_binding: Option<crate::CloudConfigBundleBinding>,
     /// Runtime-only cancellation inherited by config snapshots and pending EMA startups.
@@ -288,6 +291,7 @@ pub struct ConfigLayerStack {
 impl PartialEq for ConfigLayerStack {
     fn eq(&self, other: &Self) -> bool {
         let Self {
+            mcp_user_input_identity,
             cloud_config_binding: _,
             mcp_ema_cancellation: _,
             applied_config_server,
@@ -300,7 +304,8 @@ impl PartialEq for ConfigLayerStack {
             is_projectless,
             project_trust,
         } = self;
-        applied_config_server == &other.applied_config_server
+        mcp_user_input_identity == &other.mcp_user_input_identity
+            && applied_config_server == &other.applied_config_server
             && model_provider_requirements == &other.model_provider_requirements
             && layers == &other.layers
             && requirements == &other.requirements
@@ -325,6 +330,7 @@ impl ConfigLayerStack {
             &requirements_toml,
         )?);
         let stack = Self {
+            mcp_user_input_identity: None,
             cloud_config_binding: None,
             mcp_ema_cancellation: crate::McpEmaCancellation::default(),
             applied_config_server: None,
@@ -385,6 +391,30 @@ impl ConfigLayerStack {
 
     pub fn cloud_config_binding(&self) -> Option<&crate::CloudConfigBundleBinding> {
         self.cloud_config_binding.as_ref()
+    }
+
+    /// Identity of the selected user inputs accepted for MCP, never an authority
+    /// source or an alternate effective-config projection. Startup uses its
+    /// loaded layers; an MCP-only publication may retain older trusted layers
+    /// while accepting a fresh ordinary-server map.
+    pub fn mcp_user_input_identity(&self) -> Vec<(AbsolutePathBuf, String)> {
+        self.mcp_user_input_identity.clone().unwrap_or_else(|| {
+            self.layers_low_to_high()
+                .filter_map(|layer| match &layer.name {
+                    ConfigLayerSource::User { file, .. } => {
+                        Some((file.clone(), layer.version.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+    }
+
+    /// Carry the exact loaded MCP inputs alongside the resolved map without
+    /// changing config values, enterprise admission or managed restrictions.
+    pub fn with_mcp_user_input_identity_from(mut self, incoming: &Self) -> Self {
+        self.mcp_user_input_identity = Some(incoming.mcp_user_input_identity());
+        self
     }
 
     pub fn with_mcp_ema_cancellation(mut self, cancellation: crate::McpEmaCancellation) -> Self {
@@ -548,6 +578,7 @@ impl ConfigLayerStack {
             None => layers.push(user_layer),
         }
         Ok(Self {
+            mcp_user_input_identity: None,
             layers,
             cloud_config_binding: self.cloud_config_binding.clone(),
             mcp_ema_cancellation: self.mcp_ema_cancellation.clone(),
@@ -646,6 +677,7 @@ impl ConfigLayerStack {
             }
         }
         Self {
+            mcp_user_input_identity: other.mcp_user_input_identity.clone(),
             layers,
             cloud_config_binding: self.cloud_config_binding.clone(),
             mcp_ema_cancellation: self.mcp_ema_cancellation.clone(),

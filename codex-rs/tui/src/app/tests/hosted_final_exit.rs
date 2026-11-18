@@ -319,7 +319,7 @@ async fn shared_hosted_server_outlives_every_backend_close_and_then_drops() -> R
             .response
             .send(Ok(Ok(serde_json::Value::Null)))
             .expect("the final-exit observer still owns the pending close");
-        Ok::<_, anyhow::Error>(())
+        Ok::<_, color_eyre::eyre::Report>(())
     };
     let (exit, cloud_result) = tokio::join!(
         crate::app_server_session::final_exit_sessions(

@@ -4389,7 +4389,9 @@ async fn shutdown_edge_binding_does_not_wait_on_a_held_thread_map_lock() {
     let later = manager
         .start_thread(StartThreadOptions::new(config, None))
         .await;
-    assert!(matches!(later, Err(CodexErr::InternalAgentDied)));
+    assert!(
+        later.is_err_and(|error| matches!(error.details(), CodexErrorDetails::InternalAgentDied))
+    );
     assert_eq!(manager.list_thread_ids().await, visible_before);
 }
 

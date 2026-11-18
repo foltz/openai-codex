@@ -23,11 +23,20 @@ pub(super) struct ReconnectState {
     pub(super) seen_version_notice: Option<String>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReconnectAttachment {
+    Writable,
+    ExternalWriter,
+    #[cfg(test)]
+    ObserveOnly,
+}
+
 pub(super) struct Reconnected {
     pub(super) session: AppServerSession,
     bootstrap: AppServerBootstrap,
     thread: Option<AppServerStartedThread>,
     retention: Option<crate::app_server_session::PendingRetention>,
+    external_writer: bool,
 }
 
 #[cfg(test)]
@@ -56,7 +65,7 @@ pub(super) async fn reconnect(
         task_tools,
         presentation,
         worker_custody,
-        false,
+        ReconnectAttachment::ObserveOnly,
     )
     .await
 }
@@ -75,7 +84,7 @@ pub(super) async fn reconnect_with_adoption(
     task_tools: ThreadToolTransport,
     presentation: ReconnectPresentation,
     worker_custody: std::sync::Arc<codex_app_server_client::InProcessHost>,
-    adopt_displayed: bool,
+    attachment: ReconnectAttachment,
 ) -> Result<Reconnected> {
     if matches!(target, AppServerTarget::Cloud) {
         color_eyre::eyre::bail!("Reopen Codex to reconnect the cloud backend.");
@@ -119,7 +128,7 @@ pub(super) async fn reconnect_with_adoption(
             let bootstrap = session.bootstrap(&config).await?;
             let thread = if let Some(thread_id) = thread_id {
                 stage = "resuming the conversation";
-                let resumed = if adopt_displayed {
+                let resumed = if attachment == ReconnectAttachment::Writable {
                     session
                         .prepare_retained_resume(
                             &local_settings,
@@ -184,6 +193,7 @@ pub(super) async fn reconnect_with_adoption(
                 bootstrap,
                 thread,
                 retention,
+                external_writer: attachment == ReconnectAttachment::ExternalWriter,
             })
         };
         let result = tokio::time::timeout_at(deadline, attempt).await;
@@ -413,6 +423,7 @@ impl App {
             bootstrap,
             thread,
             mut retention,
+            external_writer,
         } = connected;
         let resumed_id = thread.as_ref().map(|started| started.session.thread_id);
         session.model_provider_override = self.harness_overrides.model_provider.clone();
@@ -570,7 +581,10 @@ impl App {
             if started.blocks_direct_input {
                 self.agent_navigation.mark_parent_owned(id);
             }
-            let channel = ThreadEventChannel::new(THREAD_EVENT_CHANNEL_CAPACITY);
+            let mut channel = ThreadEventChannel::new(THREAD_EVENT_CHANNEL_CAPACITY);
+            if external_writer {
+                channel.mark_external_writer();
+            }
             {
                 let mut store = channel.store.lock().await;
                 store.set_session(started.session, started.turns);
@@ -593,6 +607,9 @@ impl App {
                     tracing::warn!(%drain_err, "failed to discard input after reconnecting");
                 }
                 return Err(err);
+            }
+            if external_writer {
+                self.chat_widget.show_external_writer_thread();
             }
             if resumed_id == Some(id)
                 && !self.chat_widget.is_external_writer_view()

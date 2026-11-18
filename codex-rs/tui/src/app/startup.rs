@@ -1446,7 +1446,11 @@ See the Codex keymap documentation for supported actions and examples."
                         backends.worker_custody_at(displayed_session),
                         // Cached external-writer views remain observations;
                         // only the displayed writable attachment may reacquire.
-                        !app.chat_widget.is_external_writer_view(),
+                        if app.chat_widget.is_external_writer_view() {
+                            reconnect::ReconnectAttachment::ExternalWriter
+                        } else {
+                            reconnect::ReconnectAttachment::Writable
+                        },
                     );
                     let future = Box::pin(async move {
                         if let reconnect::ReconnectPresentation::Startup(deadline) = presentation

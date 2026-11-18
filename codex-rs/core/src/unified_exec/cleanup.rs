@@ -8,9 +8,9 @@ use std::time::Duration;
 use std::time::Instant;
 
 use codex_file_system::SandboxLaunch;
+use codex_protocol::exec_output::SandboxCleanupSummary;
 use codex_sandboxing::CleanupDeadlineScope;
 use codex_sandboxing::SandboxCleanupCustody;
-use codex_sandboxing::SandboxCleanupSummary;
 use codex_sandboxing::SandboxCleanupTightener;
 use codex_sandboxing::SandboxType;
 use codex_utils_pty::ProcessPin;

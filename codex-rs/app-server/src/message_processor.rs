@@ -1065,6 +1065,9 @@ impl MessageProcessor {
         outbound_initialized: &AtomicBool,
         cancellation: tokio_util::sync::CancellationToken,
     ) {
+        if matches!(&request, ClientRequest::ThreadStart { .. }) {
+            eprintln!("HOSTED_SERVER typed request entered");
+        }
         let request_id = ConnectionRequestId {
             connection_id,
             request_id: request.id().clone(),
@@ -2090,6 +2093,7 @@ impl MessageProcessor {
                 .await
                 .map(|response| Some(response.into())),
             ClientRequest::ThreadStart { params, .. } => {
+                eprintln!("HOSTED_SERVER dispatch thread start");
                 self.thread_processor
                     .thread_start(
                         request_id.clone(),

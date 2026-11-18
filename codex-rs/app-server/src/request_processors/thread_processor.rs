@@ -612,6 +612,7 @@ impl ThreadRequestProcessor {
         client_mcp_extensions: ClientMcpExtensions,
         request_context: RequestContext,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        eprintln!("HOSTED_SERVER thread start wrapper entered");
         self.thread_start_inner(
             request_id,
             params,
@@ -1357,6 +1358,7 @@ impl ThreadRequestProcessor {
         client_mcp_extensions: ClientMcpExtensions,
         request_context: RequestContext,
     ) -> Result<(), JSONRPCErrorError> {
+        eprintln!("HOSTED_SERVER thread start inner entered");
         let crate::thread_state::RetainingParams { params, retention } = request;
         let ThreadStartParams {
             model,

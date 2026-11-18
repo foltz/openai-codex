@@ -324,11 +324,17 @@ fn create_bwrap_flags(
             crate::wslg::ensure_supported_path(&path)?;
         }
     }
+    validate_proc_deny_rules(file_system_sandbox_policy, sandbox_policy_cwd)?;
+    let (filesystem, post_proc_masks) = create_filesystem_args_with_post_proc_masks(
+        file_system_sandbox_policy,
+        sandbox_policy_cwd,
+        options,
+    )?;
     let BwrapArgs {
         args: filesystem_args,
         preserved_files,
         synthetic_mount_targets,
-    } = create_filesystem_args(file_system_sandbox_policy, sandbox_policy_cwd, options)?;
+    } = filesystem;
     let normalized_command_cwd = normalize_command_cwd_for_bwrap(command_cwd);
     let mut args = Vec::new();
     args.push("--new-session".to_string());
@@ -364,6 +370,8 @@ fn create_bwrap_flags(
         args.push("--proc".to_string());
         args.push("/proc".to_string());
     }
+    // A fresh procfs would cover masks placed with the ordinary filesystem mounts.
+    args.extend(post_proc_masks);
     if normalized_command_cwd.as_path() != command_cwd {
         // Bubblewrap otherwise inherits the helper's logical cwd, which can be
         // a symlink alias that disappears once the sandbox only mounts
@@ -400,11 +408,11 @@ fn create_bwrap_flags(
 ///    those writable roots so protected subpaths win.
 /// 6. Nested unreadable carveouts under a writable root are masked after that
 ///    root is bound, and unrelated unreadable roots are masked afterward.
-fn create_filesystem_args(
+fn create_filesystem_args_with_post_proc_masks(
     file_system_sandbox_policy: &FileSystemSandboxPolicy,
     cwd: &Path,
     options: BwrapOptions,
-) -> Result<BwrapArgs> {
+) -> Result<(BwrapArgs, Vec<String>)> {
     let daemon_directory = codex_uds::prepare_shared_daemon_socket_directory()?;
     let daemon_directories = crate::daemon_mounts::daemon_socket_mask_paths(
         &daemon_directory,
@@ -462,48 +470,33 @@ fn create_filesystem_args(
                 (!resolved.as_path().exists()).then(|| resolved.into_path_buf())
             })
             .collect();
-    let mut unreadable_roots = resolved
-        .unreadable_roots
-        .into_iter()
-        .map(AbsolutePathBuf::into_path_buf)
-        .collect::<Vec<_>>();
-    // Bubblewrap can only mask concrete paths. Expand unreadable glob patterns
-    // to the existing matches we can see before constructing the mount overlay;
-    // core tool helpers still evaluate the original patterns directly at read time.
-    unreadable_roots.extend(
-        expand_unreadable_globs(
-            &resolved.unreadable_globs,
-            cwd,
-            options.glob_scan_max_depth.or(resolved.glob_scan_max_depth),
-        )?
-        .into_iter()
-        .map(AbsolutePathBuf::into_path_buf),
-    );
+    let mut unreadable_roots = collect_unreadable_roots(
+        file_system_sandbox_policy,
+        cwd,
+        &resolved.unreadable_globs,
+        options,
+    )?;
     unreadable_roots.sort();
     unreadable_roots.dedup();
+    let proc_unreadable_roots = partition_proc_unreadable_roots(&mut unreadable_roots, options)?;
 
+    let mut device_args = Vec::new();
+    let mut device_files = Vec::new();
+    append_device_tree_args(&mut device_args, &mut device_files, &unreadable_roots)?;
     let mut args = if resolved.has_full_disk_read_access {
         // Read-only root, then mount a minimal device tree.
         // In bubblewrap (`bubblewrap.c`, `SETUP_MOUNT_DEV`), `--dev /dev`
         // creates the standard minimal nodes: null, zero, full, random,
         // urandom, and tty. `/dev` must be mounted before writable roots so
         // explicit `/dev/*` writable binds remain visible.
-        vec![
-            "--ro-bind".to_string(),
-            "/".to_string(),
-            "/".to_string(),
-            "--dev".to_string(),
-            "/dev".to_string(),
-        ]
+        let mut args = vec!["--ro-bind".to_string(), "/".to_string(), "/".to_string()];
+        args.extend(device_args.clone());
+        args
     } else {
         // Start from an empty filesystem and add only the approved readable
         // roots plus a minimal `/dev`.
-        let mut args = vec![
-            "--tmpfs".to_string(),
-            "/".to_string(),
-            "--dev".to_string(),
-            "/dev".to_string(),
-        ];
+        let mut args = vec!["--tmpfs".to_string(), "/".to_string()];
+        args.extend(device_args.clone());
 
         let mut readable_roots: BTreeSet<PathBuf> = resolved
             .readable_roots
@@ -528,13 +521,8 @@ fn create_filesystem_args(
         // the broad read baseline. Explicit unreadable carveouts are
         // re-applied later.
         if readable_roots.iter().any(|root| root == Path::new("/")) {
-            args = vec![
-                "--ro-bind".to_string(),
-                "/".to_string(),
-                "/".to_string(),
-                "--dev".to_string(),
-                "/dev".to_string(),
-            ];
+            args = vec!["--ro-bind".to_string(), "/".to_string(), "/".to_string()];
+            args.extend(device_args.clone());
         } else {
             for root in readable_roots {
                 if !root.exists() {
@@ -566,7 +554,7 @@ fn create_filesystem_args(
     }
     let mut bwrap_args = BwrapArgs {
         args,
-        preserved_files: Vec::new(),
+        preserved_files: device_files,
         synthetic_mount_targets: Vec::new(),
     };
     let mut allowed_write_paths = Vec::with_capacity(writable_roots.len());
@@ -631,9 +619,12 @@ fn create_filesystem_args(
             if mount_root == Path::new("/") {
                 // The root bind shadows the earlier device tree and applies nodev.
                 // Recreate only standard devices before applying explicit deny masks.
+                append_device_tree_args(
+                    &mut bwrap_args.args,
+                    &mut bwrap_args.preserved_files,
+                    &unreadable_roots,
+                )?;
                 bwrap_args.args.extend([
-                    "--dev".to_string(),
-                    "/dev".to_string(),
                     "--bind-try".to_string(),
                     "/dev/shm".to_string(),
                     "/dev/shm".to_string(),
@@ -777,6 +768,54 @@ fn create_filesystem_args(
         ]);
     }
 
+    // Masks under `/proc` go last: on top of the fresh procfs when one is
+    // mounted (the caller emits them after `--proc /proc`), otherwise here.
+    let mut proc_masks = BwrapArgs {
+        args: Vec::new(),
+        preserved_files: Vec::new(),
+        synthetic_mount_targets: Vec::new(),
+    };
+    for unreadable_root in &proc_unreadable_roots {
+        if proc_entry_kind(unreadable_root) == ProcEntryKind::Pid {
+            // Only `/proc/1` gets here; every other PID was refused.
+            append_pid_one_mask(&mut proc_masks, unreadable_root)?;
+            continue;
+        }
+        // Present at validation; fail closed if the entry has gone since,
+        // because procfs never lets a mask wait for it to reappear.
+        if !unreadable_root.exists() {
+            return absent_shared_proc_entry(unreadable_root);
+        }
+        append_unreadable_root_args(&mut proc_masks, unreadable_root, &allowed_write_paths)?;
+    }
+    let BwrapArgs {
+        args: proc_mask_args,
+        preserved_files,
+        synthetic_mount_targets,
+    } = proc_masks;
+    bwrap_args.preserved_files.extend(preserved_files);
+    bwrap_args
+        .synthetic_mount_targets
+        .extend(synthetic_mount_targets);
+    if !options.mount_proc {
+        // The root bind exposes the host procfs, so the masks hold here.
+        bwrap_args.args.extend(proc_mask_args);
+        return Ok((bwrap_args, Vec::new()));
+    }
+
+    Ok((bwrap_args, proc_mask_args))
+}
+
+/// Build every filesystem mask inline, as if `/proc` were mounted beforehand.
+#[cfg(test)]
+fn create_filesystem_args(
+    file_system_sandbox_policy: &FileSystemSandboxPolicy,
+    cwd: &Path,
+    options: BwrapOptions,
+) -> Result<BwrapArgs> {
+    let (mut bwrap_args, post_proc_mask_args) =
+        create_filesystem_args_with_post_proc_masks(file_system_sandbox_policy, cwd, options)?;
+    bwrap_args.args.extend(post_proc_mask_args);
     Ok(bwrap_args)
 }
 
@@ -827,6 +866,321 @@ fn append_daemon_socket_masks(
         }
     }
     Ok(())
+}
+
+fn collect_unreadable_roots(
+    file_system_sandbox_policy: &FileSystemSandboxPolicy,
+    cwd: &Path,
+    unreadable_globs: &[String],
+    options: BwrapOptions,
+) -> Result<Vec<PathBuf>> {
+    let resolved = file_system_sandbox_policy
+        .resolve_for_enforcement(cwd, FileSystemPolicyProjection::LinuxMounts)?;
+    let mut unreadable_roots = resolved
+        .unreadable_roots
+        .into_iter()
+        .map(AbsolutePathBuf::into_path_buf)
+        .collect::<Vec<_>>();
+    let mut scanned_globs = Vec::new();
+    for pattern in unreadable_globs {
+        match literal_deny_pattern(pattern, cwd) {
+            Some(path) => {
+                // Like a glob match, a symlinked literal also masks its
+                // canonical target.
+                if let Some(target) = canonical_deny_target(path.as_path()) {
+                    unreadable_roots.push(target);
+                }
+                unreadable_roots.push(path.into_path_buf());
+            }
+            None => scanned_globs.push(pattern.clone()),
+        }
+    }
+    unreadable_roots.extend(
+        expand_unreadable_globs(
+            &scanned_globs,
+            cwd,
+            options.glob_scan_max_depth.or(resolved.glob_scan_max_depth),
+        )?
+        .into_iter()
+        .map(AbsolutePathBuf::into_path_buf),
+    );
+    Ok(unreadable_roots)
+}
+
+/// Refuse deny rules under `/proc` that no mount can enforce for the life of
+/// the sandbox. Unlike building the bubblewrap argv, this creates no
+/// directories, opens no descriptors that outlive it, and registers nothing,
+/// so a refusal leaves no trace.
+pub(crate) fn validate_proc_deny_rules(
+    file_system_sandbox_policy: &FileSystemSandboxPolicy,
+    cwd: &Path,
+) -> Result<()> {
+    // The refusals ignore every option; the default glob depth (none) is
+    // the one every launch uses.
+    let options = BwrapOptions::default();
+    let unreadable_globs = file_system_sandbox_policy.get_unreadable_globs_with_cwd(cwd);
+    let mut unreadable_roots =
+        collect_unreadable_roots(file_system_sandbox_policy, cwd, &unreadable_globs, options)?;
+    partition_proc_unreadable_roots(&mut unreadable_roots, options)?;
+    Ok(())
+}
+
+const PROC_ROOT: &str = "/proc";
+
+/// How a deny path under `/proc` relates to the processes inside the sandbox.
+#[derive(Debug, PartialEq, Eq)]
+enum ProcEntryKind<'a> {
+    /// `/proc/self`, `/proc/thread-self`, or a link into them such as
+    /// `/proc/mounts`. Each process that reads it sees its own entry.
+    PerReader(&'a str),
+    /// `/proc/<pid>`, which names one process of the caller's PID namespace.
+    Pid,
+    /// `/proc` itself or an entry that is the same for every process.
+    Shared,
+}
+
+fn proc_entry_kind(path: &Path) -> ProcEntryKind<'_> {
+    let Some(name) = path
+        .strip_prefix(PROC_ROOT)
+        .ok()
+        .and_then(|relative| relative.components().next())
+        .and_then(|component| component.as_os_str().to_str())
+    else {
+        return ProcEntryKind::Shared;
+    };
+    if name.bytes().all(|byte| byte.is_ascii_digit()) {
+        return ProcEntryKind::Pid;
+    }
+    let per_reader = |entry: &std::ffi::OsStr| entry == "self" || entry == "thread-self";
+    let links_to_per_reader = fs::read_link(Path::new(PROC_ROOT).join(name))
+        .ok()
+        .and_then(|target| {
+            target
+                .components()
+                .next()
+                .map(|component| per_reader(component.as_os_str()))
+        })
+        .unwrap_or(false);
+    if per_reader(std::ffi::OsStr::new(name)) || links_to_per_reader {
+        ProcEntryKind::PerReader(name)
+    } else {
+        ProcEntryKind::Shared
+    }
+}
+
+/// The only PID whose procfs entry names one process for the whole sandbox.
+///
+/// In a fresh PID namespace, PID 1 is bubblewrap's first process: it runs
+/// `setup_newroot` (`bubblewrap.c:3148`, `:3426`) and, under the `--as-pid-1`
+/// that `launcher.rs` adds with `--unshare-pid`, execs the inner stage, which
+/// stays until the command exits. When PID 1 exits, the kernel kills the rest
+/// of the namespace and allocates no further PIDs in it, so `/proc/1` never
+/// names another process. With the host procfs, PID 1 is the host (or
+/// container) init, which outlives the sandbox. Any other PID can exit and be
+/// reused by an unrelated process while the sandbox runs.
+const PID_ONE: &str = "1";
+
+/// Entries of these `/proc/<pid>` directories name objects that come and go
+/// while the process runs: threads (`task/<tid>`), open descriptors (`fd/<n>`,
+/// `fdinfo/<n>`) and memory mappings (`map_files/<range>`). A mount covers
+/// only the dentry that exists at setup; a later object gets a new name, and
+/// procfs drops a dentry (with any mount on it) when its object goes away.
+/// The directories themselves last as long as the process and can be masked.
+const DYNAMIC_PID_DIRECTORIES: &[&str] = &["task", "fd", "fdinfo", "map_files"];
+
+/// Check that a mask on the `/proc/1/...` entry `path` names enforces the deny
+/// for the life of the sandbox, and return whether it is a directory. The
+/// entry is inspected in this process's own PID directory, which has the same
+/// static layout.
+fn pid_one_entry_is_dir(path: &Path) -> Result<bool> {
+    let pid_one = Path::new(PROC_ROOT).join(PID_ONE);
+    let Ok(relative) = path.strip_prefix(&pid_one) else {
+        return Ok(true);
+    };
+    let refuse = |entry: &Path, reason: &str| {
+        Err(CodexErr::Fatal(format!(
+            "cannot enforce sandbox deny-read path {} because {} {reason}",
+            path.display(),
+            entry.display()
+        )))
+    };
+    let mut model = PathBuf::from("/proc/self");
+    let mut literal = pid_one;
+    let mut is_dir = true;
+    for component in relative.components() {
+        let name = component.as_os_str();
+        let parent = literal.file_name().map(std::ffi::OsStr::to_os_string);
+        literal.push(name);
+        model.push(name);
+        if parent.is_some_and(|parent| {
+            DYNAMIC_PID_DIRECTORIES
+                .iter()
+                .any(|directory| parent == *directory)
+        }) {
+            return refuse(
+                &literal,
+                "names a thread, descriptor or mapping that can appear after the \
+                 sandbox starts; deny its parent directory instead",
+            );
+        }
+        let metadata = match fs::symlink_metadata(&model) {
+            Ok(metadata) => metadata,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return refuse(
+                    &literal,
+                    "does not exist, and procfs cannot hold a mount for an entry \
+                     that appears later",
+                );
+            }
+            Err(err) => return Err(err.into()),
+        };
+        if metadata.file_type().is_symlink() {
+            /*
+             * mount(2) follows procfs links such as `cwd`, `root` and `exe` to
+             * the object they name, so a mask would land on that object (for
+             * `root`, the sandbox root) instead of on the denied path.
+             */
+            return refuse(&literal, "is a procfs link");
+        }
+        is_dir = metadata.is_dir();
+    }
+    Ok(is_dir)
+}
+
+/// Mask a `/proc/1/...` deny path at its literal location.
+fn append_pid_one_mask(bwrap_args: &mut BwrapArgs, unreadable_root: &Path) -> Result<()> {
+    let path = path_to_string(unreadable_root);
+    if pid_one_entry_is_dir(unreadable_root)? {
+        bwrap_args.args.extend([
+            "--perms".to_string(),
+            "000".to_string(),
+            "--tmpfs".to_string(),
+            path.clone(),
+            "--remount-ro".to_string(),
+            path,
+        ]);
+        return Ok(());
+    }
+    bwrap_args
+        .args
+        .extend(["--perms".to_string(), "000".to_string()]);
+    append_empty_file_bind_data_args(bwrap_args, unreadable_root)
+}
+
+/// Refuse a deny on a shared `/proc` entry that does not exist, naming its
+/// first missing component, in the words of the `/proc/1` refusal.
+fn absent_shared_proc_entry<T>(path: &Path) -> Result<T> {
+    let entry = find_first_non_existent_component(path).unwrap_or_else(|| path.to_path_buf());
+    Err(CodexErr::Fatal(format!(
+        "cannot enforce sandbox deny-read path {} because {} does not exist, and procfs \
+         cannot hold a mount for an entry that appears later; deny an existing parent \
+         directory instead",
+        path.display(),
+        entry.display()
+    )))
+}
+
+/// Take the deny roots under `/proc` out of `unreadable_roots`, refusing the
+/// ones no mount can enforce for the lifetime of the sandbox.
+///
+/// A fresh procfs is mounted after every filesystem mount, so these masks are
+/// applied after it; without one they still go after every other mount. The
+/// refusals do not depend on how procfs is mounted, and this function has no
+/// side effects, so it also serves as the pre-launch validation pass.
+fn partition_proc_unreadable_roots(
+    unreadable_roots: &mut Vec<PathBuf>,
+    options: BwrapOptions,
+) -> Result<Vec<PathBuf>> {
+    let proc_root = Path::new(PROC_ROOT);
+    // Without a fresh procfs, WSL masking replaces `/proc` with an empty tmpfs.
+    let proc_replaced =
+        !options.mount_proc && (options.mask_wsl_interop || options.mask_wslg_distro);
+    let (mut proc_roots, other_roots): (Vec<PathBuf>, Vec<PathBuf>) =
+        std::mem::take(unreadable_roots)
+            .into_iter()
+            .partition(|root| root.starts_with(proc_root));
+    *unreadable_roots = other_roots;
+    proc_roots.sort();
+    proc_roots.dedup();
+    let mut proc_unreadable_roots = Vec::new();
+    for root in &proc_roots {
+        // A denied ancestor's mask already hides this path (the ancestor is
+        // validated in its own turn), and bubblewrap cannot create a mount
+        // point inside that read-only mask.
+        if proc_roots
+            .iter()
+            .any(|ancestor| ancestor != root && root.starts_with(ancestor))
+        {
+            continue;
+        }
+        if let ProcEntryKind::PerReader(entry) = proc_entry_kind(root) {
+            /*
+             * bubblewrap resolves the path once, in its own setup process,
+             * which is never the sandboxed command. A mount mask cannot
+             * follow each reader, so fail closed rather than mask the
+             * wrong process.
+             */
+            return Err(CodexErr::Fatal(format!(
+                "cannot enforce sandbox deny-read path {} because /proc/{entry} resolves \
+                 to the reading process; deny /proc instead",
+                root.display()
+            )));
+        }
+        if proc_entry_kind(root) == ProcEntryKind::Pid {
+            if !root.starts_with(Path::new(PROC_ROOT).join(PID_ONE)) {
+                return Err(CodexErr::Fatal(format!(
+                    "cannot enforce sandbox deny-read path {} because another process can \
+                     receive that PID while the sandbox runs; only /proc/1 lasts as long as \
+                     the sandbox, so deny /proc instead",
+                    root.display()
+                )));
+            }
+            pid_one_entry_is_dir(root)?;
+        } else if !root.exists() {
+            /*
+             * A shared entry such as `/proc/driver/<name>` or a binfmt_misc
+             * registration can appear while the sandbox runs (a module loads,
+             * a format registers). bubblewrap can only mask what exists at
+             * setup, so skipping the deny would leave the later entry readable.
+             */
+            return absent_shared_proc_entry(root);
+        }
+        if root != proc_root && proc_replaced {
+            continue;
+        }
+        proc_unreadable_roots.push(root.clone());
+    }
+    Ok(proc_unreadable_roots)
+}
+
+/// The canonical target to mask alongside a symlinked deny match.
+///
+/// A procfs link target (for example `/dev/fd` resolves to `/proc/<pid>/fd`)
+/// names the process that scanned it, not a sandboxed one, so only the
+/// matched path itself is masked.
+fn canonical_deny_target(path: &Path) -> Option<PathBuf> {
+    canonical_target_if_symlinked_path(path).filter(|target| !target.starts_with(PROC_ROOT))
+}
+
+/// A deny glob pattern without any glob syntax (no `*`, `?`, `[`, `]`, `{`,
+/// `}` or `\` escape) matches exactly one path. It is enforced as that exact
+/// path through the literal deny-path masks, without a scan: an absent path
+/// follows the same absence handling as a literal deny path, and the scan
+/// depth does not apply. Any pattern with glob syntax returns `None` and is
+/// expanded (or refused) as a glob.
+fn literal_deny_pattern(pattern: &str, cwd: &Path) -> Option<AbsolutePathBuf> {
+    if pattern
+        .chars()
+        .any(|ch| matches!(ch, '*' | '?' | '[' | ']' | '{' | '}' | '\\'))
+    {
+        return None;
+    }
+    Some(AbsolutePathBuf::resolve_path_against_base(pattern, cwd))
 }
 
 /// Snapshot deny-glob matches and their canonical targets for bubblewrap masks.
@@ -881,7 +1235,7 @@ pub fn expand_unreadable_globs(
     for (search_root, globs) in patterns_by_search_root {
         let paths = glob_files(search_root.as_path(), &globs, max_depth)?;
         for path in paths {
-            if let Some(target) = canonical_target_if_symlinked_path(path.as_path()) {
+            if let Some(target) = canonical_deny_target(path.as_path()) {
                 expanded_paths.insert(AbsolutePathBuf::from_absolute_path_checked(target)?);
             }
             expanded_paths.insert(path);
@@ -904,9 +1258,9 @@ fn split_glob_pattern(pattern: &str, cwd: &Path) -> Option<(AbsolutePathBuf, Str
     // they are too broad for startup-time sandbox construction.
     let absolute_pattern = AbsolutePathBuf::resolve_path_against_base(pattern, cwd);
     let pattern = absolute_pattern.to_string_lossy();
-    let first_glob_index = pattern
-        .char_indices()
-        .find_map(|(index, ch)| matches!(ch, '*' | '?' | '[' | ']').then_some(index))?;
+    let first_glob_index = pattern.char_indices().find_map(|(index, ch)| {
+        matches!(ch, '*' | '?' | '[' | ']' | '{' | '}' | '\\').then_some(index)
+    })?;
     let static_prefix = &pattern[..first_glob_index];
     if static_prefix.is_empty() || static_prefix == "/" {
         return None;
@@ -1013,6 +1367,94 @@ fn glob_files(
 
 fn path_to_string(path: &Path) -> String {
     path.to_string_lossy().to_string()
+}
+
+/// Device nodes that bubblewrap's `--dev` (`SETUP_MOUNT_DEV`) binds from the
+/// host `/dev`.
+const BWRAP_DEV_NODES: &[&str] = &["null", "zero", "full", "random", "urandom", "tty"];
+/// Symlinks `--dev` creates whose absolute targets live under `/proc`. bwrap
+/// resolves a mount destination in its setup root, where `/proc` does not
+/// exist, so a deny mask on one of these paths aborts sandbox setup.
+const BWRAP_DEV_PROC_SYMLINKS: &[(&str, &str)] = &[
+    ("stdin", "/proc/self/fd/0"),
+    ("stdout", "/proc/self/fd/1"),
+    ("stderr", "/proc/self/fd/2"),
+    ("fd", "/proc/self/fd"),
+    ("core", "/proc/kcore"),
+];
+/// Private `--dev` instance that supplies devpts (and the console bind) when
+/// `/dev` has to be assembled explicitly.
+const DEV_STAGE: &str = "/dev/.codex-dev";
+/// Entries reached through relative links into the stage, so deny masks on the
+/// canonical names land on the staged objects themselves.
+const DEV_STAGE_LINKS: &[(&str, &str)] = &[
+    ("pts", ".codex-dev/pts"),
+    ("ptmx", "pts/ptmx"),
+    ("console", ".codex-dev/console"),
+];
+
+/// Append the minimal device tree. Unless a deny targets one of `--dev`'s
+/// `/proc` symlinks this is exactly `--dev /dev`. Otherwise reproduce the
+/// same layout on a fresh tmpfs, leaving each denied symlink absent so the
+/// later deny mask lands on a real path instead of a dangling symlink.
+fn append_device_tree_args(
+    args: &mut Vec<String>,
+    preserved_files: &mut Vec<File>,
+    unreadable_roots: &[PathBuf],
+) -> Result<()> {
+    let is_denied = |name: &str| {
+        let entry = Path::new("/dev").join(name);
+        unreadable_roots.iter().any(|root| root.starts_with(&entry))
+    };
+    if !BWRAP_DEV_PROC_SYMLINKS
+        .iter()
+        .any(|&(name, _)| is_denied(name))
+    {
+        args.extend(["--dev".to_string(), "/dev".to_string()]);
+        return Ok(());
+    }
+
+    args.extend(["--tmpfs".to_string(), "/dev".to_string()]);
+    // Same host nodes and the same nodev-exempt bind that `--dev` uses.
+    for node in BWRAP_DEV_NODES {
+        let path = format!("/dev/{node}");
+        args.extend(["--dev-bind".to_string(), path.clone(), path]);
+    }
+    for &(name, target) in BWRAP_DEV_PROC_SYMLINKS {
+        if !is_denied(name) {
+            args.extend([
+                "--symlink".to_string(),
+                target.to_string(),
+                format!("/dev/{name}"),
+            ]);
+        }
+    }
+    // bwrap mounts a fresh devpts only through `--dev`, so stage one. The
+    // stage's duplicate device nodes get the empty-file deny mask. Its own
+    // `/proc` symlinks cannot be masked (the reason this tree exists); they
+    // alias `/proc/self/fd` and `/proc/kcore`, which stay reachable anyway.
+    args.extend(["--dev".to_string(), DEV_STAGE.to_string()]);
+    for &(name, target) in DEV_STAGE_LINKS {
+        args.extend([
+            "--symlink".to_string(),
+            target.to_string(),
+            format!("/dev/{name}"),
+        ]);
+    }
+    for node in BWRAP_DEV_NODES {
+        // Bubblewrap consumes and closes the descriptor for each bind-data mount.
+        let null_file = File::open("/dev/null")?;
+        args.extend([
+            "--perms".to_string(),
+            "000".to_string(),
+            "--ro-bind-data".to_string(),
+            null_file.as_raw_fd().to_string(),
+            format!("{DEV_STAGE}/{node}"),
+        ]);
+        preserved_files.push(null_file);
+    }
+    args.extend(["--dir".to_string(), "/dev/shm".to_string()]);
+    Ok(())
 }
 
 fn path_depth(path: &Path) -> usize {
@@ -1396,3 +1838,15 @@ mod wslg_tests;
 #[cfg(test)]
 #[path = "bwrap_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "bwrap_proc_tests.rs"]
+mod proc_tests;
+
+#[cfg(test)]
+#[path = "bwrap_literal_glob_tests.rs"]
+mod literal_glob_tests;
+
+#[cfg(test)]
+#[path = "bwrap_device_tests.rs"]
+mod device_tests;

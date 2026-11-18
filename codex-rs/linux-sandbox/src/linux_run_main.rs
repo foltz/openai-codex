@@ -266,6 +266,10 @@ pub fn run_main() -> ! {
         // Outer stage: bubblewrap first, then re-enter this binary in the
         // sandboxed environment to apply seccomp. This path never falls back
         // to legacy Landlock on failure.
+        // Validate in the outer stage before proxy setup, launcher probes or
+        // target registration. The inner stage already sees the masked procfs.
+        crate::bwrap::validate_proc_deny_rules(&file_system_sandbox_policy, &sandbox_policy_cwd)
+            .unwrap_or_else(|err| panic!("{err}"));
         let (proxy_route_spec, proxy_controls) = if let Some(context) = managed_network.as_ref() {
             // Older explicit-proxy callers may omit the port list.
             let ports =

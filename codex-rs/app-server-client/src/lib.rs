@@ -2381,6 +2381,79 @@ mod tests {
         assert_eq!(std::error::Error::source(&deserialize).is_some(), true);
     }
 
+    async fn assert_embedded_shutdown_deadline(final_exit: bool) {
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let (_event_tx, event_rx) = mpsc::unbounded_channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let (finished_tx, finished_rx) = oneshot::channel();
+        let start = Instant::now();
+        let deadline = start
+            + if final_exit {
+                Duration::from_millis(100)
+            } else {
+                IN_PROCESS_SHUTDOWN_TIMEOUT
+            };
+        let worker_handle = tokio::spawn(async move {
+            let ClientCommand::Shutdown {
+                response_tx,
+                deadline: received,
+            } = command_rx.recv().await.expect("shutdown admitted")
+            else {
+                panic!("only shutdown is expected");
+            };
+            assert_eq!(
+                received, deadline,
+                "the worker receives the original deadline"
+            );
+            release_rx
+                .await
+                .expect("the fixture releases the original worker");
+            assert!(response_tx.is_closed(), "timeout closed only the observer");
+            finished_tx
+                .send(())
+                .expect("the original worker was not aborted");
+        });
+        let client = AppServerClient::InProcess(InProcessAppServerClient {
+            command_tx,
+            event_rx,
+            worker_handle,
+            _host: Arc::new(InProcessHost::default()),
+        });
+        if final_exit {
+            assert!(matches!(
+                client.shutdown_by(deadline).await,
+                FinalClose::TimedOut(_)
+            ));
+        } else {
+            let error = client
+                .shutdown()
+                .await
+                .expect_err("stalled embedded close times out");
+            assert_eq!(error.kind(), ErrorKind::TimedOut);
+        }
+        assert_eq!(
+            Instant::now(),
+            deadline,
+            "no new 45-second budget is started"
+        );
+        release_tx
+            .send(())
+            .expect("the original worker remains alive");
+        finished_rx
+            .await
+            .expect("the released worker exits without abort");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn embedded_final_close_passes_the_shared_deadline_and_does_not_abort() {
+        assert_embedded_shutdown_deadline(/*final_exit*/ true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn embedded_ordinary_close_keeps_its_original_budget() {
+        assert_embedded_shutdown_deadline(/*final_exit*/ false).await;
+    }
+
     #[tokio::test]
     async fn next_event_surfaces_lagged_markers() {
         let (command_tx, _) = mpsc::channel(1);

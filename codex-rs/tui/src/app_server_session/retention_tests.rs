@@ -62,10 +62,12 @@ async fn abandoning_existing_grant_does_not_release_another_adoption() {
     let (client, mut commands, _events) = CloudClient::channel(4);
     let client = AppServerClient::Cloud(client);
     let (retention, _warnings) = RetentionClient::new();
+    // Keep the command channel alive while asserting that no release was sent.
+    let handle = client.request_handle();
     let acquiring = tokio::spawn(async move {
         retention
             .adopt_thread(
-                client.request_handle(),
+                handle,
                 "existing".into(),
                 Some(ThreadRetentionAcquireResponse::AlreadyHeld {
                     grant_id: "existing-grant".into(),

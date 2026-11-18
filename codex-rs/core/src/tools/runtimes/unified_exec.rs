@@ -58,6 +58,7 @@ use codex_shell_command::powershell::prefix_powershell_script_with_utf8;
 use codex_utils_path_uri::PathUri;
 use std::collections::HashMap;
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 

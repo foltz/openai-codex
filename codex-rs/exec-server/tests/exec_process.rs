@@ -2564,3 +2564,123 @@ async fn remote_process_without_bubblewrap_exits_101_and_proves_no_helpers() -> 
     );
     Ok(())
 }
+
+// Diagnostic only: the qualifying test above retains its original two-second event bound.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "non-qualifying P08 event timeline diagnostic"]
+async fn remote_process_without_bubblewrap_exits_101_and_proves_no_helpers_diagnostic_timeline()
+-> Result<()> {
+    let timeline = std::time::Instant::now();
+    eprintln!("P08_TIMELINE {:?} begin", timeline.elapsed());
+    // The legacy bundled-bubblewrap locations next to the launcher executable
+    // (`codex-linux-sandbox` resolves to this test binary). If one exists, the
+    // launch would find bubblewrap and this test could not observe its absence.
+    let current_exe = std::env::current_exe()?;
+    let exe_dir = current_exe
+        .parent()
+        .context("test binary should have a parent directory")?;
+    let mut bundled_candidates = vec![
+        exe_dir.join("codex-resources").join("bwrap"),
+        exe_dir.join("bwrap"),
+    ];
+    if let Some(package_target_dir) = exe_dir.parent() {
+        bundled_candidates.push(package_target_dir.join("codex-resources").join("bwrap"));
+    }
+    anyhow::ensure!(
+        bundled_candidates.iter().all(|path| !path.exists()),
+        "missing-bubblewrap control requires no bundled bubblewrap: {bundled_candidates:?}"
+    );
+
+    let context = create_process_context(/*use_remote*/ true).await?;
+    eprintln!("P08_TIMELINE {:?} context ready", timeline.elapsed());
+    let tmp = TempDir::new()?;
+    let cwd = PathUri::from_host_native_path(tmp.path())?;
+    let policy = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
+        path: FileSystemPath::Special {
+            value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
+        },
+        access: FileSystemAccessMode::Read,
+        missing_path_behavior: None,
+    }]);
+    let mut sandbox = FileSystemSandboxContext::from_permission_profile(
+        PermissionProfile::from_runtime_permissions(&policy, NetworkSandboxPolicy::Restricted),
+        cwd.clone(),
+    );
+    sandbox.workspace_roots.clear();
+
+    eprintln!("P08_TIMELINE {:?} before start", timeline.elapsed());
+    let session = context
+        .backend
+        .start(ExecParams {
+            metadata: Default::default(),
+            process_id: ProcessId::from("proc-missing-bubblewrap"),
+            argv: vec!["/bin/true".to_string()],
+            cwd,
+            shell_snapshot: None,
+            env_policy: None,
+            env: HashMap::new(),
+            tty: false,
+            pipe_stdin: false,
+            arg0: None,
+            sandbox: Some(sandbox),
+            enforce_managed_network: false,
+            managed_network: None,
+            network_proxy: None,
+        })
+        .await?;
+    eprintln!("P08_TIMELINE {:?} start returned", timeline.elapsed());
+    let process = session.process;
+    let mut events = process.subscribe_events();
+    eprintln!("P08_TIMELINE {:?} subscribed", timeline.elapsed());
+    let mut stderr = String::new();
+    let mut exit_code = None;
+    let sandbox_cleanup = loop {
+        let event = timeout(Duration::from_secs(10), events.recv())
+            .await
+            .with_context(|| {
+                format!("P08_TIMELINE {:?} event wait elapsed", timeline.elapsed())
+            })??;
+        eprintln!("P08_TIMELINE {:?} event {event:?}", timeline.elapsed());
+        match event {
+            ExecProcessEvent::Output(chunk) => {
+                if matches!(chunk.stream, ExecOutputStream::Stderr) {
+                    stderr.push_str(&String::from_utf8_lossy(&chunk.chunk.into_inner()));
+                }
+            }
+            ExecProcessEvent::Exited {
+                exit_code: code, ..
+            } => {
+                exit_code = Some(code);
+            }
+            ExecProcessEvent::Closed {
+                sandbox_cleanup, ..
+            } => break sandbox_cleanup,
+            ExecProcessEvent::Failed(message) => {
+                anyhow::bail!("process failed before closed state: {message}");
+            }
+        }
+    };
+    drop(process);
+    eprintln!(
+        "P08_TIMELINE {:?} assertions exit={exit_code:?} cleanup={sandbox_cleanup:?}",
+        timeline.elapsed()
+    );
+
+    assert_eq!(
+        exit_code,
+        Some(101),
+        "unexpected launcher exit; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("bubblewrap is unavailable"),
+        "unexpected stderr: {stderr}"
+    );
+    let sandbox_cleanup =
+        sandbox_cleanup.context("Linux sandbox launch should report its cleanup")?;
+    assert!(
+        sandbox_cleanup.joined && sandbox_cleanup.state == SandboxCleanupState::Complete,
+        "unexpected sandbox cleanup: {sandbox_cleanup:?}"
+    );
+    Ok(())
+}

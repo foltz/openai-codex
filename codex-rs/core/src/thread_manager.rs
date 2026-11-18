@@ -1501,7 +1501,10 @@ impl ThreadManager {
     }
 
     pub async fn start_thread(&self, options: StartThreadOptions) -> CodexResult<NewThread> {
-        eprintln!("COLD_TRACE core start_thread entry");
+        {
+            let stack_probe = 0u8;
+            eprintln!("COLD_TRACE core start_thread entry sp={:p}", &stack_probe);
+        }
         Box::pin(self.start_thread_inner(
             options, /*forked_from_thread_id*/ None, /*startup*/ None,
             /*captured_account_work*/ None, /*deferred_clear_session_start*/ None,
@@ -1620,7 +1623,13 @@ impl ThreadManager {
         captured_account_work: Option<account_work::CapturedConstructionWork>,
         deferred_clear_session_start: Option<crate::session::DeferredClearSessionStart>,
     ) -> CodexResult<NewThread> {
-        eprintln!("COLD_TRACE core start_thread_inner entry");
+        {
+            let stack_probe = 0u8;
+            eprintln!(
+                "COLD_TRACE core start_thread_inner entry sp={:p}",
+                &stack_probe
+            );
+        }
         let (session_source, thread_source) = options.effective_sources(&self.state.session_source);
         options.session_source = Some(session_source);
         options.thread_source = thread_source;
@@ -2802,7 +2811,10 @@ impl ThreadManagerState {
         self: &Arc<Self>,
         mut request: ThreadSpawnRequest,
     ) -> CodexResult<NewThread> {
-        eprintln!("COLD_TRACE core spawn_thread entry");
+        {
+            let stack_probe = 0u8;
+            eprintln!("COLD_TRACE core spawn_thread entry sp={:p}", &stack_probe);
+        }
         // Capture in the original request before handing the original constructor
         // to the registry; later pollers must not rediscover ambient authority.
         let captured = match request.captured_account_work.take() {
@@ -2939,7 +2951,13 @@ impl ThreadManagerState {
         initial_mcp_work: Option<Box<dyn codex_mcp::McpAttemptWork>>,
         ready_work: Option<Box<dyn codex_extension_api::HostOperationWork>>,
     ) -> CodexResult<NewThread> {
-        eprintln!("COLD_TRACE core spawn_thread_owned entry");
+        {
+            let stack_probe = 0u8;
+            eprintln!(
+                "COLD_TRACE core spawn_thread_owned entry sp={:p}",
+                &stack_probe
+            );
+        }
         let cancellation = request
             .options
             .config
@@ -3333,7 +3351,10 @@ impl ThreadManagerState {
                 &session_source,
             ) => manager,
         };
-        eprintln!("COLD_TRACE core before session spawn");
+        {
+            let stack_probe = 0u8;
+            eprintln!("COLD_TRACE core before session spawn sp={:p}", &stack_probe);
+        }
         let spawn_result = Session::spawn_with_custody(
             SessionSpawnArgs {
                 deferred_clear_session_start,
@@ -3411,7 +3432,13 @@ impl ThreadManagerState {
             Some(Arc::clone(&custody)),
         )
         .await;
-        eprintln!("COLD_TRACE core session spawn returned");
+        {
+            let stack_probe = 0u8;
+            eprintln!(
+                "COLD_TRACE core session spawn returned sp={:p}",
+                &stack_probe
+            );
+        }
         let (session, io) = match spawn_result {
             Ok(spawned) => spawned,
             Err(error) => {

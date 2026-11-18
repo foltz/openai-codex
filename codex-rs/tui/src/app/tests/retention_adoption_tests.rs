@@ -115,15 +115,24 @@ async fn resume_observation_and_provisional_adoption_have_distinct_custody() -> 
 }
 
 async fn resume_observation_and_provisional_adoption_scenario() -> Result<()> {
-    eprintln!("COLD_TRACE fixture entry");
+    {
+        let stack_probe = 0u8;
+        eprintln!("COLD_TRACE fixture entry sp={:p}", &stack_probe);
+    }
     let (mut app, _, _) = make_test_app_with_channels().await;
     app.config
         .features
         .set_enabled(codex_features::Feature::Plugins, false)?;
-    eprintln!("COLD_TRACE app ready");
+    {
+        let stack_probe = 0u8;
+        eprintln!("COLD_TRACE app ready sp={:p}", &stack_probe);
+    }
     let mut server =
         boxed_future!(crate::start_embedded_app_server_for_picker(&app.config)).await?;
-    eprintln!("COLD_TRACE server ready");
+    {
+        let stack_probe = 0u8;
+        eprintln!("COLD_TRACE server ready sp={:p}", &stack_probe);
+    }
     let id = ThreadId::from_string(
         &app_test_support::create_fake_rollout(
             app.config.codex_home.as_path(),
@@ -135,7 +144,10 @@ async fn resume_observation_and_provisional_adoption_scenario() -> Result<()> {
         )
         .expect("resume source rollout"),
     )?;
-    eprintln!("COLD_TRACE before resume");
+    {
+        let stack_probe = 0u8;
+        eprintln!("COLD_TRACE before resume sp={:p}", &stack_probe);
+    }
     boxed_future!(server.resume_thread(
         &app.local_settings,
         app.config.clone(),
@@ -143,7 +155,10 @@ async fn resume_observation_and_provisional_adoption_scenario() -> Result<()> {
         crate::app_server_session::ResumeModelSettings::PreserveExistingThread
     ))
     .await?;
-    eprintln!("COLD_TRACE client resume returned");
+    {
+        let stack_probe = 0u8;
+        eprintln!("COLD_TRACE client resume returned sp={:p}", &stack_probe);
+    }
     let ThreadRetentionAcquireResponse::Acquired { grant_id } = probe(&mut server, id).await?
     else {
         panic!("observing a thread must not have acquired a retention grant")

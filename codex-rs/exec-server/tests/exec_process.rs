@@ -45,6 +45,8 @@ use codex_network_proxy::RemoteNetworkProxyConfig;
 use codex_network_proxy::RemoteNetworkProxyLaunchConfig;
 #[cfg(unix)]
 use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
+#[cfg(target_os = "linux")]
+use codex_protocol::exec_output::SandboxCleanupState;
 #[cfg(unix)]
 use codex_protocol::models::PermissionProfile;
 #[cfg(unix)]
@@ -2453,4 +2455,112 @@ async fn exec_process_signal_terminates_on_windows(use_remote: bool) -> Result<(
 #[serial_test::serial(remote_exec_server)]
 async fn exec_process_preserves_queued_events_before_subscribe(use_remote: bool) -> Result<()> {
     assert_exec_process_preserves_queued_events_before_subscribe(use_remote).await
+}
+
+/// With an empty environment the launcher has no `PATH`, so it finds no system
+/// bubblewrap (`find_system_bwrap_in_path` reads only `PATH`). The test binary
+/// that serves as the launcher has no bundled bubblewrap beside it either. The
+/// launcher must then fail the way the real multitool's `main` does: it panics
+/// with a message and exits 101, after it has declared to its cleanup custody
+/// that no helper exists. Constructor dispatch must preserve that exit status,
+/// and `Closed` must retain the launch's own joined cleanup proof.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_process_without_bubblewrap_exits_101_and_proves_no_helpers() -> Result<()> {
+    // The legacy bundled-bubblewrap locations next to the launcher executable
+    // (`codex-linux-sandbox` resolves to this test binary). If one exists, the
+    // launch would find bubblewrap and this test could not observe its absence.
+    let current_exe = std::env::current_exe()?;
+    let exe_dir = current_exe
+        .parent()
+        .context("test binary should have a parent directory")?;
+    let mut bundled_candidates = vec![
+        exe_dir.join("codex-resources").join("bwrap"),
+        exe_dir.join("bwrap"),
+    ];
+    if let Some(package_target_dir) = exe_dir.parent() {
+        bundled_candidates.push(package_target_dir.join("codex-resources").join("bwrap"));
+    }
+    anyhow::ensure!(
+        bundled_candidates.iter().all(|path| !path.exists()),
+        "missing-bubblewrap control requires no bundled bubblewrap: {bundled_candidates:?}"
+    );
+
+    let context = create_process_context(/*use_remote*/ true).await?;
+    let tmp = TempDir::new()?;
+    let cwd = PathUri::from_host_native_path(tmp.path())?;
+    let policy = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
+        path: FileSystemPath::Special {
+            value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
+        },
+        access: FileSystemAccessMode::Read,
+        missing_path_behavior: None,
+    }]);
+    let mut sandbox = FileSystemSandboxContext::from_permission_profile(
+        PermissionProfile::from_runtime_permissions(&policy, NetworkSandboxPolicy::Restricted),
+        cwd.clone(),
+    );
+    sandbox.workspace_roots.clear();
+
+    let session = context
+        .backend
+        .start(ExecParams {
+            metadata: Default::default(),
+            process_id: ProcessId::from("proc-missing-bubblewrap"),
+            argv: vec!["/bin/true".to_string()],
+            cwd,
+            shell_snapshot: None,
+            env_policy: None,
+            env: HashMap::new(),
+            tty: false,
+            pipe_stdin: false,
+            arg0: None,
+            sandbox: Some(sandbox),
+            enforce_managed_network: false,
+            managed_network: None,
+            network_proxy: None,
+        })
+        .await?;
+    let process = session.process;
+    let mut events = process.subscribe_events();
+    let mut stderr = String::new();
+    let mut exit_code = None;
+    let sandbox_cleanup = loop {
+        match timeout(Duration::from_secs(2), events.recv()).await?? {
+            ExecProcessEvent::Output(chunk) => {
+                if matches!(chunk.stream, ExecOutputStream::Stderr) {
+                    stderr.push_str(&String::from_utf8_lossy(&chunk.chunk.into_inner()));
+                }
+            }
+            ExecProcessEvent::Exited {
+                exit_code: code, ..
+            } => {
+                exit_code = Some(code);
+            }
+            ExecProcessEvent::Closed {
+                sandbox_cleanup, ..
+            } => break sandbox_cleanup,
+            ExecProcessEvent::Failed(message) => {
+                anyhow::bail!("process failed before closed state: {message}");
+            }
+        }
+    };
+    drop(process);
+
+    assert_eq!(
+        exit_code,
+        Some(101),
+        "unexpected launcher exit; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("bubblewrap is unavailable"),
+        "unexpected stderr: {stderr}"
+    );
+    let sandbox_cleanup =
+        sandbox_cleanup.context("Linux sandbox launch should report its cleanup")?;
+    assert!(
+        sandbox_cleanup.joined && sandbox_cleanup.state == SandboxCleanupState::Complete,
+        "unexpected sandbox cleanup: {sandbox_cleanup:?}"
+    );
+    Ok(())
 }

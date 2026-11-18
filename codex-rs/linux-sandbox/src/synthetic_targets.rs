@@ -3281,7 +3281,7 @@ pub(crate) fn finish_refused_keeper(
         targets: Vec::new(),
     };
     let stopped = custody.deadline.stop_reason().is_some();
-    let persist_error = match keeper_bookkeeping_lock(&mut custody.deadline, stopped) {
+    let mut persist_error = match keeper_bookkeeping_lock(&mut custody.deadline, stopped) {
         Ok((registry, _lock)) => registry
             .write_launch_receipt(&receipt)
             .err()

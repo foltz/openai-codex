@@ -3116,13 +3116,15 @@ fn keeper_bookkeeping_lock(
 #[derive(Debug)]
 pub(crate) struct KeeperFinish {
     pub(crate) state: CleanupState,
-    /// Why the receipt (or the never-started statement) was not persisted:
-    /// the registry still says `running`, and the owner report says so.
+    /// Persistence or owner-delivery failure. A persistence failure leaves
+    /// the registry running or incomplete; a delivery failure can leave a
+    /// truthful complete disk receipt that the owner was never told about.
+    /// Neither is a clean finisher result.
     pub(crate) persist_error: Option<String>,
 }
 
 impl KeeperFinish {
-    /// The reported state, as the receipt spells it.
+    /// The finisher outcome, including any later owner-delivery failure.
     pub(crate) fn state_name(&self) -> &'static str {
         self.state.encode()
     }

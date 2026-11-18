@@ -518,3 +518,15 @@ fn an_expired_deadline_reads_and_polls_nothing() {
     assert!(!report.joined);
     assert_eq!(report.state, SandboxCleanupState::TimedOut);
 }
+
+#[test]
+fn oversized_final_summary_is_incomplete_even_after_positive_join() {
+    let text = "v=1\nkind=helpers\nreaper=none\nend\nv=1\nstate=incomplete\nreport=exceeds-atomic-bound\nend\n";
+    let joined = parse_report(text, true);
+    assert!(joined.joined);
+    assert_eq!(joined.state, SandboxCleanupState::Incomplete);
+    assert_eq!(
+        parse_report(text, false).state,
+        SandboxCleanupState::TimedOut
+    );
+}

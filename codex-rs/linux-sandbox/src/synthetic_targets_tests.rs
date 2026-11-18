@@ -2409,3 +2409,44 @@ fn unreaped_zombie_cannot_prove_handle_less_creation() {
     );
     child.finish().expect("reap child");
 }
+
+#[test]
+fn failed_final_delivery_cannot_return_complete_keeper_finish() {
+    let fixture = fixture();
+    let launcher = terminated_token();
+    let ids = LaunchIdentity::keeper(launcher.clone(), own_token());
+    let (reader, writer) = report_pipe();
+    drop(reader);
+    let base = fixture._base.path().to_path_buf();
+    let finished = with_test_registry_base(&base, || {
+        finish_keeper(
+            &[],
+            Some(Vec::new()),
+            &ids,
+            SandboxProof::Gone,
+            &mut LaunchCustody {
+                deadline: far_deadline(),
+                report: Some(writer),
+            },
+            ReaperJoin::FinishedByReaper,
+            false,
+        )
+    });
+    assert_eq!(finished.state, CleanupState::Incomplete);
+    assert!(
+        finished
+            .persist_error
+            .as_deref()
+            .is_some_and(|error| error.contains("cannot deliver final launch report"))
+    );
+    let persisted = fixture
+        .registry
+        .launch_receipt(&launcher)
+        .expect("read")
+        .expect("persisted receipt");
+    assert_eq!(
+        persisted.state,
+        CleanupState::Complete,
+        "disk cleanup truth remains distinct from delivery failure"
+    );
+}

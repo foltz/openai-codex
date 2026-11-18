@@ -421,6 +421,18 @@ fn mcp_input_identity_survives_snapshots_without_changing_trusted_layers() {
     // A newly loaded user snapshot owns its own identity, never the previous
     // MCP-only marker. Copying a runtime snapshot preserves that snapshot's
     // accepted inputs instead.
+    let unknown = accepted.clone().with_unknown_mcp_user_input_identity();
+    assert_eq!(unknown.mcp_user_input_identity(), None);
+    assert_eq!(
+        old.with_user_layer_from(&unknown).mcp_user_input_identity(),
+        None
+    );
+    assert_eq!(
+        unknown
+            .with_user_layer_from(&next)
+            .mcp_user_input_identity(),
+        next.mcp_user_input_identity()
+    );
     let replaced = accepted.with_user_layer_from(&old);
     assert_eq!(
         replaced.mcp_user_input_identity(),

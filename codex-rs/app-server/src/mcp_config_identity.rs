@@ -35,9 +35,10 @@ pub(crate) struct McpConfigIdentity {
 
 impl McpConfigIdentity {
     pub(crate) fn from_config(config: &Config) -> std::io::Result<Option<Self>> {
-        let layers = config
-            .config_layer_stack
-            .mcp_user_input_identity()
+        let Some(inputs) = config.config_layer_stack.mcp_user_input_identity() else {
+            return Ok(None);
+        };
+        let layers = inputs
             .into_iter()
             .map(|(file, version)| {
                 file.into_path_buf()

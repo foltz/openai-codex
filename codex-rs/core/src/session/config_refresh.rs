@@ -239,6 +239,13 @@ impl Session {
                     outcome = ConfigRefreshOutcome::Rejected;
                 }
             }
+            if outcome == ConfigRefreshOutcome::Rejected {
+                let config = Arc::make_mut(&mut config);
+                config.config_layer_stack = config
+                    .config_layer_stack
+                    .clone()
+                    .with_unknown_mcp_user_input_identity();
+            }
             if let Some(member) = &self.services.runtime_config_membership {
                 member.before_publication(&config, outcome);
             }

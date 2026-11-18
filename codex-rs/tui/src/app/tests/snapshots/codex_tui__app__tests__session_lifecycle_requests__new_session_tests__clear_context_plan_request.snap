@@ -16,8 +16,7 @@ Scenario: Clear context and implement the approved plan in a fresh thread.
         Deferred tool namespaces:
         - codex_tui: Manage Codex tasks available through the connected app server.
         </tools>
-02:message/user[2]:
-    [01] <AGENTS_MD>
-    [02] <ENVIRONMENT_CONTEXT>
+02:message/user:
+    <ENVIRONMENT_CONTEXT>
 03:message/user:
     Read the approved plan at <PLAN_FILE> and implement it.

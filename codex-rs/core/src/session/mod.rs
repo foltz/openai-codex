@@ -1248,57 +1248,59 @@ impl Session {
         let (agent_status_tx, agent_status_rx) = watch::channel(AgentStatus::PendingInit);
 
         eprintln!("COLD_TRACE before Session new");
-        let session = Box::pin(Session::new(
-            startup.clone(),
-            session_configuration,
-            attached_thread,
-            control_endpoint,
-            prompt_cache_key,
-            &environment_selections,
-            config.clone(),
-            instructions,
-            installation_id,
-            auth_manager.clone(),
-            runtime_auth,
-            models_manager.clone(),
-            git_root_discovery,
-            model_info,
-            exec_policy,
-            tx_event.clone(),
-            agent_status_tx.clone(),
-            conversation_history,
-            history_initialization,
-            fork_persistence,
-            session_source_clone,
-            skills_service,
-            plugins_manager,
-            mcp_manager.clone(),
-            code_mode_session_provider,
-            extensions,
-            host_admission,
-            initial_mcp_work,
-            thread_extension_init,
-            client_mcp_extensions,
-            agent_control,
-            reserved_thread_id,
-            environment_manager,
-            inherited_environments,
-            analytics_events_client,
-            image_store,
-            thread_store,
-            resume_preparation,
-            parent_rollout_thread_trace,
-            attestation_provider,
-            external_time_provider,
-            runtime_config_change_listener,
-            runtime_config_change_gate,
-            multi_agent_version,
-            git_enrichment_policy,
-            windows_sandbox_proxy_settings_mode,
-            deferred_clear_session_start,
-            custody.as_deref(),
-            resources.as_deref(),
-        ))
+        let session = box_session_future(|| {
+            Session::new(
+                startup.clone(),
+                session_configuration,
+                attached_thread,
+                control_endpoint,
+                prompt_cache_key,
+                &environment_selections,
+                config.clone(),
+                instructions,
+                installation_id,
+                auth_manager.clone(),
+                runtime_auth,
+                models_manager.clone(),
+                git_root_discovery,
+                model_info,
+                exec_policy,
+                tx_event.clone(),
+                agent_status_tx.clone(),
+                conversation_history,
+                history_initialization,
+                fork_persistence,
+                session_source_clone,
+                skills_service,
+                plugins_manager,
+                mcp_manager.clone(),
+                code_mode_session_provider,
+                extensions,
+                host_admission,
+                initial_mcp_work,
+                thread_extension_init,
+                client_mcp_extensions,
+                agent_control,
+                reserved_thread_id,
+                environment_manager,
+                inherited_environments,
+                analytics_events_client,
+                image_store,
+                thread_store,
+                resume_preparation,
+                parent_rollout_thread_trace,
+                attestation_provider,
+                external_time_provider,
+                runtime_config_change_listener,
+                runtime_config_change_gate,
+                multi_agent_version,
+                git_enrichment_policy,
+                windows_sandbox_proxy_settings_mode,
+                deferred_clear_session_start,
+                custody.as_deref(),
+                resources.as_deref(),
+            )
+        })
         .await
         .map_err(|e| {
             error!("Failed to create session: {e:#}");
@@ -6534,3 +6536,12 @@ mod world_state_item_tests;
 
 #[cfg(test)]
 mod mailbox_task_commit_tests;
+
+#[inline(never)]
+fn box_session_future<F: std::future::Future>(create: impl FnOnce() -> F) -> std::pin::Pin<Box<F>> {
+    eprintln!(
+        "COLD_TRACE Session new future bytes={}",
+        std::mem::size_of::<F>()
+    );
+    Box::pin(create())
+}

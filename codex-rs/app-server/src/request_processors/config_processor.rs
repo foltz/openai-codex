@@ -537,6 +537,13 @@ async fn reload_user_config_inner(
         }
     }
 
+    if planned.is_empty() && !complete {
+        // All failures so far were planning failures or user-layer-neutral
+        // enterprise revocations. With no identity-bearing publication ahead,
+        // the last applied baseline is still truthful and must be retained.
+        return;
+    }
+
     // Thread configuration can change from here on. Withdraw the applied
     // identity first so an incomplete or cancelled transition fails closed; it
     // is restored only after every thread published the candidate layers.

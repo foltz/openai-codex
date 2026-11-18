@@ -689,14 +689,16 @@ impl ThreadRequestProcessor {
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
         let mut minted = None;
         // Keep the large fork future out of the shared request dispatcher's stack frame.
-        let result = Box::pin(self.thread_fork_inner(
-            request_id,
-            request,
-            app_server_client_name,
-            app_server_client_version,
-            client_mcp_extensions,
-            &mut minted,
-        ))
+        let result = box_thread_start_future(|| {
+            self.thread_fork_inner(
+                request_id,
+                request,
+                app_server_client_name,
+                app_server_client_version,
+                client_mcp_extensions,
+                &mut minted,
+            )
+        })
         .await;
         // A fork that fails before its response releases exactly the grant it minted.
         if result.is_err()

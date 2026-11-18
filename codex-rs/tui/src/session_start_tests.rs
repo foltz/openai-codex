@@ -35,6 +35,10 @@ async fn start_session(
 
 #[tokio::test]
 async fn archived_session_requires_confirmation_before_resume_or_fork() -> Result<()> {
+    crate::boxed_future!(archived_session_confirmation_scenario()).await
+}
+
+async fn archived_session_confirmation_scenario() -> Result<()> {
     for action in [
         SessionStartAction::Resume(
             ResumeModelSettings::RestoreFromThread,
@@ -43,11 +47,14 @@ async fn archived_session_requires_confirmation_before_resume_or_fork() -> Resul
         SessionStartAction::Fork(crate::app_server_session::ForkPermissionMode::InheritSaved),
     ] {
         let codex_home = TempDir::new()?;
-        let config = ConfigBuilder::default()
+        let mut config = ConfigBuilder::default()
             .codex_home(codex_home.path().to_path_buf())
             .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
             .build()
             .await?;
+        config
+            .features
+            .set_enabled(codex_features::Feature::Plugins, false)?;
         let timestamp = "2025-01-05T12-00-00";
         let id = create_fake_rollout(
             codex_home.path(),

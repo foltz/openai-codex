@@ -121,8 +121,17 @@ async fn resume_observation_and_provisional_adoption_scenario() -> Result<()> {
         .set_enabled(codex_features::Feature::Plugins, false)?;
     let mut server =
         boxed_future!(crate::start_embedded_app_server_for_picker(&app.config)).await?;
-    let started = boxed_future!(server.start_thread(&app.config)).await?;
-    let id = started.session.thread_id;
+    let id = ThreadId::from_string(
+        &app_test_support::create_fake_rollout(
+            app.config.codex_home.as_path(),
+            "2026-01-01T00-00-00",
+            "2026-01-01T00:00:00Z",
+            "saved resume source",
+            Some(app.config.model_provider_id.as_str()),
+            None,
+        )
+        .expect("resume source rollout"),
+    )?;
     boxed_future!(server.resume_thread(
         &app.local_settings,
         app.config.clone(),
@@ -177,10 +186,17 @@ async fn resume_observation_and_provisional_adoption_scenario() -> Result<()> {
         "abandoning an already-held adoption must not release the committed grant"
     );
 
-    let other = boxed_future!(server.start_thread(&app.config))
-        .await?
-        .session
-        .thread_id;
+    let other = ThreadId::from_string(
+        &app_test_support::create_fake_rollout(
+            app.config.codex_home.as_path(),
+            "2026-01-01T00-00-01",
+            "2026-01-01T00:00:01Z",
+            "saved resume source",
+            Some(app.config.model_provider_id.as_str()),
+            None,
+        )
+        .expect("resume source rollout"),
+    )?;
     let (_, pending) = boxed_future!(server.prepare_retained_resume(
         &app.local_settings,
         app.config.clone(),

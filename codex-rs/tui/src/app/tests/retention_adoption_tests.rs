@@ -115,12 +115,15 @@ async fn resume_observation_and_provisional_adoption_have_distinct_custody() -> 
 }
 
 async fn resume_observation_and_provisional_adoption_scenario() -> Result<()> {
+    eprintln!("COLD_TRACE fixture entry");
     let (mut app, _, _) = make_test_app_with_channels().await;
     app.config
         .features
         .set_enabled(codex_features::Feature::Plugins, false)?;
+    eprintln!("COLD_TRACE app ready");
     let mut server =
         boxed_future!(crate::start_embedded_app_server_for_picker(&app.config)).await?;
+    eprintln!("COLD_TRACE server ready");
     let id = ThreadId::from_string(
         &app_test_support::create_fake_rollout(
             app.config.codex_home.as_path(),
@@ -132,6 +135,7 @@ async fn resume_observation_and_provisional_adoption_scenario() -> Result<()> {
         )
         .expect("resume source rollout"),
     )?;
+    eprintln!("COLD_TRACE before resume");
     boxed_future!(server.resume_thread(
         &app.local_settings,
         app.config.clone(),

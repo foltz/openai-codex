@@ -540,6 +540,9 @@ pub struct ProcessOutputChunk {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReadResponse {
+    /// Final executor-owned cleanup evidence; absence is not a clean receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_cleanup: Option<SandboxCleanupSummary>,
     pub chunks: Vec<ProcessOutputChunk>,
     pub next_seq: u64,
     pub exited: bool,
@@ -594,7 +597,15 @@ pub struct SignalResponse {}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminateParams {
+    /// Remaining cleanup budget, anchored when the executor receives it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_deadline_ms: Option<u64>,
     pub process_id: ProcessId,
+}
+
+/// Round down: serialization must never extend an original deadline.
+pub fn cleanup_deadline_ms_until(deadline: std::time::Instant, now: std::time::Instant) -> u64 {
+    u64::try_from(deadline.saturating_duration_since(now).as_millis()).unwrap_or(u64::MAX)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1361,6 +1372,8 @@ pub struct ExecExitedNotification {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecClosedNotification {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_cleanup: Option<SandboxCleanupSummary>,
     pub process_id: ProcessId,
     pub seq: u64,
 }
@@ -1483,6 +1496,74 @@ mod tests {
             joined: false,
         }
     }
+    #[test]
+    fn remote_cleanup_fields_round_trip_and_legacy_omission_stays_absent() {
+        let legacy: super::ExecClosedNotification =
+            serde_json::from_value(serde_json::json!({"processId":"p", "seq":3}))
+                .expect("old Closed");
+        assert_eq!(legacy.sandbox_cleanup, None);
+        assert_eq!(
+            serde_json::to_value(legacy).expect("serialize"),
+            serde_json::json!({"processId":"p", "seq":3})
+        );
+        let closed = super::ExecClosedNotification {
+            process_id: crate::ProcessId::from("p"),
+            seq: 3,
+            sandbox_cleanup: Some(timed_out_cleanup_summary()),
+        };
+        assert_eq!(
+            serde_json::from_value::<super::ExecClosedNotification>(
+                serde_json::to_value(&closed).expect("encode")
+            )
+            .expect("decode"),
+            closed
+        );
+        let mut read: super::ReadResponse = serde_json::from_value(serde_json::json!({"chunks":[],"nextSeq":4,"exited":true,"exitCode":0,"closed":true,"failure":null})).expect("old read");
+        assert_eq!(read.sandbox_cleanup, None);
+        assert!(
+            serde_json::to_value(&read)
+                .expect("encode")
+                .get("sandboxCleanup")
+                .is_none()
+        );
+        read.sandbox_cleanup = Some(timed_out_cleanup_summary());
+        assert_eq!(
+            serde_json::from_value::<super::ReadResponse>(
+                serde_json::to_value(&read).expect("encode")
+            )
+            .expect("decode"),
+            read
+        );
+        let mut terminate: super::TerminateParams =
+            serde_json::from_value(serde_json::json!({"processId":"p"})).expect("old terminate");
+        assert_eq!(terminate.cleanup_deadline_ms, None);
+        terminate.cleanup_deadline_ms = Some(0);
+        assert_eq!(
+            serde_json::from_value::<super::TerminateParams>(
+                serde_json::to_value(&terminate).expect("encode")
+            )
+            .expect("decode"),
+            terminate
+        );
+    }
+
+    #[test]
+    fn remote_cleanup_budget_rounds_down_and_expired_is_zero() {
+        let now = std::time::Instant::now();
+        assert_eq!(
+            super::cleanup_deadline_ms_until(now + std::time::Duration::from_micros(1999), now),
+            1
+        );
+        assert_eq!(
+            super::cleanup_deadline_ms_until(now + std::time::Duration::from_micros(999), now),
+            0
+        );
+        assert_eq!(
+            super::cleanup_deadline_ms_until(now, now + std::time::Duration::from_secs(1)),
+            0
+        );
+    }
+
     #[test]
     fn fs_responses_carry_optional_sandbox_cleanup() {
         let read = super::FsReadFileResponse {

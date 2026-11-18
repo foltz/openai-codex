@@ -33,6 +33,7 @@ impl MockExecProcess {
             .await
             .pop_front()
             .unwrap_or(ReadResponse {
+                sandbox_cleanup: None,
                 chunks: Vec::new(),
                 next_seq: 1,
                 exited: false,

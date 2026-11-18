@@ -265,7 +265,7 @@ async fn pushed_hook_output(mut events: ExecProcessEventReceiver) -> Option<Envi
             } if seq == next_seq => {
                 exit_code = Some(code);
             }
-            ExecProcessEvent::Closed { seq } if seq == next_seq => {
+            ExecProcessEvent::Closed { seq, .. } if seq == next_seq => {
                 return Some(output.finish(exit_code?));
             }
             ExecProcessEvent::Output(_)

@@ -95,6 +95,7 @@ impl SessionState {
 
     fn recover_events(&self, response: ReadResponse) -> Result<bool, ExecServerError> {
         let ReadResponse {
+            sandbox_cleanup,
             chunks,
             next_seq,
             exited,
@@ -134,6 +135,16 @@ impl SessionState {
             if let Some(pending_sandbox_denied) = pending_exit {
                 *pending_sandbox_denied =
                     Some(pending_sandbox_denied.unwrap_or(false) || sandbox_denied);
+            }
+            // A real Closed already received wins over recovery metadata.
+            // Fill only absence; never replace an executor's existing receipt.
+            if let Some(ExecProcessEvent::Closed {
+                sandbox_cleanup: pending,
+                ..
+            }) = ordered_events.pending.get_mut(&target_seq)
+                && pending.is_none()
+            {
+                *pending = sandbox_cleanup.clone();
             }
             let mut exit_known = ordered_events.exit_published || exit_pending;
             if closed
@@ -186,7 +197,10 @@ impl SessionState {
                 )
             {
                 ordered_events
-                    .insert_pending(ExecProcessEvent::Closed { seq: target_seq })
+                    .insert_pending(ExecProcessEvent::Closed {
+                        seq: target_seq,
+                        sandbox_cleanup: sandbox_cleanup.clone(),
+                    })
                     .map_err(ExecServerError::Protocol)?;
             }
 
@@ -612,6 +626,7 @@ impl Inner {
                         .call_for_cleanup(
                             EXEC_TERMINATE_METHOD,
                             &TerminateParams {
+                                cleanup_deadline_ms: None,
                                 process_id: process_id.clone(),
                             },
                         )

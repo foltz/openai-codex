@@ -137,6 +137,7 @@ fn recovered_output(seq: u64, stream: ExecOutputStream, bytes: &[u8]) -> Process
 
 fn retained_read_response(chunks: Vec<ProcessOutputChunk>, next_seq: u64) -> ReadResponse {
     ReadResponse {
+        sandbox_cleanup: None,
         chunks,
         next_seq,
         exited: false,

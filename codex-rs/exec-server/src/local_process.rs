@@ -604,6 +604,7 @@ impl LocalProcess {
                 }
                 (
                     ReadResponse {
+                        sandbox_cleanup: None,
                         chunks,
                         next_seq,
                         exited: process.exit_code.is_some(),
@@ -985,6 +986,7 @@ impl LocalProcess {
 
     async fn terminate(&self, process_id: &ProcessId) -> Result<(), ExecServerError> {
         self.terminate_process(TerminateParams {
+            cleanup_deadline_ms: None,
             process_id: process_id.clone(),
         })
         .await
@@ -1204,9 +1206,13 @@ async fn maybe_emit_closed(process_id: ProcessId, inner: Arc<Inner>) {
         let seq = process.next_seq;
         process.next_seq += 1;
         let _ = process.wake_tx.send(seq);
-        process.events.publish(ExecProcessEvent::Closed { seq });
+        process.events.publish(ExecProcessEvent::Closed {
+            seq,
+            sandbox_cleanup: None,
+        });
         (
             ExecClosedNotification {
+                sandbox_cleanup: None,
                 process_id: process_id.clone(),
                 seq,
             },
@@ -1714,6 +1720,7 @@ mod tests {
         assert_eq!(
             backend
                 .terminate_process(TerminateParams {
+                    cleanup_deadline_ms: None,
                     process_id: process.process_id.clone(),
                 })
                 .await
@@ -1750,6 +1757,7 @@ mod tests {
         assert_eq!(
             backend
                 .terminate_process(TerminateParams {
+                    cleanup_deadline_ms: None,
                     process_id: process.process_id.clone(),
                 })
                 .await
@@ -1786,6 +1794,7 @@ mod tests {
         assert_eq!(
             exit_response,
             ReadResponse {
+                sandbox_cleanup: None,
                 chunks: Vec::new(),
                 next_seq: 2,
                 exited: true,
@@ -1908,6 +1917,7 @@ mod tests {
         assert_eq!(
             response,
             ReadResponse {
+                sandbox_cleanup: None,
                 chunks: expected_chunks,
                 next_seq: retained_chunk_count + 2,
                 exited: false,

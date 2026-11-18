@@ -408,7 +408,7 @@ async fn accepted_websocket_interoperates_and_recovers_with_real_direct_executor
                     last_seq = seq;
                     saw_exit = true;
                 }
-                ExecProcessEvent::Closed { seq } => {
+                ExecProcessEvent::Closed { seq, .. } => {
                     assert!(saw_exit, "closed must be delivered after exit");
                     assert_eq!(seq, last_seq + 1);
                     break;
@@ -633,6 +633,7 @@ async fn accepted_websocket_reconnect_recovers_running_process_and_output() -> R
         JSONRPCMessage::Response(JSONRPCResponse {
             id,
             result: serde_json::to_value(ReadResponse {
+                sandbox_cleanup: None,
                 chunks: Vec::new(),
                 next_seq: 1,
                 exited: false,
@@ -666,6 +667,7 @@ async fn accepted_websocket_reconnect_recovers_running_process_and_output() -> R
         }
     );
     let response = ReadResponse {
+        sandbox_cleanup: None,
         chunks: Vec::new(),
         next_seq: 1,
         exited: false,

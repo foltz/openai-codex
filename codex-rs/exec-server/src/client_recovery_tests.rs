@@ -165,6 +165,7 @@ fn recovery_handles_dense_tail_output_and_newer_notification() {
     assert!(
         !state
             .recover_events(ReadResponse {
+                sandbox_cleanup: None,
                 chunks,
                 next_seq: last_seq + 1,
                 exited: true,
@@ -196,6 +197,7 @@ fn recovery_rejects_output_at_closed_sequence() {
 
     let error = state
         .recover_events(ReadResponse {
+            sandbox_cleanup: None,
             chunks: vec![ProcessOutputChunk {
                 seq: 1,
                 stream: ExecOutputStream::Stdout,
@@ -232,6 +234,7 @@ async fn recovery_adds_sandbox_denial_to_pending_exit_event() {
 
     state
         .recover_events(ReadResponse {
+            sandbox_cleanup: None,
             chunks: vec![ProcessOutputChunk {
                 seq: 1,
                 stream: ExecOutputStream::Stderr,
@@ -259,4 +262,74 @@ async fn recovery_adds_sandbox_denial_to_pending_exit_event() {
             sandbox_denied: Some(true),
         })
     );
+}
+
+#[tokio::test]
+async fn recovery_carries_cleanup_without_overwriting_an_existing_closed_receipt() {
+    use crate::protocol::{SandboxCleanupState, SandboxCleanupSummary};
+    let recovered = SandboxCleanupSummary {
+        state: SandboxCleanupState::TimedOut,
+        reaped: 1,
+        preserved_unproven: 0,
+        host_owned: 2,
+        handed_off: 0,
+        timed_out: 3,
+        joined: false,
+    };
+    let existing = SandboxCleanupSummary {
+        host_owned: 9,
+        ..recovered.clone()
+    };
+    // New recovery Closed, a pending legacy Closed, and a pending receipt
+    // already observed from a live notification are all distinct cases.
+    for pending in [None, Some(None), Some(Some(existing.clone()))] {
+        let state = SessionState::new(true);
+        if let Some(summary) = &pending {
+            assert!(
+                !state
+                    .publish_ordered_event(ExecProcessEvent::Closed {
+                        seq: 3,
+                        sandbox_cleanup: summary.clone()
+                    })
+                    .expect("queue Closed")
+            );
+        }
+        assert!(
+            state
+                .recover_events(ReadResponse {
+                    chunks: vec![ProcessOutputChunk {
+                        seq: 1,
+                        stream: ExecOutputStream::Stdout,
+                        chunk: b"x".to_vec().into()
+                    }],
+                    next_seq: 4,
+                    exited: true,
+                    exit_code: Some(0),
+                    closed: true,
+                    failure: None,
+                    sandbox_denied: false,
+                    sandbox_cleanup: Some(recovered.clone()),
+                })
+                .expect("recover")
+        );
+        let mut events = state.subscribe_events();
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .expect("bounded event")
+                .expect("event");
+        }
+        let closed = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("bounded Closed")
+            .expect("Closed");
+        let expected = pending.flatten().unwrap_or_else(|| recovered.clone());
+        assert_eq!(
+            closed,
+            ExecProcessEvent::Closed {
+                seq: 3,
+                sandbox_cleanup: Some(expected)
+            }
+        );
+    }
 }

@@ -984,6 +984,7 @@ impl ExecServerClient {
         self.call_for_cleanup(
             EXEC_TERMINATE_METHOD,
             &TerminateParams {
+                cleanup_deadline_ms: None,
                 process_id: process_id.clone(),
             },
         )
@@ -1666,6 +1667,7 @@ impl SessionState {
     fn synthesized_failure(&self, message: String) -> ReadResponse {
         let next_seq = (*self.wake_tx.borrow()).saturating_add(1);
         ReadResponse {
+            sandbox_cleanup: None,
             chunks: Vec::new(),
             next_seq,
             exited: true,
@@ -1999,8 +2001,10 @@ async fn handle_server_notification(
                 // Closed is terminal, but it can arrive before tail output or
                 // exited. Keep routing this process until the ordered publisher
                 // says Closed has actually been delivered.
-                let result =
-                    session.publish_ordered_event(ExecProcessEvent::Closed { seq: params.seq });
+                let result = session.publish_ordered_event(ExecProcessEvent::Closed {
+                    seq: params.seq,
+                    sandbox_cleanup: params.sandbox_cleanup,
+                });
                 if result.is_ok() {
                     session.note_change(params.seq);
                 }
@@ -2729,6 +2733,15 @@ mod tests {
         .await
         .expect("client should connect");
 
+        let cleanup = crate::protocol::SandboxCleanupSummary {
+            state: crate::protocol::SandboxCleanupState::Incomplete,
+            reaped: 1,
+            preserved_unproven: 2,
+            host_owned: 3,
+            handed_off: 0,
+            timed_out: 0,
+            joined: true,
+        };
         let process_id = ProcessId::from("reordered");
         let session = client
             .register_session(&process_id)
@@ -2741,6 +2754,7 @@ mod tests {
                 method: EXEC_CLOSED_METHOD.to_string(),
                 params: Some(
                     serde_json::to_value(ExecClosedNotification {
+                        sandbox_cleanup: Some(cleanup.clone()),
                         process_id: process_id.clone(),
                         seq: 4,
                     })
@@ -2818,7 +2832,10 @@ mod tests {
                     exit_code: 0,
                     sandbox_denied: Some(true),
                 },
-                ExecProcessEvent::Closed { seq: 4 },
+                ExecProcessEvent::Closed {
+                    seq: 4,
+                    sandbox_cleanup: Some(cleanup)
+                },
             ]
         );
 
@@ -3301,6 +3318,7 @@ mod tests {
                 JSONRPCMessage::Response(JSONRPCResponse {
                     id: recovery_read.id,
                     result: serde_json::to_value(ReadResponse {
+                        sandbox_cleanup: None,
                         chunks: Vec::new(),
                         next_seq: 1,
                         exited: false,

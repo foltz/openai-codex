@@ -1123,7 +1123,11 @@ mod tests {
     #[test]
     fn executor_terminal_evidence_rejects_exit_failure_and_lost_events() {
         assert!(
-            executor_event_proves_close(Ok(ExecProcessEvent::Closed { seq: 2 })).expect("closed")
+            executor_event_proves_close(Ok(ExecProcessEvent::Closed {
+                seq: 2,
+                sandbox_cleanup: None
+            }))
+            .expect("closed")
         );
         assert!(
             !executor_event_proves_close(Ok(ExecProcessEvent::Exited {

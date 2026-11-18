@@ -152,6 +152,7 @@ async fn terminate_reports_false_after_process_exit() {
     loop {
         let response = handler
             .terminate(TerminateParams {
+                cleanup_deadline_ms: None,
                 process_id: ProcessId::from("proc-1"),
             })
             .await

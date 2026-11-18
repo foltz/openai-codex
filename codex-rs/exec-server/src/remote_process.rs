@@ -124,6 +124,13 @@ impl ExecProcess for RemoteExecProcess {
     fn terminate(&self) -> ExecProcessFuture<'_, ()> {
         Box::pin(RemoteExecProcess::terminate(self))
     }
+
+    fn terminate_with_cleanup_deadline(
+        &self,
+        deadline: std::time::Instant,
+    ) -> ExecProcessFuture<'_, ()> {
+        Box::pin(self.session.terminate_with_cleanup_deadline(deadline))
+    }
 }
 
 impl Drop for RemoteExecProcess {

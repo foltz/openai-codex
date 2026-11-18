@@ -974,6 +974,14 @@ impl ExecServerClient {
         &self,
         process_id: &ProcessId,
     ) -> Result<TerminateResponse, ExecServerError> {
+        self.terminate_with_deadline(process_id, None).await
+    }
+
+    pub async fn terminate_with_deadline(
+        &self,
+        process_id: &ProcessId,
+        cleanup_deadline: Option<std::time::Instant>,
+    ) -> Result<TerminateResponse, ExecServerError> {
         // A close notification may arrive before the termination response.
         if let Some(session) = self.inner.get_session(process_id) {
             session
@@ -984,7 +992,9 @@ impl ExecServerClient {
         self.call_for_cleanup(
             EXEC_TERMINATE_METHOD,
             &TerminateParams {
-                cleanup_deadline_ms: None,
+                cleanup_deadline_ms: cleanup_deadline.map(|deadline| {
+                    crate::protocol::cleanup_deadline_ms_until(deadline, std::time::Instant::now())
+                }),
                 process_id: process_id.clone(),
             },
         )
@@ -1829,6 +1839,17 @@ impl Session {
 
     pub(crate) async fn terminate(&self) -> Result<(), ExecServerError> {
         self.client.terminate(&self.process_id).await?;
+        self.cancel_network_policy_decisions();
+        Ok(())
+    }
+
+    pub(crate) async fn terminate_with_cleanup_deadline(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<(), ExecServerError> {
+        self.client
+            .terminate_with_deadline(&self.process_id, Some(deadline))
+            .await?;
         self.cancel_network_policy_decisions();
         Ok(())
     }

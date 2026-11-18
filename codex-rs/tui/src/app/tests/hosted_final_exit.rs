@@ -406,8 +406,31 @@ async fn startup_cancellation_retires_the_primary_hosted_endpoint() -> Result<()
         proxy,
         _keep_alive,
     } = hosted_session(RealtimeRequestBehavior::Forward).await?;
+    let (cloud, mut commands, _events) = codex_app_server_client::CloudClient::channel(1);
+    let other = AppServerSession::new(
+        crate::backend_id::BackendId::new(),
+        codex_app_server_client::AppServerClient::Cloud(cloud),
+        crate::app_server_session::ThreadParamsMode::Embedded,
+    );
+    let worker = tokio::spawn(async move {
+        let command = commands
+            .recv()
+            .await
+            .expect("the secondary backend is closed");
+        assert!(matches!(
+            command.operation,
+            codex_app_server_client::CloudOperation::Shutdown
+        ));
+        command
+            .response
+            .send(Ok(Ok(serde_json::Value::Null)))
+            .expect("the shared-budget observer remains live");
+    });
+    let mut others = vec![other];
     let start = Instant::now();
-    let exit = crate::app::startup::cancel_startup_sessions(app_server, &mut Vec::new()).await;
+    let exit = crate::app::startup::cancel_startup_sessions(app_server, &mut others).await;
+    assert!(others.is_empty());
+    worker.await.expect("the secondary owner is joined");
     assert!(matches!(exit.exit_reason, crate::ExitReason::UserRequested));
     assert!(start.elapsed() <= crate::app_server_session::FINAL_EXIT_BUDGET + EPSILON);
     assert_eq!(recorded_params(&requests, DECLARE).len(), 1);

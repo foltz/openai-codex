@@ -507,7 +507,7 @@ async fn temporary_recap_threads_disable_memories_and_remote_mcp_servers() -> Re
         options,
     )
     .await?;
-    let thread_id = ThreadId::from_string(&response.thread.id)?;
+    let thread_id = ThreadId::from_string(&response.response.thread.id)?;
     let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
     app.temporary_structured_requests.insert(thread_id, sender);
     // Even if a hidden thread reaches visible routing, it must not prompt.

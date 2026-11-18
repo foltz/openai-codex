@@ -71,6 +71,30 @@ impl RetentionClient {
         });
     }
 
+    /// Temporary helpers own only a freshly minted start grant. They never
+    /// reacquire missing evidence or release somebody else's existing grant.
+    pub(crate) async fn temporary_start_grant(
+        request_handle: AppServerRequestHandle,
+        thread_id: String,
+        evidence: Option<ThreadRetentionAcquireResponse>,
+    ) -> Option<PendingRetention> {
+        let Some(evidence @ ThreadRetentionAcquireResponse::Acquired { .. }) = evidence else {
+            tracing::debug!("temporary structured thread started without a new retention grant");
+            return None;
+        };
+        let (client, _warnings) = Self::new();
+        match client
+            .adopt_thread(request_handle, thread_id, Some(evidence))
+            .await
+        {
+            Ok(pending) => Some(pending),
+            Err(error) => {
+                tracing::debug!(%error, "temporary structured retention could not be adopted");
+                None
+            }
+        }
+    }
+
     /// Separate acquisition without evidence; production uses `adopt_thread`.
     #[cfg(test)]
     pub(super) async fn retain_thread(

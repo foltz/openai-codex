@@ -15,6 +15,7 @@ use crate::history_cell::ThreadRecapHistoryCell;
 use crate::history_cell::ThreadRecapLoadingCell;
 use crate::pager_overlay::Overlay;
 use crate::temporary_structured_request::TemporaryStructuredThreadOptions;
+use crate::temporary_structured_request::TemporaryThread;
 use crate::temporary_structured_request::run_temporary_structured_turn;
 use crate::temporary_structured_request::start_temporary_thread;
 use crate::temporary_structured_request::unsubscribe_temporary_thread;
@@ -250,7 +251,7 @@ impl App {
         let task = tokio::spawn(async move {
             let result = start_temporary_thread(&request_handle, options)
                 .await
-                .map(|thread| thread.thread.id)
+                .map(|thread| thread.into_thread())
                 .map_err(|error| error.to_string());
 
             event_sender.send(AppEvent::RecapStarted {
@@ -274,7 +275,7 @@ impl App {
         app_server: &AppServerSession,
         request: RecapRequest,
         history: String,
-        result: Result<String, String>,
+        result: Result<TemporaryThread, String>,
     ) {
         let RecapRequest {
             thread_id,
@@ -330,7 +331,9 @@ impl App {
             }
             let request_handle = app_server.request_handle();
             tokio::spawn(async move {
-                unsubscribe_temporary_thread(&request_handle, temporary_thread_id_text).await;
+                let TemporaryThread { id, retention } = temporary_thread_id_text;
+                drop(retention);
+                unsubscribe_temporary_thread(&request_handle, id).await;
             });
             return;
         }

@@ -389,7 +389,7 @@ async fn check_thread_title_generation(scenario: TitleScenario) -> color_eyre::R
             TitleDriveEvent::Ui(event) => {
                 if let AppEvent::ThreadTitleStarted { result, .. } = event.as_ref() {
                     temporary_thread_id =
-                        Some(result.as_ref().expect("hidden title thread").clone());
+                        Some(result.as_ref().expect("hidden title thread").id.clone());
                 }
                 generated |= matches!(event.as_ref(), AppEvent::GeneratedThreadTitle { .. });
                 app.handle_event(&mut tui, &mut app_server, *event).await?;
@@ -534,7 +534,10 @@ async fn canceled_thread_title_ignores_late_start_and_completion() -> color_eyre
         destination,
         "prompt".to_string(),
         /*effort*/ None,
-        Ok(temporary_thread_id.to_string()),
+        Ok(crate::temporary_structured_request::TemporaryThread {
+            id: temporary_thread_id.to_string(),
+            retention: None,
+        }),
         cancellation.clone(),
     );
     assert!(app.temporary_structured_requests.is_empty());
@@ -899,7 +902,10 @@ async fn failed_thread_title_requests_are_removed() -> color_eyre::Result<()> {
         suggestion,
         "prompt".to_string(),
         /*effort*/ None,
-        Ok("invalid-thread-id".to_string()),
+        Ok(crate::temporary_structured_request::TemporaryThread {
+            id: "invalid-thread-id".to_string(),
+            retention: None,
+        }),
         CancellationToken::new(),
     );
     assert!(app.pending_thread_titles.is_empty());

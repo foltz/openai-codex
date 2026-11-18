@@ -11,6 +11,7 @@ use crate::app_event::ThreadTitleDestination;
 use crate::app_server_session::AppServerSession;
 use crate::app_server_session::ThreadSettingsOwner;
 use crate::temporary_structured_request::TemporaryStructuredThreadOptions;
+use crate::temporary_structured_request::TemporaryThread;
 use crate::temporary_structured_request::run_temporary_structured_turn;
 use crate::temporary_structured_request::start_temporary_thread;
 use crate::temporary_structured_request::unsubscribe_temporary_thread;
@@ -111,7 +112,7 @@ impl App {
         tokio::spawn(async move {
             let result = start_temporary_thread(&request_handle, options)
                 .await
-                .map(|thread| thread.thread.id)
+                .map(|thread| thread.into_thread())
                 .map_err(|error| error.to_string());
 
             event_sender.send(AppEvent::ThreadTitleStarted {
@@ -134,14 +135,16 @@ impl App {
         destination: ThreadTitleDestination,
         prompt: String,
         effort: Option<ReasoningEffort>,
-        result: Result<String, String>,
+        result: Result<TemporaryThread, String>,
         cancellation: CancellationToken,
     ) {
         if cancellation.is_cancelled() {
             if let Ok(temporary_thread_id) = result {
                 let request_handle = app_server.request_handle();
                 tokio::spawn(async move {
-                    unsubscribe_temporary_thread(&request_handle, temporary_thread_id).await;
+                    let TemporaryThread { id, retention } = temporary_thread_id;
+                    drop(retention);
+                    unsubscribe_temporary_thread(&request_handle, id).await;
                 });
             }
             return;

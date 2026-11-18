@@ -31,6 +31,36 @@ use uuid::Uuid;
 const STRUCTURED_TURN_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 30);
 const STRUCTURED_RESPONSE_MAX_BYTES: usize = 8 * 1024;
 
+/// Unique ownership of the idle start-to-turn window, including an undelivered
+/// UI event. Dropping the guard releases only the newly minted grant.
+#[derive(Debug)]
+pub(crate) struct TemporaryThread {
+    pub(crate) id: String,
+    pub(crate) retention: Option<crate::app_server_session::PendingRetention>,
+}
+
+impl std::ops::Deref for TemporaryThread {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.id
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct StartedTemporaryThread {
+    pub(crate) response: ThreadStartResponse,
+    retention: Option<crate::app_server_session::PendingRetention>,
+}
+
+impl StartedTemporaryThread {
+    pub(crate) fn into_thread(self) -> TemporaryThread {
+        TemporaryThread {
+            id: self.response.thread.id,
+            retention: self.retention,
+        }
+    }
+}
+
 /// Preserve the visible thread's provider, permissions, and external-tool isolation.
 pub(crate) struct TemporaryStructuredThreadOptions {
     pub(crate) thread_source: ThreadSource,
@@ -48,7 +78,7 @@ pub(crate) struct TemporaryStructuredThreadOptions {
 pub(crate) async fn start_temporary_thread(
     request_handle: &AppServerRequestHandle,
     options: TemporaryStructuredThreadOptions,
-) -> color_eyre::Result<ThreadStartResponse> {
+) -> color_eyre::Result<StartedTemporaryThread> {
     let TemporaryStructuredThreadOptions {
         thread_source,
         model,
@@ -122,6 +152,7 @@ pub(crate) async fn start_temporary_thread(
                     permissions: custom_permission_profile.clone(),
                     runtime_workspace_roots: Some(Vec::new()),
                     ephemeral: Some(true),
+                    retain_for_connection: true,
                     thread_source: Some(thread_source),
                     environments: Some(Vec::new()),
                     dynamic_tools: Some(Vec::new()),
@@ -135,6 +166,13 @@ pub(crate) async fn start_temporary_thread(
     })
     .await
     .map_err(|_| eyre!("temporary structured thread start timed out"))??;
+
+    let retention = crate::app_server_session::RetentionClient::temporary_start_grant(
+        request_handle.clone(),
+        response.thread.id.clone(),
+        response.retention.clone(),
+    )
+    .await;
 
     if let Some(expected_profile) = custom_permission_profile {
         if response
@@ -152,7 +190,10 @@ pub(crate) async fn start_temporary_thread(
         ));
     }
 
-    Ok(response)
+    Ok(StartedTemporaryThread {
+        response,
+        retention,
+    })
 }
 
 /// Submit a structured turn using the temporary thread's existing settings.
@@ -252,13 +293,17 @@ pub(crate) async fn unsubscribe_temporary_thread(
 /// Run a bounded structured turn, interrupt it on cancellation, and detach the temporary thread.
 pub(crate) async fn run_temporary_structured_turn(
     request_handle: AppServerRequestHandle,
-    thread_id: String,
+    temporary_thread: TemporaryThread,
     prompt: String,
     output_schema: Value,
     effort: Option<ReasoningEffort>,
     notifications: UnboundedReceiver<ServerNotification>,
     cancellation: CancellationToken,
 ) -> color_eyre::Result<String> {
+    let TemporaryThread {
+        id: thread_id,
+        mut retention,
+    } = temporary_thread;
     let mut turn_id = None;
     let result = tokio::time::timeout(STRUCTURED_TURN_TIMEOUT, async {
         if cancellation.is_cancelled() {
@@ -275,6 +320,9 @@ pub(crate) async fn run_temporary_structured_turn(
         )
         .await?;
 
+        // The acknowledged turn is Active, so server lifecycle now protects it.
+        // The grant must not extend through completion or require a quarantine.
+        drop(retention.take());
         turn_id = Some(turn.turn.id.clone());
         tokio::select! {
             biased;
@@ -284,6 +332,9 @@ pub(crate) async fn run_temporary_structured_turn(
     })
     .await
     .unwrap_or_else(|_| Err(eyre!("temporary structured turn timed out")));
+
+    // Failed/cancelled startup and a startup timeout also end this grant.
+    drop(retention);
 
     // Give interruption its own deadline so cancellation near the response timeout
     // still gets a chance to stop the hidden turn.

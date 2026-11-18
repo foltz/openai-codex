@@ -439,7 +439,7 @@ pub(crate) enum AppEvent {
         destination: ThreadTitleDestination,
         prompt: String,
         effort: Option<ReasoningEffort>,
-        result: Result<String, String>,
+        result: Result<crate::temporary_structured_request::TemporaryThread, String>,
     },
     /// Route a hidden title request to its automatic rename or editable prompt.
     GeneratedThreadTitle {
@@ -1933,7 +1933,7 @@ pub(crate) enum AppEvent {
         completed_turn_count: usize,
         turn_revision: usize,
         history: String,
-        result: Result<String, String>,
+        result: Result<crate::temporary_structured_request::TemporaryThread, String>,
     },
 
     /// Deliver the generated recap from a temporary structured turn.

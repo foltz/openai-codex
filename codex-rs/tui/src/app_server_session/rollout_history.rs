@@ -28,6 +28,13 @@ use color_eyre::eyre::Result;
 // Bound recovery to recent messages when item paging is unavailable.
 const READ_ONLY_HISTORY_TURN_LIMIT: u32 = 100;
 
+/// Only the caller that will install a writable view may request adoption.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResumePurpose {
+    Observe,
+    Adopt,
+}
+
 impl AppServerSession {
     /// Read a conflicting thread without taking its writer lease. This is a snapshot, not an
     /// attachment: the caller must not route turns through this session.
@@ -157,6 +164,46 @@ impl AppServerSession {
         model_settings: ResumeModelSettings,
         permission_overrides: crate::resume_permissions::ResumePermissions,
     ) -> Result<AppServerStartedThread> {
+        Box::pin(self.resume_thread_for_purpose(
+            local_settings,
+            config,
+            thread_id,
+            model_settings,
+            permission_overrides,
+            ResumePurpose::Observe,
+        ))
+        .await
+        .map(|(started, _retention)| started)
+    }
+
+    pub(crate) async fn prepare_retained_resume(
+        &mut self,
+        local_settings: &crate::local_settings::LocalSettings,
+        config: Config,
+        thread_id: ThreadId,
+        model_settings: ResumeModelSettings,
+        permission_overrides: crate::resume_permissions::ResumePermissions,
+    ) -> Result<(AppServerStartedThread, Option<retention::PendingRetention>)> {
+        Box::pin(self.resume_thread_for_purpose(
+            local_settings,
+            config,
+            thread_id,
+            model_settings,
+            permission_overrides,
+            ResumePurpose::Adopt,
+        ))
+        .await
+    }
+
+    async fn resume_thread_for_purpose(
+        &mut self,
+        local_settings: &crate::local_settings::LocalSettings,
+        config: Config,
+        thread_id: ThreadId,
+        model_settings: ResumeModelSettings,
+        permission_overrides: crate::resume_permissions::ResumePermissions,
+        purpose: ResumePurpose,
+    ) -> Result<(AppServerStartedThread, Option<retention::PendingRetention>)> {
         if self.thread_params_mode().settings_owner() == ThreadSettingsOwner::Client {
             self.thread_tool_transport()
                 .check_namespace(&self.request_handle, &config.cwd)
@@ -189,6 +236,7 @@ impl AppServerSession {
             self.thread_tool_transport()
                 .configure_mcp(&mut params.config);
         }
+        params.retain_for_connection = purpose == ResumePurpose::Adopt;
         let paginated = self.history_support == ThreadHistorySupport::Paginated;
         let cached_legacy = paginated
             && self
@@ -248,6 +296,25 @@ impl AppServerSession {
                 ));
             }
         };
+        let retention = if purpose == ResumePurpose::Adopt {
+            match self
+                .retention
+                .adopt_thread(
+                    self.request_handle(),
+                    response.thread.id.clone(),
+                    response.retention.clone(),
+                )
+                .await
+            {
+                Ok(retention) => Some(retention),
+                Err(error) => {
+                    self.retention.warn_adoption(&response.thread.id, &error);
+                    None
+                }
+            }
+        } else {
+            None
+        };
         if let Some(subscribed) = &mut self.attachment_subscribed {
             *subscribed = true;
         }
@@ -274,7 +341,7 @@ impl AppServerSession {
             self.remember_task_tool_thread(thread_id);
             started.task_tools_available = true;
         }
-        Ok(started)
+        Ok((started, retention))
     }
 }
 

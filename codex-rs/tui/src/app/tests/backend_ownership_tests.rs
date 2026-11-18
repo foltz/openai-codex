@@ -303,6 +303,7 @@ async fn prepared_resume_cannot_activate_through_another_backend() -> Result<()>
     .await?;
     app.chat_widget.insert_str("keep this draft");
     let prepared = super::super::resume_preparation::PreparedResume {
+        retention: None,
         backend_id: BackendId::new(),
         config: app.config.clone(),
         local_settings: app.local_settings.clone(),

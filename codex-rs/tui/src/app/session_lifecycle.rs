@@ -1994,6 +1994,7 @@ impl App {
             read_only,
             history_notice,
             provider_error,
+            retention,
         } = prepared;
         if backend_id != app_server.backend_id() {
             self.add_session_picker_error(
@@ -2029,6 +2030,9 @@ impl App {
             .await
         {
             Ok(()) => {
+                if let Some(retention) = retention {
+                    retention.commit();
+                }
                 self.remember_attached_host_project(app_server);
                 if let Some(mut input) = retained_input {
                     // A successful resume is the authority for clearing the old rejection.

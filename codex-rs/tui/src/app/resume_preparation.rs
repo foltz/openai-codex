@@ -32,6 +32,7 @@ pub(super) struct PreparedResume {
     pub(super) read_only: bool,
     pub(super) history_notice: Option<&'static str>,
     pub(super) provider_error: Option<codex_app_server_protocol::ModelProviderError>,
+    pub(super) retention: Option<crate::app_server_session::retention::PendingRetention>,
 }
 
 impl App {
@@ -75,7 +76,7 @@ impl App {
             app_server.remember_thread_history_mode(target_session.thread_id, history_mode);
         }
         let resumed = app_server
-            .resume_thread_with_permission_overrides(
+            .prepare_retained_resume(
                 &local_settings,
                 resume_config.clone(),
                 target_session.thread_id,
@@ -85,8 +86,8 @@ impl App {
             .await;
         let mut history_notice = None;
         let mut provider_error = None;
-        let (resumed, read_only) = match resumed {
-            Ok(resumed) => (resumed, false),
+        let (resumed, read_only, retention) = match resumed {
+            Ok((resumed, retention)) => (resumed, false, retention),
             Err(err)
                 if crate::app_server_session::is_active_writer_error(&err)
                     || crate::app_server_session::model_provider_error(&err).is_some() =>
@@ -102,7 +103,7 @@ impl App {
                 {
                     Ok((thread, notice)) => {
                         history_notice = notice;
-                        (thread, true)
+                        (thread, true, None)
                     }
                     Err(read_err) => {
                         self.add_session_picker_error(format!(
@@ -128,6 +129,7 @@ impl App {
             read_only,
             history_notice,
             provider_error,
+            retention,
         })
     }
 }

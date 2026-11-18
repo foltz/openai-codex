@@ -108,3 +108,105 @@ async fn startup_event_owns_provisional_retention_until_installation_scenario() 
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn resume_observation_and_provisional_adoption_have_distinct_custody() -> Result<()> {
+    boxed_future!(resume_observation_and_provisional_adoption_scenario()).await
+}
+
+async fn resume_observation_and_provisional_adoption_scenario() -> Result<()> {
+    let (mut app, _, _) = make_test_app_with_channels().await;
+    app.config
+        .features
+        .set_enabled(codex_features::Feature::Plugins, false)?;
+    let mut server =
+        boxed_future!(crate::start_embedded_app_server_for_picker(&app.config)).await?;
+    let started = boxed_future!(server.start_thread(&app.config)).await?;
+    let id = started.session.thread_id;
+    boxed_future!(server.resume_thread(
+        &app.local_settings,
+        app.config.clone(),
+        id,
+        crate::app_server_session::ResumeModelSettings::PreserveExistingThread
+    ))
+    .await?;
+    let ThreadRetentionAcquireResponse::Acquired { grant_id } = probe(&mut server, id).await?
+    else {
+        panic!("observing a thread must not have acquired a retention grant")
+    };
+    let _: codex_app_server_protocol::ThreadRetentionReleaseResponse = server
+        .request_handle()
+        .request_typed(ClientRequest::ThreadRetentionRelease {
+            request_id: server.next_request_id(),
+            params: codex_app_server_protocol::ThreadRetentionReleaseParams {
+                thread_id: id.to_string(),
+                grant_id,
+            },
+        })
+        .await?;
+
+    let (resumed, pending) = boxed_future!(server.prepare_retained_resume(
+        &app.local_settings,
+        app.config.clone(),
+        id,
+        crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
+        crate::resume_permissions::ResumePermissions::default(),
+    ))
+    .await?;
+    assert_eq!(resumed.session.thread_id, id);
+    assert!(matches!(
+        probe(&mut server, id).await?,
+        ThreadRetentionAcquireResponse::AlreadyHeld { .. }
+    ));
+    pending.expect("adoption has provisional custody").commit();
+    let (_, existing) = boxed_future!(server.prepare_retained_resume(
+        &app.local_settings,
+        app.config.clone(),
+        id,
+        crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
+        crate::resume_permissions::ResumePermissions::default(),
+    ))
+    .await?;
+    drop(existing);
+    tokio::task::yield_now().await;
+    assert!(
+        matches!(
+            probe(&mut server, id).await?,
+            ThreadRetentionAcquireResponse::AlreadyHeld { .. }
+        ),
+        "abandoning an already-held adoption must not release the committed grant"
+    );
+
+    let other = boxed_future!(server.start_thread(&app.config))
+        .await?
+        .session
+        .thread_id;
+    let (_, pending) = boxed_future!(server.prepare_retained_resume(
+        &app.local_settings,
+        app.config.clone(),
+        other,
+        crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
+        crate::resume_permissions::ResumePermissions::default(),
+    ))
+    .await?;
+    drop(pending);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match probe(&mut server, other).await? {
+                ThreadRetentionAcquireResponse::Acquired { .. } => {
+                    break Ok::<_, color_eyre::Report>(());
+                }
+                ThreadRetentionAcquireResponse::AlreadyHeld { .. } => {
+                    tokio::task::yield_now().await
+                }
+                other => panic!("unexpected retention probe: {other:?}"),
+            }
+        }
+    })
+    .await??;
+    for thread_id in [id, other] {
+        server.thread_unsubscribe(thread_id).await?;
+    }
+    server.shutdown().await?;
+    Ok(())
+}

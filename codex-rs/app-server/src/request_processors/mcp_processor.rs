@@ -1019,17 +1019,27 @@ mod request_custody_tests {
     #[tokio::test]
     async fn closed_auth_owner_refuses_mcp_dispatch_before_polling() {
         let tasks = ProcessorTasks::default();
+        let permits = AccountWorkPermits::new();
+        let work = AccountOperationWork {
+            permit: permits.try_acquire().unwrap(),
+            turns: AccountTurnWork::default(),
+            auth_tasks: Some(tasks.ticket()),
+        };
         tasks.close_registration().unwrap();
         let polled = Arc::new(AtomicBool::new(false));
         let observed = Arc::clone(&polled);
-        let result = crate::auth_task_work::scope_account_request(tasks.ticket(), None, async {
-            assert!(
-                spawn_scoped_mcp_request(None, async move {
-                    observed.store(true, Ordering::SeqCst);
-                })
-                .is_err()
-            );
-        })
+        let result = crate::auth_task_work::scope_account_request(
+            tasks.ticket(),
+            Some(Box::new(work)),
+            async {
+                assert!(
+                    spawn_scoped_mcp_request(None, async move {
+                        observed.store(true, Ordering::SeqCst);
+                    })
+                    .is_err()
+                );
+            },
+        )
         .await;
         assert!(result.is_err());
         assert!(!polled.load(Ordering::SeqCst));

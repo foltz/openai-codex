@@ -27,8 +27,10 @@ pub(super) struct Reconnected {
     pub(super) session: AppServerSession,
     bootstrap: AppServerBootstrap,
     thread: Option<AppServerStartedThread>,
+    retention: Option<crate::app_server_session::PendingRetention>,
 }
 
+#[cfg(test)]
 #[expect(
     clippy::too_many_arguments,
     reason = "retain logical ownership across connection replacement"
@@ -43,6 +45,37 @@ pub(super) async fn reconnect(
     task_tools: ThreadToolTransport,
     presentation: ReconnectPresentation,
     worker_custody: std::sync::Arc<codex_app_server_client::InProcessHost>,
+) -> Result<Reconnected> {
+    reconnect_with_adoption(
+        backend_id,
+        target,
+        config,
+        local_settings,
+        thread_id,
+        remote_cwd,
+        task_tools,
+        presentation,
+        worker_custody,
+        false,
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "retain logical ownership across connection replacement"
+)]
+pub(super) async fn reconnect_with_adoption(
+    backend_id: crate::backend_id::BackendId,
+    target: AppServerTarget,
+    config: Config,
+    local_settings: crate::local_settings::LocalSettings,
+    thread_id: Option<ThreadId>,
+    remote_cwd: Option<PathBuf>,
+    task_tools: ThreadToolTransport,
+    presentation: ReconnectPresentation,
+    worker_custody: std::sync::Arc<codex_app_server_client::InProcessHost>,
+    adopt_displayed: bool,
 ) -> Result<Reconnected> {
     if matches!(target, AppServerTarget::Cloud) {
         color_eyre::eyre::bail!("Reopen Codex to reconnect the cloud backend.");
@@ -86,15 +119,28 @@ pub(super) async fn reconnect(
             let bootstrap = session.bootstrap(&config).await?;
             let thread = if let Some(thread_id) = thread_id {
                 stage = "resuming the conversation";
-                match session
-                    .resume_thread(
-                        &local_settings,
-                        config.clone(),
-                        thread_id,
-                        ResumeModelSettings::PreserveExistingThread,
-                    )
-                    .await
-                {
+                let resumed = if adopt_displayed {
+                    session
+                        .prepare_retained_resume(
+                            &local_settings,
+                            config.clone(),
+                            thread_id,
+                            ResumeModelSettings::PreserveExistingThread,
+                            crate::resume_permissions::ResumePermissions::default(),
+                        )
+                        .await
+                } else {
+                    session
+                        .resume_thread(
+                            &local_settings,
+                            config.clone(),
+                            thread_id,
+                            ResumeModelSettings::PreserveExistingThread,
+                        )
+                        .await
+                        .map(|thread| (thread, None))
+                };
+                match resumed {
                     Ok(thread) => Some(thread),
                     Err(error)
                         if matches!(
@@ -129,10 +175,15 @@ pub(super) async fn reconnect(
             } else {
                 None
             };
+            let (thread, retention) = match thread {
+                Some((thread, retention)) => (Some(thread), retention),
+                None => (None, None),
+            };
             Ok::<_, color_eyre::Report>(Reconnected {
                 session,
                 bootstrap,
                 thread,
+                retention,
             })
         };
         let result = tokio::time::timeout_at(deadline, attempt).await;
@@ -361,7 +412,9 @@ impl App {
             mut session,
             bootstrap,
             thread,
+            mut retention,
         } = connected;
+        let resumed_id = thread.as_ref().map(|started| started.session.thread_id);
         session.model_provider_override = self.harness_overrides.model_provider.clone();
         let selected = self
             .chat_widget
@@ -540,6 +593,14 @@ impl App {
                     tracing::warn!(%drain_err, "failed to discard input after reconnecting");
                 }
                 return Err(err);
+            }
+            if resumed_id == Some(id)
+                && !self.chat_widget.is_external_writer_view()
+                && !self.thread_unavailable(id)
+            {
+                if let Some(retention) = retention.take() {
+                    retention.commit();
+                }
             }
             self.config = self.chat_widget.config_ref().clone();
             if self.thread_unavailable(id) && !self.chat_widget.is_external_writer_view() {

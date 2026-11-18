@@ -1429,7 +1429,7 @@ See the Codex keymap documentation for supported actions and examples."
                     let presentation = app.reconnect.presentation;
                     let wait_for_drain =
                         app.pending_startup_thread_start && backends.is_listening(displayed_owner);
-                    let attempt = reconnect::reconnect(
+                    let attempt = reconnect::reconnect_with_adoption(
                         displayed_owner,
                         app.app_server_target.clone(),
                         app.config.clone(),
@@ -1444,6 +1444,9 @@ See the Codex keymap documentation for supported actions and examples."
                             .thread_tool_transport(),
                         presentation,
                         backends.worker_custody_at(displayed_session),
+                        // Cached external-writer views remain observations;
+                        // only the displayed writable attachment may reacquire.
+                        !app.chat_widget.is_external_writer_view(),
                     );
                     let future = Box::pin(async move {
                         if let reconnect::ReconnectPresentation::Startup(deadline) = presentation

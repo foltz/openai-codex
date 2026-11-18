@@ -1497,40 +1497,42 @@ impl ThreadRequestProcessor {
         let custody_error_request = error_request_id.clone();
         let recovery_state = self.state_db.clone();
         let retention_state_manager = self.thread_state_manager.clone();
-        let thread_start_task = async move {
+        let thread_start_task = box_thread_start_future(|| async move {
             let mut minted = None;
-            let result = Self::thread_start_task(
-                listener_task_context,
-                thread_store,
-                config_manager,
-                ThreadStartCustody {
-                    request_id,
-                    retention,
-                    minted: &mut minted,
-                },
-                app_server_client_name,
-                app_server_client_version,
-                client_mcp_extensions,
-                config,
-                typesafe_overrides,
-                dynamic_tools,
-                selected_capability_roots.unwrap_or_default(),
-                history_mode.map(Into::into),
-                session_start_source,
-                clear_predecessor_thread_id,
-                clear_recovery,
-                recovery_state,
-                thread_source.map(Into::into),
-                project_id,
-                daybreak_enabled,
-                environment_requests,
-                service_name,
-                allow_provider_model_fallback,
-                experimental_raw_events,
-                request_trace,
-                initial_config_warnings,
-                control_endpoint,
-            )
+            let result = box_thread_start_future(|| {
+                Self::thread_start_task(
+                    listener_task_context,
+                    thread_store,
+                    config_manager,
+                    ThreadStartCustody {
+                        request_id,
+                        retention,
+                        minted: &mut minted,
+                    },
+                    app_server_client_name,
+                    app_server_client_version,
+                    client_mcp_extensions,
+                    config,
+                    typesafe_overrides,
+                    dynamic_tools,
+                    selected_capability_roots.unwrap_or_default(),
+                    history_mode.map(Into::into),
+                    session_start_source,
+                    clear_predecessor_thread_id,
+                    clear_recovery,
+                    recovery_state,
+                    thread_source.map(Into::into),
+                    project_id,
+                    daybreak_enabled,
+                    environment_requests,
+                    service_name,
+                    allow_provider_model_fallback,
+                    experimental_raw_events,
+                    request_trace,
+                    initial_config_warnings,
+                    control_endpoint,
+                )
+            })
             .await;
             if let Err(error) = result {
                 if let Some((thread_id, principal, grant_id)) = minted {
@@ -1540,7 +1542,7 @@ impl ThreadRequestProcessor {
                 }
                 outgoing.send_error(error_request_id, error).await;
             }
-        };
+        });
         let receipt = self
             .background_tasks
             .spawn(
@@ -7382,6 +7384,16 @@ fn build_thread_from_loaded_snapshot(
 #[cfg(test)]
 #[path = "thread_processor_tests.rs"]
 mod thread_processor_tests;
+
+/// Construct the large startup state machine in a separate frame before it is
+/// captured by request/auth scopes. Box::pin at the call site can still reserve
+/// its full size on the embedded runtime's polling stack.
+#[inline(never)]
+fn box_thread_start_future<F: std::future::Future>(
+    create: impl FnOnce() -> F,
+) -> std::pin::Pin<Box<F>> {
+    Box::pin(create())
+}
 
 struct ThreadStartCustody<'a> {
     request_id: ConnectionRequestId,

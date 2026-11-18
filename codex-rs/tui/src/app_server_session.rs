@@ -1185,6 +1185,7 @@ impl AppServerSession {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn start_thread_with_session_start_source(
         &mut self,
         local_settings: &LocalSettings,
@@ -1449,6 +1450,7 @@ impl AppServerSession {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn fork_thread_with_permission_mode(
         &mut self,
         local_settings: &LocalSettings,
@@ -1477,6 +1479,7 @@ impl AppServerSession {
         clippy::too_many_arguments,
         reason = "fork position and named permissions are independent"
     )]
+    #[cfg(test)]
     pub(crate) async fn fork_thread_at(
         &mut self,
         local_settings: &LocalSettings,
@@ -1497,34 +1500,6 @@ impl AppServerSession {
             ForkPresentation::Regular,
             selected_profile,
             ForkPermissionMode::InheritSaved,
-            ForkConfigSource::Session,
-            /*adopt*/ false,
-        )
-        .await
-        .map(|(thread, _retention)| thread)
-    }
-
-    pub(crate) async fn fork_thread_for_directory_change(
-        &mut self,
-        local_settings: &LocalSettings,
-        config: Config,
-        thread_id: ThreadId,
-        selected_profile: Option<&PermissionProfileSelection>,
-    ) -> Result<AppServerStartedThread> {
-        let permission_mode = match self.thread_params_mode() {
-            ThreadParamsMode::Embedded => ForkPermissionMode::OverrideFromCurrentConfig,
-            ThreadParamsMode::Remote | ThreadParamsMode::Cloud => ForkPermissionMode::InheritSaved,
-        };
-        self.fork_thread_at_with_presentation(
-            local_settings,
-            config,
-            thread_id,
-            /*last_turn_id*/ None,
-            /*before_turn_id*/ None,
-            ForkGoalContinuation::DeferUntilNextTurn,
-            ForkPresentation::Regular,
-            selected_profile,
-            permission_mode,
             ForkConfigSource::Session,
             /*adopt*/ false,
         )

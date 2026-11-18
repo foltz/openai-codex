@@ -596,7 +596,7 @@ impl App {
         let mut read_only_thread = false;
         let mut provider_error = None;
         let mut history_notice = None;
-        let (mut chat_widget, initial_started_thread) = match session_selection {
+        let (mut chat_widget, initial_started_thread, initial_retention) = match session_selection {
             SessionSelection::StartFresh
             | SessionSelection::Exit
             | SessionSelection::AgentsOverview => {
@@ -664,7 +664,7 @@ impl App {
                 chat_widget.set_queue_submissions_until_session_configured(
                     /*queue*/ !start_in_agents_overview,
                 );
-                (chat_widget, None)
+                (chat_widget, None, None)
             }
             SessionSelection::Resume(target_session) => {
                 if app_server_target.thread_params_mode()
@@ -693,7 +693,7 @@ impl App {
                 let resumed = match startup_draft
                     .run_until(
                         tui,
-                        app_server.resume_thread_with_permission_overrides(
+                        app_server.prepare_retained_resume(
                             &local_settings,
                             config.clone(),
                             target_session.thread_id,
@@ -726,7 +726,7 @@ impl App {
                         {
                             Ok(result) => result.map(|(thread, notice)| {
                                 history_notice = notice;
-                                thread
+                                (thread, None)
                             }),
                             Err(err) => {
                                 return shutdown_on_startup_error(
@@ -776,7 +776,9 @@ impl App {
                     )
                     .await;
                     match startup_try!(resumed) {
-                        SessionStartOutcome::Started(started) => Some(*started),
+                        SessionStartOutcome::Started(started, retention) => {
+                            Some((*started, retention))
+                        }
                         SessionStartOutcome::CommandCenter => None,
                         SessionStartOutcome::Exit => {
                             return Ok(
@@ -784,6 +786,10 @@ impl App {
                             );
                         }
                     }
+                };
+                let (resumed, retention) = match resumed {
+                    Some((thread, retention)) => (Some(thread), retention),
+                    None => (None, None),
                 };
                 let init = crate::chatwidget::ChatWidgetInit {
                     local_settings: local_settings.clone(),
@@ -814,7 +820,7 @@ impl App {
                         .clone(),
                     session_telemetry: session_telemetry.clone(),
                 };
-                (ChatWidget::new_with_app_event(init), resumed)
+                (ChatWidget::new_with_app_event(init), resumed, retention)
             }
             SessionSelection::Fork(target_session) => {
                 let explicit_permission_override =
@@ -848,7 +854,7 @@ impl App {
                 let forked = match startup_draft
                     .run_until(
                         tui,
-                        app_server.fork_thread_with_permission_mode(
+                        app_server.prepare_retained_fork_thread_with_permission_mode(
                             &local_settings,
                             config.clone(),
                             target_session.thread_id,
@@ -880,11 +886,15 @@ impl App {
                 )
                 .await;
                 let forked = match startup_try!(forked) {
-                    SessionStartOutcome::Started(started) => Some(*started),
+                    SessionStartOutcome::Started(started, retention) => Some((*started, retention)),
                     SessionStartOutcome::CommandCenter => None,
                     SessionStartOutcome::Exit => {
                         return Ok(cancel_startup_sessions(app_server, &mut other_backends).await);
                     }
+                };
+                let (forked, retention) = match forked {
+                    Some((thread, retention)) => (Some(thread), retention),
+                    None => (None, None),
                 };
                 if let Some(forked) = &forked {
                     if let Some(worktree) = managed_worktree.as_ref()
@@ -926,7 +936,7 @@ impl App {
                         .clone(),
                     session_telemetry: session_telemetry.clone(),
                 };
-                (ChatWidget::new_with_app_event(init), forked)
+                (ChatWidget::new_with_app_event(init), forked, retention)
             }
         };
         let startup_session_cancelled = initial_started_thread.is_none()
@@ -1179,6 +1189,9 @@ See the Codex keymap documentation for supported actions and examples."
                 Err(err) => {
                     return shutdown_on_startup_error(app_server, &mut other_backends, err).await;
                 }
+            }
+            if let Some(retention) = initial_retention {
+                retention.commit();
             }
             app.remember_attached_host_project(&app_server);
             if let Some(error) = provider_error {

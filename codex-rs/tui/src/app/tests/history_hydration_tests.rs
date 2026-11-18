@@ -303,11 +303,11 @@ async fn history_hydration_archived_retry_uses_first_attempt_runtime_settings() 
                 },
                 &target,
                 action,
-                initial,
+                initial.map(|thread| (thread, None)),
                 async || Ok(crate::unarchive_prompt::UnarchiveChoice::Unarchive),
             )
             .await?;
-            let SessionStartOutcome::Started(started) = outcome else {
+            let SessionStartOutcome::Started(started, _retention) = outcome else {
                 panic!("retry starts session")
             };
             let count = started

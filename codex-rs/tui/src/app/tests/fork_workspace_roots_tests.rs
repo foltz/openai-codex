@@ -123,6 +123,15 @@ async fn check_fork_dispatch(mode: ThreadParamsMode) -> Result<()> {
     let installed = app
         .current_displayed_thread_id()
         .expect("fork is displayed");
+    // Serialize behind any abandoned fork release before observing the grant.
+    let (_, provisional_probe) = Box::pin(server.prepare_retained_resume(
+        &app.local_settings,
+        app.config.clone(),
+        installed,
+        crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
+        crate::resume_permissions::ResumePermissions::default(),
+    ))
+    .await?;
     let held: codex_app_server_protocol::ThreadRetentionAcquireResponse = server
         .request_handle()
         .request_typed(ClientRequest::ThreadRetentionAcquire {
@@ -138,6 +147,11 @@ async fn check_fork_dispatch(mode: ThreadParamsMode) -> Result<()> {
     ));
 
     assert_eq!(app.chat_widget.config_ref().workspace_roots, expected_roots);
+    assert!(
+        recorded_params(&requests, "thread/retention/release").is_empty(),
+        "installed fork must not abandon its grant before the serialized probe"
+    );
+    drop(provisional_probe);
     let fork_roots: Vec<_> = recorded_params(&requests, "thread/fork")
         .into_iter()
         .map(|params| params["runtimeWorkspaceRoots"].clone())

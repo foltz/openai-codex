@@ -99,7 +99,7 @@ async fn archived_session_requires_confirmation_before_resume_or_fork() -> Resul
         }
 
         assert_eq!(prompts.get(), 2);
-        let SessionStartOutcome::Started(started) =
+        let SessionStartOutcome::Started(started, retention) =
             start_session(&mut app_server, &config, &target, action, async || {
                 prompts.set(prompts.get() + 1);
                 Ok(UnarchiveChoice::Unarchive)
@@ -128,7 +128,11 @@ async fn archived_session_requires_confirmation_before_resume_or_fork() -> Resul
             }
         }
 
-        let SessionStartOutcome::Started(resumed) = start_session(
+        if let Some(retention) = retention {
+            retention.commit();
+        }
+
+        let SessionStartOutcome::Started(resumed, _retention) = start_session(
             &mut app_server,
             &config,
             &target,

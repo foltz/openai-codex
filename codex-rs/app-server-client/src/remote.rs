@@ -16,6 +16,8 @@ use std::io::Error as IoError;
 use std::io::ErrorKind;
 use std::io::Result as IoResult;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::AppServerEvent;
@@ -55,6 +57,7 @@ use tokio::io::AsyncWrite;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio::time::timeout;
 use tokio::time::timeout_at;
@@ -181,9 +184,10 @@ pub struct RemoteAppServerClient {
     worker_handle: RemoteWorker,
     terminal_error: WorkerTerminalError,
     worker_custody: Option<Arc<InProcessHost>>,
+    final_exit: FinalExitLatch,
 }
 
-/// The transport failure the worker observed before it stopped. The worker
+/// The transport failure or final-exit deadline the worker observed before it stopped. The worker
 /// records it before refusing queued commands, so `shutdown` reports the same
 /// failure whether its close was refused in the queue or could no longer be
 /// queued because the worker had already exited.
@@ -249,9 +253,138 @@ impl RemoteWorker {
     }
 }
 
+/// Requests that tear down state this connection owns and that the final-exit
+/// path legitimately issues. Exact methods only:
+/// - hosted-endpoint declare and retire (tui `app_server_session.rs`
+///   `retire_hosted_mcp_endpoint`);
+/// - retention release from settling adoptions
+///   (tui `app_server_session/retention.rs` `ThreadRetentionRelease`).
+///
+/// Admission name for answers to server requests (resolve and reject). Not
+/// owned teardown, so it is refused at the edge.
+const SERVER_REQUEST_RESPONSE: &str = "server/request/response";
+
+const OWNED_TEARDOWN_METHODS: &[&str] = &[
+    "kcf/mcpServer/hostedEndpoint/declare",
+    "kcf/mcpServer/hostedEndpoint/retire",
+    "thread/retention/release",
+];
+
+/// Shared final-exit state: the edge, and the EARLIEST deadline any owner
+/// latched. Every handle and the worker observe the same latch.
+#[derive(Clone)]
+struct FinalExitLatch {
+    edge: Arc<AtomicBool>,
+    deadline: Arc<watch::Sender<Option<tokio::time::Instant>>>,
+}
+
+impl FinalExitLatch {
+    fn new() -> Self {
+        Self {
+            edge: Arc::new(AtomicBool::new(false)),
+            deadline: Arc::new(watch::channel(None).0),
+        }
+    }
+
+    /// Sets the edge and latches the earliest deadline; never extends it.
+    fn begin(&self, deadline: tokio::time::Instant) -> tokio::time::Instant {
+        self.edge.store(true, Ordering::Release);
+        self.deadline.send_modify(|latched| {
+            *latched = Some(latched.map_or(deadline, |current| current.min(deadline)));
+        });
+        self.deadline().unwrap_or(deadline)
+    }
+
+    fn deadline(&self) -> Option<tokio::time::Instant> {
+        *self.deadline.borrow()
+    }
+
+    fn expired(&self) -> bool {
+        self.deadline()
+            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+    }
+
+    /// After expiry nothing is admitted; at the edge only exact owned
+    /// teardown methods are admitted.
+    fn admit(&self, method: &str) -> IoResult<()> {
+        if self.expired() {
+            return Err(IoError::new(
+                ErrorKind::TimedOut,
+                "remote app-server final-exit deadline has expired; no work is admitted",
+            ));
+        }
+        if self.edge.load(Ordering::Acquire) && !OWNED_TEARDOWN_METHODS.contains(&method) {
+            return Err(IoError::new(
+                ErrorKind::ConnectionAborted,
+                format!(
+                    "remote app-server connection is in final exit; `{method}` is not an owned teardown request"
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Resolves only when a latched final-exit deadline is reached. Cancel-safe.
+async fn final_exit_deadline_reached(latch: &mut watch::Receiver<Option<tokio::time::Instant>>) {
+    loop {
+        let current = *latch.borrow_and_update();
+        match current {
+            Some(deadline) => {
+                tokio::select! {
+                    () = tokio::time::sleep_until(deadline) => return,
+                    changed = latch.changed() => {
+                        if changed.is_err() {
+                            tokio::time::sleep_until(deadline).await;
+                            return;
+                        }
+                    }
+                }
+            }
+            None => {
+                if latch.changed().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            }
+        }
+    }
+}
+
+fn final_exit_incomplete() -> (ErrorKind, String) {
+    (
+        ErrorKind::TimedOut,
+        "remote app-server final-exit deadline expired; the worker stopped incomplete".to_string(),
+    )
+}
+
+/// Only Closed proves the close and original worker join completed.
+/// TimedOut carries an error, never the original: hosted originals already
+/// belong to the run host before any cancellable shutdown starts.
+#[derive(Debug)]
+pub enum FinalClose {
+    Closed,
+    CloseFailed(IoError),
+    TimedOut(IoError),
+    JoinFailed(String),
+}
+
+impl FinalClose {
+    pub fn is_closed(&self) -> bool {
+        matches!(self, Self::Closed)
+    }
+    fn into_result(self) -> IoResult<()> {
+        match self {
+            Self::Closed => Ok(()),
+            Self::CloseFailed(error) | Self::TimedOut(error) => Err(error),
+            Self::JoinFailed(message) => Err(IoError::other(message)),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct RemoteAppServerRequestHandle {
     command_tx: mpsc::Sender<RemoteClientCommand>,
+    final_exit: FinalExitLatch,
 }
 
 enum SocketPeerPolicy {
@@ -426,11 +559,26 @@ impl RemoteAppServerClient {
         let (event_tx, event_rx) = mpsc::unbounded_channel::<AppServerEvent>();
         let terminal_error = WorkerTerminalError::default();
         let worker_terminal_error = terminal_error.clone();
+        let final_exit = FinalExitLatch::new();
+        let worker_final_exit = final_exit.clone();
+        let mut final_deadline = final_exit.deadline.subscribe();
         let worker_handle = tokio::spawn(async move {
             let mut pending_requests =
                 HashMap::<RequestId, oneshot::Sender<IoResult<RequestResult>>>::new();
             let mut worker_exit_error: Option<(ErrorKind, String)> = None;
             let mut transport_failed = false;
+            // The outer deadline covers the whole worker operation, including
+            // a blocked socket write or close. Dropping that operation is an
+            // incomplete terminal outcome, never a successful close or abort
+            // of a separately owned task. The original join stays in its host.
+            tokio::select! {
+                biased;
+                () = final_exit_deadline_reached(&mut final_deadline) => {
+                    let (kind, message) = final_exit_incomplete();
+                    worker_terminal_error.record(kind, &message);
+                    worker_exit_error = Some((kind, message));
+                }
+                () = async {
             loop {
                 tokio::select! {
                     biased;
@@ -443,6 +591,19 @@ impl RemoteAppServerClient {
                             let _ = stream.close().await;
                             break;
                         };
+                        let method = match &command {
+                            RemoteClientCommand::Request { request, .. } => Some(request.method.clone()),
+                            RemoteClientCommand::Notify { notification, .. } => Some(notification.to_string()),
+                            RemoteClientCommand::ResolveServerRequest { .. }
+                            | RemoteClientCommand::RejectServerRequest { .. } => Some(SERVER_REQUEST_RESPONSE.to_owned()),
+                            RemoteClientCommand::Shutdown { .. } => None,
+                        };
+                        if let Some(method) = method
+                            && let Err(error) = worker_final_exit.admit(&method)
+                        {
+                            refuse_command(command, error.kind(), &format!("{error} (refused at dequeue)"));
+                            continue;
+                        }
                         match command {
                             RemoteClientCommand::Request { request, response_tx } => {
                                 let request_id = request.id.clone();
@@ -606,6 +767,9 @@ impl RemoteAppServerClient {
                                             }
                                             Err(err) => {
                                                 warn!(%err, method, "rejecting unknown remote app-server request");
+                                                if worker_final_exit.admit(SERVER_REQUEST_RESPONSE).is_err() {
+                                                    continue;
+                                                }
                                                 if let Err(reject_err) = write_jsonrpc_message(
                                                     &mut stream,
                                                     JSONRPCMessage::Error(JSONRPCError {
@@ -714,6 +878,9 @@ impl RemoteAppServerClient {
                 }
             }
 
+                } => {}
+            }
+
             let (err_kind, err_message) = worker_exit_error.unwrap_or_else(|| {
                 (
                     ErrorKind::BrokenPipe,
@@ -740,12 +907,14 @@ impl RemoteAppServerClient {
             worker_handle: RemoteWorker::Unhosted(Some(worker_handle)),
             terminal_error,
             worker_custody: None,
+            final_exit,
         })
     }
 
     pub fn request_handle(&self) -> RemoteAppServerRequestHandle {
         RemoteAppServerRequestHandle {
             command_tx: self.command_tx.clone(),
+            final_exit: self.final_exit.clone(),
         }
     }
 
@@ -763,6 +932,7 @@ impl RemoteAppServerClient {
     }
 
     pub async fn notify(&self, notification: ClientNotification) -> IoResult<()> {
+        self.final_exit.admit(&notification.to_string())?;
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
             .send(RemoteClientCommand::Notify {
@@ -811,7 +981,23 @@ impl RemoteAppServerClient {
         self.event_rx.recv().await
     }
 
+    pub fn begin_final_exit(&self, deadline: Instant) {
+        self.final_exit.begin(deadline);
+    }
+
+    pub async fn shutdown_by(self, deadline: Instant) -> FinalClose {
+        let deadline = self.final_exit.begin(deadline);
+        self.close_until(deadline).await
+    }
+
     pub async fn shutdown(self) -> IoResult<()> {
+        // Reconnect shutdown remains unlatched and has its ordinary budget.
+        self.close_until(Instant::now() + SHUTDOWN_TIMEOUT)
+            .await
+            .into_result()
+    }
+
+    async fn close_until(self, deadline: Instant) -> FinalClose {
         let Self {
             command_tx,
             event_rx,
@@ -820,10 +1006,10 @@ impl RemoteAppServerClient {
             mut worker_handle,
             terminal_error,
             worker_custody: _host,
+            final_exit: _latch,
         } = self;
         // One caller budget covers admission, acknowledgement and original join.
         // Hosted originals remain in the run host even if this observer is cancelled.
-        let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
         let (response_tx, response_rx) = oneshot::channel();
         let close_error = match timeout_at(
             deadline,
@@ -849,8 +1035,15 @@ impl RemoteAppServerClient {
         let joined = worker_handle.observe_until(deadline).await;
         // Preserve event delivery until the close and original join are observed.
         drop(event_rx);
-        joined?;
-        close_error.map_or(Ok(()), Err)
+        match joined {
+            Err(error) if error.kind() == ErrorKind::TimedOut => FinalClose::TimedOut(error),
+            Err(error) => FinalClose::JoinFailed(error.to_string()),
+            Ok(()) => match close_error {
+                None => FinalClose::Closed,
+                Some(error) if error.kind() == ErrorKind::TimedOut => FinalClose::TimedOut(error),
+                Some(error) => FinalClose::CloseFailed(error),
+            },
+        }
     }
 }
 
@@ -860,6 +1053,7 @@ impl RemoteAppServerRequestHandle {
         request_id: RequestId,
         result: JsonRpcResult,
     ) -> IoResult<()> {
+        self.final_exit.admit(SERVER_REQUEST_RESPONSE)?;
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
             .send(RemoteClientCommand::ResolveServerRequest {
@@ -887,6 +1081,7 @@ impl RemoteAppServerRequestHandle {
         request_id: RequestId,
         error: JSONRPCErrorError,
     ) -> IoResult<()> {
+        self.final_exit.admit(SERVER_REQUEST_RESPONSE)?;
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
             .send(RemoteClientCommand::RejectServerRequest {
@@ -915,6 +1110,7 @@ impl RemoteAppServerRequestHandle {
     }
 
     pub async fn request_json_rpc(&self, request: JSONRPCRequest) -> IoResult<RequestResult> {
+        self.final_exit.admit(&request.method)?;
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
             .send(RemoteClientCommand::Request {
@@ -1330,6 +1526,7 @@ mod tests {
             worker_handle: RemoteWorker::Unhosted(Some(worker_handle)),
             terminal_error: WorkerTerminalError::default(),
             worker_custody: None,
+            final_exit: FinalExitLatch::new(),
         };
 
         client
@@ -1621,11 +1818,93 @@ mod tests {
                 worker_handle: RemoteWorker::Unhosted(Some(worker_handle)),
                 terminal_error: WorkerTerminalError::default(),
                 worker_custody: None,
+                final_exit: FinalExitLatch::new(),
             },
             release_tx,
             entered_rx,
             done_rx,
         )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn final_close_timeout_keeps_the_original_in_its_run_host() {
+        let host = Arc::new(InProcessHost::default());
+        let (client, release, entered, done) = controlled_shutdown_client(false);
+        let client = client.with_worker_custody(Arc::clone(&host)).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let closing = tokio::spawn(client.shutdown_by(deadline));
+        entered.await.unwrap();
+        let close = closing.await.unwrap();
+        let FinalClose::TimedOut(error) = close else {
+            panic!("not a completed close: {close:?}");
+        };
+        assert!(error.to_string().contains("original retained by run host"));
+        assert_eq!(Instant::now(), deadline);
+        assert_eq!(
+            host.observe_client_workers_until(Instant::now()).await,
+            vec![TaskObservation::TimedOut]
+        );
+        release.send(()).unwrap();
+        done.await.unwrap();
+        assert_eq!(
+            host.observe_client_workers_until(Instant::now() + Duration::from_secs(1))
+                .await,
+            vec![TaskObservation::Terminated(TaskTermination::Normal)]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn final_exit_stops_a_real_blocked_write_and_refuses_queued_ordinary_work() {
+        let host = Arc::new(InProcessHost::default());
+        let (client, release, peer) = production_client_with_gated_peer(PeerExit::Reset).await;
+        let client = client.with_worker_custody(Arc::clone(&host)).unwrap();
+        let big = block_worker_in_write(&client).await;
+        let handle = client.request_handle();
+        let idle_capacity = handle.command_tx.capacity();
+        let queued_handle = handle.clone();
+        let queued = tokio::spawn(async move {
+            queued_handle
+                .request_json_rpc(JSONRPCRequest {
+                    id: RequestId::Integer(9),
+                    method: "thread/loaded/list".to_owned(),
+                    params: None,
+                    trace: None,
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while handle.command_tx.capacity() >= idle_capacity {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_millis(100);
+        client.begin_final_exit(deadline);
+        assert_eq!(
+            handle
+                .request_json_rpc(JSONRPCRequest {
+                    id: RequestId::Integer(10),
+                    method: "turn/start".to_owned(),
+                    params: None,
+                    trace: None
+                })
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::ConnectionAborted
+        );
+        let close = client.shutdown_by(deadline).await;
+        assert!(!close.is_closed(), "abandoned write must remain incomplete");
+        assert_eq!(big.await.unwrap().unwrap_err().kind(), ErrorKind::TimedOut);
+        assert!(queued.await.unwrap().is_err());
+        assert_eq!(
+            host.observe_client_workers_until(Instant::now() + Duration::from_secs(2))
+                .await,
+            vec![TaskObservation::Terminated(TaskTermination::Normal)]
+        );
+        release.send(()).unwrap();
+        peer.await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -1785,5 +2064,90 @@ mod tests {
                 vec![TaskObservation::Terminated(TaskTermination::Panicked)]
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod final_exit_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn latch_keeps_the_earliest_deadline_and_exact_teardown_boundary() {
+        let latch = FinalExitLatch::new();
+        assert!(latch.admit("turn/start").is_ok());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        assert_eq!(latch.begin(deadline), deadline);
+        assert_eq!(latch.begin(deadline + Duration::from_secs(5)), deadline);
+        for method in OWNED_TEARDOWN_METHODS {
+            assert!(latch.admit(method).is_ok());
+        }
+        for method in [
+            "turn/start",
+            SERVER_REQUEST_RESPONSE,
+            "kcf/mcpServer/hostedEndpoint/retireAll",
+            "thread/retention/release/extra",
+        ] {
+            assert_eq!(
+                latch.admit(method).unwrap_err().kind(),
+                ErrorKind::ConnectionAborted
+            );
+        }
+        let earlier = Instant::now() + Duration::from_millis(50);
+        assert_eq!(latch.begin(earlier), earlier);
+        tokio::time::advance(Duration::from_millis(50)).await;
+        for method in OWNED_TEARDOWN_METHODS {
+            assert_eq!(latch.admit(method).unwrap_err().kind(), ErrorKind::TimedOut);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shared_request_handle_refuses_after_expiry_without_enqueueing() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let latch = FinalExitLatch::new();
+        let handle = RemoteAppServerRequestHandle {
+            command_tx: tx,
+            final_exit: latch.clone(),
+        };
+        let clone = handle.clone();
+        latch.begin(Instant::now());
+        let request = JSONRPCRequest {
+            id: RequestId::Integer(1),
+            method: OWNED_TEARDOWN_METHODS[0].to_owned(),
+            params: None,
+            trace: None,
+        };
+        assert_eq!(
+            clone.request_json_rpc(request).await.unwrap_err().kind(),
+            ErrorKind::TimedOut
+        );
+        assert_eq!(
+            clone
+                .resolve_server_request(RequestId::Integer(2), serde_json::json!({}))
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::TimedOut
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn waiting_deadline_observes_tightening_without_extending() {
+        let latch = FinalExitLatch::new();
+        let first = Instant::now() + Duration::from_secs(10);
+        latch.begin(first);
+        let mut receiver = latch.deadline.subscribe();
+        let waiter = tokio::spawn(async move {
+            final_exit_deadline_reached(&mut receiver).await;
+        });
+        tokio::task::yield_now().await;
+        let earlier = Instant::now() + Duration::from_secs(1);
+        latch.begin(earlier);
+        latch.begin(first);
+        waiter.await.unwrap();
+        assert_eq!(Instant::now(), earlier);
     }
 }

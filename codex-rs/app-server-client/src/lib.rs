@@ -85,6 +85,7 @@ use toml::Value as TomlValue;
 use tracing::warn;
 
 pub use crate::path::AppServerPath;
+pub use crate::remote::FinalClose;
 pub use crate::remote::RemoteAppServerClient;
 pub use crate::remote::RemoteAppServerConnectArgs;
 pub use crate::remote::RemoteAppServerEndpoint;
@@ -708,6 +709,11 @@ impl InProcessAppServerClient {
     /// error. The worker is deliberately not aborted: its host-owned runtime
     /// and cleanup receipts remain observable after this caller returns.
     pub async fn shutdown(self) -> IoResult<()> {
+        self.shutdown_until(Instant::now() + IN_PROCESS_SHUTDOWN_TIMEOUT)
+            .await
+    }
+
+    async fn shutdown_until(self, deadline: Instant) -> IoResult<()> {
         let Self {
             command_tx,
             event_rx,
@@ -718,7 +724,6 @@ impl InProcessAppServerClient {
         // Keep the event consumer alive until the worker has been observed or
         // the deadline elapsed. Dropping it first would let the worker's
         // owner-drop exit win before this caller-deadlined Shutdown is queued.
-        let deadline = Instant::now() + IN_PROCESS_SHUTDOWN_TIMEOUT;
         let mut command_error = None;
         let (response_tx, response_rx) = oneshot::channel();
         match timeout_at(
@@ -1009,6 +1014,25 @@ impl AppServerClient {
             Self::InProcess(client) => client.next_event().await.map(Into::into),
             Self::Remote(client) => client.next_event().await,
             Self::Cloud(client) => client.next_event().await,
+        }
+    }
+
+    pub fn begin_final_exit(&self, deadline: Instant) {
+        if let Self::Remote(client) = self {
+            client.begin_final_exit(deadline);
+        }
+    }
+
+    pub async fn shutdown_by(self, deadline: Instant) -> FinalClose {
+        let result = match self {
+            Self::Remote(client) => return client.shutdown_by(deadline).await,
+            Self::InProcess(client) => client.shutdown_until(deadline).await,
+            Self::Cloud(client) => client.shutdown_until(deadline).await,
+        };
+        match result {
+            Ok(()) => FinalClose::Closed,
+            Err(error) if error.kind() == ErrorKind::TimedOut => FinalClose::TimedOut(error),
+            Err(error) => FinalClose::CloseFailed(error),
         }
     }
 

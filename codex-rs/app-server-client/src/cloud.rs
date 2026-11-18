@@ -197,12 +197,16 @@ impl CloudClient {
     }
 
     pub(crate) async fn shutdown(self) -> io::Result<()> {
-        tokio::time::timeout(
-            crate::SHUTDOWN_TIMEOUT,
-            self.handle.unit(CloudOperation::Shutdown),
-        )
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "cloud backend shutdown timed out"))?
+        self.shutdown_until(tokio::time::Instant::now() + crate::SHUTDOWN_TIMEOUT)
+            .await
+    }
+
+    pub(crate) async fn shutdown_until(self, deadline: tokio::time::Instant) -> io::Result<()> {
+        tokio::time::timeout_at(deadline, self.handle.unit(CloudOperation::Shutdown))
+            .await
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "cloud backend shutdown timed out")
+            })?
     }
 }
 

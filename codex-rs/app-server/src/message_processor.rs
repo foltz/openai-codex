@@ -1804,15 +1804,16 @@ impl MessageProcessor {
                                 .thread_manager
                                 .derive_request_operation_work()
                                 .map_err(|_| account_transition_in_progress())?;
-                            let operation =
-                                Box::pin(processor_for_request.handle_initialized_client_request(
+                            let operation = box_dispatch_future(|| {
+                                processor_for_request.handle_initialized_client_request(
                                     connection_request_id,
                                     codex_request,
                                     request_context,
                                     session,
                                     event_stream_ready,
                                     managed_transition_caller_authorized,
-                                ));
+                                )
+                            });
                             let result = if transition_auth {
                                 crate::auth_task_work::scope_with_ticket(
                                     auth_ticket,
@@ -3006,4 +3007,17 @@ mod retention_authority_tests {
             ConnectionRetention::Refused(ThreadRetentionRefusalReason::AuthorityUnavailable)
         );
     }
+}
+
+#[inline(never)]
+fn box_dispatch_future<F: std::future::Future>(
+    create: impl FnOnce() -> F,
+) -> std::pin::Pin<Box<F>> {
+    let stack_probe = 0u8;
+    eprintln!(
+        "COLD_TRACE dispatch future bytes={} sp={:p}",
+        std::mem::size_of::<F>(),
+        &stack_probe
+    );
+    Box::pin(create())
 }

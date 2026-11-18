@@ -1417,6 +1417,28 @@ pub struct McpRuntimeContext {
     hosted_endpoint_custody: Option<crate::HostedEndpointCustody>,
 }
 
+/// Uses the same exact configured URL/header identity as hosted declaration.
+/// Dynamic helper/OAuth credentials do not silently become retirement authority.
+pub(crate) fn hosted_endpoint_key(
+    config: &codex_config::McpServerConfig,
+) -> Option<(codex_rmcp_client::EndpointKey, bool)> {
+    let codex_config::McpServerTransportConfig::StreamableHttp {
+        url,
+        http_headers: Some(headers),
+        ..
+    } = &config.transport
+    else {
+        return None;
+    };
+    let key = codex_rmcp_client::EndpointKey::from_http_headers(
+        url,
+        headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str())),
+    )?;
+    Some((key, codex_rmcp_client::LoopbackEndpoint::parse(url).is_ok()))
+}
+
 /// Applies the local HTTP headers helper configured for an MCP server.
 ///
 /// Callers retain ownership of selecting the underlying HTTP transport. This
@@ -1494,6 +1516,10 @@ impl McpRuntimeContext {
 
     pub(crate) fn hosted_endpoint_custody(&self) -> Option<&crate::HostedEndpointCustody> {
         self.hosted_endpoint_custody.as_ref()
+    }
+
+    pub(crate) fn canonical_thread_id(&self) -> Option<String> {
+        self.canonical_thread_id.clone()
     }
 
     /// Supplies the owning session's canonical identity; threadless callers

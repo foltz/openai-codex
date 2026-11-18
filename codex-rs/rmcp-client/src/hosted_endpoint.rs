@@ -92,6 +92,24 @@ impl LoopbackEndpoint {
 pub struct EndpointKey([u8; 32]);
 
 impl EndpointKey {
+    /// Extracts exactly one case-insensitive configured Authorization header.
+    /// Ambiguous case-duplicate fields cannot mint hosted ownership identity.
+    pub fn from_http_headers<'a>(
+        url: &str,
+        headers: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Option<Self> {
+        let mut authorization = None;
+        for (name, value) in headers {
+            if name.eq_ignore_ascii_case("authorization") {
+                if authorization.is_some() {
+                    return None;
+                }
+                authorization = Some(value);
+            }
+        }
+        authorization.map(|value| Self::for_streamable_http(url, value))
+    }
+
     pub fn for_streamable_http(url: &str, authorization: &str) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(b"kcf-hosted-mcp-endpoint-v1\0");

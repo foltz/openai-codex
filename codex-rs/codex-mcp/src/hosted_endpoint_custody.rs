@@ -257,6 +257,14 @@ impl HostedEndpointCustody {
                 return Err(HostedEndpointRefusal::Retired);
             }
             endpoint.owners.retain(|owner| !owner.released_with_proof());
+            let weak = lower.downgrade();
+            if endpoint
+                .owners
+                .iter()
+                .any(|owner| owner.lower.same_registry(&weak))
+            {
+                return Ok(());
+            }
             if endpoint.owners.len() >= HOSTED_ENDPOINT_OWNER_CAPACITY {
                 return Err(HostedEndpointRefusal::CapacityExhausted);
             }

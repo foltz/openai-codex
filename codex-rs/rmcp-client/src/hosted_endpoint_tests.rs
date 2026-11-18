@@ -137,3 +137,29 @@ fn loopback_endpoint_accepts_only_literal_canonical_loopback_http() {
         assert_eq!(LoopbackEndpoint::parse(raw), Err(error), "{raw}");
     }
 }
+
+#[test]
+fn configured_header_identity_refuses_ambiguous_authorization() {
+    let url = "http://127.0.0.1:4000/mcp";
+    assert_eq!(
+        EndpointKey::from_http_headers(
+            url,
+            [
+                ("Authorization", "Bearer a"),
+                ("Accept", "application/json")
+            ]
+        ),
+        Some(EndpointKey::for_streamable_http(url, "Bearer a"))
+    );
+    for headers in [
+        [("Authorization", "Bearer a"), ("authorization", "Bearer b")],
+        [("authorization", "Bearer b"), ("Authorization", "Bearer a")],
+        [("Authorization", "Bearer a"), ("authorization", "Bearer a")],
+    ] {
+        assert_eq!(EndpointKey::from_http_headers(url, headers), None);
+    }
+    assert_eq!(
+        EndpointKey::from_http_headers(url, [("Accept", "application/json")]),
+        None
+    );
+}

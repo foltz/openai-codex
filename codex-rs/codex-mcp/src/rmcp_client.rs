@@ -1690,6 +1690,23 @@ pub(crate) async fn make_rmcp_client_in_retirement(
     retirement: RmcpClientRetirement,
 ) -> Result<RmcpClient, StartupOutcomeError> {
     let config = server.config().clone();
+    // This is the common per-physical constructor, including private fallback,
+    // pooled startup and independent event transports. Admit its exact lower
+    // before any helper, authentication work or transport reservation can run.
+    if let Some(custody) = runtime_context.hosted_endpoint_custody()
+        && let Some((key, loopback)) = crate::runtime::hosted_endpoint_key(&config)
+        && custody
+            .admit(
+                key,
+                runtime_context.canonical_thread_id(),
+                &retirement,
+                loopback,
+            )
+            .is_err()
+    {
+        retirement.close_registration();
+        return Err(StartupOutcomeError::Cancelled);
+    }
     if server.credential_policy() == McpCredentialPolicy::ExecutorOnly {
         // Executor HTTP declarations cannot acquire host header helpers through
         // cached registration materialization.

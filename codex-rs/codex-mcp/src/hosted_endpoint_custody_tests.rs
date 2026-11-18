@@ -241,3 +241,67 @@ async fn released_entries_are_reclaimed_only_without_live_or_unproven_owners() {
     custody.release_connection(5);
     assert_eq!(custody.census().provisional, 0, "nothing left to retire");
 }
+
+#[tokio::test]
+async fn repeated_admission_of_one_physical_lower_has_one_receipt() {
+    let custody = HostedEndpointCustody::default();
+    use_and_declare(&custody, "dedup", 1);
+    let lower = RmcpClientRetirement::default();
+    admit(&custody, "dedup", "creator", &lower);
+    admit(&custody, "dedup", "creator", &lower);
+    let result = custody
+        .retire(key("dedup"), capability("cap-dedup"), 1, soon())
+        .await
+        .expect("retire");
+    assert!(result.is_complete());
+    assert_eq!(result.receipts.len(), 1);
+}
+
+#[tokio::test]
+async fn physical_constructor_refuses_tombstone_before_auth_or_environment_work() {
+    use crate::rmcp_client::StartupOutcomeError;
+    use crate::server::EffectiveMcpServer;
+    use codex_config::McpServerConfig;
+    use codex_config::types::AuthKeyringBackendKind;
+    use codex_config::types::McpServerAuth;
+    use codex_config::types::OAuthCredentialsStoreMode;
+    use codex_rmcp_client::McpOAuthRefreshMode;
+
+    let custody = HostedEndpointCustody::default();
+    use_and_declare(&custody, "constructor", 1);
+    assert!(
+        custody
+            .retire(key("constructor"), capability("cap-constructor"), 1, soon())
+            .await
+            .expect("tombstone")
+            .is_complete()
+    );
+    for enterprise_auth in [false, true] {
+        let mut config: McpServerConfig = serde_json::from_value(serde_json::json!({
+            "url": "http://127.0.0.1:1/constructor/mcp",
+            "http_headers": {"Authorization": "Bearer constructor"}
+        }))
+        .expect("server config");
+        if enterprise_auth {
+            config.auth = McpServerAuth::EmaAuth;
+        }
+        let lower = RmcpClientRetirement::default();
+        let result = crate::rmcp_client::make_rmcp_client_in_retirement(
+            None,
+            "hosted-constructor",
+            EffectiveMcpServer::from_host_config(config),
+            OAuthCredentialsStoreMode::default(),
+            AuthKeyringBackendKind::default(),
+            McpOAuthRefreshMode::Legacy,
+            crate::connection_pool::tests::context()
+                .with_hosted_endpoint_custody(custody.clone())
+                .with_canonical_thread_id("creator".to_owned()),
+            Err("environment work must not be reached".to_owned()),
+            None,
+            crate::McpProtocolMode::Legacy,
+            lower.clone(),
+        )
+        .await;
+        assert!(matches!(result, Err(StartupOutcomeError::Cancelled)));
+    }
+}

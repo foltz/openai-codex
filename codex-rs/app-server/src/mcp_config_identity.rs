@@ -352,6 +352,8 @@ mod tests {
         let delegate = applied
             .register_runtime_config(&old)
             .expect("delegate member");
+        let retained_runtime = Arc::new(codex_mcp::McpRuntime::empty(false));
+        retained_runtime.retain_lifetime_guard(Box::new(Arc::clone(&delegate)));
         std::fs::write(
             &file,
             "[features]\nplugins = false\nsecret_auth_storage = true\n",

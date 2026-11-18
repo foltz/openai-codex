@@ -140,8 +140,11 @@ impl RetentionClient {
                 }
             };
             let response = match evidence {
-                Some(evidence) => Ok(evidence),
-                None => {
+                // Atomic resume evidence may predate a queued release from
+                // an abandoned preparation. Revalidate AlreadyHeld only after
+                // that cleanup settles under this same per-thread lock. A new
+                // Acquired handle is exact-grant fenced against older releases.
+                Some(ThreadRetentionAcquireResponse::AlreadyHeld { .. }) | None => {
                     request_handle
                         .request_typed::<ThreadRetentionAcquireResponse>(
                             ClientRequest::ThreadRetentionAcquire {
@@ -156,6 +159,7 @@ impl RetentionClient {
                         )
                         .await
                 }
+                Some(evidence) => Ok(evidence),
             };
             let (result, acquired_grant) = match response {
                 Ok(ThreadRetentionAcquireResponse::Acquired { grant_id }) => {

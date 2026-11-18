@@ -496,3 +496,81 @@ async fn tree_shutdown_waits_for_private_delegate() {
         .expect("private delegate should shut down cleanly");
     assert!(io.session_loop_termination.now_or_never().is_some());
 }
+
+struct DelegateIdentityMember;
+
+impl crate::RuntimeConfigMembership for DelegateIdentityMember {
+    fn before_publication(&self, _config: &Config, _outcome: crate::ConfigRefreshOutcome) {}
+}
+
+#[derive(Default)]
+struct DelegateIdentityListener {
+    members: std::sync::Mutex<Vec<std::sync::Weak<DelegateIdentityMember>>>,
+}
+
+impl crate::RuntimeConfigChangeListener for DelegateIdentityListener {
+    fn before_runtime_config_change(&self) {}
+
+    fn register_runtime_config(
+        &self,
+        _config: &Config,
+    ) -> Option<Arc<dyn crate::RuntimeConfigMembership>> {
+        let member = Arc::new(DelegateIdentityMember);
+        self.members.lock().unwrap().push(Arc::downgrade(&member));
+        Some(member)
+    }
+}
+
+#[tokio::test]
+async fn private_delegate_registers_runtime_identity_with_its_parent_host() {
+    let (mut parent, context, _events) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    let listener = Arc::new(DelegateIdentityListener::default());
+    let host_listener: Arc<dyn crate::RuntimeConfigChangeListener> = listener.clone();
+    let gate = crate::RuntimeConfigChangeGate::default();
+    let services = &mut Arc::get_mut(&mut parent)
+        .expect("parent is uniquely owned before delegate start")
+        .services;
+    services.runtime_config_change_listener = Some(Arc::clone(&host_listener));
+    services.runtime_config_change_gate = Some(gate);
+    let mut config = context.config.as_ref().clone();
+    config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
+    config
+        .features
+        .set_enabled(codex_features::Feature::Plugins, false)
+        .unwrap();
+    let (session, io) = run_codex_thread_interactive(
+        config,
+        Arc::clone(&parent.services.auth_manager),
+        Arc::clone(&parent.services.models_manager),
+        Arc::clone(&parent),
+        Arc::clone(&context),
+        context.initial_environments.clone(),
+        CancellationToken::new(),
+        SubAgentSource::Review,
+        codex_extension_api::SessionIsolation::Isolated,
+        None,
+        crate::session::GitEnrichmentPolicy::Fresh,
+        codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
+    )
+    .await
+    .expect("start private delegate without a provider turn");
+    assert!(Arc::ptr_eq(
+        session
+            .services
+            .runtime_config_change_listener
+            .as_ref()
+            .unwrap(),
+        &host_listener
+    ));
+    assert!(session.services.runtime_config_membership.is_some());
+    let members = listener.members.lock().unwrap();
+    assert_eq!(
+        members.len(),
+        1,
+        "the direct Session::spawn path must register once"
+    );
+    assert!(members[0].upgrade().is_some());
+    drop(members);
+    io.shutdown_and_wait().await.expect("delegate shuts down");
+}

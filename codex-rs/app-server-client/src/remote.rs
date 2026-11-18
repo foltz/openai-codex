@@ -1011,26 +1011,33 @@ impl RemoteAppServerClient {
         // One caller budget covers admission, acknowledgement and original join.
         // Hosted originals remain in the run host even if this observer is cancelled.
         let (response_tx, response_rx) = oneshot::channel();
-        let close_error = match timeout_at(
-            deadline,
-            command_tx.send(RemoteClientCommand::Shutdown { response_tx }),
-        )
-        .await
-        {
-            Ok(Ok(())) => match timeout_at(deadline, response_rx).await {
-                Ok(Ok(Ok(()))) => None,
-                Ok(Ok(Err(error))) => Some(error),
+        let close_error = if Instant::now() >= deadline {
+            Some(IoError::new(
+                ErrorKind::TimedOut,
+                "remote app-server final-exit deadline expired before close admission",
+            ))
+        } else {
+            match timeout_at(
+                deadline,
+                command_tx.send(RemoteClientCommand::Shutdown { response_tx }),
+            )
+            .await
+            {
+                Ok(Ok(())) => match timeout_at(deadline, response_rx).await {
+                    Ok(Ok(Ok(()))) => None,
+                    Ok(Ok(Err(error))) => Some(error),
+                    Ok(Err(_)) => terminal_error.error(),
+                    Err(_) => Some(IoError::new(
+                        ErrorKind::TimedOut,
+                        "remote app-server shutdown acknowledgement timed out",
+                    )),
+                },
                 Ok(Err(_)) => terminal_error.error(),
                 Err(_) => Some(IoError::new(
                     ErrorKind::TimedOut,
-                    "remote app-server shutdown acknowledgement timed out",
+                    "remote app-server shutdown admission timed out",
                 )),
-            },
-            Ok(Err(_)) => terminal_error.error(),
-            Err(_) => Some(IoError::new(
-                ErrorKind::TimedOut,
-                "remote app-server shutdown admission timed out",
-            )),
+            }
         };
         let joined = worker_handle.observe_until(deadline).await;
         // Preserve event delivery until the close and original join are observed.
@@ -2098,6 +2105,40 @@ mod final_exit_tests {
         for method in OWNED_TEARDOWN_METHODS {
             assert_eq!(latch.admit(method).unwrap_err().kind(), ErrorKind::TimedOut);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_final_close_does_not_enqueue_a_shutdown() {
+        let host = Arc::new(InProcessHost::default());
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let (_event_tx, event_rx) = mpsc::unbounded_channel();
+        let (observed_tx, observed_rx) = oneshot::channel();
+        let worker = tokio::spawn(async move {
+            let _ = observed_tx.send(command_rx.recv().await.is_some());
+        });
+        let client = RemoteAppServerClient {
+            command_tx,
+            event_rx,
+            pending_events: VecDeque::new(),
+            metadata: RemoteServerMetadata::default(),
+            worker_handle: RemoteWorker::Unhosted(Some(worker)),
+            terminal_error: WorkerTerminalError::default(),
+            worker_custody: None,
+            final_exit: FinalExitLatch::new(),
+        }
+        .with_worker_custody(Arc::clone(&host))
+        .unwrap();
+        let close = client.shutdown_by(Instant::now()).await;
+        assert!(matches!(close, FinalClose::TimedOut(_)));
+        assert!(
+            !observed_rx.await.unwrap(),
+            "no Shutdown reached the worker after expiry"
+        );
+        assert_eq!(
+            host.observe_client_workers_until(Instant::now() + Duration::from_secs(1))
+                .await,
+            vec![TaskObservation::Terminated(TaskTermination::Normal)]
+        );
     }
 
     #[tokio::test(start_paused = true)]

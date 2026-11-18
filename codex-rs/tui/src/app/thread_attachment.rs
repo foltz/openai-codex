@@ -44,6 +44,7 @@ pub(crate) struct Prepared {
     pub(super) result: Result<PreparedAttachment, String>,
     pub(super) metadata: crate::app_server_session::AttachmentMetadata,
     pub(super) close_check: Result<bool, String>,
+    pub(super) retention: Option<crate::app_server_session::retention::PendingRetention>,
 }
 
 /// A close identifies a thread, but multiple runtimes can have used that thread ID.
@@ -167,7 +168,7 @@ pub(super) async fn prepare_saved(
             }
             _ => ResumeModelSettings::PreserveExistingThread,
         };
-        prepare(&mut view, settings, config, child, mode).await
+        prepare_for_adoption(&mut view, settings, config, child, mode, true).await
     }
     .await
     .map_err(
@@ -178,11 +179,16 @@ pub(super) async fn prepare_saved(
             _ => err.to_string(),
         },
     );
+    let (result, retention) = match result {
+        Ok((attachment, retention)) => (Ok(attachment), retention),
+        Err(error) => (Err(error), None),
+    };
     let metadata = view.take_attachment_metadata(child);
     Prepared {
         result,
         metadata,
         close_check: Ok(false),
+        retention,
     }
 }
 
@@ -193,6 +199,29 @@ pub(super) async fn prepare(
     thread_id: ThreadId,
     resume_settings: ResumeModelSettings,
 ) -> Result<PreparedAttachment> {
+    prepare_for_adoption(
+        app_server,
+        local_settings,
+        config,
+        thread_id,
+        resume_settings,
+        false,
+    )
+    .await
+    .map(|(attachment, _retention)| attachment)
+}
+
+async fn prepare_for_adoption(
+    app_server: &mut AppServerSession,
+    local_settings: &crate::local_settings::LocalSettings,
+    config: &Config,
+    thread_id: ThreadId,
+    resume_settings: ResumeModelSettings,
+    adopt: bool,
+) -> Result<(
+    PreparedAttachment,
+    Option<crate::app_server_session::retention::PendingRetention>,
+)> {
     let mut resume_config = config.clone();
     if resume_settings == ResumeModelSettings::PreserveSideConversation {
         resume_config.developer_instructions = Some(
@@ -200,11 +229,24 @@ pub(super) async fn prepare(
                 .instructions(resume_config.developer_instructions.as_deref()),
         );
     }
-    match app_server
-        .resume_thread(local_settings, resume_config, thread_id, resume_settings)
-        .await
-    {
-        Ok(started) => Ok(PreparedAttachment::Live(Box::new(started))),
+    let resumed = if adopt {
+        app_server
+            .prepare_retained_resume(
+                local_settings,
+                resume_config,
+                thread_id,
+                resume_settings,
+                crate::resume_permissions::ResumePermissions::default(),
+            )
+            .await
+    } else {
+        app_server
+            .resume_thread(local_settings, resume_config, thread_id, resume_settings)
+            .await
+            .map(|started| (started, None))
+    };
+    match resumed {
+        Ok((started, retention)) => Ok((PreparedAttachment::Live(Box::new(started)), retention)),
         // Once subscribed, a second unanchored read could overlap live events.
         Err(err) if app_server.attachment_subscribed == Some(true) => Err(err),
         Err(resume_err) => {
@@ -243,7 +285,7 @@ pub(super) async fn prepare(
                     "Agent thread {thread_id} is not yet available for replay or live attach."
                 ));
             }
-            Ok(PreparedAttachment::ReplayOnly(Box::new(thread)))
+            Ok((PreparedAttachment::ReplayOnly(Box::new(thread)), None))
         }
     }
 }
@@ -258,6 +300,7 @@ impl App {
         attachment: PreparedAttachment,
         metadata: crate::app_server_session::AttachmentMetadata,
         updates: &SubscriptionUpdates,
+        retention: Option<crate::app_server_session::retention::PendingRetention>,
     ) -> Result<()> {
         use crate::app_server_session::SideChatStorage;
         debug_assert_eq!(server.backend_id(), target.backend_id);
@@ -297,6 +340,12 @@ impl App {
                 pending_profile_on_unavailable_thread: false,
             },
         )
-        .await
+        .await?;
+        if live && self.current_displayed_thread_id() == Some(child) {
+            if let Some(retention) = retention {
+                retention.commit();
+            }
+        }
+        Ok(())
     }
 }

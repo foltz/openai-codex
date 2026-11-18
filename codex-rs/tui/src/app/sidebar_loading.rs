@@ -257,6 +257,7 @@ impl App {
                     attachment,
                     prepared.metadata,
                     &incoming.received,
+                    prepared.retention,
                 )
                 .await;
         }

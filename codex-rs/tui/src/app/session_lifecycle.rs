@@ -1096,7 +1096,7 @@ impl App {
         &mut self,
         app_server: &mut AppServerSession,
         result: Result<AppServerStartedThread>,
-        retention: Option<crate::app_server_session::retention::PendingRetention>,
+        retention: Option<crate::app_server_session::PendingRetention>,
     ) -> Result<()> {
         if !self.pending_startup_thread_start {
             if let Ok(started) = result {

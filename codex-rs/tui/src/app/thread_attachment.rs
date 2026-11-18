@@ -44,7 +44,7 @@ pub(crate) struct Prepared {
     pub(super) result: Result<PreparedAttachment, String>,
     pub(super) metadata: crate::app_server_session::AttachmentMetadata,
     pub(super) close_check: Result<bool, String>,
-    pub(super) retention: Option<crate::app_server_session::retention::PendingRetention>,
+    pub(super) retention: Option<crate::app_server_session::PendingRetention>,
 }
 
 /// A close identifies a thread, but multiple runtimes can have used that thread ID.
@@ -220,7 +220,7 @@ async fn prepare_for_adoption(
     adopt: bool,
 ) -> Result<(
     PreparedAttachment,
-    Option<crate::app_server_session::retention::PendingRetention>,
+    Option<crate::app_server_session::PendingRetention>,
 )> {
     let mut resume_config = config.clone();
     if resume_settings == ResumeModelSettings::PreserveSideConversation {
@@ -300,7 +300,7 @@ impl App {
         attachment: PreparedAttachment,
         metadata: crate::app_server_session::AttachmentMetadata,
         updates: &SubscriptionUpdates,
-        retention: Option<crate::app_server_session::retention::PendingRetention>,
+        retention: Option<crate::app_server_session::PendingRetention>,
     ) -> Result<()> {
         use crate::app_server_session::SideChatStorage;
         debug_assert_eq!(server.backend_id(), target.backend_id);

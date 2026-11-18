@@ -32,7 +32,7 @@ pub(super) struct PreparedResume {
     pub(super) read_only: bool,
     pub(super) history_notice: Option<&'static str>,
     pub(super) provider_error: Option<codex_app_server_protocol::ModelProviderError>,
-    pub(super) retention: Option<crate::app_server_session::retention::PendingRetention>,
+    pub(super) retention: Option<crate::app_server_session::PendingRetention>,
 }
 
 impl App {

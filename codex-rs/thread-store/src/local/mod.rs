@@ -572,7 +572,7 @@ impl ThreadStore for LocalThreadStore {
         &self,
         params: ResumeThreadParams,
     ) -> ThreadStoreFuture<'_, Arc<Vec<RolloutItem>>> {
-        Box::pin(async move { live_writer::resume_thread(self, params).await })
+        box_resume_future(|| async move { live_writer::resume_thread(self, params).await })
     }
 
     fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreFuture<'_, ()> {
@@ -2456,4 +2456,14 @@ mod tests {
             )
         }));
     }
+}
+
+// Construct the cold writer future in its own frame before erasing its type.
+#[inline(never)]
+fn box_resume_future<F: std::future::Future>(create: impl FnOnce() -> F) -> std::pin::Pin<Box<F>> {
+    eprintln!(
+        "COLD_TRACE local resume future bytes={}",
+        std::mem::size_of::<F>()
+    );
+    Box::pin(create())
 }

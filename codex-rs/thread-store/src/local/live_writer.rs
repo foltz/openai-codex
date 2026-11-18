@@ -76,6 +76,7 @@ pub(super) async fn resume_thread(
     store: &LocalThreadStore,
     params: ResumeThreadParams,
 ) -> ThreadStoreResult<Arc<Vec<RolloutItem>>> {
+    eprintln!("COLD_TRACE local writer resume entry");
     let _live_writer_guard = store.live_writer_locks.lock(params.thread_id).await;
     store.ensure_live_recorder_absent(params.thread_id).await?;
     let writer_lock = store.acquire_writer_lock(params.thread_id)?;

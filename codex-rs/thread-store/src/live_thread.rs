@@ -212,6 +212,7 @@ impl LiveThread {
         mut params: ResumeThreadParams,
         resume_preparation: Option<ThreadStoreResumePreparation>,
     ) -> ThreadStoreResult<(Self, Arc<Vec<RolloutItem>>)> {
+        eprintln!("COLD_TRACE LiveThread resume entry");
         let thread_id = params.thread_id;
         let metadata = if history_mode == ThreadHistoryMode::Paginated
             && let Some(local_store) = thread_store.as_any().downcast_ref::<LocalThreadStore>()

@@ -1504,3 +1504,19 @@ async fn resource_release_observation_of_recorded_receipts_binds_no_deadline_and
         );
     }
 }
+
+#[test]
+fn a_live_sandbox_launch_withholds_clean_retirement_before_its_guard_drops() {
+    let census = Arc::new(SandboxCleanupCensus::default());
+    let operation =
+        crate::sandboxing::cleanup_census::SandboxCleanupOperation::new(Arc::clone(&census), true);
+    let clean = CleanupExecution::Finished {
+        persistence_failed: false,
+    };
+    assert_eq!(
+        clean.with_sandbox_cleanup_census(census.totals()),
+        CleanupExecution::SandboxCleanupUnproven { timed_out: false }
+    );
+    operation.finish(codex_file_system::SandboxLaunch::NotLaunched, None);
+    assert_eq!(clean.with_sandbox_cleanup_census(census.totals()), clean);
+}

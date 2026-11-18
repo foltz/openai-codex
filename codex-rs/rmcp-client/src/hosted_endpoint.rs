@@ -89,7 +89,7 @@ impl LoopbackEndpoint {
 
 /// Digest of one exact endpoint URL and its configured `Authorization` value.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct EndpointKey([u8; 32]);
+pub struct EndpointKey([u8; 32], [u8; 32]);
 
 impl EndpointKey {
     /// Extracts exactly one case-insensitive configured Authorization header.
@@ -117,7 +117,16 @@ impl EndpointKey {
         hasher.update(url.as_bytes());
         hasher.update((authorization.len() as u64).to_be_bytes());
         hasher.update(authorization.as_bytes());
-        Self(digest_bytes(hasher))
+        let mut url_hasher = Sha256::new();
+        url_hasher.update(b"kcf-hosted-mcp-url-v1\0");
+        url_hasher.update(url.as_bytes());
+        Self(digest_bytes(hasher), digest_bytes(url_hasher))
+    }
+
+    /// Same exact configured URL, without revealing its authorization value.
+    /// This is an incompleteness signal, never authority over another key.
+    pub fn same_url(&self, other: &Self) -> bool {
+        self.1 == other.1
     }
 }
 

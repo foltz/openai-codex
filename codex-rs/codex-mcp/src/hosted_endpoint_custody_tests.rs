@@ -305,3 +305,38 @@ async fn physical_constructor_refuses_tombstone_before_auth_or_environment_work(
         assert!(matches!(result, Err(StartupOutcomeError::Cancelled)));
     }
 }
+
+#[tokio::test]
+async fn same_url_other_authorization_is_incomplete_in_both_admission_orders() {
+    let url = "http://127.0.0.1:4000/shared/mcp";
+    let tracked = EndpointKey::for_streamable_http(url, "Bearer tracked");
+    let other = EndpointKey::for_streamable_http(url, "Bearer other");
+    for other_first in [false, true] {
+        let custody = HostedEndpointCustody::default();
+        let lower = RmcpClientRetirement::default();
+        if other_first {
+            custody
+                .admit(other, Some("other".to_owned()), &lower, true)
+                .expect("other admission");
+        }
+        custody.track_override(tracked, 1).expect("track");
+        custody
+            .declare(tracked, capability("tracked"), 1)
+            .expect("declare");
+        if !other_first {
+            custody
+                .admit(other, Some("other".to_owned()), &lower, true)
+                .expect("other admission");
+        }
+        let result = custody
+            .retire(tracked, capability("tracked"), 1, soon())
+            .await
+            .expect("retire");
+        assert!(result.possibly_untracked);
+        assert!(!result.is_complete());
+        assert!(result.receipts.is_empty());
+        assert!(!lower.retirement_proof().is_proven());
+        // No authority over the foreign key is minted by the conservative flag.
+        assert!(!custody.is_retired(&other));
+    }
+}

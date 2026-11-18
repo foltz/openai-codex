@@ -226,8 +226,19 @@ impl HostedEndpointCustody {
         {
             return Err(HostedEndpointRefusal::CapacityExhausted);
         }
-        let possibly_untracked =
-            state.untracked_sightings.remove(&key) || state.sightings_overflowed;
+        let possibly_untracked = state.sightings_overflowed
+            || state
+                .untracked_sightings
+                .iter()
+                .any(|seen| seen.same_url(&key))
+            || state.endpoints.iter().any(|(other_key, endpoint)| {
+                other_key.same_url(&key)
+                    && endpoint
+                        .owners
+                        .iter()
+                        .any(|owner| !owner.released_with_proof())
+            });
+        state.untracked_sightings.remove(&key);
         state.endpoints.insert(
             key,
             Endpoint {
@@ -252,6 +263,23 @@ impl HostedEndpointCustody {
         loopback: bool,
     ) -> Result<(), HostedEndpointRefusal> {
         let mut state = self.lock();
+        if state
+            .endpoints
+            .get(&key)
+            .is_some_and(|endpoint| endpoint.retired)
+        {
+            return Err(HostedEndpointRefusal::Retired);
+        }
+        // Another Authorization identity on the same URL is not ours to close.
+        // Keep that missing scope explicit instead of reporting a false clean
+        // endpoint census. This does not grant authority over the other lower.
+        if loopback {
+            for (other_key, endpoint) in &mut state.endpoints {
+                if *other_key != key && other_key.same_url(&key) {
+                    endpoint.possibly_untracked = true;
+                }
+            }
+        }
         if let Some(endpoint) = state.endpoints.get_mut(&key) {
             if endpoint.retired {
                 return Err(HostedEndpointRefusal::Retired);

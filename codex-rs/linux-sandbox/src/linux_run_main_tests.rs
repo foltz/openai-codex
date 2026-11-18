@@ -18,6 +18,7 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 #[cfg(test)]
 use std::os::fd::IntoRawFd;
+use std::os::unix::ffi::OsStrExt;
 #[cfg(test)]
 use std::os::unix::fs::PermissionsExt;
 

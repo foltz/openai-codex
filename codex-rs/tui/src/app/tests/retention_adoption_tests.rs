@@ -217,7 +217,7 @@ async fn fork_preparation_keeps_new_grants_provisional_until_installation() -> R
 }
 
 async fn fork_preparation_retention_scenario() -> Result<()> {
-    for install in [false, true] {
+    for (install, ephemeral) in [(false, false), (true, false), (false, true), (true, true)] {
         let (mut app, _, _) = make_test_app_with_channels().await;
         app.config
             .features
@@ -244,9 +244,11 @@ async fn fork_preparation_retention_scenario() -> Result<()> {
         .await?;
         app.enqueue_primary_thread_session(started.session, started.turns)
             .await?;
+        let mut fork_config = app.config.clone();
+        fork_config.ephemeral = ephemeral;
         let (forked, retention) = boxed_future!(server.prepare_retained_fork_thread_at(
             &app.local_settings,
-            app.config.clone(),
+            fork_config,
             source,
             None,
             None,
@@ -256,6 +258,7 @@ async fn fork_preparation_retention_scenario() -> Result<()> {
         .await?;
         let id = forked.session.thread_id;
         assert_ne!(id, source);
+        assert_eq!(server.thread_read(id, false).await?.ephemeral, ephemeral);
         assert!(retention.is_some());
         assert!(matches!(
             probe(&mut server, id).await?,

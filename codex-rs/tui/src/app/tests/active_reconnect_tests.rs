@@ -826,6 +826,9 @@ async fn production_reconnect_retention_scenario() -> Result<()> {
     use tokio_tungstenite::tungstenite::Message;
     for external in [false, true] {
         let (mut app, mut events, _ops) = make_test_app_with_channels().await;
+        app.config
+            .features
+            .set_enabled(codex_features::Feature::Plugins, false)?;
         let id = ThreadId::new();
         let cwd = app.config.cwd.clone();
         app.primary_thread_id = Some(id);

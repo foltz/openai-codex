@@ -663,14 +663,16 @@ impl ThreadRequestProcessor {
         crate::thread_state::recovery::resume_scope(async {
             let mut prepared_config = None;
             // Keep the resume future off the request handler's stack.
-            while Box::pin(self.thread_resume_inner(
-                &target,
-                &request,
-                app_server_client_name.clone(),
-                app_server_client_version.clone(),
-                client_mcp_extensions.clone(),
-                &mut prepared_config,
-            ))
+            while box_thread_start_future(|| {
+                self.thread_resume_inner(
+                    &target,
+                    &request,
+                    app_server_client_name.clone(),
+                    app_server_client_version.clone(),
+                    client_mcp_extensions.clone(),
+                    &mut prepared_config,
+                )
+            })
             .await?
             .is_continue()
             {}

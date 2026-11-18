@@ -1391,7 +1391,11 @@ pub(super) async fn start_recording_app_server_with_realtime_speech(
                 event = embedded.next_event() => {
                     let Some(event) = event else { break };
                     if let codex_app_server_client::InProcessServerEvent::ServerNotification(notification) = event
-                        && matches!(*notification, ServerNotification::ThreadSettingsUpdated(_))
+                        && matches!(
+                            *notification,
+                            ServerNotification::ThreadSettingsUpdated(_)
+                                | ServerNotification::TurnCompleted(_)
+                        )
                     {
                         let result = websocket.send(Message::Text(serde_json::to_string(&notification)?.into())).await;
                         if result.as_ref().is_err_and(is_recording_client_disconnect) {

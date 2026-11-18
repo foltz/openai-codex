@@ -9,7 +9,6 @@ use std::os::fd::AsRawFd;
 use std::os::fd::BorrowedFd;
 use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
-use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicI32;
@@ -383,7 +382,7 @@ pub fn run_main() -> ! {
             report_no_targets(&mut custody);
             exit_with_bwrap_build_error(err);
         }
-        let (proxy_route_spec, proxy_controls) = if allow_network_for_proxy {
+        let (proxy_route_spec, proxy_controls) = if let Some(context) = managed_network.as_ref() {
             let (proxy_route_spec, controls) = prepare_host_proxy_route_spec(
                 (!context.loopback_ports.is_empty()).then_some(context.loopback_ports.as_slice()),
             )

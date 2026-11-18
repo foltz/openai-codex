@@ -570,7 +570,7 @@ enabled = false
 
         reload_mcp_config(&thread_manager, &config_manager, &applied_identity).await?;
 
-        let current_identity = McpConfigIdentity::from_config(&thread.config().await)?;
+        let current_identity = McpConfigIdentity::from_config(thread.config().await.as_ref())?;
         assert_ne!(current_identity, startup_identity);
         assert_eq!(applied_identity.current(), current_identity);
         let fork = thread_manager.start_thread(inherited_fork).await?;

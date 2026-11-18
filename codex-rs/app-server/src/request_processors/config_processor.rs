@@ -551,7 +551,6 @@ async fn reload_user_config_inner(
     for (thread_id, thread, expected_config, next_config) in planned {
         let published = Box::pin(publish_thread_user_config(
             config_manager,
-            applied_mcp_config_identity,
             thread.as_ref(),
             thread_id,
             &candidate_identity,
@@ -649,7 +648,7 @@ async fn publish_thread_user_config(
     false
 }
 
-fn map_requirements_to_api(
+pub(crate) fn map_requirements_to_api(
     requirements: Option<ConfigRequirementsToml>,
     allowed_login_methods: Vec<ForcedLoginMethod>,
 ) -> Option<ConfigRequirements> {

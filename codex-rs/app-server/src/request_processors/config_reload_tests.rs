@@ -414,7 +414,7 @@ async fn user_reload_retains_applied_identity_when_no_thread_can_be_materialized
         "no identity-bearing publication occurred, so the last baseline remains truthful"
     );
     assert_eq!(
-        McpConfigIdentity::from_config(&started.thread.config().await)?,
+        McpConfigIdentity::from_config(started.thread.config().await.as_ref())?,
         baseline
     );
     started.thread.shutdown_and_wait().await?;

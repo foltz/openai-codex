@@ -379,6 +379,7 @@ impl LinuxSandboxCleanupCustody {
         let mut report_open = true;
         let mut launcher_exited = matches!(self.launcher, LauncherState::NotSpawned);
         let mut helpers = Helpers::default();
+        let mut retirement_published = false;
         let joined = loop {
             if expired() {
                 break false;
@@ -427,10 +428,9 @@ impl LinuxSandboxCleanupCustody {
             // First consume only currently available terminal evidence. A
             // completed launch needs no new deadline delivered to a gone reader.
             // Otherwise publish the retirement bound before any blocking wait.
-            if self.tightener.deadline().is_none()
-                && let Some(deadline) = retire_deadline
-            {
+            if !retirement_published && let Some(deadline) = retire_deadline {
                 self.tightener.tighten(deadline);
+                retirement_published = true;
             }
             let Some(deadline) = self.tightener.deadline() else {
                 break false;

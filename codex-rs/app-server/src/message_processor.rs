@@ -1902,8 +1902,6 @@ impl MessageProcessor {
         codex_request: ClientRequest,
         session: Arc<ConnectionSessionState>,
     ) -> Result<(), JSONRPCErrorError> {
-        let stack_probe = 0u8;
-        eprintln!("COLD_TRACE small session dispatch sp={:p}", &stack_probe);
         let connection_id = connection_request_id.connection_id;
         let app_server_client_name = session.app_server_client_name().map(str::to_string);
         let client_version = session.client_version().map(str::to_string);
@@ -3082,11 +3080,5 @@ mod retention_authority_tests {
 fn box_dispatch_future<F: std::future::Future>(
     create: impl FnOnce() -> F,
 ) -> std::pin::Pin<Box<F>> {
-    let stack_probe = 0u8;
-    eprintln!(
-        "COLD_TRACE dispatch future bytes={} sp={:p}",
-        std::mem::size_of::<F>(),
-        &stack_probe
-    );
     Box::pin(create())
 }

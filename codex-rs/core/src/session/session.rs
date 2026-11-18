@@ -954,10 +954,6 @@ impl Session {
         startup_custody: Option<&super::startup_custody::SessionStartupCustody>,
         startup_resources: Option<&super::startup_resources::StartupResources>,
     ) -> anyhow::Result<Arc<Self>> {
-        {
-            let stack_probe = 0u8;
-            eprintln!("COLD_TRACE Session new entry sp={:p}", &stack_probe);
-        }
         match (startup_custody, startup_resources) {
             (Some(custody), Some(resources)) if custody.owns_resources(resources) => {}
             (None, None) => {}
@@ -976,10 +972,6 @@ impl Session {
 
         // Register before MCP startup without holding the gate over startup,
         // network work, or callbacks. Host identity reads/reloads share this gate.
-        {
-            let stack_probe = 0u8;
-            eprintln!("COLD_TRACE before membership sp={:p}", &stack_probe);
-        }
         let runtime_config_membership = {
             let _guard = match runtime_config_change_gate.as_ref() {
                 Some(gate) => Some(gate.lock().await),
@@ -1251,10 +1243,6 @@ impl Session {
         // - initialize thread persistence with new or resumed session info
         // - perform default shell discovery
         // - load history metadata (skipped for subagents)
-        {
-            let stack_probe = 0u8;
-            eprintln!("COLD_TRACE before persistence setup sp={:p}", &stack_probe);
-        }
         let persistence_auth = futures::FutureExt::shared(codex_model_provider::run_auth_call(
             crate::provider_auth_work::initial_access(
                 initial_mcp_work.as_deref(),
@@ -1358,13 +1346,6 @@ impl Session {
                         }
                     }
                     InitialHistory::Resumed(resumed_history) => {
-                        {
-                            let stack_probe = 0u8;
-                            eprintln!(
-                                "COLD_TRACE persistence resumed branch sp={:p}",
-                                &stack_probe
-                            );
-                        }
                         let params = ResumeThreadParams {
                             history_revision: resumed_history.history_revision.clone(),
                             thread_id: resumed_history.conversation_id,
@@ -1386,13 +1367,6 @@ impl Session {
                         let (context_tx, context_rx) = tokio::sync::oneshot::channel();
                         let live_thread = guard
                             .acquire(async move {
-                                {
-                                    let stack_probe = 0u8;
-                                    eprintln!(
-                                        "COLD_TRACE before LiveThread resume sp={:p}",
-                                        &stack_probe
-                                    );
-                                }
                                 let (live_thread, history) = LiveThread::resume(
                                     store,
                                     history_mode,
@@ -1400,13 +1374,6 @@ impl Session {
                                     resume_preparation,
                                 )
                                 .await?;
-                                {
-                                    let stack_probe = 0u8;
-                                    eprintln!(
-                                        "COLD_TRACE LiveThread resume ready sp={:p}",
-                                        &stack_probe
-                                    );
-                                }
                                 // Cancellation still leaves the writer with the acquisition guard.
                                 let _ = context_tx.send(history);
                                 Ok(live_thread)
@@ -1517,17 +1484,9 @@ impl Session {
             otel.name = "session_init.auth_mcp",
         ));
 
-        {
-            let stack_probe = 0u8;
-            eprintln!("COLD_TRACE before persistence join sp={:p}", &stack_probe);
-        }
         // Join all independent futures.
         let (thread_persistence_result, state_db_ctx, auth_and_mcp_result) =
             tokio::join!(thread_persistence_fut, state_db_fut, auth_and_mcp_fut);
-        {
-            let stack_probe = 0u8;
-            eprintln!("COLD_TRACE persistence join ready sp={:p}", &stack_probe);
-        }
         let (auth, mcp_projection) = auth_and_mcp_result?;
 
         let (live_thread, mut live_thread_init, resume_context) = thread_persistence_result
@@ -2438,9 +2397,7 @@ impl Session {
             };
 
             // record_initial_history can emit events. We record only after the SessionConfiguredEvent is emitted.
-            { let stack_probe = 0u8; eprintln!("COLD_TRACE before initial history sp={:p}", &stack_probe); }
             Box::pin(sess.record_initial_history(initial_history)).await;
-            { let stack_probe = 0u8; eprintln!("COLD_TRACE initial history ready sp={:p}", &stack_probe); }
             if restore_child_window {
                 sess.state.lock().await.restore_auto_compact_window(
                     /*window_number*/ 0,

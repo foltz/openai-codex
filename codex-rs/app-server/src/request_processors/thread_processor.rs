@@ -660,10 +660,6 @@ impl ThreadRequestProcessor {
         app_server_client_version: Option<String>,
         client_mcp_extensions: ClientMcpExtensions,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        {
-            let stack_probe = 0u8;
-            eprintln!("COLD_TRACE resume outer entry sp={:p}", &stack_probe);
-        }
         crate::thread_state::recovery::resume_scope(async {
             let mut prepared_config = None;
             // Keep the resume future off the request handler's stack.
@@ -4317,10 +4313,6 @@ impl ThreadRequestProcessor {
         client_mcp_extensions: ClientMcpExtensions,
         prepared_config: &mut Option<PreparedResumeConfig>,
     ) -> Result<ControlFlow<()>, JSONRPCErrorError> {
-        {
-            let stack_probe = 0u8;
-            eprintln!("COLD_TRACE resume inner entry sp={:p}", &stack_probe);
-        }
         let params = &request.params;
         let retention = request.retention;
         if let Ok(id) = ThreadId::from_string(&params.thread_id) {
@@ -4657,10 +4649,6 @@ impl ThreadRequestProcessor {
             }
             InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_) => None,
         };
-        {
-            let stack_probe = 0u8;
-            eprintln!("COLD_TRACE before metadata sp={:p}", &stack_probe);
-        }
         let persisted_metadata = self
             .load_and_apply_persisted_resume_metadata(
                 &thread_history,
@@ -4670,10 +4658,6 @@ impl ThreadRequestProcessor {
             )
             .await;
 
-        {
-            let stack_probe = 0u8;
-            eprintln!("COLD_TRACE metadata ready sp={:p}", &stack_probe);
-        }
         let clear_reasoning_effort = !has_explicit_model_resume_override
             && persisted_metadata
                 .as_ref()
@@ -4771,10 +4755,6 @@ impl ThreadRequestProcessor {
                 session_configured,
                 ..
             }) => {
-                {
-                    let stack_probe = 0u8;
-                    eprintln!("COLD_TRACE core start returned sp={:p}", &stack_probe);
-                }
                 let ThreadResumeTarget::Client(request_id) = target else {
                     // Observe lifecycle events without attaching a client subscription.
                     self.thread_watch_manager
@@ -7427,15 +7407,9 @@ mod thread_processor_tests;
 /// captured by request/auth scopes. Box::pin at the call site can still reserve
 /// its full size on the embedded runtime's polling stack.
 #[inline(never)]
-#[track_caller]
 fn box_thread_start_future<F: std::future::Future>(
     create: impl FnOnce() -> F,
 ) -> std::pin::Pin<Box<F>> {
-    eprintln!(
-        "COLD_TRACE boxed line={} bytes={}",
-        std::panic::Location::caller().line(),
-        std::mem::size_of::<F>()
-    );
     Box::pin(create())
 }
 

@@ -860,13 +860,6 @@ impl Session {
         custody: Option<Arc<startup_custody::SessionStartupCustody>>,
         resources: Option<Arc<startup_resources::StartupResources>>,
     ) -> CodexResult<(Arc<Self>, SessionIo)> {
-        {
-            let stack_probe = 0u8;
-            eprintln!(
-                "COLD_TRACE session spawn_internal entry sp={:p}",
-                &stack_probe
-            );
-        }
         args.config
             .config_layer_stack
             .ensure_config_server_applied()?;
@@ -1253,10 +1246,6 @@ impl Session {
         let session_source_clone = session_configuration.session_source.clone();
         let (agent_status_tx, agent_status_rx) = watch::channel(AgentStatus::PendingInit);
 
-        {
-            let stack_probe = 0u8;
-            eprintln!("COLD_TRACE before Session new sp={:p}", &stack_probe);
-        }
         let session = box_session_future(|| {
             Session::new(
                 startup.clone(),
@@ -2008,10 +1997,6 @@ impl Session {
     }
 
     async fn record_initial_history(&self, conversation_history: InitialHistory) {
-        {
-            let stack_probe = 0u8;
-            eprintln!("COLD_TRACE record history entry sp={:p}", &stack_probe);
-        }
         let (is_subagent, is_paginated_subagent) = {
             let state = self.state.lock().await;
             let session_configuration = &state.session_configuration;
@@ -2040,15 +2025,7 @@ impl Session {
                 None
             }
             InitialHistory::Resumed(resumed_history) => {
-                {
-                    let stack_probe = 0u8;
-                    eprintln!("COLD_TRACE before default turn sp={:p}", &stack_probe);
-                }
                 let turn_context = self.new_default_turn().await;
-                {
-                    let stack_probe = 0u8;
-                    eprintln!("COLD_TRACE default turn ready sp={:p}", &stack_probe);
-                }
                 let rollout_items = resumed_history.history;
                 if matches!(
                     rollout_items.iter().rev().find_map(|item| match item {
@@ -6557,9 +6534,5 @@ mod mailbox_task_commit_tests;
 
 #[inline(never)]
 fn box_session_future<F: std::future::Future>(create: impl FnOnce() -> F) -> std::pin::Pin<Box<F>> {
-    eprintln!(
-        "COLD_TRACE Session new future bytes={}",
-        std::mem::size_of::<F>()
-    );
     Box::pin(create())
 }

@@ -2461,9 +2461,5 @@ mod tests {
 // Construct the cold writer future in its own frame before erasing its type.
 #[inline(never)]
 fn box_resume_future<F: std::future::Future>(create: impl FnOnce() -> F) -> std::pin::Pin<Box<F>> {
-    eprintln!(
-        "COLD_TRACE local resume future bytes={}",
-        std::mem::size_of::<F>()
-    );
     Box::pin(create())
 }

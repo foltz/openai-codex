@@ -2920,8 +2920,6 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
                 cli_version: "0.0.0".to_string(),
                 source: RolloutSessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                     parent_thread_id: root_thread_id,
-                    clear_predecessor_thread_id: None,
-                    clear_transition_id: None,
                     depth: 1,
                     agent_path: None,
                     agent_nickname: Some(format!("child-{index}")),

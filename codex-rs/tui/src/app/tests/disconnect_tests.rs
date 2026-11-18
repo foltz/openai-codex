@@ -640,6 +640,7 @@ async fn rejected_initial_thread_start_reconnects_and_submits_prompt_once() -> R
             /*remote_cwd*/ None,
             crate::dynamic_tools_mcp::ThreadToolTransport::Dynamic,
             app.reconnect.presentation,
+            app_server.worker_custody().unwrap_or_default(),
         )
         .await?;
         app.finish_reconnect(

@@ -323,6 +323,7 @@ async fn reconnect_daemon_command_center_after_socket_replacement_without_a_conv
             /*remote_cwd*/ None,
             session.thread_tool_transport(),
             app.reconnect.presentation,
+            session.worker_custody().unwrap_or_default(),
         )
         .await?;
         app.finish_reconnect(

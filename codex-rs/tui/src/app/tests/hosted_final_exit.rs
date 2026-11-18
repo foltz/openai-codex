@@ -32,14 +32,14 @@ struct Hosted {
 /// A remote session with the TUI's hosted tools server and one thread whose
 /// overrides name it, so the daemon attributes the endpoint to this connection.
 async fn hosted_session(behavior: RealtimeRequestBehavior) -> Result<Hosted> {
-    hosted_session_with_transport_retention(behavior, true).await
+    boxed_future!(hosted_session_with_transport_retention(behavior, true)).await
 }
 
 async fn hosted_session_with_transport_retention(
     behavior: RealtimeRequestBehavior,
     retain_transport: bool,
 ) -> Result<Hosted> {
-    let (mut app, events, ops) = Box::pin(make_test_app_with_channels()).await;
+    let (mut app, events, ops) = boxed_future!(make_test_app_with_channels()).await;
     let codex_home = tempdir()?;
     app.config.codex_home = codex_home.path().to_path_buf().abs();
     app.config
@@ -47,7 +47,7 @@ async fn hosted_session_with_transport_retention(
         .set_enabled(codex_features::Feature::Plugins, false)?;
     app.config.sqlite = codex_state::SqliteConfig::new_for_testing(codex_home.path().abs());
     let (mut app_server, requests, proxy) =
-        Box::pin(start_recording_app_server_with_realtime_speech(
+        boxed_future!(start_recording_app_server_with_realtime_speech(
             &app.config,
             HistoryCapabilities::Current,
             /*blocked_thread_list*/ None,
@@ -57,13 +57,13 @@ async fn hosted_session_with_transport_retention(
             LoaderOverrides::without_managed_config_for_tests(),
         ))
         .await?;
-    Box::pin(app_server.start_dynamic_tool_mcp(
+    boxed_future!(app_server.start_dynamic_tool_mcp(
         app.config.clone(),
         app.app_event_tx.clone(),
         app.dynamic_tool_status_updates.clone(),
     ))
     .await?;
-    let started = Box::pin(app_server.start_thread(&app.config)).await?;
+    let started = boxed_future!(app_server.start_thread(&app.config)).await?;
     assert!(
         started.task_tools_available,
         "the daemon path hosts task tools"
@@ -81,16 +81,24 @@ async fn hosted_session_with_transport_retention(
 
 #[tokio::test]
 async fn final_exit_retires_the_hosted_endpoint_within_one_budget() -> Result<()> {
+    boxed_future!(final_exit_retires_the_hosted_endpoint_within_one_budget_scenario()).await
+}
+
+async fn final_exit_retires_the_hosted_endpoint_within_one_budget_scenario() -> Result<()> {
     let Hosted {
         app_server,
         requests,
         proxy,
         _keep_alive,
-    } = hosted_session(RealtimeRequestBehavior::Forward).await?;
+    } = boxed_future!(hosted_session(RealtimeRequestBehavior::Forward)).await?;
     let budget = Duration::from_secs(10);
     let started = Instant::now();
 
-    let exit = crate::app_server_session::final_exit_sessions([app_server], budget).await;
+    let exit = boxed_future!(crate::app_server_session::final_exit_sessions(
+        [app_server],
+        budget
+    ))
+    .await;
 
     assert!(started.elapsed() <= budget, "{:?}", started.elapsed());
     assert!(
@@ -108,16 +116,24 @@ async fn final_exit_retires_the_hosted_endpoint_within_one_budget() -> Result<()
 
 #[tokio::test]
 async fn hung_retirement_times_out_at_the_single_original_deadline() -> Result<()> {
+    boxed_future!(hung_retirement_times_out_at_the_single_original_deadline_scenario()).await
+}
+
+async fn hung_retirement_times_out_at_the_single_original_deadline_scenario() -> Result<()> {
     let Hosted {
         app_server,
         requests,
         proxy,
         _keep_alive,
-    } = hosted_session(RealtimeRequestBehavior::StallHostedRetire).await?;
+    } = boxed_future!(hosted_session(RealtimeRequestBehavior::StallHostedRetire)).await?;
     let budget = Duration::from_secs(1);
     let started = Instant::now();
 
-    let exit = crate::app_server_session::final_exit_sessions([app_server], budget).await;
+    let exit = boxed_future!(crate::app_server_session::final_exit_sessions(
+        [app_server],
+        budget
+    ))
+    .await;
 
     // Declare, retire, client close and worker join all share one deadline.
     let elapsed = started.elapsed();
@@ -136,18 +152,27 @@ async fn hung_retirement_times_out_at_the_single_original_deadline() -> Result<(
 
 #[tokio::test]
 async fn retained_handles_cannot_extend_exit_and_only_teardown_is_admitted() -> Result<()> {
+    boxed_future!(retained_handles_cannot_extend_exit_and_only_teardown_is_admitted_scenario())
+        .await
+}
+
+async fn retained_handles_cannot_extend_exit_and_only_teardown_is_admitted_scenario() -> Result<()>
+{
     let Hosted {
         app_server,
         requests,
         proxy,
         _keep_alive,
-    } = hosted_session(RealtimeRequestBehavior::StallHostedRetire).await?;
+    } = boxed_future!(hosted_session(RealtimeRequestBehavior::StallHostedRetire)).await?;
     let retained = app_server.request_handle();
     let budget = Duration::from_secs(2);
     let started = Instant::now();
 
     let (exit, (ordinary, teardown)) = tokio::join!(
-        crate::app_server_session::final_exit_sessions([app_server], budget),
+        boxed_future!(crate::app_server_session::final_exit_sessions(
+            [app_server],
+            budget
+        )),
         async {
             // The retire is sent only after the final-exit edge.
             while recorded_params(&requests, RETIRE).is_empty() {
@@ -207,15 +232,22 @@ async fn retained_handles_cannot_extend_exit_and_only_teardown_is_admitted() -> 
 
 #[tokio::test]
 async fn older_daemon_without_hosted_methods_is_unsupported_never_clean() -> Result<()> {
+    boxed_future!(older_daemon_without_hosted_methods_is_unsupported_never_clean_scenario()).await
+}
+
+async fn older_daemon_without_hosted_methods_is_unsupported_never_clean_scenario() -> Result<()> {
     let Hosted {
         app_server,
         requests,
         proxy,
         _keep_alive,
-    } = hosted_session(RealtimeRequestBehavior::HostedUnsupported).await?;
+    } = boxed_future!(hosted_session(RealtimeRequestBehavior::HostedUnsupported)).await?;
 
-    let exit =
-        crate::app_server_session::final_exit_sessions([app_server], Duration::from_secs(10)).await;
+    let exit = boxed_future!(crate::app_server_session::final_exit_sessions(
+        [app_server],
+        Duration::from_secs(10)
+    ))
+    .await;
 
     assert!(
         matches!(exit.entries[0].1, HostedRetireOutcome::Unsupported { .. }),
@@ -231,13 +263,22 @@ async fn older_daemon_without_hosted_methods_is_unsupported_never_clean() -> Res
 
 #[tokio::test]
 async fn all_backends_are_latched_before_any_retire_wait_and_share_one_deadline() -> Result<()> {
-    let a = hosted_session(RealtimeRequestBehavior::StallHostedRetire).await?;
-    let b = hosted_session(RealtimeRequestBehavior::StallHostedRetire).await?;
+    boxed_future!(all_backends_are_latched_before_any_retire_wait_and_share_one_deadline_scenario())
+        .await
+}
+
+async fn all_backends_are_latched_before_any_retire_wait_and_share_one_deadline_scenario()
+-> Result<()> {
+    let a = boxed_future!(hosted_session(RealtimeRequestBehavior::StallHostedRetire)).await?;
+    let b = boxed_future!(hosted_session(RealtimeRequestBehavior::StallHostedRetire)).await?;
     let retained_b = b.app_server.request_handle();
     let budget = Duration::from_secs(2);
     let started = Instant::now();
     let (exit, ordinary) = tokio::join!(
-        crate::app_server_session::final_exit_sessions([a.app_server, b.app_server], budget),
+        boxed_future!(crate::app_server_session::final_exit_sessions(
+            [a.app_server, b.app_server],
+            budget
+        )),
         async {
             tokio::time::timeout(Duration::from_secs(5), async {
                 while recorded_params(&a.requests, RETIRE).is_empty() {
@@ -284,12 +325,20 @@ async fn all_backends_are_latched_before_any_retire_wait_and_share_one_deadline(
 
 #[tokio::test]
 async fn hosted_server_outlives_an_unrelated_backend_close_and_then_drops() -> Result<()> {
+    boxed_future!(hosted_server_outlives_an_unrelated_backend_close_and_then_drops_scenario()).await
+}
+
+async fn hosted_server_outlives_an_unrelated_backend_close_and_then_drops_scenario() -> Result<()> {
     let Hosted {
         app_server,
         proxy,
         _keep_alive,
         ..
-    } = hosted_session_with_transport_retention(RealtimeRequestBehavior::Forward, false).await?;
+    } = boxed_future!(hosted_session_with_transport_retention(
+        RealtimeRequestBehavior::Forward,
+        false
+    ))
+    .await?;
     let transport = app_server.thread_tool_transport();
     let crate::dynamic_tools_mcp::ThreadToolTransport::Mcp(server) = &transport else {
         panic!("the fixture owns a real hosted MCP server");
@@ -324,10 +373,10 @@ async fn hosted_server_outlives_an_unrelated_backend_close_and_then_drops() -> R
         Ok::<_, color_eyre::eyre::Report>(())
     };
     let (exit, cloud_result) = tokio::join!(
-        crate::app_server_session::final_exit_sessions(
+        boxed_future!(crate::app_server_session::final_exit_sessions(
             [app_server, cloud],
             Duration::from_secs(10)
-        ),
+        )),
         close_cloud,
     );
     cloud_result?;
@@ -341,12 +390,16 @@ async fn hosted_server_outlives_an_unrelated_backend_close_and_then_drops() -> R
 
 #[tokio::test]
 async fn stalled_remote_retirement_does_not_starve_an_embedded_close() -> Result<()> {
+    boxed_future!(stalled_remote_retirement_does_not_starve_an_embedded_close_scenario()).await
+}
+
+async fn stalled_remote_retirement_does_not_starve_an_embedded_close_scenario() -> Result<()> {
     let Hosted {
         app_server,
         proxy,
         _keep_alive,
         ..
-    } = hosted_session(RealtimeRequestBehavior::StallHostedRetire).await?;
+    } = boxed_future!(hosted_session(RealtimeRequestBehavior::StallHostedRetire)).await?;
     let (mut app, _events, _ops) = Box::pin(make_test_app_with_channels()).await;
     let home = tempdir()?;
     app.config.codex_home = home.path().to_path_buf().abs();
@@ -354,7 +407,10 @@ async fn stalled_remote_retirement_does_not_starve_an_embedded_close() -> Result
     app.config
         .features
         .set_enabled(codex_features::Feature::Plugins, false)?;
-    let embedded = crate::tests::start_test_embedded_app_server(app.config.clone()).await?;
+    let embedded = boxed_future!(crate::tests::start_test_embedded_app_server(
+        app.config.clone()
+    ))
+    .await?;
     let embedded = AppServerSession::new(
         crate::backend_id::BackendId::new(),
         codex_app_server_client::AppServerClient::InProcess(embedded),
@@ -362,7 +418,11 @@ async fn stalled_remote_retirement_does_not_starve_an_embedded_close() -> Result
     );
     let budget = Duration::from_secs(2);
     let start = Instant::now();
-    let exit = crate::app_server_session::final_exit_sessions([app_server, embedded], budget).await;
+    let exit = boxed_future!(crate::app_server_session::final_exit_sessions(
+        [app_server, embedded],
+        budget
+    ))
+    .await;
     assert!(start.elapsed() <= budget + EPSILON);
     assert_eq!(exit.entries[0].1, HostedRetireOutcome::TimedOut);
     assert_eq!(exit.entries[1].1, HostedRetireOutcome::NotHosted);
@@ -376,18 +436,23 @@ async fn stalled_remote_retirement_does_not_starve_an_embedded_close() -> Result
 
 #[tokio::test]
 async fn startup_error_after_dynamic_server_retires_the_hosted_endpoint() -> Result<()> {
+    boxed_future!(startup_error_after_dynamic_server_retires_the_hosted_endpoint_scenario()).await
+}
+
+async fn startup_error_after_dynamic_server_retires_the_hosted_endpoint_scenario() -> Result<()> {
     let Hosted {
         app_server,
         requests,
         proxy,
         _keep_alive,
-    } = hosted_session(RealtimeRequestBehavior::Forward).await?;
+    } = boxed_future!(hosted_session(RealtimeRequestBehavior::Forward)).await?;
     let start = Instant::now();
-    let error = crate::app::startup::shutdown_on_startup_error(
+    let mut other_backends = Vec::new();
+    let error = boxed_future!(crate::app::startup::shutdown_on_startup_error(
         app_server,
-        &mut Vec::new(),
+        &mut other_backends,
         color_eyre::eyre::eyre!("injected startup error"),
-    )
+    ))
     .await
     .expect_err("the original startup error is preserved");
     assert!(error.to_string().contains("injected startup error"));
@@ -400,12 +465,16 @@ async fn startup_error_after_dynamic_server_retires_the_hosted_endpoint() -> Res
 
 #[tokio::test]
 async fn startup_cancellation_retires_the_primary_hosted_endpoint() -> Result<()> {
+    boxed_future!(startup_cancellation_retires_the_primary_hosted_endpoint_scenario()).await
+}
+
+async fn startup_cancellation_retires_the_primary_hosted_endpoint_scenario() -> Result<()> {
     let Hosted {
         app_server,
         requests,
         proxy,
         _keep_alive,
-    } = hosted_session(RealtimeRequestBehavior::Forward).await?;
+    } = boxed_future!(hosted_session(RealtimeRequestBehavior::Forward)).await?;
     let (cloud, mut commands, _events) = codex_app_server_client::CloudClient::channel(1);
     let other = AppServerSession::new(
         crate::backend_id::BackendId::new(),
@@ -428,7 +497,11 @@ async fn startup_cancellation_retires_the_primary_hosted_endpoint() -> Result<()
     });
     let mut others = vec![other];
     let start = Instant::now();
-    let exit = crate::app::startup::cancel_startup_sessions(app_server, &mut others).await;
+    let exit = boxed_future!(crate::app::startup::cancel_startup_sessions(
+        app_server,
+        &mut others
+    ))
+    .await;
     assert!(others.is_empty());
     worker.await.expect("the secondary owner is joined");
     assert!(matches!(exit.exit_reason, crate::ExitReason::UserRequested));

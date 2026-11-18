@@ -35,7 +35,25 @@ pub(crate) struct McpConfigIdentity {
 
 impl McpConfigIdentity {
     pub(crate) fn from_config(config: &Config) -> std::io::Result<Option<Self>> {
-        Self::from_layers(&config.config_layer_stack)
+        let Some(inputs) = config.config_layer_stack.mcp_user_input_identity() else {
+            return Ok(None);
+        };
+        let layers = inputs
+            .into_iter()
+            .map(|(file, version)| {
+                file.into_path_buf()
+                    .into_os_string()
+                    .into_string()
+                    .map(|file_path| McpConfigIdentityLayer { file_path, version })
+                    .map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "selected MCP configuration path is not valid UTF-8",
+                        )
+                    })
+            })
+            .collect::<std::io::Result<Vec<_>>>()?;
+        Ok((!layers.is_empty()).then_some(Self { layers }))
     }
 
     pub(crate) fn from_layers(

@@ -111,14 +111,16 @@ pub(crate) async fn final_exit_sessions(
     for session in &sessions {
         session.begin_final_exit(deadline);
     }
-    // 03's retention release extends each session's teardown, through the
-    // same latched handles and deadline. One stalled retirement must not stop
+    // Connection close revokes retention; no extra release loop is needed.
+    // One stalled retirement must not stop
     // an unrelated session from closing while its deadline is still live.
-    let closes = futures::future::join_all(sessions.into_iter().map(|session| async move {
-        let id = session.backend_id();
-        let hosted = session.final_exit_teardown(deadline).await;
-        let (close, server) = session.close_by(deadline).await;
-        (id, hosted, close, server)
+    let closes = futures::future::join_all(sessions.into_iter().map(|session| {
+        Box::pin(async move {
+            let id = session.backend_id();
+            let hosted = session.final_exit_teardown(deadline).await;
+            let (close, server) = session.close_by(deadline).await;
+            (id, hosted, close, server)
+        })
     }))
     .await;
     let mut servers = Vec::new();

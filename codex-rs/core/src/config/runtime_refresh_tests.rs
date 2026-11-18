@@ -203,6 +203,14 @@ async fn mcp_refresh_preserves_current_user_and_session_layers_without_reopening
             .collect::<Vec<_>>()
     };
     assert_eq!(preserved_layers(&refreshed), preserved_layers(&current));
+    assert_ne!(
+        current.config_layer_stack.mcp_user_input_identity(),
+        next.config_layer_stack.mcp_user_input_identity(),
+    );
+    assert_eq!(
+        refreshed.config_layer_stack.mcp_user_input_identity(),
+        next.config_layer_stack.mcp_user_input_identity(),
+    );
     let server = &runtime_servers(&refreshed)["enterprise"];
     assert!(!server.enabled);
     assert_eq!(

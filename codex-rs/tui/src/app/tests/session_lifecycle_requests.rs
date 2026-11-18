@@ -2397,7 +2397,7 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths() 
 
 async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths_scenario()
 -> Result<()> {
-    let (mut app, events, _ops) = Box::pin(make_test_app_with_channels()).await;
+    let (mut app, events, _ops) = boxed_future!(make_test_app_with_channels()).await;
     // Invalid optional worktree settings must preserve both daemon start paths.
     let codex_home = tempdir()?;
     app.config.codex_home = codex_home.path().to_path_buf().abs();
@@ -2407,20 +2407,20 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths_sc
         "web_search = \"disabled\"\n[desktop]\ngit-worktree-root = 'relative'\n",
     )?;
     // Keep the large lifecycle futures off the Windows test thread's stack.
-    let (mut app_server, mut requests, mut proxy) = Box::pin(start_recording_app_server(
+    let (mut app_server, mut requests, mut proxy) = boxed_future!(start_recording_app_server(
         &app.config,
         /*blocked_thread_list*/ None,
         /*failed_thread_name*/ None,
     ))
     .await?;
-    Box::pin(app_server.start_dynamic_tool_mcp(
+    boxed_future!(app_server.start_dynamic_tool_mcp(
         app.config.clone(),
         app.app_event_tx.clone(),
         app.dynamic_tool_status_updates.clone(),
     ))
     .await?;
 
-    let started = Box::pin(app_server.start_thread(&app.config)).await?;
+    let started = boxed_future!(app_server.start_thread(&app.config)).await?;
     let thread_id = started.session.thread_id;
     assert!(started.task_tools_available);
     assert!(app_server.task_tools_available(thread_id));
@@ -2507,7 +2507,7 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths_sc
         ThreadHistoryMode::Legacy,
         "Approved task source",
     )?;
-    Box::pin(app_server.resume_thread(
+    boxed_future!(app_server.resume_thread(
         &app.local_settings,
         app.config.clone(),
         delegation_source,
@@ -2522,7 +2522,7 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths_sc
         starts[0]["config"]["mcp_servers.codex_tui"]
     );
     let mut attachment = app_server.attachment_view(delegation_source);
-    Box::pin(attachment.resume_thread(
+    boxed_future!(attachment.resume_thread(
         &app.local_settings,
         app.config.clone(),
         delegation_source,
@@ -2536,8 +2536,12 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths_sc
         reattached["config"]["mcp_servers.codex_tui"],
         starts[0]["config"]["mcp_servers.codex_tui"]
     );
-    Box::pin(app_server.fork_thread(&app.local_settings, app.config.clone(), delegation_source))
-        .await?;
+    boxed_future!(app_server.fork_thread(
+        &app.local_settings,
+        app.config.clone(),
+        delegation_source
+    ))
+    .await?;
     let forked = recorded_params(&requests, "thread/fork")
         .pop()
         .expect("forked task request");
@@ -2588,7 +2592,7 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths_sc
         "{paused}"
     );
     let (replacement, replacement_requests, replacement_proxy) =
-        Box::pin(start_recording_app_server(
+        boxed_future!(start_recording_app_server(
             &app.config,
             /*blocked_thread_list*/ None,
             /*failed_thread_name*/ None,
@@ -2683,7 +2687,7 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths_sc
         if registered_ids.is_empty() {
             assert!(recorded_params(&requests, "thread/fork").is_empty());
         }
-        Box::pin(app.handle_event(&mut tui, &mut app_server, registration)).await?;
+        boxed_future!(app.handle_event(&mut tui, &mut app_server, registration)).await?;
         assert_eq!(
             app.agents_overview.threads[&forked_thread_id],
             Some(expected_thread)

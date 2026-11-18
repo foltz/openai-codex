@@ -75,6 +75,11 @@ async fn reload_mcp_config_with_policy(
     // `refresh_mcp_config` may publish while it is held (never the core-owned
     // `refresh_runtime_config`, which would re-lock this non-reentrant gate).
     let _apply_guard = applied_mcp_config_identity.lock_apply().await;
+    // Fence configurations loaded before this transition, including inherited
+    // fork options whose parent has already left the visible thread registry.
+    // Published sessions keep their selective refresh authority; candidate
+    // loads below capture the new startup generation.
+    config_manager.revoke_mcp_ema_startups();
     if matches!(policy, ReloadPolicy::BestEffort) {
         // A partial best-effort refresh cannot truthfully claim a single applied
         // process-wide MCP configuration. Invalidate before any thread mutation.

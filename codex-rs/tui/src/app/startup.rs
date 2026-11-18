@@ -20,10 +20,10 @@ use color_eyre::eyre::ContextCompat;
 pub(super) async fn shutdown_startup_sessions(
     sessions: impl IntoIterator<Item = AppServerSession>,
 ) {
-    let exit = crate::app_server_session::final_exit_sessions(
+    let exit = crate::boxed_future!(crate::app_server_session::final_exit_sessions(
         sessions,
         crate::app_server_session::FINAL_EXIT_BUDGET,
-    )
+    ))
     .await;
     exit.report();
     if let Err(shutdown_error) = exit.into_result() {

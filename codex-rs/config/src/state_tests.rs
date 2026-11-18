@@ -396,3 +396,58 @@ fn with_user_config_updates_matching_user_layer_without_replacing_active_profile
         Some("on-request")
     );
 }
+
+#[test]
+fn mcp_input_identity_survives_snapshots_without_changing_trusted_layers() {
+    let temp_dir = TempDir::new().expect("tempdir");
+    let path = test_user_config_path(&temp_dir, "config.toml");
+    let stack = |contents: &str| {
+        ConfigLayerStack::default()
+            .with_user_config(&path, toml::from_str(contents).expect("user config"))
+            .expect("valid stack")
+    };
+    let old = stack("[mcp_servers.old]\ncommand = 'old'");
+    let next = stack("[mcp_servers.new]\ncommand = 'new'");
+    let accepted = old.clone().with_mcp_user_input_identity_from(&next);
+    assert_eq!(accepted.effective_config(), old.effective_config());
+    assert_eq!(
+        accepted.mcp_user_input_identity(),
+        next.mcp_user_input_identity()
+    );
+    assert_eq!(
+        accepted.clone().mcp_user_input_identity(),
+        next.mcp_user_input_identity()
+    );
+    // A newly loaded user snapshot owns its own identity, never the previous
+    // MCP-only marker. Copying a runtime snapshot preserves that snapshot's
+    // accepted inputs instead.
+    let unknown = accepted.clone().with_unknown_mcp_user_input_identity();
+    assert_eq!(unknown.mcp_user_input_identity(), None);
+    assert_eq!(
+        old.with_user_layer_from(&unknown).mcp_user_input_identity(),
+        None
+    );
+    assert_eq!(
+        unknown
+            .with_user_layer_from(&next)
+            .mcp_user_input_identity(),
+        next.mcp_user_input_identity()
+    );
+    let replaced = accepted.with_user_layer_from(&old);
+    assert_eq!(
+        replaced.mcp_user_input_identity(),
+        old.mcp_user_input_identity()
+    );
+    let copied = old.with_user_layer_from(&accepted);
+    assert_eq!(
+        copied.mcp_user_input_identity(),
+        next.mcp_user_input_identity()
+    );
+    let edited = accepted
+        .with_user_config(&path, toml::from_str("value = 3").unwrap())
+        .unwrap();
+    assert_ne!(
+        edited.mcp_user_input_identity(),
+        next.mcp_user_input_identity()
+    );
+}

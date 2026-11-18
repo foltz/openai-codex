@@ -63,6 +63,27 @@ pub trait RuntimeConfigChangeListener: Send + Sync {
     /// Called under the matching gate immediately before a newly constructed
     /// thread becomes visible. No async work or thread creation is allowed here.
     fn before_thread_publication(&self, _config: &crate::config::Config) {}
+
+    /// Registers session-owned runtime provenance before MCP startup, under the
+    /// shared gate. The returned member stays with SessionServices, including
+    /// delegates that are not in ThreadManager's visible thread map.
+    fn register_runtime_config(
+        &self,
+        _config: &crate::config::Config,
+    ) -> Option<Arc<dyn RuntimeConfigMembership>> {
+        None
+    }
+}
+
+/// Session-lifetime provenance observer. Implementations retain metadata only,
+/// never the Session itself, and drop their membership when its owner drops.
+pub trait RuntimeConfigMembership: Send + Sync {
+    /// Runs synchronously under the session state lock before a non-stale swap.
+    fn before_publication(
+        &self,
+        config: &crate::config::Config,
+        outcome: crate::ConfigRefreshOutcome,
+    );
 }
 
 /// Serializes host-owned and legacy core runtime configuration changes.
@@ -147,6 +168,7 @@ pub(crate) struct SessionServices {
     pub(crate) code_mode_service: CodeModeService,
     pub(crate) tool_search_handler_cache: ToolSearchHandlerCache,
     pub(crate) turn_environments: Arc<ThreadEnvironments>,
+    pub(crate) runtime_config_membership: Option<Arc<dyn RuntimeConfigMembership>>,
 }
 
 impl SessionServices {

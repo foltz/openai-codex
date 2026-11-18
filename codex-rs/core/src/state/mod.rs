@@ -13,6 +13,7 @@ pub(crate) use auto_compact_window::AutoCompactWindowSnapshot;
 pub(crate) use auto_compact_window::ContextWindowIdGenerator;
 pub use service::RuntimeConfigChangeGate;
 pub use service::RuntimeConfigChangeListener;
+pub use service::RuntimeConfigMembership;
 pub(crate) use service::SessionServices;
 pub(crate) use session::EagerSessionStartOutcome;
 pub(crate) use session::ReasoningEffortPin;

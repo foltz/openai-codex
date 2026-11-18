@@ -970,6 +970,18 @@ impl Session {
             host_admission.as_deref(),
         )?;
 
+        // Register before MCP startup without holding the gate over startup,
+        // network work, or callbacks. Host identity reads/reloads share this gate.
+        let runtime_config_membership = {
+            let _guard = match runtime_config_change_gate.as_ref() {
+                Some(gate) => Some(gate.lock().await),
+                None => None,
+            };
+            runtime_config_change_listener
+                .as_ref()
+                .and_then(|listener| listener.register_runtime_config(&config))
+        };
+
         debug!(
             "Configuring session: model={}; provider={:?}",
             session_configuration
@@ -2095,6 +2107,7 @@ impl Session {
                 ThreadTraceContext::disabled()
             });
             let services = SessionServices {
+                runtime_config_membership,
                 runtime_config_change_listener,
                 runtime_config_change_gate,
                 // Start with an empty connection set. The initialized set is

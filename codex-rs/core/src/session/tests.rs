@@ -6907,6 +6907,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
     )
     .expect("initialize test hooks");
     let services = SessionServices {
+        runtime_config_membership: None,
         runtime_config_change_listener: None,
         runtime_config_change_gate: None,
         mcp_runtime,
@@ -9300,6 +9301,7 @@ where
     )
     .expect("initialize test hooks");
     let services = SessionServices {
+        runtime_config_membership: None,
         runtime_config_change_listener: None,
         runtime_config_change_gate: None,
         mcp_runtime,

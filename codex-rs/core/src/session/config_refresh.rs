@@ -239,6 +239,9 @@ impl Session {
                     outcome = ConfigRefreshOutcome::Rejected;
                 }
             }
+            if let Some(member) = &self.services.runtime_config_membership {
+                member.before_publication(&config, outcome);
+            }
             // Both Published and Rejected can replace runtime configuration.
             // Notify only after every stale-owner refusal, before any mutation.
             if owner == RuntimeConfigChangeOwner::Core

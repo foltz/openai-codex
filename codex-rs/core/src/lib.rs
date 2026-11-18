@@ -274,6 +274,7 @@ mod function_tool;
 mod state;
 pub use state::RuntimeConfigChangeGate;
 pub use state::RuntimeConfigChangeListener;
+pub use state::RuntimeConfigMembership;
 mod tasks;
 mod user_shell_command;
 pub mod util;

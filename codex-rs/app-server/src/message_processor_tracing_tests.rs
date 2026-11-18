@@ -980,3 +980,58 @@ async fn build_test_processor_for_retirement(
         .expect("create test auth manager");
     build_test_processor_for_retirement_with_auth(config, auth).await
 }
+
+#[tokio::test]
+async fn production_reset_inventory_revokes_hosted_declaration_authority() -> Result<()> {
+    use crate::hosted_mcp_endpoints::tests::Behavior;
+    use crate::hosted_mcp_endpoints::tests::CAPABILITY;
+    use crate::hosted_mcp_endpoints::tests::declare_params;
+    use crate::hosted_mcp_endpoints::tests::serve_proof;
+    use crate::hosted_mcp_endpoints::tests::thread_start_naming;
+    use crate::managed_transition::ResetInventory;
+    use codex_app_server_protocol::McpHostedEndpointDeclareResponse;
+    use codex_app_server_protocol::McpHostedEndpointRefusalReason;
+
+    let home = TempDir::new()?;
+    let mut config = build_test_config(home.path(), "http://127.0.0.1:1").await?;
+    config.features.disable(codex_features::Feature::Plugins)?;
+    let (processor, _outgoing) = build_test_processor_for_retirement(Arc::new(config)).await;
+    let (url, _hits) = serve_proof(Behavior::Answer).await;
+    let endpoints = &processor.hosted_mcp_endpoints;
+    endpoints
+        .admit_request(ConnectionId(1), &thread_start_naming(&url))
+        .expect("hosted attribution");
+    assert!(matches!(
+        endpoints
+            .declare(ConnectionId(1), declare_params(&url, CAPABILITY), || false)
+            .await,
+        McpHostedEndpointDeclareResponse::Declared { .. }
+    ));
+    let custody = processor
+        .thread_manager
+        .mcp_manager()
+        .hosted_endpoint_custody();
+    assert_eq!(custody.census().declared, 1);
+
+    // Invoke the process-owned inventory used by the coordinator, not registry
+    // cleanup directly. Later account-dependent stages may refuse this fixture;
+    // hosted authority must already be revoked before either return outcome.
+    let reset = processor.reset_inventory.reset_all().await;
+    eprintln!("production reset inventory result: {reset:?}");
+    assert_eq!(custody.census().declared, 0, "reset result: {reset:?}");
+    for connection in [ConnectionId(1), ConnectionId(2)] {
+        assert_eq!(
+            endpoints
+                .declare(connection, declare_params(&url, CAPABILITY), || false)
+                .await,
+            McpHostedEndpointDeclareResponse::Refused {
+                reason: McpHostedEndpointRefusalReason::NotUsed,
+            },
+            "old capability must not restore cleared attribution"
+        );
+    }
+    processor
+        .drain_background_tasks_until(tokio::time::Instant::now() + Duration::from_secs(20))
+        .await;
+    Ok(())
+}

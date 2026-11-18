@@ -294,3 +294,105 @@ async fn critical_path_refresh_respects_managed_disable() {
             .enabled(Feature::CriticalPathTiming)
     );
 }
+
+#[derive(Default)]
+struct RuntimeIdentityInvalidations(std::sync::atomic::AtomicUsize);
+
+impl crate::RuntimeConfigChangeListener for RuntimeIdentityInvalidations {
+    fn before_runtime_config_change(&self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn core_refresh_notifies_for_a_swap_but_not_a_stale_owner() {
+    let (mut session, _) = make_session_and_context().await;
+    let notifications = Arc::new(RuntimeIdentityInvalidations::default());
+    session.services.runtime_config_change_listener = Some(notifications.clone());
+    let original = session.get_config().await;
+    assert_eq!(
+        session
+            .refresh_runtime_config(Arc::clone(&original), original.as_ref().clone())
+            .await,
+        crate::ConfigRefreshOutcome::Published
+    );
+    assert_eq!(notifications.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        session
+            .refresh_runtime_config(Arc::clone(&original), original.as_ref().clone())
+            .await,
+        crate::ConfigRefreshOutcome::Stale
+    );
+    assert_eq!(notifications.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn host_refresh_does_not_relock_or_notify_the_host_owned_transition() {
+    let (mut session, _) = make_session_and_context().await;
+    let notifications = Arc::new(RuntimeIdentityInvalidations::default());
+    let gate = crate::RuntimeConfigChangeGate::default();
+    session.services.runtime_config_change_listener = Some(notifications.clone());
+    session.services.runtime_config_change_gate = Some(gate.clone());
+    let _host_guard = gate.lock().await;
+    let original = session.get_config().await;
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        session.refresh_runtime_config_from_host(Arc::clone(&original), original.as_ref().clone()),
+    )
+    .await
+    .expect("a host-owned publication must not re-lock its transition gate");
+    assert_eq!(outcome, crate::ConfigRefreshOutcome::Published);
+    assert_eq!(notifications.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let current = session.get_config().await;
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            session.refresh_runtime_config(Arc::clone(&current), current.as_ref().clone())
+        )
+        .await
+        .is_err(),
+        "a core reload must wait for the host's transition"
+    );
+    assert!(Arc::ptr_eq(&session.get_config().await, &current));
+    assert_eq!(notifications.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn rejected_core_publication_invalidates_before_the_mixed_state_swap() -> anyhow::Result<()> {
+    let (mut session, _) = make_session_and_context().await;
+    let notifications = Arc::new(RuntimeIdentityInvalidations::default());
+    session.services.runtime_config_change_listener = Some(notifications.clone());
+    let mut original = session.get_config().await.as_ref().clone();
+    original.config_layer_stack = original
+        .config_layer_stack
+        .with_user_config(
+            &original.codex_home.join(CONFIG_TOML_FILE),
+            toml::toml! {
+                apps.calendar.enabled = "false"
+                apps.drive.enabled = false
+            }
+            .into(),
+        )?
+        .with_session_apps(toml::toml! { calendar.enabled = false }.into())?;
+    let original = Arc::new(original);
+    session
+        .state
+        .lock()
+        .await
+        .session_configuration
+        .original_config_do_not_use = Arc::clone(&original);
+    let mut next = original.as_ref().clone();
+    next.config_layer_stack = next
+        .config_layer_stack
+        .with_session_apps(toml::Table::new().into())?;
+    let _guard = session.lock_runtime_config_change_gate().await;
+    assert_eq!(
+        session
+            .refresh_config(Arc::clone(&original), next, RuntimeConfigRefresh::Mcp)
+            .await,
+        crate::ConfigRefreshOutcome::Rejected
+    );
+    assert!(!Arc::ptr_eq(&session.get_config().await, &original));
+    assert_eq!(notifications.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    Ok(())
+}

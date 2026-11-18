@@ -6907,6 +6907,8 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
     )
     .expect("initialize test hooks");
     let services = SessionServices {
+        runtime_config_change_listener: None,
+        runtime_config_change_gate: None,
         mcp_runtime,
         mcp_handler_cache: Default::default(),
         unified_exec_manager: UnifiedExecProcessManager::new(
@@ -7270,6 +7272,8 @@ pub(super) async fn make_session_with_custody_and_rx(
         codex_rollout_trace::ThreadTraceContext::disabled(),
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,
+        /*runtime_config_change_listener*/ None,
+        /*runtime_config_change_gate*/ None,
         Some(config.multi_agent_version_from_features()),
         GitEnrichmentPolicy::Fresh,
         codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
@@ -7423,6 +7427,8 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         codex_rollout_trace::ThreadTraceContext::disabled(),
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,
+        /*runtime_config_change_listener*/ None,
+        /*runtime_config_change_gate*/ None,
         Some(config.multi_agent_version_from_features()),
         GitEnrichmentPolicy::Fresh,
         codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
@@ -9294,6 +9300,8 @@ where
     )
     .expect("initialize test hooks");
     let services = SessionServices {
+        runtime_config_change_listener: None,
+        runtime_config_change_gate: None,
         mcp_runtime,
         mcp_handler_cache: Default::default(),
         unified_exec_manager: UnifiedExecProcessManager::new(

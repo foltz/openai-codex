@@ -676,6 +676,9 @@ pub(crate) struct SessionSpawnArgs {
     pub(crate) thread_store: Arc<dyn ThreadStore>,
     pub(crate) attestation_provider: Option<Arc<dyn AttestationProvider>>,
     pub(crate) external_time_provider: Option<Arc<dyn TimeProvider>>,
+    pub(crate) runtime_config_change_listener: Option<Arc<dyn crate::RuntimeConfigChangeListener>>,
+    pub(crate) runtime_config_change_gate: Option<crate::RuntimeConfigChangeGate>,
+
     pub(crate) inherited_multi_agent_version: Option<MultiAgentVersion>,
     pub(crate) git_enrichment_policy: GitEnrichmentPolicy,
     pub(crate) windows_sandbox_proxy_settings_mode:
@@ -912,6 +915,8 @@ impl Session {
             thread_store,
             attestation_provider,
             external_time_provider,
+            runtime_config_change_listener,
+            runtime_config_change_gate,
             inherited_multi_agent_version,
             git_enrichment_policy,
             windows_sandbox_proxy_settings_mode,
@@ -1283,6 +1288,8 @@ impl Session {
             parent_rollout_thread_trace,
             attestation_provider,
             external_time_provider,
+            runtime_config_change_listener,
+            runtime_config_change_gate,
             multi_agent_version,
             git_enrichment_policy,
             windows_sandbox_proxy_settings_mode,
@@ -2807,6 +2814,7 @@ impl Session {
     }
 
     pub(crate) async fn reload_user_config_layer(&self) {
+        let _change_guard = self.lock_runtime_config_change_gate().await;
         // Refresh layer-backed runtime state for an existing session, including enabled plugin,
         // skill, hook, and MCP feature state. Other feature gates and legacy notify settings
         // remain session-static.

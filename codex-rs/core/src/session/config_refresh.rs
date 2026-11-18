@@ -13,7 +13,37 @@ use codex_config::McpServerAuth;
 use codex_features::Feature;
 use tracing::warn;
 
+/// Who owns the [`crate::RuntimeConfigChangeGate`] for one runtime configuration
+/// publication (KESTREL-CODEX-011).
+///
+/// Ownership never bypasses the publication checks: both owners publish only
+/// through `Session::refresh_config_as`, so the compare-and-swap, stale-owner,
+/// cloud-policy, and enterprise MCP fail-closed rules always apply.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RuntimeConfigChangeOwner {
+    /// A core-initiated change. The caller holds the session's gate, when one
+    /// is installed, and the host's listener is notified immediately before an
+    /// accepted publication mutates the session configuration.
+    Core,
+    /// The embedding host holds the matching gate for its entire transition
+    /// and owns the provenance the listener would invalidate, so core neither
+    /// re-locks the gate nor notifies the listener.
+    Host,
+}
+
 impl Session {
+    /// Serializes a core-initiated runtime configuration change with
+    /// host-owned transitions. Callers that already hold the gate (host-owned
+    /// paths) must not call this; the gate is not reentrant.
+    pub(super) async fn lock_runtime_config_change_gate(
+        &self,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        match self.services.runtime_config_change_gate.as_ref() {
+            Some(gate) => Some(gate.lock().await),
+            None => None,
+        }
+    }
+
     pub(crate) async fn disable_mcp_enterprise_auth(&self) {
         {
             let mut state = self.state.lock().await;
@@ -37,24 +67,74 @@ impl Session {
         expected_config: Arc<Config>,
         next_config: Config,
     ) -> ConfigRefreshOutcome {
-        self.refresh_config(expected_config, next_config, RuntimeConfigRefresh::User)
-            .await
+        let _change_guard = self.lock_runtime_config_change_gate().await;
+        self.refresh_config_as(
+            expected_config,
+            next_config,
+            RuntimeConfigRefresh::User,
+            RuntimeConfigChangeOwner::Core,
+        )
+        .await
     }
 
+    /// Applies a materialized runtime configuration under a transition the
+    /// host already owns. Callers must hold the matching
+    /// `RuntimeConfigChangeGate` for the entire runtime transition and must
+    /// pass the snapshot they captured under that gate as `expected_config`.
+    pub(crate) async fn refresh_runtime_config_from_host(
+        &self,
+        expected_config: Arc<Config>,
+        next_config: Config,
+    ) -> ConfigRefreshOutcome {
+        self.refresh_config_as(
+            expected_config,
+            next_config,
+            RuntimeConfigRefresh::User,
+            RuntimeConfigChangeOwner::Host,
+        )
+        .await
+    }
+
+    /// Host-owned MCP refresh. As before KESTREL-CODEX-011 adaptation, callers
+    /// (app-server MCP reloads) hold the runtime-config change gate and own
+    /// the applied identity, so this path neither re-locks nor notifies.
     pub(crate) async fn refresh_mcp_config(
         &self,
         expected_config: Arc<Config>,
         next_config: Config,
     ) -> ConfigRefreshOutcome {
-        self.refresh_config(expected_config, next_config, RuntimeConfigRefresh::Mcp)
-            .await
+        self.refresh_config_as(
+            expected_config,
+            next_config,
+            RuntimeConfigRefresh::Mcp,
+            RuntimeConfigChangeOwner::Host,
+        )
+        .await
     }
 
+    /// Core-owned publication for callers that already hold the session's
+    /// runtime-config change gate, such as `reload_user_config_layer`.
     pub(super) async fn refresh_config(
         &self,
         expected_config: Arc<Config>,
         next_config: Config,
         scope: RuntimeConfigRefresh,
+    ) -> ConfigRefreshOutcome {
+        self.refresh_config_as(
+            expected_config,
+            next_config,
+            scope,
+            RuntimeConfigChangeOwner::Core,
+        )
+        .await
+    }
+
+    async fn refresh_config_as(
+        &self,
+        expected_config: Arc<Config>,
+        next_config: Config,
+        scope: RuntimeConfigRefresh,
+        owner: RuntimeConfigChangeOwner,
     ) -> ConfigRefreshOutcome {
         let (mut config, mut outcome, rejection_kind) =
             match expected_config.resolve_runtime_refresh(&next_config, scope) {
@@ -158,6 +238,13 @@ impl Session {
                         .with_cloud_config_binding(/*binding*/ None);
                     outcome = ConfigRefreshOutcome::Rejected;
                 }
+            }
+            // Both Published and Rejected can replace runtime configuration.
+            // Notify only after every stale-owner refusal, before any mutation.
+            if owner == RuntimeConfigChangeOwner::Core
+                && let Some(listener) = &self.services.runtime_config_change_listener
+            {
+                listener.before_runtime_config_change();
             }
             if let Some(rejection_kind) = rejection_kind {
                 warn!(

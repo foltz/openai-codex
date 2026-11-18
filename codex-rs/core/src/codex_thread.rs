@@ -1607,6 +1607,20 @@ impl CodexThread {
         .await
     }
 
+    /// Publishes within a host-owned runtime-config transition. The host must
+    /// hold the matching change gate and invalidate its identity before calling.
+    pub async fn refresh_runtime_config_from_host(
+        &self,
+        expected_config: Arc<crate::config::Config>,
+        next_config: crate::config::Config,
+    ) -> ConfigRefreshOutcome {
+        Box::pin(
+            self.session
+                .refresh_runtime_config_from_host(expected_config, next_config),
+        )
+        .await
+    }
+
     /// Revokes enterprise MCP authority from the current owner after a failed reload.
     pub async fn disable_mcp_enterprise_auth(&self) {
         self.session.disable_mcp_enterprise_auth().await;

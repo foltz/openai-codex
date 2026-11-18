@@ -79,6 +79,9 @@ impl RuntimeConfigChangeGate {
 }
 
 pub(crate) struct SessionServices {
+    pub(crate) runtime_config_change_listener: Option<Arc<dyn crate::RuntimeConfigChangeListener>>,
+    pub(crate) runtime_config_change_gate: Option<crate::RuntimeConfigChangeGate>,
+
     /// The single owner of live MCP connections for this thread.
     pub(crate) mcp_runtime: Arc<McpRuntime>,
     /// Immutable MCP handlers scoped to this thread's current binding.

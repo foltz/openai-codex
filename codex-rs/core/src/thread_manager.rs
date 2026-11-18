@@ -660,6 +660,8 @@ pub(crate) struct ThreadManagerState {
     session_source: SessionSource,
     installation_id: String,
     analytics_events_client: Option<AnalyticsEventsClient>,
+    runtime_config_change_listener: Option<Arc<dyn crate::RuntimeConfigChangeListener>>,
+    runtime_config_change_gate: Option<crate::RuntimeConfigChangeGate>,
     // Captures submitted ops for testing purpose when test mode is enabled.
     ops_log: Option<SharedCapturedOps>,
 }
@@ -785,6 +787,8 @@ impl ThreadManager {
                 session_source,
                 installation_id,
                 analytics_events_client,
+                runtime_config_change_listener: None,
+                runtime_config_change_gate: None,
                 ops_log: should_use_test_thread_manager_behavior()
                     .then(|| Arc::new(std::sync::Mutex::new(Vec::new()))),
             }),
@@ -792,6 +796,31 @@ impl ThreadManager {
             shutdown: Default::default(),
             _test_codex_home_guard: None,
         }
+    }
+
+    /// Registers a host-owned invalidator for runtime configuration reloads
+    /// before this manager is shared with threads.
+    pub fn with_runtime_config_change_listener(
+        mut self,
+        listener: Arc<dyn crate::RuntimeConfigChangeListener>,
+    ) -> Self {
+        let Some(state) = Arc::get_mut(&mut self.state) else {
+            unreachable!(
+                "runtime config change listener must be set before thread manager is shared"
+            );
+        };
+        state.runtime_config_change_listener = Some(listener);
+        self
+    }
+
+    /// Registers the host-owned serialization gate for runtime configuration
+    /// transitions before this manager is shared with threads.
+    pub fn with_runtime_config_change_gate(mut self, gate: crate::RuntimeConfigChangeGate) -> Self {
+        let Some(state) = Arc::get_mut(&mut self.state) else {
+            unreachable!("runtime config change gate must be set before thread manager is shared");
+        };
+        state.runtime_config_change_gate = Some(gate);
+        self
     }
 
     /// Generate every new thread identifier with the caller-provided factory.
@@ -1014,6 +1043,8 @@ impl ThreadManager {
                 session_source: SessionSource::Exec,
                 installation_id,
                 analytics_events_client: None,
+                runtime_config_change_listener: None,
+                runtime_config_change_gate: None,
                 ops_log: should_use_test_thread_manager_behavior()
                     .then(|| Arc::new(std::sync::Mutex::new(Vec::new()))),
             }),
@@ -3359,6 +3390,8 @@ impl ThreadManagerState {
                 thread_store: Arc::clone(&self.thread_store),
                 attestation_provider: self.attestation_provider.clone(),
                 external_time_provider: self.external_time_provider.clone(),
+                runtime_config_change_listener: self.runtime_config_change_listener.clone(),
+                runtime_config_change_gate: self.runtime_config_change_gate.clone(),
                 inherited_multi_agent_version: startup_context.multi_agent_version,
                 git_enrichment_policy: if matches!(
                     &tracked_session_source,

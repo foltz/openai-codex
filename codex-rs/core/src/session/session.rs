@@ -945,6 +945,8 @@ impl Session {
         parent_rollout_thread_trace: ThreadTraceContext,
         attestation_provider: Option<Arc<dyn AttestationProvider>>,
         external_time_provider: Option<Arc<dyn TimeProvider>>,
+        runtime_config_change_listener: Option<Arc<dyn crate::RuntimeConfigChangeListener>>,
+        runtime_config_change_gate: Option<crate::RuntimeConfigChangeGate>,
         multi_agent_version: Option<MultiAgentVersion>,
         git_enrichment_policy: GitEnrichmentPolicy,
         windows_sandbox_proxy_settings_mode: codex_sandboxing::WindowsSandboxProxySettingsMode,
@@ -2093,6 +2095,8 @@ impl Session {
                 ThreadTraceContext::disabled()
             });
             let services = SessionServices {
+                runtime_config_change_listener,
+                runtime_config_change_gate,
                 // Start with an empty connection set. The initialized set is
                 // published after SessionConfigured so MCP events follow it.
                 mcp_runtime,

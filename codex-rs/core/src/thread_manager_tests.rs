@@ -4307,3 +4307,324 @@ async fn interrupted_fork_snapshot_uses_persisted_mid_turn_history_without_live_
         1,
     );
 }
+
+#[tokio::test]
+async fn shutdown_edge_binding_does_not_wait_on_a_held_thread_map_lock() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config
+        .features
+        .disable(crate::features::Feature::Plugins)
+        .expect("disable unrelated plugin warmup");
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let first = manager
+        .start_thread(StartThreadOptions::new(config.clone(), None))
+        .await
+        .expect("start thread");
+
+    // A contended registry: the lookup map's write lock is held (by another
+    // thread) until after the deadline.
+    let map = Arc::clone(&manager.state.threads);
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let _held = map.blocking_write();
+        locked_tx.send(()).expect("locked");
+        let _ = release_rx.recv();
+    });
+    locked_rx.recv().expect("the lookup map is write-locked");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let binding = manager.bind_shutdown_deadlines_now(deadline);
+    assert_eq!(
+        binding,
+        ShutdownDeadlineBinding {
+            bound: 1,
+            legacy_cleanup_started: 0,
+            unavailable: 0,
+            lookup_contended: true,
+        }
+    );
+    // Already bound to `deadline` before the lock is released: a later,
+    // looser binding keeps the earlier deadline.
+    assert_eq!(
+        first
+            .thread
+            .bind_shutdown_deadline(deadline + Duration::from_secs(60))
+            .expect("bound"),
+        deadline
+    );
+
+    // Released only after the deadline: nothing is pending, so nothing binds
+    // (or polls) late.
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(2)).await;
+    release_tx.send(()).expect("release");
+    holder.join().expect("lock holder");
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        first
+            .thread
+            .bind_shutdown_deadline(deadline + Duration::from_secs(120))
+            .expect("still bound"),
+        deadline,
+        "no late binding changed the deadline"
+    );
+    tokio::time::resume();
+
+    // Published after the edge: bound at publication (never Legacy).
+    let later = manager
+        .start_thread(StartThreadOptions::new(config.clone(), None))
+        .await
+        .expect("start thread after the edge");
+    assert_eq!(
+        later
+            .thread
+            .bind_shutdown_deadline(deadline + Duration::from_secs(60))
+            .expect("bound at publication"),
+        deadline
+    );
+}
+
+#[tokio::test]
+async fn shutdown_edge_binding_consumes_clean_terminal_legacy_proof() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config
+        .features
+        .disable(crate::features::Feature::Plugins)
+        .expect("disable unrelated plugin warmup");
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let started = manager
+        .start_thread(StartThreadOptions::new(config.clone(), None))
+        .await
+        .expect("start thread");
+    // Legacy cleanup: Shutdown submitted with no deadline bound.
+    started
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("legacy shutdown");
+    // Preconditions: the cleanup really ran in Legacy mode, it is terminal
+    // under the strict rule, and the runtime is still in the lookup map.
+    assert!(matches!(
+        started
+            .thread
+            .bind_shutdown_deadline(tokio::time::Instant::now() + Duration::from_secs(10)),
+        Err(ThreadRetirementError::LegacyCleanupStarted)
+    ));
+    assert_eq!(
+        started.thread.observed_terminal_cleanup(),
+        Some(crate::session::SessionLoopOutcome::Normal)
+    );
+    assert!(manager.get_thread(started.thread_id).await.is_ok());
+
+    let binding =
+        manager.bind_shutdown_deadlines_now(tokio::time::Instant::now() + Duration::from_secs(10));
+
+    assert_eq!(binding, ShutdownDeadlineBinding::default());
+    assert!(binding.is_complete());
+}
+
+#[tokio::test]
+async fn shutdown_edge_binding_counts_unclean_or_abnormal_terminal_legacy() {
+    use crate::session::SessionLoopOutcome;
+    use crate::session::retirement::CleanupExecution;
+    use crate::session::retirement::recovery_tests::inject_completed_legacy_receipt;
+    use crate::session::retirement::tests::ThreadLoopFixture;
+    use crate::session::retirement::tests::exact_thread_fixture;
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config
+        .features
+        .disable(crate::features::Feature::Plugins)
+        .expect("disable unrelated plugin warmup");
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let clean = CleanupExecution::Finished {
+        persistence_failed: false,
+    };
+    // (loop, retained Legacy receipt, unproven sandbox cleanup, loop outcome,
+    // accepted as terminal)
+    let mut cases = vec![
+        // Positive control: the strict proof is consumed.
+        (
+            ThreadLoopFixture::Gone,
+            clean,
+            false,
+            SessionLoopOutcome::Normal,
+            true,
+        ),
+        (
+            ThreadLoopFixture::Gone,
+            CleanupExecution::Finished {
+                persistence_failed: true,
+            },
+            false,
+            SessionLoopOutcome::Normal,
+            false,
+        ),
+        // A clean receipt with a live unproven sandbox census.
+        (
+            ThreadLoopFixture::Gone,
+            clean,
+            true,
+            SessionLoopOutcome::Normal,
+            false,
+        ),
+        // Terminal but abnormal loops: `observed_terminal_cleanup` is `Some`.
+        (
+            ThreadLoopFixture::Cancelled,
+            clean,
+            false,
+            SessionLoopOutcome::Cancelled,
+            false,
+        ),
+        (
+            ThreadLoopFixture::Panicked,
+            clean,
+            false,
+            SessionLoopOutcome::Panicked,
+            false,
+        ),
+    ];
+    for failure in [
+        CleanupExecution::SandboxCleanupUnproven { timed_out: false },
+        CleanupExecution::Panicked,
+        CleanupExecution::TimedOut,
+        CleanupExecution::McpFailed,
+        CleanupExecution::TaskJoinFailed,
+        CleanupExecution::ConversationShutdownFailed,
+    ] {
+        cases.push((
+            ThreadLoopFixture::Gone,
+            failure,
+            false,
+            SessionLoopOutcome::Normal,
+            false,
+        ));
+    }
+    for (case, (mode, receipt, unproven_sandbox, outcome, accepted)) in
+        cases.into_iter().enumerate()
+    {
+        let thread = Arc::new(exact_thread_fixture(mode).await);
+        inject_completed_legacy_receipt(&thread.session.cleanup_owner(), receipt);
+        if unproven_sandbox {
+            thread
+                .session
+                .services
+                .sandbox_cleanup_census()
+                .record(/*may_have_launched*/ true, None);
+        }
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                thread.io.session_loop_termination.clone()
+            )
+            .await
+            .expect("fixture loop joins"),
+            outcome,
+            "case {case}"
+        );
+        assert_eq!(
+            thread.observed_terminal_cleanup() == Some(SessionLoopOutcome::Normal),
+            accepted,
+            "case {case}: fixture matches the strict rule"
+        );
+        let thread_id = thread.session.thread_id();
+        manager
+            .state
+            .threads
+            .write()
+            .await
+            .insert(thread_id, Arc::clone(&thread));
+
+        let binding = manager
+            .bind_shutdown_deadlines_now(tokio::time::Instant::now() + Duration::from_secs(10));
+
+        let expected = if accepted {
+            ShutdownDeadlineBinding::default()
+        } else {
+            ShutdownDeadlineBinding {
+                legacy_cleanup_started: 1,
+                ..ShutdownDeadlineBinding::default()
+            }
+        };
+        assert_eq!(binding, expected, "case {case}: {receipt:?} {outcome:?}");
+        assert_eq!(binding.is_complete(), accepted, "case {case}");
+        manager.state.threads.write().await.remove(&thread_id);
+    }
+}
+
+#[tokio::test]
+async fn shutdown_all_threads_bounded_binds_runtimes_and_keeps_manager_admitting() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config
+        .features
+        .disable(crate::features::Feature::Plugins)
+        .expect("disable unrelated plugin warmup");
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let old = manager
+        .start_thread(StartThreadOptions::new(config.clone(), None))
+        .await
+        .expect("start thread");
+
+    // Reset-style reusable bounded shutdown.
+    let report = manager
+        .shutdown_all_threads_bounded(Duration::from_secs(10))
+        .await;
+    assert_eq!(report.completed, vec![old.thread_id]);
+    assert!(report.timed_out.is_empty());
+
+    // The deadline was bound before submission: cleanup was not legacy, so a
+    // later exact-thread binding is accepted instead of LegacyCleanupStarted.
+    assert!(
+        old.thread
+            .bind_shutdown_deadline(tokio::time::Instant::now() + Duration::from_secs(10))
+            .is_ok()
+    );
+
+    // Reusable: construction admission stays open after the bounded shutdown.
+    let next = manager
+        .start_thread(StartThreadOptions::new(config.clone(), None))
+        .await
+        .expect("manager still admits after a reset-style bounded shutdown");
+    assert_eq!(manager.list_thread_ids().await, vec![next.thread_id]);
+    let report = manager
+        .shutdown_all_threads_bounded(Duration::from_secs(10))
+        .await;
+    assert_eq!(report.completed, vec![next.thread_id]);
+}

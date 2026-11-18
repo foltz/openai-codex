@@ -1520,3 +1520,281 @@ fn a_live_sandbox_launch_withholds_clean_retirement_before_its_guard_drops() {
     operation.finish(codex_file_system::SandboxLaunch::NotLaunched, None);
     assert_eq!(clean.with_sandbox_cleanup_census(census.totals()), clean);
 }
+
+#[tokio::test]
+async fn shutdown_edge_binding_counts_in_flight_legacy_cleanup() {
+    use crate::config::ConfigBuilder;
+    use crate::thread_manager::StartThreadOptions;
+    use crate::thread_manager::ThreadManager;
+    let home = tempfile::tempdir().unwrap();
+    let mut config = ConfigBuilder::default()
+        .codex_home(home.path().to_path_buf())
+        .fallback_cwd(Some(home.path().to_path_buf()))
+        .build()
+        .await
+        .unwrap();
+    config.ephemeral = true;
+    config
+        .features
+        .disable(crate::features::Feature::Plugins)
+        .expect("disable unrelated plugin warmup");
+    let manager = Arc::new(ThreadManager::with_models_provider_and_home_for_tests(
+        codex_login::CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    ));
+    let stop = tokio_util::sync::CancellationToken::new();
+    let tasks = tokio_util::task::TaskTracker::new();
+    let mut options = StartThreadOptions::new(config, /*control_endpoint*/ None);
+    options
+        .thread_extension_init
+        .insert(codex_extension_api::SessionIsolation::Isolated);
+    let started = manager
+        .start_thread_until(options, stop.clone().cancelled_owned(), &tasks)
+        .await
+        .unwrap();
+    // Block Legacy cleanup mid-flight at the refresh gate.
+    let refresh = started.thread.session.mcp_refresh.acquire().await.unwrap();
+    stop.cancel();
+    tasks.close();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !started
+            .thread
+            .session
+            .task_admission_closed
+            .load(Ordering::Acquire)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Legacy cleanup is in flight and blocked");
+    assert_eq!(started.thread.observed_terminal_cleanup(), None);
+
+    let binding = manager.bind_shutdown_deadlines_now(Instant::now() + Duration::from_secs(20));
+
+    assert_eq!(
+        binding,
+        crate::ShutdownDeadlineBinding {
+            legacy_cleanup_started: 1,
+            ..crate::ShutdownDeadlineBinding::default()
+        }
+    );
+    assert!(!binding.is_complete());
+    drop(refresh);
+    tokio::time::timeout(Duration::from_secs(20), tasks.wait())
+        .await
+        .expect("the Legacy cleanup finishes before the edge deadline");
+}
+
+#[tokio::test]
+async fn permanent_manager_shutdown_clamps_in_flight_legacy_cleanup() {
+    use crate::config::ConfigBuilder;
+    use crate::thread_manager::StartThreadOptions;
+    use crate::thread_manager::ThreadManager;
+    let home = tempfile::tempdir().unwrap();
+    let mut config = ConfigBuilder::default()
+        .codex_home(home.path().to_path_buf())
+        .fallback_cwd(Some(home.path().to_path_buf()))
+        .build()
+        .await
+        .unwrap();
+    config.ephemeral = true;
+    config
+        .features
+        .disable(crate::features::Feature::Plugins)
+        .expect("disable unrelated plugin warmup");
+    let manager = Arc::new(ThreadManager::with_models_provider_and_home_for_tests(
+        codex_login::CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    ));
+    let stop = tokio_util::sync::CancellationToken::new();
+    let tasks = tokio_util::task::TaskTracker::new();
+    let mut options = StartThreadOptions::new(config, /*control_endpoint*/ None);
+    options
+        .thread_extension_init
+        .insert(codex_extension_api::SessionIsolation::Isolated);
+    let started = manager
+        .start_thread_until(options, stop.clone().cancelled_owned(), &tasks)
+        .await
+        .unwrap();
+    // Block Legacy cleanup mid-flight at the refresh gate.
+    let refresh = started.thread.session.mcp_refresh.acquire().await.unwrap();
+    stop.cancel();
+    tasks.close();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !started
+            .thread
+            .session
+            .task_admission_closed
+            .load(Ordering::Acquire)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Legacy cleanup is in flight and blocked");
+
+    // Permanent whole-manager shutdown, its owner deadline already reached.
+    let retirement = manager
+        .begin_shutdown(Instant::now())
+        .expect("permanent manager shutdown");
+    // The Legacy driver stops at that deadline although the blocked step
+    // never ran: clamped, not driven past the host's owner deadline.
+    tokio::time::timeout(Duration::from_secs(5), tasks.wait())
+        .await
+        .expect("the Legacy driver stops at the manager's deadline");
+    let owner = started.thread.session.cleanup_owner();
+    assert_eq!(owner.completed(), Some(CleanupExecution::TimedOut));
+    assert!(
+        owner.legacy_retained.lock().unwrap().is_some(),
+        "partial work retained, not aborted"
+    );
+    drop(refresh);
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        owner.completed(),
+        Some(CleanupExecution::TimedOut),
+        "sticky: no poll after the deadline"
+    );
+    drop(retirement);
+}
+
+#[tokio::test]
+async fn managed_legacy_cleanup_in_progress_is_retained_as_incomplete() {
+    use crate::config::ConfigBuilder;
+    use crate::thread_manager::StartThreadOptions;
+    use crate::thread_manager::ThreadManager;
+    let home = tempfile::tempdir().unwrap();
+    let mut config = ConfigBuilder::default()
+        .codex_home(home.path().to_path_buf())
+        .fallback_cwd(Some(home.path().to_path_buf()))
+        .build()
+        .await
+        .unwrap();
+    config.ephemeral = true;
+    config
+        .features
+        .disable(crate::features::Feature::Plugins)
+        .expect("disable unrelated plugin warmup");
+    let manager = Arc::new(ThreadManager::with_models_provider_and_home_for_tests(
+        codex_login::CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    ));
+    let stop = tokio_util::sync::CancellationToken::new();
+    let tasks = tokio_util::task::TaskTracker::new();
+    let mut options = StartThreadOptions::new(config.clone(), /*control_endpoint*/ None);
+    options
+        .thread_extension_init
+        .insert(codex_extension_api::SessionIsolation::Isolated);
+    let started = manager
+        .start_thread_until(options, stop.clone().cancelled_owned(), &tasks)
+        .await
+        .unwrap();
+    let weak = Arc::downgrade(&started.thread);
+    let refresh = started.thread.session.mcp_refresh.acquire().await.unwrap();
+    stop.cancel();
+    tasks.close();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !started
+            .thread
+            .session
+            .task_admission_closed
+            .load(Ordering::Acquire)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("legacy common cleanup entered; refresh gate prevents completion");
+    assert!(started.thread.observed_terminal_cleanup().is_none());
+    assert!(matches!(
+        started
+            .thread
+            .begin_retirement(Instant::now() + Duration::from_secs(5)),
+        Err(crate::ThreadRetirementError::LegacyCleanupStarted)
+    ));
+    let report = manager
+        .begin_shutdown(Instant::now() + Duration::from_secs(5))
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert!(!report.is_complete());
+    assert!(weak.upgrade().is_some());
+    drop(refresh);
+    tokio::time::timeout(Duration::from_secs(5), tasks.wait())
+        .await
+        .expect("cleanup joins");
+    assert_eq!(
+        started.thread.observed_terminal_cleanup(),
+        Some(super::super::SessionLoopOutcome::Normal)
+    );
+    drop(started);
+    // Registration compacts completed population before refusing the closed
+    // manager. The retained shutdown report itself remains incomplete.
+    assert!(
+        manager
+            .start_thread(StartThreadOptions::new(
+                config, /*control_endpoint*/ None
+            ))
+            .await
+            .is_err()
+    );
+    assert!(weak.upgrade().is_none());
+}
+
+#[tokio::test]
+async fn legacy_join_failure_withholds_shutdown_complete() {
+    let (session, _, events) = super::super::tests::make_session_and_context_with_rx().await;
+    let owner = session.cleanup_owner();
+    assert_eq!(
+        session.task_joins.shutdown_until(Instant::now()).await,
+        crate::tasks::TaskJoinOutcome::Complete { panicked: false }
+    );
+    // Deliberately violate ordering: a birth after registry closure must be
+    // retained as an authority failure, never projected as clean shutdown.
+    session.spawn_startup_auxiliary(async {}).await;
+    assert!(super::super::handlers::shutdown(&session, "shutdown".to_string()).await);
+    assert_eq!(
+        owner.observe(session).await,
+        CleanupExecution::TaskJoinFailed
+    );
+    while let Ok(event) = events.try_recv() {
+        assert!(!matches!(
+            event.msg,
+            codex_protocol::protocol::EventMsg::ShutdownComplete
+        ));
+    }
+}
+
+#[tokio::test]
+async fn failed_common_api_receipt_never_projects_shutdown_complete() {
+    for failure in [
+        CleanupExecution::ConversationShutdownFailed,
+        CleanupExecution::CodeModeShutdownFailed,
+        CleanupExecution::McpPrewarmFailed,
+    ] {
+        let (session, _, events) = super::super::tests::make_session_and_context_with_rx().await;
+        let owner = session.cleanup_owner();
+        // Exercise the ordinary consumer of a retained failed receipt. This
+        // is not a claim of backend-specific failure-injection coverage.
+        owner.state.lock().expect("owner").completion =
+            Some(futures::future::ready(failure).boxed().shared());
+        assert!(super::super::handlers::shutdown(&session, "shutdown".to_string()).await);
+        assert_eq!(owner.observe(Arc::clone(&session)).await, failure);
+        while let Ok(event) = events.try_recv() {
+            assert!(!matches!(
+                event.msg,
+                codex_protocol::protocol::EventMsg::ShutdownComplete
+            ));
+        }
+    }
+}

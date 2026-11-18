@@ -753,3 +753,206 @@ async fn turn_start_jsonrpc_span_parents_core_turn_spans() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn processor_login_shutdown_facade_binds_first_deadline() -> Result<()> {
+    let home = TempDir::new()?;
+    let config = Arc::new(build_test_config(home.path(), "http://127.0.0.1:1").await?);
+    let (processor, _outgoing) = build_test_processor_for_retirement(config).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    drop(processor.begin_login_shutdown(deadline)?);
+    let ticket = processor.begin_login_shutdown(deadline + std::time::Duration::from_secs(60))?;
+    assert_eq!(ticket.deadline(), deadline);
+    let report = ticket.wait().await;
+    assert!(report.tasks.is_clean());
+    assert_eq!(report.browsers, Ok(Vec::new()));
+    assert!(!report.admission_unavailable);
+    // Independently clean the fixture's other worker populations. The login
+    // report is not a claim about them or a substitute for host retirement.
+    processor.drain_background_tasks_until(deadline).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn processor_thread_shutdown_facade_retains_first_attempt() -> Result<()> {
+    let home = TempDir::new()?;
+    let config = Arc::new(build_test_config(home.path(), "http://127.0.0.1:1").await?);
+    let (processor, _outgoing) = build_test_processor_for_retirement(config).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    drop(processor.begin_thread_shutdown(deadline).unwrap());
+    let ticket = processor
+        .begin_thread_shutdown(deadline + std::time::Duration::from_secs(20))
+        .unwrap();
+    assert_eq!(ticket.deadline(), deadline);
+    let report = ticket.wait().await;
+    assert!(report.is_complete(), "{report:?}");
+    assert_eq!(ticket.wait().await, report);
+    // This proves only the thread limb. Independently stop fixture workers;
+    // the thread receipt must not be mistaken for all-processor cleanup.
+    processor.drain_background_tasks_until(deadline).await;
+    Ok(())
+}
+
+#[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "the fixture exclusively observes worker shutdown under its owner lock before testing background custody"
+)]
+async fn background_drain_timeout_retains_work_and_reobserves_completion() -> Result<()> {
+    use crate::command_exec::CommandExecSandboxShutdown;
+    use crate::models_refresh_worker::ModelsRefreshShutdown;
+    use tokio::time::Instant;
+
+    let home = TempDir::new()?;
+    let config = Arc::new(build_test_config(home.path(), "http://127.0.0.1:1").await?);
+    let (processor, _outgoing) = build_test_processor_for_retirement(config).await;
+    assert_eq!(
+        processor
+            .models_refresh_worker
+            .lock()
+            .await
+            .shutdown_until(Instant::now() + std::time::Duration::from_secs(5))
+            .await,
+        ModelsRefreshShutdown::Joined
+    );
+    let resource = Arc::new(());
+    let weak_resource = Arc::downgrade(&resource);
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let task = processor
+        .thread_processor
+        .background_tasks_for_test()
+        .spawn(async move {
+            let _resource = resource;
+            entered_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+        })
+        .unwrap();
+    entered_rx.await?;
+    let mut observer = Box::pin(
+        processor
+            .drain_background_tasks_until(Instant::now() + std::time::Duration::from_millis(10)),
+    );
+    assert!(futures::poll!(observer.as_mut()).is_pending());
+    drop(observer);
+    let pending = processor
+        .drain_background_tasks_until(Instant::now() + std::time::Duration::from_millis(10))
+        .await;
+    assert!(!pending.is_clean());
+    assert!(!pending.thread_starts.terminal);
+    assert!(weak_resource.upgrade().is_some());
+    assert_eq!(
+        processor.thread_processor.background_tasks_for_test().len(),
+        1
+    );
+    release_tx.send(()).unwrap();
+    // A later observer may normalize a completed join, but cannot extend the
+    // expired attempt to wait for work. Settle the actual task first.
+    let _ = task.await;
+    let deadline = Instant::now() + std::time::Duration::from_secs(1);
+    let (first, second) = tokio::join!(
+        processor.drain_background_tasks_until(deadline),
+        processor.drain_background_tasks_until(deadline),
+    );
+    assert_eq!(first, second);
+    assert!(first.is_clean(), "{first:?}");
+    let expected = first;
+    // An uncollected or unproven command/exec sandbox cleanup alone makes
+    // the otherwise clean background shutdown evidence non-clean.
+    for command_exec in [
+        CommandExecSandboxShutdown {
+            in_flight: 1,
+            unproven: 0,
+        },
+        CommandExecSandboxShutdown {
+            in_flight: 0,
+            unproven: 1,
+        },
+    ] {
+        assert!(
+            !super::ProcessorBackgroundShutdown {
+                command_exec,
+                ..expected.clone()
+            }
+            .is_clean()
+        );
+    }
+    assert!(weak_resource.upgrade().is_none());
+    processor.clear_runtime_references();
+    processor.shutdown_threads().await;
+    Ok(())
+}
+
+async fn build_test_processor_for_retirement_with_auth(
+    config: Arc<Config>,
+    auth_manager: Arc<AuthManager>,
+) -> (
+    Arc<MessageProcessor>,
+    mpsc::Receiver<crate::outgoing_message::OutgoingEnvelope>,
+) {
+    let (outgoing_tx, outgoing_rx) = mpsc::channel(16);
+    let config_manager = ConfigManager::new(
+        config.codex_home.to_path_buf(),
+        Vec::new(),
+        LoaderOverrides::with_managed_config_path_for_tests(
+            config.codex_home.join("managed_config.toml").to_path_buf(),
+        ),
+        /*strict_config*/ false,
+        CloudConfigBundleLoader::default(),
+        Arg0DispatchPaths::default(),
+        Arc::new(codex_config::NoopThreadConfigLoader),
+    );
+    let analytics_events_client = analytics_events_client_from_config(
+        Arc::clone(&auth_manager),
+        config.as_ref(),
+        /*runtime_auth_slot*/ None,
+    );
+    let outgoing = Arc::new(OutgoingMessageSender::new(
+        outgoing_tx,
+        analytics_events_client.clone(),
+    ));
+    let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
+        managed_transition_control_socket_endpoint: None,
+        managed_transition_process_instance_id: None,
+        telemetry_reset: Default::default(),
+        control_endpoint: None,
+        cloud_skill_provider: None,
+        outgoing,
+        analytics_events_client,
+        arg0_paths: Arg0DispatchPaths::default(),
+        startup_cwd: Some(config.cwd.to_path_buf()),
+        config,
+        config_manager,
+        environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
+        feedback: CodexFeedback::new(),
+        log_db: None,
+        state_db: None,
+        config_warnings: Vec::new(),
+        startup_warnings_tx: mpsc::unbounded_channel().0,
+        session_source: SessionSource::VSCode,
+        user_verification: Arc::new(crate::user_verification::Service::new(Arc::clone(
+            &auth_manager,
+        ))),
+        auth_manager,
+        runtime_auth_slot: None,
+        installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
+        code_mode_session_provider: None,
+        rpc_transport: AppServerRpcTransport::Stdio,
+        remote_control_handle: None,
+        // This fixture observes retirement, not network plugin warmup.
+        plugin_startup_tasks: None,
+    }));
+    (processor, outgoing_rx)
+}
+
+async fn build_test_processor_for_retirement(
+    config: Arc<Config>,
+) -> (
+    Arc<MessageProcessor>,
+    mpsc::Receiver<crate::outgoing_message::OutgoingEnvelope>,
+) {
+    let auth = AuthManager::shared_from_config(config.as_ref(), false)
+        .await
+        .expect("create test auth manager");
+    build_test_processor_for_retirement_with_auth(config, auth).await
+}

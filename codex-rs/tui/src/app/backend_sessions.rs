@@ -316,8 +316,8 @@ impl BackendSessions {
             sessions.push(entry.session);
             custody.push(entry.worker_custody);
         }
-        let exit = boxed_future!(crate::app_server_session::final_exit_sessions(
-            sessions, budget
+        let exit = Box::pin(crate::app_server_session::final_exit_sessions(
+            sessions, budget,
         ))
         .await;
         drop(custody);

@@ -447,9 +447,10 @@ async fn startup_error_after_dynamic_server_retires_the_hosted_endpoint_scenario
         _keep_alive,
     } = boxed_future!(hosted_session(RealtimeRequestBehavior::Forward)).await?;
     let start = Instant::now();
+    let mut other_backends = Vec::new();
     let error = boxed_future!(crate::app::startup::shutdown_on_startup_error(
         app_server,
-        &mut Vec::new(),
+        &mut other_backends,
         color_eyre::eyre::eyre!("injected startup error"),
     ))
     .await

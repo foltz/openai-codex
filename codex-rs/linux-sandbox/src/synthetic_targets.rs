@@ -96,6 +96,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
+#[cfg(test)]
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::AtomicPtr;
@@ -211,6 +212,7 @@ pub(crate) fn open_shared_registry() -> io::Result<Registry> {
 }
 
 /// Cached registry path for callers that only need its location.
+#[cfg(test)]
 pub(crate) fn shared_registry_root() -> PathBuf {
     static ROOT: OnceLock<PathBuf> = OnceLock::new();
     ROOT.get_or_init(|| {

@@ -2528,6 +2528,7 @@ fn attach_bwrap_info_fd(args: &mut Vec<String>, preserved_files: &mut Vec<File>)
 }
 
 /// Trusted per-uid registry, shared independently of TMPDIR.
+#[cfg(test)]
 pub(crate) fn synthetic_mount_registry_root() -> PathBuf {
     crate::synthetic_targets::shared_registry_root()
 }

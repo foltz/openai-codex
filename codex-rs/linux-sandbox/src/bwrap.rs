@@ -26,7 +26,10 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+#[cfg(test)]
 use crate::linux_run_main::synthetic_mount_registry_root;
+use crate::synthetic_targets::open_shared_registry;
+use crate::synthetic_targets::shared_registry_path;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
 use codex_protocol::permissions::FileSystemPolicyProjection;
@@ -700,7 +703,13 @@ fn create_filesystem_args_with_post_proc_masks(
         // Protect the registry only where a writable bind exposes it. Apply
         // this before deny masks so a denied parent stays hidden, rather than
         // trying to recreate the registry beneath an already read-only tmpfs.
-        let registry_root = synthetic_mount_registry_root();
+        // Only the location is needed here; argv construction creates the
+        // registry solely when a writable bind exposes it.
+        let registry_root = shared_registry_path().map_err(|err| {
+            CodexErr::Fatal(format!(
+                "no trusted sandbox registry location to protect: {err}"
+            ))
+        })?;
         let registry_mount = if registry_root.starts_with(mount_root) {
             Some(registry_root.as_path())
         } else if mount_root.starts_with(&registry_root) {
@@ -709,7 +718,13 @@ fn create_filesystem_args_with_post_proc_masks(
             None
         };
         if let Some(registry_mount) = registry_mount {
-            fs::create_dir_all(&registry_root)?;
+            // Creates and verifies ownership and mode; refuses an untrusted one.
+            open_shared_registry().map_err(|err| {
+                CodexErr::Fatal(format!(
+                    "cannot open the trusted sandbox registry {}: {err}",
+                    registry_root.display()
+                ))
+            })?;
             bwrap_args.args.push("--ro-bind".to_string());
             bwrap_args.args.push(path_to_string(registry_mount));
             bwrap_args.args.push(path_to_string(registry_mount));

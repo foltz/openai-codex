@@ -311,7 +311,7 @@ async fn sidebar_event_owns_retention_until_install_or_abandonment() -> Result<(
 
 async fn sidebar_event_retention_scenario() -> Result<()> {
     use crate::app_server_session::SideChatStorage;
-    for outcome in ["installed", "stale", "discarded"] {
+    for outcome in ["installed", "boundary-failed", "stale", "discarded"] {
         let (mut app, _, _) = make_test_app_with_channels().await;
         app.config
             .features
@@ -342,7 +342,7 @@ async fn sidebar_event_retention_scenario() -> Result<()> {
         app.enqueue_primary_thread_session(started.session, started.turns)
             .await?;
         app.active_thread_id = Some(parent);
-        let fork = boxed_future!(server.sidebar_fork(
+        let mut fork = boxed_future!(server.sidebar_fork(
             app.local_settings.clone(),
             app.side_fork_config(),
             parent,
@@ -358,6 +358,11 @@ async fn sidebar_event_retention_scenario() -> Result<()> {
         else {
             panic!("queued sidebar event must own a grant");
         };
+        if outcome == "boundary-failed" {
+            // Exercise the real event/install refusal path while keeping the
+            // minting connection alive; this is not a transport-close test.
+            fork.boundary = Err("injected boundary failure".to_string());
+        }
         let request = uuid::Uuid::new_v4();
         let event = AppEvent::SideCreated {
             backend_id: server.backend_id(),
@@ -384,7 +389,7 @@ async fn sidebar_event_retention_scenario() -> Result<()> {
             .await??;
             server.thread_unsubscribe(child).await?;
         } else {
-            if outcome == "installed" {
+            if matches!(outcome, "installed" | "boundary-failed") {
                 let pane = app.sidebars.entry(Some(parent)).or_default();
                 pane.creation = Some(super::super::sidebar::SideCreation {
                     owner: server.backend_id(),
@@ -405,6 +410,15 @@ async fn sidebar_event_retention_scenario() -> Result<()> {
                 app.side_threads.contains_key(&child),
                 outcome == "installed"
             );
+            if outcome == "boundary-failed" {
+                assert!(matches!(
+                    app.sidebars[&Some(parent)]
+                        .creation
+                        .as_ref()
+                        .map(|creation| &creation.state),
+                    Some(super::super::sidebar::CreationState::Failed { .. })
+                ));
+            }
             if outcome == "installed" {
                 // Revalidation waits for any earlier abandonment release. An
                 // accidental drop would mint a DIFFERENT opaque grant here.

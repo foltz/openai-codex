@@ -35,6 +35,7 @@ pub use hosted_endpoint_custody::HOSTED_ENDPOINT_PROVISIONAL_PER_CONNECTION;
 pub use hosted_endpoint_custody::HostedEndpointConnectionReceipt;
 pub use hosted_endpoint_custody::HostedEndpointCustody;
 pub use hosted_endpoint_custody::HostedEndpointCustodyCensus;
+pub use hosted_endpoint_custody::HostedEndpointDeclaration;
 pub use hosted_endpoint_custody::HostedEndpointRefusal;
 pub use hosted_endpoint_custody::HostedEndpointRetirementCensus;
 pub use resource_client::CodexAppsResourceListParams;

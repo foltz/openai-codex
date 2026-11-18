@@ -2302,7 +2302,9 @@ async fn retired_hosted_key_refuses_pool_acquisition_before_reserving_or_startin
     );
     let capability = codex_rmcp_client::CapabilityDigest::of("pool-capability");
     custody.track_override(endpoint, 1).expect("track");
-    custody.declare(endpoint, capability, 1).expect("declare");
+    custody
+        .declare_for_test(endpoint, capability, 1)
+        .expect("declare");
     assert!(
         custody
             .retire(endpoint, capability, 1, tokio::time::Instant::now())

@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::PoisonError;
+use std::sync::Weak;
 
 use codex_rmcp_client::CapabilityDigest;
 use codex_rmcp_client::EndpointKey;
@@ -106,6 +107,7 @@ impl Owner {
 }
 
 struct Endpoint {
+    ever_declared: bool,
     /// `None` while provisional.
     capability: Option<CapabilityDigest>,
     /// Connections whose own thread requests named this endpoint.
@@ -123,6 +125,7 @@ impl Endpoint {
 }
 
 struct CustodyState {
+    generation: Option<u64>,
     capacity: usize,
     endpoints: HashMap<EndpointKey, Endpoint>,
     untracked_sightings: HashSet<EndpointKey>,
@@ -148,6 +151,16 @@ impl CustodyState {
     }
 }
 
+/// Attribution captured before a proof challenge. It grants no declaration
+/// authority on its own and is bound to one original custody generation.
+#[derive(Clone)]
+pub struct HostedEndpointDeclaration {
+    owner: Weak<Mutex<CustodyState>>,
+    generation: u64,
+    key: EndpointKey,
+    connection: u64,
+}
+
 #[derive(Clone)]
 pub struct HostedEndpointCustody {
     state: Arc<Mutex<CustodyState>>,
@@ -164,6 +177,7 @@ impl HostedEndpointCustody {
         Self {
             state: Arc::new(Mutex::new(CustodyState {
                 capacity,
+                generation: Some(0),
                 endpoints: HashMap::new(),
                 untracked_sightings: HashSet::new(),
                 sightings_overflowed: false,
@@ -242,6 +256,7 @@ impl HostedEndpointCustody {
         state.endpoints.insert(
             key,
             Endpoint {
+                ever_declared: false,
                 capability: None,
                 users: HashSet::from([connection]),
                 declarers: HashSet::new(),
@@ -311,20 +326,54 @@ impl HostedEndpointCustody {
         Ok(())
     }
 
-    /// Records `connection` as a declarer. The caller must already have
-    /// verified, by challenge, that the endpoint holds `capability`. Only a
-    /// connection that used the endpoint in its own thread requests may declare.
-    pub fn declare(
+    /// Capture attribution before starting a challenge. Reset revokes all
+    /// outstanding tickets, even if the same connection later reattributes.
+    pub fn begin_declare(
         &self,
         key: EndpointKey,
-        capability: CapabilityDigest,
         connection: u64,
+    ) -> Result<HostedEndpointDeclaration, HostedEndpointRefusal> {
+        let state = self.lock();
+        let generation = state.generation.ok_or(HostedEndpointRefusal::NotOwner)?;
+        let endpoint = state
+            .endpoints
+            .get(&key)
+            .ok_or(HostedEndpointRefusal::NotOwner)?;
+        if endpoint.retired {
+            return Err(HostedEndpointRefusal::Retired);
+        }
+        if !endpoint.users.contains(&connection) {
+            return Err(HostedEndpointRefusal::NotOwner);
+        }
+        Ok(HostedEndpointDeclaration {
+            owner: Arc::downgrade(&self.state),
+            generation,
+            key,
+            connection,
+        })
+    }
+
+    /// Commit only after the endpoint proved possession of the capability.
+    /// Ticket validation and publication share the reset/tombstone mutex.
+    pub fn declare(
+        &self,
+        ticket: HostedEndpointDeclaration,
+        capability: CapabilityDigest,
     ) -> Result<HostedEndpointCustodyCensus, HostedEndpointRefusal> {
+        if !ticket.owner.ptr_eq(&Arc::downgrade(&self.state)) {
+            return Err(HostedEndpointRefusal::NotOwner);
+        }
         let mut state = self.lock();
+        if state.generation != Some(ticket.generation) {
+            return Err(HostedEndpointRefusal::NotOwner);
+        }
+        let HostedEndpointDeclaration {
+            key, connection, ..
+        } = ticket;
         let committed = state
             .endpoints
             .values()
-            .filter(|endpoint| endpoint.capability.is_some())
+            .filter(|endpoint| endpoint.retired || endpoint.capability.is_some())
             .count();
         let capacity = state.capacity;
         let Some(endpoint) = state.endpoints.get_mut(&key) else {
@@ -346,14 +395,45 @@ impl HostedEndpointCustody {
             }
             None => endpoint.capability = Some(capability),
         }
+        endpoint.ever_declared = true;
         endpoint.declarers.insert(connection);
         Ok(state.census())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn declare_for_test(
+        &self,
+        key: EndpointKey,
+        capability: CapabilityDigest,
+        connection: u64,
+    ) -> Result<HostedEndpointCustodyCensus, HostedEndpointRefusal> {
+        let ticket = self.begin_declare(key, connection)?;
+        self.declare(ticket, capability)
+    }
+
+    /// Called only after account work and thread construction have drained,
+    /// before account-work admission reopens. Keep tombstones and unknown
+    /// physical owners; no old user, declarer or capability carries forward.
+    pub fn reset_for_account_transition(&self) {
+        let mut state = self.lock();
+        state.generation = state.generation.and_then(|value| value.checked_add(1));
+        state.endpoints.retain(|_, endpoint| {
+            endpoint.users.clear();
+            endpoint.declarers.clear();
+            endpoint.capability = None;
+            endpoint.retired
+                || endpoint
+                    .owners
+                    .iter()
+                    .any(|owner| !owner.released_with_proof())
+        });
     }
 
     /// Drops `connection`'s use and declarations. Tombstones are kept forever.
     /// A declared endpoint is forgotten only when nobody uses or declared it and
     /// every owner left with terminal proof. A provisional endpoint is forgotten
-    /// once nobody uses it and no owner is still alive.
+    /// once nobody uses it and no owner is still alive. A formerly declared
+    /// endpoint retains unknown evidence across account reset as well.
     pub fn release_connection(&self, connection: u64) {
         let mut state = self.lock();
         state.endpoints.retain(|_, endpoint| {
@@ -362,7 +442,7 @@ impl HostedEndpointCustody {
             if endpoint.retired || !endpoint.users.is_empty() || !endpoint.declarers.is_empty() {
                 return true;
             }
-            if endpoint.capability.is_some() {
+            if endpoint.ever_declared {
                 !endpoint.owners.iter().all(Owner::released_with_proof)
             } else {
                 endpoint

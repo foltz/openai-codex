@@ -24,7 +24,7 @@ fn use_and_declare(custody: &HostedEndpointCustody, name: &str, connection: u64)
         .track_override(key(name), connection)
         .expect("track");
     custody
-        .declare(key(name), capability(&format!("cap-{name}")), connection)
+        .declare_for_test(key(name), capability(&format!("cap-{name}")), connection)
         .expect("declare");
 }
 
@@ -89,19 +89,19 @@ async fn only_a_connection_that_used_the_endpoint_may_declare_or_retire() {
     let custody = HostedEndpointCustody::default();
     // Never used by any connection: no blind declaration.
     assert_eq!(
-        custody.declare(key("c"), capability("cap-c"), 1),
+        custody.declare_for_test(key("c"), capability("cap-c"), 1),
         Err(HostedEndpointRefusal::NotOwner)
     );
     use_and_declare(&custody, "c", 1);
     // Another connection that never named the endpoint cannot declare it.
     assert_eq!(
-        custody.declare(key("c"), capability("cap-c"), 2),
+        custody.declare_for_test(key("c"), capability("cap-c"), 2),
         Err(HostedEndpointRefusal::NotOwner)
     );
     // One that did, but with a different capability, cannot either.
     custody.track_override(key("c"), 2).expect("track");
     assert_eq!(
-        custody.declare(key("c"), capability("forged"), 2),
+        custody.declare_for_test(key("c"), capability("forged"), 2),
         Err(HostedEndpointRefusal::NotOwner)
     );
     assert_eq!(
@@ -194,7 +194,7 @@ async fn capacities_are_fixed_and_tombstones_are_never_evicted() {
     use_and_declare(&custody, "f", 1);
     custody.track_override(key("g"), 2).expect("provisional");
     assert_eq!(
-        custody.declare(key("g"), capability("cap-g"), 2),
+        custody.declare_for_test(key("g"), capability("cap-g"), 2),
         Err(HostedEndpointRefusal::CapacityExhausted)
     );
     custody
@@ -203,7 +203,7 @@ async fn capacities_are_fixed_and_tombstones_are_never_evicted() {
         .expect("owner retires");
     custody.release_connection(1);
     assert_eq!(
-        custody.declare(key("g"), capability("cap-g"), 2),
+        custody.declare_for_test(key("g"), capability("cap-g"), 2),
         Err(HostedEndpointRefusal::CapacityExhausted)
     );
     assert!(custody.is_retired(&key("f")));
@@ -321,7 +321,7 @@ async fn same_url_other_authorization_is_incomplete_in_both_admission_orders() {
         }
         custody.track_override(tracked, 1).expect("track");
         custody
-            .declare(tracked, capability("tracked"), 1)
+            .declare_for_test(tracked, capability("tracked"), 1)
             .expect("declare");
         if !other_first {
             custody
@@ -339,4 +339,133 @@ async fn same_url_other_authorization_is_incomplete_in_both_admission_orders() {
         // No authority over the foreign key is minted by the conservative flag.
         assert!(!custody.is_retired(&other));
     }
+}
+
+#[test]
+fn reset_invalidates_pending_challenge_even_after_same_connection_reattributes() {
+    let custody = HostedEndpointCustody::default();
+    custody.track_override(key("reset"), 1).expect("track");
+    let old = custody
+        .begin_declare(key("reset"), 1)
+        .expect("old challenge");
+    custody.reset_for_account_transition();
+    custody
+        .track_override(key("reset"), 1)
+        .expect("fresh attribution");
+    assert_eq!(
+        custody.declare(old, capability("old")),
+        Err(HostedEndpointRefusal::NotOwner)
+    );
+    let fresh = custody
+        .begin_declare(key("reset"), 1)
+        .expect("fresh challenge");
+    assert!(custody.declare(fresh, capability("new")).is_ok());
+}
+
+#[test]
+fn challenge_ticket_cannot_cross_runtime_owners_and_generation_exhaustion_fails_closed() {
+    let a = HostedEndpointCustody::default();
+    let b = HostedEndpointCustody::default();
+    for custody in [&a, &b] {
+        custody.track_override(key("ticket"), 1).expect("track");
+    }
+    let ticket = a.begin_declare(key("ticket"), 1).expect("ticket");
+    assert_eq!(
+        b.declare(ticket, capability("a")),
+        Err(HostedEndpointRefusal::NotOwner)
+    );
+    a.lock().generation = Some(u64::MAX);
+    let last = a.begin_declare(key("ticket"), 1).expect("last generation");
+    a.reset_for_account_transition();
+    a.track_override(key("ticket"), 1)
+        .expect("track after exhaustion");
+    assert_eq!(
+        a.declare(last, capability("a")),
+        Err(HostedEndpointRefusal::NotOwner)
+    );
+    assert!(matches!(
+        a.begin_declare(key("ticket"), 1),
+        Err(HostedEndpointRefusal::NotOwner)
+    ));
+    a.reset_for_account_transition();
+    assert_eq!(a.lock().generation, None);
+}
+
+#[tokio::test]
+async fn account_reset_revokes_authority_but_keeps_unproven_physical_evidence() {
+    let custody = HostedEndpointCustody::default();
+    use_and_declare(&custody, "reset-owner", 1);
+    let lower = RmcpClientRetirement::default();
+    admit(&custody, "reset-owner", "old-owner", &lower);
+    drop(lower); // No positive retirement proof.
+    custody.reset_for_account_transition();
+    custody.release_connection(1);
+    assert!(!custody.is_used_by(&key("reset-owner"), 1));
+    assert_eq!(custody.census().provisional, 1);
+    assert_eq!(
+        custody
+            .retire(key("reset-owner"), capability("cap-reset-owner"), 1, soon())
+            .await,
+        Err(HostedEndpointRefusal::NotOwner)
+    );
+    custody
+        .track_override(key("reset-owner"), 2)
+        .expect("new attribution");
+    custody
+        .declare_for_test(key("reset-owner"), capability("new-owner"), 2)
+        .expect("new proof");
+    let result = custody
+        .retire(key("reset-owner"), capability("new-owner"), 2, soon())
+        .await
+        .expect("retire");
+    assert_eq!(result.unknown, vec![Some("old-owner".to_owned())]);
+    assert!(!result.is_complete());
+}
+
+#[tokio::test]
+async fn account_resets_do_not_refund_permanent_tombstone_capacity() {
+    let custody = HostedEndpointCustody::with_capacity(1);
+    use_and_declare(&custody, "permanent", 1);
+    assert!(
+        custody
+            .retire(key("permanent"), capability("cap-permanent"), 1, soon())
+            .await
+            .expect("retire")
+            .is_complete()
+    );
+    for _ in 0..3 {
+        custody.reset_for_account_transition();
+        assert_eq!(custody.census().tombstones, 1);
+        assert!(custody.is_retired(&key("permanent")));
+    }
+    custody
+        .track_override(key("replacement"), 2)
+        .expect("new provisional");
+    assert_eq!(
+        custody.declare_for_test(key("replacement"), capability("new"), 2),
+        Err(HostedEndpointRefusal::CapacityExhausted)
+    );
+}
+
+#[test]
+fn reset_provisional_overflow_keeps_old_owners_and_refuses_new_tracking() {
+    let custody = HostedEndpointCustody::default();
+    let mut owners = Vec::new();
+    for index in 0..=HOSTED_ENDPOINT_PROVISIONAL_CAPACITY {
+        let name = format!("reset-{index}");
+        use_and_declare(&custody, &name, 1);
+        let lower = RmcpClientRetirement::default();
+        admit(&custody, &name, &name, &lower);
+        owners.push(lower);
+    }
+    custody.reset_for_account_transition();
+    assert_eq!(
+        custody.census().provisional,
+        HOSTED_ENDPOINT_PROVISIONAL_CAPACITY + 1
+    );
+    assert_eq!(
+        custody.track_override(key("new-after-reset"), 2),
+        Err(HostedEndpointRefusal::CapacityExhausted)
+    );
+    assert_eq!(owners.len(), HOSTED_ENDPOINT_PROVISIONAL_CAPACITY + 1);
 }

@@ -78,6 +78,10 @@ impl ResetInventory for ProductionResetInventory {
                 return Err(ResetInventoryError::ConstructorsIncomplete);
             }
             self.thread_manager.invalidate_mcp_runtimes().await;
+            self.thread_manager
+                .mcp_manager()
+                .hosted_endpoint_custody()
+                .reset_for_account_transition();
 
             // Resolve and publish the strict new-generation cloud loader before
             // rebuilding configuration or deriving residency/telemetry routes.

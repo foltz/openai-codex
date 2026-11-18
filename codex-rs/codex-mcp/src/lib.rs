@@ -12,7 +12,11 @@ pub use binding::is_model_search_tool;
 pub use binding_clients::McpResourceListing;
 pub use client_capabilities::client_mcp_extensions;
 pub use client_tool_catalog::CodexAppsToolSnapshot;
+// The hosted client and app-server use one proof format, never copied HMAC code.
+pub use codex_rmcp_client::HOSTED_ENDPOINT_PROOF_PATH;
 pub use codex_rmcp_client::McpProtocolMode;
+pub use codex_rmcp_client::hosted_endpoint_proof;
+pub use codex_rmcp_client::hosted_endpoint_proof_matches;
 pub use connection_manager::NetworkPolicyMetadata;
 pub use connection_manager::NetworkPolicyMetadataProvider;
 pub use connection_manager::tool_is_model_visible;

@@ -102,10 +102,29 @@ type ToolConnection = Arc<RwLock<Option<(AppServerRequestHandle, AppEventSender)
 pub(crate) struct DynamicToolMcpServer {
     connection: ToolConnection,
     config: Value,
+    // Separate authority: never appears in thread configuration or Debug output.
+    retirement_capability: Arc<String>,
     task: JoinHandle<()>,
 }
 
+struct OwnershipProof {
+    capability: Arc<String>,
+    url: String,
+}
+
 impl DynamicToolMcpServer {
+    pub(crate) fn hosted_endpoint(&self) -> Option<(String, String, String)> {
+        Some((
+            self.config.get("url")?.as_str()?.to_owned(),
+            self.config
+                .get("http_headers")?
+                .get("Authorization")?
+                .as_str()?
+                .to_owned(),
+            self.retirement_capability.as_str().to_owned(),
+        ))
+    }
+
     pub(crate) fn suspend(&self) {
         *self
             .connection
@@ -131,6 +150,15 @@ impl DynamicToolMcpServer {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let authorization = Arc::new(format!("Bearer {}", Uuid::new_v4()));
+        let retirement_capability = Arc::new(format!(
+            "{}{}",
+            Uuid::new_v4().simple(),
+            Uuid::new_v4().simple()
+        ));
+        let ownership_proof = Arc::new(OwnershipProof {
+            capability: Arc::clone(&retirement_capability),
+            url: format!("http://{address}/mcp"),
+        });
         let server_config = json!({
             "url": format!("http://{address}/mcp"),
             "http_headers": {"Authorization": authorization.as_str()},
@@ -159,13 +187,23 @@ impl DynamicToolMcpServer {
             Arc::new(LocalSessionManager::default()),
             StreamableHttpServerConfig::default(),
         );
-        let router =
-            Router::new()
-                .nest_service("/mcp", service)
-                .layer(middleware::from_fn_with_state(
-                    authorization,
-                    require_authorization,
-                ));
+        let router = Router::new()
+            .nest_service("/mcp", service)
+            .layer(middleware::from_fn_with_state(
+                authorization,
+                require_authorization,
+            ))
+            // Proof is outside the configured bearer layer. Only an HMAC
+            // response leaves this route; the retirement capability does not.
+            .merge(
+                Router::new()
+                    .route(
+                        codex_mcp::HOSTED_ENDPOINT_PROOF_PATH,
+                        axum::routing::post(answer_ownership_challenge),
+                    )
+                    .layer(axum::extract::DefaultBodyLimit::max(128))
+                    .with_state(ownership_proof),
+            );
         let task = tokio::spawn(async move {
             if let Err(error) = axum::serve(listener, router).await {
                 tracing::warn!(%error, "TUI task-tools MCP server stopped");
@@ -174,6 +212,7 @@ impl DynamicToolMcpServer {
         Ok(Self {
             connection,
             config: server_config,
+            retirement_capability,
             task,
         })
     }
@@ -183,6 +222,20 @@ impl Drop for DynamicToolMcpServer {
     fn drop(&mut self) {
         self.task.abort();
     }
+}
+
+async fn answer_ownership_challenge(
+    State(proof): State<Arc<OwnershipProof>>,
+    nonce: String,
+) -> Result<String, StatusCode> {
+    if nonce.is_empty() || nonce.len() > 128 || !nonce.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(codex_mcp::hosted_endpoint_proof(
+        &proof.capability,
+        &nonce,
+        &proof.url,
+    ))
 }
 
 async fn require_authorization(
@@ -355,5 +408,43 @@ impl ServerHandler for DynamicToolMcpHandler {
             CallToolResult::error(content)
         }
         .into())
+    }
+}
+
+#[cfg(test)]
+mod hosted_proof_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn challenge_uses_the_shared_bound_proof_and_rejects_malformed_nonces() {
+        let proof = Arc::new(OwnershipProof {
+            capability: Arc::new("private-capability".to_owned()),
+            url: "http://127.0.0.1:41005/mcp".to_owned(),
+        });
+        for nonce in ["".to_owned(), "not-hex".to_owned(), "a".repeat(129)] {
+            assert_eq!(
+                answer_ownership_challenge(State(Arc::clone(&proof)), nonce)
+                    .await
+                    .unwrap_err(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+        let nonce = "a".repeat(64);
+        let response = answer_ownership_challenge(State(Arc::clone(&proof)), nonce.clone())
+            .await
+            .unwrap();
+        assert!(codex_mcp::hosted_endpoint_proof_matches(
+            &proof.capability,
+            &nonce,
+            &proof.url,
+            &response
+        ));
+        assert!(!codex_mcp::hosted_endpoint_proof_matches(
+            &proof.capability,
+            &"b".repeat(64),
+            &proof.url,
+            &response
+        ));
+        assert!(!response.contains(proof.capability.as_str()));
     }
 }

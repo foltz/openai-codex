@@ -52,7 +52,7 @@ use rmcp::model::ContentBlock;
 use rmcp::model::JsonObject;
 use rmcp::model::ListToolsResult;
 use rmcp::model::ServerCapabilities;
-use rmcp::model::ServerInfo;
+use rmcp::model::ServerConfig;
 use rmcp::model::Tool;
 use rmcp::model::ToolAnnotations;
 use rmcp::service::RequestContext;
@@ -81,8 +81,8 @@ const SERVER_NAME: &str = "codex_tui";
 struct PingServer;
 
 impl ServerHandler for PingServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
 
     async fn list_tools(

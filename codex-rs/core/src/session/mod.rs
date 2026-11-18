@@ -1247,6 +1247,7 @@ impl Session {
         let session_source_clone = session_configuration.session_source.clone();
         let (agent_status_tx, agent_status_rx) = watch::channel(AgentStatus::PendingInit);
 
+        eprintln!("COLD_TRACE before Session new");
         let session = Box::pin(Session::new(
             startup.clone(),
             session_configuration,
@@ -1996,6 +1997,7 @@ impl Session {
     }
 
     async fn record_initial_history(&self, conversation_history: InitialHistory) {
+        eprintln!("COLD_TRACE record history entry");
         let (is_subagent, is_paginated_subagent) = {
             let state = self.state.lock().await;
             let session_configuration = &state.session_configuration;
@@ -2024,7 +2026,9 @@ impl Session {
                 None
             }
             InitialHistory::Resumed(resumed_history) => {
+                eprintln!("COLD_TRACE before default turn");
                 let turn_context = self.new_default_turn().await;
+                eprintln!("COLD_TRACE default turn ready");
                 let rollout_items = resumed_history.history;
                 if matches!(
                     rollout_items.iter().rev().find_map(|item| match item {

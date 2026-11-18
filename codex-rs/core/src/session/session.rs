@@ -954,6 +954,7 @@ impl Session {
         startup_custody: Option<&super::startup_custody::SessionStartupCustody>,
         startup_resources: Option<&super::startup_resources::StartupResources>,
     ) -> anyhow::Result<Arc<Self>> {
+        eprintln!("COLD_TRACE Session new entry");
         match (startup_custody, startup_resources) {
             (Some(custody), Some(resources)) if custody.owns_resources(resources) => {}
             (None, None) => {}
@@ -2397,7 +2398,9 @@ impl Session {
             };
 
             // record_initial_history can emit events. We record only after the SessionConfiguredEvent is emitted.
+            eprintln!("COLD_TRACE before initial history");
             Box::pin(sess.record_initial_history(initial_history)).await;
+            eprintln!("COLD_TRACE initial history ready");
             if restore_child_window {
                 sess.state.lock().await.restore_auto_compact_window(
                     /*window_number*/ 0,

@@ -23,6 +23,8 @@ use crate::request_processors::ProcessorThreadShutdown;
 /// Host custody must outlive every embedded client started in it, including
 /// startup failures and incomplete shutdown. Dropping this host is not a
 /// successful shutdown. It is deliberately not a global background reaper.
+/// Explicitly bound remote client workers share this run-owned host but retain
+/// separate original-task observations; they are not embedded runtime receipts.
 #[derive(Default)]
 pub struct InProcessHost {
     state: Mutex<HostCustody>,
@@ -32,9 +34,57 @@ pub struct InProcessHost {
 struct HostCustody {
     closed: bool,
     runtimes: Vec<Arc<RuntimeCustody>>,
+    client_workers: Vec<Arc<EmbeddedTaskOwner>>,
 }
 
 impl InProcessHost {
+    /// Bind an original client worker before any shutdown observer can be cancelled.
+    /// The caller must keep this host alive across client replacement and incomplete shutdown.
+    /// Refusal returns the original handle; it never silently detaches it.
+    pub fn bind_client_worker(
+        &self,
+        handle: JoinHandle<()>,
+    ) -> Result<Arc<EmbeddedTaskOwner>, JoinHandle<()>> {
+        let Ok(mut state) = self.state.lock() else {
+            return Err(handle);
+        };
+        if state.closed {
+            return Err(handle);
+        }
+        let owner = Arc::new(EmbeddedTaskOwner::from_handle(handle));
+        state.client_workers.push(Arc::clone(&owner));
+        Ok(owner)
+    }
+
+    /// Observe the currently bound client population without closing registration.
+    /// Final host shutdown must close registration before claiming a frozen population.
+    /// Only positive normal joins release entries; failed and incomplete debt remains.
+    pub async fn observe_client_workers_until(
+        &self,
+        deadline: Instant,
+    ) -> io::Result<Vec<TaskObservation>> {
+        let workers = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("client worker custody unavailable"))?
+            .client_workers
+            .clone();
+        let reports =
+            futures::future::join_all(workers.iter().map(|worker| worker.observe_until(deadline)))
+                .await;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("client worker custody unavailable"))?;
+        state.client_workers.retain(|candidate| {
+            !workers.iter().zip(&reports).any(|(worker, report)| {
+                Arc::ptr_eq(candidate, worker)
+                    && *report == TaskObservation::Terminated(TaskTermination::Normal)
+            })
+        });
+        Ok(reports)
+    }
+
     pub(super) fn reserve(&self) -> io::Result<Arc<RuntimeCustody>> {
         let mut state = self
             .state
@@ -495,7 +545,7 @@ type JoinReceipt = Shared<BoxFuture<'static, TaskTermination>>;
 /// The host retains this original until terminal observation or actual process
 /// exit. It has no timer-triggered abort and does not expose process authority.
 /// Dropping an observer never takes the original JoinHandle out of this owner.
-pub(super) struct EmbeddedTaskOwner {
+pub struct EmbeddedTaskOwner {
     completion: JoinReceipt,
     terminal_hint: AbortHandle,
 }
@@ -531,7 +581,7 @@ impl EmbeddedTaskOwner {
 
     /// Observe without consuming custody or introducing a new cleanup budget.
     /// The caller supplies its already-established absolute deadline.
-    pub(super) async fn observe_until(&self, deadline: Instant) -> TaskObservation {
+    pub async fn observe_until(&self, deadline: Instant) -> TaskObservation {
         if let Some(outcome) = self.completion.peek() {
             return TaskObservation::Terminated(*outcome);
         }

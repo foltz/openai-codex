@@ -2557,4 +2557,57 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::Other);
         assert!(error.to_string().contains("worker panicked"));
     }
+    #[tokio::test]
+    async fn dropping_remote_client_closes_connection_with_request_handles_retained() {
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected account/read request");
+            };
+            assert_eq!(request.method, "account/read");
+            seen_tx.send(()).expect("request observer remains alive");
+            assert!(matches!(
+                websocket.next().await,
+                Some(Ok(Message::Close(_)))
+            ));
+            closed_tx.send(()).expect("close observer remains alive");
+        })
+        .await;
+        let client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+        let handle = client.request_handle();
+        let pending_handle = handle.clone();
+        let request = |id| ClientRequest::GetAccount {
+            request_id: RequestId::Integer(id),
+            params: codex_app_server_protocol::GetAccountParams {
+                cache_only: false,
+                refresh_token: false,
+            },
+        };
+        let pending = tokio::spawn(async move { pending_handle.request(request(1)).await });
+        timeout(SHUTDOWN_TIMEOUT, seen_rx)
+            .await
+            .expect("request reaches server")
+            .expect("server observes request");
+        drop(client);
+        timeout(SHUTDOWN_TIMEOUT, closed_rx)
+            .await
+            .expect("dropping the event consumer closes the websocket")
+            .expect("server observes close");
+        let pending_error = timeout(SHUTDOWN_TIMEOUT, pending)
+            .await
+            .expect("pending request finishes")
+            .expect("request task joins")
+            .expect_err("pending request fails when client closes");
+        assert_eq!(pending_error.kind(), ErrorKind::BrokenPipe);
+        let error = timeout(SHUTDOWN_TIMEOUT, handle.request(request(2)))
+            .await
+            .expect("retained handle never hangs after client drop")
+            .expect_err("retained handle no longer owns a connection");
+        assert_eq!(error.kind(), ErrorKind::BrokenPipe);
+    }
 }

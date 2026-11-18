@@ -42,6 +42,7 @@ pub(super) async fn reconnect(
     remote_cwd: Option<PathBuf>,
     task_tools: ThreadToolTransport,
     presentation: ReconnectPresentation,
+    worker_custody: std::sync::Arc<codex_app_server_client::InProcessHost>,
 ) -> Result<Reconnected> {
     if matches!(target, AppServerTarget::Cloud) {
         color_eyre::eyre::bail!("Reopen Codex to reconnect the cloud backend.");
@@ -72,7 +73,11 @@ pub(super) async fn reconnect(
         let attempt = async {
             tokio::time::sleep(Duration::from_secs(delay)).await;
             stage = "connecting to the server";
-            let client = crate::app_server_connection::connect(&target).await?;
+            let client = crate::app_server_connection::connect_in_host(
+                &target,
+                std::sync::Arc::clone(&worker_custody),
+            )
+            .await?;
             let mut session = AppServerSession::new(backend_id, client, mode)
                 .with_local_codex_home(&config.codex_home)
                 .with_remote_cwd_override(remote_cwd.clone())

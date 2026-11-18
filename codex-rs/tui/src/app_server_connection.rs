@@ -52,3 +52,17 @@ pub(crate) async fn connect(target: &AppServerTarget) -> color_eyre::Result<AppS
         }
     }
 }
+
+/// Bind both explicit remote and verified Windows local-daemon workers before
+/// the client reaches cancellable session operations. The caller owns the run host.
+pub(crate) async fn connect_in_host(
+    target: &AppServerTarget,
+    host: std::sync::Arc<codex_app_server_client::InProcessHost>,
+) -> color_eyre::Result<AppServerClient> {
+    match connect(target).await? {
+        AppServerClient::Remote(client) => {
+            Ok(AppServerClient::Remote(client.with_worker_custody(host)?))
+        }
+        client => Ok(client),
+    }
+}

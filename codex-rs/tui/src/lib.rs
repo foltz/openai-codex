@@ -602,7 +602,7 @@ async fn start_app_server(
     let connection = if matches!(target, AppServerTarget::Embedded) {
         None
     } else {
-        Some(app_server_connection::connect(target).await)
+        Some(app_server_connection::connect_in_host(target, Arc::clone(&embedded_host)).await)
     };
     if let Some(connection) = connection {
         match connection {

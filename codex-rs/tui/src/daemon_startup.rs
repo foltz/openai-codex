@@ -160,7 +160,10 @@ pub(super) async fn compatibility_warning(
             .await
             .map_err(|_| "could not connect to check daemon feature settings".to_string())?;
         if requested.is_empty() {
-            let _ = client.shutdown().await;
+            client
+                .shutdown()
+                .await
+                .map_err(|_| "could not stop daemon feature probe".to_string())?;
             return Ok(());
         }
         // Both legacy managed config and current requirements override CLI flags.
@@ -200,7 +203,10 @@ pub(super) async fn compatibility_warning(
             Err(_) => return Err("could not check daemon configuration requirements".to_string()),
         }
         if requested.is_empty() {
-            let _ = client.shutdown().await;
+            client
+                .shutdown()
+                .await
+                .map_err(|_| "could not stop daemon feature probe".to_string())?;
             return Ok(());
         }
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -211,7 +217,10 @@ pub(super) async fn compatibility_warning(
             tx,
         );
         let result = rx.await;
-        let _ = client.shutdown().await;
+        client
+            .shutdown()
+            .await
+            .map_err(|_| "could not stop daemon feature probe".to_string())?;
         let features = result.map_err(|_| "daemon feature check was interrupted".to_string())??;
         requested.retain(|name, enabled| {
             match features.iter().find(|feature| feature.name == *name) {

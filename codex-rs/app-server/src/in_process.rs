@@ -104,6 +104,7 @@ use tracing::warn;
 #[path = "in_process_bootstrap.rs"]
 mod bootstrap;
 mod shutdown;
+pub use shutdown::EmbeddedTaskOwner as ClientWorkerOwner;
 pub use shutdown::InProcessHost;
 pub use shutdown::ProcessorCleanupExecution;
 pub use shutdown::ProcessorCleanupProgress;

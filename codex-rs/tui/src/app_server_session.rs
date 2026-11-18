@@ -55,6 +55,7 @@ use crate::status::StatusAccountDisplay;
 use crate::status::plan_type_display_name;
 use crate::terminal_visualization_instructions::with_terminal_visualization_instructions;
 use codex_app_server_client::AppServerClient;
+use codex_app_server_client::AppServerEvent;
 use codex_app_server_client::AppServerPath;
 use codex_app_server_client::AppServerRequestHandle;
 use codex_app_server_client::TypedRequestError;
@@ -392,6 +393,7 @@ pub(crate) struct AppServerSession {
     /// Owns events and the connection lifetime for live sessions. Request-only views share the
     /// request handle below and have no connection owner.
     connection_owner: Option<AppServerClient>,
+    reported_disconnect: Option<String>,
     request_handle: AppServerRequestHandle,
     request_id_namespace: Option<Uuid>,
     next_request_id: i64,
@@ -614,6 +616,7 @@ impl AppServerSession {
         Self {
             backend_id,
             connection_owner,
+            reported_disconnect: None,
             request_handle,
             request_id_namespace: None,
             next_request_id: 1,
@@ -1082,6 +1085,11 @@ impl AppServerSession {
 
     pub(crate) async fn next_event(&mut self) -> Option<AppServerSessionEvent> {
         let event = self.connection_owner.as_mut()?.next_event().await?;
+        if let AppServerEvent::Disconnected { message } = &event
+            && self.reported_disconnect.is_none()
+        {
+            self.reported_disconnect = Some(message.clone());
+        }
         if let codex_app_server_client::AppServerEvent::ServerNotification(notification) = &event
             && let codex_app_server_protocol::ServerNotification::ThreadReadStateChanged(change) =
                 notification.as_ref()
@@ -2291,15 +2299,27 @@ impl AppServerSession {
         // cleanup observes its original resources. Request-only views own no connection.
         let Self {
             connection_owner,
+            reported_disconnect,
             dynamic_tool_mcp,
             ..
         } = self;
+        let remote = matches!(connection_owner, Some(AppServerClient::Remote(_)));
         let result = match connection_owner {
             Some(client) => client.shutdown().await,
             None => Ok(()),
         };
         drop(dynamic_tool_mcp);
-        result
+        settle_reported_disconnect(remote, reported_disconnect.as_deref(), result)
+    }
+
+    /// The logical backend collection retains this host across connection replacement.
+    pub(crate) fn worker_custody(
+        &self,
+    ) -> Option<std::sync::Arc<codex_app_server_client::InProcessHost>> {
+        match self.connection_owner.as_ref()? {
+            AppServerClient::Remote(client) => client.worker_custody(),
+            _ => None,
+        }
     }
 
     pub(crate) fn request_handle(&self) -> AppServerRequestHandle {
@@ -5409,3 +5429,38 @@ mod tests {
         ));
     }
 }
+
+/// Only the exact remote failure already delivered to this session is acknowledged.
+/// A join failure, timeout, different error, or embedded failure still surfaces.
+fn settle_reported_disconnect(
+    remote: bool,
+    reported: Option<&str>,
+    result: std::io::Result<()>,
+) -> std::io::Result<()> {
+    match result {
+        Err(error) if remote && reported == Some(error.to_string().as_str()) => Ok(()),
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod reported_disconnect_result_tests {
+    use super::*;
+    #[test]
+    fn only_the_identical_reported_remote_failure_is_acknowledged() {
+        let error = || std::io::Error::new(std::io::ErrorKind::BrokenPipe, "observed reset");
+        assert!(settle_reported_disconnect(true, Some("observed reset"), Err(error())).is_ok());
+        assert!(settle_reported_disconnect(true, None, Err(error())).is_err());
+        assert!(settle_reported_disconnect(false, Some("observed reset"), Err(error())).is_err());
+        let different =
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "original worker still live");
+        let result =
+            settle_reported_disconnect(true, Some("observed reset"), Err(different)).unwrap_err();
+        assert_eq!(result.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(result.to_string(), "original worker still live");
+    }
+}
+
+#[cfg(test)]
+#[path = "app_server_session/disconnect_shutdown_tests.rs"]
+pub(crate) mod disconnect_shutdown_tests;

@@ -1435,6 +1435,7 @@ See the Codex keymap documentation for supported actions and examples."
                             .session_at(displayed_session)
                             .thread_tool_transport(),
                         presentation,
+                        backends.worker_custody_at(displayed_session),
                     );
                     let future = Box::pin(async move {
                         if let reconnect::ReconnectPresentation::Startup(deadline) = presentation

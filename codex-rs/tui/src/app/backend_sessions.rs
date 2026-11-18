@@ -62,6 +62,8 @@ struct SessionEntry {
     // Stable, nonsecret name supplied by the registrar for this logical app-server.
     preference_key: Option<String>,
     session: AppServerSession,
+    // Append-only logical backend ownership outlives each replaced session.
+    worker_custody: std::sync::Arc<codex_app_server_client::InProcessHost>,
     listening: bool,
     pending_events: VecDeque<AppServerSessionEvent>,
     side_startup: Vec<AppServerSessionEvent>,
@@ -100,9 +102,11 @@ impl BackendSessions {
 
     pub(super) fn insert(&mut self, session: AppServerSession) {
         assert!(self.session(session.backend_id()).is_none());
+        let worker_custody = session.worker_custody().unwrap_or_default();
         self.entries.push(SessionEntry {
             preference_key: None,
             session,
+            worker_custody,
             listening: true,
             pending_events: VecDeque::new(),
             side_startup: Vec::new(),
@@ -122,6 +126,13 @@ impl BackendSessions {
 
     pub(super) fn session_at(&self, slot: SessionSlot) -> &AppServerSession {
         &self.entries[slot.0].session
+    }
+
+    pub(super) fn worker_custody_at(
+        &self,
+        slot: SessionSlot,
+    ) -> std::sync::Arc<codex_app_server_client::InProcessHost> {
+        std::sync::Arc::clone(&self.entries[slot.0].worker_custody)
     }
 
     pub(super) fn displayed_owner(&self) -> BackendId {
@@ -303,5 +314,59 @@ impl BackendSessions {
             }
         }
         first_error.map_or(Ok(()), Err)
+    }
+}
+
+#[cfg(test)]
+mod worker_host_lifetime_tests {
+    use super::*;
+    use crate::app_server_session::disconnect_shutdown_tests::session_with_resetting_peer_in_host;
+    use codex_app_server_client::InProcessHost;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn logical_backend_retains_worker_host_after_session_owner_is_consumed()
+    -> color_eyre::Result<()> {
+        let host = Arc::new(InProcessHost::default());
+        let weak = Arc::downgrade(&host);
+        let (session, peer) = session_with_resetting_peer_in_host(Some(Arc::clone(&host))).await?;
+        peer.await?;
+        let mut backends = BackendSessions::new(session);
+        let slot = backends.displayed;
+        let view = backends.session_at(slot).request_view();
+        let original = std::mem::replace(backends.session_at_mut(slot), view);
+        drop(host);
+        assert!(
+            original.shutdown().await.is_err(),
+            "the reset was not reported by this session"
+        );
+        assert!(
+            weak.upgrade().is_some(),
+            "logical backend must outlive the consumed connection owner"
+        );
+        let reconnect_host = backends.worker_custody_at(slot);
+        assert!(Arc::ptr_eq(
+            &reconnect_host,
+            &weak.upgrade().expect("run custody")
+        ));
+        let (replacement, peer) =
+            session_with_resetting_peer_in_host(Some(Arc::clone(&reconnect_host))).await?;
+        peer.await?;
+        assert!(Arc::ptr_eq(
+            &replacement.worker_custody().expect("replacement bound"),
+            &reconnect_host
+        ));
+        assert!(replacement.shutdown().await.is_err());
+        drop(reconnect_host);
+        assert!(
+            weak.upgrade().is_some(),
+            "append-only backend still owns both joins"
+        );
+        drop(backends);
+        assert!(
+            weak.upgrade().is_none(),
+            "worker captures must not form a host cycle"
+        );
+        Ok(())
     }
 }

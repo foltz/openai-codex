@@ -55,6 +55,7 @@ pub(crate) fn classify(request: &ClientRequest) -> AccountDependency {
         | ClientRequest::McpServerEventStreamStart { .. }
         | ClientRequest::McpServerOauthLogin { .. }
         | ClientRequest::McpServerRefresh { .. }
+        | ClientRequest::McpServerConfigIdentity { .. }
         | ClientRequest::McpServerStatusList { .. }
         | ClientRequest::McpServerToolCall { .. }
         | ClientRequest::ModelList { .. }
@@ -278,6 +279,7 @@ mod tests {
     fn credential_and_online_catalog_reads_are_counted_before_effects() {
         for (method, params) in [
             ("getAuthStatus", serde_json::json!({})),
+            ("config/mcpServer/identity", serde_json::Value::Null),
             ("account/rateLimits/read", serde_json::json!({})),
             ("model/list", serde_json::json!({})),
             ("model/list", serde_json::json!({"modelProvider":"other"})),

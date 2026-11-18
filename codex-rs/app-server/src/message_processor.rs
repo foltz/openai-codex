@@ -536,6 +536,8 @@ impl MessageProcessor {
         let gateway_login_control =
             codex_login::GatewayLoginControl::for_runtime(&auth_manager.runtime_config());
         gateway_login_control.require_explicit_login();
+        let applied_mcp_config_identity =
+            crate::mcp_config_identity::AppliedMcpConfigIdentity::from_startup_config(&config);
         let thread_state_manager = ThreadStateManager::new();
         thread_state_manager
             .set_interactive_subscription_notification_outgoing(Arc::clone(&outgoing));
@@ -652,6 +654,9 @@ impl MessageProcessor {
                     Some(time_provider)
                 },
             );
+            let manager = manager
+                .with_runtime_config_change_gate(applied_mcp_config_identity.apply_gate())
+                .with_runtime_config_change_listener(Arc::new(applied_mcp_config_identity.clone()));
             match code_mode_session_provider {
                 Some(provider) => manager.with_code_mode_session_provider(provider),
                 None => manager,
@@ -727,6 +732,7 @@ impl MessageProcessor {
         let config_processor = ConfigRequestProcessor::new(
             outgoing.clone(),
             config_manager.clone(),
+            applied_mcp_config_identity.clone(),
             thread_manager.clone(),
             Arc::clone(&model_catalog),
             analytics_events_client.clone(),
@@ -749,6 +755,7 @@ impl MessageProcessor {
             outgoing.clone(),
             Arc::clone(&config),
             config_manager.clone(),
+            applied_mcp_config_identity.clone(),
             Arc::clone(&model_catalog),
             workspace_routing_tasks.ticket(),
             login_tasks.ticket(),
@@ -795,6 +802,7 @@ impl MessageProcessor {
             thread_state_manager.clone(),
             outgoing.clone(),
             config_manager.clone(),
+            applied_mcp_config_identity.clone(),
             account_processor.clone(),
             control_endpoint.clone(),
         );
@@ -804,6 +812,7 @@ impl MessageProcessor {
             outgoing.clone(),
             analytics_events_client.clone(),
             config_manager.clone(),
+            applied_mcp_config_identity.clone(),
             on_effective_plugins_changed,
         );
         let remote_control_processor = RemoteControlRequestProcessor::new(remote_control_handle);

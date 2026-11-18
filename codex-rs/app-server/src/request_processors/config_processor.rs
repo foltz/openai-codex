@@ -1,3 +1,5 @@
+use crate::mcp_config_identity::AppliedMcpConfigIdentity;
+use crate::mcp_config_identity::McpConfigIdentity;
 use codex_app_server_protocol::ApplicationStorageRequirements;
 use std::sync::Arc;
 
@@ -88,6 +90,7 @@ const SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT: &[&str] = &[
 pub(crate) struct WeakConfigRequestProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     config_manager: ConfigManager,
+    applied_mcp_config_identity: AppliedMcpConfigIdentity,
     thread_manager: std::sync::Weak<ThreadManager>,
     model_catalog: Arc<ModelCatalog>,
     analytics_events_client: AnalyticsEventsClient,
@@ -98,6 +101,7 @@ impl WeakConfigRequestProcessor {
         Some(ConfigRequestProcessor {
             outgoing: Arc::clone(&self.outgoing),
             config_manager: self.config_manager.clone(),
+            applied_mcp_config_identity: self.applied_mcp_config_identity.clone(),
             thread_manager: self.thread_manager.upgrade()?,
             model_catalog: Arc::clone(&self.model_catalog),
             analytics_events_client: self.analytics_events_client.clone(),
@@ -109,6 +113,7 @@ impl WeakConfigRequestProcessor {
 pub(crate) struct ConfigRequestProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     config_manager: ConfigManager,
+    applied_mcp_config_identity: AppliedMcpConfigIdentity,
     thread_manager: Arc<ThreadManager>,
     model_catalog: Arc<ModelCatalog>,
     analytics_events_client: AnalyticsEventsClient,
@@ -119,6 +124,7 @@ impl ConfigRequestProcessor {
         WeakConfigRequestProcessor {
             outgoing: Arc::clone(&self.outgoing),
             config_manager: self.config_manager.clone(),
+            applied_mcp_config_identity: self.applied_mcp_config_identity.clone(),
             thread_manager: Arc::downgrade(&self.thread_manager),
             model_catalog: Arc::clone(&self.model_catalog),
             analytics_events_client: self.analytics_events_client.clone(),
@@ -128,6 +134,7 @@ impl ConfigRequestProcessor {
     pub(crate) fn new(
         outgoing: Arc<OutgoingMessageSender>,
         config_manager: ConfigManager,
+        applied_mcp_config_identity: AppliedMcpConfigIdentity,
         thread_manager: Arc<ThreadManager>,
         model_catalog: Arc<ModelCatalog>,
         analytics_events_client: AnalyticsEventsClient,
@@ -135,6 +142,7 @@ impl ConfigRequestProcessor {
         Self {
             outgoing,
             config_manager,
+            applied_mcp_config_identity,
             thread_manager,
             model_catalog,
             analytics_events_client,
@@ -218,7 +226,12 @@ impl ConfigRequestProcessor {
         if !session_defaults_only {
             self.handle_config_mutation().await;
             if should_reload {
-                reload_user_config(&self.config_manager, &self.thread_manager).await;
+                reload_user_config(
+                    &self.config_manager,
+                    &self.thread_manager,
+                    &self.applied_mcp_config_identity,
+                )
+                .await;
             }
         }
         Ok(ClientResponsePayload::ConfigBatchWrite(response))
@@ -233,7 +246,12 @@ impl ConfigRequestProcessor {
             .handle_config_mutation_result(self.set_experimental_feature_enablement(params).await)
             .await?;
         if !response.enablement.is_empty() {
-            reload_user_config(&self.config_manager, &self.thread_manager).await;
+            reload_user_config(
+                &self.config_manager,
+                &self.thread_manager,
+                &self.applied_mcp_config_identity,
+            )
+            .await;
         }
         self.outgoing
             .send_response_as(
@@ -424,78 +442,207 @@ impl ConfigRequestProcessor {
 pub(super) async fn reload_user_config(
     config_manager: &ConfigManager,
     thread_manager: &ThreadManager,
+    applied_mcp_config_identity: &AppliedMcpConfigIdentity,
 ) {
     // Reload owns several config snapshots; do not inline that future into dispatch.
-    Box::pin(reload_user_config_inner(config_manager, thread_manager)).await;
+    Box::pin(reload_user_config_inner(
+        config_manager,
+        thread_manager,
+        applied_mcp_config_identity,
+    ))
+    .await;
 }
 
-async fn reload_user_config_inner(config_manager: &ConfigManager, thread_manager: &ThreadManager) {
-    config_manager.revoke_mcp_ema_startups();
-    if let Err(err) = config_manager.load_config_layers(/*cwd*/ None).await {
-        tracing::warn!("failed to rebuild user config for runtime refresh: {err}");
-        for thread_id in thread_manager.list_thread_ids().await {
-            if let Ok(thread) = thread_manager.get_thread(thread_id).await {
+/// Bounded publication attempts for one thread's user reload. Stale owners
+/// reload from the current owner; an MCP requirement promotion consumes one
+/// attempt before the user update is reloaded from the promoted owner.
+const USER_RELOAD_ATTEMPTS: usize = 4;
+
+async fn reload_user_config_inner(
+    config_manager: &ConfigManager,
+    thread_manager: &ThreadManager,
+    applied_mcp_config_identity: &AppliedMcpConfigIdentity,
+) {
+    // The host owns this whole runtime transition (KESTREL-CODEX-011). Holding
+    // the gate serializes it with core-initiated reloads and MCP reloads, and
+    // every thread's expected owner below is captured under this same gate.
+    let _apply_guard = applied_mcp_config_identity.lock_apply().await;
+    // Validate host layers without materializing a host-level `Config`: thread
+    // overrides may supply settings, such as a model provider, that the host
+    // configuration alone would reject.
+    let host_layers = match config_manager.load_config_layers(/*cwd*/ None).await {
+        Ok(layers) => layers,
+        Err(err) => {
+            tracing::warn!("failed to rebuild user config for runtime refresh: {err}");
+            for thread_id in thread_manager.list_thread_ids().await {
+                if let Ok(thread) = thread_manager.get_thread(thread_id).await {
+                    thread.disable_mcp_enterprise_auth().await;
+                }
+            }
+            // No thread received a user-layer change, so the retained applied
+            // identity remains truthful.
+            return;
+        }
+    };
+    let candidate_identity = match McpConfigIdentity::from_layers(&host_layers) {
+        Ok(identity) => identity,
+        Err(err) => {
+            tracing::warn!(%err, "failed to identify user config for runtime refresh");
+            return;
+        }
+    };
+
+    // Plan every thread before publishing any user-layer change. Each expected
+    // owner is the snapshot observed under the held gate; publication later
+    // compares and swaps against exactly that snapshot.
+    let mut complete = true;
+    let mut planned = Vec::new();
+    for thread_id in thread_manager.list_thread_ids().await {
+        let thread = match thread_manager.get_thread(thread_id).await {
+            Ok(thread) => thread,
+            Err(err) => {
+                tracing::warn!(%thread_id, %err, "failed to load thread for runtime refresh");
+                complete = false;
+                continue;
+            }
+        };
+        let expected_config = thread.config().await;
+        let next_config = match config_manager
+            .load_latest_config_with_session_layers(
+                &expected_config.config_layer_stack,
+                &expected_config.cwd,
+            )
+            .await
+        {
+            Ok(config) => config,
+            Err(err) => {
+                tracing::warn!(%thread_id, %err, "failed to reload thread configuration");
                 thread.disable_mcp_enterprise_auth().await;
+                complete = false;
+                continue;
+            }
+        };
+        match McpConfigIdentity::from_config(&next_config) {
+            Ok(identity) if identity == candidate_identity => {
+                planned.push((thread_id, thread, expected_config, next_config));
+            }
+            Ok(_) => {
+                tracing::warn!(%thread_id, "selected MCP configuration changed while reloading runtime config");
+                return;
+            }
+            Err(err) => {
+                tracing::warn!(%thread_id, %err, "failed to identify thread runtime configuration");
+                return;
             }
         }
-        return;
     }
-    let thread_ids = thread_manager.list_thread_ids().await;
-    for thread_id in thread_ids {
-        let Ok(thread) = thread_manager.get_thread(thread_id).await else {
-            continue;
-        };
-        for attempt in 0..4 {
-            let current_config = thread.config().await;
-            let next_config = match config_manager
-                .load_latest_config_with_session_layers(
-                    &current_config.config_layer_stack,
-                    &current_config.cwd,
-                )
-                .await
-            {
-                Ok(config) => config,
-                Err(err) => {
-                    tracing::warn!(%thread_id, %err, "failed to reload thread configuration");
-                    thread.disable_mcp_enterprise_auth().await;
-                    break;
-                }
-            };
-            let current_requirements = current_config.config_layer_stack.requirements();
-            let next_requirements = next_config.config_layer_stack.requirements();
-            let promote_mcp = current_requirements.mcp_servers != next_requirements.mcp_servers
-                || current_requirements.plugins != next_requirements.plugins
-                || current_requirements.feature_requirements
-                    != next_requirements.feature_requirements;
-            let outcome = if promote_mcp {
-                // Keep the loaded MCP map and its requirements under one owner,
-                // then reload the user update from that owner.
-                Box::pin(thread.refresh_mcp_config(current_config, next_config)).await
-            } else {
-                // Keep runtime refresh state off the request dispatcher's stack.
-                Box::pin(thread.refresh_runtime_config(current_config, next_config)).await
-            };
-            match outcome {
-                codex_core::ConfigRefreshOutcome::Published => {
-                    if !promote_mcp {
-                        break;
+
+    // Thread configuration can change from here on. Withdraw the applied
+    // identity first so an incomplete or cancelled transition fails closed; it
+    // is restored only after every thread published the candidate layers.
+    applied_mcp_config_identity.invalidate();
+    for (thread_id, thread, expected_config, next_config) in planned {
+        let published = Box::pin(publish_thread_user_config(
+            config_manager,
+            applied_mcp_config_identity,
+            thread.as_ref(),
+            thread_id,
+            &candidate_identity,
+            expected_config,
+            next_config,
+        ))
+        .await;
+        complete &= published;
+    }
+    if complete {
+        applied_mcp_config_identity.replace(candidate_identity);
+    } else {
+        tracing::warn!(
+            "user configuration reload was not published to every thread; the applied MCP configuration identity stays unavailable until a complete reload"
+        );
+    }
+}
+
+/// Publishes one planned thread reload through the host-gated compare-and-swap
+/// path. Returns true only when the candidate user layers were published; a
+/// stale, rejected, or exhausted refresh never reports success.
+async fn publish_thread_user_config(
+    config_manager: &ConfigManager,
+    thread: &codex_core::CodexThread,
+    thread_id: codex_protocol::ThreadId,
+    candidate_identity: &Option<McpConfigIdentity>,
+    expected_config: Arc<codex_core::config::Config>,
+    next_config: codex_core::config::Config,
+) -> bool {
+    let mut planned = Some((expected_config, next_config));
+    for attempt in 0..USER_RELOAD_ATTEMPTS {
+        let (expected_config, next_config) = match planned.take() {
+            Some(planned) => planned,
+            None => {
+                // Re-capture the current owner under the same host gate.
+                let expected_config = thread.config().await;
+                let next_config = match config_manager
+                    .load_latest_config_with_session_layers(
+                        &expected_config.config_layer_stack,
+                        &expected_config.cwd,
+                    )
+                    .await
+                {
+                    Ok(config) => config,
+                    Err(err) => {
+                        tracing::warn!(%thread_id, %err, "failed to reload thread configuration");
+                        thread.disable_mcp_enterprise_auth().await;
+                        return false;
+                    }
+                };
+                match McpConfigIdentity::from_config(&next_config) {
+                    Ok(identity) if identity == *candidate_identity => {}
+                    Ok(_) => {
+                        tracing::warn!(%thread_id, "selected MCP configuration changed while reloading runtime config");
+                        return false;
+                    }
+                    Err(err) => {
+                        tracing::warn!(%thread_id, %err, "failed to identify thread runtime configuration");
+                        return false;
                     }
                 }
-                codex_core::ConfigRefreshOutcome::Stale => {}
-                codex_core::ConfigRefreshOutcome::Rejected => {
-                    tracing::warn!(%thread_id, "stopped user configuration reload after rejected refresh");
-                    break;
+                (expected_config, next_config)
+            }
+        };
+        let current_requirements = expected_config.config_layer_stack.requirements();
+        let next_requirements = next_config.config_layer_stack.requirements();
+        let promote_mcp = current_requirements.mcp_servers != next_requirements.mcp_servers
+            || current_requirements.plugins != next_requirements.plugins
+            || current_requirements.feature_requirements != next_requirements.feature_requirements;
+        let outcome = if promote_mcp {
+            // Keep the loaded MCP map and its requirements under one owner,
+            // then reload the user update from that owner.
+            Box::pin(thread.refresh_mcp_config(expected_config, next_config)).await
+        } else {
+            // Keep runtime refresh state off the request dispatcher's stack.
+            Box::pin(thread.refresh_runtime_config_from_host(expected_config, next_config)).await
+        };
+        match outcome {
+            codex_core::ConfigRefreshOutcome::Published => {
+                if !promote_mcp {
+                    return true;
                 }
             }
-            if attempt == 3 {
-                thread.disable_mcp_enterprise_auth().await;
-                tracing::warn!(%thread_id, "configuration kept changing during user reload; enterprise MCP disabled");
+            codex_core::ConfigRefreshOutcome::Stale => {}
+            codex_core::ConfigRefreshOutcome::Rejected => {
+                tracing::warn!(%thread_id, "stopped user configuration reload after rejected refresh");
+                return false;
             }
         }
+        if attempt + 1 == USER_RELOAD_ATTEMPTS {
+            thread.disable_mcp_enterprise_auth().await;
+            tracing::warn!(%thread_id, "configuration kept changing during user reload; enterprise MCP disabled");
+        }
     }
+    false
 }
 
-pub(crate) fn map_requirements_to_api(
+fn map_requirements_to_api(
     requirements: Option<ConfigRequirementsToml>,
     allowed_login_methods: Vec<ForcedLoginMethod>,
 ) -> Option<ConfigRequirements> {
@@ -1080,7 +1227,12 @@ client_id = "mcp-client"
             home.path().join(codex_config::CONFIG_TOML_FILE),
             "[tool_suggest]\ndisabled_tools = [{ type = 'connector', id = 'calendar' }]\n",
         )?;
-        reload_user_config(&config_manager, &thread_manager).await;
+        reload_user_config(
+            &config_manager,
+            &thread_manager,
+            &crate::mcp_config_identity::AppliedMcpConfigIdentity::default(),
+        )
+        .await;
 
         let refreshed = thread.config().await;
         assert_eq!(

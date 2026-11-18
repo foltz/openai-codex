@@ -5,6 +5,7 @@ use super::config_processor::map_error as map_config_error;
 use super::*;
 use crate::auth_mode::auth_mode_to_api;
 use crate::external_auth::ExternalAuthBridge;
+use crate::mcp_config_identity::AppliedMcpConfigIdentity;
 use crate::model_catalog::ModelCatalog;
 use crate::outgoing_message::AccountNotification;
 use chrono::DateTime;
@@ -117,6 +118,7 @@ pub(crate) struct AccountRequestProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     config: Arc<Config>,
     config_manager: ConfigManager,
+    applied_mcp_config_identity: AppliedMcpConfigIdentity,
     model_catalog: Arc<ModelCatalog>,
     workspace_routing_tasks: crate::processor_task_retirement::ProcessorTaskTicket,
     login_tasks: crate::processor_task_retirement::ProcessorTaskTicket,
@@ -141,6 +143,7 @@ impl AccountRequestProcessor {
         outgoing: Arc<OutgoingMessageSender>,
         config: Arc<Config>,
         config_manager: ConfigManager,
+        applied_mcp_config_identity: AppliedMcpConfigIdentity,
         model_catalog: Arc<ModelCatalog>,
         workspace_routing_tasks: crate::processor_task_retirement::ProcessorTaskTicket,
         login_tasks: crate::processor_task_retirement::ProcessorTaskTicket,
@@ -165,6 +168,7 @@ impl AccountRequestProcessor {
             outgoing,
             config,
             config_manager,
+            applied_mcp_config_identity,
             model_catalog,
             workspace_routing_tasks,
             login_tasks,
@@ -335,6 +339,7 @@ impl AccountRequestProcessor {
 
     async fn maybe_refresh_plugin_caches_for_current_config(
         config_manager: &ConfigManager,
+        applied_mcp_config_identity: &AppliedMcpConfigIdentity,
         thread_manager: &Arc<ThreadManager>,
         auth: Option<CodexAuth>,
     ) {
@@ -351,17 +356,20 @@ impl AccountRequestProcessor {
                 Self::spawn_effective_plugins_changed_task(
                     Arc::clone(thread_manager),
                     config_manager.clone(),
+                    applied_mcp_config_identity.clone(),
                     McpRefreshReason::AccountPluginCacheChanged,
                 );
                 let plugins_config = config.plugins_config_input();
                 let refresh_thread_manager = Arc::clone(thread_manager);
                 let refresh_config_manager = config_manager.clone();
+                let refresh_applied_identity = applied_mcp_config_identity.clone();
                 let on_effective_plugins_changed: Arc<
                     dyn Fn(codex_core_plugins::EffectivePluginsChange) + Send + Sync,
                 > = Arc::new(move |change| {
                     Self::spawn_effective_plugins_changed_task(
                         Arc::clone(&refresh_thread_manager),
                         refresh_config_manager.clone(),
+                        refresh_applied_identity.clone(),
                         change.metadata_change_id.map_or(
                             McpRefreshReason::AccountPluginCacheChanged,
                             McpRefreshReason::InstalledPluginMetadata,
@@ -397,13 +405,18 @@ impl AccountRequestProcessor {
     fn spawn_effective_plugins_changed_task(
         thread_manager: Arc<ThreadManager>,
         config_manager: ConfigManager,
+        applied_mcp_config_identity: AppliedMcpConfigIdentity,
         reason: McpRefreshReason,
     ) {
         if let Err(error) = crate::effective_plugin_change::spawn_plugin_change_task(async move {
             thread_manager.plugins_manager().clear_cache();
             thread_manager.skills_service().clear_cache();
-            crate::mcp_refresh::reload_mcp_config_best_effort(&thread_manager, &config_manager)
-                .await;
+            crate::mcp_refresh::reload_mcp_config_best_effort(
+                &thread_manager,
+                &config_manager,
+                &applied_mcp_config_identity,
+            )
+            .await;
             thread_manager.invalidate_mcp_runtimes_for(reason).await;
         }) {
             warn!(?error, "failed to admit account plugin refresh task");
@@ -1092,6 +1105,7 @@ impl AccountRequestProcessor {
         if payload.success && auth_changes.borrow().owner_generation == owner_generation {
             Self::maybe_refresh_plugin_caches_for_current_config(
                 &self.config_manager,
+                &self.applied_mcp_config_identity,
                 &self.thread_manager,
                 self.auth_manager.auth_cached(),
             )
@@ -1166,6 +1180,7 @@ impl AccountRequestProcessor {
 
         Self::maybe_refresh_plugin_caches_for_current_config(
             &self.config_manager,
+            &self.applied_mcp_config_identity,
             &self.thread_manager,
             self.auth_manager.auth_cached(),
         )

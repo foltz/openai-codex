@@ -52,9 +52,19 @@ async fn reloads_accept_a_provider_supplied_by_thread_overrides() -> anyhow::Res
             ),
         )?;
         if enabled {
-            reload_mcp_config(&threads, &manager).await?;
+            reload_mcp_config(
+                &threads,
+                &manager,
+                &crate::mcp_config_identity::AppliedMcpConfigIdentity::default(),
+            )
+            .await?;
         } else {
-            reload_user_config(&manager, &threads).await;
+            reload_user_config(
+                &manager,
+                &threads,
+                &crate::mcp_config_identity::AppliedMcpConfigIdentity::default(),
+            )
+            .await;
         }
         let config = thread.config().await;
         assert_eq!(config.model_provider_id, "thread-provider");
@@ -121,7 +131,11 @@ async fn user_reload_promotes_plugin_and_feature_requirements_without_server_cha
     )?;
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        reload_user_config(&manager, &threads),
+        reload_user_config(
+            &manager,
+            &threads,
+            &crate::mcp_config_identity::AppliedMcpConfigIdentity::default(),
+        ),
     )
     .await
     .expect("policy promotion must terminate");

@@ -211,6 +211,7 @@ impl AccountRequestProcessor {
         self.model_catalog.invalidate().await;
         Self::maybe_refresh_plugin_caches_for_current_config(
             &self.config_manager,
+            &self.applied_mcp_config_identity,
             &self.thread_manager,
             self.auth_manager.auth_cached(),
         )

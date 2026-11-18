@@ -112,6 +112,7 @@ async fn background_routing_skips_config_until_chatgpt_sign_in(
         outgoing,
         config,
         manager,
+        crate::mcp_config_identity::AppliedMcpConfigIdentity::default(),
         model_catalog,
         routing_tasks.ticket(),
         login_tasks.ticket(),

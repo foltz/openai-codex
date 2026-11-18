@@ -1,4 +1,6 @@
 use crate::config_manager::ConfigManager;
+use crate::mcp_config_identity::AppliedMcpConfigIdentity;
+use crate::mcp_config_identity::McpConfigIdentity;
 use codex_core::CodexThread;
 use codex_core::ConfigRefreshOutcome;
 use codex_core::ThreadManager;
@@ -10,11 +12,13 @@ use tracing::warn;
 pub(crate) async fn reload_mcp_config(
     thread_manager: &Arc<ThreadManager>,
     config_manager: &ConfigManager,
+    applied_mcp_config_identity: &AppliedMcpConfigIdentity,
 ) -> io::Result<()> {
     // Keep the reload state machine out of the request dispatcher's stack frame.
     Box::pin(reload_mcp_config_with_policy(
         thread_manager,
         config_manager,
+        applied_mcp_config_identity,
         ReloadPolicy::Strict,
     ))
     .await
@@ -23,10 +27,12 @@ pub(crate) async fn reload_mcp_config(
 pub(crate) async fn reload_mcp_config_best_effort(
     thread_manager: &Arc<ThreadManager>,
     config_manager: &ConfigManager,
+    applied_mcp_config_identity: &AppliedMcpConfigIdentity,
 ) {
     if let Err(err) = Box::pin(reload_mcp_config_with_policy(
         thread_manager,
         config_manager,
+        applied_mcp_config_identity,
         ReloadPolicy::BestEffort,
     ))
     .await
@@ -41,12 +47,42 @@ enum ReloadPolicy {
     BestEffort,
 }
 
+/// A strict reload publishes only configuration materialized from the
+/// selected user layers it captured under the apply gate.
+fn check_selected_identity(
+    candidate_identity: Option<&Option<McpConfigIdentity>>,
+    next_config: &Config,
+) -> io::Result<()> {
+    let identity = McpConfigIdentity::from_config(next_config)?;
+    if candidate_identity == Some(&identity) {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            "selected MCP configuration changed while reloading",
+        ))
+    }
+}
+
 async fn reload_mcp_config_with_policy(
     thread_manager: &ThreadManager,
     config_manager: &ConfigManager,
+    applied_mcp_config_identity: &AppliedMcpConfigIdentity,
     policy: ReloadPolicy,
 ) -> io::Result<()> {
-    config_manager.revoke_mcp_ema_startups();
+    // The host owns this whole MCP transition (KESTREL-CODEX-006/011). Holding
+    // the gate serializes it with user reloads and core-initiated refreshes;
+    // every expected owner below is captured under it, and only the host-owned
+    // `refresh_mcp_config` may publish while it is held (never the core-owned
+    // `refresh_runtime_config`, which would re-lock this non-reentrant gate).
+    let _apply_guard = applied_mcp_config_identity.lock_apply().await;
+    if matches!(policy, ReloadPolicy::BestEffort) {
+        // A partial best-effort refresh cannot truthfully claim a single applied
+        // process-wide MCP configuration. Invalidate before any thread mutation.
+        applied_mcp_config_identity.invalidate();
+    }
+    // Strict only: the selected user layers this reload publishes, captured
+    // from the first host layer load under the gate.
+    let mut candidate_identity: Option<Option<McpConfigIdentity>> = None;
     let mut rejected = false;
     let mut load_error = None;
     let mut completed: Vec<Arc<CodexThread>> = Vec::new();
@@ -56,7 +92,26 @@ async fn reload_mcp_config_with_policy(
         let host_loaded = match policy {
             ReloadPolicy::BestEffort => true,
             ReloadPolicy::Strict => match config_manager.load_config_layers(/*cwd*/ None).await {
-                Ok(_) => true,
+                Ok(layers) => match McpConfigIdentity::from_layers(&layers) {
+                    Ok(identity)
+                        if candidate_identity
+                            .as_ref()
+                            .is_none_or(|candidate| *candidate == identity) =>
+                    {
+                        candidate_identity = Some(identity);
+                        true
+                    }
+                    Ok(_) => {
+                        load_error.get_or_insert(io::Error::other(
+                            "selected MCP configuration changed while reloading",
+                        ));
+                        false
+                    }
+                    Err(err) => {
+                        load_error.get_or_insert(err);
+                        false
+                    }
+                },
                 Err(err) => {
                     load_error.get_or_insert(err);
                     false
@@ -73,6 +128,11 @@ async fn reload_mcp_config_with_policy(
                 }
                 Err(err) => {
                     warn!(%thread_id, %err, "failed to load thread for MCP configuration refresh");
+                    if matches!(policy, ReloadPolicy::Strict) {
+                        load_error.get_or_insert(io::Error::other(format!(
+                            "failed to load thread {thread_id}: {err}"
+                        )));
+                    }
                 }
             }
         }
@@ -85,7 +145,23 @@ async fn reload_mcp_config_with_policy(
                 let mut target_load_error = None;
                 let next_config = if host_loaded {
                     match load_refresh_config(&current_config, config_manager).await {
-                        Ok(next_config) => next_config,
+                        Ok(next_config) => {
+                            if matches!(policy, ReloadPolicy::Strict)
+                                && let Err(err) = check_selected_identity(
+                                    candidate_identity.as_ref(),
+                                    &next_config,
+                                )
+                            {
+                                target_load_error = Some(err);
+                                disabled_enterprise_config(&current_config)
+                            } else {
+                                // Thread configuration can change from here on.
+                                // Withdraw the applied identity first so an
+                                // incomplete or cancelled reload fails closed.
+                                applied_mcp_config_identity.invalidate();
+                                next_config
+                            }
+                        }
                         Err(err) => {
                             if matches!(policy, ReloadPolicy::BestEffort) {
                                 warn!(%thread_id, %err, "failed to load session configuration");
@@ -119,11 +195,20 @@ async fn reload_mcp_config_with_policy(
         }
         if pass == 2 {
             for thread_id in thread_manager.list_thread_ids().await {
-                if let Ok(thread) = thread_manager.get_thread(thread_id).await
-                    && !completed.iter().any(|done| Arc::ptr_eq(done, &thread))
-                {
-                    thread.disable_mcp_enterprise_auth().await;
-                    rejected = true;
+                match thread_manager.get_thread(thread_id).await {
+                    Ok(thread) if !completed.iter().any(|done| Arc::ptr_eq(done, &thread)) => {
+                        thread.disable_mcp_enterprise_auth().await;
+                        rejected = true;
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        warn!(%thread_id, %err, "failed to load thread for MCP configuration refresh");
+                        if matches!(policy, ReloadPolicy::Strict) {
+                            load_error.get_or_insert(io::Error::other(format!(
+                                "failed to load thread {thread_id}: {err}"
+                            )));
+                        }
+                    }
                 }
             }
         }
@@ -138,6 +223,12 @@ async fn reload_mcp_config_with_policy(
         return Err(io::Error::other(
             "enterprise MCP configuration was rejected; affected sessions retained their previous configuration with enterprise MCP disabled",
         ));
+    }
+    // Every current thread published the candidate layers under this gate.
+    if matches!(policy, ReloadPolicy::Strict)
+        && let Some(candidate_identity) = candidate_identity
+    {
+        applied_mcp_config_identity.replace(candidate_identity);
     }
     Ok(())
 }
@@ -207,7 +298,11 @@ mod tests {
         }
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            reload_mcp_config(&thread_manager, &config_manager),
+            reload_mcp_config(
+                &thread_manager,
+                &config_manager,
+                &crate::mcp_config_identity::AppliedMcpConfigIdentity::default(),
+            ),
         )
         .await
         .expect("reload must terminate under owner churn")
@@ -220,15 +315,25 @@ mod tests {
     #[tokio::test]
     async fn strict_refresh_reports_thread_planning_failures() -> anyhow::Result<()> {
         let (temp_dir, thread_manager, config_manager, _loader) = refresh_test_state().await?;
+        let applied_identity = AppliedMcpConfigIdentity::from_startup_config(
+            &config_manager.load_latest_config(None).await?,
+        );
+        let startup_identity = applied_identity.current();
+        assert!(startup_identity.is_some());
+
         std::fs::write(
             temp_dir.path().join(codex_config::CONFIG_TOML_FILE),
             "[features]\nsecret_auth_storage = true\n",
         )?;
 
-        let err = reload_mcp_config(&thread_manager, &config_manager)
+        let err = reload_mcp_config(&thread_manager, &config_manager, &applied_identity)
             .await
             .expect_err("strict refresh should fail");
 
+        assert!(
+            applied_identity.current().is_none(),
+            "a partial refresh must not advertise either identity"
+        );
         assert_eq!(err.to_string(), "failed to load refresh config");
         for thread_id in thread_manager.list_thread_ids().await {
             let config = thread_manager.get_thread(thread_id).await?.config().await;
@@ -248,13 +353,23 @@ mod tests {
     #[tokio::test]
     async fn best_effort_refresh_updates_healthy_threads() -> anyhow::Result<()> {
         let (temp_dir, thread_manager, config_manager, loader) = refresh_test_state().await?;
+        let applied_identity = AppliedMcpConfigIdentity::from_startup_config(
+            &config_manager.load_latest_config(None).await?,
+        );
+        let startup_identity = applied_identity.current();
+        assert!(startup_identity.is_some());
+
         std::fs::write(
             temp_dir.path().join(codex_config::CONFIG_TOML_FILE),
             "[features]\nsecret_auth_storage = true\n",
         )?;
 
-        reload_mcp_config_best_effort(&thread_manager, &config_manager).await;
+        reload_mcp_config_best_effort(&thread_manager, &config_manager, &applied_identity).await;
 
+        assert!(
+            applied_identity.current().is_none(),
+            "a partial refresh must not advertise either identity"
+        );
         assert_eq!(loader.good_loads.load(Ordering::Relaxed), 1);
         assert_eq!(loader.bad_loads.load(Ordering::Relaxed), 1);
         for thread_id in thread_manager.list_thread_ids().await {
@@ -273,17 +388,24 @@ mod tests {
     #[tokio::test]
     async fn strict_refresh_preserves_config_when_host_config_cannot_load() -> anyhow::Result<()> {
         let (temp_dir, thread_manager, config_manager, _loader) = refresh_test_state().await?;
+        let applied_identity = AppliedMcpConfigIdentity::from_startup_config(
+            &config_manager.load_latest_config(None).await?,
+        );
+        let startup_identity = applied_identity.current();
+        assert!(startup_identity.is_some());
+
         std::fs::write(
             temp_dir.path().join(codex_config::CONFIG_TOML_FILE),
             "[features",
         )?;
 
         assert!(
-            reload_mcp_config(&thread_manager, &config_manager)
+            reload_mcp_config(&thread_manager, &config_manager, &applied_identity)
                 .await
                 .is_err()
         );
 
+        assert_eq!(applied_identity.current(), startup_identity);
         for thread_id in thread_manager.list_thread_ids().await {
             let config = thread_manager.get_thread(thread_id).await?.config().await;
             assert_eq!(
@@ -395,6 +517,12 @@ enabled = false
     #[tokio::test]
     async fn strict_refresh_installs_refreshed_thread_mcp_config() -> anyhow::Result<()> {
         let (temp_dir, thread_manager, config_manager, _loader) = refresh_test_state().await?;
+        let applied_identity = AppliedMcpConfigIdentity::from_startup_config(
+            &config_manager.load_latest_config(None).await?,
+        );
+        let startup_identity = applied_identity.current();
+        assert!(startup_identity.is_some());
+
         let mut good_thread = None;
         for thread_id in thread_manager.list_thread_ids().await {
             let thread = thread_manager.get_thread(thread_id).await?;
@@ -440,8 +568,11 @@ enabled = false
 "#,
         )?;
 
-        reload_mcp_config(&thread_manager, &config_manager).await?;
+        reload_mcp_config(&thread_manager, &config_manager, &applied_identity).await?;
 
+        let current_identity = McpConfigIdentity::from_config(&thread.config().await)?;
+        assert_ne!(current_identity, startup_identity);
+        assert_eq!(applied_identity.current(), current_identity);
         let fork = thread_manager.start_thread(inherited_fork).await?;
         assert!(
             fork.thread

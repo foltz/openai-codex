@@ -2,6 +2,7 @@ use super::account_processor::EnterpriseLoginCompletion;
 use super::account_processor::EnterpriseLoginTarget;
 use super::thread_input::ensure_direct_input_allowed;
 use super::*;
+use crate::mcp_config_identity::AppliedMcpConfigIdentity;
 use codex_config::types::McpServerAuth;
 use codex_core::McpRefreshReason;
 use codex_mcp::McpServerSource;
@@ -24,6 +25,7 @@ pub(crate) struct McpRequestProcessor {
     thread_manager: Arc<ThreadManager>,
     pub(super) outgoing: Arc<OutgoingMessageSender>,
     config_manager: ConfigManager,
+    applied_mcp_config_identity: AppliedMcpConfigIdentity,
     account_processor: Arc<AccountRequestProcessor>,
     pub(super) thread_state_manager: ThreadStateManager,
 }
@@ -35,6 +37,7 @@ impl McpRequestProcessor {
         thread_state_manager: ThreadStateManager,
         outgoing: Arc<OutgoingMessageSender>,
         config_manager: ConfigManager,
+        applied_mcp_config_identity: AppliedMcpConfigIdentity,
         account_processor: Arc<AccountRequestProcessor>,
         control_endpoint: Option<String>,
     ) -> Self {
@@ -43,6 +46,7 @@ impl McpRequestProcessor {
             thread_manager,
             outgoing,
             config_manager,
+            applied_mcp_config_identity,
             account_processor,
             control_endpoint,
             thread_state_manager,
@@ -105,9 +109,13 @@ impl McpRequestProcessor {
         &self,
         _params: Option<()>,
     ) -> Result<McpServerRefreshResponse, JSONRPCErrorError> {
-        crate::mcp_refresh::reload_mcp_config(&self.thread_manager, &self.config_manager)
-            .await
-            .map_err(|err| internal_error(format!("failed to refresh MCP servers: {err}")))?;
+        crate::mcp_refresh::reload_mcp_config(
+            &self.thread_manager,
+            &self.config_manager,
+            &self.applied_mcp_config_identity,
+        )
+        .await
+        .map_err(|err| internal_error(format!("failed to refresh MCP servers: {err}")))?;
         Ok(McpServerRefreshResponse {})
     }
 

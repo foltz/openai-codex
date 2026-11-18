@@ -1314,6 +1314,69 @@ mod tests {
             OutgoingMessageSender::new(outgoing_tx, AnalyticsEventsClient::disabled()),
         ));
 
+        let candidate = manager.created_listener_state(successor_thread_id).await;
+        for owner in [None, Some(ThreadId::new())] {
+            assert!(
+                manager
+                    .subscribe_and_install_listener_with_clear_owner(
+                        successor_thread_id,
+                        &candidate,
+                        &[],
+                        None,
+                        owner,
+                        |_| -> Result<(), ()> {
+                            panic!("non-owner must not install a reserved listener")
+                        },
+                    )
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(
+            manager
+                .subscribe_and_install_listener_with_clear_owner(
+                    successor_thread_id,
+                    &candidate,
+                    &[requester],
+                    None,
+                    Some(predecessor_thread_id),
+                    |_| -> Result<(), ()> {
+                        panic!("clear listener installation must not subscribe")
+                    },
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            manager
+                .subscribe_and_install_listener_with_clear_owner(
+                    successor_thread_id,
+                    &candidate,
+                    &[],
+                    None,
+                    Some(predecessor_thread_id),
+                    |attached| {
+                        assert!(!attached);
+                        Ok::<(), ()>(())
+                    },
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(!manager.has_subscribers(successor_thread_id).await);
+        assert_eq!(
+            manager
+                .state
+                .lock()
+                .await
+                .clear_successor_reservations
+                .get(&successor_thread_id),
+            Some(&predecessor_thread_id)
+        );
+
         assert!(matches!(
             manager
                 .try_ensure_connection_subscribed_for_listener(
@@ -3441,9 +3504,46 @@ impl ThreadStateManager {
         retention: Option<(ConnectionId, ConnectionRetention)>,
         install: impl FnOnce(bool) -> Result<T, E>,
     ) -> Result<Option<(T, watch::Receiver<bool>, bool, ConnectionRetentionOutcome)>, E> {
+        self.subscribe_and_install_listener_with_clear_owner(
+            thread_id,
+            candidate,
+            connection_ids,
+            retention,
+            None,
+            install,
+        )
+        .await
+    }
+
+    /// A clear may install only its reserved successor's listener, without
+    /// exposing a subscription before its durable A -> B move completes.
+    pub(crate) async fn subscribe_and_install_listener_with_clear_owner<T, E>(
+        &self,
+        thread_id: ThreadId,
+        candidate: &ListenerStateCandidate,
+        connection_ids: &[ConnectionId],
+        retention: Option<(ConnectionId, ConnectionRetention)>,
+        clear_predecessor: Option<ThreadId>,
+        install: impl FnOnce(bool) -> Result<T, E>,
+    ) -> Result<Option<(T, watch::Receiver<bool>, bool, ConnectionRetentionOutcome)>, E> {
         let (installed, watcher, attached, change, retained) = {
             let mut state = self.state.lock().await;
-            if state.clear_successor_reservations.contains_key(&thread_id)
+            let clear_authorized = match (
+                state.clear_successor_reservations.get(&thread_id),
+                clear_predecessor,
+            ) {
+                (None, None) => true,
+                (Some(owner), Some(predecessor)) => {
+                    *owner == predecessor
+                        && state
+                            .clear_transition_reservations
+                            .contains_key(&predecessor)
+                        && connection_ids.is_empty()
+                        && retention.is_none()
+                }
+                _ => false,
+            };
+            if !clear_authorized
                 || state
                     .lifecycle
                     .get(&thread_id)

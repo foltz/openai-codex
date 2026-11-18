@@ -192,6 +192,9 @@ struct ListenerStarted;
 
 enum ListenerStartup<'a> {
     Active,
+    ClearSuccessor {
+        predecessor_thread_id: ThreadId,
+    },
     Subscribe {
         connection_id: ConnectionId,
         raw_events_enabled: bool,
@@ -414,6 +417,27 @@ pub(super) async fn ensure_listener_task_running(
     .map(|_| ())
 }
 
+pub(super) async fn ensure_clear_successor_listener_running(
+    listener_task_context: ListenerTaskContext,
+    predecessor_thread_id: ThreadId,
+    successor_thread_id: ThreadId,
+    conversation: Arc<CodexThread>,
+    thread_state: Arc<Mutex<ThreadState>>,
+) -> Result<(), JSONRPCErrorError> {
+    start_listener(
+        listener_task_context,
+        successor_thread_id,
+        conversation,
+        ListenerStateCandidate::Existing(thread_state),
+        ListenerStartup::ClearSuccessor {
+            predecessor_thread_id,
+        },
+    )
+    .await
+    .into_subscription(successor_thread_id)
+    .map(|_| ())
+}
+
 #[expect(
     clippy::await_holding_invalid_type,
     reason = "listener installation and removal must be serialized against subscriptions"
@@ -453,9 +477,17 @@ async fn start_listener(
         } => Some((*connection_id, *retention)),
         _ => None,
     };
+    let clear_predecessor = match &startup {
+        ListenerStartup::ClearSuccessor {
+            predecessor_thread_id,
+        } => Some(*predecessor_thread_id),
+        _ => None,
+    };
     let (mut listener_command_rx, listener_generation, mut unloading_state, attached, retained) = {
         let (created, connection_ids, raw_events_enabled) = match &startup {
-            ListenerStartup::Active => (false, &[][..], false),
+            ListenerStartup::Active | ListenerStartup::ClearSuccessor { .. } => {
+                (false, &[][..], false)
+            }
             ListenerStartup::Subscribe {
                 connection_id,
                 raw_events_enabled,
@@ -519,11 +551,12 @@ async fn start_listener(
         }
         let installed = listener_task_context
             .thread_state_manager
-            .subscribe_and_install_listener_retaining(
+            .subscribe_and_install_listener_with_clear_owner(
                 conversation_id,
                 &listener_state,
                 connection_ids,
                 retention,
+                clear_predecessor,
                 |attached| {
                     let listener_matches = state.listener_matches(&conversation);
                     if !created && conversation.has_shutdown_status() {

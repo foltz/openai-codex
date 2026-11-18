@@ -1759,12 +1759,6 @@ pub(super) async fn start_recording_app_server_with_realtime_speech(
                             }
                         }
                     };
-                    if let JSONRPCMessage::Error(error) = &response {
-                        eprintln!(
-                            "recording app-server request {:?} refused: {:?}",
-                            error.id, error.error
-                        );
-                    }
                     let result = websocket
                         .send(Message::Text(serde_json::to_string(&response)?.into()))
                         .await;

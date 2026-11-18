@@ -502,7 +502,8 @@ impl ThreadRequestProcessor {
             .grant_connection_retention(successor_thread_id, connection_id, retention)
             .await;
         let started = self
-            .ensure_listener_task_running(
+            .ensure_clear_successor_listener_running(
+                predecessor_thread_id,
                 successor_thread_id,
                 successor.thread.clone(),
                 successor_thread_state,

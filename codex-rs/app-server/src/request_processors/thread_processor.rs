@@ -1352,6 +1352,23 @@ impl ThreadRequestProcessor {
         .await
     }
 
+    pub(super) async fn ensure_clear_successor_listener_running(
+        &self,
+        predecessor_thread_id: ThreadId,
+        successor_thread_id: ThreadId,
+        conversation: Arc<CodexThread>,
+        thread_state: Arc<Mutex<ThreadState>>,
+    ) -> Result<(), JSONRPCErrorError> {
+        super::thread_lifecycle::ensure_clear_successor_listener_running(
+            self.listener_task_context(),
+            predecessor_thread_id,
+            successor_thread_id,
+            conversation,
+            thread_state,
+        )
+        .await
+    }
+
     async fn thread_start_inner(
         &self,
         request_id: ConnectionRequestId,

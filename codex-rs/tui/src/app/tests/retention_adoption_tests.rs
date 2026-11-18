@@ -210,3 +210,93 @@ async fn resume_observation_and_provisional_adoption_scenario() -> Result<()> {
     server.shutdown().await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn fork_preparation_keeps_new_grants_provisional_until_installation() -> Result<()> {
+    boxed_future!(fork_preparation_retention_scenario()).await
+}
+
+async fn fork_preparation_retention_scenario() -> Result<()> {
+    for install in [false, true] {
+        let (mut app, _, _) = make_test_app_with_channels().await;
+        app.config
+            .features
+            .set_enabled(codex_features::Feature::Plugins, false)?;
+        let source = ThreadId::from_string(
+            &app_test_support::create_fake_rollout(
+                app.config.codex_home.as_path(),
+                "2026-01-01T00-00-00",
+                "2026-01-01T00:00:00Z",
+                "saved fork source",
+                Some(app.config.model_provider_id.as_str()),
+                None,
+            )
+            .expect("source rollout"),
+        )?;
+        let mut server =
+            boxed_future!(crate::start_embedded_app_server_for_picker(&app.config)).await?;
+        let started = boxed_future!(server.resume_thread(
+            &app.local_settings,
+            app.config.clone(),
+            source,
+            crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
+        ))
+        .await?;
+        app.enqueue_primary_thread_session(started.session, started.turns)
+            .await?;
+        let (forked, retention) = boxed_future!(server.prepare_retained_fork_thread_at(
+            &app.local_settings,
+            app.config.clone(),
+            source,
+            None,
+            None,
+            crate::app_server_session::ForkGoalContinuation::DeferUntilNextTurn,
+            None,
+        ))
+        .await?;
+        let id = forked.session.thread_id;
+        assert_ne!(id, source);
+        assert!(retention.is_some());
+        assert!(matches!(
+            probe(&mut server, id).await?,
+            ThreadRetentionAcquireResponse::AlreadyHeld { .. }
+        ));
+        if install {
+            let mut tui = crate::tui::test_support::make_test_tui()?;
+            boxed_future!(app.replace_chat_widget_with_app_server_thread(
+                &mut tui,
+                forked,
+                super::super::session_lifecycle::ThreadAttachPresentation::SessionLineage,
+                None,
+            ))
+            .await?;
+            assert_eq!(app.current_displayed_thread_id(), Some(id));
+            retention.expect("provisional fork grant").commit();
+            assert!(matches!(
+                probe(&mut server, id).await?,
+                ThreadRetentionAcquireResponse::AlreadyHeld { .. }
+            ));
+        } else {
+            drop(retention);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match probe(&mut server, id).await? {
+                        ThreadRetentionAcquireResponse::Acquired { .. } => {
+                            break Ok::<_, color_eyre::Report>(());
+                        }
+                        ThreadRetentionAcquireResponse::AlreadyHeld { .. } => {
+                            tokio::task::yield_now().await
+                        }
+                        other => panic!("unexpected retention probe: {other:?}"),
+                    }
+                }
+            })
+            .await??;
+            assert_eq!(app.current_displayed_thread_id(), Some(source));
+        }
+        server.thread_unsubscribe(id).await?;
+        server.thread_unsubscribe(source).await?;
+        server.shutdown().await?;
+    }
+    Ok(())
+}

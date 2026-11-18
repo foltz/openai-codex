@@ -16,6 +16,7 @@ enum DestinationConfig {
 /// Session and configuration prepared before the event loop attaches a managed checkout.
 pub(super) struct ManagedWorktreeAttach {
     started: AppServerStartedThread,
+    retention: Option<crate::app_server_session::PendingRetention>,
     config: Box<Config>,
     local_settings: crate::local_settings::LocalSettings,
     keymap: RuntimeKeymap,
@@ -451,7 +452,7 @@ impl App {
         let preserve_history = has_rollout && !is_new_worktree;
         let transitioned = if preserve_history {
             app_server
-                .fork_thread_for_directory_change(
+                .prepare_retained_fork_thread_for_directory_change(
                     &local_settings,
                     config.clone(),
                     thread_id,
@@ -460,7 +461,7 @@ impl App {
                 .await
         } else {
             app_server
-                .start_thread_with_session_start_source(
+                .prepare_retained_thread_start(
                     &local_settings,
                     &config,
                     /*session_start_source*/ None,
@@ -471,7 +472,7 @@ impl App {
                 )
                 .await
         };
-        let mut transitioned = match transitioned {
+        let (mut transitioned, retention) = match transitioned {
             Ok(value) => value,
             Err(e) => return self.working_directory_error(format!("Failed to change: {e}")),
         };
@@ -551,6 +552,7 @@ impl App {
         }
         let attach = ManagedWorktreeAttach {
             started: transitioned,
+            retention,
             config: Box::new(config),
             local_settings,
             keymap,
@@ -576,6 +578,7 @@ impl App {
     ) {
         let ManagedWorktreeAttach {
             started,
+            retention,
             config,
             local_settings,
             keymap,
@@ -597,6 +600,9 @@ impl App {
         let (lineage, message) = (ThreadAttachPresentation::SessionLineage, None);
         if let Err(error) = attach_widget(self, tui, started, lineage, message).await {
             return self.working_directory_error(format!("Could not restore session: {error}"));
+        }
+        if let Some(retention) = retention {
+            retention.commit();
         }
         if selected_profile.is_some() {
             self.adopt_inherited_server_selection();

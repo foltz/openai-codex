@@ -56,8 +56,8 @@ pub(super) async fn continue_with_rewrite(
         config.model_reasoning_effort = app.chat_widget.current_reasoning_effort();
         config.daybreak_enabled = app.chat_widget.daybreak_enabled;
         let selected_profile = app.selected_server_profile(thread_id);
-        let started = app_server
-            .fork_thread_at(
+        let (started, retention) = app_server
+            .prepare_retained_fork_thread_at(
                 &app.local_settings,
                 config.clone(),
                 thread_id,
@@ -101,6 +101,9 @@ pub(super) async fn continue_with_rewrite(
             app.adopt_inherited_server_selection();
         }
         ensure!(!app.thread_unavailable(fork_id), "the fork is unavailable");
+        if let Some(retention) = retention {
+            retention.commit();
+        }
         let turn = app
             .chat_widget
             .prepare_safety_recourse_rewrite(&prompt)

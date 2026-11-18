@@ -115,6 +115,28 @@ async fn check_fork_dispatch(mode: ThreadParamsMode) -> Result<()> {
     .await?;
 
     assert_ne!(app.chat_widget.thread_id(), Some(source_thread_id));
+    assert!(
+        recorded_params(&requests, "thread/fork")
+            .iter()
+            .all(|params| params["retainForConnection"] == true)
+    );
+    let installed = app
+        .current_displayed_thread_id()
+        .expect("fork is displayed");
+    let held: codex_app_server_protocol::ThreadRetentionAcquireResponse = server
+        .request_handle()
+        .request_typed(ClientRequest::ThreadRetentionAcquire {
+            request_id: server.next_request_id(),
+            params: codex_app_server_protocol::ThreadRetentionAcquireParams {
+                thread_id: installed.to_string(),
+            },
+        })
+        .await?;
+    assert!(matches!(
+        held,
+        codex_app_server_protocol::ThreadRetentionAcquireResponse::AlreadyHeld { .. }
+    ));
+
     assert_eq!(app.chat_widget.config_ref().workspace_roots, expected_roots);
     let fork_roots: Vec<_> = recorded_params(&requests, "thread/fork")
         .into_iter()

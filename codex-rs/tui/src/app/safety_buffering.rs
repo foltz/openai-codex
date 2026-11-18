@@ -199,7 +199,7 @@ impl App {
         self.config = retry_config.clone();
         let selected_profile = self.selected_server_profile(thread_id);
         let started = app_server
-            .fork_thread_at(
+            .prepare_retained_fork_thread_at(
                 &self.local_settings,
                 retry_config,
                 thread_id,
@@ -209,7 +209,7 @@ impl App {
                 selected_profile.as_ref(),
             )
             .await;
-        let started = match started {
+        let (started, retention) = match started {
             Ok(started) => started,
             Err(err) => {
                 self.fail_safety_buffered_branch(input_state, prompt, err);
@@ -235,6 +235,9 @@ impl App {
             return;
         }
 
+        if let Some(retention) = retention {
+            retention.commit();
+        }
         if selected_profile.is_some() {
             self.adopt_inherited_server_selection();
         }

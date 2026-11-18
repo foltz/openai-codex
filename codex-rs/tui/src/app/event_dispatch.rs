@@ -663,7 +663,7 @@ impl App {
                     fork_config.model_reasoning_effort =
                         self.chat_widget.current_reasoning_effort();
                     let selected_profile = self.selected_server_profile(thread_id);
-                    match app_server.fork_thread_at(
+                    match app_server.prepare_retained_fork_thread_at(
                         &self.local_settings,
                         fork_config,
                         thread_id,
@@ -672,7 +672,7 @@ impl App {
                         ForkGoalContinuation::StartIfIdle,
                         selected_profile.as_ref(),
                     ).await {
-                        Ok(mut forked) => {
+                        Ok((mut forked, retention)) => {
                             let retained_input = from_locked_thread
                                 .then(|| self.chat_widget.capture_thread_input_state())
                                 .flatten();
@@ -703,6 +703,7 @@ impl App {
                                 .await
                             {
                                 Ok(()) => {
+                                    if let Some(retention) = retention { retention.commit(); }
                                     if selected_profile.is_some() {
                                         self.adopt_inherited_server_selection();
                                     }

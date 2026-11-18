@@ -1353,6 +1353,86 @@ impl AppServerSession {
         Ok((started, retention))
     }
 
+    pub(crate) async fn prepare_retained_fork_thread_with_permission_mode(
+        &mut self,
+        local_settings: &LocalSettings,
+        config: Config,
+        thread_id: ThreadId,
+        permission_mode: ForkPermissionMode,
+    ) -> Result<(AppServerStartedThread, Option<PendingRetention>)> {
+        self.fork_thread_at_with_presentation(
+            local_settings,
+            config,
+            thread_id,
+            /*last_turn_id*/ None,
+            /*before_turn_id*/ None,
+            ForkGoalContinuation::StartIfIdle,
+            ForkPresentation::Regular,
+            /*selected_profile*/ None,
+            permission_mode,
+            ForkConfigSource::Local,
+            /*adopt*/ true,
+        )
+        .await
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "preserve the existing fork preparation arguments"
+    )]
+    pub(crate) async fn prepare_retained_fork_thread_at(
+        &mut self,
+        local_settings: &LocalSettings,
+        config: Config,
+        thread_id: ThreadId,
+        last_turn_id: Option<String>,
+        before_turn_id: Option<String>,
+        goal_continuation: ForkGoalContinuation,
+        selected_profile: Option<&PermissionProfileSelection>,
+    ) -> Result<(AppServerStartedThread, Option<PendingRetention>)> {
+        self.fork_thread_at_with_presentation(
+            local_settings,
+            config,
+            thread_id,
+            last_turn_id,
+            before_turn_id,
+            goal_continuation,
+            ForkPresentation::Regular,
+            selected_profile,
+            ForkPermissionMode::InheritSaved,
+            ForkConfigSource::Session,
+            /*adopt*/ true,
+        )
+        .await
+    }
+
+    pub(crate) async fn prepare_retained_fork_thread_for_directory_change(
+        &mut self,
+        local_settings: &LocalSettings,
+        config: Config,
+        thread_id: ThreadId,
+        selected_profile: Option<&PermissionProfileSelection>,
+    ) -> Result<(AppServerStartedThread, Option<PendingRetention>)> {
+        let permission_mode = match self.thread_params_mode() {
+            ThreadParamsMode::Embedded => ForkPermissionMode::OverrideFromCurrentConfig,
+            ThreadParamsMode::Remote | ThreadParamsMode::Cloud => ForkPermissionMode::InheritSaved,
+        };
+        self.fork_thread_at_with_presentation(
+            local_settings,
+            config,
+            thread_id,
+            /*last_turn_id*/ None,
+            /*before_turn_id*/ None,
+            ForkGoalContinuation::DeferUntilNextTurn,
+            ForkPresentation::Regular,
+            selected_profile,
+            permission_mode,
+            ForkConfigSource::Session,
+            /*adopt*/ true,
+        )
+        .await
+    }
+
     #[cfg(test)]
     pub(crate) async fn fork_thread(
         &mut self,
@@ -1387,8 +1467,10 @@ impl AppServerSession {
             /*selected_profile*/ None,
             permission_mode,
             ForkConfigSource::Local,
+            /*adopt*/ false,
         )
         .await
+        .map(|(thread, _retention)| thread)
     }
 
     #[expect(
@@ -1416,8 +1498,10 @@ impl AppServerSession {
             selected_profile,
             ForkPermissionMode::InheritSaved,
             ForkConfigSource::Session,
+            /*adopt*/ false,
         )
         .await
+        .map(|(thread, _retention)| thread)
     }
 
     pub(crate) async fn fork_thread_for_directory_change(
@@ -1442,8 +1526,10 @@ impl AppServerSession {
             selected_profile,
             permission_mode,
             ForkConfigSource::Session,
+            /*adopt*/ false,
         )
         .await
+        .map(|(thread, _retention)| thread)
     }
 
     /// Fork and inject the side boundary on a request-only view. The live session
@@ -1549,8 +1635,10 @@ impl AppServerSession {
             selected_profile,
             ForkPermissionMode::InheritSaved,
             ForkConfigSource::Session,
+            /*adopt*/ false,
         )
         .await
+        .map(|(thread, _retention)| thread)
     }
 
     #[expect(
@@ -1569,7 +1657,9 @@ impl AppServerSession {
         selected_profile: Option<&PermissionProfileSelection>,
         permission_mode: ForkPermissionMode,
         config_source: ForkConfigSource,
-    ) -> Result<AppServerStartedThread> {
+        adopt: bool,
+    ) -> Result<(AppServerStartedThread, Option<PendingRetention>)> {
+        let adopt = adopt && presentation == ForkPresentation::Regular && !config.ephemeral;
         if self.thread_params_mode == ThreadParamsMode::Cloud {
             color_eyre::eyre::bail!("Cloud conversations cannot be forked in the TUI yet.");
         }
@@ -1609,6 +1699,7 @@ impl AppServerSession {
                 self.remote_cwd_override.as_deref(),
             )
         };
+        params.retain_for_connection = adopt;
         if params.attach_to_source {
             params.thread_source =
                 Some(ThreadSource::Feature(ATTACHED_SIDE_CHAT_SOURCE.to_string()));
@@ -1682,6 +1773,25 @@ impl AppServerSession {
             }
         };
         let mut response = response;
+        let retention = if adopt {
+            match self
+                .retention
+                .adopt_thread(
+                    self.request_handle(),
+                    response.thread.id.clone(),
+                    response.retention.clone(),
+                )
+                .await
+            {
+                Ok(retention) => Some(retention),
+                Err(error) => {
+                    self.retention.warn_adoption(&response.thread.id, &error);
+                    None
+                }
+            }
+        } else {
+            None
+        };
         if presentation == ForkPresentation::Regular
             && !response.thread.ephemeral
             && let Err(error) = self
@@ -1726,7 +1836,7 @@ impl AppServerSession {
             started.task_tools_available = true;
             self.remember_task_tool_thread(started.session.thread_id);
         }
-        Ok(started)
+        Ok((started, retention))
     }
 
     pub(crate) fn thread_params_mode(&self) -> ThreadParamsMode {

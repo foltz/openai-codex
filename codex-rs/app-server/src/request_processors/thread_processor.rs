@@ -4674,9 +4674,8 @@ impl ThreadRequestProcessor {
                 // Config loading can call back into Desktop; release both locks during host work.
                 drop(_goal_resume_guard);
                 drop(_thread_list_state_permit);
-                let config = self
-                    .config_manager
-                    .load_for_resume(
+                let config = box_thread_start_future(|| {
+                    self.config_manager.load_for_resume(
                         resume_source_thread
                             .as_ref()
                             .map(|thread| thread.model_provider.as_str())
@@ -4702,8 +4701,9 @@ impl ThreadRequestProcessor {
                         typesafe_overrides,
                         history_cwd,
                     )
-                    .await
-                    .map_err(|err| config_load_error(&err))?;
+                })
+                .await
+                .map_err(|err| config_load_error(&err))?;
                 *prepared_config = Some(PreparedResumeConfig {
                     state: config_state,
                     config,

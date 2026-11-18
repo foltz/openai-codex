@@ -2,6 +2,7 @@ use crate::exec::ExecCapturePolicy;
 use crate::exec::ExecExpiration;
 use crate::sandboxing::ExecOptions;
 use crate::sandboxing::ExecRequest;
+use crate::sandboxing::cleanup_census::SandboxCleanupCensus;
 use crate::sandboxing::execute_env;
 use crate::tools::sandboxing::SandboxAttempt;
 use anyhow::Context;
@@ -15,6 +16,7 @@ use codex_protocol::error::SandboxErr;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::FileSystemPermissions;
 use codex_protocol::models::PermissionProfile;
+use codex_sandboxing::CleanupDeadlineScope;
 use codex_sandboxing::SandboxCommand;
 use codex_sandboxing::SandboxManager;
 use codex_sandboxing::SandboxSelection;
@@ -25,6 +27,7 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -35,6 +38,8 @@ mod tests;
 #[derive(Clone)]
 pub(crate) struct ShellSnapshotSandbox {
     sandbox: SandboxType,
+    sandbox_cleanup_scope: Option<CleanupDeadlineScope>,
+    sandbox_cleanup_census: Option<Arc<SandboxCleanupCensus>>,
     sandbox_requested: bool,
     permissions: PermissionProfile,
     enforce_managed_network: bool,
@@ -79,6 +84,8 @@ impl ShellSnapshotSandbox {
     ) -> Self {
         Self {
             sandbox: attempt.sandbox,
+            sandbox_cleanup_scope: None,
+            sandbox_cleanup_census: None,
             sandbox_requested: attempt.sandbox_requested,
             permissions: attempt.permissions.clone(),
             enforce_managed_network: attempt.enforce_managed_network,
@@ -92,6 +99,16 @@ impl ShellSnapshotSandbox {
             additional_permissions: additional_permissions.cloned(),
             network_denial_cancellation_token: attempt.network_denial_cancellation_token.clone(),
         }
+    }
+
+    pub(crate) fn with_sandbox_cleanup(
+        mut self,
+        scope: CleanupDeadlineScope,
+        census: Arc<SandboxCleanupCensus>,
+    ) -> Self {
+        self.sandbox_cleanup_scope = Some(scope);
+        self.sandbox_cleanup_census = Some(census);
+        self
     }
 
     pub(crate) fn cache_key(&self) -> Result<String> {
@@ -193,7 +210,7 @@ impl ShellSnapshotSandbox {
             timeout: snapshot_timeout,
             cancellation,
         };
-        let request = ExecRequest::from_sandbox_exec_request(
+        let mut request = ExecRequest::from_sandbox_exec_request(
             request,
             ExecOptions {
                 expiration,
@@ -203,6 +220,8 @@ impl ShellSnapshotSandbox {
         )
         .await
         .context("failed to prepare shell snapshot execution")?;
+        request.sandbox_cleanup_scope = self.sandbox_cleanup_scope.clone();
+        request.sandbox_cleanup_census = self.sandbox_cleanup_census.clone();
         // Caller cancellation must leave execution alive long enough to clean up its process group.
         let output = tokio::spawn(execute_env(request, /*stdout_stream*/ None))
             .await

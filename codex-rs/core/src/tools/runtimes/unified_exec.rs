@@ -279,12 +279,18 @@ impl<'a> ToolRuntime<UnifiedExecRequest<'_>, UnifiedExecAttempt> for UnifiedExec
                     base_command,
                     shell,
                     &ctx.step_context.turn.config,
-                    Some(ShellSnapshotSandbox::new(
-                        attempt,
-                        managed_network,
-                        &prepared.turn_environment.selection.environment_id,
-                        prepared.permissions.additional_permissions.as_ref(),
-                    )),
+                    Some(
+                        ShellSnapshotSandbox::new(
+                            attempt,
+                            managed_network,
+                            &prepared.turn_environment.selection.environment_id,
+                            prepared.permissions.additional_permissions.as_ref(),
+                        )
+                        .with_sandbox_cleanup(
+                            ctx.session.services.sandbox_cleanup_scope().clone(),
+                            Arc::clone(ctx.session.services.sandbox_cleanup_census()),
+                        ),
+                    ),
                 )
                 .await
         };

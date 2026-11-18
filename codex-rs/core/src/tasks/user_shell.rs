@@ -215,6 +215,8 @@ pub(crate) async fn execute_user_shell_command(
         env: exec_env_map,
         exec_server_env_config: None,
         exec_server_shell_snapshot: None,
+        sandbox_cleanup_scope: None,
+        sandbox_cleanup_census: None,
         // `/shell` is the explicit full-access escape hatch, so it must not
         // inherit a managed proxy from the surrounding session or turn.
         network: None,

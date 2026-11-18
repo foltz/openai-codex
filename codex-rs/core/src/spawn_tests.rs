@@ -21,6 +21,7 @@ async fn spawn_trace_omits_sensitive_inputs() -> std::io::Result<()> {
         network_sandbox_policy: NetworkSandboxPolicy::Enabled,
         network: None,
         stdio_policy: StdioPolicy::RedirectForShellTool,
+        inherited_fds: Vec::new(),
         env: HashMap::from([("SETTING".into(), "canary-env-value".into())]),
     })
     .await;

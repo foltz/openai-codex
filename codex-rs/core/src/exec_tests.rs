@@ -389,6 +389,8 @@ async fn full_buffer_expiration_cleans_up_after_leader_exit(
         expiration,
         capture_policy,
         /*stdout_stream*/ None,
+        None,
+        None,
     );
     let after_leader_exit = async {
         timeout(Duration::from_secs(5), async {
@@ -462,6 +464,8 @@ async fn full_buffer_expiration_preserves_successful_background_startup() -> any
         ExecExpiration::Timeout(Duration::from_secs(5)),
         ExecCapturePolicy::FullBufferWithExpiration,
         /*stdout_stream*/ None,
+        None,
+        None,
     )
     .await?;
     assert!(output.exit_status.success());
@@ -1660,4 +1664,60 @@ fn long_running_command() -> Vec<String> {
         "-Command".to_string(),
         "Start-Sleep -Seconds 30".to_string(),
     ]
+}
+
+#[test]
+fn sandbox_cleanup_deadline_is_command_timeout_plus_drain() {
+    let start = Instant::now();
+    let drain = Duration::from_millis(IO_DRAIN_TIMEOUT_MS);
+    assert_eq!(
+        sandbox_cleanup_deadline(
+            &ExecExpiration::Timeout(Duration::from_secs(5)),
+            ExecCapturePolicy::ShellTool,
+            start,
+        ),
+        Some(start + Duration::from_secs(5) + drain)
+    );
+    assert_eq!(
+        sandbox_cleanup_deadline(
+            &ExecExpiration::DefaultTimeout,
+            ExecCapturePolicy::SensitiveFullBuffer,
+            start,
+        ),
+        Some(start + Duration::from_millis(DEFAULT_EXEC_COMMAND_TIMEOUT_MS) + drain)
+    );
+    assert_eq!(
+        sandbox_cleanup_deadline(
+            &ExecExpiration::TimeoutOrCancellation {
+                timeout: Duration::from_secs(7),
+                cancellation: CancellationToken::new(),
+            },
+            ExecCapturePolicy::FullBufferWithExpiration,
+            start,
+        ),
+        Some(start + Duration::from_secs(7) + drain)
+    );
+}
+
+#[test]
+fn sandbox_cleanup_deadline_is_none_without_an_original_deadline() {
+    let start = Instant::now();
+    // Cancellation-only: the owner has no original retirement deadline.
+    assert_eq!(
+        sandbox_cleanup_deadline(
+            &ExecExpiration::Cancellation(CancellationToken::new()),
+            ExecCapturePolicy::ShellTool,
+            start,
+        ),
+        None
+    );
+    // A capture that ignores expiration never retires on the timeout.
+    assert_eq!(
+        sandbox_cleanup_deadline(
+            &ExecExpiration::Timeout(Duration::from_secs(5)),
+            ExecCapturePolicy::FullBuffer,
+            start,
+        ),
+        None
+    );
 }

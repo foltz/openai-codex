@@ -1323,6 +1323,10 @@ impl UnifiedExecProcessManager {
         let missing_remote_proxy =
             environment.is_remote() && network.is_some() && network_proxy_launch.is_none();
         let request = ExecRequest {
+            sandbox_cleanup_scope: Some(tool_ctx.session.services.sandbox_cleanup_scope().clone()),
+            sandbox_cleanup_census: Some(Arc::clone(
+                tool_ctx.session.services.sandbox_cleanup_census(),
+            )),
             exec_server_enforce_managed_network: request.exec_server_enforce_managed_network
                 && !missing_remote_proxy,
             exec_server_network_proxy: network_proxy_launch,

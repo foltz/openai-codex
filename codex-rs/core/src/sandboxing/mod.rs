@@ -9,6 +9,7 @@ the exec-only metadata and translates transformed sandbox commands back into
 ExecRequest for execution.
 */
 
+use self::cleanup_census::SandboxCleanupCensus;
 use crate::exec::ExecCapturePolicy;
 use crate::exec::ExecExpiration;
 use crate::exec::StdoutStream;
@@ -25,6 +26,7 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::models::PermissionProfile;
 pub use codex_protocol::models::SandboxPermissions;
+use codex_sandboxing::CleanupDeadlineScope;
 use codex_sandboxing::SandboxExecRequest;
 use codex_sandboxing::SandboxType;
 use codex_sandboxing::WindowsSandboxFilesystemOverrides;
@@ -32,6 +34,7 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use codex_utils_string::truncate_middle_with_token_budget;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub(crate) struct ExecOptions {
@@ -57,6 +60,8 @@ pub struct ExecRequest {
     pub expiration: ExecExpiration,
     pub capture_policy: ExecCapturePolicy,
     pub sandbox: SandboxType,
+    pub(crate) sandbox_cleanup_scope: Option<CleanupDeadlineScope>,
+    pub(crate) sandbox_cleanup_census: Option<Arc<SandboxCleanupCensus>>,
     pub windows_sandbox_policy_cwd: PathUri,
     pub windows_sandbox_workspace_roots: Vec<AbsolutePathBuf>,
     // TODO(anp): Reconcile these backend copies with TurnEnvironment::sandbox_context
@@ -95,6 +100,8 @@ impl ExecRequest {
             env,
             exec_server_env_config: None,
             exec_server_shell_snapshot: None,
+            sandbox_cleanup_scope: None,
+            sandbox_cleanup_census: None,
             network,
             network_environment_id,
             expiration,
@@ -173,6 +180,8 @@ impl ExecRequest {
             env,
             exec_server_env_config: None,
             exec_server_shell_snapshot: None,
+            sandbox_cleanup_scope: None,
+            sandbox_cleanup_census: None,
             network,
             network_environment_id,
             expiration,

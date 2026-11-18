@@ -224,6 +224,8 @@ fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
             ]),
         }),
         exec_server_shell_snapshot: None,
+        sandbox_cleanup_scope: None,
+        sandbox_cleanup_census: None,
         network: None,
         network_environment_id: None,
         expiration: crate::exec::ExecExpiration::DefaultTimeout,

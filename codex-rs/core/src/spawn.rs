@@ -47,6 +47,7 @@ pub(crate) struct SpawnChildRequest<'a> {
     pub network: Option<&'a NetworkProxy>,
     pub stdio_policy: StdioPolicy,
     pub env: HashMap<String, String>,
+    pub inherited_fds: Vec<i32>,
 }
 
 pub(crate) async fn spawn_child_async(request: SpawnChildRequest<'_>) -> std::io::Result<Child> {
@@ -59,7 +60,14 @@ pub(crate) async fn spawn_child_async(request: SpawnChildRequest<'_>) -> std::io
         network,
         stdio_policy,
         mut env,
+        inherited_fds,
     } = request;
+
+    #[cfg(not(target_os = "linux"))]
+    debug_assert!(
+        inherited_fds.is_empty(),
+        "cleanup descriptors are Linux-only"
+    );
 
     env.retain(|name, _| !is_non_inheritable_env_var(name));
 
@@ -112,6 +120,14 @@ pub(crate) async fn spawn_child_async(request: SpawnChildRequest<'_>) -> std::io
             // This relies on prctl(2), so it only works on Linux.
             #[cfg(target_os = "linux")]
             {
+                // Only the launcher inherits these owned cleanup descriptors.
+                // Preserve unrelated descriptor flags, clearing CLOEXEC only.
+                for fd in &inherited_fds {
+                    let flags = libc::fcntl(*fd, libc::F_GETFD);
+                    if flags < 0 || libc::fcntl(*fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
                 // This prctl call effectively requests, "deliver SIGTERM when my
                 // current parent dies."
                 codex_utils_pty::process_group::set_parent_death_signal(parent_pid)?;

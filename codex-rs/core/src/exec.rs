@@ -7,6 +7,7 @@ use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitStatus;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -20,15 +21,18 @@ use tokio_util::sync::CancellationToken;
 use crate::sandboxing::ExecOptions;
 use crate::sandboxing::ExecRequest;
 use crate::sandboxing::SandboxPermissions;
+use crate::sandboxing::cleanup_census::{SandboxCleanupCensus, SandboxCleanupOperation};
 use crate::spawn::SpawnChildRequest;
 use crate::spawn::StdioPolicy;
 use crate::spawn::spawn_child_async;
+use codex_file_system::SandboxLaunch;
 use codex_network_proxy::NetworkProxy;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
 use codex_protocol::error::SandboxErr;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::exec_output::StreamOutput;
+use codex_protocol::exec_output::{SandboxCleanupState, SandboxCleanupSummary};
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::Event;
@@ -52,6 +56,7 @@ use codex_sandboxing::resolve_windows_elevated_filesystem_overrides;
 use codex_sandboxing::resolve_windows_restricted_token_filesystem_overrides;
 #[cfg(any(test, target_os = "windows"))]
 use codex_sandboxing::windows_sandbox_uses_elevated_backend;
+use codex_sandboxing::{CleanupDeadlineScope, SandboxCleanupCustody};
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use codex_utils_pty::DEFAULT_OUTPUT_BYTES_CAP;
@@ -458,6 +463,8 @@ pub(crate) async fn execute_exec_request(
         env,
         exec_server_env_config: _,
         exec_server_shell_snapshot: _,
+        sandbox_cleanup_scope,
+        sandbox_cleanup_census,
         network,
         expiration,
         capture_policy,
@@ -506,6 +513,8 @@ pub(crate) async fn execute_exec_request(
         stdout_stream,
         after_spawn,
         sandbox,
+        sandbox_cleanup_scope.as_ref(),
+        sandbox_cleanup_census,
         &permission_profile,
         &windows_sandbox_policy_cwd,
         &windows_sandbox_workspace_roots,
@@ -522,7 +531,9 @@ async fn get_raw_output_result(
     network_sandbox_policy: NetworkSandboxPolicy,
     stdout_stream: Option<StdoutStream>,
     after_spawn: Option<Box<dyn FnOnce() + Send>>,
-    #[cfg_attr(not(windows), allow(unused_variables))] sandbox: SandboxType,
+    sandbox: SandboxType,
+    sandbox_cleanup_scope: Option<&CleanupDeadlineScope>,
+    sandbox_cleanup_census: Option<Arc<SandboxCleanupCensus>>,
     #[cfg_attr(not(windows), allow(unused_variables))] permission_profile: &PermissionProfile,
     #[cfg_attr(not(windows), allow(unused_variables))] windows_sandbox_policy_cwd: &AbsolutePathBuf,
     #[cfg_attr(not(windows), allow(unused_variables))]
@@ -543,7 +554,16 @@ async fn get_raw_output_result(
         .await;
     }
 
-    exec(params, network_sandbox_policy, stdout_stream, after_spawn).await
+    exec(
+        params,
+        network_sandbox_policy,
+        stdout_stream,
+        after_spawn,
+        sandbox,
+        sandbox_cleanup_scope,
+        sandbox_cleanup_census,
+    )
+    .await
 }
 
 #[cfg(target_os = "windows")]
@@ -928,9 +948,12 @@ async fn exec(
     network_sandbox_policy: NetworkSandboxPolicy,
     stdout_stream: Option<StdoutStream>,
     after_spawn: Option<Box<dyn FnOnce() + Send>>,
+    sandbox: SandboxType,
+    sandbox_cleanup_scope: Option<&CleanupDeadlineScope>,
+    sandbox_cleanup_census: Option<Arc<SandboxCleanupCensus>>,
 ) -> Result<RawExecToolCallOutput> {
     let ExecParams {
-        command,
+        mut command,
         cwd,
         mut env,
         network,
@@ -954,14 +977,42 @@ async fn exec(
             })?;
     }
 
-    let (program, args) = command.split_first().ok_or_else(|| {
-        CodexErr::Io(io::Error::new(
+    if command.is_empty() {
+        return Err(CodexErr::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
             "command args are empty",
-        ))
-    })?;
+        )));
+    }
+    let inner = SandboxCleanupCustody::for_launch(
+        sandbox,
+        sandbox_cleanup_deadline(&expiration, capture_policy, Instant::now()),
+        sandbox_cleanup_scope,
+    )?;
+    let operation = if inner.is_some() {
+        sandbox_cleanup_census.map(|census| SandboxCleanupOperation::new(census, true))
+    } else {
+        None
+    };
+    let mut cleanup = ExecCleanupCustody {
+        custody: inner,
+        sandbox_cleanup_scope,
+        operation,
+    };
+    if let Some(custody) = cleanup.custody.as_mut()
+        && let Err(error) = custody.attach_to_launcher_argv(&mut command)
+    {
+        custody.spawned(None);
+        cleanup.finish(SandboxLaunch::NotLaunched).await;
+        return Err(error.into());
+    }
+    let inherited_fds = cleanup
+        .custody
+        .as_ref()
+        .map(SandboxCleanupCustody::inherited_fds)
+        .unwrap_or_default();
+    let (program, args) = command.split_first().expect("validated nonempty command");
     let arg0_ref = arg0.as_deref();
-    let child = spawn_child_async(SpawnChildRequest {
+    let spawned = spawn_child_async(SpawnChildRequest {
         program: PathBuf::from(program),
         args: args.into(),
         arg0: arg0_ref,
@@ -973,12 +1024,135 @@ async fn exec(
         network: None,
         stdio_policy: StdioPolicy::RedirectForShellTool,
         env,
+        inherited_fds,
     })
-    .await?;
+    .await;
+    // Pin before waiting/reaping, and release parent child-side descriptors
+    // on failure as well as success.
+    if let Some(custody) = cleanup.custody.as_mut() {
+        custody.spawned(spawned.as_ref().ok().and_then(Child::id));
+    }
+    let child = match spawned {
+        Ok(child) => child,
+        Err(error) => {
+            cleanup.finish(SandboxLaunch::NotLaunched).await;
+            return Err(error.into());
+        }
+    };
     if let Some(after_spawn) = after_spawn {
         after_spawn();
     }
-    consume_output(child, expiration, capture_policy, stdout_stream).await
+    let result = consume_output(
+        child,
+        expiration,
+        capture_policy,
+        stdout_stream,
+        cleanup.custody.as_ref(),
+        sandbox_cleanup_scope,
+    )
+    .await;
+    cleanup.finish(SandboxLaunch::Launched).await;
+    result
+}
+
+/// Holds an exec's custody until it is collected. If the exec future is
+/// dropped first (its caller stopped waiting) while this process is still
+/// alive, the launch is retired with the output drain budget, or keeps the
+/// session's latched retirement deadline, before custody is given up. This
+/// is a live owner's budget, not a death-time one: nothing here runs if the
+/// owner process dies, and the launcher then sees the bare pipe EOF.
+struct ExecCleanupCustody<'a> {
+    custody: Option<SandboxCleanupCustody>,
+    sandbox_cleanup_scope: Option<&'a CleanupDeadlineScope>,
+    operation: Option<SandboxCleanupOperation>,
+}
+
+impl Drop for ExecCleanupCustody<'_> {
+    fn drop(&mut self) {
+        tighten_unless_retiring(
+            self.custody.as_ref(),
+            self.sandbox_cleanup_scope,
+            Instant::now() + Duration::from_millis(IO_DRAIN_TIMEOUT_MS),
+        );
+    }
+}
+
+/// The exec's original cleanup deadline: its command expiration plus the
+/// output drain this owner grants afterwards. Cancellation-only and
+/// non-expiring captures have no original deadline; only a later
+/// cancellation, interrupt, or session retirement tightens one.
+fn sandbox_cleanup_deadline(
+    expiration: &ExecExpiration,
+    capture_policy: ExecCapturePolicy,
+    spawn_start: Instant,
+) -> Option<Instant> {
+    if !capture_policy.uses_expiration() {
+        return None;
+    }
+    let timeout = match expiration {
+        ExecExpiration::Timeout(timeout)
+        | ExecExpiration::TimeoutOrCancellation { timeout, .. } => *timeout,
+        ExecExpiration::DefaultTimeout => Duration::from_millis(DEFAULT_EXEC_COMMAND_TIMEOUT_MS),
+        ExecExpiration::Cancellation(_) => return None,
+    };
+    spawn_start
+        .checked_add(timeout)
+        .and_then(|deadline| deadline.checked_add(Duration::from_millis(IO_DRAIN_TIMEOUT_MS)))
+}
+
+/// Deadline an explicit cancellation grants the launch's cleanup: the
+/// termination grace this owner already gives the process group, plus the
+/// output drain. It only tightens; it never extends the original deadline.
+fn sandbox_cleanup_cancellation_deadline(now: Instant) -> Instant {
+    now + CANCELLATION_TERMINATION_GRACE_PERIOD + Duration::from_millis(IO_DRAIN_TIMEOUT_MS)
+}
+
+/// Applies an owner budget (cancellation or interrupt) to the launch's
+/// cleanup deadline, unless its session is retiring: then the latched
+/// retirement deadline, which already reaches the custody through the scope,
+/// is the budget, and a fresh one could only cut it.
+fn tighten_unless_retiring(
+    custody: Option<&SandboxCleanupCustody>,
+    sandbox_cleanup_scope: Option<&CleanupDeadlineScope>,
+    deadline: Instant,
+) {
+    let Some(custody) = custody else {
+        return;
+    };
+    if sandbox_cleanup_scope
+        .and_then(CleanupDeadlineScope::latched)
+        .is_some()
+    {
+        return;
+    }
+    custody.tighten(deadline);
+}
+
+/// Collects the launch report in this process. A launch that still has no
+/// cleanup deadline is retired now with the same drain budget as the output.
+async fn collect_sandbox_cleanup(custody: SandboxCleanupCustody) -> SandboxCleanupSummary {
+    let summary = custody
+        .collect(Duration::from_millis(IO_DRAIN_TIMEOUT_MS))
+        .await;
+    if summary.state != SandboxCleanupState::Complete {
+        tracing::warn!(?summary, "sandbox synthetic mount cleanup did not complete");
+    }
+    summary
+}
+
+impl ExecCleanupCustody<'_> {
+    async fn finish(&mut self, launch: SandboxLaunch) {
+        let custody = self.custody.take();
+        // A refused argv or failed spawn cannot have executed the launcher.
+        // Waiting for its nonexistent helper declaration would invent work.
+        let summary = match (launch, custody) {
+            (SandboxLaunch::NotLaunched, _) | (_, None) => None,
+            (_, Some(custody)) => Some(collect_sandbox_cleanup(custody).await),
+        };
+        if let Some(operation) = self.operation.take() {
+            operation.finish(launch, summary);
+        }
+    }
 }
 
 /// Consumes the output of a child process according to the configured capture
@@ -988,6 +1162,8 @@ async fn consume_output(
     expiration: ExecExpiration,
     capture_policy: ExecCapturePolicy,
     stdout_stream: Option<StdoutStream>,
+    custody: Option<&SandboxCleanupCustody>,
+    sandbox_cleanup_scope: Option<&CleanupDeadlineScope>,
 ) -> Result<RawExecToolCallOutput> {
     // Both stdout and stderr were configured with `Stdio::piped()`
     // above, therefore `take()` should normally return `Some`.  If it doesn't
@@ -1045,6 +1221,7 @@ async fn consume_output(
                     )
                 }
                 Some(ExecExpirationOutcome::Cancelled) => {
+                    tighten_unless_retiring(custody, sandbox_cleanup_scope, sandbox_cleanup_cancellation_deadline(Instant::now()));
                     // Let TERM-aware processes run cleanup briefly, then kill any
                     // remaining members of the original process group.
                     let process_group_id = child.id();
@@ -1080,6 +1257,7 @@ async fn consume_output(
             }
         }
         _ = tokio::signal::ctrl_c() => {
+            tighten_unless_retiring(custody, sandbox_cleanup_scope, Instant::now() + Duration::from_millis(IO_DRAIN_TIMEOUT_MS));
             kill_child_process_group(&mut child)?;
             child.start_kill()?;
             (synthetic_exit_status(EXIT_CODE_SIGNAL_BASE + SIGKILL_CODE), false)
@@ -1138,6 +1316,7 @@ async fn consume_output(
                         timed_out = true;
                     }
                     Some(ExecExpirationOutcome::Cancelled) => {
+                        tighten_unless_retiring(custody, sandbox_cleanup_scope, sandbox_cleanup_cancellation_deadline(Instant::now()));
                         exit_status = synthetic_exit_status_for_code(/*code*/ 1);
                     }
                     None => unreachable!("full-buffer capture always uses expiration"),

@@ -95,8 +95,8 @@ impl FinalExit {
     }
 }
 
-/// Latch every remote synchronously, then perform teardown and close in two
-/// concurrent phases. Earlier close results retain their shared server Arc
+/// Latch every remote synchronously, then perform each session's teardown and close
+/// concurrently with the other sessions. Earlier close results retain their shared server Arc
 /// until every backend close is observed. No phase gets a fresh budget.
 pub(crate) async fn final_exit_sessions(
     sessions: impl IntoIterator<Item = AppServerSession>,
@@ -111,27 +111,19 @@ pub(crate) async fn final_exit_sessions(
     for session in &sessions {
         session.begin_final_exit(deadline);
     }
-    // 03's retention release extends this teardown phase, through the same
-    // latched handles and deadline; no retention traffic is assumed here.
-    let hosted = futures::future::join_all(
-        sessions
-            .iter()
-            .map(|session| session.final_exit_teardown(deadline)),
-    )
-    .await;
-    let ids = sessions
-        .iter()
-        .map(AppServerSession::backend_id)
-        .collect::<Vec<_>>();
-    let closes = futures::future::join_all(
-        sessions
-            .into_iter()
-            .map(|session| session.close_by(deadline)),
-    )
+    // 03's retention release extends each session's teardown, through the
+    // same latched handles and deadline. One stalled retirement must not stop
+    // an unrelated session from closing while its deadline is still live.
+    let closes = futures::future::join_all(sessions.into_iter().map(|session| async move {
+        let id = session.backend_id();
+        let hosted = session.final_exit_teardown(deadline).await;
+        let (close, server) = session.close_by(deadline).await;
+        (id, hosted, close, server)
+    }))
     .await;
     let mut servers = Vec::new();
     let mut entries = Vec::new();
-    for ((id, hosted), (close, server)) in ids.into_iter().zip(hosted).zip(closes) {
+    for (id, hosted, close, server) in closes {
         servers.push(server);
         entries.push((id, hosted, close));
     }

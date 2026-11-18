@@ -13,10 +13,47 @@ use super::*;
 use crate::session_start::SessionStartAction;
 use crate::session_start::SessionStartConfig;
 use crate::session_start::SessionStartOutcome;
-use crate::session_start::cancel_session_start;
 use crate::session_start::complete_session_start;
 use crate::unarchive_prompt::run_unarchive_prompt;
 use color_eyre::eyre::ContextCompat;
+
+pub(super) async fn shutdown_startup_sessions(
+    sessions: impl IntoIterator<Item = AppServerSession>,
+) {
+    let exit = crate::app_server_session::final_exit_sessions(
+        sessions,
+        crate::app_server_session::FINAL_EXIT_BUDGET,
+    )
+    .await;
+    exit.report();
+    if let Err(shutdown_error) = exit.into_result() {
+        tracing::warn!("app-server shutdown failed: {shutdown_error}");
+    }
+}
+
+pub(super) async fn shutdown_on_startup_error(
+    app_server: AppServerSession,
+    other_backends: &mut Vec<AppServerSession>,
+    error: impl Into<color_eyre::eyre::Report>,
+) -> Result<AppExitInfo> {
+    shutdown_startup_sessions(std::iter::once(app_server).chain(other_backends.drain(..))).await;
+    Err(error.into())
+}
+
+pub(super) async fn cancel_startup_sessions(
+    app_server: AppServerSession,
+    other_backends: &mut Vec<AppServerSession>,
+) -> AppExitInfo {
+    shutdown_startup_sessions(std::iter::once(app_server).chain(other_backends.drain(..))).await;
+    AppExitInfo {
+        token_usage: Default::default(),
+        thread_id: None,
+        resume_hint: None,
+        disconnect_info: None,
+        update_action: None,
+        exit_reason: ExitReason::UserRequested,
+    }
+}
 
 fn spawn_startup_thread_start(
     app_server: &AppServerSession,
@@ -274,37 +311,6 @@ impl App {
         daemon_cli_executable: Option<AbsolutePathBuf>,
     ) -> Result<AppExitInfo> {
         use tokio_stream::StreamExt;
-
-        async fn shutdown_startup_sessions(sessions: impl IntoIterator<Item = AppServerSession>) {
-            let exit = crate::app_server_session::final_exit_sessions(
-                sessions,
-                crate::app_server_session::FINAL_EXIT_BUDGET,
-            )
-            .await;
-            exit.report();
-            if let Err(shutdown_error) = exit.into_result() {
-                tracing::warn!("app-server shutdown failed: {shutdown_error}");
-            }
-        }
-
-        async fn shutdown_on_startup_error(
-            app_server: AppServerSession,
-            other_backends: &mut Vec<AppServerSession>,
-            error: impl Into<color_eyre::eyre::Report>,
-        ) -> Result<AppExitInfo> {
-            shutdown_startup_sessions(std::iter::once(app_server).chain(other_backends.drain(..)))
-                .await;
-            Err(error.into())
-        }
-
-        async fn cancel_startup_sessions(
-            app_server: AppServerSession,
-            other_backends: &mut Vec<AppServerSession>,
-        ) -> AppExitInfo {
-            let exit_info = cancel_session_start(app_server).await;
-            shutdown_startup_sessions(other_backends.drain(..)).await;
-            exit_info
-        }
 
         let (mut app_server, mut other_backends, backend_settings) = initial_backends.into_parts();
         // Preserve singleton error propagation while releasing all sessions on multi-backend exits.

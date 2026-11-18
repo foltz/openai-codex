@@ -32,6 +32,13 @@ struct Hosted {
 /// A remote session with the TUI's hosted tools server and one thread whose
 /// overrides name it, so the daemon attributes the endpoint to this connection.
 async fn hosted_session(behavior: RealtimeRequestBehavior) -> Result<Hosted> {
+    hosted_session_with_transport_retention(behavior, true).await
+}
+
+async fn hosted_session_with_transport_retention(
+    behavior: RealtimeRequestBehavior,
+    retain_transport: bool,
+) -> Result<Hosted> {
     let (mut app, events, ops) = Box::pin(make_test_app_with_channels()).await;
     let codex_home = tempdir()?;
     app.config.codex_home = codex_home.path().to_path_buf().abs();
@@ -63,7 +70,7 @@ async fn hosted_session(behavior: RealtimeRequestBehavior) -> Result<Hosted> {
     );
     // The proxy's embedded threads retire after remote client close. Keep
     // their hosted MCP endpoint alive until that shutdown is observed.
-    let tool_transport = app_server.thread_tool_transport();
+    let tool_transport = retain_transport.then(|| app_server.thread_tool_transport());
     Ok(Hosted {
         app_server,
         requests,
@@ -272,5 +279,137 @@ async fn all_backends_are_latched_before_any_retire_wait_and_share_one_deadline(
     drop(retained_b);
     let _ = a.proxy.await;
     let _ = b.proxy.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn shared_hosted_server_outlives_every_backend_close_and_then_drops() -> Result<()> {
+    let Hosted {
+        app_server,
+        proxy,
+        _keep_alive,
+        ..
+    } = hosted_session_with_transport_retention(RealtimeRequestBehavior::Forward, false).await?;
+    let transport = app_server.thread_tool_transport();
+    let crate::dynamic_tools_mcp::ThreadToolTransport::Mcp(server) = &transport else {
+        panic!("the fixture owns a real hosted MCP server");
+    };
+    let weak = Arc::downgrade(server);
+    let (cloud, mut commands, _events) = codex_app_server_client::CloudClient::channel(1);
+    let cloud = AppServerSession::new(
+        crate::backend_id::BackendId::new(),
+        codex_app_server_client::AppServerClient::Cloud(cloud),
+        crate::app_server_session::ThreadParamsMode::Embedded,
+    )
+    .with_thread_tool_transport(transport);
+    let close_cloud = async {
+        let command = commands.recv().await.expect("cloud close is admitted");
+        assert!(matches!(
+            command.operation,
+            codex_app_server_client::CloudOperation::Shutdown
+        ));
+        // The remote backend and its real embedded proxy have already closed,
+        // while the other close is still waiting on its owner's acknowledgement.
+        proxy.await??;
+        assert!(
+            weak.upgrade().is_some(),
+            "an earlier close must retain the shared server"
+        );
+        command
+            .response
+            .send(Ok(Ok(serde_json::Value::Null)))
+            .expect("the final-exit observer still owns the pending close");
+        Ok::<_, anyhow::Error>(())
+    };
+    let (exit, cloud_result) = tokio::join!(
+        crate::app_server_session::final_exit_sessions(
+            [app_server, cloud],
+            Duration::from_secs(10)
+        ),
+        close_cloud,
+    );
+    cloud_result?;
+    assert!(exit.is_clean(), "{exit:?}");
+    assert!(
+        weak.upgrade().is_none(),
+        "all closes discharge the final server references"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn stalled_remote_retirement_does_not_starve_an_embedded_close() -> Result<()> {
+    let Hosted {
+        app_server,
+        proxy,
+        _keep_alive,
+        ..
+    } = hosted_session(RealtimeRequestBehavior::StallHostedRetire).await?;
+    let (mut app, _events, _ops) = Box::pin(make_test_app_with_channels()).await;
+    let home = tempdir()?;
+    app.config.codex_home = home.path().to_path_buf().abs();
+    app.config.sqlite = codex_state::SqliteConfig::new_for_testing(home.path().abs());
+    app.config
+        .features
+        .set_enabled(codex_features::Feature::Plugins, false)?;
+    let embedded = crate::lib_tests::start_test_embedded_app_server(app.config.clone()).await?;
+    let embedded = AppServerSession::new(
+        crate::backend_id::BackendId::new(),
+        codex_app_server_client::AppServerClient::InProcess(embedded),
+        crate::app_server_session::ThreadParamsMode::Embedded,
+    );
+    let budget = Duration::from_secs(2);
+    let start = Instant::now();
+    let exit = crate::app_server_session::final_exit_sessions([app_server, embedded], budget).await;
+    assert!(start.elapsed() <= budget + EPSILON);
+    assert_eq!(exit.entries[0].1, HostedRetireOutcome::TimedOut);
+    assert_eq!(exit.entries[1].1, HostedRetireOutcome::NotHosted);
+    assert!(
+        exit.entries[1].2.is_closed(),
+        "the fast embedded close is not starved: {exit:?}"
+    );
+    let _ = proxy.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn startup_error_after_dynamic_server_retires_the_hosted_endpoint() -> Result<()> {
+    let Hosted {
+        app_server,
+        requests,
+        proxy,
+        _keep_alive,
+    } = hosted_session(RealtimeRequestBehavior::Forward).await?;
+    let start = Instant::now();
+    let error = crate::app::startup::shutdown_on_startup_error(
+        app_server,
+        &mut Vec::new(),
+        color_eyre::eyre::eyre!("injected startup error"),
+    )
+    .await
+    .expect_err("the original startup error is preserved");
+    assert!(error.to_string().contains("injected startup error"));
+    assert!(start.elapsed() <= crate::app_server_session::FINAL_EXIT_BUDGET + EPSILON);
+    assert_eq!(recorded_params(&requests, DECLARE).len(), 1);
+    assert_eq!(recorded_params(&requests, RETIRE).len(), 1);
+    proxy.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn startup_cancellation_retires_the_primary_hosted_endpoint() -> Result<()> {
+    let Hosted {
+        app_server,
+        requests,
+        proxy,
+        _keep_alive,
+    } = hosted_session(RealtimeRequestBehavior::Forward).await?;
+    let start = Instant::now();
+    let exit = crate::app::startup::cancel_startup_sessions(app_server, &mut Vec::new()).await;
+    assert!(matches!(exit.exit_reason, crate::ExitReason::UserRequested));
+    assert!(start.elapsed() <= crate::app_server_session::FINAL_EXIT_BUDGET + EPSILON);
+    assert_eq!(recorded_params(&requests, DECLARE).len(), 1);
+    assert_eq!(recorded_params(&requests, RETIRE).len(), 1);
+    proxy.await??;
     Ok(())
 }

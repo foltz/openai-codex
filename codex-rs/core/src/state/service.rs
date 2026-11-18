@@ -59,6 +59,10 @@ use tokio::sync::Mutex;
 /// section.
 pub trait RuntimeConfigChangeListener: Send + Sync {
     fn before_runtime_config_change(&self);
+
+    /// Called under the matching gate immediately before a newly constructed
+    /// thread becomes visible. No async work or thread creation is allowed here.
+    fn before_thread_publication(&self, _config: &crate::config::Config) {}
 }
 
 /// Serializes host-owned and legacy core runtime configuration changes.
@@ -67,6 +71,9 @@ pub trait RuntimeConfigChangeListener: Send + Sync {
 /// when a direct core reload cannot overlap an app-server-owned transition.
 /// The gate deliberately contains no host-specific semantics; the optional
 /// listener remains responsible for invalidating host provenance.
+///
+/// Never start a thread while holding this non-reentrant gate: final thread
+/// publication takes it after startup completes, before insertion in the map.
 #[derive(Clone, Debug, Default)]
 pub struct RuntimeConfigChangeGate {
     lock: Arc<Mutex<()>>,

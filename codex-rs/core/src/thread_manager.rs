@@ -3488,9 +3488,15 @@ impl ThreadManagerState {
             }
         };
 
-        let ema_cancellation = session
-            .get_config()
-            .await
+        // Startup (including callbacks) finishes before taking the gate. A
+        // concurrent host reload must either enumerate this thread or complete
+        // before this publication checks its actual selected-layer identity.
+        let _change_guard = match self.runtime_config_change_gate.as_ref() {
+            Some(gate) => Some(gate.lock().await),
+            None => None,
+        };
+        let publication_config = session.get_config().await;
+        let ema_cancellation = publication_config
             .config_layer_stack
             .mcp_ema_cancellation()
             .clone();
@@ -3521,6 +3527,9 @@ impl ThreadManagerState {
                             .failed_initialization_persistence
                             .store(false, std::sync::atomic::Ordering::Release);
                         ema_cancellation.publish();
+                        if let Some(listener) = &self.runtime_config_change_listener {
+                            listener.before_thread_publication(&publication_config);
+                        }
                         e.insert(thread.clone());
                         let tier_acceptance =
                             pending_service_tier.and_then(|(mut state, update)| {

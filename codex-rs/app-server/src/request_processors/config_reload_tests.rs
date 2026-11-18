@@ -270,3 +270,98 @@ async fn mcp_refresh_rejects_superseded_app_server_policy(
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn thread_publication_keeps_matching_identity_and_invalidates_disk_drift()
+-> anyhow::Result<()> {
+    use crate::mcp_config_identity::AppliedMcpConfigIdentity;
+    let home = tempfile::tempdir()?;
+    std::fs::write(
+        home.path().join(codex_config::CONFIG_TOML_FILE),
+        "[features]\nplugins = false\n",
+    )?;
+    let manager = ConfigManager::without_managed_config_for_tests(home.path().to_path_buf());
+    let initial = manager.load_latest_config(None).await?;
+    let applied = AppliedMcpConfigIdentity::from_startup_config(&initial);
+    let startup_identity = applied.current();
+    assert!(startup_identity.is_some());
+    let threads = codex_core::test_support::thread_manager_with_models_provider_and_home(
+        CodexAuth::from_api_key("dummy"),
+        initial.model_provider.clone(),
+        initial.codex_home.to_path_buf(),
+        Arc::new(EnvironmentManager::default_for_tests()),
+    )
+    .with_runtime_config_change_gate(applied.apply_gate())
+    .with_runtime_config_change_listener(Arc::new(applied.clone()));
+    let first = threads
+        .start_thread(codex_core::StartThreadOptions::new(initial, None))
+        .await?;
+    assert_eq!(applied.current(), startup_identity);
+    std::fs::write(
+        home.path().join(codex_config::CONFIG_TOML_FILE),
+        "[features]\nplugins = false\nsecret_auth_storage = true\n",
+    )?;
+    let next = manager.load_latest_config(None).await?;
+    let second = threads
+        .start_thread(codex_core::StartThreadOptions::new(next, None))
+        .await?;
+    assert!(
+        applied.current().is_none(),
+        "a new visible thread must not retain a stale identity"
+    );
+    first.thread.shutdown_and_wait().await?;
+    second.thread.shutdown_and_wait().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn delayed_thread_publication_checks_identity_after_the_host_transition() -> anyhow::Result<()>
+{
+    use crate::mcp_config_identity::AppliedMcpConfigIdentity;
+    use crate::mcp_config_identity::McpConfigIdentity;
+    let home = tempfile::tempdir()?;
+    std::fs::write(
+        home.path().join(codex_config::CONFIG_TOML_FILE),
+        "[features]\nplugins = false\n",
+    )?;
+    let manager = ConfigManager::without_managed_config_for_tests(home.path().to_path_buf());
+    let initial = manager.load_latest_config(None).await?;
+    let applied = AppliedMcpConfigIdentity::from_startup_config(&initial);
+    let threads = codex_core::test_support::thread_manager_with_models_provider_and_home(
+        CodexAuth::from_api_key("dummy"),
+        initial.model_provider.clone(),
+        initial.codex_home.to_path_buf(),
+        Arc::new(EnvironmentManager::default_for_tests()),
+    )
+    .with_runtime_config_change_gate(applied.apply_gate())
+    .with_runtime_config_change_listener(Arc::new(applied.clone()));
+    let guard = applied.lock_apply().await;
+    let threads = Arc::new(threads);
+    let starting_threads = Arc::clone(&threads);
+    let mut start = tokio::spawn(async move {
+        starting_threads
+            .start_thread(codex_core::StartThreadOptions::new(initial, None))
+            .await
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut start)
+            .await
+            .is_err()
+    );
+    assert!(threads.list_thread_ids().await.is_empty());
+    std::fs::write(
+        home.path().join(codex_config::CONFIG_TOML_FILE),
+        "[features]\nplugins = false\nsecret_auth_storage = true\n",
+    )?;
+    let next = manager.load_latest_config(None).await?;
+    let post_transition = McpConfigIdentity::from_config(&next)?;
+    applied.replace(post_transition.clone());
+    drop(guard);
+    let started = tokio::time::timeout(std::time::Duration::from_secs(10), start).await???;
+    assert!(
+        applied.current().is_none(),
+        "the pre-transition snapshot cannot preserve the later identity"
+    );
+    started.thread.shutdown_and_wait().await?;
+    Ok(())
+}

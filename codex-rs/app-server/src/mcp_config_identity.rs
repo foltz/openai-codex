@@ -130,6 +130,15 @@ impl codex_core::RuntimeConfigChangeListener for AppliedMcpConfigIdentity {
         // transition replaces it.
         self.invalidate();
     }
+
+    fn before_thread_publication(&self, config: &Config) {
+        // The caller holds the shared transition gate. A new thread may have
+        // loaded before a reload, or after an unreloaded disk edit. Neither may
+        // silently preserve a process-wide identity that does not describe it.
+        if McpConfigIdentity::from_config(config).ok().flatten() != self.current() {
+            self.invalidate();
+        }
+    }
 }
 
 #[cfg(test)]

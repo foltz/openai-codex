@@ -172,6 +172,7 @@ mod thread_name_websocket;
 mod thread_queue;
 mod thread_read;
 mod thread_read_state;
+mod thread_interactive_subscription;
 mod thread_retention;
 mod thread_resume;
 mod thread_revert;

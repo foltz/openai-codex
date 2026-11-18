@@ -82,6 +82,7 @@ mod git_attribution;
 mod guardian_v2;
 mod history_notes_extension;
 mod hooks_list;
+mod hosted_mcp_endpoint_retire;
 mod host_skills;
 mod https_mock;
 mod imagegen_extension;

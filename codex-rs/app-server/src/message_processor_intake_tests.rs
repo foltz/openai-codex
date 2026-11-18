@@ -8,6 +8,7 @@ async fn real_processor_intake_closes_admission_and_latches_existing_cleanup_own
     let config = Arc::new(
         codex_core::config::ConfigBuilder::default()
             .codex_home(home.path().to_path_buf())
+            .cli_overrides(vec![("features.plugins".to_string(), false.into())])
             .build()
             .await
             .unwrap(),
@@ -55,6 +56,7 @@ async fn registered_intake_callback_keeps_only_weak_processor_custody() {
     let config = Arc::new(
         codex_core::config::ConfigBuilder::default()
             .codex_home(home.path().to_path_buf())
+            .cli_overrides(vec![("features.plugins".to_string(), false.into())])
             .build()
             .await
             .unwrap(),
@@ -94,6 +96,7 @@ async fn published_intake_deadline_without_binding_receipt_is_not_clean() {
     let config = Arc::new(
         codex_core::config::ConfigBuilder::default()
             .codex_home(home.path().to_path_buf())
+            .cli_overrides(vec![("features.plugins".to_string(), false.into())])
             .build()
             .await
             .unwrap(),
@@ -128,6 +131,7 @@ async fn connection_drain_timeout_remains_unclean_after_original_finishes() {
     let config = Arc::new(
         codex_core::config::ConfigBuilder::default()
             .codex_home(home.path().to_path_buf())
+            .cli_overrides(vec![("features.plugins".to_string(), false.into())])
             .build()
             .await
             .unwrap(),
@@ -174,6 +178,7 @@ async fn connection_drain_preserves_handler_panic_and_half_close_unanswered() {
     let config = Arc::new(
         codex_core::config::ConfigBuilder::default()
             .codex_home(home.path().to_path_buf())
+            .cli_overrides(vec![("features.plugins".to_string(), false.into())])
             .build()
             .await
             .unwrap(),
@@ -215,6 +220,7 @@ async fn not_admitted_refusal_reports_exact_recipient_and_router_loss() {
     let config = Arc::new(
         codex_core::config::ConfigBuilder::default()
             .codex_home(home.path().to_path_buf())
+            .cli_overrides(vec![("features.plugins".to_string(), false.into())])
             .build()
             .await
             .unwrap(),

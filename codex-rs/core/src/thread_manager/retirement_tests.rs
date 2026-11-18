@@ -1572,6 +1572,10 @@ async fn first_visible_runtime_is_already_bound_to_the_shutdown_edge() {
         .await
         .unwrap();
     config.ephemeral = true;
+    config
+        .features
+        .disable(codex_features::Feature::Plugins)
+        .expect("disable unrelated plugin warmup");
     let manager = ThreadManager::with_models_provider_and_home_for_tests(
         codex_login::CodexAuth::from_api_key("dummy"),
         config.model_provider.clone(),

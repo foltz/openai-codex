@@ -438,14 +438,10 @@ async fn sidebar_event_retention_scenario() -> Result<()> {
             if outcome == "installed" {
                 // Revalidation waits for any earlier abandonment release. An
                 // accidental drop would mint a DIFFERENT opaque grant here.
-                let (_, observation) = boxed_future!(server.prepare_retained_resume(
-                    &app.local_settings,
-                    app.config.clone(),
-                    child,
-                    crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
-                    crate::resume_permissions::ResumePermissions::default(),
-                ))
-                .await?;
+                let observation = server
+                    .retain_clear_successor(&child.to_string(), None)
+                    .await
+                    .expect("serialized retention revalidation");
                 assert_eq!(
                     probe(&mut server, child).await?,
                     ThreadRetentionAcquireResponse::AlreadyHeld {

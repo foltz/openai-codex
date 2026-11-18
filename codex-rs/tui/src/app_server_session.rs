@@ -1704,7 +1704,8 @@ impl AppServerSession {
                 == ForkPresentation::SideConversation(SideChatStorage::Attached),
             last_turn_id,
             before_turn_id,
-            defer_goal_continuation: goal_continuation == ForkGoalContinuation::DeferUntilNextTurn,
+            defer_goal_continuation: goal_continuation == ForkGoalContinuation::DeferUntilNextTurn
+                && !config.ephemeral,
             exclude_turns,
             ..thread_fork_params_from_config(
                 session_config,

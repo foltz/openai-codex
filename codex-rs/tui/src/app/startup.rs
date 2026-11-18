@@ -313,12 +313,11 @@ impl App {
         use tokio_stream::StreamExt;
 
         let (mut app_server, mut other_backends, backend_settings) = initial_backends.into_parts();
-        // Preserve singleton error propagation while releasing all sessions on multi-backend exits.
+        // Preserve the startup error while retiring every owned session, including a singleton.
         macro_rules! startup_try {
             ($result:expr) => {
                 match $result {
                     Ok(value) => value,
-                    Err(error) if other_backends.is_empty() => return Err(error.into()),
                     Err(error) => {
                         return shutdown_on_startup_error(app_server, &mut other_backends, error)
                             .await;

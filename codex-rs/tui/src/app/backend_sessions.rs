@@ -316,7 +316,10 @@ impl BackendSessions {
             sessions.push(entry.session);
             custody.push(entry.worker_custody);
         }
-        let exit = crate::app_server_session::final_exit_sessions(sessions, budget).await;
+        let exit = boxed_future!(crate::app_server_session::final_exit_sessions(
+            sessions, budget
+        ))
+        .await;
         drop(custody);
         exit
     }

@@ -55,6 +55,7 @@ pub(crate) fn classify(request: &ClientRequest) -> AccountDependency {
         | ClientRequest::McpServerEventStreamStart { .. }
         | ClientRequest::McpServerOauthLogin { .. }
         | ClientRequest::McpServerRefresh { .. }
+        | ClientRequest::McpHostedEndpointDeclare { .. }
         | ClientRequest::McpServerConfigIdentity { .. }
         | ClientRequest::McpServerStatusList { .. }
         | ClientRequest::McpServerToolCall { .. }
@@ -116,7 +117,8 @@ pub(crate) fn classify(request: &ClientRequest) -> AccountDependency {
         | ClientRequest::UserVerificationEnroll { .. }
         | ClientRequest::UserVerificationStatus { .. }
         | ClientRequest::UserVerificationVerify { .. } => AccountDependency::Permit,
-        ClientRequest::ManagedTransitionStart { .. }
+        ClientRequest::McpHostedEndpointRetire { .. }
+        | ClientRequest::ManagedTransitionStart { .. }
         | ClientRequest::ManagedTransitionRead { .. }
         | ClientRequest::ManagedTransitionCancel { .. }
         | ClientRequest::BedrockDiscover { .. }
@@ -290,6 +292,25 @@ mod tests {
                 "{method}"
             );
         }
+    }
+
+    #[test]
+    fn hosted_declaration_is_account_work_but_retirement_stays_independent() {
+        let params = serde_json::json!({
+            "url":"http://127.0.0.1:41005/mcp", "authorization":"Bearer configured",
+            "retirementCapability":"private-capability", "timeoutMs":1000
+        });
+        assert_eq!(
+            classify(&request(
+                "kcf/mcpServer/hostedEndpoint/declare",
+                params.clone()
+            )),
+            AccountDependency::Permit
+        );
+        assert_eq!(
+            classify(&request("kcf/mcpServer/hostedEndpoint/retire", params)),
+            AccountDependency::Independent
+        );
     }
 
     #[test]

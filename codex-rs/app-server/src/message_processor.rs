@@ -251,6 +251,7 @@ pub(crate) struct MessageProcessor {
     managed_transition_coordinator: crate::managed_transition::ManagedTransitionCoordinator,
     request_auth_tasks: crate::processor_task_retirement::ProcessorTasks,
     thread_manager: Arc<ThreadManager>,
+    hosted_mcp_endpoints: crate::hosted_mcp_endpoints::HostedMcpEndpoints,
     thread_state_manager: ThreadStateManager,
     turn_cost_worker: Option<TurnCostWorker>,
     skills_watcher: Arc<SkillsWatcher>,
@@ -662,6 +663,10 @@ impl MessageProcessor {
                 None => manager,
             }
         });
+        let hosted_mcp_endpoints = crate::hosted_mcp_endpoints::HostedMcpEndpoints::new(
+            thread_manager.mcp_manager().hosted_endpoint_custody(),
+            Arc::clone(&environment_manager_for_requests),
+        );
         let runtime_auth = thread_manager.runtime_auth_manager();
         if let (Some(slot), Some(runtime)) = (runtime_auth_slot, &runtime_auth) {
             // Analytics starts before the harness. Bind its requests to the harness registration.
@@ -924,6 +929,7 @@ impl MessageProcessor {
         );
 
         Self {
+            hosted_mcp_endpoints,
             turn_admission,
             intake_shutdown_deadline: OnceLock::new(),
             intake_thread_binding: OnceLock::new(),
@@ -1572,6 +1578,7 @@ impl MessageProcessor {
         let deadline = self.connection_drain_deadline(owner_deadline);
         session_state.disconnect.cancel();
         session_state.rpc_gate.close().await;
+        self.hosted_mcp_endpoints.connection_closed(connection_id);
         self.account_processor
             .gateway_connection_closed(connection_id);
         self.request_serialization_queues.discard_closed().await;
@@ -1702,7 +1709,10 @@ impl MessageProcessor {
             | ClientRequest::ThreadSettingsUpdate { .. }
             | ClientRequest::TurnSettingsUpdate { .. }
             | ClientRequest::ThreadDelete { .. }
-            | ClientRequest::ThreadArchive { .. } => (Some(self.turn_admission.admit()?), false),
+            | ClientRequest::ThreadArchive { .. }
+            | ClientRequest::McpHostedEndpointDeclare { .. } => {
+                (Some(self.turn_admission.admit()?), false)
+            }
             ClientRequest::ThreadSample { .. }
             | ClientRequest::ThreadGuardianReview { .. }
             | ClientRequest::TurnStart { .. }
@@ -1717,6 +1727,9 @@ impl MessageProcessor {
             }
             _ => (None, false),
         };
+
+        self.hosted_mcp_endpoints
+            .admit_request(connection_id, &codex_request)?;
 
         let event_stream_ready = match &codex_request {
             ClientRequest::McpServerEventStreamStart { params, .. } => Some(
@@ -2611,6 +2624,21 @@ impl MessageProcessor {
             }
             ClientRequest::McpServerConfigIdentity { params, .. } => {
                 self.mcp_processor.mcp_server_config_identity(params).await
+            }
+            ClientRequest::McpHostedEndpointDeclare { params, .. } => {
+                let gate = Arc::clone(&session.rpc_gate);
+                let response = self
+                    .hosted_mcp_endpoints
+                    .declare(connection_id, params, || gate.is_closed())
+                    .await;
+                Ok(Some(response.into()))
+            }
+            ClientRequest::McpHostedEndpointRetire { params, .. } => {
+                let response = self
+                    .hosted_mcp_endpoints
+                    .retire(connection_id, params)
+                    .await;
+                Ok(Some(response.into()))
             }
             ClientRequest::McpServerStatusList { params, .. } => {
                 self.mcp_processor

@@ -1400,6 +1400,27 @@ client_request_definitions! {
         response: v2::McpServerEventStreamStopResponse,
     },
 
+    #[experimental("kcf/mcpServer/hostedEndpoint/declare")]
+    /// Declares, on this connection, a literal loopback MCP endpoint that the
+    /// client hosts and has already named in its own thread overrides. The
+    /// server confirms hosting with a nonce challenge answered by the endpoint
+    /// itself before recording the declaration.
+    McpHostedEndpointDeclare => "kcf/mcpServer/hostedEndpoint/declare" {
+        params: v2::McpHostedEndpointDeclareParams,
+        serialization: None,
+        response: v2::McpHostedEndpointDeclareResponse,
+    },
+
+    #[experimental("kcf/mcpServer/hostedEndpoint/retire")]
+    /// Retires every connection this runtime owner holds to an endpoint that
+    /// the calling connection declared, under the caller's remaining budget,
+    /// and permanently refuses new ones.
+    McpHostedEndpointRetire => "kcf/mcpServer/hostedEndpoint/retire" {
+        params: v2::McpHostedEndpointRetireParams,
+        serialization: None,
+        response: v2::McpHostedEndpointRetireResponse,
+    },
+
     McpServerToolCall => "mcpServer/tool/call" {
         params: v2::McpServerToolCallParams,
         serialization: thread_id(params.thread_id),

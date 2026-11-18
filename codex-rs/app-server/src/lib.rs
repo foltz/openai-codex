@@ -148,6 +148,7 @@ pub mod in_process;
 mod log_write_warning;
 #[cfg(unix)]
 mod managed_daemon;
+mod hosted_mcp_endpoints;
 mod mcp_config_identity;
 mod mcp_refresh;
 mod message_processor;

@@ -1035,3 +1035,56 @@ async fn production_reset_inventory_revokes_hosted_declaration_authority() -> Re
         .await;
     Ok(())
 }
+
+#[tokio::test]
+async fn production_connection_close_revokes_hosted_declaration_authority() -> Result<()> {
+    use crate::hosted_mcp_endpoints::tests::Behavior;
+    use crate::hosted_mcp_endpoints::tests::CAPABILITY;
+    use crate::hosted_mcp_endpoints::tests::declare_params;
+    use crate::hosted_mcp_endpoints::tests::serve_proof;
+    use crate::hosted_mcp_endpoints::tests::thread_start_naming;
+    use codex_app_server_protocol::McpHostedEndpointDeclareResponse;
+    use codex_app_server_protocol::McpHostedEndpointRefusalReason;
+
+    let home = TempDir::new()?;
+    let mut config = build_test_config(home.path(), "http://127.0.0.1:1").await?;
+    config.features.disable(codex_features::Feature::Plugins)?;
+    let (processor, _outgoing) = build_test_processor_for_retirement(Arc::new(config)).await;
+    let (url, _hits) = serve_proof(Behavior::Answer).await;
+    let endpoints = &processor.hosted_mcp_endpoints;
+    endpoints
+        .admit_request(ConnectionId(1), &thread_start_naming(&url))
+        .expect("hosted attribution");
+    assert!(matches!(
+        endpoints
+            .declare(ConnectionId(1), declare_params(&url, CAPABILITY), || false)
+            .await,
+        McpHostedEndpointDeclareResponse::Declared { .. }
+    ));
+    let custody = processor
+        .thread_manager
+        .mcp_manager()
+        .hosted_endpoint_custody();
+    assert_eq!(custody.census().declared, 1);
+
+    // Drive the real connection-close hook, including its RPC gate and
+    // hosted teardown, rather than calling the registry's release directly.
+    let session = ConnectionSessionState::new(crate::transport::ConnectionOrigin::Stdio);
+    processor.connection_closed(ConnectionId(1), &session).await;
+    assert_eq!(custody.census().declared, 0);
+    for connection in [ConnectionId(1), ConnectionId(2)] {
+        assert_eq!(
+            endpoints
+                .declare(connection, declare_params(&url, CAPABILITY), || false)
+                .await,
+            McpHostedEndpointDeclareResponse::Refused {
+                reason: McpHostedEndpointRefusalReason::NotUsed,
+            },
+            "old capability must not restore cleared attribution"
+        );
+    }
+    processor
+        .drain_background_tasks_until(tokio::time::Instant::now() + Duration::from_secs(20))
+        .await;
+    Ok(())
+}

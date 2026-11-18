@@ -3,6 +3,10 @@ use super::account_processor::EnterpriseLoginTarget;
 use super::thread_input::ensure_direct_input_allowed;
 use super::*;
 use crate::mcp_config_identity::AppliedMcpConfigIdentity;
+use crate::mcp_config_identity::McpConfigIdentity;
+use codex_app_server_protocol::McpServerConfigIdentity;
+use codex_app_server_protocol::McpServerConfigIdentityLayer;
+use codex_app_server_protocol::McpServerConfigIdentityResponse;
 use codex_config::types::McpServerAuth;
 use codex_core::McpRefreshReason;
 use codex_mcp::McpServerSource;
@@ -75,6 +79,15 @@ impl McpRequestProcessor {
         })
     }
 
+    pub(crate) async fn mcp_server_config_identity(
+        &self,
+        params: Option<()>,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        self.mcp_server_config_identity_response(params)
+            .await
+            .map(|response| Some(response.into()))
+    }
+
     pub(crate) async fn mcp_server_status_list(
         &self,
         request_id: &ConnectionRequestId,
@@ -117,6 +130,40 @@ impl McpRequestProcessor {
         .await
         .map_err(|err| internal_error(format!("failed to refresh MCP servers: {err}")))?;
         Ok(McpServerRefreshResponse {})
+    }
+
+    async fn mcp_server_config_identity_response(
+        &self,
+        _params: Option<()>,
+    ) -> Result<McpServerConfigIdentityResponse, JSONRPCErrorError> {
+        let _apply_guard = self.applied_mcp_config_identity.lock_apply().await;
+        let applied = self
+            .applied_mcp_config_identity
+            .current()
+            .ok_or_else(|| internal_error("selected user configuration identity is unavailable"))?;
+        let current_config = self.load_latest_config(/*fallback_cwd*/ None).await?;
+        let current = McpConfigIdentity::from_config(&current_config)
+            .map_err(|err| {
+                internal_error(format!(
+                    "failed to identify selected MCP configuration: {err}"
+                ))
+            })?
+            .ok_or_else(|| internal_error("selected user configuration identity is unavailable"))?;
+
+        Ok(McpServerConfigIdentityResponse {
+            applied: mcp_server_config_identity(applied),
+            current: mcp_server_config_identity(current),
+        })
+    }
+
+    async fn load_latest_config(
+        &self,
+        fallback_cwd: Option<PathBuf>,
+    ) -> Result<Config, JSONRPCErrorError> {
+        self.config_manager
+            .load_latest_config(fallback_cwd)
+            .await
+            .map_err(|err| internal_error(format!("failed to reload config: {err}")))
     }
 
     async fn load_global_config(&self) -> Result<Config, JSONRPCErrorError> {
@@ -862,5 +909,18 @@ fn with_mcp_tool_call_thread_id_meta(
             Some(serde_json::Value::Object(map))
         }
         other => other,
+    }
+}
+
+fn mcp_server_config_identity(identity: McpConfigIdentity) -> McpServerConfigIdentity {
+    McpServerConfigIdentity {
+        layers: identity
+            .layers
+            .into_iter()
+            .map(|layer| McpServerConfigIdentityLayer {
+                file_path: layer.file_path,
+                version: layer.version,
+            })
+            .collect(),
     }
 }

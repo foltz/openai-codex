@@ -3,6 +3,7 @@
 use super::AppServerSession;
 use super::AppServerStartedThread;
 use super::HistoryHydrationScope;
+use super::PendingRetention;
 use super::ResumeModelSettings;
 use super::ThreadHistorySupport;
 use super::ThreadSettingsOwner;
@@ -183,7 +184,7 @@ impl AppServerSession {
         thread_id: ThreadId,
         model_settings: ResumeModelSettings,
         permission_overrides: crate::resume_permissions::ResumePermissions,
-    ) -> Result<(AppServerStartedThread, Option<retention::PendingRetention>)> {
+    ) -> Result<(AppServerStartedThread, Option<PendingRetention>)> {
         Box::pin(self.resume_thread_for_purpose(
             local_settings,
             config,
@@ -203,7 +204,7 @@ impl AppServerSession {
         model_settings: ResumeModelSettings,
         permission_overrides: crate::resume_permissions::ResumePermissions,
         purpose: ResumePurpose,
-    ) -> Result<(AppServerStartedThread, Option<retention::PendingRetention>)> {
+    ) -> Result<(AppServerStartedThread, Option<PendingRetention>)> {
         if self.thread_params_mode().settings_owner() == ThreadSettingsOwner::Client {
             self.thread_tool_transport()
                 .check_namespace(&self.request_handle, &config.cwd)

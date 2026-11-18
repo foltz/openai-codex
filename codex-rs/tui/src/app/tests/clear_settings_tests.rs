@@ -27,7 +27,8 @@ pub(super) async fn pump_until_turn_request(
             if let Ok(Some(event)) =
                 tokio::time::timeout(Duration::from_millis(20), server.next_event()).await
             {
-                app.handle_app_server_event(server, event).await;
+                assert_eq!(event.backend_id, server.backend_id());
+                app.handle_app_server_event(server, event.event).await;
             }
         }
         Ok::<(), color_eyre::eyre::Report>(())

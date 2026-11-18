@@ -372,6 +372,11 @@ mod tests {
         drop(delegate);
         assert!(applied.current().is_none());
         drop(retained_delegate);
+        assert!(
+            applied.current().is_none(),
+            "a retained MCP runtime still owns its provenance"
+        );
+        drop(retained_runtime);
         assert_eq!(applied.current(), next_identity);
         drop(parent);
         Ok(())

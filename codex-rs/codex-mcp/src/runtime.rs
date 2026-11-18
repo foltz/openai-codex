@@ -149,6 +149,8 @@ pub struct McpRuntime {
     elicitation_router: ElicitationRequestRouter,
     resource_origins: Mutex<ResourceOrigins>,
     ema_auth: OnceLock<crate::ema_auth::EmaAuthContext>,
+    // Host provenance must survive cancelled construction while this runtime is retained.
+    lifetime_guards: Mutex<Vec<Box<dyn Send + Sync>>>,
 }
 
 /// Retained at runtime birth without owning a current snapshot or McpRuntime.
@@ -407,7 +409,18 @@ impl McpRuntime {
             elicitation_router,
             resource_origins: Mutex::default(),
             ema_auth: OnceLock::new(),
+            lifetime_guards: Mutex::default(),
         }
+    }
+
+    /// Retains host-owned metadata for this runtime's complete lifetime.
+    /// A guard must not hold this runtime or its Session strongly (no cycle).
+    /// This is synchronous so startup can attach it before any cancellation point.
+    pub fn retain_lifetime_guard(&self, guard: Box<dyn Send + Sync>) {
+        self.lifetime_guards
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(guard);
     }
 
     /// Updates this thread's bounded resource provenance from a live or restored event.

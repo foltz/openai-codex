@@ -1893,6 +1893,12 @@ impl Session {
                     .map_err(|_| anyhow::anyhow!("startup MCP resource admission is closed"))?,
                 None => Arc::new(McpRuntime::empty(mcp_projection.config.prefix_mcp_tool_names)),
             };
+            if let Some(member) = &runtime_config_membership {
+                // Startup resources can retain MCP after this constructor is
+                // cancelled, before any SessionServices exists. Keep provenance
+                // with that original runtime as well as the eventual Session.
+                mcp_runtime.retain_lifetime_guard(Box::new(Arc::clone(member)));
+            }
             let hooks_config = build_hooks_config(
                 &config,
                 plugins_manager.as_ref(),

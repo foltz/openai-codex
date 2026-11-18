@@ -440,6 +440,53 @@ fn managed_proxy_inner_command_includes_route_spec() {
 }
 
 #[test]
+fn sender_built_custody_argv_parses_into_the_receiver_fields() {
+    let custody = codex_sandboxing::SandboxCleanupCustody::for_launch(
+        codex_sandboxing::SandboxType::LinuxSeccomp,
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(5)),
+        None,
+    )
+    .expect("create sender custody")
+    .expect("Linux launch has custody");
+    let mut argv = [
+        "codex-linux-sandbox",
+        "--sandbox-policy-cwd",
+        "/tmp",
+        "--",
+        "/bin/true",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    custody
+        .attach_to_launcher_argv(&mut argv)
+        .expect("attach sender custody arguments");
+    let deadline_index = argv
+        .iter()
+        .position(|arg| arg == "--cleanup-deadline-monotonic-ns")
+        .expect("sender publishes the original deadline");
+    let deadline = argv[deadline_index + 1]
+        .parse::<u64>()
+        .expect("sender deadline is numeric");
+    assert!(deadline > 0);
+    let parsed = LinuxSandboxCommand::try_parse_from(argv.clone())
+        .expect("receiver accepts sender-built custody arguments");
+    assert_eq!(parsed.cleanup_deadline_monotonic_ns, Some(deadline));
+    let inherited = custody.inherited_fds();
+    assert_eq!(inherited.len(), 2);
+    assert_eq!(parsed.cleanup_deadline_fd, Some(inherited[0]));
+    assert_eq!(parsed.cleanup_report_fd, Some(inherited[1]));
+    crate::cleanup_custody::validate_pipe_pair(
+        parsed.cleanup_deadline_fd,
+        parsed.cleanup_report_fd,
+    )
+    .expect("sender descriptors satisfy the receiver contract");
+    assert_eq!(parsed.command, vec!["/bin/true".to_owned()]);
+
+    argv[deadline_index + 1] = "not-a-deadline".to_owned();
+    assert!(LinuxSandboxCommand::try_parse_from(argv).is_err());
+}
+
+#[test]
 fn managed_network_policy_alone_enables_proxy_mode() {
     let parsed = LinuxSandboxCommand::try_parse_from([
         "codex-linux-sandbox",

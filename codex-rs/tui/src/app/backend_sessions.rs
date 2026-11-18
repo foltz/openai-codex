@@ -321,6 +321,7 @@ impl BackendSessions {
 mod worker_host_lifetime_tests {
     use super::*;
     use crate::app_server_session::disconnect_shutdown_tests::session_with_resetting_peer_in_host;
+    use crate::app_server_session::disconnect_shutdown_tests::wait_for_unreported_peer_reset;
     use codex_app_server_client::InProcessHost;
     use std::sync::Arc;
 
@@ -331,6 +332,7 @@ mod worker_host_lifetime_tests {
         let weak = Arc::downgrade(&host);
         let (session, peer) = session_with_resetting_peer_in_host(Some(Arc::clone(&host))).await?;
         peer.await?;
+        wait_for_unreported_peer_reset(&session).await;
         let mut backends = BackendSessions::new(session);
         let slot = backends.displayed;
         let view = backends.session_at(slot).request_view();
@@ -352,6 +354,7 @@ mod worker_host_lifetime_tests {
         let (replacement, peer) =
             session_with_resetting_peer_in_host(Some(Arc::clone(&reconnect_host))).await?;
         peer.await?;
+        wait_for_unreported_peer_reset(&replacement).await;
         assert!(Arc::ptr_eq(
             &replacement.worker_custody().expect("replacement bound"),
             &reconnect_host

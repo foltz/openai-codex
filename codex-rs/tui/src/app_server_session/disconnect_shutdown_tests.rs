@@ -83,21 +83,7 @@ async fn reported_disconnect_releases_the_session_close() -> color_eyre::Result<
 async fn unreported_reset_fails_the_session_close() -> color_eyre::Result<()> {
     let (session, peer) = session_with_resetting_peer().await?;
     peer.await?;
-    // Positive gate without consuming events: a request fails only once the
-    // worker has stopped, after it recorded its terminal failure.
-    let request = session
-        .request_handle()
-        .request_typed::<codex_app_server_protocol::UserVerificationStatusResponse>(
-            ClientRequest::UserVerificationStatus {
-                request_id: RequestId::String("after-reset".to_string()),
-                params: codex_app_server_protocol::UserVerificationStatusParams {},
-            },
-        )
-        .await;
-    assert!(
-        matches!(request, Err(TypedRequestError::Transport { .. })),
-        "{request:?}"
-    );
+    wait_for_unreported_peer_reset(&session).await;
 
     let error = session
         .shutdown()
@@ -116,4 +102,27 @@ async fn unreported_reset_fails_the_session_close() -> color_eyre::Result<()> {
         "{error}"
     );
     Ok(())
+}
+
+/// Wait for the actual client worker's failure without reporting its event.
+/// A peer task ending alone is not evidence that the client has read the reset.
+pub(crate) async fn wait_for_unreported_peer_reset(session: &AppServerSession) {
+    // Positive gate without consuming events: a request fails only once the
+    // worker has stopped, after it recorded its terminal failure.
+    let handle = session.request_handle();
+    let request = tokio::time::timeout(
+        Duration::from_secs(5),
+        handle.request_typed::<codex_app_server_protocol::UserVerificationStatusResponse>(
+            ClientRequest::UserVerificationStatus {
+                request_id: RequestId::String("after-reset".to_string()),
+                params: codex_app_server_protocol::UserVerificationStatusParams {},
+            },
+        ),
+    )
+    .await
+    .expect("the worker observes the already closed peer");
+    assert!(
+        matches!(request, Err(TypedRequestError::Transport { .. })),
+        "{request:?}"
+    );
 }

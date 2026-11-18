@@ -42,6 +42,7 @@ struct SystemBwrapCapabilities {
 static LAUNCHER: OnceLock<BubblewrapLauncher> = OnceLock::new();
 
 pub(crate) fn exec_bwrap(mut argv: Vec<String>, mut preserved_files: Vec<File>) -> ! {
+    crate::synthetic_targets::ensure_no_creation_pins().unwrap_or_else(|err| panic!("{err}"));
     if argv
         .iter()
         .take_while(|arg| arg.as_str() != "--")

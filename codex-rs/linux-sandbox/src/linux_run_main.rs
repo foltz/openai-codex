@@ -2733,6 +2733,7 @@ fn build_inner_seccomp_command(args: InnerSeccompCommandArgs<'_>) -> Vec<String>
 
 /// Exec the provided argv, panicking with context if it fails.
 fn exec_or_panic(command: Vec<String>) -> ! {
+    crate::synthetic_targets::ensure_no_creation_pins().unwrap_or_else(|err| panic!("{err}"));
     #[expect(clippy::expect_used)]
     let c_command =
         CString::new(command[0].as_str()).expect("Failed to convert command to CString");

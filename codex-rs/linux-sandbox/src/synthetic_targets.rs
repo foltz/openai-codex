@@ -97,6 +97,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicI32;
+use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -621,6 +623,8 @@ impl Registry {
                 self.remove_key_file(key, &name)?;
             }
         }
+        // Records are gone before the independent live-creator pins close.
+        retire_creation_pins(self, key, dev, ino);
         Ok(())
     }
 
@@ -1032,6 +1036,7 @@ pub(crate) fn read_boot_id() -> io::Result<String> {
 }
 
 struct ProcessStat {
+    state: u8,
     parent: libc::pid_t,
     start_ticks: u64,
 }
@@ -1048,6 +1053,11 @@ fn read_process_stat(pid: libc::pid_t) -> io::Result<ProcessStat> {
     let fields: Vec<&str> = fields.split_ascii_whitespace().collect();
     // Field 3 (state) is index 0: ppid is field 4, starttime field 22.
     Ok(ProcessStat {
+        state: fields
+            .first()
+            .filter(|state| state.len() == 1)
+            .ok_or_else(invalid)?
+            .as_bytes()[0],
         parent: fields
             .get(1)
             .and_then(|v| v.parse().ok())
@@ -1087,8 +1097,9 @@ fn pidfd_signal(fd: BorrowedFd<'_>, signal: libc::c_int) -> io::Result<()> {
 }
 
 /// Classifies a recorded owner. Only a different boot, a vanished pid, or a
-/// pid now held by a process with another start time prove termination; a
-/// pidfd pins the process while its start time is read.
+/// pid now held by a process with another start time, or a dead/zombie task
+/// prove termination. Zombies have already released their descriptors and
+/// namespaces. A pidfd pins the process while its state/start time is read.
 pub(crate) fn liveness(token: &ProcessToken) -> Liveness {
     let Ok(boot_id) = read_boot_id() else {
         return Liveness::Uncertain;
@@ -1102,7 +1113,12 @@ pub(crate) fn liveness(token: &ProcessToken) -> Liveness {
         Err(_) => return Liveness::Uncertain,
     };
     match read_process_stat(token.pid) {
-        Ok(stat) if stat.start_ticks != token.start_ticks => return Liveness::Terminated,
+        Ok(stat)
+            if stat.start_ticks != token.start_ticks
+                || matches!(stat.state, b'Z' | b'X' | b'x') =>
+        {
+            return Liveness::Terminated;
+        }
         Ok(_) => {}
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Liveness::Terminated,
         Err(_) => return Liveness::Uncertain,
@@ -1647,6 +1663,97 @@ impl LaunchReceipt {
     }
 }
 
+// A handle-less CreationRecord may be trusted by another launch while its
+// creator is Alive. Keep an independent O_PATH pin until the record is retired
+// or the creator exits, including registration drops, early returns and unwind.
+// Nodes are process-lifetime bookkeeping: they are never freed. Only their fd
+// is closed after retirement. This avoids a mutex inherited locked across fork
+// (the helper forks after registration); child copies never release a parent's
+// pins. Helper lifetime and its finite target list bound this storage.
+struct CreationPin {
+    creator_pid: libc::pid_t,
+    registry: PathBuf,
+    key: String,
+    dev: u64,
+    ino: u64,
+    fd: AtomicI32,
+    next: *mut CreationPin,
+}
+
+static CREATION_PINS: AtomicPtr<CreationPin> = AtomicPtr::new(std::ptr::null_mut());
+
+fn pin_creation(
+    registry: &Registry,
+    key: &str,
+    identity: &ObjectIdentity,
+    held: BorrowedFd<'_>,
+) -> io::Result<()> {
+    use std::os::fd::IntoRawFd;
+    let fd = held.try_clone_to_owned()?;
+    let node = Box::into_raw(Box::new(CreationPin {
+        creator_pid: unsafe { libc::getpid() },
+        registry: registry.path.clone(),
+        key: key.to_string(),
+        dev: identity.dev,
+        ino: identity.ino,
+        fd: AtomicI32::new(fd.into_raw_fd()),
+        next: std::ptr::null_mut(),
+    }));
+    let mut head = CREATION_PINS.load(Ordering::Acquire);
+    loop {
+        // SAFETY: this unpublished node is owned exclusively by this call.
+        unsafe { (*node).next = head };
+        match CREATION_PINS.compare_exchange_weak(head, node, Ordering::Release, Ordering::Acquire)
+        {
+            Ok(_) => return Ok(()),
+            Err(actual) => head = actual,
+        }
+    }
+}
+
+fn retire_creation_pins(registry: &Registry, key: &str, dev: u64, ino: u64) {
+    let pid = unsafe { libc::getpid() };
+    let mut node = CREATION_PINS.load(Ordering::Acquire);
+    while !node.is_null() {
+        // SAFETY: published nodes are immutable except the atomic fd and are
+        // never freed, including after retirement. Acquire pairs publication.
+        let pin = unsafe { &*node };
+        if pin.creator_pid == pid
+            && pin.registry == registry.path
+            && pin.key == key
+            && pin.dev == dev
+            && pin.ino == ino
+        {
+            let fd = pin.fd.swap(-1, Ordering::AcqRel);
+            if fd >= 0 {
+                // SAFETY: swap gives this caller exclusive ownership; no retry
+                // on EINTR, which could otherwise close a reused descriptor.
+                unsafe { libc::close(fd) };
+            }
+        }
+        node = pin.next;
+    }
+}
+
+/// Exec preserves pid/start time but drops CLOEXEC pins. Refuse that transition
+/// while this process still supplies a CreationRecord's live-inode premise.
+/// Forked bwrap children own no records of their parent and may exec normally.
+pub(crate) fn ensure_no_creation_pins() -> io::Result<()> {
+    let pid = unsafe { libc::getpid() };
+    let mut node = CREATION_PINS.load(Ordering::Acquire);
+    while !node.is_null() {
+        // SAFETY: same process-lifetime publication invariant as above.
+        let pin = unsafe { &*node };
+        if pin.creator_pid == pid && pin.fd.load(Ordering::Acquire) >= 0 {
+            return Err(io::Error::other(
+                "refusing exec while synthetic target creation records remain pinned",
+            ));
+        }
+        node = pin.next;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
@@ -2172,6 +2279,9 @@ fn install_target(
     }
     let created = format!("{CREATED_PREFIX}{}", holder_id.encode());
     let published = identity_of(held.as_fd()).and_then(|identity| {
+        // Pin before publication, including a failure or panic after the
+        // record is visible. Retire only after all matching records disappear.
+        pin_creation(registry, key, &identity, held.as_fd())?;
         let record = CreationRecord {
             kind,
             identity,
@@ -2212,6 +2322,11 @@ fn install_target(
             let records = registry
                 .remove_key_file(key, &created)
                 .and_then(|()| registry.remove_key_file(key, &holder_name));
+            if records.is_ok() {
+                if let Ok(stat) = fstat(held.as_fd()) {
+                    retire_creation_pins(registry, key, stat.st_dev as u64, stat.st_ino as u64);
+                }
+            }
             records
                 .err()
                 .map(|_| TargetOutcome::Incomplete(IncompleteReason::HolderUnproven))

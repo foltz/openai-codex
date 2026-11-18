@@ -2265,3 +2265,147 @@ fn cleanup_synthetic_mount_targets_preserves_real_pre_existing_empty_file() {
     assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
     assert_eq!(fs::read(&file).expect("read preserved file"), b"");
 }
+
+/// Observe a real descriptor, not only bookkeeping. The pin must retain the
+/// unlinked inode even after all registration-local descriptors have dropped.
+fn has_open_inode(dev: u64, ino: u64) -> bool {
+    fs::read_dir("/proc/self/fd")
+        .expect("fd table")
+        .flatten()
+        .filter_map(|entry| fs::metadata(entry.path()).ok())
+        .any(|metadata| metadata.dev() == dev && metadata.ino() == ino)
+}
+
+#[test]
+fn creation_pin_survives_dropped_registrations_and_refuses_exec() {
+    assert_eq!(
+        in_forked_child(|| {
+            let fixture = fixture();
+            let target = fixture.work.path().join(".git");
+            let launch = own_token();
+            let registrations = register(&fixture, &[dir_target(&target)], &launch);
+            let metadata = fs::metadata(&target).expect("created target");
+            fs::remove_dir(&target).expect("simulate external unlink");
+            drop(registrations);
+            assert!(
+                has_open_inode(metadata.dev(), metadata.ino()),
+                "creator still pins the unlinked inode after registration drop"
+            );
+            assert!(
+                ensure_no_creation_pins().is_err(),
+                "exec must not invalidate a live creation record's pin"
+            );
+            // A forked child has a different creator identity. Its exec cannot
+            // invalidate this parent's descriptor and must remain available.
+            assert_eq!(
+                in_forked_child(|| if ensure_no_creation_pins().is_ok() {
+                    0
+                } else {
+                    1
+                }),
+                0
+            );
+            0
+        }),
+        0
+    );
+}
+
+#[test]
+fn creation_pin_survives_registration_unwind() {
+    assert_eq!(
+        in_forked_child(|| {
+            let fixture = fixture();
+            let target = fixture.work.path().join(".git");
+            let mut identity = None;
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let registrations = register(&fixture, &[dir_target(&target)], &own_token());
+                let metadata = fs::metadata(&target).expect("created target");
+                identity = Some((metadata.dev(), metadata.ino()));
+                fs::remove_dir(&target).expect("unlink target");
+                assert!(!registrations.is_empty());
+                panic!("keeper failure after creation");
+            }));
+            assert!(panic.is_err());
+            let (dev, ino) = identity.expect("registered before panic");
+            assert!(
+                has_open_inode(dev, ino),
+                "unwind must not release the creation pin"
+            );
+            assert!(ensure_no_creation_pins().is_err());
+            0
+        }),
+        0
+    );
+}
+
+#[test]
+fn successful_retirement_releases_creation_pin_and_exec_guard() {
+    assert_eq!(
+        in_forked_child(|| {
+            let fixture = fixture();
+            let target = fixture.work.path().join(".git");
+            let launch = own_token();
+            let registrations = register(&fixture, &[dir_target(&target)], &launch);
+            let metadata = fs::metadata(&target).expect("created target");
+            assert!(ensure_no_creation_pins().is_err());
+            assert_eq!(
+                release(
+                    &fixture,
+                    &registrations,
+                    &launch,
+                    SandboxProof::Gone,
+                    &mut NamespaceScan::default()
+                ),
+                vec![(target, TargetOutcome::Reaped)]
+            );
+            drop(registrations);
+            assert!(!has_open_inode(metadata.dev(), metadata.ino()));
+            assert!(ensure_no_creation_pins().is_ok());
+            0
+        }),
+        0
+    );
+}
+
+#[test]
+fn unreaped_zombie_cannot_prove_handle_less_creation() {
+    let fixture = fixture();
+    let target = fixture.work.path().join(".git");
+    let registrations = register(&fixture, &[dir_target(&target)], &own_token());
+    let key = &registrations[0].key;
+    let mut child =
+        fork_gated_child(Instant::now() + FIXTURE_BUDGET).expect("pidfd-backed child required");
+    let token = ProcessToken::for_pid(child.pid).expect("live child token");
+    let identity =
+        identity_of(registrations[0].held.as_ref().expect("held").as_fd()).expect("identity");
+    {
+        let _lock = fixture.registry.lock().expect("lock");
+        for (name, record) in fixture.registry.records(key).expect("records") {
+            let mut record = record.expect("record");
+            record.identity.handle = None;
+            record.creator = token.clone();
+            fixture
+                .registry
+                .write_key_file(key, &name, record.encode().as_bytes())
+                .expect("bind zombie creator");
+        }
+    }
+    drop(child.release.take());
+    assert!(
+        pidfd_exits_within(child.pidfd.as_fd(), CHILD_GATE_WAIT),
+        "child exits without reaping"
+    );
+    assert!(matches!(
+        read_process_stat(child.pid).expect("unreaped stat").state,
+        b'Z' | b'X' | b'x'
+    ));
+    assert_eq!(liveness(&token), Liveness::Terminated);
+    assert!(
+        !fixture
+            .registry
+            .proves_created(key, SyntheticMountTargetKind::EmptyDirectory, &identity)
+            .expect("proof")
+    );
+    child.finish().expect("reap child");
+}

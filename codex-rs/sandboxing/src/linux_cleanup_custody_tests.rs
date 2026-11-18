@@ -530,3 +530,50 @@ fn oversized_final_summary_is_incomplete_even_after_positive_join() {
         SandboxCleanupState::TimedOut
     );
 }
+
+#[test]
+fn terminal_launch_without_deadline_needs_no_retirement_frame() {
+    let mut launcher = exiting_child();
+    let mut custody = LinuxSandboxCleanupCustody::new(None).expect("custody");
+    let tightener = custody.tightener();
+    write_and_close_report(
+        &mut custody,
+        "v=1\nkind=helpers\nreaper=none\nend\nv=1\nstate=complete\nend\n",
+    );
+    custody.spawned(Some(launcher.id()));
+    launcher.wait();
+
+    let report = custody.collect_blocking_with_retire_grace(Duration::from_secs(2));
+    assert!(report.joined);
+    assert_eq!(report.state, SandboxCleanupState::Complete);
+    assert_eq!(tightener.deadline(), None);
+    assert_eq!(tightener.delivery_failure(), None);
+}
+
+#[test]
+fn nonterminal_launch_still_publishes_retirement_before_waiting() {
+    let mut custody = LinuxSandboxCleanupCustody::new(None).expect("custody");
+    drop(custody.child_tighten.take());
+    let tightener = custody.tightener();
+    let mut writer = std::fs::File::from(custody.child_report.take().expect("report end"));
+    writer
+        .write_all(b"v=1\nkind=helpers\nreaper=none\nend\nv=1\nstate=complete\nend\n")
+        .expect("write report");
+    custody.spawned(None);
+    let observer = Arc::clone(&tightener);
+    let close_report = std::thread::spawn(move || {
+        let bound = Instant::now() + Duration::from_secs(1);
+        while observer.deadline().is_none() {
+            assert!(Instant::now() < bound, "retirement bound was not published");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(writer);
+    });
+
+    let report = custody.collect_blocking_with_retire_grace(Duration::from_secs(2));
+    close_report.join().expect("close report");
+    assert!(report.joined);
+    assert_eq!(report.state, SandboxCleanupState::Incomplete);
+    assert!(tightener.deadline().is_some());
+    assert_eq!(tightener.delivery_failure(), Some("receiver-gone"));
+}

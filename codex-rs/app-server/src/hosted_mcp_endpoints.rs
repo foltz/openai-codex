@@ -557,4 +557,4 @@ fn retire_response(census: HostedEndpointRetirementCensus) -> McpHostedEndpointR
 
 #[cfg(test)]
 #[path = "hosted_mcp_endpoints_tests.rs"]
-mod tests;
+pub(crate) mod tests;

@@ -14,7 +14,7 @@ use std::sync::atomic::Ordering;
 use tokio::net::TcpListener;
 
 const AUTHORIZATION: &str = "Bearer config-bearer";
-const CAPABILITY: &str = "retirement-capability";
+pub(crate) const CAPABILITY: &str = "retirement-capability";
 
 fn endpoints() -> HostedMcpEndpoints {
     HostedMcpEndpoints::new(
@@ -23,7 +23,7 @@ fn endpoints() -> HostedMcpEndpoints {
     )
 }
 
-fn thread_start_naming(url: &str) -> ClientRequest {
+pub(crate) fn thread_start_naming(url: &str) -> ClientRequest {
     ClientRequest::ThreadStart {
         request_id: RequestId::Integer(1),
         params: ThreadStartParams {
@@ -36,7 +36,7 @@ fn thread_start_naming(url: &str) -> ClientRequest {
     }
 }
 
-fn declare_params(url: &str, capability: &str) -> McpHostedEndpointDeclareParams {
+pub(crate) fn declare_params(url: &str, capability: &str) -> McpHostedEndpointDeclareParams {
     McpHostedEndpointDeclareParams {
         url: url.to_owned(),
         authorization: AUTHORIZATION.to_owned(),
@@ -57,7 +57,7 @@ struct ProofState {
 }
 
 #[derive(Clone)]
-enum Behavior {
+pub(crate) enum Behavior {
     Answer,
     AnswerAfter(Duration),
     Oversized,
@@ -91,7 +91,7 @@ async fn proof_route(State(state): State<ProofState>, nonce: String) -> axum::re
 }
 
 /// Serves the challenge route; returns the endpoint URL and its hit counter.
-async fn serve_proof(behavior: Behavior) -> (String, Arc<AtomicUsize>) {
+pub(crate) async fn serve_proof(behavior: Behavior) -> (String, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let url = format!("http://{}/mcp", listener.local_addr().expect("addr"));
     let hits = Arc::new(AtomicUsize::new(0));

@@ -462,12 +462,14 @@ fn report_no_targets(custody: &mut crate::synthetic_targets::LaunchCustody) {
         return;
     }
     // Before bubblewrap (and so the command) starts: no reaper will exist.
-    crate::synthetic_targets::declare_reaper(custody.report.as_ref(), /*reaper*/ None);
+    crate::synthetic_targets::declare_reaper(custody.report.as_ref(), /*reaper*/ None)
+        .unwrap_or_else(|err| panic!("cannot declare sandbox helper custody: {err}"));
     if let Ok(launch) = crate::synthetic_targets::ProcessToken::current() {
         crate::cleanup_custody::write_report(
             custody.report.as_ref(),
             &crate::synthetic_targets::no_target_receipt(&launch),
-        );
+        )
+        .unwrap_or_else(|err| panic!("cannot report target-free launch: {err}"));
     }
 }
 
@@ -1127,7 +1129,8 @@ fn declare_keeper(
     crate::synthetic_targets::declare_keeper_receipt(&registry, &ids).map_err(|err| {
         format!("refusing to launch the Linux sandbox: cannot declare the sandbox keeper: {err}")
     })?;
-    crate::synthetic_targets::declare_reaper(custody.report.as_ref(), Some(&keeper));
+    crate::synthetic_targets::declare_reaper(custody.report.as_ref(), Some(&keeper))
+        .map_err(|err| format!("cannot declare sandbox keeper to its owner: {err}"))?;
     Ok(ids)
 }
 

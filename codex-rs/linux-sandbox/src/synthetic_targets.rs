@@ -3242,7 +3242,15 @@ pub(crate) fn finish_keeper(
         // the `running` receipt (or lacks the never-started statement).
         report.push_str("persist=failed\n");
     }
-    write_report(custody.report.as_ref(), &report);
+    if let Err(err) = write_report(custody.report.as_ref(), &report) {
+        note_persist_error(
+            &mut persist_error,
+            format!("cannot deliver final launch report: {err}"),
+        );
+        if receipt.state == CleanupState::Complete {
+            receipt.state = CleanupState::Incomplete;
+        }
+    }
     KeeperFinish {
         state: receipt.state,
         persist_error,
@@ -3262,7 +3270,7 @@ pub(crate) fn finish_refused_keeper(
     ids: &LaunchIdentity,
     custody: &mut LaunchCustody,
 ) -> KeeperFinish {
-    let receipt = LaunchReceipt {
+    let mut receipt = LaunchReceipt {
         launch: ids.receipt().clone(),
         state: CleanupState::Incomplete,
         finisher: Some("launcher"),
@@ -3283,7 +3291,15 @@ pub(crate) fn finish_refused_keeper(
     if persist_error.is_some() {
         report.push_str("persist=failed\n");
     }
-    write_report(custody.report.as_ref(), &report);
+    if let Err(err) = write_report(custody.report.as_ref(), &report) {
+        note_persist_error(
+            &mut persist_error,
+            format!("cannot deliver final launch report: {err}"),
+        );
+        if receipt.state == CleanupState::Complete {
+            receipt.state = CleanupState::Incomplete;
+        }
+    }
     KeeperFinish {
         state: receipt.state,
         persist_error,
@@ -3320,7 +3336,7 @@ pub(crate) fn finish_launch(
         registry.write_launch_receipt(&receipt)?;
         Ok(receipt)
     })?;
-    write_report(custody.report.as_ref(), &receipt.encode());
+    write_report(custody.report.as_ref(), &receipt.encode())?;
     Ok(receipt.state)
 }
 
@@ -3328,9 +3344,12 @@ pub(crate) fn finish_launch(
 /// before the sandboxed command can start) positively proves that no reaper
 /// was created; `Some` names the exact reaper so the owner can pin and join
 /// it. Nothing is declared when a reaper may exist but cannot be named.
-pub(crate) fn declare_reaper(report: Option<&OwnedFd>, reaper: Option<&ProcessToken>) {
+pub(crate) fn declare_reaper(
+    report: Option<&OwnedFd>,
+    reaper: Option<&ProcessToken>,
+) -> io::Result<()> {
     let reaper = reaper.map_or_else(|| "none".to_string(), ProcessToken::encode);
-    write_report(report, &format!("v=1\nkind=helpers\nreaper={reaper}\n"));
+    write_report(report, &format!("v=1\nkind=helpers\nreaper={reaper}\n"))
 }
 
 /// The receipt for a launch that installed nothing: written to the owner's

@@ -35,7 +35,6 @@
 //! already provably finished when bubblewrap exits.
 
 use std::io;
-use std::io::Write;
 use std::os::fd::AsFd;
 use std::os::fd::AsRawFd;
 use std::os::fd::BorrowedFd;
@@ -419,19 +418,56 @@ pub(crate) fn parse_inherited_fd(value: &str) -> Result<RawFd, String> {
     Ok(fd)
 }
 
-/// Writes one receipt block to the owner's report pipe. A receipt is far
-/// below `PIPE_BUF`, so the write is atomic; an owner that stopped reading
-/// makes it fail with `EPIPE` (SIGPIPE is ignored by the Rust runtime).
-pub(crate) fn write_report(report: Option<&OwnedFd>, receipt: &str) {
+/// Writes one bounded atomic frame without ever waiting for the owner. The
+/// final census can exceed PIPE_BUF: retain its full persisted receipt, but
+/// report an explicit incomplete summary instead of interleaving or blocking.
+/// Failure is returned to the finisher, never treated as delivered evidence.
+pub(crate) fn write_report(report: Option<&OwnedFd>, receipt: &str) -> io::Result<()> {
     let Some(report) = report else {
-        return;
+        return Ok(());
     };
-    let block = format!("{receipt}end\n");
-    let mut file = std::mem::ManuallyDrop::new(unsafe {
-        // SAFETY: borrowed for one write; the OwnedFd keeps ownership.
-        std::fs::File::from_raw_fd(report.as_raw_fd())
-    });
-    let _ = file.write_all(block.as_bytes());
+    let fd = report.as_raw_fd();
+    // SAFETY: the owned descriptor remains valid through both fcntl calls.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // PIPE_BUF is an atomic-write bound, not pipe capacity. No capacity-based
+    // correctness assumption or wait is introduced.
+    let bound = unsafe { libc::fpathconf(fd, libc::_PC_PIPE_BUF) };
+    if bound <= 0 {
+        return Err(io::Error::other(
+            "cannot establish report pipe atomic-write bound",
+        ));
+    }
+    let full = format!("{receipt}end\n");
+    let oversized = full.len() > bound as usize;
+    let block = if oversized {
+        "v=1\nstate=incomplete\nreport=exceeds-atomic-bound\nend\n"
+    } else {
+        &full
+    };
+    if block.len() > bound as usize {
+        return Err(io::Error::other(
+            "report pipe cannot carry an incomplete summary",
+        ));
+    }
+    // SAFETY: block is valid for its exact length. With O_NONBLOCK and a size
+    // <= PIPE_BUF this is all-or-nothing. EINTR is an observable failure; no
+    // retry loop can run past the original cleanup bound.
+    let written = unsafe { libc::write(fd, block.as_ptr().cast(), block.len()) };
+    if written < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if written as usize != block.len() {
+        return Err(io::Error::other("report pipe short atomic write"));
+    }
+    if oversized {
+        return Err(io::Error::other(
+            "full report exceeds atomic bound; incomplete summary delivered",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

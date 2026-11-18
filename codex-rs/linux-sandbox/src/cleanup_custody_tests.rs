@@ -1,5 +1,6 @@
 use super::*;
 use pretty_assertions::assert_eq;
+use std::io::{Read, Write};
 use std::os::fd::FromRawFd;
 use std::time::Duration;
 use std::time::Instant;
@@ -165,4 +166,83 @@ fn custody_pair_requires_distinct_pipes_in_the_correct_directions() {
     );
     assert!(validate_pipe_pair(Some(0), None).is_err());
     assert!(unsafe { libc::fcntl(deadline_read.as_raw_fd(), libc::F_GETFD) } >= 0);
+}
+
+#[test]
+fn report_frame_is_atomic_and_complete() {
+    let (read, write) = pipe();
+    let write = OwnedFd::from(write);
+    write_report(Some(&write), "v=1\nstate=complete\n").expect("delivered frame");
+    drop(write);
+    let mut text = String::new();
+    std::fs::File::from(read)
+        .read_to_string(&mut text)
+        .expect("read frame");
+    assert_eq!(text, "v=1\nstate=complete\nend\n");
+}
+
+#[test]
+fn oversized_report_delivers_only_explicit_incomplete_summary() {
+    let (read, write) = pipe();
+    let write = OwnedFd::from(write);
+    let bound = unsafe { libc::fpathconf(write.as_raw_fd(), libc::_PC_PIPE_BUF) };
+    assert!(bound > 0);
+    let receipt = format!("v=1\nstate=complete\n{}", "x".repeat(bound as usize));
+    assert!(write_report(Some(&write), &receipt).is_err());
+    drop(write);
+    let mut text = String::new();
+    std::fs::File::from(read)
+        .read_to_string(&mut text)
+        .expect("read summary");
+    assert_eq!(
+        text,
+        "v=1\nstate=incomplete\nreport=exceeds-atomic-bound\nend\n"
+    );
+}
+
+#[test]
+fn saturated_report_pipe_returns_failure_without_waiting_or_partial_frame() {
+    let (read, write) = pipe();
+    let write = OwnedFd::from(write);
+    let flags = unsafe { libc::fcntl(write.as_raw_fd(), libc::F_GETFL) };
+    assert!(flags >= 0);
+    assert_eq!(
+        unsafe { libc::fcntl(write.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let capacity = unsafe { libc::fcntl(write.as_raw_fd(), libc::F_GETPIPE_SZ) };
+    assert!(capacity > 0);
+    let fill = vec![b'x'; capacity as usize];
+    assert_eq!(
+        unsafe { libc::write(write.as_raw_fd(), fill.as_ptr().cast(), fill.len()) },
+        capacity as isize
+    );
+    let start = Instant::now();
+    assert_eq!(
+        write_report(Some(&write), "v=1\nstate=complete\n")
+            .expect_err("full pipe")
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert!(start.elapsed() < Duration::from_secs(1));
+    drop(write);
+    let mut observed = Vec::new();
+    std::fs::File::from(read)
+        .read_to_end(&mut observed)
+        .expect("drain");
+    assert_eq!(observed, fill, "no receipt prefix was partially written");
+}
+
+#[test]
+fn closed_report_reader_is_failure_and_no_owner_is_a_noop() {
+    let (read, write) = pipe();
+    let write = OwnedFd::from(write);
+    drop(read);
+    assert_eq!(
+        write_report(Some(&write), "v=1\nstate=complete\n")
+            .expect_err("closed owner")
+            .raw_os_error(),
+        Some(libc::EPIPE)
+    );
+    assert!(write_report(None, "ignored").is_ok());
 }

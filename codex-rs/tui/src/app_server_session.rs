@@ -307,8 +307,6 @@ pub(crate) async fn request_thread_start_with_history_fallback(
 ) -> std::result::Result<(ThreadStartResponse, ThreadHistorySupport, bool), TypedRequestError> {
     let mut history_support = ThreadHistorySupport::Paginated;
     loop {
-        #[cfg(test)]
-        eprintln!("HOSTED_START typed request");
         match request_handle
             .request_typed(ClientRequest::ThreadStart {
                 request_id,
@@ -1112,8 +1110,6 @@ impl AppServerSession {
 
     #[cfg(test)]
     pub(crate) async fn start_thread(&mut self, config: &Config) -> Result<AppServerStartedThread> {
-        #[cfg(test)]
-        eprintln!("HOSTED_START wrapper entered");
         self.start_thread_with_session_start_source(
             &LocalSettings::from(config),
             config,
@@ -1136,8 +1132,6 @@ impl AppServerSession {
         selected_profile: Option<&PermissionProfileSelection>,
         host_project_cwd: Option<&std::path::Path>,
     ) -> Result<AppServerStartedThread> {
-        #[cfg(test)]
-        eprintln!("HOSTED_START source entered");
         if self.thread_params_mode.settings_owner() == ThreadSettingsOwner::Server
             && selected_profile.is_some()
         {
@@ -1145,20 +1139,14 @@ impl AppServerSession {
                 "Cloud conversations currently use server-selected permissions."
             );
         }
-        #[cfg(test)]
-        eprintln!("HOSTED_START before config");
         let request_id = self.next_request_id();
         let session_config = self.session_config_with_effective_service_tier(config);
-        #[cfg(test)]
-        eprintln!("HOSTED_START config resolved");
         let mut params = thread_start_params_from_config(
             &session_config,
             self.thread_params_mode(),
             remote_cwd_override.or(self.remote_cwd_override.as_deref()),
             session_start_source,
         );
-        #[cfg(test)]
-        eprintln!("HOSTED_START params built");
         params.clear_predecessor_thread_id = clear_predecessor_thread_id;
         if self.thread_params_mode.settings_owner() == ThreadSettingsOwner::Client {
             params.model_provider = self
@@ -1180,13 +1168,9 @@ impl AppServerSession {
             params.history_mode = None;
         }
         if self.thread_params_mode.settings_owner() == ThreadSettingsOwner::Client {
-            #[cfg(test)]
-            eprintln!("HOSTED_START before namespace");
             self.thread_tool_transport()
                 .check_namespace(&self.request_handle, &config.cwd)
                 .await?;
-            #[cfg(test)]
-            eprintln!("HOSTED_START namespace checked");
             self.thread_tool_transport().configure(&mut params);
         }
         let request_handle = self.request_handle();
@@ -1198,8 +1182,6 @@ impl AppServerSession {
         } else {
             None
         };
-        #[cfg(test)]
-        eprintln!("HOSTED_START before start RPC");
         let started = match project {
             Some(project) => request_handle
                 .start_cloud_project_thread(request_id, params, project)
@@ -1210,8 +1192,6 @@ impl AppServerSession {
                     .await
             }
         };
-        #[cfg(test)]
-        eprintln!("HOSTED_START start RPC returned");
         let (response, history_support, task_tools_available) = started.map_err(|err| {
             bootstrap_request_error("thread/start failed during TUI bootstrap", err)
         })?;

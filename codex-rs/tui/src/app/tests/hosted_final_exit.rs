@@ -39,9 +39,7 @@ async fn hosted_session_with_transport_retention(
     behavior: RealtimeRequestBehavior,
     retain_transport: bool,
 ) -> Result<Hosted> {
-    eprintln!("HOSTED_SETUP entering app construction");
     let (mut app, events, ops) = boxed_future!(make_test_app_with_channels()).await;
-    eprintln!("HOSTED_SETUP app constructed");
     let codex_home = tempdir()?;
     app.config.codex_home = codex_home.path().to_path_buf().abs();
     app.config
@@ -59,21 +57,13 @@ async fn hosted_session_with_transport_retention(
             LoaderOverrides::without_managed_config_for_tests(),
         ))
         .await?;
-    eprintln!("HOSTED_SETUP recording server connected");
     boxed_future!(app_server.start_dynamic_tool_mcp(
         app.config.clone(),
         app.app_event_tx.clone(),
         app.dynamic_tool_status_updates.clone(),
     ))
     .await?;
-    eprintln!("HOSTED_SETUP dynamic tools started");
-    let start = boxed_future!(app_server.start_thread(&app.config));
-    eprintln!(
-        "HOSTED_SETUP thread future bytes={}",
-        std::mem::size_of_val(start.as_ref().get_ref())
-    );
-    let started = start.await?;
-    eprintln!("HOSTED_SETUP thread started");
+    let started = boxed_future!(app_server.start_thread(&app.config)).await?;
     assert!(
         started.task_tools_available,
         "the daemon path hosts task tools"
@@ -91,7 +81,6 @@ async fn hosted_session_with_transport_retention(
 
 #[tokio::test]
 async fn final_exit_retires_the_hosted_endpoint_within_one_budget() -> Result<()> {
-    eprintln!("HOSTED_TEST entered");
     boxed_future!(final_exit_retires_the_hosted_endpoint_within_one_budget_scenario()).await
 }
 

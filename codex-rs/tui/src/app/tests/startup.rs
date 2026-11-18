@@ -2204,3 +2204,78 @@ async fn cloud_switch_wait_applies_navigation_before_polling_terminal_input() ->
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn abandoned_startup_event_releases_only_its_provisional_grant() -> Result<()> {
+    use codex_app_server_client::AppServerClient;
+    use codex_app_server_client::CloudClient;
+    use codex_app_server_client::CloudOperation;
+    use codex_app_server_protocol::ThreadRetentionAcquireResponse;
+    use codex_app_server_protocol::ThreadRetentionReleaseResponse;
+
+    for queued in [false, true] {
+        let (client, mut commands, _events) = CloudClient::channel(4);
+        let mut server = AppServerSession::new(
+            crate::backend_id::BackendId::new(),
+            AppServerClient::Cloud(client),
+            ThreadParamsMode::Remote,
+        );
+        let thread_id = ThreadId::new();
+        let retention = server
+            .retain_clear_successor(
+                &thread_id.to_string(),
+                Some(ThreadRetentionAcquireResponse::Acquired {
+                    grant_id: "startup-grant".into(),
+                }),
+            )
+            .await
+            .expect("provisional grant evidence is accepted");
+        let event = AppEvent::StartupThreadStarted {
+            backend_id: server.backend_id(),
+            result: Ok(crate::app_server_session::PendingStartupThread {
+                started: AppServerStartedThread {
+                    session: test_thread_session(thread_id, test_path_buf("/tmp/project")),
+                    turns: Vec::new(),
+                    blocks_direct_input: false,
+                    task_tools_available: false,
+                },
+                retention: Some(retention),
+            }),
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            matches!(
+                commands.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "the grant stays provisional while its event is owned"
+        );
+        if queued {
+            let (send, receive) = unbounded_channel();
+            send.send(event).unwrap();
+            drop(receive);
+        } else {
+            drop(event);
+        }
+        let command = tokio::time::timeout(std::time::Duration::from_secs(1), commands.recv())
+            .await?
+            .expect("abandoned event releases its new grant");
+        let CloudOperation::Request(request) = command.operation else {
+            panic!("expected release")
+        };
+        let codex_app_server_protocol::ClientRequest::ThreadRetentionRelease { params, .. } =
+            *request
+        else {
+            panic!("expected retention release")
+        };
+        assert_eq!(params.thread_id, thread_id.to_string());
+        assert_eq!(params.grant_id, "startup-grant");
+        command
+            .response
+            .send(Ok(Ok(serde_json::to_value(
+                ThreadRetentionReleaseResponse::Released {},
+            )?)))
+            .unwrap();
+    }
+    Ok(())
+}

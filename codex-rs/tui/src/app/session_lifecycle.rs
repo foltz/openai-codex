@@ -1070,10 +1070,33 @@ impl App {
         self.sync_active_agent_label();
     }
 
+    pub(super) async fn handle_pending_startup_thread_started(
+        &mut self,
+        app_server: &mut AppServerSession,
+        result: Result<crate::app_server_session::PendingStartupThread>,
+    ) -> Result<()> {
+        let (result, retention) = match result {
+            Ok(pending) => (Ok(pending.started), pending.retention),
+            Err(error) => (Err(error), None),
+        };
+        self.install_startup_thread(app_server, result, retention)
+            .await
+    }
+
+    #[cfg(test)]
     pub(super) async fn handle_startup_thread_started(
         &mut self,
         app_server: &mut AppServerSession,
         result: Result<AppServerStartedThread>,
+    ) -> Result<()> {
+        self.install_startup_thread(app_server, result, None).await
+    }
+
+    async fn install_startup_thread(
+        &mut self,
+        app_server: &mut AppServerSession,
+        result: Result<AppServerStartedThread>,
+        retention: Option<crate::app_server_session::retention::PendingRetention>,
     ) -> Result<()> {
         if !self.pending_startup_thread_start {
             if let Ok(started) = result {
@@ -1171,6 +1194,9 @@ impl App {
                 }
                 self.enqueue_primary_thread_session(started.session, started.turns)
                     .await?;
+                if let Some(retention) = retention {
+                    retention.commit();
+                }
                 self.apply_backend_banner_fallback(app_server).await;
                 if let Some(model) = self.harness_overrides.model.as_deref()
                     && model == self.chat_widget.current_model()

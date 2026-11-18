@@ -511,7 +511,13 @@ async fn lost_initial_thread_reply_keeps_startup_draft_offline() -> Result<()> {
         app.handle_event(
             &mut tui,
             &mut session,
-            AppEvent::StartupThreadStarted { backend_id, result },
+            AppEvent::StartupThreadStarted {
+                backend_id,
+                result: result.map(|started| crate::app_server_session::PendingStartupThread {
+                    started,
+                    retention: None,
+                }),
+            },
         )
         .await?;
         assert!(app.reconnect.offline);

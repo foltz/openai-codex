@@ -1173,11 +1173,14 @@ async fn fresh_startup_thread_drains_buffered_approval_before_draft_handoff() ->
         &mut app_server,
         AppEvent::StartupThreadStarted {
             backend_id,
-            result: Ok(AppServerStartedThread {
-                session: test_thread_session(thread_id, test_path_buf("/tmp/project")),
-                turns: Vec::new(),
-                blocks_direct_input: false,
-                task_tools_available: false,
+            result: Ok(crate::app_server_session::PendingStartupThread {
+                started: AppServerStartedThread {
+                    session: test_thread_session(thread_id, test_path_buf("/tmp/project")),
+                    turns: Vec::new(),
+                    blocks_direct_input: false,
+                    task_tools_available: false,
+                },
+                retention: None,
             }),
         },
     ))

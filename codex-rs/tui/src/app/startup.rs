@@ -65,11 +65,12 @@ fn spawn_startup_thread_start(
 ) {
     let backend_id = app_server.backend_id();
     let request_handle = app_server.request_handle();
+    let retention_client = app_server.retention_client();
     let thread_params_mode = app_server.thread_params_mode();
     let remote_cwd_override = app_server.remote_cwd_override().map(Path::to_path_buf);
     let thread_tool_transport = app_server.thread_tool_transport();
     tokio::spawn(async move {
-        let result = crate::app_server_session::start_thread_with_request_handle(
+        let result = crate::app_server_session::prepare_startup_thread(
             request_handle,
             &local_settings,
             config,
@@ -77,11 +78,12 @@ fn spawn_startup_thread_start(
             remote_cwd_override,
             thread_tool_transport,
             launch_choices,
+            Some(retention_client),
         )
         .await
         .and_then(|started| {
             if let Some(worktree) = worktree.as_ref() {
-                worktree.bind(started.session.thread_id)?;
+                worktree.bind(started.started.session.thread_id)?;
             }
             Ok(started)
         });

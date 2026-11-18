@@ -1145,6 +1145,10 @@ impl AppServerSession {
         }
     }
 
+    pub(crate) fn retention_client(&self) -> retention::RetentionClient {
+        self.retention.clone()
+    }
+
     pub(crate) async fn thread_clear(
         &mut self,
         thread_id: ThreadId,
@@ -2467,6 +2471,7 @@ impl AppServerSession {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn start_thread_with_request_handle(
     request_handle: AppServerRequestHandle,
     local_settings: &LocalSettings,
@@ -2476,6 +2481,30 @@ pub(crate) async fn start_thread_with_request_handle(
     thread_tool_transport: ThreadToolTransport,
     launch_choices: StartupLaunchChoices,
 ) -> Result<AppServerStartedThread> {
+    prepare_startup_thread(
+        request_handle,
+        local_settings,
+        config,
+        thread_params_mode,
+        remote_cwd_override,
+        thread_tool_transport,
+        launch_choices,
+        None,
+    )
+    .await
+    .map(|pending| pending.started)
+}
+
+pub(crate) async fn prepare_startup_thread(
+    request_handle: AppServerRequestHandle,
+    local_settings: &LocalSettings,
+    config: Config,
+    thread_params_mode: ThreadParamsMode,
+    remote_cwd_override: Option<PathBuf>,
+    thread_tool_transport: ThreadToolTransport,
+    launch_choices: StartupLaunchChoices,
+    retention_client: Option<retention::RetentionClient>,
+) -> Result<PendingStartupThread> {
     let request_id = RequestId::String(format!("startup-thread-start-{}", Uuid::new_v4()));
     let mut params = thread_start_params_with_reviewer(
         &config,
@@ -2493,17 +2522,43 @@ pub(crate) async fn start_thread_with_request_handle(
         params.daybreak_enabled = (config.daybreak_enabled && !config.ephemeral).then_some(true);
         thread_tool_transport.configure(&mut params);
     }
+    params.retain_for_connection = retention_client.is_some();
     let (response, _history_support, task_tools_available) =
         request_thread_start_with_history_fallback(&request_handle, request_id, params)
             .await
             .map_err(|err| {
                 bootstrap_request_error("thread/start failed during TUI bootstrap", err)
             })?;
+    let retention = match retention_client {
+        Some(client) => match client
+            .adopt_thread(
+                request_handle,
+                response.thread.id.clone(),
+                response.retention.clone(),
+            )
+            .await
+        {
+            Ok(retention) => Some(retention),
+            Err(error) => {
+                client.warn_adoption(&response.thread.id, &error);
+                None
+            }
+        },
+        None => None,
+    };
     let mut started =
         started_thread_from_start_response(response, local_settings, &config, thread_params_mode)
             .await?;
     started.task_tools_available = task_tools_available;
-    Ok(started)
+    Ok(PendingStartupThread { started, retention })
+}
+
+/// Unique provisional retention travels with the startup event. Dropping an
+/// undelivered or stale event abandons only its newly acquired grant.
+#[derive(Debug)]
+pub(crate) struct PendingStartupThread {
+    pub(crate) started: AppServerStartedThread,
+    pub(crate) retention: Option<retention::PendingRetention>,
 }
 
 pub(crate) fn workspace_display(

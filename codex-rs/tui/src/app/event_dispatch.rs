@@ -395,7 +395,7 @@ impl App {
                 }
             }
             AppEvent::StartupThreadStarted { result, .. } => {
-                self.handle_startup_thread_started(app_server, result)
+                self.handle_pending_startup_thread_started(app_server, result)
                     .await?;
             }
             AppEvent::DynamicToolThreadStarted {

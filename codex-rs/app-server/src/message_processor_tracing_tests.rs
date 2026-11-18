@@ -994,7 +994,7 @@ async fn production_reset_inventory_revokes_hosted_declaration_authority() -> Re
 
     let home = TempDir::new()?;
     let mut config = build_test_config(home.path(), "http://127.0.0.1:1").await?;
-    config.features.disable(codex_features::Feature::Plugins);
+    config.features.disable(codex_features::Feature::Plugins)?;
     let (processor, _outgoing) = build_test_processor_for_retirement(Arc::new(config)).await;
     let (url, _hits) = serve_proof(Behavior::Answer).await;
     let endpoints = &processor.hosted_mcp_endpoints;
@@ -1017,6 +1017,7 @@ async fn production_reset_inventory_revokes_hosted_declaration_authority() -> Re
     // cleanup directly. Later account-dependent stages may refuse this fixture;
     // hosted authority must already be revoked before either return outcome.
     let reset = processor.reset_inventory.reset_all().await;
+    eprintln!("production reset inventory result: {reset:?}");
     assert_eq!(custody.census().declared, 0, "reset result: {reset:?}");
     for connection in [ConnectionId(1), ConnectionId(2)] {
         assert_eq!(

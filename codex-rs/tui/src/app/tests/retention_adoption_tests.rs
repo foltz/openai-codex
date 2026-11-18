@@ -300,3 +300,145 @@ async fn fork_preparation_retention_scenario() -> Result<()> {
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn sidebar_event_owns_retention_until_install_or_abandonment() -> Result<()> {
+    boxed_future!(sidebar_event_retention_scenario()).await
+}
+
+async fn sidebar_event_retention_scenario() -> Result<()> {
+    use crate::app_server_session::SideChatStorage;
+    for outcome in ["installed", "stale", "discarded"] {
+        let (mut app, _, _) = make_test_app_with_channels().await;
+        app.config
+            .features
+            .set_enabled(codex_features::Feature::Plugins, false)?;
+        enable_side_retention(&mut app)?;
+        let parent = ThreadId::from_string(
+            &app_test_support::create_fake_rollout(
+                app.config.codex_home.as_path(),
+                "2026-01-01T00-00-00",
+                "2026-01-01T00:00:00Z",
+                "sidebar source",
+                Some(app.config.model_provider_id.as_str()),
+                None,
+            )
+            .expect("source rollout"),
+        )?;
+        let mut server =
+            boxed_future!(crate::start_embedded_app_server_for_picker(&app.config)).await?;
+        let started = boxed_future!(server.resume_thread(
+            &app.local_settings,
+            app.config.clone(),
+            parent,
+            crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
+        ))
+        .await?;
+        app.chat_widget
+            .handle_thread_session(started.session.clone());
+        app.enqueue_primary_thread_session(started.session, started.turns)
+            .await?;
+        app.active_thread_id = Some(parent);
+        let fork = boxed_future!(server.sidebar_fork(
+            app.local_settings.clone(),
+            app.side_fork_config(),
+            parent,
+            None,
+            SideChatStorage::Temporary,
+        ))
+        .await?;
+        assert_eq!(fork.boundary, Ok(()));
+        assert!(fork.retention.is_some());
+        let child = fork.thread.session.thread_id;
+        let ThreadRetentionAcquireResponse::AlreadyHeld { grant_id } =
+            probe(&mut server, child).await?
+        else {
+            panic!("queued sidebar event must own a grant");
+        };
+        let request = uuid::Uuid::new_v4();
+        let event = AppEvent::SideCreated {
+            backend_id: server.backend_id(),
+            parent,
+            request,
+            result: Ok(Box::new(fork)),
+        };
+        tokio::task::yield_now().await;
+        if outcome == "discarded" {
+            drop(event);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match probe(&mut server, child).await? {
+                        ThreadRetentionAcquireResponse::Acquired { .. } => {
+                            break Ok::<_, color_eyre::Report>(());
+                        }
+                        ThreadRetentionAcquireResponse::AlreadyHeld { .. } => {
+                            tokio::task::yield_now().await
+                        }
+                        other => panic!("unexpected sidebar probe: {other:?}"),
+                    }
+                }
+            })
+            .await??;
+            server.thread_unsubscribe(child).await?;
+        } else {
+            if outcome == "installed" {
+                let pane = app.sidebars.entry(Some(parent)).or_default();
+                pane.creation = Some(super::super::sidebar::SideCreation {
+                    owner: server.backend_id(),
+                    state: super::super::sidebar::CreationState::Waiting {
+                        request,
+                        started: Instant::now(),
+                    },
+                    message: None,
+                });
+                pane.show(
+                    super::super::sidebar::SidebarContent::Chooser,
+                    super::super::sidebar::PaneFocus::Main,
+                );
+            }
+            let mut tui = crate::tui::test_support::make_test_tui()?;
+            boxed_future!(app.handle_event(&mut tui, &mut server, event)).await?;
+            assert_eq!(
+                app.side_threads.contains_key(&child),
+                outcome == "installed"
+            );
+            if outcome == "installed" {
+                // Revalidation waits for any earlier abandonment release. An
+                // accidental drop would mint a DIFFERENT opaque grant here.
+                let (_, observation) = boxed_future!(server.prepare_retained_resume(
+                    &app.local_settings,
+                    app.config.clone(),
+                    child,
+                    crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
+                    crate::resume_permissions::ResumePermissions::default(),
+                ))
+                .await?;
+                assert_eq!(
+                    probe(&mut server, child).await?,
+                    ThreadRetentionAcquireResponse::AlreadyHeld {
+                        grant_id: grant_id.clone()
+                    }
+                );
+                drop(observation);
+                assert!(app.discard_side_thread(&mut server, child).await);
+            }
+            let released: codex_app_server_protocol::ThreadRetentionReleaseResponse = server
+                .request_handle()
+                .request_typed(ClientRequest::ThreadRetentionRelease {
+                    request_id: server.next_request_id(),
+                    params: codex_app_server_protocol::ThreadRetentionReleaseParams {
+                        thread_id: child.to_string(),
+                        grant_id,
+                    },
+                })
+                .await?;
+            assert_eq!(
+                released,
+                codex_app_server_protocol::ThreadRetentionReleaseResponse::NotHeld {}
+            );
+        }
+        server.thread_unsubscribe(parent).await?;
+        server.shutdown().await?;
+    }
+    Ok(())
+}

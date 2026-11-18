@@ -984,6 +984,9 @@ impl App {
                     .entry(Some(parent_thread_id))
                     .or_default()
                     .chat_ready(child_thread_id);
+                if let Some(retention) = fork.retention {
+                    retention.commit();
+                }
                 if !enter {
                     self.sync_side_thread_ui();
                     return;

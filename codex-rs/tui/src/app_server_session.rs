@@ -522,6 +522,7 @@ pub(crate) struct SidebarFork {
     pub(crate) boundary: Result<(), String>,
     pub(crate) inherited_profile: bool,
     pub(crate) storage: SideChatStorage,
+    pub(crate) retention: Option<PendingRetention>,
     legacy: bool,
 }
 
@@ -1535,16 +1536,28 @@ impl AppServerSession {
                 storage = SideChatStorage::Attached;
             }
             let fork = view
-                .fork_side_thread(&settings, config.clone(), parent, profile.as_ref(), storage)
+                .prepare_retained_side_fork(
+                    &settings,
+                    config.clone(),
+                    parent,
+                    profile.as_ref(),
+                    storage,
+                )
                 .await;
-            let thread = match fork {
+            let (thread, retention) = match fork {
                 Err(err)
                     if storage == SideChatStorage::Attached
                         && side_chat_history::is_attached_thread_store_unsupported(&err) =>
                 {
                     storage = SideChatStorage::Temporary;
-                    view.fork_side_thread(&settings, config, parent, profile.as_ref(), storage)
-                        .await?
+                    view.prepare_retained_side_fork(
+                        &settings,
+                        config,
+                        parent,
+                        profile.as_ref(),
+                        storage,
+                    )
+                    .await?
                 }
                 result => result?,
             };
@@ -1576,6 +1589,7 @@ impl AppServerSession {
                 boundary,
                 inherited_profile: profile.is_some(),
                 storage,
+                retention,
                 legacy: view.history_support == ThreadHistorySupport::LegacyOnly,
             })
         }
@@ -1590,6 +1604,32 @@ impl AppServerSession {
         }
     }
 
+    pub(crate) async fn prepare_retained_side_fork(
+        &mut self,
+        local_settings: &LocalSettings,
+        mut config: Config,
+        thread_id: ThreadId,
+        selected_profile: Option<&PermissionProfileSelection>,
+        storage: SideChatStorage,
+    ) -> Result<(AppServerStartedThread, Option<PendingRetention>)> {
+        storage.configure_fork(&mut config);
+        self.fork_thread_at_with_presentation(
+            local_settings,
+            config,
+            thread_id,
+            /*last_turn_id*/ None,
+            /*before_turn_id*/ None,
+            ForkGoalContinuation::StartIfIdle,
+            ForkPresentation::SideConversation(storage),
+            selected_profile,
+            ForkPermissionMode::InheritSaved,
+            ForkConfigSource::Session,
+            /*adopt*/ true,
+        )
+        .await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn fork_side_thread(
         &mut self,
         local_settings: &LocalSettings,
@@ -1634,7 +1674,6 @@ impl AppServerSession {
         config_source: ForkConfigSource,
         adopt: bool,
     ) -> Result<(AppServerStartedThread, Option<PendingRetention>)> {
-        let adopt = adopt && presentation == ForkPresentation::Regular && !config.ephemeral;
         if self.thread_params_mode == ThreadParamsMode::Cloud {
             color_eyre::eyre::bail!("Cloud conversations cannot be forked in the TUI yet.");
         }

@@ -35,7 +35,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 async fn interactive_subscription_list_requires_experimental_opt_in() -> Result<()> {
     let mut server = TestAppServer::builder()
         .without_auto_env()
-        .with_root_config("[features]\nplugins = false")
+        .with_args(&["-c", "features.plugins=false"])
         .build()
         .await?;
     let initialized = server
@@ -76,7 +76,7 @@ async fn interactive_subscription_list_requires_experimental_opt_in() -> Result<
 async fn thread_interactive_subscription_list_is_empty_without_server_entitlement() -> Result<()> {
     let mut app_server = TestAppServer::builder()
         .without_auto_env()
-        .with_root_config("[features]\nplugins = false")
+        .with_args(&["-c", "features.plugins=false"])
         .build()
         .await?;
     let initialized = app_server

@@ -39,7 +39,7 @@ async fn hosted_session_with_transport_retention(
     behavior: RealtimeRequestBehavior,
     retain_transport: bool,
 ) -> Result<Hosted> {
-    let (mut app, events, ops) = Box::pin(make_test_app_with_channels()).await;
+    let (mut app, events, ops) = boxed_future!(make_test_app_with_channels()).await;
     let codex_home = tempdir()?;
     app.config.codex_home = codex_home.path().to_path_buf().abs();
     app.config
@@ -47,7 +47,7 @@ async fn hosted_session_with_transport_retention(
         .set_enabled(codex_features::Feature::Plugins, false)?;
     app.config.sqlite = codex_state::SqliteConfig::new_for_testing(codex_home.path().abs());
     let (mut app_server, requests, proxy) =
-        Box::pin(start_recording_app_server_with_realtime_speech(
+        boxed_future!(start_recording_app_server_with_realtime_speech(
             &app.config,
             HistoryCapabilities::Current,
             /*blocked_thread_list*/ None,
@@ -57,13 +57,13 @@ async fn hosted_session_with_transport_retention(
             LoaderOverrides::without_managed_config_for_tests(),
         ))
         .await?;
-    Box::pin(app_server.start_dynamic_tool_mcp(
+    boxed_future!(app_server.start_dynamic_tool_mcp(
         app.config.clone(),
         app.app_event_tx.clone(),
         app.dynamic_tool_status_updates.clone(),
     ))
     .await?;
-    let started = Box::pin(app_server.start_thread(&app.config)).await?;
+    let started = boxed_future!(app_server.start_thread(&app.config)).await?;
     assert!(
         started.task_tools_available,
         "the daemon path hosts task tools"

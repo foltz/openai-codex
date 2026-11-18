@@ -78,8 +78,11 @@ pub(super) async fn resume_thread(
 ) -> ThreadStoreResult<Arc<Vec<RolloutItem>>> {
     eprintln!("COLD_TRACE local writer resume entry");
     let _live_writer_guard = store.live_writer_locks.lock(params.thread_id).await;
+    eprintln!("COLD_TRACE writer mutex ready");
     store.ensure_live_recorder_absent(params.thread_id).await?;
+    eprintln!("COLD_TRACE recorder absence ready");
     let writer_lock = store.acquire_writer_lock(params.thread_id)?;
+    eprintln!("COLD_TRACE writer lock ready");
     let rollout_path = match params.rollout_path {
         Some(rollout_path) => rollout_path,
         None => {
@@ -99,8 +102,10 @@ pub(super) async fn resume_thread(
                 .path
         }
     };
+    eprintln!("COLD_TRACE before requested path resolve");
     let rollout_path =
         super::read_thread::resolve_requested_rollout_path(store, rollout_path).await?;
+    eprintln!("COLD_TRACE requested path ready");
     if !params.include_archived
         && super::helpers::rollout_path_is_archived(&store.config.codex_home, &rollout_path)
     {
@@ -108,6 +113,7 @@ pub(super) async fn resume_thread(
             message: format!("thread {} is archived", params.thread_id),
         });
     }
+    eprintln!("COLD_TRACE before history load");
     let history = match params.history {
         Some(history)
             if !matches!(
@@ -130,6 +136,7 @@ pub(super) async fn resume_thread(
                 .items,
         ),
     };
+    eprintln!("COLD_TRACE history ready");
     let history_mode = canonical_history_mode_from_rollout_items(&history);
     let cwd = params
         .metadata
@@ -150,6 +157,7 @@ pub(super) async fn resume_thread(
         params.thread_id,
         history_mode,
     )?;
+    eprintln!("COLD_TRACE before recorder resume");
     let recorder = RolloutRecorder::new_with_writer_lock(
         &config,
         RolloutRecorderParams::resume(rollout_path),
@@ -159,6 +167,7 @@ pub(super) async fn resume_thread(
     .map_err(|err| ThreadStoreError::Internal {
         message: format!("failed to resume local thread recorder: {err}"),
     })?;
+    eprintln!("COLD_TRACE recorder ready");
     store
         .insert_live_recorder(
             params.thread_id,

@@ -813,3 +813,141 @@ pub(super) async fn drain_history(
             .collect::<Vec<_>>(),
     ))
 }
+
+#[tokio::test]
+async fn production_reconnect_adopts_only_the_installed_writable_view() -> Result<()> {
+    boxed_future!(production_reconnect_retention_scenario()).await
+}
+
+async fn production_reconnect_retention_scenario() -> Result<()> {
+    use crate::app::reconnect::{ReconnectAttachment, reconnect_with_adoption};
+    for external in [false, true] {
+        let (mut app, mut events, _ops) = make_test_app_with_channels().await;
+        let id = ThreadId::new();
+        let cwd = app.config.cwd.clone();
+        app.primary_thread_id = Some(id);
+        app.active_thread_id = Some(id);
+        let cached = test_thread_session(id, cwd.to_path_buf());
+        app.ensure_thread_channel(id)
+            .store
+            .lock()
+            .await
+            .set_session(cached.clone(), Vec::new());
+        app.chat_widget.handle_thread_session(cached);
+        if external {
+            app.ensure_thread_channel(id).mark_external_writer();
+            app.chat_widget.show_external_writer_thread();
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        app.app_server_target = AppServerTarget::Remote {
+            endpoint: crate::resolve_remote_addr(&format!("ws://{}", listener.local_addr()?))?,
+        };
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            let mut granted = false;
+            let mut resumes = 0;
+            let methods = serve_reconnect_requests(tokio_tungstenite::accept_async(stream).await?, |request| {
+                let thread = json!({
+                    "id": id, "sessionId": id, "preview": "retained", "ephemeral": false,
+                    "modelProvider": "test-provider", "createdAt": 1, "updatedAt": 2,
+                    "status": {"type": "idle"}, "cwd": cwd, "cliVersion": "0.0.0",
+                    "source": "cli", "turns": []
+                });
+                std::future::ready(Some(match request.method.as_str() {
+                    "thread/resume" => {
+                        let params = request.params.as_ref().unwrap();
+                        assert_eq!(params["threadId"], id.to_string());
+                        assert_eq!(params["retainForConnection"].as_bool().unwrap_or(false), !external);
+                        let mut response = json!({"thread": thread, "model": "gpt-test",
+                            "modelProvider": "test-provider", "cwd": cwd, "approvalPolicy": "never",
+                            "approvalsReviewer": "user", "sandbox": {"type": "dangerFullAccess"},
+                            "reasoningEffort": null});
+                        if !external {
+                            let status = if resumes == 0 { "acquired" } else {
+                                assert!(granted, "installed adoption must keep its grant");
+                                "alreadyHeld"
+                            };
+                            response["retention"] = json!({"status": status, "grantId": "new-connection-grant"});
+                            granted = true;
+                        }
+                        resumes += 1;
+                        json!({"result": response})
+                    }
+                    "thread/retention/acquire" => {
+                        assert!(!external, "external writer never acquires");
+                        assert!(granted, "revalidation occurs after any earlier abandonment release");
+                        json!({"result": {"status": "alreadyHeld", "grantId": "new-connection-grant"}})
+                    }
+                    "thread/retention/release" => panic!("a committed or observed view must not abandon a grant"),
+                    "thread/read" => json!({"result": {"thread": thread}}),
+                    "thread/list" | "thread/loaded/list" => json!({"result": {"data": [], "nextCursor": null}}),
+                    "thread/goal/get" => json!({"result": {"goal": null}}),
+                    method => panic!("unexpected reconnect method: {method}"),
+                }))
+            }).await?;
+            assert_eq!(resumes, if external { 1 } else { 2 });
+            Ok::<_, color_eyre::Report>(methods)
+        });
+        let mut session = crate::start_embedded_app_server_for_picker(&app.config).await?;
+        let mut tui = crate::tui::test_support::make_test_tui()?;
+        app.begin_reconnect();
+        let connected = Box::pin(reconnect_with_adoption(
+            session.backend_id(),
+            app.app_server_target.clone(),
+            app.config.clone(),
+            app.local_settings.clone(),
+            Some(id),
+            None,
+            session.thread_tool_transport(),
+            ReconnectPresentation::Conversation,
+            session.worker_custody().unwrap_or_default(),
+            if external {
+                ReconnectAttachment::ExternalWriter
+            } else {
+                ReconnectAttachment::Writable
+            },
+        ))
+        .await?;
+        Box::pin(app.finish_reconnect(
+            &mut tui,
+            &mut session,
+            &mut events,
+            connected,
+            CODEX_CLI_VERSION,
+        ))
+        .await?;
+        assert_eq!(app.current_displayed_thread_id(), Some(id));
+        assert_eq!(app.chat_widget.is_external_writer_view(), external);
+        if external {
+            assert_eq!(
+                app.thread_event_channels[&id].attachment(),
+                ThreadEventAttachment::ExternalWriter
+            );
+        } else {
+            // The same new connection revalidates AlreadyHeld under its settlement
+            // lock. This cannot race past an earlier abandoned preparation release.
+            let (_, probe) = session
+                .prepare_retained_resume(
+                    &app.local_settings,
+                    app.config.clone(),
+                    id,
+                    crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
+                    crate::resume_permissions::ResumePermissions::default(),
+                )
+                .await?;
+            assert!(probe.is_some());
+            drop(probe); // AlreadyHeld is not ours to release.
+        }
+        session.shutdown().await?;
+        let methods = server.await??;
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|m| m.as_str() == "thread/retention/acquire")
+                .count(),
+            usize::from(!external)
+        );
+        assert!(!methods.iter().any(|m| m == "thread/retention/release"));
+    }
+    Ok(())
+}

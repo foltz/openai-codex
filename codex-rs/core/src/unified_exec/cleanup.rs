@@ -21,9 +21,52 @@ use futures::future::Shared;
 use crate::sandboxing::cleanup_census::SandboxCleanupCensus;
 use crate::sandboxing::cleanup_census::SandboxCleanupOperation;
 
-const RETIRE_GRACE: Duration = Duration::from_secs(2);
+pub(super) const RETIRE_GRACE: Duration = Duration::from_secs(2);
 type Collection = Shared<BoxFuture<'static, SandboxCleanupSummary>>;
 type Operation = Arc<Mutex<Option<SandboxCleanupOperation>>>;
+
+/// Remote observation uses the existing retirement scope too. A scope can
+/// tighten before the process-store lock is acquired; wake its observer at
+/// once rather than waiting on a stale timeout captured before retirement.
+#[derive(Debug, Default)]
+pub(super) struct RemoteCleanupDeadline {
+    deadline: Mutex<Option<Instant>>,
+    pub(super) changed: tokio::sync::Notify,
+}
+
+impl RemoteCleanupDeadline {
+    pub(super) fn tighten(&self, deadline: Instant) {
+        let moved = {
+            let mut current = self
+                .deadline
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if current.is_none_or(|earlier| deadline < earlier) {
+                *current = Some(deadline);
+                true
+            } else {
+                false
+            }
+        };
+        if moved {
+            self.changed.notify_waiters();
+        }
+    }
+
+    pub(super) fn deadline(&self) -> Instant {
+        let mut current = self
+            .deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *current.get_or_insert_with(|| Instant::now() + RETIRE_GRACE)
+    }
+}
+
+impl codex_sandboxing::CleanupDeadlineSink for RemoteCleanupDeadline {
+    fn tighten(&self, deadline: Instant) {
+        self.tighten(deadline);
+    }
+}
 
 struct CollectionState {
     custody: Option<SandboxCleanupCustody>,

@@ -180,6 +180,15 @@ impl ExecProcessEventReceiver {
         }
     }
 
+    /// Inert replay fixture for cross-crate process-owner tests. It runs no
+    /// executor or transport, and remains open after the supplied events.
+    #[doc(hidden)]
+    pub fn from_replay_for_tests(events: Vec<ExecProcessEvent>) -> Self {
+        let mut receiver = Self::empty();
+        receiver.replay = events.into();
+        receiver
+    }
+
     /// Returns the next replayed or live event.
     ///
     /// `Lagged` means this receiver fell behind the bounded live channel. The

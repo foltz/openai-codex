@@ -12,6 +12,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+use crate::sandboxing::cleanup_census::SandboxCleanupOperation;
 use codex_exec_server::ExecOutputStream;
 use codex_exec_server::ExecProcess;
 use codex_exec_server::ExecProcessEvent;
@@ -19,9 +20,11 @@ use codex_exec_server::ProcessSignal as ExecServerProcessSignal;
 use codex_exec_server::ReadResponse as ExecReadResponse;
 use codex_exec_server::StartedExecProcess;
 use codex_exec_server::WriteStatus;
+use codex_file_system::SandboxLaunch;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::exec_output::StreamOutput;
 use codex_protocol::protocol::TruncationPolicy;
+use codex_sandboxing::CleanupDeadlineScope;
 use codex_sandboxing::SandboxType;
 use codex_sandboxing::is_likely_sandbox_denied;
 use codex_sandboxing::record_filesystem_sandbox_violation;
@@ -34,6 +37,7 @@ use codex_utils_pty::SpawnedPty;
 use super::UNIFIED_EXEC_OUTPUT_MAX_BYTES;
 use super::UNIFIED_EXEC_OUTPUT_MAX_TOKENS;
 use super::UnifiedExecError;
+use super::cleanup::RemoteCleanupDeadline;
 use super::cleanup::SandboxCleanup;
 use super::process_state::ProcessState;
 use crate::shell_snapshot::ShellSnapshotFile;
@@ -110,6 +114,8 @@ pub(crate) struct UnifiedExecProcess {
     sandbox_type: Option<SandboxType>,
     timed_out: AtomicBool,
     sandbox_cleanup: Option<SandboxCleanup>,
+    remote_cleanup_deadline: Arc<RemoteCleanupDeadline>,
+    remote_cleanup_operation: std::sync::Mutex<Option<SandboxCleanupOperation>>,
     /// Explicit termination overrides retention of remote output after exit.
     pub(super) termination_requested: AtomicBool,
     // The shell may still need to replay this file after process startup returns.
@@ -157,6 +163,8 @@ impl UnifiedExecProcess {
             sandbox_type,
             timed_out: AtomicBool::new(false),
             sandbox_cleanup: None,
+            remote_cleanup_deadline: Arc::new(RemoteCleanupDeadline::default()),
+            remote_cleanup_operation: std::sync::Mutex::new(None),
             termination_requested: AtomicBool::new(false),
             _shell_snapshot: None,
         }
@@ -239,7 +247,12 @@ impl UnifiedExecProcess {
     fn finish_termination(&self) {
         self.termination_requested.store(true, Ordering::Release);
         self.output.cancellation_token.cancel();
-        if let Some(output_task) = &self.output_task {
+        // Local output is independent of custody. Remote Closed carries the
+        // cleanup receipt, so keep that original observation alive until its
+        // bound or the owning process itself is dropped.
+        if matches!(self.process_handle, ProcessHandle::Local(_))
+            && let Some(output_task) = &self.output_task
+        {
             output_task.abort();
         }
     }
@@ -247,10 +260,59 @@ impl UnifiedExecProcess {
     pub(super) async fn collect_sandbox_cleanup(&self) {
         if let Some(cleanup) = &self.sandbox_cleanup {
             cleanup.collect().await;
+        } else if matches!(self.process_handle, ProcessHandle::ExecServer(_)) {
+            if matches!(self.sandbox_type, Some(sandbox) if sandbox != SandboxType::LinuxSeccomp) {
+                return;
+            }
+            loop {
+                let tightened = self.remote_cleanup_deadline.changed.notified();
+                tokio::pin!(tightened);
+                tightened.as_mut().enable();
+                let deadline = self.remote_cleanup_deadline();
+                let wait = async {
+                    loop {
+                        let changed = self.output.output_closed_notify.notified();
+                        tokio::pin!(changed);
+                        changed.as_mut().enable();
+                        if self.output.output_closed.load(Ordering::Acquire) {
+                            break;
+                        }
+                        changed.await;
+                    }
+                };
+                tokio::select! {
+                    _ = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), wait) => break,
+                    _ = &mut tightened => continue,
+                }
+            }
+            if let Some(operation) = self
+                .remote_cleanup_operation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                let summary = self.state_rx.borrow().sandbox_cleanup;
+                let launch = match self.sandbox_type {
+                    Some(SandboxType::LinuxSeccomp) => SandboxLaunch::Launched,
+                    Some(_) => SandboxLaunch::NotLaunched,
+                    None => SandboxLaunch::Unknown,
+                };
+                operation.finish(launch, summary);
+            }
+            if !self.output.output_closed.load(Ordering::Acquire)
+                && let Some(task) = &self.output_task
+            {
+                task.abort();
+            }
         }
     }
 
+    fn remote_cleanup_deadline(&self) -> std::time::Instant {
+        self.remote_cleanup_deadline.deadline()
+    }
+
     pub(super) fn retire(&self, deadline: std::time::Instant) {
+        self.remote_cleanup_deadline.tighten(deadline);
         if let Some(cleanup) = &self.sandbox_cleanup {
             cleanup.tighten(deadline);
         }
@@ -269,8 +331,11 @@ impl UnifiedExecProcess {
             ProcessHandle::Local(process_handle) => process_handle.terminate(),
             ProcessHandle::ExecServer(process_handle) => {
                 let process_handle = Arc::clone(process_handle);
+                let deadline = self.remote_cleanup_deadline();
                 tokio::spawn(async move {
-                    let _ = process_handle.terminate().await;
+                    let _ = process_handle
+                        .terminate_with_cleanup_deadline(deadline)
+                        .await;
                 });
             }
         }
@@ -285,7 +350,7 @@ impl UnifiedExecProcess {
             ProcessHandle::Local(process_handle) => process_handle.terminate(),
             ProcessHandle::ExecServer(process_handle) => {
                 process_handle
-                    .terminate()
+                    .terminate_with_cleanup_deadline(self.remote_cleanup_deadline())
                     .await
                     .map_err(|err| UnifiedExecError::process_failed(err.to_string()))?;
             }
@@ -453,11 +518,40 @@ impl UnifiedExecProcess {
         started: StartedExecProcess,
         output_drain_policy: OutputDrainPolicy,
     ) -> Result<Self, UnifiedExecError> {
+        Self::from_exec_server_started_with_cleanup(started, output_drain_policy, None, None).await
+    }
+
+    pub(super) async fn from_exec_server_started_with_cleanup(
+        started: StartedExecProcess,
+        output_drain_policy: OutputDrainPolicy,
+        scope: Option<CleanupDeadlineScope>,
+        operation: Option<SandboxCleanupOperation>,
+    ) -> Result<Self, UnifiedExecError> {
         let process_handle = ProcessHandle::ExecServer(Arc::clone(&started.process));
         // Older peers do not report this field. In that case, skip local
         // classification rather than attributing a violation to a guessed backend.
         let sandbox_type = started.sandbox_type;
         let mut managed = Self::new(process_handle, sandbox_type, output_drain_policy);
+        // Own the census guard and scope before any early-exit await. A
+        // cancelled constructor/drop can therefore never erase a launch.
+        if let Some(scope) = scope {
+            let sink: Arc<dyn codex_sandboxing::CleanupDeadlineSink> =
+                managed.remote_cleanup_deadline.clone();
+            scope.register(&sink);
+        }
+        *managed
+            .remote_cleanup_operation
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = operation;
+        if matches!(sandbox_type, Some(sandbox) if sandbox != SandboxType::LinuxSeccomp)
+            && let Some(operation) = managed
+                .remote_cleanup_operation
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+        {
+            operation.finish(SandboxLaunch::NotLaunched, None);
+        }
         let output_handles = managed.output_handles().clone();
         managed.output_task = Some(Self::spawn_exec_server_output_task(
             started,
@@ -588,6 +682,7 @@ impl UnifiedExecProcess {
                         }
                     };
                     let ExecReadResponse {
+                        sandbox_cleanup,
                         chunks,
                         next_seq,
                         exited,
@@ -596,6 +691,13 @@ impl UnifiedExecProcess {
                         failure,
                         sandbox_denied,
                     } = response;
+                    if let Some(summary) = sandbox_cleanup {
+                        state_tx.send_modify(|state| {
+                            if state.sandbox_cleanup.is_none() {
+                                state.sandbox_cleanup = Some(summary);
+                            }
+                        });
+                    }
                     for chunk in chunks.into_iter().filter(|chunk| chunk.seq > last_seq) {
                         let bytes = chunk.chunk.into_inner();
                         let mut guard = output_buffer.lock().await;
@@ -666,10 +768,18 @@ impl UnifiedExecProcess {
                             cancellation_token.cancel();
                         }
                     }
-                    ExecProcessEvent::Closed { seq, .. } => {
+                    ExecProcessEvent::Closed {
+                        seq,
+                        sandbox_cleanup,
+                    } => {
                         if seq <= last_seq {
                             continue;
                         }
+                        state_tx.send_modify(|state| {
+                            if state.sandbox_cleanup.is_none() {
+                                state.sandbox_cleanup = sandbox_cleanup;
+                            }
+                        });
                         output_closed.store(true, Ordering::Release);
                         output_closed_notify.notify_waiters();
                         cancellation_token.cancel();
@@ -742,5 +852,18 @@ impl UnifiedExecProcess {
 impl Drop for UnifiedExecProcess {
     fn drop(&mut self) {
         self.terminate();
+        // Take the original guard now: a detached output task must not erase
+        // missing debt after the owning session has observed its census.
+        drop(
+            self.remote_cleanup_operation
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
+        if matches!(self.process_handle, ProcessHandle::ExecServer(_))
+            && let Some(task) = &self.output_task
+        {
+            task.abort();
+        }
     }
 }

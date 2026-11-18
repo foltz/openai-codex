@@ -1386,6 +1386,13 @@ impl UnifiedExecProcessManager {
                 unified_exec_process_id = process_id,
                 process.id = params.process_id.as_str(),
             );
+            // Own unknown launch debt before the cancellable remote start.
+            let cleanup_operation = request.sandbox_cleanup_census.as_ref().map(|census| {
+                crate::sandboxing::cleanup_census::SandboxCleanupOperation::new(
+                    Arc::clone(census),
+                    true,
+                )
+            });
             let started = match network_policy_decider {
                 Some(decider) => {
                     backend
@@ -1400,8 +1407,13 @@ impl UnifiedExecProcessManager {
             } else {
                 OutputDrainPolicy::BoundedAfterExit
             };
-            return UnifiedExecProcess::from_exec_server_started(started, output_drain_policy)
-                .await;
+            return UnifiedExecProcess::from_exec_server_started_with_cleanup(
+                started,
+                output_drain_policy,
+                request.sandbox_cleanup_scope.clone(),
+                cleanup_operation,
+            )
+            .await;
         }
 
         // TODO(anp): Keep PathUri through the local PTY/process launch boundary.

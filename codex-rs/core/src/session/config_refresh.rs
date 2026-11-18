@@ -23,7 +23,7 @@ use tracing::warn;
 pub(super) enum RuntimeConfigChangeOwner {
     /// A core-initiated change. The caller holds the session's gate, when one
     /// is installed, and the host's listener is notified immediately before an
-    /// accepted publication mutates the session configuration.
+    /// non-stale swap mutates the session configuration, including Rejected.
     Core,
     /// The embedding host holds the matching gate for its entire transition
     /// and owns the provenance the listener would invalidate, so core neither

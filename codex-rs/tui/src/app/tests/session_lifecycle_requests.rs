@@ -1238,6 +1238,9 @@ pub(super) enum HistoryCapabilities {
     ItemsAndSummaryTurnsFail,
     ThreadListFails,
     ThreadStartFails,
+    RecoveryUnsupported,
+    RecoveryRevisionMismatch,
+    RecoveryWithoutStateDb,
     ThreadStartWhileShuttingDown,
     ThreadStartDuringLegacyShutdown,
     ConfigReadUnsupported(i64),
@@ -1350,9 +1353,12 @@ pub(super) async fn start_recording_app_server_with_realtime_speech(
     realtime_behavior: RealtimeRequestBehavior,
     loader_overrides: LoaderOverrides,
 ) -> Result<RecordingAppServer> {
-    let state_db =
+    let state_db = if history_capabilities == HistoryCapabilities::RecoveryWithoutStateDb {
+        None
+    } else {
         crate::init_state_db_for_app_server_target(config, &crate::AppServerTarget::Embedded)
-            .await?;
+            .await?
+    };
     let mut embedded = crate::start_embedded_app_server(
         codex_arg0::Arg0DispatchPaths::default(),
         config.clone(),
@@ -1564,6 +1570,27 @@ pub(super) async fn start_recording_app_server_with_realtime_speech(
                                 data: None,
                                 message: "method not found".to_string(),
                             },
+                        })
+                    } else if history_capabilities == HistoryCapabilities::RecoveryUnsupported
+                        && request.method == "thread/clear/recovery/read"
+                    {
+                        JSONRPCMessage::Error(JSONRPCError {
+                            id: request_id,
+                            error: JSONRPCErrorError {
+                                code: -32601,
+                                data: None,
+                                message: "method not found".into(),
+                            },
+                        })
+                    } else if history_capabilities == HistoryCapabilities::RecoveryRevisionMismatch
+                        && request.method == "thread/clear/recovery/read"
+                    {
+                        JSONRPCMessage::Response(JSONRPCResponse {
+                            id: request_id,
+                            result: serde_json::json!({
+                                "contractVersion": 2, "durability": "durable",
+                                "observation": {"type": "support"}
+                            }),
                         })
                     } else if matches!(
                         history_capabilities,

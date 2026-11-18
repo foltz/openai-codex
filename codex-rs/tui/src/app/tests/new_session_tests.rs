@@ -1574,3 +1574,167 @@ async fn fresh_session_carries_only_the_displayed_clear_predecessor() -> Result<
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn recovery_selects_supported_history_on_a_fresh_connection_without_retry() -> Result<()> {
+    for capabilities in [
+        HistoryCapabilities::Current,
+        HistoryCapabilities::RecoveryWithoutStateDb,
+    ] {
+        let (mut app, _, _) = make_test_app_with_channels().await;
+        app.config
+            .features
+            .set_enabled(codex_features::Feature::Plugins, false)?;
+        app.cli_kv_overrides
+            .push(("features.plugins".into(), toml::Value::Boolean(false)));
+        let home = tempdir()?;
+        app.config.codex_home = home.path().to_path_buf().abs();
+        app.config.sqlite = SqliteConfig::new_for_testing(home.path().abs());
+        let (mut server, requests, proxy) = start_recording_app_server_with_history(
+            &app.config,
+            capabilities,
+            None,
+            None,
+            crate::app_server_session::ThreadParamsMode::Embedded,
+            LoaderOverrides::default(),
+        )
+        .await?;
+        let a = ThreadId::new();
+        // No start or fork has taught this newly connected session LegacyOnly.
+        let (started, retention) = server
+            .start_clear_recovery(&app.local_settings, &app.config, Some(a))
+            .await?;
+        retention.commit(); // This direct facade fixture explicitly adopts the returned thread.
+        assert_ne!(started.session.thread_id, a);
+        let starts = recorded_params(&requests, "thread/start");
+        assert_eq!(starts.len(), 1);
+        assert!(starts[0]["historyMode"].is_null());
+        assert_eq!(
+            starts[0]["clearRecovery"]["predecessorThreadId"],
+            a.to_string()
+        );
+        let read = server
+            .request_handle()
+            .request_typed::<codex_app_server_protocol::ThreadClearRecoveryReadResponse>(
+                codex_app_server_protocol::ClientRequest::ThreadClearRecoveryRead {
+                    request_id: codex_app_server_protocol::RequestId::String(
+                        "recovery-check".into(),
+                    ),
+                    params: codex_app_server_protocol::ThreadClearRecoveryReadParams {
+                        successor_thread_id: Some(started.session.thread_id.to_string()),
+                    },
+                },
+            )
+            .await;
+        if capabilities == HistoryCapabilities::RecoveryWithoutStateDb {
+            assert!(read.is_err());
+        } else {
+            assert!(matches!(
+                read?.observation,
+                codex_app_server_protocol::ThreadClearRecoveryObservation::Complete { .. }
+            ));
+        }
+        server.shutdown().await?;
+        proxy.await??;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn recovery_checks_support_before_creation_and_never_retries_a_failed_start() -> Result<()> {
+    for capabilities in [
+        HistoryCapabilities::RecoveryUnsupported,
+        HistoryCapabilities::RecoveryRevisionMismatch,
+        HistoryCapabilities::ThreadStartFails,
+    ] {
+        let (mut app, mut events, _) = make_test_app_with_channels().await;
+        app.config
+            .features
+            .set_enabled(codex_features::Feature::Plugins, false)?;
+        app.cli_kv_overrides
+            .push(("features.plugins".into(), toml::Value::Boolean(false)));
+        let home = tempdir()?;
+        app.config.codex_home = home.path().to_path_buf().abs();
+        app.config.sqlite = SqliteConfig::new_for_testing(home.path().abs());
+        let current = ThreadId::new();
+        app.enqueue_primary_thread_session(
+            test_thread_session(current, app.config.cwd.to_path_buf()),
+            Vec::new(),
+        )
+        .await?;
+        app.app_server_target = AppServerTarget::Remote {
+            endpoint: crate::resolve_remote_addr("ws://127.0.0.1:1")?,
+        };
+        app.ensure_thread_channel(current).mark_replay_only();
+        while events.try_recv().is_ok() {}
+        let (mut server, requests, proxy) = start_recording_app_server_with_history(
+            &app.config,
+            capabilities,
+            /*blocked_thread_list*/ None,
+            /*failed_thread_name*/ None,
+            crate::app_server_session::ThreadParamsMode::Embedded,
+            LoaderOverrides::default(),
+        )
+        .await?;
+        let mut tui = crate::tui::test_support::make_test_tui()?;
+        app.clear_displayed_session(
+            &mut tui,
+            &mut server,
+            Some("keep input".into()),
+            /*new_thread_name*/ None,
+        )
+        .await;
+        assert_eq!(app.chat_widget.thread_id(), Some(current));
+        assert_eq!(app.chat_widget.composer_text_with_pending(), "keep input");
+        assert!(recorded_params(&requests, "thread/unsubscribe").is_empty());
+        assert!(recorded_params(&requests, "thread/clear").is_empty());
+        let starts = recorded_params(&requests, "thread/start");
+        assert_eq!(
+            starts.len(),
+            usize::from(capabilities == HistoryCapabilities::ThreadStartFails)
+        );
+        if let Some(start) = starts.first() {
+            assert_eq!(
+                start["clearRecovery"],
+                serde_json::json!({
+                    "contractVersion": 1, "predecessorThreadId": current.to_string()
+                })
+            );
+            assert!(start["clearPredecessorThreadId"].is_null());
+        }
+        let errors = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event {
+                AppEvent::InsertHistoryCell(cell) => {
+                    Some(lines_to_single_string(&cell.display_lines(/*width*/ 1000)))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        match capabilities {
+            HistoryCapabilities::RecoveryUnsupported => {
+                assert!(
+                    errors.contains("Clear recovery is unsupported or unavailable"),
+                    "{errors}"
+                )
+            }
+            HistoryCapabilities::RecoveryRevisionMismatch => {
+                assert!(
+                    errors.contains("Clear recovery contract mismatch"),
+                    "{errors}"
+                )
+            }
+            _ => {
+                assert!(
+                    errors.contains(
+                        "Clear recovery outcome is unknown or refused; no automatic retry"
+                    ),
+                    "{errors}"
+                )
+            }
+        }
+        server.shutdown().await?;
+        proxy.await??;
+    }
+    Ok(())
+}

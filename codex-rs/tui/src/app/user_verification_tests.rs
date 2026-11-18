@@ -143,7 +143,7 @@ async fn run_verification_rpc_scenario(scenario: RpcScenario) -> color_eyre::Res
                         "userVerification/status" => {
                             assert!(response_received);
                             socket.send(Message::Text(serde_json::json!({ "id": request.id, "result": { "unavailableReason": null, "unavailableMessage": null, "credentialId": null } }).to_string().into())).await?;
-                            return Ok::<_, color_eyre::Report>(());
+                            return Ok::<_, color_eyre::Report>(socket);
                         }
                         method => panic!("unexpected RPC: {method}"),
                     };
@@ -186,7 +186,7 @@ async fn run_verification_rpc_scenario(scenario: RpcScenario) -> color_eyre::Res
                             .await?;
                         continue;
                     }
-                    return Ok::<_, color_eyre::Report>(());
+                    return Ok::<_, color_eyre::Report>(socket);
                 }
                 JSONRPCMessage::Notification(_) => {}
                 JSONRPCMessage::Error(error) => {
@@ -351,7 +351,25 @@ async fn run_verification_rpc_scenario(scenario: RpcScenario) -> color_eyre::Res
             insta::assert_snapshot!("older_binary_verification_warning", rendered);
         }
     }
-    tokio::time::timeout(std::time::Duration::from_secs(/*secs*/ 5), server).await???;
-    session.shutdown().await?;
+    let socket =
+        tokio::time::timeout(std::time::Duration::from_secs(/*secs*/ 5), server).await???;
+    let (shutdown, close) = tokio::join!(session.shutdown(), complete_client_close(socket));
+    shutdown?;
+    close?;
+    Ok(())
+}
+
+/// Wait for the client's Close and flush the queued reply before dropping the mock peer.
+async fn complete_client_close(
+    mut socket: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+) -> color_eyre::Result<()> {
+    use tokio_tungstenite::tungstenite::Message;
+
+    let frame = socket.next().await;
+    let Some(Ok(Message::Close(_))) = frame else {
+        color_eyre::eyre::bail!("expected the client's close frame, got {frame:?}");
+    };
+    // The peer initiated closing; flush its queued reply rather than initiating another close.
+    SinkExt::close(&mut socket).await?;
     Ok(())
 }

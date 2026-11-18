@@ -1317,8 +1317,8 @@ impl App {
                     } else {
                         None
                     };
-                let started =
-                    crate::boxed_future!(app_server.start_thread_with_session_start_source(
+                let (started, retention) =
+                    crate::boxed_future!(app_server.prepare_retained_thread_start(
                         &self.local_settings,
                         &config,
                         session_start_source,
@@ -1333,7 +1333,7 @@ impl App {
                             "Failed to start a fresh session through the app server: {err}"
                         )
                     })?;
-                (started, None)
+                (started, retention)
             }
         };
         Ok(PreparedFreshSession {

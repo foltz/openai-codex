@@ -1190,6 +1190,54 @@ impl AppServerSession {
         selected_profile: Option<&PermissionProfileSelection>,
         host_project_cwd: Option<&std::path::Path>,
     ) -> Result<AppServerStartedThread> {
+        self.start_thread_with_adoption(
+            local_settings,
+            config,
+            session_start_source,
+            clear_predecessor_thread_id,
+            remote_cwd_override,
+            selected_profile,
+            host_project_cwd,
+            /*adopt*/ false,
+        )
+        .await
+        .map(|(started, _retention)| started)
+    }
+
+    pub(crate) async fn prepare_retained_thread_start(
+        &mut self,
+        local_settings: &LocalSettings,
+        config: &Config,
+        session_start_source: Option<ThreadStartSource>,
+        clear_predecessor_thread_id: Option<String>,
+        remote_cwd_override: Option<&std::path::Path>,
+        selected_profile: Option<&PermissionProfileSelection>,
+        host_project_cwd: Option<&std::path::Path>,
+    ) -> Result<(AppServerStartedThread, Option<retention::PendingRetention>)> {
+        self.start_thread_with_adoption(
+            local_settings,
+            config,
+            session_start_source,
+            clear_predecessor_thread_id,
+            remote_cwd_override,
+            selected_profile,
+            host_project_cwd,
+            /*adopt*/ true,
+        )
+        .await
+    }
+
+    async fn start_thread_with_adoption(
+        &mut self,
+        local_settings: &LocalSettings,
+        config: &Config,
+        session_start_source: Option<ThreadStartSource>,
+        clear_predecessor_thread_id: Option<String>,
+        remote_cwd_override: Option<&std::path::Path>,
+        selected_profile: Option<&PermissionProfileSelection>,
+        host_project_cwd: Option<&std::path::Path>,
+        adopt: bool,
+    ) -> Result<(AppServerStartedThread, Option<retention::PendingRetention>)> {
         if self.thread_params_mode.settings_owner() == ThreadSettingsOwner::Server
             && selected_profile.is_some()
         {
@@ -1206,6 +1254,7 @@ impl AppServerSession {
             session_start_source,
         );
         params.clear_predecessor_thread_id = clear_predecessor_thread_id;
+        params.retain_for_connection = adopt;
         if self.thread_params_mode.settings_owner() == ThreadSettingsOwner::Client {
             params.model_provider = self
                 .model_provider_override
@@ -1263,6 +1312,25 @@ impl AppServerSession {
                 response.cwd.as_path(),
             )
         });
+        let retention = if adopt {
+            match self
+                .retention
+                .adopt_thread(
+                    self.request_handle(),
+                    response.thread.id.clone(),
+                    response.retention.clone(),
+                )
+                .await
+            {
+                Ok(retention) => Some(retention),
+                Err(error) => {
+                    self.retention.warn_adoption(&response.thread.id, &error);
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let mut started = started_thread_from_start_response(
             response,
             local_settings,
@@ -1277,7 +1345,7 @@ impl AppServerSession {
         if task_tools_available {
             self.remember_task_tool_thread(started.session.thread_id);
         }
-        Ok(started)
+        Ok((started, retention))
     }
 
     #[cfg(test)]

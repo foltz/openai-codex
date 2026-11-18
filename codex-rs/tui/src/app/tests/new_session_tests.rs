@@ -569,6 +569,7 @@ async fn plan_implementation_reads_approved_plan_file_in_fresh_session() -> Resu
     let starts = super::session_lifecycle_requests::recorded_params(&wire_requests, "thread/start");
     assert_eq!(starts.len(), 2, "one original start and one plan start");
     assert_eq!(starts[1]["sessionStartSource"], "clear");
+    assert_eq!(starts[1]["retainForConnection"], true);
     assert_eq!(starts[1]["clearPredecessorThreadId"], source_id.to_string());
     assert!(
         super::session_lifecycle_requests::recorded_params(&wire_requests, "thread/clear")

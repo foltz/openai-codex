@@ -55,6 +55,15 @@ impl RetentionClient {
         )
     }
 
+    pub(super) fn warn_adoption(&self, thread_id: &str, error: &color_eyre::Report) {
+        let _ = self.warnings.send(WarningNotification {
+            thread_id: None,
+            message: format!(
+                "Session {thread_id} could not be retained: {error}. It may close while idle."
+            ),
+        });
+    }
+
     pub(super) fn warn_clear(&self, thread_id: &str, error: &color_eyre::Report) {
         let _ = self.warnings.send(WarningNotification {
             thread_id: None,

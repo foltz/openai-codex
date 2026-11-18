@@ -227,7 +227,7 @@ impl App {
             .map_err(|error| format!("Failed to read new session defaults: {error}"))?;
         let host_project_cwd = self.backend_preference_context.local_cwd.clone();
         let start = destination
-            .start_thread_with_session_start_source(
+            .prepare_retained_thread_start(
                 &local_settings,
                 &config,
                 /*session_start_source*/ None,
@@ -237,7 +237,7 @@ impl App {
                 host_project_cwd.as_deref(),
             )
             .map_err(|error| format!("Failed to start the new conversation: {error}"));
-        let started = if responsive_cloud_switch {
+        let (started, retention) = if responsive_cloud_switch {
             let events = tui.event_stream();
             wait_for_cloud_switch(
                 self,
@@ -279,7 +279,7 @@ impl App {
                 started,
                 config,
                 local_settings,
-                retention: None,
+                retention,
             },
             ThreadAttachPresentation::FreshAfterClear,
             /*initial_user_message*/ None,

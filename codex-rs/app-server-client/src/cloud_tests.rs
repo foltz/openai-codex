@@ -103,6 +103,50 @@ async fn cloud_shutdown_times_out_when_owner_does_not_respond() {
     assert!(commands.recv().await.is_none());
 }
 
+#[tokio::test(start_paused = true)]
+async fn cloud_final_close_uses_the_original_deadline_without_a_fresh_budget() {
+    let (client, mut commands, events) = CloudClient::channel(/*capacity*/ 1);
+    let start = tokio::time::Instant::now();
+    let deadline = start + std::time::Duration::from_millis(100);
+    let result = AppServerClient::Cloud(client).shutdown_by(deadline).await;
+    assert!(matches!(result, crate::FinalClose::TimedOut(_)));
+    assert_eq!(tokio::time::Instant::now(), deadline);
+    let command = commands.try_recv().expect("shutdown was admitted");
+    assert!(matches!(command.operation, CloudOperation::Shutdown));
+    assert!(command.response.is_closed());
+    assert!(events.is_closed());
+    assert!(commands.recv().await.is_none());
+
+    // Reconnect/ordinary close keeps its existing budget rather than inheriting
+    // the final-exit deadline or replacing it for the other direction.
+    let (ordinary, _commands, _events) = CloudClient::channel(/*capacity*/ 1);
+    let start = tokio::time::Instant::now();
+    let error = AppServerClient::Cloud(ordinary)
+        .shutdown()
+        .await
+        .expect_err("an unresponsive ordinary owner times out");
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert_eq!(tokio::time::Instant::now(), start + crate::SHUTDOWN_TIMEOUT);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cloud_final_close_reports_closed_only_after_the_owner_acknowledges() {
+    let (client, mut commands, _events) = CloudClient::channel(/*capacity*/ 1);
+    let worker = tokio::spawn(async move {
+        let command = commands.recv().await.expect("shutdown was admitted");
+        assert!(matches!(command.operation, CloudOperation::Shutdown));
+        command
+            .response
+            .send(Ok(Ok(serde_json::Value::Null)))
+            .expect("caller remains until the acknowledgement");
+    });
+    let result = AppServerClient::Cloud(client)
+        .shutdown_by(tokio::time::Instant::now() + std::time::Duration::from_millis(100))
+        .await;
+    assert!(matches!(result, crate::FinalClose::Closed));
+    worker.await.expect("the fixture worker is joined");
+}
+
 #[tokio::test]
 async fn native_model_list_bypasses_the_cloud_command_queue() -> color_eyre::Result<()> {
     use codex_app_server_protocol::ModelListResponse;

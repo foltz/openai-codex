@@ -854,28 +854,52 @@ async fn background_drain_timeout_retains_work_and_reobserves_completion() -> Re
         processor.drain_background_tasks_until(deadline),
         processor.drain_background_tasks_until(deadline),
     );
-    assert_eq!(first, second);
+    // Compare each named population without adding production Eq/Clone merely for a test.
+    macro_rules! same_population {
+        ($($field:ident),* $(,)?) => { $(assert_eq!(first.$field, second.$field);)* };
+    }
+    same_population!(
+        models,
+        turn_cost,
+        thread_starts,
+        apps,
+        skills,
+        plugins,
+        command_exec,
+        model_auth,
+        request_auth,
+        auxiliary_tasks,
+        workspace_routing
+    );
+    let first_login = first.login.as_ref().expect("first login receipt");
+    let second_login = second.login.as_ref().expect("second login receipt");
+    assert_eq!(first_login.tasks, second_login.tasks);
+    assert_eq!(first_login.browsers, second_login.browsers);
+    assert_eq!(
+        first_login.admission_unavailable,
+        second_login.admission_unavailable
+    );
     assert!(first.is_clean(), "{first:?}");
-    let expected = first;
+    assert!(second.is_clean(), "{second:?}");
+    let mut expected = first;
     // An uncollected or unproven command/exec sandbox cleanup alone makes
     // the otherwise clean background shutdown evidence non-clean.
     for command_exec in [
         CommandExecSandboxShutdown {
             in_flight: 1,
-            unproven: 0,
+            ..Default::default()
         },
         CommandExecSandboxShutdown {
-            in_flight: 0,
             unproven: 1,
+            ..Default::default()
+        },
+        CommandExecSandboxShutdown {
+            unavailable: true,
+            ..Default::default()
         },
     ] {
-        assert!(
-            !super::ProcessorBackgroundShutdown {
-                command_exec,
-                ..expected.clone()
-            }
-            .is_clean()
-        );
+        expected.command_exec = command_exec;
+        assert!(!expected.is_clean());
     }
     assert!(weak_resource.upgrade().is_none());
     processor.clear_runtime_references();

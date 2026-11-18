@@ -1536,7 +1536,7 @@ async fn shutdown_edge_binding_counts_in_flight_legacy_cleanup() {
     config.ephemeral = true;
     config
         .features
-        .disable(crate::features::Feature::Plugins)
+        .disable(codex_features::Feature::Plugins)
         .expect("disable unrelated plugin warmup");
     let manager = Arc::new(ThreadManager::with_models_provider_and_home_for_tests(
         codex_login::CodexAuth::from_api_key("dummy"),
@@ -1603,7 +1603,7 @@ async fn permanent_manager_shutdown_clamps_in_flight_legacy_cleanup() {
     config.ephemeral = true;
     config
         .features
-        .disable(crate::features::Feature::Plugins)
+        .disable(codex_features::Feature::Plugins)
         .expect("disable unrelated plugin warmup");
     let manager = Arc::new(ThreadManager::with_models_provider_and_home_for_tests(
         codex_login::CodexAuth::from_api_key("dummy"),
@@ -1680,7 +1680,7 @@ async fn managed_legacy_cleanup_in_progress_is_retained_as_incomplete() {
     config.ephemeral = true;
     config
         .features
-        .disable(crate::features::Feature::Plugins)
+        .disable(codex_features::Feature::Plugins)
         .expect("disable unrelated plugin warmup");
     let manager = Arc::new(ThreadManager::with_models_provider_and_home_for_tests(
         codex_login::CodexAuth::from_api_key("dummy"),

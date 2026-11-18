@@ -4314,7 +4314,7 @@ async fn shutdown_edge_binding_does_not_wait_on_a_held_thread_map_lock() {
     let mut config = test_config().await;
     config
         .features
-        .disable(crate::features::Feature::Plugins)
+        .disable(codex_features::Feature::Plugins)
         .expect("disable unrelated plugin warmup");
     config.codex_home = temp_dir.path().join("codex-home").abs();
     config.cwd = config.codex_home.abs();
@@ -4401,7 +4401,7 @@ async fn shutdown_edge_binding_consumes_clean_terminal_legacy_proof() {
     let mut config = test_config().await;
     config
         .features
-        .disable(crate::features::Feature::Plugins)
+        .disable(codex_features::Feature::Plugins)
         .expect("disable unrelated plugin warmup");
     config.codex_home = temp_dir.path().join("codex-home").abs();
     config.cwd = config.codex_home.abs();
@@ -4454,7 +4454,7 @@ async fn shutdown_edge_binding_counts_unclean_or_abnormal_terminal_legacy() {
     let mut config = test_config().await;
     config
         .features
-        .disable(crate::features::Feature::Plugins)
+        .disable(codex_features::Feature::Plugins)
         .expect("disable unrelated plugin warmup");
     config.codex_home = temp_dir.path().join("codex-home").abs();
     config.cwd = config.codex_home.abs();
@@ -4586,7 +4586,7 @@ async fn shutdown_all_threads_bounded_binds_runtimes_and_keeps_manager_admitting
     let mut config = test_config().await;
     config
         .features
-        .disable(crate::features::Feature::Plugins)
+        .disable(codex_features::Feature::Plugins)
         .expect("disable unrelated plugin warmup");
     config.codex_home = temp_dir.path().join("codex-home").abs();
     config.cwd = config.codex_home.abs();

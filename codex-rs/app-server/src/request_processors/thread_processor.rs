@@ -7391,7 +7391,7 @@ pub(crate) const BACKGROUND_TASK_DRAIN_CAP: Duration = Duration::from_secs(10);
 pub(crate) const THREAD_SHUTDOWN_CAP: Duration = Duration::from_secs(10);
 
 #[cfg(test)]
-impl ThreadProcessor {
+impl ThreadRequestProcessor {
     pub(crate) fn background_tasks_for_test(
         &self,
     ) -> &crate::processor_task_retirement::ProcessorTasks {

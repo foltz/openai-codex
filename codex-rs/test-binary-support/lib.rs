@@ -39,7 +39,11 @@ where
     let argv1 = args.next();
     match classify(exe_name, argv1.as_deref().and_then(|arg| arg.to_str())) {
         TestBinaryDispatchMode::DispatchArg0Only => {
-            let _ = arg0_dispatch();
+            // Helpers dispatch from a constructor, where unwinding would abort.
+            // Preserve Rust's normal panic exit status without a core dump.
+            if std::panic::catch_unwind(arg0_dispatch).is_err() {
+                std::process::exit(101);
+            }
             None
         }
         TestBinaryDispatchMode::Skip => None,
